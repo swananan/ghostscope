@@ -1,7 +1,7 @@
 //! Neutral semantic plans produced before runtime-specific lowering.
 
 use crate::core::{
-    DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, PlanExprOp,
+    Availability, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, PlanExprOp,
 };
 use std::fmt;
 
@@ -49,6 +49,22 @@ pub struct PieceLocation {
     pub bit_offset: u32,
     pub bit_size: u32,
     pub location: Box<VariableLocation>,
+}
+
+/// Semantic location produced after DWARF expression evaluation.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParsedLocation {
+    pub location: VariableLocation,
+    pub availability: Availability,
+}
+
+impl ParsedLocation {
+    pub(crate) fn from_evaluation_result(result: &EvaluationResult) -> Self {
+        Self {
+            location: VariableLocation::from_evaluation_result(result),
+            availability: Availability::from_evaluation_result(result),
+        }
+    }
 }
 
 impl VariableLocation {

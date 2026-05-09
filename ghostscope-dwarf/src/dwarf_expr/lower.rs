@@ -5,7 +5,8 @@
 
 use crate::binary::{DwarfEndian, DwarfReader};
 use crate::core::{
-    DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, PlanExprOp, Result,
+    CfaResult, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, PlanExprOp,
+    Result,
 };
 use crate::dwarf_expr::{errors as expr_errors, modes::DwarfExprMode};
 use crate::index::{CfiIndex, FunctionBlocks};
@@ -242,6 +243,52 @@ impl ExpressionEvaluator {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn parse_expression_as_cfa_in_unit(
+        expr_bytes: &[u8],
+        endian: DwarfEndian,
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        address: u64,
+        get_cfa: Option<&dyn Fn(u64) -> Result<Option<CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
+    ) -> Result<Option<CfaResult>> {
+        let evaluation = Self::parse_expression_in_unit(
+            expr_bytes,
+            endian,
+            unit,
+            dwarf,
+            address,
+            get_cfa,
+            function_context,
+            cfi_index,
+        )?;
+        Ok(Self::evaluation_result_to_cfa(evaluation))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn parse_location_lists_as_cfa(
+        unit: &gimli::Unit<DwarfReader>,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        offset: gimli::LocationListsOffset<usize>,
+        address: u64,
+        get_cfa: Option<&dyn Fn(u64) -> Result<Option<CfaResult>>>,
+        function_context: Option<&FunctionBlocks>,
+        cfi_index: Option<&CfiIndex>,
+    ) -> Result<Option<CfaResult>> {
+        let evaluation = Self::parse_location_lists(
+            unit,
+            dwarf,
+            offset,
+            address,
+            get_cfa,
+            function_context,
+            cfi_index,
+        )?;
+        Ok(Self::evaluation_result_to_cfa(evaluation))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn parse_expression_with_context(
         expr_bytes: &[u8],
         endian: DwarfEndian,
@@ -305,6 +352,42 @@ impl ExpressionEvaluator {
             EvaluationResult::Composite(_) => Err(anyhow::anyhow!(
                 "composite DWARF expression cannot be represented as one PlanExprOp[]"
             )),
+        }
+    }
+
+    fn evaluation_result_to_cfa(evaluation: EvaluationResult) -> Option<CfaResult> {
+        match evaluation {
+            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                register,
+                offset,
+                ..
+            }) => Some(CfaResult::RegisterPlusOffset {
+                register,
+                offset: offset.unwrap_or(0),
+            }),
+            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
+                Some(CfaResult::Expression { steps })
+            }
+            EvaluationResult::MemoryLocation(LocationResult::Address(address)) => {
+                Some(CfaResult::Expression {
+                    steps: vec![PlanExprOp::PushConstant(address as i64)],
+                })
+            }
+            EvaluationResult::DirectValue(DirectValueResult::Constant(value)) => {
+                Some(CfaResult::Expression {
+                    steps: vec![PlanExprOp::PushConstant(value)],
+                })
+            }
+            EvaluationResult::DirectValue(DirectValueResult::ImplicitValue(bytes))
+                if bytes.len() == 8 =>
+            {
+                let mut value = [0u8; 8];
+                value.copy_from_slice(&bytes);
+                Some(CfaResult::Expression {
+                    steps: vec![PlanExprOp::PushConstant(u64::from_le_bytes(value) as i64)],
+                })
+            }
+            _ => None,
         }
     }
 

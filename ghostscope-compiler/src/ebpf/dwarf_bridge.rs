@@ -5,9 +5,9 @@
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use ghostscope_dwarf::{
-    AddressOrigin, Availability, EntryValueCase, MemoryAccessSize, PlanExprOp, PlannedAddress,
-    PlannedAddressKind, RuntimeComputedExpr, SectionType, TypeInfo, VariableAccessPath,
-    VariableAccessSegment, VariableLocation, VariableMaterializationPlan, VariableReadPlan,
+    AddressOrigin, Availability, EntryValueCase, LvalueAddressPlan, MemoryAccessSize, PlanExprOp,
+    PlannedAddress, PlannedAddressKind, RuntimeComputedExpr, SectionType, TypeInfo,
+    VariableAccessPath, VariableAccessSegment, VariableMaterializationPlan, VariableReadPlan,
 };
 use ghostscope_process::module_probe;
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
@@ -435,57 +435,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         status_ptr: Option<PointerValue<'ctx>>,
         module_hint: Option<&str>,
     ) -> Result<IntValue<'ctx>> {
-        if !plan.availability.is_available() {
-            return Err(Self::dwarf_expression_unavailable_error(
-                &plan.name,
-                &plan.availability,
-                pc_address,
-            ));
+        match plan.lvalue_address_plan() {
+            LvalueAddressPlan::Address { address } => {
+                self.planned_address_to_llvm_address(&address, status_ptr, module_hint)
+            }
+            LvalueAddressPlan::Unavailable { availability } => Err(
+                Self::dwarf_lvalue_address_unavailable_error(&plan.name, &availability, pc_address),
+            ),
         }
-
-        let address = match &plan.location {
-            VariableLocation::Address(_)
-            | VariableLocation::RegisterAddress { .. }
-            | VariableLocation::FrameBaseRelative { .. }
-            | VariableLocation::ComputedAddress(_) => {
-                PlannedAddress::from_location(plan.location.clone()).ok_or_else(|| {
-                    CodeGenError::DwarfError(format!(
-                        "DWARF variable '{}' has an address-backed location that could not be planned",
-                        plan.name
-                    ))
-                })?
-            }
-            VariableLocation::OptimizedOut => {
-                return Err(Self::dwarf_expression_unavailable_error(
-                    &plan.name,
-                    &Availability::OptimizedOut,
-                    pc_address,
-                ))
-            }
-            VariableLocation::Pieces(_) => {
-                return Err(CodeGenError::DwarfError(format!(
-                    "DWARF variable '{}' is split across pieces; piece reconstruction is not implemented",
-                    plan.name
-                )))
-            }
-            VariableLocation::AbsoluteAddressValue(_)
-            | VariableLocation::RegisterValue { .. }
-            | VariableLocation::ComputedValue(_)
-            | VariableLocation::ImplicitValue(_) => {
-                return Err(CodeGenError::DwarfError(format!(
-                    "cannot take address of value-backed DWARF expression '{}'",
-                    plan.name
-                )))
-            }
-            VariableLocation::Unknown => {
-                return Err(CodeGenError::DwarfError(format!(
-                    "DWARF variable '{}' has unknown location",
-                    plan.name
-                )))
-            }
-        };
-
-        self.planned_address_to_llvm_address(&address, status_ptr, module_hint)
     }
 
     fn generate_memory_location_from_planned_address(
@@ -1394,6 +1351,7 @@ mod tests {
     use ghostscope_dwarf::AddressExpr;
     use ghostscope_dwarf::PlanExprOp;
     use ghostscope_dwarf::Provenance;
+    use ghostscope_dwarf::VariableLocation;
     use inkwell::context::Context as LlvmContext;
 
     fn read_plan(
@@ -1837,33 +1795,26 @@ mod tests {
     }
 
     #[test]
-    fn lvalue_address_rejects_absolute_address_values() {
+    fn unavailable_lvalue_address_plan_formats_error() {
         let llctx = LlvmContext::create();
         let opts = crate::CompileOptions::default();
-        let mut ctx = EbpfContext::new(&llctx, "value_backed_lvalue", Some(0), &opts).expect("ctx");
+        let mut ctx = EbpfContext::new(&llctx, "unavailable_lvalue", Some(0), &opts).expect("ctx");
         ctx.create_basic_ebpf_function("f").expect("fn");
 
-        let ty = ghostscope_protocol::TypeInfo::PointerType {
-            target_type: Box::new(ghostscope_protocol::TypeInfo::BaseType {
-                name: "int".to_string(),
-                size: 4,
-                encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
-            }),
-            size: 8,
-        };
         let plan = read_plan(
-            "ptr",
-            "int*",
-            Some(ty),
-            VariableLocation::AbsoluteAddressValue(AddressExpr::constant(0x2000)),
-            Availability::Available,
+            "x",
+            "int",
+            None,
+            VariableLocation::OptimizedOut,
+            Availability::OptimizedOut,
         );
 
         let err = ctx
             .variable_read_plan_to_lvalue_address_with_hint(&plan, 0x1234, None, None)
-            .expect_err("value-backed locations should not support address-of");
+            .expect_err("unavailable lvalue plans should be rejected");
 
-        assert!(matches!(err, CodeGenError::DwarfError(_)));
-        assert!(err.to_string().contains("value-backed"));
+        assert!(matches!(err, CodeGenError::VariableUnavailable(_)));
+        assert!(err.to_string().contains("cannot take its address"));
+        assert!(err.to_string().contains("optimized out"));
     }
 }

@@ -37,8 +37,8 @@ pub use core::{
 // Re-export semantic contract types.
 pub use semantics::{
     AddressOrigin, AddressSpaceInfo, CfaRulePlan, CompactUnwindRow, CompactUnwindStats,
-    CompactUnwindTable, InlineFrame, PcContext, PcLineInfo, PcRange, PlannedAddress,
-    PlannedAddressKind, PlannedValue, RegisterRecoveryPlan, RuntimeComputedExpr,
+    CompactUnwindTable, InlineFrame, LvalueAddressPlan, PcContext, PcLineInfo, PcRange,
+    PlannedAddress, PlannedAddressKind, PlannedValue, RegisterRecoveryPlan, RuntimeComputedExpr,
     RuntimeComputedKind, UnwindDiagnostic, UnwindDiagnosticKind, VariableAccessPath,
     VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
     VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
