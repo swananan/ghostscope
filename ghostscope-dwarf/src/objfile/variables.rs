@@ -288,7 +288,7 @@ impl LoadedObjfile {
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&crate::index::CfiIndex>,
-    ) -> Result<Vec<crate::parser::VariableWithEvaluation>> {
+    ) -> Result<Vec<crate::parser::ParsedVariable>> {
         let items_with_depths = items
             .iter()
             .map(|(cu_off, die_off)| (*cu_off, *die_off, 0))
@@ -309,7 +309,7 @@ impl LoadedObjfile {
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&crate::index::CfiIndex>,
-    ) -> Result<Vec<crate::parser::VariableWithEvaluation>> {
+    ) -> Result<Vec<crate::parser::ParsedVariable>> {
         let mut vars = Vec::with_capacity(items.len());
         for (cu_off, die_off, scope_depth) in items.iter().cloned() {
             let header = self.dwarf.unit_header(cu_off)?;
@@ -370,7 +370,7 @@ impl LoadedObjfile {
         module: crate::ModuleId,
         address: u64,
     ) -> Result<(
-        Vec<crate::parser::VariableWithEvaluation>,
+        Vec<crate::parser::ParsedVariable>,
         Vec<VariableQueryDiagnostic>,
     )> {
         self.ensure_block_index_for_address(address);
@@ -672,7 +672,7 @@ impl LoadedObjfile {
         &self,
         address: u64,
         items: &[(gimli::DebugInfoOffset, gimli::UnitOffset)],
-    ) -> Result<Vec<crate::parser::VariableWithEvaluation>> {
+    ) -> Result<Vec<crate::parser::ParsedVariable>> {
         self.resolve_variables_by_offsets_at_address_with_cfa(address, items, None, None, None)
     }
 }

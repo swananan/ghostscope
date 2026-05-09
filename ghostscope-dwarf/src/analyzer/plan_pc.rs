@@ -129,7 +129,7 @@ impl DwarfAnalyzer {
     }
 
     pub(super) fn read_plan_from_variable(
-        variable: crate::parser::VariableWithEvaluation,
+        variable: crate::parser::ParsedVariable,
         provenance: Provenance,
     ) -> VariableReadPlan {
         VariableReadPlan::from_visible_variable(variable.visible_variable(), provenance)
