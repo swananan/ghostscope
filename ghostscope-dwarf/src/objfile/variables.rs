@@ -528,9 +528,9 @@ impl LoadedObjfile {
                     &unit,
                     gimli::constants::DW_AT_frame_base,
                 ) {
-                    let eval_res = match val {
+                    let cfa = match val {
                         gimli::AttributeValue::Exprloc(expr) => {
-                            ExpressionEvaluator::parse_expression_in_unit(
+                            ExpressionEvaluator::parse_expression_as_cfa_in_unit(
                                 expr.0.to_slice().ok().as_deref().unwrap_or(&[]),
                                 expr.0.endian(),
                                 &unit,
@@ -541,9 +541,10 @@ impl LoadedObjfile {
                                 None,
                             )
                             .ok()
+                            .flatten()
                         }
                         gimli::AttributeValue::LocationListsRef(offset) => {
-                            ExpressionEvaluator::parse_location_lists(
+                            ExpressionEvaluator::parse_location_lists_as_cfa(
                                 &unit,
                                 dwarf,
                                 gimli::LocationListsOffset(offset.0),
@@ -553,18 +554,20 @@ impl LoadedObjfile {
                                 None,
                             )
                             .ok()
+                            .flatten()
                         }
                         gimli::AttributeValue::DebugLocListsIndex(index) => dwarf
                             .locations_offset(&unit, index)
                             .ok()
                             .and_then(|offset| {
-                                ExpressionEvaluator::parse_location_lists(
+                                ExpressionEvaluator::parse_location_lists_as_cfa(
                                     &unit, dwarf, offset, pc, None, None, None,
                                 )
                                 .ok()
+                                .flatten()
                             }),
                         gimli::AttributeValue::SecOffset(offset) => {
-                            ExpressionEvaluator::parse_location_lists(
+                            ExpressionEvaluator::parse_location_lists_as_cfa(
                                 &unit,
                                 dwarf,
                                 gimli::LocationListsOffset(offset),
@@ -574,52 +577,12 @@ impl LoadedObjfile {
                                 None,
                             )
                             .ok()
+                            .flatten()
                         }
                         _ => None,
                     };
 
-                    if let Some(er) = eval_res {
-                        use crate::core::{
-                            CfaResult, EvaluationResult, LocationResult, PlanExprOp,
-                        };
-                        let cfa = match er {
-                            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
-                                register,
-                                offset,
-                                ..
-                            }) => CfaResult::RegisterPlusOffset {
-                                register,
-                                offset: offset.unwrap_or(0),
-                            },
-                            EvaluationResult::MemoryLocation(
-                                LocationResult::ComputedLocation { steps },
-                            ) => CfaResult::Expression { steps },
-                            EvaluationResult::MemoryLocation(LocationResult::Address(addr)) => {
-                                CfaResult::Expression {
-                                    steps: vec![PlanExprOp::PushConstant(addr as i64)],
-                                }
-                            }
-                            EvaluationResult::DirectValue(
-                                crate::core::DirectValueResult::Constant(c),
-                            ) => CfaResult::Expression {
-                                steps: vec![PlanExprOp::PushConstant(c)],
-                            },
-                            EvaluationResult::DirectValue(
-                                crate::core::DirectValueResult::ImplicitValue(bytes),
-                            ) => {
-                                if bytes.len() == 8 {
-                                    let mut arr = [0u8; 8];
-                                    arr.copy_from_slice(&bytes);
-                                    let v = u64::from_le_bytes(arr) as i64;
-                                    CfaResult::Expression {
-                                        steps: vec![PlanExprOp::PushConstant(v)],
-                                    }
-                                } else {
-                                    continue;
-                                }
-                            }
-                            _ => continue,
-                        };
+                    if let Some(cfa) = cfa {
                         return Some(cfa);
                     }
                 }

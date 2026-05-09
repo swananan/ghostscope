@@ -7,7 +7,7 @@
 
 use crate::{
     binary::DwarfReader,
-    core::{attr_u64, Availability, EvaluationResult, Result, VariableLocation},
+    core::{attr_u64, Availability, ParsedLocation, Result, VariableLocation},
     dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
     index::{CfiIndex, FunctionBlocks},
     parser::ExpressionEvaluator,
@@ -776,7 +776,7 @@ impl DetailedParser {
         };
         let is_parameter = entry.tag() == gimli::constants::DW_TAG_formal_parameter;
         let type_name = Self::resolve_type_name(entry, unit, dwarf)?;
-        let evaluation_result = self.parse_location(
+        let parsed_location = self.parse_location(
             entry,
             unit,
             dwarf,
@@ -785,8 +785,8 @@ impl DetailedParser {
             function_context,
             cfi_index,
         )?;
-        let location = VariableLocation::from_evaluation_result(&evaluation_result);
-        let availability = Availability::from_evaluation_result(&evaluation_result);
+        let location = parsed_location.location;
+        let availability = parsed_location.availability;
         // Full type resolution disabled in shallow mode
         let dwarf_type = None;
         Ok(Some(ParsedVariable {
@@ -891,9 +891,9 @@ impl DetailedParser {
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
-    ) -> Result<EvaluationResult> {
-        // Use ExpressionEvaluator for unified logic
-        ExpressionEvaluator::evaluate_location(
+    ) -> Result<ParsedLocation> {
+        // Keep evaluator results behind the parser boundary.
+        let evaluation = ExpressionEvaluator::evaluate_location(
             entry,
             unit,
             dwarf,
@@ -901,7 +901,8 @@ impl DetailedParser {
             get_cfa,
             function_context,
             cfi_index,
-        )
+        )?;
+        Ok(ParsedLocation::from_evaluation_result(&evaluation))
     }
 
     // extract_name removed; call resolve_name_with_origins directly when needed

@@ -2427,6 +2427,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         ))
     }
 
+    pub(crate) fn dwarf_lvalue_address_unavailable_error(
+        name: &str,
+        availability: &Availability,
+        pc_address: u64,
+    ) -> CodeGenError {
+        let reason = Self::format_availability_reason(availability);
+        CodeGenError::VariableUnavailable(format!(
+            "'{name}' is {reason}; cannot take its address at PC 0x{pc_address:x}"
+        ))
+    }
+
     fn format_availability_reason(availability: &Availability) -> String {
         match availability {
             Availability::OptimizedOut => "optimized out at the selected probe PC".to_string(),

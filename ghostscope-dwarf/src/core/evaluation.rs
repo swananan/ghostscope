@@ -14,7 +14,7 @@ use std::fmt;
 
 /// Internal result of evaluating a DWARF expression
 #[derive(Debug, Clone, PartialEq)]
-pub enum EvaluationResult {
+pub(crate) enum EvaluationResult {
     /// Direct value - expression result is the variable value (no memory read needed)
     DirectValue(DirectValueResult),
 
@@ -31,7 +31,7 @@ pub enum EvaluationResult {
 
 /// Direct value results - expression produces the variable value directly
 #[derive(Debug, Clone, PartialEq)]
-pub enum DirectValueResult {
+pub(crate) enum DirectValueResult {
     /// Literal constant from DWARF expression (DW_OP_lit*, DW_OP_const*)
     Constant(i64),
 
@@ -57,7 +57,7 @@ pub enum DirectValueResult {
 
 /// Memory location results - expression produces an address to be read via bpf_probe_read_user
 #[derive(Debug, Clone, PartialEq)]
-pub enum LocationResult {
+pub(crate) enum LocationResult {
     /// Absolute memory address (DW_OP_addr)
     Address(u64),
 
@@ -104,13 +104,13 @@ pub struct CallerFrameRecovery {
 
 /// Piece of a composite location
 #[derive(Debug, Clone, PartialEq)]
-pub struct PieceResult {
+pub(crate) struct PieceResult {
     /// Location of this piece
-    pub location: EvaluationResult,
+    pub(crate) location: EvaluationResult,
     /// Size in bytes
-    pub size: u64,
+    pub(crate) size: u64,
     /// Bit offset within the piece (for bit fields)
-    pub bit_offset: Option<u64>,
+    pub(crate) bit_offset: Option<u64>,
 }
 
 /// One caller-side case for recovering a callee's DW_OP_entry_value.

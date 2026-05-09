@@ -164,6 +164,12 @@ pub enum VariableMaterialization {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum LvalueAddressPlan {
+    Address { address: PlannedAddress },
+    Unavailable { availability: Availability },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct VariableMaterializationPlan {
     pub name: String,
     pub type_name: String,
@@ -427,6 +433,16 @@ impl VariableReadPlan {
             availability: lowering.availability.clone(),
             lowering,
             materialization,
+        }
+    }
+
+    pub fn lvalue_address_plan(&self) -> LvalueAddressPlan {
+        if !self.availability.is_available() {
+            LvalueAddressPlan::Unavailable {
+                availability: self.availability.clone(),
+            }
+        } else {
+            lvalue_address_materialization(&self.name, &self.location)
         }
     }
 
@@ -695,6 +711,48 @@ fn planned_value_size(dwarf_type: Option<&TypeInfo>) -> MemoryAccessSize {
     dwarf_type
         .map(|ty| MemoryAccessSize::from_size(ty.size()))
         .unwrap_or(MemoryAccessSize::U64)
+}
+
+fn lvalue_address_materialization(name: &str, location: &VariableLocation) -> LvalueAddressPlan {
+    match location {
+        VariableLocation::Address(_)
+        | VariableLocation::RegisterAddress { .. }
+        | VariableLocation::FrameBaseRelative { .. }
+        | VariableLocation::ComputedAddress(_) => {
+            match PlannedAddress::from_location(location.clone()) {
+                Some(address) => LvalueAddressPlan::Address { address },
+                None => LvalueAddressPlan::Unavailable {
+                    availability: Availability::Unsupported(UnsupportedReason::AddressClass {
+                        detail: format!(
+                            "DWARF variable '{name}' has an address-backed location that could not be planned"
+                        ),
+                    }),
+                },
+            }
+        }
+        VariableLocation::OptimizedOut => LvalueAddressPlan::Unavailable {
+            availability: Availability::OptimizedOut,
+        },
+        VariableLocation::Pieces(_) => LvalueAddressPlan::Unavailable {
+            availability: Availability::Unsupported(UnsupportedReason::ExpressionShape {
+                detail: "split variable pieces cannot be materialized as one lvalue address"
+                    .to_string(),
+            }),
+        },
+        VariableLocation::AbsoluteAddressValue(_)
+        | VariableLocation::RegisterValue { .. }
+        | VariableLocation::ComputedValue(_)
+        | VariableLocation::ImplicitValue(_) => LvalueAddressPlan::Unavailable {
+            availability: Availability::Unsupported(UnsupportedReason::AddressClass {
+                detail: "cannot take address of value-backed DWARF expression".to_string(),
+            }),
+        },
+        VariableLocation::Unknown => LvalueAddressPlan::Unavailable {
+            availability: Availability::Unsupported(UnsupportedReason::AddressClass {
+                detail: "unknown DWARF variable location".to_string(),
+            }),
+        },
+    }
 }
 
 fn address_origin_for_steps(steps: &[PlanExprOp]) -> AddressOrigin {
@@ -1196,6 +1254,107 @@ mod tests {
             dwarf_type: Some(dwarf_type),
             ..read_plan(location)
         }
+    }
+
+    #[test]
+    fn lvalue_address_plan_accepts_address_locations_without_type_info() {
+        let plan = read_plan(VariableLocation::RegisterAddress {
+            dwarf_reg: 6,
+            offset: -16,
+        });
+
+        let lvalue = plan.lvalue_address_plan();
+
+        assert_eq!(
+            lvalue,
+            LvalueAddressPlan::Address {
+                address: PlannedAddress {
+                    kind: PlannedAddressKind::RegisterOffset {
+                        dwarf_reg: 6,
+                        offset: -16
+                    },
+                    origin: AddressOrigin::RuntimeDerived,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn lvalue_address_plan_rejects_value_backed_locations() {
+        let plan = read_plan(VariableLocation::RegisterValue { dwarf_reg: 0 });
+
+        let lvalue = plan.lvalue_address_plan();
+
+        assert!(matches!(
+            lvalue,
+            LvalueAddressPlan::Unavailable {
+                availability: Availability::Unsupported(UnsupportedReason::AddressClass { .. })
+            }
+        ));
+        match lvalue {
+            LvalueAddressPlan::Unavailable {
+                availability: Availability::Unsupported(UnsupportedReason::AddressClass { detail }),
+            } => {
+                assert!(detail.contains("value-backed"));
+            }
+            other => panic!("unexpected lvalue availability: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lvalue_address_plan_rejects_absolute_address_values() {
+        let plan = read_plan(VariableLocation::AbsoluteAddressValue(
+            AddressExpr::constant(0x2000),
+        ));
+
+        let lvalue = plan.lvalue_address_plan();
+
+        match lvalue {
+            LvalueAddressPlan::Unavailable {
+                availability: Availability::Unsupported(UnsupportedReason::AddressClass { detail }),
+            } => {
+                assert!(detail.contains("value-backed"));
+            }
+            other => panic!("unexpected lvalue availability: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lvalue_address_plan_rejects_piece_locations() {
+        let plan = read_plan(VariableLocation::Pieces(vec![PieceLocation {
+            bit_offset: 0,
+            bit_size: 32,
+            location: Box::new(VariableLocation::RegisterValue { dwarf_reg: 0 }),
+        }]));
+
+        let lvalue = plan.lvalue_address_plan();
+
+        match lvalue {
+            LvalueAddressPlan::Unavailable {
+                availability:
+                    Availability::Unsupported(UnsupportedReason::ExpressionShape { detail }),
+            } => {
+                assert!(detail.contains("split variable pieces"));
+            }
+            other => panic!("unexpected lvalue availability: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lvalue_address_plan_preserves_optimized_out_availability() {
+        let plan = VariableReadPlan {
+            availability: Availability::OptimizedOut,
+            ..read_plan(VariableLocation::OptimizedOut)
+        };
+
+        let lvalue = plan.lvalue_address_plan();
+
+        assert_eq!(
+            lvalue,
+            LvalueAddressPlan::Unavailable {
+                availability: Availability::OptimizedOut
+            }
+        );
     }
 
     #[test]
