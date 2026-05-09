@@ -8,7 +8,7 @@
 
 use crate::{
     binary::DwarfReader,
-    core::ComputeStep,
+    core::PlanExprOp,
     dwarf_expr::call_site,
     parser::RangeExtractor,
     semantics::{ranges_contain_pc, resolve_origin_entry},
@@ -27,8 +27,8 @@ pub struct VarRef {
 pub struct CallSiteParameter {
     /// Callee entry register described by DW_AT_location.
     pub callee_register: u16,
-    /// Caller-side DW_AT_call_value lowered directly into ComputeStep[].
-    pub caller_value_steps: Vec<ComputeStep>,
+    /// Caller-side DW_AT_call_value lowered directly into PlanExprOp[].
+    pub caller_value_steps: Vec<PlanExprOp>,
 }
 
 /// A call-site record keyed by DW_AT_call_return_pc.
@@ -985,15 +985,15 @@ mod tests {
         assert_eq!(
             records[0].parameters[0].caller_value_steps,
             vec![
-                ComputeStep::LoadRegister(3),
-                ComputeStep::PushConstant(-1),
-                ComputeStep::Add,
+                PlanExprOp::LoadRegister(3),
+                PlanExprOp::PushConstant(-1),
+                PlanExprOp::Add,
             ]
         );
         assert_eq!(records[0].parameters[1].callee_register, 4);
         assert_eq!(
             records[0].parameters[1].caller_value_steps,
-            vec![ComputeStep::PushConstant(42)]
+            vec![PlanExprOp::PushConstant(42)]
         );
     }
 
@@ -1024,9 +1024,9 @@ mod tests {
         assert_eq!(
             records[0].parameters[0].caller_value_steps,
             vec![
-                ComputeStep::LoadRegister(3),
-                ComputeStep::PushConstant(-1),
-                ComputeStep::Add,
+                PlanExprOp::LoadRegister(3),
+                PlanExprOp::PushConstant(-1),
+                PlanExprOp::Add,
             ]
         );
     }
@@ -1117,7 +1117,7 @@ mod tests {
         assert_eq!(records[0].parameters[0].callee_register, 4);
         assert_eq!(
             records[0].parameters[0].caller_value_steps,
-            vec![ComputeStep::LoadRegister(4)]
+            vec![PlanExprOp::LoadRegister(4)]
         );
     }
 
@@ -1146,7 +1146,7 @@ mod tests {
         assert_eq!(incoming[0].parameters[0].callee_register, 5);
         assert_eq!(
             incoming[0].parameters[0].caller_value_steps,
-            vec![ComputeStep::PushConstant(42)]
+            vec![PlanExprOp::PushConstant(42)]
         );
         assert_eq!(incoming[0].call_origin, callee.abs_die_offset);
     }
@@ -1224,7 +1224,7 @@ mod tests {
                 0x1018,
                 CallSiteParameter {
                     callee_register: 5,
-                    caller_value_steps: vec![ComputeStep::PushConstant(42)],
+                    caller_value_steps: vec![PlanExprOp::PushConstant(42)],
                 }
             )]
         );

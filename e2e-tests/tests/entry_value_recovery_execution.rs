@@ -7,7 +7,7 @@ use common::{
     targets::{TargetHandle, TargetLauncher},
     FixtureCompiler, FIXTURES,
 };
-use ghostscope_dwarf::{CfaRulePlan, ComputeStep, MemoryAccessSize, RegisterRecoveryPlan};
+use ghostscope_dwarf::{CfaRulePlan, MemoryAccessSize, PlanExprOp, RegisterRecoveryPlan};
 use gimli::constants;
 use gimli::write::{
     Address, AttributeValue as WriteAttributeValue, Dwarf as WriteDwarf, EndianVec,
@@ -738,7 +738,7 @@ async fn test_recover_caller_frame_exposes_pc_and_callee_saved_steps() -> anyhow
     assert!(
         recovery.caller_pc_steps.iter().any(|step| matches!(
             step,
-            ComputeStep::Dereference {
+            PlanExprOp::Dereference {
                 size: MemoryAccessSize::U64
             }
         )),
@@ -749,7 +749,7 @@ async fn test_recover_caller_frame_exposes_pc_and_callee_saved_steps() -> anyhow
         recovery
             .caller_pc_steps
             .iter()
-            .any(|step| matches!(step, ComputeStep::PushConstant(_))),
+            .any(|step| matches!(step, PlanExprOp::PushConstant(_))),
         "caller_pc_steps should include a CFA-relative offset: {:?}",
         recovery.caller_pc_steps
     );
@@ -760,7 +760,7 @@ async fn test_recover_caller_frame_exposes_pc_and_callee_saved_steps() -> anyhow
     assert!(
         rbx_steps.iter().any(|step| matches!(
             step,
-            ComputeStep::Dereference {
+            PlanExprOp::Dereference {
                 size: MemoryAccessSize::U64
             }
         )),

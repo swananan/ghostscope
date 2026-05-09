@@ -1,28 +1,28 @@
 //! Neutral semantic plans produced before runtime-specific lowering.
 
 use crate::core::{
-    ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize,
+    DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, PlanExprOp,
 };
 use std::fmt;
 
 /// Address expression that can be evaluated by a later lowering layer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AddressExpr {
-    pub steps: Vec<ComputeStep>,
+    pub steps: Vec<PlanExprOp>,
 }
 
 impl AddressExpr {
     pub fn constant(address: u64) -> Self {
         Self {
-            steps: vec![ComputeStep::PushConstant(address as i64)],
+            steps: vec![PlanExprOp::PushConstant(address as i64)],
         }
     }
 
     pub fn register_relative(dwarf_reg: u16, offset: i64) -> Self {
-        let mut steps = vec![ComputeStep::LoadRegister(dwarf_reg)];
+        let mut steps = vec![PlanExprOp::LoadRegister(dwarf_reg)];
         if offset != 0 {
-            steps.push(ComputeStep::PushConstant(offset));
-            steps.push(ComputeStep::Add);
+            steps.push(PlanExprOp::PushConstant(offset));
+            steps.push(PlanExprOp::Add);
         }
         Self { steps }
     }
@@ -36,8 +36,8 @@ pub enum VariableLocation {
     RegisterValue { dwarf_reg: u16 },
     RegisterAddress { dwarf_reg: u16, offset: i64 },
     FrameBaseRelative { offset: i64 },
-    ComputedValue(Vec<ComputeStep>),
-    ComputedAddress(Vec<ComputeStep>),
+    ComputedValue(Vec<PlanExprOp>),
+    ComputedAddress(Vec<PlanExprOp>),
     ImplicitValue(Vec<u8>),
     Pieces(Vec<PieceLocation>),
     OptimizedOut,
@@ -73,7 +73,7 @@ impl VariableLocation {
     fn from_direct_value(value: &DirectValueResult) -> Self {
         match value {
             DirectValueResult::Constant(value) => {
-                Self::ComputedValue(vec![ComputeStep::PushConstant(*value)])
+                Self::ComputedValue(vec![PlanExprOp::PushConstant(*value)])
             }
             DirectValueResult::AbsoluteAddress(address) => {
                 Self::AbsoluteAddressValue(AddressExpr::constant(*address))
@@ -108,7 +108,7 @@ impl fmt::Display for VariableLocation {
             }
             VariableLocation::AbsoluteAddressValue(expr) => {
                 write!(f, "[DirectValue] ")?;
-                if let [ComputeStep::PushConstant(address)] = expr.steps.as_slice() {
+                if let [PlanExprOp::PushConstant(address)] = expr.steps.as_slice() {
                     DirectValueResult::AbsoluteAddress(*address as u64).fmt(f)
                 } else {
                     DirectValueResult::ComputedValue {
@@ -165,7 +165,7 @@ impl fmt::Display for VariableLocation {
 }
 
 fn location_display_for_address_expr(expr: &AddressExpr) -> String {
-    if let [ComputeStep::PushConstant(address)] = expr.steps.as_slice() {
+    if let [PlanExprOp::PushConstant(address)] = expr.steps.as_slice() {
         return format!("{}", LocationResult::Address(*address as u64));
     }
 

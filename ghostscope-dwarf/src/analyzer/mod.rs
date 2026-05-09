@@ -516,7 +516,7 @@ impl DwarfAnalyzer {
         }
     }
 
-    /// Recover the direct caller frame at a module address as ComputeStep[].
+    /// Recover the direct caller frame at a module address as PlanExprOp[].
     pub fn recover_caller_frame(
         &self,
         module_address: &ModuleAddress,

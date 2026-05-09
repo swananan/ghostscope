@@ -5,10 +5,9 @@
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use ghostscope_dwarf::{
-    AddressOrigin, Availability, MemoryAccessSize, PlannedAddress, PlannedAddressKind,
-    RuntimeComputedExpr, RuntimeEntryValueCase, RuntimeExprOp, SectionType, TypeInfo,
-    VariableAccessPath, VariableAccessSegment, VariableLocation, VariableMaterializationPlan,
-    VariableReadPlan,
+    AddressOrigin, Availability, EntryValueCase, MemoryAccessSize, PlanExprOp, PlannedAddress,
+    PlannedAddressKind, RuntimeComputedExpr, SectionType, TypeInfo, VariableAccessPath,
+    VariableAccessSegment, VariableLocation, VariableMaterializationPlan, VariableReadPlan,
 };
 use ghostscope_process::module_probe;
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
@@ -529,7 +528,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Execute a semantic runtime expression selected by DWARF read planning.
     fn generate_runtime_expr_ops(
         &mut self,
-        ops: &[RuntimeExprOp],
+        ops: &[PlanExprOp],
         pt_regs_ptr: PointerValue<'ctx>,
         _result_size: Option<MemoryAccessSize>,
         status_ptr: Option<PointerValue<'ctx>>,
@@ -546,7 +545,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         for op in ops {
             match op {
-                RuntimeExprOp::LoadRegister { dwarf_reg } => {
+                PlanExprOp::LoadRegister(dwarf_reg) => {
                     let reg_value = self.load_register_value(*dwarf_reg, pt_regs_ptr)?;
                     if let BasicValueEnum::IntValue(int_val) = reg_value {
                         stack.push(int_val);
@@ -557,12 +556,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                RuntimeExprOp::PushConstant(value) => {
+                PlanExprOp::PushConstant(value) => {
                     let const_val = self.context.i64_type().const_int(*value as u64, true);
                     stack.push(const_val);
                 }
 
-                RuntimeExprOp::Add => {
+                PlanExprOp::Add => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let sum_val = self
                             .builder
@@ -589,7 +588,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                RuntimeExprOp::Sub => {
+                PlanExprOp::Sub => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -603,7 +602,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                RuntimeExprOp::Mul => {
+                PlanExprOp::Mul => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -617,7 +616,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                RuntimeExprOp::Div => {
+                PlanExprOp::Div => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -631,7 +630,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                RuntimeExprOp::And => {
+                PlanExprOp::And => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -645,7 +644,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                RuntimeExprOp::Or => {
+                PlanExprOp::Or => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -659,7 +658,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                RuntimeExprOp::Xor => {
+                PlanExprOp::Xor => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -673,7 +672,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                RuntimeExprOp::Shl => {
+                PlanExprOp::Shl => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -687,7 +686,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                RuntimeExprOp::Shr => {
+                PlanExprOp::Shr => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
@@ -701,7 +700,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                RuntimeExprOp::UserMemoryRead { size } => {
+                PlanExprOp::Dereference { size } => {
                     if let Some(addr) = stack.pop() {
                         // Null guard: if addr == 0, set NullDeref (if status_ptr provided and current is Ok)
                         let zero64 = self.context.i64_type().const_zero();
@@ -861,12 +860,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
-                RuntimeExprOp::EntryValueLookup {
-                    caller_pc_ops,
+                PlanExprOp::EntryValueLookup {
+                    caller_pc_steps,
                     cases,
                 } => {
                     let value = self.generate_entry_value_lookup(
-                        caller_pc_ops,
+                        caller_pc_steps,
                         cases,
                         pt_regs_ptr,
                         _result_size,
@@ -897,8 +896,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     fn generate_entry_value_lookup(
         &mut self,
-        caller_pc_ops: &[RuntimeExprOp],
-        cases: &[RuntimeEntryValueCase],
+        caller_pc_ops: &[PlanExprOp],
+        cases: &[EntryValueCase],
         pt_regs_ptr: PointerValue<'ctx>,
         result_size: Option<MemoryAccessSize>,
         status_ptr: Option<PointerValue<'ctx>>,
@@ -991,7 +990,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.builder.position_at_end(case_bb);
             let case_value = self
                 .generate_runtime_expr_ops(
-                    &case.value_ops,
+                    &case.value_steps,
                     pt_regs_ptr,
                     result_size,
                     status_ptr,
@@ -1393,7 +1392,7 @@ mod tests {
     use super::*;
     use crate::script::Expr;
     use ghostscope_dwarf::AddressExpr;
-    use ghostscope_dwarf::ComputeStep;
+    use ghostscope_dwarf::PlanExprOp;
     use ghostscope_dwarf::Provenance;
     use inkwell::context::Context as LlvmContext;
 
@@ -1796,12 +1795,12 @@ mod tests {
         ctx.set_compile_time_context(0, "/nonexistent/module".to_string());
 
         let location = VariableLocation::ComputedAddress(vec![
-            ComputeStep::PushConstant(0x3000),
-            ComputeStep::Dereference {
+            PlanExprOp::PushConstant(0x3000),
+            PlanExprOp::Dereference {
                 size: MemoryAccessSize::U64,
             },
-            ComputeStep::PushConstant(16),
-            ComputeStep::Add,
+            PlanExprOp::PushConstant(16),
+            PlanExprOp::Add,
         ]);
 
         let address = PlannedAddress::from_location(location)

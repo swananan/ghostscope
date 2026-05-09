@@ -2,14 +2,14 @@
 
 use crate::{
     binary::DwarfReader,
-    core::ComputeStep,
+    core::PlanExprOp,
     dwarf_expr::{errors as expr_errors, modes::DwarfExprMode, ExpressionEvaluator},
 };
 use gimli::{Operation, Reader};
 
 pub(crate) struct ParsedCallSiteParameter {
     pub(crate) callee_register: u16,
-    pub(crate) caller_value_steps: Vec<ComputeStep>,
+    pub(crate) caller_value_steps: Vec<PlanExprOp>,
 }
 
 pub(crate) fn target_address(
@@ -84,7 +84,7 @@ fn value_steps(
     unit: &gimli::Unit<DwarfReader>,
     entry: &gimli::DebuggingInformationEntry<DwarfReader>,
     return_pc: u64,
-) -> Option<Vec<ComputeStep>> {
+) -> Option<Vec<PlanExprOp>> {
     let expr = [
         gimli::constants::DW_AT_call_value,
         gimli::constants::DW_AT_GNU_call_site_value,
@@ -116,7 +116,7 @@ fn value_steps(
 fn call_value_register_fallback(
     expr: gimli::Expression<DwarfReader>,
     encoding: gimli::Encoding,
-) -> Option<Vec<ComputeStep>> {
+) -> Option<Vec<PlanExprOp>> {
     let first = expr_errors::soft_optional(
         DwarfExprMode::CallSiteValue,
         crate::dwarf_expr::ops::parse_single_op(
@@ -137,7 +137,7 @@ fn call_value_register_fallback(
         ),
     )?;
     match inner_op {
-        Operation::Register { register } => Some(vec![ComputeStep::LoadRegister(register.0)]),
+        Operation::Register { register } => Some(vec![PlanExprOp::LoadRegister(register.0)]),
         _ => None,
     }
 }

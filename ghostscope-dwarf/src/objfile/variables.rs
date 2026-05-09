@@ -580,7 +580,7 @@ impl LoadedObjfile {
 
                     if let Some(er) = eval_res {
                         use crate::core::{
-                            CfaResult, ComputeStep, EvaluationResult, LocationResult,
+                            CfaResult, EvaluationResult, LocationResult, PlanExprOp,
                         };
                         let cfa = match er {
                             EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
@@ -596,13 +596,13 @@ impl LoadedObjfile {
                             ) => CfaResult::Expression { steps },
                             EvaluationResult::MemoryLocation(LocationResult::Address(addr)) => {
                                 CfaResult::Expression {
-                                    steps: vec![ComputeStep::PushConstant(addr as i64)],
+                                    steps: vec![PlanExprOp::PushConstant(addr as i64)],
                                 }
                             }
                             EvaluationResult::DirectValue(
                                 crate::core::DirectValueResult::Constant(c),
                             ) => CfaResult::Expression {
-                                steps: vec![ComputeStep::PushConstant(c)],
+                                steps: vec![PlanExprOp::PushConstant(c)],
                             },
                             EvaluationResult::DirectValue(
                                 crate::core::DirectValueResult::ImplicitValue(bytes),
@@ -612,7 +612,7 @@ impl LoadedObjfile {
                                     arr.copy_from_slice(&bytes);
                                     let v = u64::from_le_bytes(arr) as i64;
                                     CfaResult::Expression {
-                                        steps: vec![ComputeStep::PushConstant(v)],
+                                        steps: vec![PlanExprOp::PushConstant(v)],
                                     }
                                 } else {
                                     continue;

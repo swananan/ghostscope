@@ -5,7 +5,7 @@
 
 use crate::binary::{DwarfEndian, DwarfReader};
 use crate::core::{
-    ComputeStep, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, Result,
+    DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, PlanExprOp, Result,
 };
 use crate::dwarf_expr::{errors as expr_errors, modes::DwarfExprMode};
 use crate::index::{CfiIndex, FunctionBlocks};
@@ -227,7 +227,7 @@ impl ExpressionEvaluator {
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
-    ) -> Result<Vec<ComputeStep>> {
+    ) -> Result<Vec<PlanExprOp>> {
         let evaluation = Self::parse_expression_in_unit(
             expr_bytes,
             endian,
@@ -271,16 +271,16 @@ impl ExpressionEvaluator {
         )
     }
 
-    fn evaluation_result_to_steps(evaluation: EvaluationResult) -> Result<Vec<ComputeStep>> {
+    fn evaluation_result_to_steps(evaluation: EvaluationResult) -> Result<Vec<PlanExprOp>> {
         match evaluation {
             EvaluationResult::DirectValue(DirectValueResult::RegisterValue(register)) => {
-                Ok(vec![ComputeStep::LoadRegister(register)])
+                Ok(vec![PlanExprOp::LoadRegister(register)])
             }
             EvaluationResult::DirectValue(DirectValueResult::Constant(value)) => {
-                Ok(vec![ComputeStep::PushConstant(value)])
+                Ok(vec![PlanExprOp::PushConstant(value)])
             }
             EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(address)) => {
-                Ok(vec![ComputeStep::PushConstant(address as i64)])
+                Ok(vec![PlanExprOp::PushConstant(address as i64)])
             }
             EvaluationResult::DirectValue(DirectValueResult::ComputedValue { steps, .. }) => {
                 Ok(steps)
@@ -291,28 +291,28 @@ impl ExpressionEvaluator {
                 ..
             }) => Ok(Self::register_address_steps(register, offset)),
             EvaluationResult::MemoryLocation(LocationResult::Address(address)) => {
-                Ok(vec![ComputeStep::PushConstant(address as i64)])
+                Ok(vec![PlanExprOp::PushConstant(address as i64)])
             }
             EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
                 Ok(steps)
             }
             EvaluationResult::DirectValue(DirectValueResult::ImplicitValue(_)) => Err(
-                anyhow::anyhow!("DWARF expression lowered to implicit bytes, not ComputeStep[]"),
+                anyhow::anyhow!("DWARF expression lowered to implicit bytes, not PlanExprOp[]"),
             ),
             EvaluationResult::Optimized => Err(anyhow::anyhow!(
-                "DWARF expression optimized out, no ComputeStep[]"
+                "DWARF expression optimized out, no PlanExprOp[]"
             )),
             EvaluationResult::Composite(_) => Err(anyhow::anyhow!(
-                "composite DWARF expression cannot be represented as one ComputeStep[]"
+                "composite DWARF expression cannot be represented as one PlanExprOp[]"
             )),
         }
     }
 
-    fn register_address_steps(register: u16, offset: Option<i64>) -> Vec<ComputeStep> {
-        let mut steps = vec![ComputeStep::LoadRegister(register)];
+    fn register_address_steps(register: u16, offset: Option<i64>) -> Vec<PlanExprOp> {
+        let mut steps = vec![PlanExprOp::LoadRegister(register)];
         if let Some(offset) = offset.filter(|offset| *offset != 0) {
-            steps.push(ComputeStep::PushConstant(offset));
-            steps.push(ComputeStep::Add);
+            steps.push(PlanExprOp::PushConstant(offset));
+            steps.push(PlanExprOp::Add);
         }
         steps
     }
@@ -333,7 +333,7 @@ impl ExpressionEvaluator {
         #[derive(Debug)]
         enum ParsedOperation<R: Reader<Offset = usize>> {
             Operation(Operation<R>),
-            PrecomputedSteps(Vec<ComputeStep>),
+            PrecomputedSteps(Vec<PlanExprOp>),
         }
 
         let mut operations: Vec<ParsedOperation<_>> = Vec::new();
@@ -414,16 +414,16 @@ impl ExpressionEvaluator {
                         ..
                     }) => {
                         // Load register and add offset if non-zero
-                        steps.push(ComputeStep::LoadRegister(register.0));
+                        steps.push(PlanExprOp::LoadRegister(register.0));
                         if *offset != 0 {
-                            steps.push(ComputeStep::PushConstant(*offset));
-                            steps.push(ComputeStep::Add);
+                            steps.push(PlanExprOp::PushConstant(*offset));
+                            steps.push(PlanExprOp::Add);
                         }
                     }
                     ParsedOperation::Operation(Operation::Register { register }) => {
                         // DW_OP_reg* means the value IS in the register (direct value)
                         // We'll handle this specially below
-                        steps.push(ComputeStep::LoadRegister(register.0));
+                        steps.push(PlanExprOp::LoadRegister(register.0));
                     }
                     ParsedOperation::Operation(Operation::FrameOffset { offset }) => {
                         let Some(get_cfa_fn) = get_cfa else {
@@ -443,11 +443,11 @@ impl ExpressionEvaluator {
                                 register,
                                 offset: cfa_offset,
                             } => {
-                                steps.push(ComputeStep::LoadRegister(register));
+                                steps.push(PlanExprOp::LoadRegister(register));
                                 let total_offset = cfa_offset.saturating_add(*offset);
                                 if total_offset != 0 {
-                                    steps.push(ComputeStep::PushConstant(total_offset));
-                                    steps.push(ComputeStep::Add);
+                                    steps.push(PlanExprOp::PushConstant(total_offset));
+                                    steps.push(PlanExprOp::Add);
                                 }
                             }
                             crate::core::CfaResult::Expression {
@@ -455,41 +455,41 @@ impl ExpressionEvaluator {
                             } => {
                                 steps.append(&mut cfa_steps);
                                 if *offset != 0 {
-                                    steps.push(ComputeStep::PushConstant(*offset));
-                                    steps.push(ComputeStep::Add);
+                                    steps.push(PlanExprOp::PushConstant(*offset));
+                                    steps.push(PlanExprOp::Add);
                                 }
                             }
                         }
                     }
                     ParsedOperation::Operation(Operation::PlusConstant { value }) => {
-                        steps.push(ComputeStep::PushConstant(*value as i64));
-                        steps.push(ComputeStep::Add);
+                        steps.push(PlanExprOp::PushConstant(*value as i64));
+                        steps.push(PlanExprOp::Add);
                     }
-                    ParsedOperation::Operation(Operation::Plus) => steps.push(ComputeStep::Add),
-                    ParsedOperation::Operation(Operation::Minus) => steps.push(ComputeStep::Sub),
-                    ParsedOperation::Operation(Operation::Mul) => steps.push(ComputeStep::Mul),
-                    ParsedOperation::Operation(Operation::Div) => steps.push(ComputeStep::Div),
-                    ParsedOperation::Operation(Operation::Mod) => steps.push(ComputeStep::Mod),
-                    ParsedOperation::Operation(Operation::And) => steps.push(ComputeStep::And),
-                    ParsedOperation::Operation(Operation::Or) => steps.push(ComputeStep::Or),
-                    ParsedOperation::Operation(Operation::Xor) => steps.push(ComputeStep::Xor),
-                    ParsedOperation::Operation(Operation::Shl) => steps.push(ComputeStep::Shl),
-                    ParsedOperation::Operation(Operation::Shr) => steps.push(ComputeStep::Shr),
-                    ParsedOperation::Operation(Operation::Shra) => steps.push(ComputeStep::Shra),
-                    ParsedOperation::Operation(Operation::Not) => steps.push(ComputeStep::Not),
-                    ParsedOperation::Operation(Operation::Neg) => steps.push(ComputeStep::Neg),
-                    ParsedOperation::Operation(Operation::Abs) => steps.push(ComputeStep::Abs),
-                    ParsedOperation::Operation(Operation::Eq) => steps.push(ComputeStep::Eq),
-                    ParsedOperation::Operation(Operation::Ne) => steps.push(ComputeStep::Ne),
-                    ParsedOperation::Operation(Operation::Lt) => steps.push(ComputeStep::Lt),
-                    ParsedOperation::Operation(Operation::Le) => steps.push(ComputeStep::Le),
-                    ParsedOperation::Operation(Operation::Gt) => steps.push(ComputeStep::Gt),
-                    ParsedOperation::Operation(Operation::Ge) => steps.push(ComputeStep::Ge),
+                    ParsedOperation::Operation(Operation::Plus) => steps.push(PlanExprOp::Add),
+                    ParsedOperation::Operation(Operation::Minus) => steps.push(PlanExprOp::Sub),
+                    ParsedOperation::Operation(Operation::Mul) => steps.push(PlanExprOp::Mul),
+                    ParsedOperation::Operation(Operation::Div) => steps.push(PlanExprOp::Div),
+                    ParsedOperation::Operation(Operation::Mod) => steps.push(PlanExprOp::Mod),
+                    ParsedOperation::Operation(Operation::And) => steps.push(PlanExprOp::And),
+                    ParsedOperation::Operation(Operation::Or) => steps.push(PlanExprOp::Or),
+                    ParsedOperation::Operation(Operation::Xor) => steps.push(PlanExprOp::Xor),
+                    ParsedOperation::Operation(Operation::Shl) => steps.push(PlanExprOp::Shl),
+                    ParsedOperation::Operation(Operation::Shr) => steps.push(PlanExprOp::Shr),
+                    ParsedOperation::Operation(Operation::Shra) => steps.push(PlanExprOp::Shra),
+                    ParsedOperation::Operation(Operation::Not) => steps.push(PlanExprOp::Not),
+                    ParsedOperation::Operation(Operation::Neg) => steps.push(PlanExprOp::Neg),
+                    ParsedOperation::Operation(Operation::Abs) => steps.push(PlanExprOp::Abs),
+                    ParsedOperation::Operation(Operation::Eq) => steps.push(PlanExprOp::Eq),
+                    ParsedOperation::Operation(Operation::Ne) => steps.push(PlanExprOp::Ne),
+                    ParsedOperation::Operation(Operation::Lt) => steps.push(PlanExprOp::Lt),
+                    ParsedOperation::Operation(Operation::Le) => steps.push(PlanExprOp::Le),
+                    ParsedOperation::Operation(Operation::Gt) => steps.push(PlanExprOp::Gt),
+                    ParsedOperation::Operation(Operation::Ge) => steps.push(PlanExprOp::Ge),
                     ParsedOperation::Operation(Operation::UnsignedConstant { value }) => {
-                        steps.push(ComputeStep::PushConstant(*value as i64));
+                        steps.push(PlanExprOp::PushConstant(*value as i64));
                     }
                     ParsedOperation::Operation(Operation::SignedConstant { value }) => {
-                        steps.push(ComputeStep::PushConstant(*value));
+                        steps.push(PlanExprOp::PushConstant(*value));
                     }
                     ParsedOperation::Operation(Operation::StackValue) => {
                         // This marks the result as a computed value, not a memory location
@@ -515,7 +515,7 @@ impl ExpressionEvaluator {
                                 ))
                             }
                         };
-                        steps.push(ComputeStep::Dereference { size: mem_size });
+                        steps.push(PlanExprOp::Dereference { size: mem_size });
                     }
                     ParsedOperation::Operation(Operation::Nop) => {}
                     ParsedOperation::Operation(op) => {
@@ -532,7 +532,7 @@ impl ExpressionEvaluator {
                 if steps.len() == 1 {
                     // Single step - optimize to direct form
                     match &steps[0] {
-                        ComputeStep::LoadRegister(reg) => {
+                        PlanExprOp::LoadRegister(reg) => {
                             if has_stack_value {
                                 // Register value directly
                                 return Ok(EvaluationResult::DirectValue(
@@ -549,7 +549,7 @@ impl ExpressionEvaluator {
                                 ));
                             }
                         }
-                        ComputeStep::PushConstant(val) => {
+                        PlanExprOp::PushConstant(val) => {
                             if has_stack_value {
                                 // Constant value
                                 return Ok(EvaluationResult::DirectValue(
@@ -566,11 +566,11 @@ impl ExpressionEvaluator {
                     }
                 } else if steps.len() == 3 {
                     // Common pattern: LoadRegister + PushConstant + Add
-                    if matches!(steps[0], ComputeStep::LoadRegister(_))
-                        && matches!(steps[1], ComputeStep::PushConstant(_))
-                        && matches!(steps[2], ComputeStep::Add)
+                    if matches!(steps[0], PlanExprOp::LoadRegister(_))
+                        && matches!(steps[1], PlanExprOp::PushConstant(_))
+                        && matches!(steps[2], PlanExprOp::Add)
                     {
-                        if let (ComputeStep::LoadRegister(reg), ComputeStep::PushConstant(offset)) =
+                        if let (PlanExprOp::LoadRegister(reg), PlanExprOp::PushConstant(offset)) =
                             (&steps[0], &steps[1])
                         {
                             if !has_stack_value {
@@ -623,7 +623,7 @@ impl ExpressionEvaluator {
     where
         R: gimli::Reader<Offset = usize>,
     {
-        use crate::core::{CfaResult, ComputeStep};
+        use crate::core::{CfaResult, PlanExprOp};
 
         match op {
             // Direct register value
@@ -674,8 +674,8 @@ impl ExpressionEvaluator {
                                 },
                             )),
                             CfaResult::Expression { mut steps } => {
-                                steps.push(ComputeStep::PushConstant(*offset));
-                                steps.push(ComputeStep::Add);
+                                steps.push(PlanExprOp::PushConstant(*offset));
+                                steps.push(PlanExprOp::Add);
                                 Ok(EvaluationResult::MemoryLocation(
                                     LocationResult::ComputedLocation { steps },
                                 ))
@@ -818,7 +818,7 @@ impl ExpressionEvaluator {
         location: EvaluationResult,
         byte_offset: i64,
     ) -> Result<EvaluationResult> {
-        use crate::core::{ComputeStep, DirectValueResult, EvaluationResult, LocationResult};
+        use crate::core::{DirectValueResult, EvaluationResult, LocationResult, PlanExprOp};
 
         fn checked_add_i64(base: i64, delta: i64) -> Result<i64> {
             base.checked_add(delta)
@@ -855,9 +855,9 @@ impl ExpressionEvaluator {
                     Ok(EvaluationResult::DirectValue(
                         DirectValueResult::ComputedValue {
                             steps: vec![
-                                ComputeStep::LoadRegister(register),
-                                ComputeStep::PushConstant(total_offset),
-                                ComputeStep::Add,
+                                PlanExprOp::LoadRegister(register),
+                                PlanExprOp::PushConstant(total_offset),
+                                PlanExprOp::Add,
                             ],
                             result_size: MemoryAccessSize::U64,
                         },
@@ -866,8 +866,8 @@ impl ExpressionEvaluator {
             }
             EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { mut steps }) => {
                 if byte_offset != 0 {
-                    steps.push(ComputeStep::PushConstant(byte_offset));
-                    steps.push(ComputeStep::Add);
+                    steps.push(PlanExprOp::PushConstant(byte_offset));
+                    steps.push(PlanExprOp::Add);
                 }
                 Ok(EvaluationResult::DirectValue(
                     DirectValueResult::ComputedValue {
@@ -1284,8 +1284,8 @@ impl ExpressionEvaluator {
 mod tests {
     use super::ExpressionEvaluator;
     use crate::core::{
-        CfaResult, ComputeStep, DirectValueResult, EvaluationResult, LocationResult,
-        MemoryAccessSize,
+        CfaResult, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize,
+        PlanExprOp,
     };
     use gimli::constants;
     use gimli::RunTimeEndian;
@@ -1420,9 +1420,9 @@ mod tests {
                 ],
                 EvaluationResult::DirectValue(DirectValueResult::ComputedValue {
                     steps: vec![
-                        ComputeStep::PushConstant(1),
-                        ComputeStep::PushConstant(2),
-                        ComputeStep::Add,
+                        PlanExprOp::PushConstant(1),
+                        PlanExprOp::PushConstant(2),
+                        PlanExprOp::Add,
                     ],
                     result_size: MemoryAccessSize::U64,
                 }),
