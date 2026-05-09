@@ -19,7 +19,7 @@ impl Availability {
         matches!(self, Self::Available | Self::PartiallyAvailable)
     }
 
-    pub fn from_evaluation_result(result: &EvaluationResult) -> Self {
+    pub(crate) fn from_evaluation_result(result: &EvaluationResult) -> Self {
         match result {
             EvaluationResult::Optimized => Self::OptimizedOut,
             EvaluationResult::Composite(pieces) => {
@@ -41,12 +41,6 @@ impl Availability {
             }
             _ => Self::Available,
         }
-    }
-}
-
-impl From<&EvaluationResult> for Availability {
-    fn from(value: &EvaluationResult) -> Self {
-        Self::from_evaluation_result(value)
     }
 }
 
@@ -159,7 +153,7 @@ mod tests {
     #[test]
     fn optimized_result_is_unavailable() {
         assert_eq!(
-            Availability::from(&EvaluationResult::Optimized),
+            Availability::from_evaluation_result(&EvaluationResult::Optimized),
             Availability::OptimizedOut
         );
     }
@@ -180,7 +174,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            Availability::from(&result),
+            Availability::from_evaluation_result(&result),
             Availability::PartiallyAvailable
         );
     }

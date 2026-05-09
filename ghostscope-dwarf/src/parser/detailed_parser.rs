@@ -33,27 +33,20 @@ use std::collections::HashSet;
 
 /// Internal variable record produced before semantic planning.
 #[derive(Debug, Clone)]
-pub struct VariableWithEvaluation {
+pub struct ParsedVariable {
     pub name: String,
     pub type_name: String,
     pub dwarf_type: Option<TypeInfo>,
     pub declaration: Option<crate::core::DieRef>,
     pub type_id: Option<crate::core::TypeId>,
-    pub evaluation_result: EvaluationResult,
+    pub location: VariableLocation,
+    pub availability: Availability,
     pub scope_depth: usize,
     pub is_parameter: bool,
     pub is_artificial: bool,
 }
 
-impl VariableWithEvaluation {
-    pub fn semantic_location(&self) -> VariableLocation {
-        VariableLocation::from(&self.evaluation_result)
-    }
-
-    pub fn availability(&self) -> Availability {
-        Availability::from(&self.evaluation_result)
-    }
-
+impl ParsedVariable {
     pub fn visible_variable(&self) -> VisibleVariable {
         VisibleVariable {
             name: self.name.clone(),
@@ -61,8 +54,8 @@ impl VariableWithEvaluation {
             dwarf_type: self.dwarf_type.clone(),
             declaration: self.declaration,
             type_id: self.type_id,
-            location: self.semantic_location(),
-            availability: self.availability(),
+            location: self.location.clone(),
+            availability: self.availability.clone(),
             scope_depth: self.scope_depth,
             is_parameter: self.is_parameter,
             is_artificial: self.is_artificial,
@@ -774,7 +767,7 @@ impl DetailedParser {
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
         scope_depth: usize,
-    ) -> Result<Option<VariableWithEvaluation>> {
+    ) -> Result<Option<ParsedVariable>> {
         // No traversal context retained in shallow mode
         // Resolve basic
         let mut visited = std::collections::HashSet::new();
@@ -792,15 +785,18 @@ impl DetailedParser {
             function_context,
             cfi_index,
         )?;
+        let location = VariableLocation::from_evaluation_result(&evaluation_result);
+        let availability = Availability::from_evaluation_result(&evaluation_result);
         // Full type resolution disabled in shallow mode
         let dwarf_type = None;
-        Ok(Some(VariableWithEvaluation {
+        Ok(Some(ParsedVariable {
             name,
             type_name,
             dwarf_type,
             declaration: None,
             type_id: None,
-            evaluation_result,
+            location,
+            availability,
             scope_depth,
             is_parameter,
             is_artificial: false,
@@ -939,26 +935,27 @@ impl Default for DetailedParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Availability, DirectValueResult, VariableLocation};
+    use crate::core::{Availability, VariableLocation};
 
     #[test]
     fn variable_reports_register_value_location() {
-        let variable = VariableWithEvaluation {
+        let variable = ParsedVariable {
             name: "arg".to_string(),
             type_name: "int".to_string(),
             dwarf_type: None,
             declaration: None,
             type_id: None,
-            evaluation_result: EvaluationResult::DirectValue(DirectValueResult::RegisterValue(5)),
+            location: VariableLocation::RegisterValue { dwarf_reg: 5 },
+            availability: Availability::Available,
             scope_depth: 1,
             is_parameter: true,
             is_artificial: false,
         };
 
         assert_eq!(variable.name, "arg");
-        assert_eq!(variable.availability(), Availability::Available);
+        assert_eq!(variable.availability, Availability::Available);
         assert_eq!(
-            variable.semantic_location(),
+            variable.location,
             VariableLocation::RegisterValue { dwarf_reg: 5 }
         );
         assert!(variable.is_parameter);
@@ -967,19 +964,20 @@ mod tests {
 
     #[test]
     fn variable_reports_optimized_out_location() {
-        let variable = VariableWithEvaluation {
+        let variable = ParsedVariable {
             name: "local".to_string(),
             type_name: "int".to_string(),
             dwarf_type: None,
             declaration: None,
             type_id: None,
-            evaluation_result: EvaluationResult::Optimized,
+            location: VariableLocation::OptimizedOut,
+            availability: Availability::OptimizedOut,
             scope_depth: 2,
             is_parameter: false,
             is_artificial: false,
         };
 
-        assert_eq!(variable.availability(), Availability::OptimizedOut);
-        assert_eq!(variable.semantic_location(), VariableLocation::OptimizedOut);
+        assert_eq!(variable.availability, Availability::OptimizedOut);
+        assert_eq!(variable.location, VariableLocation::OptimizedOut);
     }
 }

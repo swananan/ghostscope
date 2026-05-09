@@ -52,7 +52,7 @@ pub struct PieceLocation {
 }
 
 impl VariableLocation {
-    pub fn from_evaluation_result(result: &EvaluationResult) -> Self {
+    pub(crate) fn from_evaluation_result(result: &EvaluationResult) -> Self {
         match result {
             EvaluationResult::DirectValue(direct) => Self::from_direct_value(direct),
             EvaluationResult::MemoryLocation(location) => Self::from_location_result(location),
@@ -97,12 +97,6 @@ impl VariableLocation {
             },
             LocationResult::ComputedLocation { steps } => Self::ComputedAddress(steps.clone()),
         }
-    }
-}
-
-impl From<&EvaluationResult> for VariableLocation {
-    fn from(value: &EvaluationResult) -> Self {
-        Self::from_evaluation_result(value)
     }
 }
 
@@ -204,7 +198,7 @@ mod tests {
         });
 
         assert_eq!(
-            VariableLocation::from(&result),
+            VariableLocation::from_evaluation_result(&result),
             VariableLocation::RegisterAddress {
                 dwarf_reg: 6,
                 offset: -16
@@ -217,7 +211,7 @@ mod tests {
         let result = EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1234));
 
         assert_eq!(
-            VariableLocation::from(&result),
+            VariableLocation::from_evaluation_result(&result),
             VariableLocation::AbsoluteAddressValue(AddressExpr::constant(0x1234))
         );
     }
@@ -231,7 +225,7 @@ mod tests {
         }]);
 
         assert_eq!(
-            VariableLocation::from(&result),
+            VariableLocation::from_evaluation_result(&result),
             VariableLocation::Pieces(vec![PieceLocation {
                 bit_offset: 32,
                 bit_size: 32,

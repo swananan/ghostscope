@@ -25,6 +25,7 @@ pub enum EvaluationResult {
     Optimized,
 
     /// Composite location (multiple pieces) - for split variables
+    #[allow(dead_code)]
     Composite(Vec<PieceResult>),
 }
 
@@ -220,46 +221,7 @@ impl MemoryAccessSize {
     }
 }
 
-impl EvaluationResult {
-    /// Check if this is a simple constant
-    pub fn as_constant(&self) -> Option<i64> {
-        match self {
-            EvaluationResult::DirectValue(DirectValueResult::Constant(c)) => Some(*c),
-            _ => None,
-        }
-    }
-
-    /// Merge with CFA result for frame-relative addresses (DW_OP_fbreg)
-    /// This is used when a variable location is relative to the frame base
-    pub fn merge_with_cfa(self, cfa: CfaResult, frame_offset: i64) -> Self {
-        match cfa {
-            CfaResult::RegisterPlusOffset { register, offset } => {
-                // CFA gives us the frame base, add the frame_offset to get final location
-                EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
-                    register,
-                    offset: Some(offset.saturating_add(frame_offset)),
-                    size: None,
-                })
-            }
-            CfaResult::Expression { mut steps } => {
-                // Add frame offset to the CFA computation
-                steps.push(ComputeStep::PushConstant(frame_offset));
-                steps.push(ComputeStep::Add);
-                EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps })
-            }
-        }
-    }
-}
-
 impl DirectValueResult {
-    /// Check if this is a simple value that can be computed at compile time
-    pub fn is_compile_time_constant(&self) -> bool {
-        matches!(
-            self,
-            DirectValueResult::Constant(_) | DirectValueResult::ImplicitValue(_)
-        )
-    }
-
     /// Convert compute steps to a human-readable expression
     fn steps_to_expression(steps: &[ComputeStep]) -> String {
         use ghostscope_platform::register_mapping::dwarf_reg_to_name;
@@ -491,14 +453,6 @@ impl DirectValueResult {
 }
 
 impl LocationResult {
-    /// Check if this is a simple location (no computation needed)
-    pub fn is_simple(&self) -> bool {
-        matches!(
-            self,
-            LocationResult::Address(_) | LocationResult::RegisterAddress { .. }
-        )
-    }
-
     /// Convert compute steps to a human-readable expression (reuse from DirectValueResult)
     fn steps_to_expression(steps: &[ComputeStep]) -> String {
         DirectValueResult::steps_to_expression(steps)
@@ -678,30 +632,5 @@ impl fmt::Display for ComputeStep {
                 write!(f, "entry_value_lookup[cases:{}]", cases.len())
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{CfaResult, EvaluationResult, LocationResult};
-
-    #[test]
-    fn merge_with_cfa_saturates_register_plus_offset() {
-        let merged = EvaluationResult::Optimized.merge_with_cfa(
-            CfaResult::RegisterPlusOffset {
-                register: 7,
-                offset: i64::MAX - 2,
-            },
-            10,
-        );
-
-        assert_eq!(
-            merged,
-            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
-                register: 7,
-                offset: Some(i64::MAX),
-                size: None,
-            })
-        );
     }
 }
