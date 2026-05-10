@@ -87,6 +87,11 @@ struct RegisteredFixture {
 // TODO: Replace this string-keyed registry with a strongly typed FixtureId enum
 // and move the per-fixture behavior behind impl methods. This table is an
 // intermediate step to remove scattered name-based special cases.
+//
+// Keep CI fixture-cache discovery in e2e-tests/cache-fixtures.sh aligned with
+// this registry and the fixture build outputs. Most C/C++ fixtures are cached
+// by executable outputs directly under tests/fixtures/*_program; rust_global is
+// the explicit target/debug exception.
 const REGISTERED_FIXTURES: &[RegisteredFixture] = &[
     RegisteredFixture {
         name: "sample_program",

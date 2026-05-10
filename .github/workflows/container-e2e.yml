@@ -18,7 +18,7 @@ jobs:
     env:
       LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
       FIXTURE_COMPILER_IMAGE: ghcr.io/swananan/ghostscope-fixture-compiler@sha256:b1e716ec17610673dcaf69497bd93ef0c700a2ad7fe8265d6764d15a8c1edc89
-      FIXTURE_COMPILER_CACHE_REV: b1e716ec17610673dcaf69497bd93ef0c700a2ad7fe8265d6764d15a8c1edc89
+      FIXTURE_COMPILER_CACHE_REV: b1e716ec17610673dcaf69497bd93ef0c700a2ad7fe8265d6764d15a8c1edc89-fixture-archive
     strategy:
       fail-fast: false
       matrix:
@@ -75,41 +75,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-target-
 
-      - name: Cache fixture binaries
+      - name: Cache fixture archive
         id: fixture-cache
         uses: actions/cache@v4
         with:
-          path: |
-            e2e-tests/tests/fixtures/sample_program/sample_program
-            e2e-tests/tests/fixtures/sample_program/sample_program_o1
-            e2e-tests/tests/fixtures/sample_program/sample_program_o2
-            e2e-tests/tests/fixtures/sample_program/sample_program_o3
-            e2e-tests/tests/fixtures/sample_program/sample_program_stripped
-            e2e-tests/tests/fixtures/sample_program/sample_program_stripped.debug
-            e2e-tests/tests/fixtures/complex_types_program/complex_types_program
-            e2e-tests/tests/fixtures/complex_types_program/complex_types_program_o1
-            e2e-tests/tests/fixtures/complex_types_program/complex_types_program_o2
-            e2e-tests/tests/fixtures/complex_types_program/complex_types_program_o3
-            e2e-tests/tests/fixtures/complex_types_program/complex_types_program_nopie
-            e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program
-            e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program_o1
-            e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program_o2
-            e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program_o3
-            e2e-tests/tests/fixtures/globals_program/globals_program
-            e2e-tests/tests/fixtures/globals_program/libgvars.so
-            e2e-tests/tests/fixtures/late_globals_program/late_globals_program
-            e2e-tests/tests/fixtures/scalar_types_program/scalar_types_program
-            e2e-tests/tests/fixtures/rust_global_program/target/debug/rust_global_program
-            e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program
-            e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program_clang_dwarf5
-            e2e-tests/tests/fixtures/inline_call_value_program/inline_call_value_program
-            e2e-tests/tests/fixtures/partitioned_ranges_program/partitioned_ranges_program
-            e2e-tests/tests/fixtures/cpp_complex_program/cpp_complex_program
-            e2e-tests/tests/fixtures/static_scope_program/static_scope_program
-            e2e-tests/tests/fixtures/static_scope_program/static_scope_program_clang_dwarf5
-            e2e-tests/tests/fixtures/entry_value_recovery_program/entry_value_recovery_program
-            e2e-tests/tests/fixtures/entry_value_recovery_program/entry_value_recovery_program_clang_dwarf5
-          key: ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-fixtures-${{ env.FIXTURE_COMPILER_CACHE_REV }}-${{ hashFiles('e2e-tests/compile-fixtures.sh', 'e2e-tests/tests/fixtures/**/*.c', 'e2e-tests/tests/fixtures/**/*.h', 'e2e-tests/tests/fixtures/**/*.cpp', 'e2e-tests/tests/fixtures/**/*.rs', 'e2e-tests/tests/fixtures/**/Makefile', 'e2e-tests/tests/fixtures/**/Cargo.toml', 'e2e-tests/tests/fixtures/**/Cargo.lock') }}
+          path: e2e-tests/.fixture-cache/fixture-binaries.tar
+          key: ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-fixtures-${{ env.FIXTURE_COMPILER_CACHE_REV }}-${{ hashFiles('e2e-tests/cache-fixtures.sh', 'e2e-tests/compile-fixtures.sh', 'e2e-tests/tests/fixtures/**/*.c', 'e2e-tests/tests/fixtures/**/*.h', 'e2e-tests/tests/fixtures/**/*.cpp', 'e2e-tests/tests/fixtures/**/*.rs', 'e2e-tests/tests/fixtures/**/Makefile', 'e2e-tests/tests/fixtures/**/Cargo.toml', 'e2e-tests/tests/fixtures/**/Cargo.lock') }}
+
+      - name: Restore fixture archive
+        if: steps.fixture-cache.outputs.cache-hit == 'true'
+        run: bash ./e2e-tests/cache-fixtures.sh unpack
 
       - name: Compile fixtures with fixture compiler image
         if: steps.fixture-cache.outputs.cache-hit != 'true'
@@ -120,6 +95,7 @@ jobs:
             "$FIXTURE_COMPILER_IMAGE" \
             bash ./compile-fixtures.sh
           sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}/e2e-tests/tests/fixtures"
+          bash ./e2e-tests/cache-fixtures.sh pack
 
       - name: Build GhostScope CLI and dwarf-tool
         run: cargo build -p ghostscope -p dwarf-tool --all-features
@@ -162,7 +138,7 @@ jobs:
     env:
       LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
       FIXTURE_COMPILER_IMAGE: ghcr.io/swananan/ghostscope-fixture-compiler@sha256:b1e716ec17610673dcaf69497bd93ef0c700a2ad7fe8265d6764d15a8c1edc89
-      FIXTURE_COMPILER_CACHE_REV: b1e716ec17610673dcaf69497bd93ef0c700a2ad7fe8265d6764d15a8c1edc89
+      FIXTURE_COMPILER_CACHE_REV: b1e716ec17610673dcaf69497bd93ef0c700a2ad7fe8265d6764d15a8c1edc89-fixture-archive
     strategy:
       fail-fast: false
       matrix:
@@ -211,41 +187,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-target-
 
-      - name: Cache fixture binaries
+      - name: Cache fixture archive
         id: fixture-cache
         uses: actions/cache@v4
         with:
-          path: |
-            e2e-tests/tests/fixtures/sample_program/sample_program
-            e2e-tests/tests/fixtures/sample_program/sample_program_o1
-            e2e-tests/tests/fixtures/sample_program/sample_program_o2
-            e2e-tests/tests/fixtures/sample_program/sample_program_o3
-            e2e-tests/tests/fixtures/sample_program/sample_program_stripped
-            e2e-tests/tests/fixtures/sample_program/sample_program_stripped.debug
-            e2e-tests/tests/fixtures/complex_types_program/complex_types_program
-            e2e-tests/tests/fixtures/complex_types_program/complex_types_program_o1
-            e2e-tests/tests/fixtures/complex_types_program/complex_types_program_o2
-            e2e-tests/tests/fixtures/complex_types_program/complex_types_program_o3
-            e2e-tests/tests/fixtures/complex_types_program/complex_types_program_nopie
-            e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program
-            e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program_o1
-            e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program_o2
-            e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program_o3
-            e2e-tests/tests/fixtures/globals_program/globals_program
-            e2e-tests/tests/fixtures/globals_program/libgvars.so
-            e2e-tests/tests/fixtures/late_globals_program/late_globals_program
-            e2e-tests/tests/fixtures/scalar_types_program/scalar_types_program
-            e2e-tests/tests/fixtures/rust_global_program/target/debug/rust_global_program
-            e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program
-            e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program_clang_dwarf5
-            e2e-tests/tests/fixtures/inline_call_value_program/inline_call_value_program
-            e2e-tests/tests/fixtures/partitioned_ranges_program/partitioned_ranges_program
-            e2e-tests/tests/fixtures/cpp_complex_program/cpp_complex_program
-            e2e-tests/tests/fixtures/static_scope_program/static_scope_program
-            e2e-tests/tests/fixtures/static_scope_program/static_scope_program_clang_dwarf5
-            e2e-tests/tests/fixtures/entry_value_recovery_program/entry_value_recovery_program
-            e2e-tests/tests/fixtures/entry_value_recovery_program/entry_value_recovery_program_clang_dwarf5
-          key: ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-fixtures-${{ env.FIXTURE_COMPILER_CACHE_REV }}-${{ hashFiles('e2e-tests/compile-fixtures.sh', 'e2e-tests/tests/fixtures/**/*.c', 'e2e-tests/tests/fixtures/**/*.h', 'e2e-tests/tests/fixtures/**/*.cpp', 'e2e-tests/tests/fixtures/**/*.rs', 'e2e-tests/tests/fixtures/**/Makefile', 'e2e-tests/tests/fixtures/**/Cargo.toml', 'e2e-tests/tests/fixtures/**/Cargo.lock') }}
+          path: e2e-tests/.fixture-cache/fixture-binaries.tar
+          key: ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-fixtures-${{ env.FIXTURE_COMPILER_CACHE_REV }}-${{ hashFiles('e2e-tests/cache-fixtures.sh', 'e2e-tests/compile-fixtures.sh', 'e2e-tests/tests/fixtures/**/*.c', 'e2e-tests/tests/fixtures/**/*.h', 'e2e-tests/tests/fixtures/**/*.cpp', 'e2e-tests/tests/fixtures/**/*.rs', 'e2e-tests/tests/fixtures/**/Makefile', 'e2e-tests/tests/fixtures/**/Cargo.toml', 'e2e-tests/tests/fixtures/**/Cargo.lock') }}
+
+      - name: Restore fixture archive
+        if: steps.fixture-cache.outputs.cache-hit == 'true'
+        run: bash ./e2e-tests/cache-fixtures.sh unpack
 
       - name: Compile fixtures with fixture compiler image
         if: steps.fixture-cache.outputs.cache-hit != 'true'
@@ -256,6 +207,7 @@ jobs:
             "$FIXTURE_COMPILER_IMAGE" \
             bash ./compile-fixtures.sh
           sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}/e2e-tests/tests/fixtures"
+          bash ./e2e-tests/cache-fixtures.sh pack
 
       - name: Build GhostScope CLI and dwarf-tool
         run: cargo build -p ghostscope -p dwarf-tool --all-features

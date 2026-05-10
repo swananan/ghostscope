@@ -2,6 +2,7 @@
 # will have compiled files and executables
 /target/
 .target_tmp
+e2e-tests/.fixture-cache/
 ghostscope-process/ebpf/sysmon-bpf/target/
 ghostscope-process/ebpf/xtask/target/
 
@@ -52,6 +53,7 @@ test_*
 !scripts/**/*.sh
 # Keep fixture compiler entrypoint tracked
 !e2e-tests/compile-fixtures.sh
+!e2e-tests/cache-fixtures.sh
 # Keep other C files in test fixtures but exclude random C files in root
 /*.c
 e2e-tests/tests/fixtures/complex_types_program/complex_types_program
@@ -71,10 +73,14 @@ e2e-tests/tests/fixtures/scalar_types_program/scalar_types_program
 e2e-tests/tests/fixtures/sample_program/sample_lib.o
 e2e-tests/tests/fixtures/sample_program/sample_program
 e2e-tests/tests/fixtures/sample_program/sample_program.o
+e2e-tests/tests/fixtures/sample_program/sample_program_o*
 e2e-tests/tests/fixtures/sample_program/sample_program_stripped
 e2e-tests/tests/fixtures/sample_program/sample_program_stripped.debug
 e2e-tests/tests/fixtures/static_scope_program/static_scope_program
 e2e-tests/tests/fixtures/static_scope_program/static_scope_program_clang_dwarf5
+e2e-tests/tests/fixtures/inline_callsite_program/inline_callsite_program_clang_dwarf5
+e2e-tests/tests/fixtures/partitioned_ranges_program/partitioned_ranges_program_*
+e2e-tests/tests/fixtures/entry_value_recovery_program/entry_value_recovery_program
 e2e-tests/tests/fixtures/entry_value_recovery_program/entry_value_recovery_program_clang_dwarf5
 e2e-tests/tests/fixtures/entry_value_breg_program/entry_value_breg_program_clang_debuglink
 e2e-tests/tests/fixtures/entry_value_breg_program/entry_value_breg_program_clang_debuglink.debug

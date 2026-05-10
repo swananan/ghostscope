@@ -25,47 +25,64 @@ fn clean_fixture_outputs(fixture_name: &str) -> anyhow::Result<()> {
 fn compiler_specific_builds_keep_sibling_fixture_outputs() -> anyhow::Result<()> {
     init();
 
-    if !common::fixture_compiler_available(FixtureCompiler::ClangDwarf5) {
-        eprintln!("Skipping fixture coexistence regression test because clang is unavailable");
-        return Ok(());
-    }
-
     let fixtures = [
-        ("inline_callsite_program", "-Wall -Wextra -gdwarf-5 -O3"),
-        ("static_scope_program", "-Wall -Wextra -gdwarf-5 -O0"),
+        (
+            "inline_callsite_program",
+            FixtureCompiler::ClangDwarf5,
+            "-Wall -Wextra -gdwarf-5 -O3",
+        ),
+        (
+            "static_scope_program",
+            FixtureCompiler::ClangDwarf5,
+            "-Wall -Wextra -gdwarf-5 -O0",
+        ),
+        (
+            "entry_value_recovery_program",
+            FixtureCompiler::ClangDwarf5,
+            "-Wall -Wextra -gdwarf-5 -O3",
+        ),
+        (
+            "partitioned_ranges_program",
+            FixtureCompiler::GccDwarf5FunctionSections,
+            "-Wall -Wextra -gdwarf-5 -O3 -DNDEBUG -ffunction-sections -freorder-blocks-and-partition",
+        ),
+        (
+            "partitioned_ranges_program",
+            FixtureCompiler::ClangDwarf5Rnglistx,
+            "-Wall -Wextra -gdwarf-5 -O3 -DNDEBUG -ffunction-sections -fbasic-block-sections=all",
+        ),
     ];
 
-    for (fixture_name, clang_dwarf5_cflags) in fixtures {
+    for (fixture_name, compiler, compiler_cflags) in fixtures {
+        if !common::fixture_compiler_available(compiler) {
+            eprintln!(
+                "Skipping fixture coexistence regression for {fixture_name} because {compiler:?} is unavailable"
+            );
+            continue;
+        }
+
         clean_fixture_outputs(fixture_name)?;
 
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(fixture_name);
         let default_binary = base.join(FixtureCompiler::Default.binary_name(fixture_name));
-        let clang_binary = base.join(FixtureCompiler::ClangDwarf5.binary_name(fixture_name));
+        let compiler_binary = base.join(compiler.binary_name(fixture_name));
 
-        common::compile_c_make_fixture(
-            fixture_name,
-            FixtureCompiler::Default,
-            clang_dwarf5_cflags,
-        )?;
+        common::compile_c_make_fixture(fixture_name, FixtureCompiler::Default, compiler_cflags)?;
         assert!(
             default_binary.exists(),
             "default binary should exist after default build for {fixture_name}"
         );
 
-        common::compile_c_make_fixture(
-            fixture_name,
-            FixtureCompiler::ClangDwarf5,
-            clang_dwarf5_cflags,
-        )?;
+        common::compile_c_make_fixture(fixture_name, compiler, compiler_cflags)?;
         assert!(
             default_binary.exists(),
-            "default binary should survive clang build for {fixture_name}"
+            "default binary should survive compiler-specific build for {fixture_name}"
         );
         assert!(
-            clang_binary.exists(),
-            "clang binary should exist after clang build for {fixture_name}"
+            compiler_binary.exists(),
+            "compiler-specific binary should exist after build for {fixture_name}"
         );
 
         clean_fixture_outputs(fixture_name)?;
