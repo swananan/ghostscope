@@ -71,10 +71,40 @@ __attribute__((noinline)) static void trace_member_pointer(int iter) {
     (void)sink;
 }
 
+typedef struct {
+    int a;
+    int b;
+} value_backed_pair_t;
+
+__attribute__((noinline)) static int trace_value_backed_aggregate(int seed) {
+    value_backed_pair_t s = {
+        .a = seed + 1,
+        .b = seed + 2,
+    };
+    int total = s.a + s.b;
+    asm volatile("" : "+r"(total) : : "memory");
+    return total;
+}
+
+__attribute__((noinline)) static int trace_shadowed_state(int seed) {
+    int state = seed + 100;
+    int total = state;
+    {
+        int state __attribute__((unused));
+        asm volatile("" : : : "memory");
+        total += seed;
+    }
+    asm volatile("" : "+r"(total) : : "memory");
+    return total;
+}
+
 int main(void) {
     int iter = 0;
     while (iter < 20000) {
         trace_member_pointer(iter);
+        volatile int semantic_sink =
+            trace_value_backed_aggregate(iter) + trace_shadowed_state(iter);
+        (void)semantic_sink;
         iter++;
         sleep(1);
     }
