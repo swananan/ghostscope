@@ -5,6 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURES_DIR="$ROOT_DIR/tests/fixtures"
 RUST_FIXTURE_DIR="$FIXTURES_DIR/rust_global_program"
 
+# cache-fixtures.sh discovers CI cache contents from the compiled outputs this
+# script leaves under tests/fixtures. If a new fixture writes binaries outside a
+# *_program directory or below a deeper target path, update that helper too.
 if [[ -n "${CLANG_BIN:-}" ]]; then
     CLANG_BIN="$CLANG_BIN"
 elif command -v clang-18 >/dev/null 2>&1; then
