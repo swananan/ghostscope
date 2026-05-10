@@ -266,23 +266,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
         match self.query_dwarf_for_complex_expr(e) {
             Ok(Some(var)) => {
-                let Some(mut ty) = var.dwarf_type.as_ref() else {
+                let Some(ty) = var.dwarf_type.as_ref() else {
                     return Err(CodeGenError::TypeError(format!(
                         "{where_ctx}: DWARF variable has no type information"
                     )));
                 };
-                // Unwrap typedef/qualified wrappers
-                loop {
-                    match ty {
-                        DwarfType::TypedefType {
-                            underlying_type, ..
-                        } => ty = underlying_type.as_ref(),
-                        DwarfType::QualifiedType {
-                            underlying_type, ..
-                        } => ty = underlying_type.as_ref(),
-                        _ => break,
-                    }
-                }
+                let ty = ghostscope_dwarf::strip_type_aliases(ty);
                 if !matches!(
                     ty,
                     DwarfType::PointerType { .. } | DwarfType::ArrayType { .. }
@@ -439,19 +428,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Prefer DWARF-based address resolution first so that array/aggregate
         // expressions decay to their base address rather than loading values.
         if let Ok(Some(var)) = self.query_dwarf_for_complex_expr(e) {
-            if let Some(mut dty) = var.dwarf_type.as_ref() {
-                // unwrap aliases
-                loop {
-                    match dty {
-                        DwarfType::TypedefType {
-                            underlying_type, ..
-                        } => dty = underlying_type.as_ref(),
-                        DwarfType::QualifiedType {
-                            underlying_type, ..
-                        } => dty = underlying_type.as_ref(),
-                        _ => break,
-                    }
-                }
+            if let Some(dty) = var.dwarf_type.as_ref() {
+                let dty = ghostscope_dwarf::strip_type_aliases(dty);
                 match dty {
                     DwarfType::PointerType { .. } => {
                         let pc_address = self.get_compile_time_context()?.pc_address;
@@ -1076,18 +1054,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Prefer DWARF resolution for richer status/hints; fallback to generic pointer resolver.
         let ptr_i64 = match self.query_dwarf_for_complex_expr(dwarf_expr)? {
             Some(var) => {
-                if let Some(mut ty) = var.dwarf_type.as_ref() {
-                    loop {
-                        match ty {
-                            DwarfType::TypedefType {
-                                underlying_type, ..
-                            } => ty = underlying_type.as_ref(),
-                            DwarfType::QualifiedType {
-                                underlying_type, ..
-                            } => ty = underlying_type.as_ref(),
-                            _ => break,
-                        }
-                    }
+                if let Some(ty) = var.dwarf_type.as_ref() {
+                    let ty = ghostscope_dwarf::strip_type_aliases(ty);
                     match ty {
                         DwarfType::PointerType { .. } => {
                             let pc_address = self.get_compile_time_context()?.pc_address;
@@ -2449,34 +2417,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             ParsedKind::Other
         }
 
-        // Helper to peel typedef/qualifier wrappers
-        fn unwrap_aliases(t: &TI) -> &TI {
-            let mut cur = t;
-            loop {
-                match cur {
-                    TI::TypedefType {
-                        underlying_type, ..
-                    } => cur = underlying_type.as_ref(),
-                    TI::QualifiedType {
-                        underlying_type, ..
-                    } => cur = underlying_type.as_ref(),
-                    _ => break,
-                }
-            }
-            cur
-        }
-
         let lit_bytes = lit.as_bytes();
         let lit_len = lit_bytes.len() as u32;
         let one = self.context.bool_type().const_int(1, false);
         let zero = self.context.bool_type().const_zero();
 
         // Build final boolean accumulator
-        let result = match dwarf_type_opt.map(unwrap_aliases) {
+        let result = match dwarf_type_opt.map(ghostscope_dwarf::strip_type_aliases) {
             // char* / const char*
             Some(TI::PointerType { target_type, .. }) => {
                 // Ensure pointee is char-like
-                let base = unwrap_aliases(target_type.as_ref());
+                let base = ghostscope_dwarf::strip_type_aliases(target_type.as_ref());
                 let is_char_like = matches!(base, TI::BaseType { name, size, .. } if name.contains("char") && *size == 1);
                 if !is_char_like {
                     return Err(CodeGenError::TypeError(
@@ -2588,7 +2539,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 element_count,
                 total_size,
             }) => {
-                let elem = unwrap_aliases(element_type.as_ref());
+                let elem = ghostscope_dwarf::strip_type_aliases(element_type.as_ref());
                 let is_char_like = matches!(elem, TI::BaseType { name, size, .. } if name.contains("char") && *size == 1);
                 if !is_char_like {
                     return Err(CodeGenError::TypeError(
