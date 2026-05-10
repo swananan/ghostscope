@@ -3,6 +3,8 @@ mod common;
 use common::{init, OptimizationLevel, FIXTURES};
 
 const TRACE_LINE: u32 = 68;
+const VALUE_BACKED_AGGREGATE_LINE: u32 = 84;
+const SHADOWED_STATE_LINE: u32 = 94;
 
 fn field_path(fields: &[&str]) -> ghostscope_dwarf::VariableAccessPath {
     ghostscope_dwarf::VariableAccessPath::fields(fields.iter().map(|field| (*field).to_string()))
@@ -41,6 +43,31 @@ async fn compile_member_pointer_script_result(
     ))
 }
 
+async fn compile_member_pointer_failure_message(
+    script: &str,
+    opt_level: OptimizationLevel,
+) -> anyhow::Result<String> {
+    match compile_member_pointer_script_result(script, opt_level).await? {
+        Ok(result) => {
+            anyhow::ensure!(
+                result.uprobe_configs.is_empty(),
+                "invalid script should not produce uprobe configs: {result:?}"
+            );
+            anyhow::ensure!(
+                !result.failed_targets.is_empty(),
+                "invalid script should report failed targets: {result:?}"
+            );
+            Ok(result
+                .failed_targets
+                .iter()
+                .map(|target| target.error_message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        Err(err) => Ok(err.user_message().into_owned()),
+    }
+}
+
 async fn member_pointer_pc(opt_level: OptimizationLevel) -> anyhow::Result<u64> {
     let binary_path = FIXTURES.get_test_binary_with_opt("member_pointer_program", opt_level)?;
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
@@ -52,6 +79,14 @@ async fn member_pointer_pc(opt_level: OptimizationLevel) -> anyhow::Result<u64> 
         "No DWARF addresses found for member_pointer_program.c:{TRACE_LINE}"
     );
     Ok(addrs[0].address)
+}
+
+fn member_pointer_source_path(opt_level: OptimizationLevel) -> anyhow::Result<std::path::PathBuf> {
+    let binary_path = FIXTURES.get_test_binary_with_opt("member_pointer_program", opt_level)?;
+    Ok(binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("member_pointer_program has no parent directory"))?
+        .join("member_pointer_program.c"))
 }
 
 #[tokio::test]
@@ -408,6 +443,72 @@ trace {}:68 {{
         message.contains("Unknown member 'no_such_member'"),
         "unexpected compile error: {message}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_value_backed_aggregate_member_access_is_rejected_o2() -> anyhow::Result<()> {
+    init();
+
+    let source_path = member_pointer_source_path(OptimizationLevel::O2)?;
+    let script = format!(
+        r#"
+trace {}:{VALUE_BACKED_AGGREGATE_LINE} {{
+    print s.b;
+}}
+"#,
+        source_path.display()
+    );
+
+    let message = compile_member_pointer_failure_message(&script, OptimizationLevel::O2).await?;
+    assert!(
+        message.contains("value-backed aggregate")
+            || message.contains("field/array extraction from aggregate values is not implemented")
+            || message.contains("DW_OP_piece"),
+        "unexpected compile error: {message}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_shadowed_unavailable_inner_variable_is_not_outer_fallback_o2() -> anyhow::Result<()> {
+    init();
+
+    let source_path = member_pointer_source_path(OptimizationLevel::O2)?;
+    let script = format!(
+        r#"
+trace {}:{SHADOWED_STATE_LINE} {{
+    print state;
+}}
+"#,
+        source_path.display()
+    );
+
+    let result = compile_member_pointer_script(&script, OptimizationLevel::O2).await?;
+    assert!(
+        !result.uprobe_configs.is_empty(),
+        "shadowed optimized-out variable should still compile a reporting probe: {result:?}"
+    );
+    assert!(
+        result.failed_targets.is_empty(),
+        "optimized-out reporting should not create failed targets: {result:?}"
+    );
+    for config in &result.uprobe_configs {
+        assert_eq!(
+            config.trace_context.variable_names,
+            vec!["state".to_string()],
+            "unexpected trace variable names: {:?}",
+            config.trace_context.variable_names
+        );
+        assert!(
+            matches!(
+                config.trace_context.types.as_slice(),
+                [ghostscope_dwarf::TypeInfo::OptimizedOut { name }] if name == "state"
+            ),
+            "shadowed inner variable should be marked optimized out, not lowered as the outer value: {:?}",
+            config.trace_context.types
+        );
+    }
     Ok(())
 }
 
