@@ -463,9 +463,101 @@ trace {}:{VALUE_BACKED_AGGREGATE_LINE} {{
     let message = compile_member_pointer_failure_message(&script, OptimizationLevel::O2).await?;
     assert!(
         message.contains("value-backed aggregate")
-            || message.contains("field/array extraction from aggregate values is not implemented")
-            || message.contains("DW_OP_piece"),
+            || message.contains("field/array extraction from aggregate values is not implemented"),
         "unexpected compile error: {message}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_value_backed_aggregate_dw_op_piece_surfaces_composite_o2() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("member_pointer_program", OptimizationLevel::O2)?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load DWARF for member_pointer_program: {e}"))?;
+    let addrs = analyzer
+        .lookup_addresses_by_source_line("member_pointer_program.c", VALUE_BACKED_AGGREGATE_LINE);
+    anyhow::ensure!(
+        !addrs.is_empty(),
+        "No DWARF addresses found for member_pointer_program.c:{VALUE_BACKED_AGGREGATE_LINE}"
+    );
+
+    for module_address in &addrs {
+        let pc_context = analyzer.resolve_pc(module_address)?;
+        let plan = analyzer
+            .plan_variable_by_name(&pc_context, "s")?
+            .ok_or_else(|| anyhow::anyhow!("expected variable read plan for 's'"))?;
+
+        assert!(
+            plan.availability.is_available(),
+            "composite variable should remain available at 0x{:x}: {plan:?}",
+            module_address.address
+        );
+
+        let ghostscope_dwarf::VariableLocation::Pieces(pieces) = &plan.location else {
+            panic!(
+                "expected DW_OP_piece-backed composite for 's' at 0x{:x}, got {:?}",
+                module_address.address, plan.location
+            );
+        };
+
+        assert_eq!(pieces.len(), 2, "unexpected composite pieces: {pieces:?}");
+        for (piece, bit_offset, constant) in [(&pieces[0], 0, 1), (&pieces[1], 32, 2)] {
+            assert_eq!(piece.bit_offset, bit_offset);
+            assert_eq!(piece.bit_size, 32);
+            assert_eq!(
+                piece.location.as_ref(),
+                &ghostscope_dwarf::VariableLocation::ComputedValue(vec![
+                    ghostscope_dwarf::PlanExprOp::LoadRegister(5),
+                    ghostscope_dwarf::PlanExprOp::PushConstant(constant),
+                    ghostscope_dwarf::PlanExprOp::Add,
+                ])
+            );
+        }
+
+        let materialized =
+            plan.materialization_plan(&ghostscope_dwarf::RuntimeCapabilities::default());
+        assert_eq!(
+            materialized.lowering.kind,
+            ghostscope_dwarf::VariableLoweringKind::Composite
+        );
+        match materialized.materialization {
+            ghostscope_dwarf::VariableMaterialization::Composite { pieces } => {
+                assert_eq!(pieces.len(), 2);
+            }
+            other => panic!("expected composite materialization, got {other:?}"),
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_value_backed_aggregate_print_rejects_split_pieces_o2() -> anyhow::Result<()> {
+    init();
+
+    let source_path = member_pointer_source_path(OptimizationLevel::O2)?;
+    let script = format!(
+        r#"
+trace {}:{VALUE_BACKED_AGGREGATE_LINE} {{
+    print s;
+}}
+"#,
+        source_path.display()
+    );
+
+    let message = compile_member_pointer_failure_message(&script, OptimizationLevel::O2).await?;
+    assert!(
+        message.contains("split across pieces")
+            && message.contains("piece reconstruction is not implemented"),
+        "unexpected compile error: {message}"
+    );
+    assert!(
+        !message.contains("DW_OP_piece"),
+        "DW_OP_piece should lower before compiler rejection: {message}"
     );
     Ok(())
 }

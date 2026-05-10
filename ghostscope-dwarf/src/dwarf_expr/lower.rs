@@ -5,8 +5,8 @@
 
 use crate::binary::{DwarfEndian, DwarfReader};
 use crate::core::{
-    CfaResult, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, PlanExprOp,
-    Result,
+    CfaResult, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, PieceResult,
+    PlanExprOp, Result,
 };
 use crate::dwarf_expr::{errors as expr_errors, modes::DwarfExprMode};
 use crate::index::{CfiIndex, FunctionBlocks};
@@ -16,6 +16,15 @@ use tracing::{debug, trace, warn};
 
 /// DWARF expression evaluator
 pub struct ExpressionEvaluator;
+
+#[derive(Debug)]
+enum ParsedOperation<R: Reader<Offset = usize>> {
+    Operation(Operation<R>),
+    PrecomputedSteps {
+        steps: Vec<PlanExprOp>,
+        forces_stack_value: bool,
+    },
+}
 
 impl ExpressionEvaluator {
     const MAX_IMPLICIT_POINTER_DEPTH: usize = 8;
@@ -400,6 +409,306 @@ impl ExpressionEvaluator {
         steps
     }
 
+    fn has_piece_expression<R>(operations: &[ParsedOperation<R>]) -> bool
+    where
+        R: Reader<Offset = usize>,
+    {
+        operations.iter().any(|op| {
+            matches!(
+                op,
+                ParsedOperation::Operation(Operation::Piece {
+                    bit_offset: None,
+                    ..
+                })
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_parsed_operations<R>(
+        operations: &[ParsedOperation<R>],
+        dwarf: Option<&gimli::Dwarf<DwarfReader>>,
+        address: u64,
+        get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        depth: usize,
+    ) -> Result<EvaluationResult>
+    where
+        R: Reader<Offset = usize>,
+    {
+        if operations.is_empty() {
+            return Err(anyhow::anyhow!("Empty expression"));
+        }
+
+        // Fast path for single operations - avoid compute processing.
+        if operations.len() == 1 {
+            if let ParsedOperation::Operation(op) = &operations[0] {
+                return Self::handle_single_operation(op, dwarf, address, get_cfa, depth);
+            }
+        }
+
+        let mut steps = Vec::new();
+        let mut has_stack_value = false;
+
+        for op in operations {
+            match op {
+                ParsedOperation::PrecomputedSteps {
+                    steps: precomputed,
+                    forces_stack_value,
+                } => {
+                    if *forces_stack_value {
+                        has_stack_value = true;
+                    }
+                    steps.extend(precomputed.iter().cloned());
+                }
+                ParsedOperation::Operation(Operation::RegisterOffset {
+                    register, offset, ..
+                }) => {
+                    steps.push(PlanExprOp::LoadRegister(register.0));
+                    if *offset != 0 {
+                        steps.push(PlanExprOp::PushConstant(*offset));
+                        steps.push(PlanExprOp::Add);
+                    }
+                }
+                ParsedOperation::Operation(Operation::Register { register }) => {
+                    steps.push(PlanExprOp::LoadRegister(register.0));
+                }
+                ParsedOperation::Operation(Operation::FrameOffset { offset }) => {
+                    let Some(get_cfa_fn) = get_cfa else {
+                        return Err(anyhow::anyhow!("DW_OP_fbreg but no CFA provider available"));
+                    };
+                    let Some(cfa) = get_cfa_fn(address)? else {
+                        return Err(anyhow::anyhow!(
+                            "DW_OP_fbreg but no CFA available at address 0x{:x}",
+                            address
+                        ));
+                    };
+
+                    match cfa {
+                        crate::core::CfaResult::RegisterPlusOffset {
+                            register,
+                            offset: cfa_offset,
+                        } => {
+                            steps.push(PlanExprOp::LoadRegister(register));
+                            let total_offset = cfa_offset.saturating_add(*offset);
+                            if total_offset != 0 {
+                                steps.push(PlanExprOp::PushConstant(total_offset));
+                                steps.push(PlanExprOp::Add);
+                            }
+                        }
+                        crate::core::CfaResult::Expression {
+                            steps: mut cfa_steps,
+                        } => {
+                            steps.append(&mut cfa_steps);
+                            if *offset != 0 {
+                                steps.push(PlanExprOp::PushConstant(*offset));
+                                steps.push(PlanExprOp::Add);
+                            }
+                        }
+                    }
+                }
+                ParsedOperation::Operation(Operation::PlusConstant { value }) => {
+                    steps.push(PlanExprOp::PushConstant(*value as i64));
+                    steps.push(PlanExprOp::Add);
+                }
+                ParsedOperation::Operation(Operation::Plus) => steps.push(PlanExprOp::Add),
+                ParsedOperation::Operation(Operation::Minus) => steps.push(PlanExprOp::Sub),
+                ParsedOperation::Operation(Operation::Mul) => steps.push(PlanExprOp::Mul),
+                ParsedOperation::Operation(Operation::Div) => steps.push(PlanExprOp::Div),
+                ParsedOperation::Operation(Operation::Mod) => steps.push(PlanExprOp::Mod),
+                ParsedOperation::Operation(Operation::And) => steps.push(PlanExprOp::And),
+                ParsedOperation::Operation(Operation::Or) => steps.push(PlanExprOp::Or),
+                ParsedOperation::Operation(Operation::Xor) => steps.push(PlanExprOp::Xor),
+                ParsedOperation::Operation(Operation::Shl) => steps.push(PlanExprOp::Shl),
+                ParsedOperation::Operation(Operation::Shr) => steps.push(PlanExprOp::Shr),
+                ParsedOperation::Operation(Operation::Shra) => steps.push(PlanExprOp::Shra),
+                ParsedOperation::Operation(Operation::Not) => steps.push(PlanExprOp::Not),
+                ParsedOperation::Operation(Operation::Neg) => steps.push(PlanExprOp::Neg),
+                ParsedOperation::Operation(Operation::Abs) => steps.push(PlanExprOp::Abs),
+                ParsedOperation::Operation(Operation::Eq) => steps.push(PlanExprOp::Eq),
+                ParsedOperation::Operation(Operation::Ne) => steps.push(PlanExprOp::Ne),
+                ParsedOperation::Operation(Operation::Lt) => steps.push(PlanExprOp::Lt),
+                ParsedOperation::Operation(Operation::Le) => steps.push(PlanExprOp::Le),
+                ParsedOperation::Operation(Operation::Gt) => steps.push(PlanExprOp::Gt),
+                ParsedOperation::Operation(Operation::Ge) => steps.push(PlanExprOp::Ge),
+                ParsedOperation::Operation(Operation::UnsignedConstant { value }) => {
+                    steps.push(PlanExprOp::PushConstant(*value as i64));
+                }
+                ParsedOperation::Operation(Operation::SignedConstant { value }) => {
+                    steps.push(PlanExprOp::PushConstant(*value));
+                }
+                ParsedOperation::Operation(Operation::StackValue) => {
+                    has_stack_value = true;
+                }
+                ParsedOperation::Operation(op @ Operation::Deref { size, space, .. }) => {
+                    if *space {
+                        return Err(crate::dwarf_expr::ops::unsupported_operation_error(
+                            "DWARF expression",
+                            op,
+                        ));
+                    }
+                    let mem_size = match size {
+                        1 => MemoryAccessSize::U8,
+                        2 => MemoryAccessSize::U16,
+                        4 => MemoryAccessSize::U32,
+                        8 => MemoryAccessSize::U64,
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "unsupported DWARF dereference size {} in operation: {:?}",
+                                size,
+                                op
+                            ))
+                        }
+                    };
+                    steps.push(PlanExprOp::Dereference { size: mem_size });
+                }
+                ParsedOperation::Operation(Operation::Nop) => {}
+                ParsedOperation::Operation(op) => {
+                    return Err(crate::dwarf_expr::ops::unsupported_operation_error(
+                        "DWARF expression",
+                        op,
+                    ));
+                }
+            }
+        }
+
+        if steps.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Could not parse multi-operation expression"
+            ));
+        }
+
+        if steps.len() == 1 {
+            match &steps[0] {
+                PlanExprOp::LoadRegister(reg) => {
+                    if has_stack_value {
+                        return Ok(EvaluationResult::DirectValue(
+                            DirectValueResult::RegisterValue(*reg),
+                        ));
+                    }
+                    return Ok(EvaluationResult::MemoryLocation(
+                        LocationResult::RegisterAddress {
+                            register: *reg,
+                            offset: None,
+                            size: None,
+                        },
+                    ));
+                }
+                PlanExprOp::PushConstant(val) => {
+                    if has_stack_value {
+                        return Ok(EvaluationResult::DirectValue(DirectValueResult::Constant(
+                            *val,
+                        )));
+                    }
+                    return Ok(EvaluationResult::MemoryLocation(LocationResult::Address(
+                        *val as u64,
+                    )));
+                }
+                _ => {}
+            }
+        } else if steps.len() == 3
+            && matches!(steps[0], PlanExprOp::LoadRegister(_))
+            && matches!(steps[1], PlanExprOp::PushConstant(_))
+            && matches!(steps[2], PlanExprOp::Add)
+        {
+            if let (PlanExprOp::LoadRegister(reg), PlanExprOp::PushConstant(offset)) =
+                (&steps[0], &steps[1])
+            {
+                if !has_stack_value {
+                    return Ok(EvaluationResult::MemoryLocation(
+                        LocationResult::RegisterAddress {
+                            register: *reg,
+                            offset: Some(*offset),
+                            size: None,
+                        },
+                    ));
+                }
+            }
+        }
+
+        if has_stack_value {
+            Ok(EvaluationResult::DirectValue(
+                DirectValueResult::ComputedValue {
+                    steps,
+                    result_size: MemoryAccessSize::U64,
+                },
+            ))
+        } else {
+            Ok(EvaluationResult::MemoryLocation(
+                LocationResult::ComputedLocation { steps },
+            ))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_piece_expression<R>(
+        operations: &[ParsedOperation<R>],
+        dwarf: Option<&gimli::Dwarf<DwarfReader>>,
+        address: u64,
+        get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
+        depth: usize,
+    ) -> Result<EvaluationResult>
+    where
+        R: Reader<Offset = usize>,
+    {
+        let mut pieces = Vec::new();
+        let mut segment_start = 0usize;
+        let mut composite_bit_offset = 0u64;
+
+        for (idx, op) in operations.iter().enumerate() {
+            let ParsedOperation::Operation(Operation::Piece {
+                size_in_bits,
+                bit_offset,
+            }) = op
+            else {
+                continue;
+            };
+
+            if bit_offset.is_some() {
+                return Err(crate::dwarf_expr::ops::unsupported_operation_error(
+                    "DWARF expression",
+                    match op {
+                        ParsedOperation::Operation(op) => op,
+                        ParsedOperation::PrecomputedSteps { .. } => unreachable!(),
+                    },
+                ));
+            }
+            if size_in_bits % 8 != 0 {
+                return Err(anyhow::anyhow!(
+                    "DW_OP_piece size {size_in_bits} is not byte-aligned"
+                ));
+            }
+
+            let segment = &operations[segment_start..idx];
+            let location = if segment.is_empty() {
+                EvaluationResult::Optimized
+            } else {
+                Self::lower_parsed_operations(segment, dwarf, address, get_cfa, depth)?
+            };
+
+            if matches!(location, EvaluationResult::Composite(_)) {
+                return Err(anyhow::anyhow!(
+                    "nested DW_OP_piece composite expressions are not supported"
+                ));
+            }
+
+            pieces.push(PieceResult {
+                location,
+                size: size_in_bits / 8,
+                bit_offset: Some(composite_bit_offset),
+            });
+            composite_bit_offset = composite_bit_offset.saturating_add(*size_in_bits);
+            segment_start = idx + 1;
+        }
+
+        if segment_start < operations.len() {
+            return Err(anyhow::anyhow!(
+                "DW_OP_piece expression has trailing operations without a piece size"
+            ));
+        }
+
+        Ok(EvaluationResult::Composite(pieces))
+    }
+
     /// Parse a full multi-operation DWARF expression
     #[allow(clippy::too_many_arguments)]
     fn parse_full_expression(
@@ -413,14 +722,7 @@ impl ExpressionEvaluator {
         cfi_index: Option<&CfiIndex>,
         depth: usize,
     ) -> Result<EvaluationResult> {
-        #[derive(Debug)]
-        enum ParsedOperation<R: Reader<Offset = usize>> {
-            Operation(Operation<R>),
-            PrecomputedSteps(Vec<PlanExprOp>),
-        }
-
         let mut operations: Vec<ParsedOperation<_>> = Vec::new();
-        let mut has_stack_value = false;
 
         // Parse all operations in the expression
         for op in expr_errors::hard(
@@ -431,10 +733,6 @@ impl ExpressionEvaluator {
                 "DWARF expression",
             ),
         )? {
-            if matches!(op, Operation::StackValue) {
-                has_stack_value = true;
-                debug!("Found DW_OP_stack_value - this is a computed value");
-            }
             match &op {
                 // Lower supported DW_OP_entry_value forms through caller-side
                 // call-site metadata. This keeps optimized parameters usable
@@ -455,10 +753,10 @@ impl ExpressionEvaluator {
                             steps,
                             forces_stack_value,
                         } => {
-                            if forces_stack_value {
-                                has_stack_value = true;
-                            }
-                            operations.push(ParsedOperation::PrecomputedSteps(steps));
+                            operations.push(ParsedOperation::PrecomputedSteps {
+                                steps,
+                                forces_stack_value,
+                            });
                         }
                         crate::dwarf_expr::entry_value::LoweredEntryValue::Optimized => {
                             return Ok(EvaluationResult::Optimized);
@@ -475,224 +773,11 @@ impl ExpressionEvaluator {
 
         debug!("Parsed {} operations in expression", operations.len());
 
-        // Fast path for single operations - avoid compute processing
-        if operations.len() == 1 {
-            if let ParsedOperation::Operation(op) = &operations[0] {
-                return Self::handle_single_operation(op, dwarf, address, get_cfa, depth);
-            }
+        if Self::has_piece_expression(&operations) {
+            return Self::lower_piece_expression(&operations, dwarf, address, get_cfa, depth);
         }
 
-        // Build compute steps from operations
-        if !operations.is_empty() {
-            let mut steps = Vec::new();
-
-            for op in &operations {
-                match op {
-                    ParsedOperation::PrecomputedSteps(precomputed) => {
-                        steps.extend(precomputed.iter().cloned());
-                    }
-                    ParsedOperation::Operation(Operation::RegisterOffset {
-                        register,
-                        offset,
-                        ..
-                    }) => {
-                        // Load register and add offset if non-zero
-                        steps.push(PlanExprOp::LoadRegister(register.0));
-                        if *offset != 0 {
-                            steps.push(PlanExprOp::PushConstant(*offset));
-                            steps.push(PlanExprOp::Add);
-                        }
-                    }
-                    ParsedOperation::Operation(Operation::Register { register }) => {
-                        // DW_OP_reg* means the value IS in the register (direct value)
-                        // We'll handle this specially below
-                        steps.push(PlanExprOp::LoadRegister(register.0));
-                    }
-                    ParsedOperation::Operation(Operation::FrameOffset { offset }) => {
-                        let Some(get_cfa_fn) = get_cfa else {
-                            return Err(anyhow::anyhow!(
-                                "DW_OP_fbreg but no CFA provider available"
-                            ));
-                        };
-                        let Some(cfa) = get_cfa_fn(address)? else {
-                            return Err(anyhow::anyhow!(
-                                "DW_OP_fbreg but no CFA available at address 0x{:x}",
-                                address
-                            ));
-                        };
-
-                        match cfa {
-                            crate::core::CfaResult::RegisterPlusOffset {
-                                register,
-                                offset: cfa_offset,
-                            } => {
-                                steps.push(PlanExprOp::LoadRegister(register));
-                                let total_offset = cfa_offset.saturating_add(*offset);
-                                if total_offset != 0 {
-                                    steps.push(PlanExprOp::PushConstant(total_offset));
-                                    steps.push(PlanExprOp::Add);
-                                }
-                            }
-                            crate::core::CfaResult::Expression {
-                                steps: mut cfa_steps,
-                            } => {
-                                steps.append(&mut cfa_steps);
-                                if *offset != 0 {
-                                    steps.push(PlanExprOp::PushConstant(*offset));
-                                    steps.push(PlanExprOp::Add);
-                                }
-                            }
-                        }
-                    }
-                    ParsedOperation::Operation(Operation::PlusConstant { value }) => {
-                        steps.push(PlanExprOp::PushConstant(*value as i64));
-                        steps.push(PlanExprOp::Add);
-                    }
-                    ParsedOperation::Operation(Operation::Plus) => steps.push(PlanExprOp::Add),
-                    ParsedOperation::Operation(Operation::Minus) => steps.push(PlanExprOp::Sub),
-                    ParsedOperation::Operation(Operation::Mul) => steps.push(PlanExprOp::Mul),
-                    ParsedOperation::Operation(Operation::Div) => steps.push(PlanExprOp::Div),
-                    ParsedOperation::Operation(Operation::Mod) => steps.push(PlanExprOp::Mod),
-                    ParsedOperation::Operation(Operation::And) => steps.push(PlanExprOp::And),
-                    ParsedOperation::Operation(Operation::Or) => steps.push(PlanExprOp::Or),
-                    ParsedOperation::Operation(Operation::Xor) => steps.push(PlanExprOp::Xor),
-                    ParsedOperation::Operation(Operation::Shl) => steps.push(PlanExprOp::Shl),
-                    ParsedOperation::Operation(Operation::Shr) => steps.push(PlanExprOp::Shr),
-                    ParsedOperation::Operation(Operation::Shra) => steps.push(PlanExprOp::Shra),
-                    ParsedOperation::Operation(Operation::Not) => steps.push(PlanExprOp::Not),
-                    ParsedOperation::Operation(Operation::Neg) => steps.push(PlanExprOp::Neg),
-                    ParsedOperation::Operation(Operation::Abs) => steps.push(PlanExprOp::Abs),
-                    ParsedOperation::Operation(Operation::Eq) => steps.push(PlanExprOp::Eq),
-                    ParsedOperation::Operation(Operation::Ne) => steps.push(PlanExprOp::Ne),
-                    ParsedOperation::Operation(Operation::Lt) => steps.push(PlanExprOp::Lt),
-                    ParsedOperation::Operation(Operation::Le) => steps.push(PlanExprOp::Le),
-                    ParsedOperation::Operation(Operation::Gt) => steps.push(PlanExprOp::Gt),
-                    ParsedOperation::Operation(Operation::Ge) => steps.push(PlanExprOp::Ge),
-                    ParsedOperation::Operation(Operation::UnsignedConstant { value }) => {
-                        steps.push(PlanExprOp::PushConstant(*value as i64));
-                    }
-                    ParsedOperation::Operation(Operation::SignedConstant { value }) => {
-                        steps.push(PlanExprOp::PushConstant(*value));
-                    }
-                    ParsedOperation::Operation(Operation::StackValue) => {
-                        // This marks the result as a computed value, not a memory location
-                        // Already handled by has_stack_value flag
-                    }
-                    ParsedOperation::Operation(op @ Operation::Deref { size, space, .. }) => {
-                        if *space {
-                            return Err(crate::dwarf_expr::ops::unsupported_operation_error(
-                                "DWARF expression",
-                                op,
-                            ));
-                        }
-                        let mem_size = match size {
-                            1 => MemoryAccessSize::U8,
-                            2 => MemoryAccessSize::U16,
-                            4 => MemoryAccessSize::U32,
-                            8 => MemoryAccessSize::U64,
-                            _ => {
-                                return Err(anyhow::anyhow!(
-                                    "unsupported DWARF dereference size {} in operation: {:?}",
-                                    size,
-                                    op
-                                ))
-                            }
-                        };
-                        steps.push(PlanExprOp::Dereference { size: mem_size });
-                    }
-                    ParsedOperation::Operation(Operation::Nop) => {}
-                    ParsedOperation::Operation(op) => {
-                        return Err(crate::dwarf_expr::ops::unsupported_operation_error(
-                            "DWARF expression",
-                            op,
-                        ));
-                    }
-                }
-            }
-
-            if !steps.is_empty() {
-                // Check for simple cases that don't need full computation
-                if steps.len() == 1 {
-                    // Single step - optimize to direct form
-                    match &steps[0] {
-                        PlanExprOp::LoadRegister(reg) => {
-                            if has_stack_value {
-                                // Register value directly
-                                return Ok(EvaluationResult::DirectValue(
-                                    DirectValueResult::RegisterValue(*reg),
-                                ));
-                            } else {
-                                // Register as address (no offset)
-                                return Ok(EvaluationResult::MemoryLocation(
-                                    LocationResult::RegisterAddress {
-                                        register: *reg,
-                                        offset: None,
-                                        size: None,
-                                    },
-                                ));
-                            }
-                        }
-                        PlanExprOp::PushConstant(val) => {
-                            if has_stack_value {
-                                // Constant value
-                                return Ok(EvaluationResult::DirectValue(
-                                    DirectValueResult::Constant(*val),
-                                ));
-                            } else {
-                                // Constant address
-                                return Ok(EvaluationResult::MemoryLocation(
-                                    LocationResult::Address(*val as u64),
-                                ));
-                            }
-                        }
-                        _ => {} // Other single operations need computation
-                    }
-                } else if steps.len() == 3 {
-                    // Common pattern: LoadRegister + PushConstant + Add
-                    if matches!(steps[0], PlanExprOp::LoadRegister(_))
-                        && matches!(steps[1], PlanExprOp::PushConstant(_))
-                        && matches!(steps[2], PlanExprOp::Add)
-                    {
-                        if let (PlanExprOp::LoadRegister(reg), PlanExprOp::PushConstant(offset)) =
-                            (&steps[0], &steps[1])
-                        {
-                            if !has_stack_value {
-                                // Register + offset as memory location
-                                return Ok(EvaluationResult::MemoryLocation(
-                                    LocationResult::RegisterAddress {
-                                        register: *reg,
-                                        offset: Some(*offset),
-                                        size: None,
-                                    },
-                                ));
-                            }
-                            // If has_stack_value, fall through to ComputedValue
-                        }
-                    }
-                }
-
-                // Complex expression - use computed forms
-                if has_stack_value {
-                    // This is a computed value
-                    return Ok(EvaluationResult::DirectValue(
-                        DirectValueResult::ComputedValue {
-                            steps,
-                            result_size: MemoryAccessSize::U64, // Default to 64-bit
-                        },
-                    ));
-                } else {
-                    // This is a computed memory location
-                    return Ok(EvaluationResult::MemoryLocation(
-                        LocationResult::ComputedLocation { steps },
-                    ));
-                }
-            }
-        }
-
-        // If we couldn't parse as a complex expression, fail
-        Err(anyhow::anyhow!(
-            "Could not parse multi-operation expression"
-        ))
+        Self::lower_parsed_operations(&operations, dwarf, address, get_cfa, depth)
     }
 
     /// Handle single DWARF operation - fast path without compute processing
@@ -1368,7 +1453,7 @@ mod tests {
     use super::ExpressionEvaluator;
     use crate::core::{
         CfaResult, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize,
-        PlanExprOp,
+        PieceResult, PlanExprOp,
     };
     use gimli::constants;
     use gimli::RunTimeEndian;
@@ -1517,6 +1602,61 @@ mod tests {
                     0xaa, 0xbb, 0xcc,
                 ])),
             ),
+            (
+                "DW_OP_piece split stack values",
+                {
+                    let mut bytes = vec![constants::DW_OP_breg5.0];
+                    bytes.extend(encode_sleb(1));
+                    bytes.push(constants::DW_OP_stack_value.0);
+                    bytes.push(constants::DW_OP_piece.0);
+                    bytes.extend(encode_uleb(4));
+                    bytes.push(constants::DW_OP_breg5.0);
+                    bytes.extend(encode_sleb(2));
+                    bytes.push(constants::DW_OP_stack_value.0);
+                    bytes.push(constants::DW_OP_piece.0);
+                    bytes.extend(encode_uleb(4));
+                    bytes
+                },
+                EvaluationResult::Composite(vec![
+                    PieceResult {
+                        location: EvaluationResult::DirectValue(DirectValueResult::ComputedValue {
+                            steps: vec![
+                                PlanExprOp::LoadRegister(5),
+                                PlanExprOp::PushConstant(1),
+                                PlanExprOp::Add,
+                            ],
+                            result_size: MemoryAccessSize::U64,
+                        }),
+                        size: 4,
+                        bit_offset: Some(0),
+                    },
+                    PieceResult {
+                        location: EvaluationResult::DirectValue(DirectValueResult::ComputedValue {
+                            steps: vec![
+                                PlanExprOp::LoadRegister(5),
+                                PlanExprOp::PushConstant(2),
+                                PlanExprOp::Add,
+                            ],
+                            result_size: MemoryAccessSize::U64,
+                        }),
+                        size: 4,
+                        bit_offset: Some(32),
+                    },
+                ]),
+            ),
+            (
+                "DW_OP_piece empty segment",
+                {
+                    let mut bytes = vec![constants::DW_OP_piece.0];
+                    bytes.extend(encode_uleb(4));
+                    bytes
+                },
+                EvaluationResult::Composite(vec![PieceResult {
+                    location: EvaluationResult::Optimized,
+                    size: 4,
+                    bit_offset: Some(0),
+                }]),
+            ),
         ];
 
         for (name, bytes, expected) in cases {
@@ -1572,15 +1712,6 @@ mod tests {
                     constants::DW_OP_stack_value.0,
                 ],
                 "DW_OP_drop",
-            ),
-            (
-                "DW_OP_piece",
-                {
-                    let mut bytes = vec![constants::DW_OP_lit1.0, constants::DW_OP_piece.0];
-                    bytes.extend(encode_uleb(1));
-                    bytes
-                },
-                "DW_OP_piece",
             ),
             (
                 "DW_OP_bit_piece",
