@@ -5,7 +5,7 @@ use crate::core::{
     PieceLocation, PlanExprOp, Provenance, Result, RuntimeCapabilities, RuntimeRequirement, TypeId,
     UnsupportedReason, VariableId, VariableLocation, VerifierRisk,
 };
-use crate::semantics::PcRange;
+use crate::semantics::{strip_type_aliases, PcRange};
 use crate::TypeInfo;
 
 /// Owned semantic view returned by PC-context variable queries.
@@ -493,15 +493,15 @@ impl VariableReadPlan {
     }
 
     fn plan_field_access(&self, dwarf_type: &TypeInfo, field: &str) -> Result<Self> {
-        let (base_location, aggregate_type) = match strip_alias_type(dwarf_type) {
+        let (base_location, aggregate_type) = match strip_type_aliases(dwarf_type) {
             TypeInfo::PointerType { target_type, .. } => (
                 dereference_location(&self.location)?,
-                strip_alias_type(target_type).clone(),
+                strip_type_aliases(target_type).clone(),
             ),
             ty => (self.location.clone(), ty.clone()),
         };
 
-        let member = match strip_alias_type(&aggregate_type) {
+        let member = match strip_type_aliases(&aggregate_type) {
             TypeInfo::StructType { name, members, .. } => members
                 .iter()
                 .find(|member| member.name == field)
@@ -539,7 +539,7 @@ impl VariableReadPlan {
         index: i64,
         context: ElementIndexContext,
     ) -> Result<Self> {
-        let (base_location, element_type, stride) = match strip_alias_type(dwarf_type) {
+        let (base_location, element_type, stride) = match strip_type_aliases(dwarf_type) {
             TypeInfo::ArrayType { element_type, .. } => {
                 let stride = element_type.size().max(1);
                 (self.location.clone(), element_type.as_ref().clone(), stride)
@@ -574,7 +574,7 @@ impl VariableReadPlan {
     }
 
     fn plan_pointer_deref(&self, dwarf_type: &TypeInfo) -> Result<Self> {
-        let target_type = match strip_alias_type(dwarf_type) {
+        let target_type = match strip_type_aliases(dwarf_type) {
             TypeInfo::PointerType { target_type, .. } => target_type.as_ref().clone(),
             ty => {
                 return Err(PlanError::InvalidPointerDereference {
@@ -1055,18 +1055,6 @@ fn requirement_rank(requirement: &RuntimeRequirement) -> u8 {
         RuntimeRequirement::SleepableUprobe => 1,
         RuntimeRequirement::UserMemoryRead => 2,
         RuntimeRequirement::DwarfCfiRecovery => 3,
-    }
-}
-
-fn strip_alias_type(ty: &TypeInfo) -> &TypeInfo {
-    match ty {
-        TypeInfo::TypedefType {
-            underlying_type, ..
-        }
-        | TypeInfo::QualifiedType {
-            underlying_type, ..
-        } => strip_alias_type(underlying_type),
-        _ => ty,
     }
 }
 

@@ -1,3 +1,4 @@
+pub mod c_types;
 pub mod pc_context;
 pub mod unwind_plan;
 pub mod variable_plan;
@@ -6,6 +7,7 @@ pub(crate) mod origins;
 pub(crate) mod pc;
 pub(crate) mod types;
 
+pub use c_types::*;
 pub(crate) use origins::{
     resolve_attr_with_unit_origins, resolve_name_with_origins, resolve_origin_entry,
 };

@@ -39,29 +39,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     fn cookie_for_module_or_fallback(&mut self, module_path: &str) -> u64 {
         self.fallback_cookie_from_module_path(module_path)
     }
-    /// Helper: unwrap typedef/qualified wrappers to the underlying type
-    fn unwrap_type_aliases(mut t: &TypeInfo) -> &TypeInfo {
-        loop {
-            match t {
-                TypeInfo::TypedefType {
-                    underlying_type, ..
-                } => t = underlying_type.as_ref(),
-                TypeInfo::QualifiedType {
-                    underlying_type, ..
-                } => t = underlying_type.as_ref(),
-                _ => break,
-            }
-        }
-        t
-    }
-
-    /// Helper: determine if a DWARF type represents an aggregate (struct/union/array)
-    fn is_aggregate_type(&self, t: &TypeInfo) -> bool {
-        matches!(
-            Self::unwrap_type_aliases(t),
-            TypeInfo::StructType { .. } | TypeInfo::UnionType { .. } | TypeInfo::ArrayType { .. }
-        )
-    }
     fn planned_value_to_llvm_value(
         &mut self,
         value: &ghostscope_dwarf::PlannedValue,
@@ -305,33 +282,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         MemoryAccessSize::from_size(dwarf_type.size())
     }
 
-    fn is_signed_integer_type(dwarf_type: &TypeInfo) -> bool {
-        match dwarf_type {
-            TypeInfo::BaseType { encoding, .. } => {
-                *encoding == ghostscope_dwarf::constants::DW_ATE_signed.0 as u16
-                    || *encoding == ghostscope_dwarf::constants::DW_ATE_signed_char.0 as u16
-            }
-            TypeInfo::EnumType { base_type, .. } => Self::is_signed_integer_type(base_type),
-            TypeInfo::BitfieldType {
-                underlying_type, ..
-            } => Self::is_signed_integer_type(underlying_type),
-            TypeInfo::TypedefType {
-                underlying_type, ..
-            }
-            | TypeInfo::QualifiedType {
-                underlying_type, ..
-            } => Self::is_signed_integer_type(underlying_type),
-            _ => false,
-        }
-    }
-
     fn sign_extend_memory_read_if_needed(
         &self,
         value: BasicValueEnum<'ctx>,
         dwarf_type: &TypeInfo,
         access_size: MemoryAccessSize,
     ) -> Result<BasicValueEnum<'ctx>> {
-        if !Self::is_signed_integer_type(dwarf_type) || matches!(access_size, MemoryAccessSize::U64)
+        if !ghostscope_dwarf::is_c_signed_integer_type(dwarf_type)
+            || matches!(access_size, MemoryAccessSize::U64)
         {
             return Ok(value);
         }
@@ -463,7 +421,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             module_hint.as_deref(),
         )?;
 
-        if self.is_aggregate_type(dwarf_type) {
+        if ghostscope_dwarf::is_c_aggregate_type(dwarf_type) {
             let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
             let as_ptr = self
                 .builder
