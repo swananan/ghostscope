@@ -943,7 +943,6 @@ trace calculate_something {
 "#;
 
     // Test with both optimization levels.
-    // TODO: Re-enable optimized runs once we can reconstruct inlined symbols without full debug info.
     let optimization_levels = [OptimizationLevel::Debug, OptimizationLevel::O2];
 
     for opt_level in &optimization_levels {
@@ -951,14 +950,6 @@ trace calculate_something {
             "=== Function Level Tracing Test ({}) ===",
             opt_level.description()
         );
-
-        if *opt_level != OptimizationLevel::Debug {
-            println!(
-                "⏭️  Skipping {} run (TODO: handle inlined symbols without full debug info)",
-                opt_level.description()
-            );
-            continue;
-        }
 
         let (exit_code, stdout, stderr) =
             run_ghostscope_with_script_opt(script_content, 3, *opt_level).await?;
