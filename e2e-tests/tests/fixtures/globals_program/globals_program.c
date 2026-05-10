@@ -6,7 +6,7 @@
 
 // Executable-level globals
 int g_counter = 42;                         // .data
-static int s_internal = 7;                  // .data
+static int s_internal = 7, module_duplicate_counter = 1000; // .data
 static int s_bss_counter;                    // .bss
 const char g_message[] = "Hello, Global!";   // .rodata
 char g_bss_buffer[1024];                     // .bss
@@ -30,7 +30,7 @@ static void tick_once(int i) {
     char* lb = lib_bss;
     // mutate executable globals
     g_counter += 1;
-    s_internal += 2;
+    s_internal += 2; module_duplicate_counter += 11;
     s_bss_counter += 3;
 
     // update complex state

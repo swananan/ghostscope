@@ -214,6 +214,72 @@ async fn test_optimized_inline_parameters_have_exact_values_before_internal_call
 }
 
 #[tokio::test]
+async fn test_optimized_out_local_print_emits_marker_at_runtime() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("inline_call_value_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let query_results = analyzer.query_source_line_best_effort(
+        "inline_call_value_program.c",
+        INLINE_BEFORE_CALL_TRACE_LINE,
+    )?;
+    anyhow::ensure!(
+        query_results.iter().any(|result| {
+            result.variables.iter().any(|variable| {
+                variable.name == "local_x"
+                    && matches!(variable.location, VariableLocation::OptimizedOut)
+            })
+        }),
+        "Expected local_x to be visible but optimized out at inline_call_value_program.c:{INLINE_BEFORE_CALL_TRACE_LINE}: {query_results:?}"
+    );
+
+    let target = spawn_inline_call_value_program(&binary_path).await?;
+    let script = format!(
+        "trace inline_call_value_program.c:{INLINE_BEFORE_CALL_TRACE_LINE} {{\n    print local_x;\n}}\n"
+    );
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(&script, 4, &target).await?;
+    target.terminate().await?;
+
+    if should_skip_for_ebpf_env(exit_code, &stderr) {
+        return Ok(());
+    }
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.contains("<optimized out>") || stdout.contains("<optimized_out>"),
+        "Expected direct print of optimized-out local_x to emit an optimized-out marker. STDOUT: {stdout}\nSTDERR: {stderr}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_optimized_out_local_value_expression_is_rejected() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("inline_call_value_program")?;
+    let target = spawn_inline_call_value_program(&binary_path).await?;
+    let script = format!(
+        "trace inline_call_value_program.c:{INLINE_BEFORE_CALL_TRACE_LINE} {{\n    if local_x == 0 {{ print \"VALUE\"; }}\n}}\n"
+    );
+    let (_exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(&script, 3, &target).await?;
+    target.terminate().await?;
+
+    let has_banner = stderr.contains("Script compilation failed")
+        || stderr.contains("No uprobe configurations created");
+    let has_message =
+        stderr.contains("local_x") && stderr.contains("optimized out at the selected probe PC");
+    assert!(
+        has_banner && has_message,
+        "Expected optimized-out local_x to be rejected in a value expression.\nSTDOUT: {stdout}\nSTDERR: {stderr}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_optimized_inline_parameters_survive_internal_call_sites() -> anyhow::Result<()> {
     init();
 

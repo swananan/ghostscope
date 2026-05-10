@@ -2034,6 +2034,57 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+async fn test_duplicate_global_name_prefers_current_module() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let target = spawn_globals_program(&binary_path).await?;
+
+    let script = r#"
+trace globals_program.c:32 {
+    print "MAIN_DUP:{}", module_duplicate_counter;
+}
+trace lib_tick {
+    print "LIB_DUP:{}", module_duplicate_counter;
+}
+"#;
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    let re_main = Regex::new(r"MAIN_DUP:(-?\d+)").unwrap();
+    let re_lib = Regex::new(r"LIB_DUP:(-?\d+)").unwrap();
+    let mut main_vals = Vec::new();
+    let mut lib_vals = Vec::new();
+    for line in stdout.lines() {
+        if let Some(c) = re_main.captures(line) {
+            main_vals.push(c[1].parse::<i64>()?);
+        }
+        if let Some(c) = re_lib.captures(line) {
+            lib_vals.push(c[1].parse::<i64>()?);
+        }
+    }
+
+    assert!(
+        main_vals.len() >= 2 && lib_vals.len() >= 2,
+        "Insufficient duplicate-global events. STDOUT: {stdout}"
+    );
+    assert_eq!(
+        main_vals[1] - main_vals[0],
+        11,
+        "main trace should bind executable static, not library static. STDOUT: {stdout}"
+    );
+    assert_eq!(
+        lib_vals[1] - lib_vals[0],
+        101,
+        "library trace should bind library static, not executable static. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_print_format_global_member_direct() -> anyhow::Result<()> {
     init();
 
