@@ -9,6 +9,11 @@ use crate::{
 };
 use std::collections::HashSet;
 
+// Optimized inline point entries observed from GCC/Clang sit only a few bytes
+// before the first non-empty range. Keep the window small so distant
+// caller-side setup PCs still fall back to the range start.
+const MAX_INLINE_POINT_ENTRY_PC_GAP: u64 = 32;
+
 impl LoadedObjfile {
     pub(crate) fn lookup_function_addresses(&self, name: &str) -> Vec<u64> {
         tracing::debug!("LoadedObjfile: looking up function '{}'", name);
@@ -224,7 +229,15 @@ impl LoadedObjfile {
                     tracing::debug!("Inline '{}' has no ranges; entry_pc={epc_dbg}", entry.name);
                 }
 
-                if let Some(addr) = Self::selected_inline_address(entry, &ranges) {
+                let entry_pc_has_line_entry = entry.entry_pc.is_some_and(|pc| {
+                    self.line_mapping
+                        .get_entries_in_range(pc, pc)
+                        .next()
+                        .is_some()
+                });
+                if let Some(addr) =
+                    Self::selected_inline_address(entry, &ranges, entry_pc_has_line_entry)
+                {
                     tracing::debug!("Inline '{}' selected=0x{addr:x}", entry.name);
                     out.push(addr);
                 } else {
@@ -303,12 +316,22 @@ impl LoadedObjfile {
     fn selected_inline_address(
         entry: &crate::core::IndexEntry,
         ranges: &[(u64, u64)],
+        entry_pc_has_line_entry: bool,
     ) -> Option<u64> {
         let first_start = ranges.first().map(|(start, _)| *start);
         let low_pc = ranges.iter().map(|(start, _)| *start).min();
+        // Optimized inline DIEs can have a point entry_pc just before the
+        // non-empty DW_AT_ranges. Keep it when the line table confirms the PC.
+        let line_table_point_entry_pc = entry.entry_pc.filter(|pc| {
+            entry_pc_has_line_entry
+                && first_start.is_some_and(|start| {
+                    *pc < start && start.saturating_sub(*pc) <= MAX_INLINE_POINT_ENTRY_PC_GAP
+                })
+        });
 
         entry
             .validated_entry_pc(ranges)
+            .or(line_table_point_entry_pc)
             .or(first_start)
             .or(low_pc)
             .or(entry.representative_addr)
@@ -1035,6 +1058,7 @@ mod tests {
                     (0x8eb16a, 0x8eb1b0),
                     (0x76e798, 0x76e7a2),
                 ],
+                false,
             ),
             Some(0x8eb16a)
         );
@@ -1059,6 +1083,7 @@ mod tests {
                     (0x8eb150, 0x8eb157),
                     (0x76e798, 0x76e7a2),
                 ],
+                false,
             ),
             Some(0x8eb12b)
         );
@@ -1069,7 +1094,31 @@ mod tests {
         let entry = inline_entry(&[(0x1289, 0x1293)], Some(0x1215));
 
         assert_eq!(
-            LoadedObjfile::selected_inline_address(&entry, &[(0x1289, 0x1293)]),
+            LoadedObjfile::selected_inline_address(&entry, &[(0x1289, 0x1293)], false),
+            Some(0x1289)
+        );
+    }
+
+    #[test]
+    fn selected_inline_address_keeps_line_table_point_entry_before_range() {
+        let entry = inline_entry(&[(0x1278, 0x1284)], Some(0x1275));
+
+        assert_eq!(
+            LoadedObjfile::selected_inline_address(&entry, &[(0x1278, 0x1284)], true),
+            Some(0x1275)
+        );
+        assert_eq!(
+            LoadedObjfile::selected_inline_address(&entry, &[(0x1278, 0x1284)], false),
+            Some(0x1278)
+        );
+    }
+
+    #[test]
+    fn selected_inline_address_rejects_distant_line_table_entry_before_range() {
+        let entry = inline_entry(&[(0x1289, 0x1293)], Some(0x1215));
+
+        assert_eq!(
+            LoadedObjfile::selected_inline_address(&entry, &[(0x1289, 0x1293)], true),
             Some(0x1289)
         );
     }
@@ -1079,7 +1128,7 @@ mod tests {
         let entry = inline_entry(&[], Some(0x1289));
 
         assert_eq!(
-            LoadedObjfile::selected_inline_address(&entry, &[]),
+            LoadedObjfile::selected_inline_address(&entry, &[], false),
             Some(0x1289)
         );
     }
