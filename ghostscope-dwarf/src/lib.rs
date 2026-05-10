@@ -36,13 +36,15 @@ pub use core::{
 
 // Re-export semantic contract types.
 pub use semantics::{
-    AddressOrigin, AddressSpaceInfo, CfaRulePlan, CompactUnwindRow, CompactUnwindStats,
-    CompactUnwindTable, InlineFrame, LvalueAddressPlan, PcContext, PcLineInfo, PcRange,
-    PlannedAddress, PlannedAddressKind, PlannedValue, RegisterRecoveryPlan, RuntimeComputedExpr,
-    RuntimeComputedKind, UnwindDiagnostic, UnwindDiagnosticKind, VariableAccessPath,
-    VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
-    VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
-    VisibleVariable, VisibleVariablesResult,
+    c_integer_comparison_type, is_c_aggregate_type, is_c_pointer_or_array_type,
+    is_c_signed_integer_type, strip_type_aliases, usual_c_arithmetic_comparison_plan,
+    AddressOrigin, AddressSpaceInfo, CIntegerComparisonPlan, CIntegerComparisonType, CfaRulePlan,
+    CompactUnwindRow, CompactUnwindStats, CompactUnwindTable, InlineFrame, LvalueAddressPlan,
+    PcContext, PcLineInfo, PcRange, PlannedAddress, PlannedAddressKind, PlannedValue,
+    RegisterRecoveryPlan, RuntimeComputedExpr, RuntimeComputedKind, UnwindDiagnostic,
+    UnwindDiagnosticKind, VariableAccessPath, VariableAccessSegment, VariableLoweringKind,
+    VariableLoweringPlan, VariableMaterialization, VariableMaterializationPlan, VariablePlan,
+    VariableQueryDiagnostic, VariableReadPlan, VisibleVariable, VisibleVariablesResult,
 };
 
 // Re-export type definitions from protocol (avoiding circular dependencies)
