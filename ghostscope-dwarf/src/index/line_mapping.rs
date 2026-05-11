@@ -7,8 +7,13 @@ use std::path::Path;
 /// Pure line mapping table for fast address→line lookup
 #[derive(Debug)]
 pub struct LineMappingTable {
-    /// Complete address to line mapping (built at startup)
-    address_to_line_map: BTreeMap<u64, LineEntry>,
+    /// Complete address to line mapping (built at startup).
+    ///
+    /// Multiple DWARF line rows can legitimately point at the same PC, for
+    /// example inline/header locations sharing one instruction. Keep every row
+    /// so source-location selection can score all candidates instead of being
+    /// decided by insertion order.
+    address_to_line_map: BTreeMap<u64, Vec<LineEntry>>,
 
     /// Path-based reverse mapping: (file_path, line_number) → addresses
     /// Uses full paths as keys for accurate lookup
@@ -28,7 +33,7 @@ impl LineMappingTable {
         mut entries: Vec<LineEntry>,
         scoped: &crate::index::ScopedFileIndexManager,
     ) -> Self {
-        let mut address_to_line_map = BTreeMap::new();
+        let mut address_to_line_map: BTreeMap<u64, Vec<LineEntry>> = BTreeMap::new();
         let mut path_line_to_addresses: HashMap<(String, u64), Vec<u64>> = HashMap::new();
         let mut basename_to_paths: HashMap<String, HashSet<String>> = HashMap::new();
 
@@ -43,7 +48,10 @@ impl LineMappingTable {
             }
 
             // Always populate the address→line map
-            address_to_line_map.insert(e.address, e.clone());
+            address_to_line_map
+                .entry(e.address)
+                .or_default()
+                .push(e.clone());
 
             // Populate path→(line→addresses) only when we have a resolved path
             if !e.file_path.is_empty() {
@@ -72,6 +80,10 @@ impl LineMappingTable {
         }
     }
 
+    fn representative_entry(entries: &[LineEntry]) -> Option<&LineEntry> {
+        entries.last()
+    }
+
     /// Find best matching line (closest address <= target address)
     pub(crate) fn lookup_line(&self, address: u64) -> Option<&LineEntry> {
         // Use BTreeMap's range to find the largest address <= target address
@@ -79,7 +91,7 @@ impl LineMappingTable {
             .address_to_line_map
             .range(..=address)
             .next_back()
-            .map(|(_, entry)| entry);
+            .and_then(|(_, entries)| Self::representative_entry(entries));
 
         if let Some(entry) = result {
             tracing::debug!(
@@ -97,18 +109,14 @@ impl LineMappingTable {
     }
 
     /// Find all line entries at exact address (for handling overlapping instructions)
-    /// Current map stores a single entry per address; use O(1) get to avoid O(N) scans.
     pub(crate) fn lookup_all_lines_at_address(&self, address: u64) -> Vec<&LineEntry> {
-        if let Some(entry) = self.address_to_line_map.get(&address) {
+        if let Some(entries) = self.address_to_line_map.get(&address) {
             tracing::debug!(
-                "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> 1 entry (file='{}', line={}, cu='{}', is_stmt={})",
+                "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> {} entries",
                 address,
-                entry.file_path,
-                entry.line,
-                entry.compilation_unit,
-                entry.is_stmt
+                entries.len()
             );
-            vec![entry]
+            entries.iter().collect()
         } else {
             tracing::debug!(
                 "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> 0 entries",
@@ -213,6 +221,7 @@ impl LineMappingTable {
         // Sort addresses
         let mut sorted_addrs = addresses.clone();
         sorted_addrs.sort_unstable();
+        sorted_addrs.dedup();
 
         // Group consecutive addresses (within 32 bytes of each other)
         const CONSECUTIVE_THRESHOLD: u64 = 32;
@@ -242,8 +251,8 @@ impl LineMappingTable {
             if group.len() == 1 {
                 // Single address - check if it's is_stmt
                 let addr = group[0];
-                if let Some(entry) = self.address_to_line_map.get(&addr) {
-                    if entry.is_stmt {
+                if let Some(entries) = self.address_to_line_map.get(&addr) {
+                    if entries.iter().any(|entry| entry.is_stmt) {
                         result.push(addr);
                     }
                     // Note: Unlike GDB, we still include non-is_stmt single addresses
@@ -262,8 +271,8 @@ impl LineMappingTable {
                 // Multiple consecutive addresses - find the first is_stmt address
                 let mut selected = None;
                 for &addr in &group {
-                    if let Some(entry) = self.address_to_line_map.get(&addr) {
-                        if entry.is_stmt {
+                    if let Some(entries) = self.address_to_line_map.get(&addr) {
+                        if entries.iter().any(|entry| entry.is_stmt) {
                             selected = Some(addr);
                             break;
                         }
@@ -341,7 +350,10 @@ impl LineMappingTable {
         let mut best_address: Option<u64> = None;
 
         // Iterate through addresses starting from function_start
-        for (&address, entry) in self.address_to_line_map.range(function_start..) {
+        for (&address, entries) in self.address_to_line_map.range(function_start..) {
+            let Some(entry) = Self::representative_entry(entries) else {
+                continue;
+            };
             if entry.prologue_end {
                 tracing::debug!(
                     "LineMappingTable: found prologue_end=true at 0x{:x} (line {}, file {})",
@@ -388,8 +400,11 @@ impl LineMappingTable {
         );
 
         // Look for the first is_stmt=true address after function_start
-        for (&address, entry) in self.address_to_line_map.range((function_start + 1)..) {
-            if entry.is_stmt {
+        for (&address, entries) in self
+            .address_to_line_map
+            .range((function_start.saturating_add(1))..)
+        {
+            if let Some(entry) = Self::representative_entry(entries).filter(|entry| entry.is_stmt) {
                 tracing::debug!(
                     "LineMappingTable: found is_stmt=true at 0x{:x} (line {}, file {})",
                     address,
@@ -397,7 +412,7 @@ impl LineMappingTable {
                     entry.file_path
                 );
                 return Some(address);
-            } else {
+            } else if let Some(entry) = Self::representative_entry(entries) {
                 // Extra diagnostics to understand why we didn't pick nearer addresses
                 tracing::debug!(
                     "LineMappingTable: skipping non-is_stmt at 0x{:x} (offset +{}, line {}, file {}, prologue_end={})",
@@ -424,6 +439,64 @@ impl LineMappingTable {
         start_addr: u64,
         end_addr: u64,
     ) -> impl Iterator<Item = (&u64, &LineEntry)> {
-        self.address_to_line_map.range(start_addr..=end_addr)
+        self.address_to_line_map
+            .range(start_addr..=end_addr)
+            .flat_map(|(address, entries)| entries.iter().map(move |entry| (address, entry)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn line_entry(address: u64, file_path: &str, line: u64, is_stmt: bool) -> LineEntry {
+        LineEntry {
+            address,
+            file_path: file_path.to_string(),
+            file_index: 1,
+            compilation_unit: Arc::from("main.c"),
+            line,
+            column: 0,
+            is_stmt,
+            prologue_end: false,
+        }
+    }
+
+    #[test]
+    fn preserves_same_address_line_entries() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let table = LineMappingTable::from_entries_with_scoped_manager(
+            vec![
+                line_entry(0x1000, "/src/include/header.h", 12, false),
+                line_entry(0x1000, "/src/main.c", 42, true),
+            ],
+            &scoped,
+        );
+
+        let entries = table.lookup_all_lines_at_address(0x1000);
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.file_path == "/src/include/header.h"));
+        assert!(entries.iter().any(|entry| entry.file_path == "/src/main.c"));
+    }
+
+    #[test]
+    fn lookup_line_uses_representative_row_with_duplicate_address() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let table = LineMappingTable::from_entries_with_scoped_manager(
+            vec![
+                line_entry(0x1000, "/src/main.c", 42, true),
+                line_entry(0x1000, "/src/include/header.h", 12, false),
+            ],
+            &scoped,
+        );
+
+        let entry = table.lookup_line(0x1004).expect("nearest line entry");
+
+        assert_eq!(entry.file_path, "/src/include/header.h");
+        assert_eq!(entry.line, 12);
     }
 }

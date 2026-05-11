@@ -102,6 +102,14 @@ impl DwarfAnalyzer {
         &self,
         module_address: &ModuleAddress,
     ) -> Result<AddressQueryResult> {
+        self.build_address_query_result_with_source_hint(module_address, None)
+    }
+
+    fn build_address_query_result_with_source_hint(
+        &self,
+        module_address: &ModuleAddress,
+        source_hint: Option<(&str, u32)>,
+    ) -> Result<AddressQueryResult> {
         let mut variables = Vec::new();
         let mut parameters = Vec::new();
 
@@ -113,7 +121,19 @@ impl DwarfAnalyzer {
             }
         }
 
-        let source_location = self.lookup_source_location(module_address);
+        let source_location = if let Some((file_path, line_number)) = source_hint {
+            self.modules
+                .get(&module_address.module_path)
+                .and_then(|module_data| {
+                    module_data.lookup_source_location_for_source_line(
+                        module_address.address,
+                        file_path,
+                        line_number,
+                    )
+                })
+        } else {
+            self.lookup_source_location(module_address)
+        };
         let function_name = self.find_function_name_by_module_address(module_address);
         let is_inline = self.is_inline_at(module_address);
 
@@ -140,6 +160,23 @@ impl DwarfAnalyzer {
             .collect()
     }
 
+    fn query_module_addresses_for_source_line(
+        &self,
+        module_addresses: Vec<ModuleAddress>,
+        file_path: &str,
+        line_number: u32,
+    ) -> Result<Vec<AddressQueryResult>> {
+        module_addresses
+            .iter()
+            .map(|module_address| {
+                self.build_address_query_result_with_source_hint(
+                    module_address,
+                    Some((file_path, line_number)),
+                )
+            })
+            .collect()
+    }
+
     fn query_module_addresses_best_effort(
         &self,
         module_addresses: Vec<ModuleAddress>,
@@ -150,6 +187,54 @@ impl DwarfAnalyzer {
 
         for module_address in &module_addresses {
             match self.build_address_query_result(module_address) {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    let error_string = error.to_string();
+                    tracing::warn!(
+                        "Skipping failed address query for {} at {}:0x{:x}: {}",
+                        query_label,
+                        module_address.module_display(),
+                        module_address.address,
+                        error_string
+                    );
+
+                    if first_error.is_none() {
+                        first_error = Some((module_address.clone(), error_string));
+                    }
+                }
+            }
+        }
+
+        if results.is_empty() {
+            if let Some((module_address, error)) = first_error {
+                return Err(anyhow::anyhow!(
+                    "Failed to analyze any address for {} (first failure at {}:0x{:x}: {})",
+                    query_label,
+                    module_address.module_display(),
+                    module_address.address,
+                    error
+                ));
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn query_module_addresses_for_source_line_best_effort(
+        &self,
+        module_addresses: Vec<ModuleAddress>,
+        file_path: &str,
+        line_number: u32,
+        query_label: &str,
+    ) -> Result<Vec<AddressQueryResult>> {
+        let mut results = Vec::new();
+        let mut first_error: Option<(ModuleAddress, String)> = None;
+
+        for module_address in &module_addresses {
+            match self.build_address_query_result_with_source_hint(
+                module_address,
+                Some((file_path, line_number)),
+            ) {
                 Ok(result) => results.push(result),
                 Err(error) => {
                     let error_string = error.to_string();
@@ -741,7 +826,7 @@ impl DwarfAnalyzer {
         line_number: u32,
     ) -> Result<Vec<AddressQueryResult>> {
         let module_addresses = self.lookup_addresses_by_source_line(file_path, line_number);
-        self.query_module_addresses(module_addresses)
+        self.query_module_addresses_for_source_line(module_addresses, file_path, line_number)
     }
 
     /// Query source-line debug information across all modules, skipping
@@ -753,8 +838,10 @@ impl DwarfAnalyzer {
         line_number: u32,
     ) -> Result<Vec<AddressQueryResult>> {
         let module_addresses = self.lookup_addresses_by_source_line(file_path, line_number);
-        self.query_module_addresses_best_effort(
+        self.query_module_addresses_for_source_line_best_effort(
             module_addresses,
+            file_path,
+            line_number,
             &format!("source line '{file_path}:{line_number}'"),
         )
     }
