@@ -1,11 +1,19 @@
 mod common;
 
+use anyhow::Context;
 use common::{fixture_compiler_available, init, FixtureCompiler, OptimizationLevel, FIXTURES};
+use gimli::write::{
+    Address, AttributeValue as WriteAttributeValue, DebugInfoRef as WriteDebugInfoRef,
+    Dwarf as WriteDwarf, EndianVec, LineProgram, Sections, Unit,
+};
 use gimli::Reader;
+use gimli::{Format, SectionId};
 use object::{Object, ObjectSection, ObjectSymbol};
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempPath;
@@ -20,6 +28,34 @@ type TestReader = gimli::EndianArcSlice<gimli::RunTimeEndian>;
 enum RangesAttrEncoding {
     Offset,
     Index,
+}
+
+fn command_available(name: &str) -> bool {
+    StdCommand::new(name)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn preferred_c_compiler() -> Option<&'static str> {
+    ["cc", "gcc", "clang"]
+        .into_iter()
+        .find(|candidate| command_available(candidate))
+}
+
+fn run_command(command: &mut StdCommand, label: &str) -> anyhow::Result<()> {
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run {label}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{label} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
 }
 
 fn find_symbol_address(binary_path: &std::path::Path, symbol_name: &str) -> anyhow::Result<u64> {
@@ -321,6 +357,226 @@ fn line_sequence_end_and_gap_without_line_rows(binary_path: &Path) -> anyhow::Re
     );
 }
 
+fn write_cross_cu_ref_addr_dwarf_sections(
+    out_dir: &Path,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let encoding = gimli::Encoding {
+        format: Format::Dwarf32,
+        version: 4,
+        address_size: 8,
+    };
+
+    let mut dwarf = WriteDwarf::new();
+
+    let decl_unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+    let decl_unit = dwarf.units.get_mut(decl_unit_id);
+    let decl_root = decl_unit.root();
+    decl_unit.get_mut(decl_root).set(
+        gimli::constants::DW_AT_name,
+        WriteAttributeValue::String(b"cross_cu_declarations.c".to_vec()),
+    );
+
+    let origin_fn_id = decl_unit.add(decl_root, gimli::constants::DW_TAG_subprogram);
+    decl_unit.get_mut(origin_fn_id).set(
+        gimli::constants::DW_AT_name,
+        WriteAttributeValue::String(b"cross_cu_origin_fn".to_vec()),
+    );
+
+    let spec_fn_id = decl_unit.add(decl_root, gimli::constants::DW_TAG_subprogram);
+    let spec_fn = decl_unit.get_mut(spec_fn_id);
+    spec_fn.set(
+        gimli::constants::DW_AT_name,
+        WriteAttributeValue::String(b"cross_cu_spec_fn".to_vec()),
+    );
+    spec_fn.set(
+        gimli::constants::DW_AT_declaration,
+        WriteAttributeValue::Flag(true),
+    );
+
+    let origin_type_id = decl_unit.add(decl_root, gimli::constants::DW_TAG_structure_type);
+    let origin_type = decl_unit.get_mut(origin_type_id);
+    origin_type.set(
+        gimli::constants::DW_AT_name,
+        WriteAttributeValue::String(b"CrossCuOriginType".to_vec()),
+    );
+    origin_type.set(
+        gimli::constants::DW_AT_declaration,
+        WriteAttributeValue::Flag(true),
+    );
+
+    let spec_type_id = decl_unit.add(decl_root, gimli::constants::DW_TAG_structure_type);
+    let spec_type = decl_unit.get_mut(spec_type_id);
+    spec_type.set(
+        gimli::constants::DW_AT_name,
+        WriteAttributeValue::String(b"CrossCuSpecType".to_vec()),
+    );
+    spec_type.set(
+        gimli::constants::DW_AT_declaration,
+        WriteAttributeValue::Flag(true),
+    );
+
+    let concrete_unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+    let concrete_unit = dwarf.units.get_mut(concrete_unit_id);
+    let concrete_root = concrete_unit.root();
+    concrete_unit.get_mut(concrete_root).set(
+        gimli::constants::DW_AT_name,
+        WriteAttributeValue::String(b"cross_cu_concrete.c".to_vec()),
+    );
+
+    let concrete_origin_fn_id =
+        concrete_unit.add(concrete_root, gimli::constants::DW_TAG_subprogram);
+    let concrete_origin_fn = concrete_unit.get_mut(concrete_origin_fn_id);
+    concrete_origin_fn.set(
+        gimli::constants::DW_AT_abstract_origin,
+        WriteAttributeValue::DebugInfoRef(WriteDebugInfoRef::Entry(decl_unit_id, origin_fn_id)),
+    );
+    concrete_origin_fn.set(
+        gimli::constants::DW_AT_low_pc,
+        WriteAttributeValue::Address(Address::Constant(0x501000)),
+    );
+    concrete_origin_fn.set(
+        gimli::constants::DW_AT_high_pc,
+        WriteAttributeValue::Udata(0x20),
+    );
+
+    let concrete_spec_fn_id = concrete_unit.add(concrete_root, gimli::constants::DW_TAG_subprogram);
+    let concrete_spec_fn = concrete_unit.get_mut(concrete_spec_fn_id);
+    concrete_spec_fn.set(
+        gimli::constants::DW_AT_specification,
+        WriteAttributeValue::DebugInfoRef(WriteDebugInfoRef::Entry(decl_unit_id, spec_fn_id)),
+    );
+    concrete_spec_fn.set(
+        gimli::constants::DW_AT_low_pc,
+        WriteAttributeValue::Address(Address::Constant(0x502000)),
+    );
+    concrete_spec_fn.set(
+        gimli::constants::DW_AT_high_pc,
+        WriteAttributeValue::Udata(0x30),
+    );
+
+    let concrete_origin_type_id =
+        concrete_unit.add(concrete_root, gimli::constants::DW_TAG_structure_type);
+    let concrete_origin_type = concrete_unit.get_mut(concrete_origin_type_id);
+    concrete_origin_type.set(
+        gimli::constants::DW_AT_abstract_origin,
+        WriteAttributeValue::DebugInfoRef(WriteDebugInfoRef::Entry(decl_unit_id, origin_type_id)),
+    );
+    concrete_origin_type.set(
+        gimli::constants::DW_AT_byte_size,
+        WriteAttributeValue::Udata(24),
+    );
+
+    let concrete_spec_type_id =
+        concrete_unit.add(concrete_root, gimli::constants::DW_TAG_structure_type);
+    let concrete_spec_type = concrete_unit.get_mut(concrete_spec_type_id);
+    concrete_spec_type.set(
+        gimli::constants::DW_AT_specification,
+        WriteAttributeValue::DebugInfoRef(WriteDebugInfoRef::Entry(decl_unit_id, spec_type_id)),
+    );
+    concrete_spec_type.set(
+        gimli::constants::DW_AT_byte_size,
+        WriteAttributeValue::Udata(16),
+    );
+
+    let mut sections = Sections::new(EndianVec::new(gimli::LittleEndian));
+    dwarf.write(&mut sections)?;
+
+    let mut written = Vec::new();
+    for id in [
+        SectionId::DebugAbbrev,
+        SectionId::DebugInfo,
+        SectionId::DebugStr,
+    ] {
+        let data = sections
+            .get(id)
+            .map(|section| section.slice().to_vec())
+            .unwrap_or_default();
+        if data.is_empty() {
+            continue;
+        }
+        let path = out_dir.join(format!("{}.bin", id.name().trim_start_matches('.')));
+        fs::write(&path, data)?;
+        written.push((id.name().to_string(), path));
+    }
+
+    Ok(written)
+}
+
+fn build_cross_cu_ref_addr_binary(out_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let Some(cc) = preferred_c_compiler() else {
+        eprintln!("Skipping cross-CU ref_addr e2e: no C compiler is available");
+        return Ok(None);
+    };
+    if !command_available("objcopy") {
+        eprintln!("Skipping cross-CU ref_addr e2e: objcopy is unavailable");
+        return Ok(None);
+    }
+
+    let source = out_dir.join("cross_cu_ref_addr_stub.c");
+    let binary = out_dir.join("cross_cu_ref_addr_stub");
+    fs::write(&source, "int main(void) { return 0; }\n")?;
+    run_command(
+        StdCommand::new(cc).arg("-o").arg(&binary).arg(&source),
+        "compile cross-CU ref_addr stub",
+    )?;
+
+    let sections = write_cross_cu_ref_addr_dwarf_sections(out_dir)?;
+    let mut objcopy = StdCommand::new("objcopy");
+    for (section_name, section_path) in &sections {
+        objcopy
+            .arg("--add-section")
+            .arg(format!("{section_name}={}", section_path.display()));
+    }
+    objcopy.arg(&binary);
+    run_command(
+        &mut objcopy,
+        "objcopy --add-section synthetic cross-CU DWARF",
+    )?;
+
+    Ok(Some(binary))
+}
+
+fn cross_cu_ref_addr_attrs(binary_path: &Path) -> anyhow::Result<HashSet<gimli::DwAt>> {
+    let dwarf = load_dwarf_from_binary(binary_path)?;
+    let mut found = HashSet::new();
+    let mut units = dwarf.units();
+
+    while let Some(header) = units.next()? {
+        let unit = dwarf.unit(header)?;
+        let mut entries = unit.entries();
+        while let Some(entry) = entries.next_dfs()? {
+            for attr_name in [
+                gimli::constants::DW_AT_abstract_origin,
+                gimli::constants::DW_AT_specification,
+            ] {
+                let Some(attr) = entry.attr(attr_name) else {
+                    continue;
+                };
+                if let gimli::AttributeValue::DebugInfoRef(offset) = attr.value() {
+                    if offset.to_unit_offset(&unit.header).is_none() {
+                        found.insert(attr_name);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(found)
+}
+
+fn assert_struct_type_size(
+    ty: Option<ghostscope_dwarf::TypeInfo>,
+    expected_name: &str,
+    expected_size: u64,
+) {
+    match ty {
+        Some(ghostscope_dwarf::TypeInfo::StructType { size, .. }) => {
+            assert_eq!(size, expected_size, "unexpected size for {expected_name}");
+        }
+        other => panic!("expected struct type for {expected_name}, got {other:?}"),
+    }
+}
+
 fn partitioned_target_ranges_attr_encoding(
     binary_path: &Path,
 ) -> anyhow::Result<RangesAttrEncoding> {
@@ -474,6 +730,61 @@ async fn test_source_line_query_preserves_same_pc_line_candidate() -> anyhow::Re
                 && result.source_line == Some(COMPLEX_DUPLICATE_PC_LINE)
         }),
         "Expected source-line query to keep requested line {COMPLEX_DUPLICATE_PC_LINE} at duplicate PC 0x{duplicate_pc:x}. Results: {query_results:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cross_cu_ref_addr_origin_and_spec_names_are_indexed() -> anyhow::Result<()> {
+    init();
+
+    let temp_dir = tempfile::tempdir()?;
+    let Some(binary_path) = build_cross_cu_ref_addr_binary(temp_dir.path())? else {
+        return Ok(());
+    };
+
+    let ref_attrs = cross_cu_ref_addr_attrs(&binary_path)?;
+    assert!(
+        ref_attrs.contains(&gimli::constants::DW_AT_abstract_origin),
+        "fixture should contain cross-CU DW_AT_abstract_origin ref_addr"
+    );
+    assert!(
+        ref_attrs.contains(&gimli::constants::DW_AT_specification),
+        "fixture should contain cross-CU DW_AT_specification ref_addr"
+    );
+
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load synthetic cross-CU DWARF from {}: {e}",
+                binary_path.display()
+            )
+        })?;
+
+    for (name, expected_address) in [
+        ("cross_cu_origin_fn", 0x501000),
+        ("cross_cu_spec_fn", 0x502000),
+    ] {
+        let addrs = analyzer.lookup_function_addresses(name);
+        assert!(
+            addrs.iter().any(|addr| {
+                addr.module_path == binary_path && addr.address == expected_address
+            }),
+            "Expected {name} to be indexed through a cross-CU origin/spec ref. Results: {addrs:?}"
+        );
+    }
+
+    assert_struct_type_size(
+        analyzer.resolve_struct_type_shallow_by_name_in_module(&binary_path, "CrossCuOriginType"),
+        "CrossCuOriginType",
+        24,
+    );
+    assert_struct_type_size(
+        analyzer.resolve_struct_type_shallow_by_name_in_module(&binary_path, "CrossCuSpecType"),
+        "CrossCuSpecType",
+        16,
     );
 
     Ok(())

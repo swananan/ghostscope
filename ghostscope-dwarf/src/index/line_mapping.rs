@@ -1,8 +1,7 @@
 //! Pure address→line mapping lookup (no parsing, no file operations)
 
-use crate::core::LineEntry;
+use crate::{core::LineEntry, path_match};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
 
 /// Pure line mapping table for fast address→line lookup
 #[derive(Debug)]
@@ -113,12 +112,16 @@ impl LineMappingTable {
     /// Find all line entries at exact address (for handling overlapping instructions)
     pub(crate) fn lookup_all_lines_at_address(&self, address: u64) -> Vec<&LineEntry> {
         if let Some(entries) = self.address_to_line_map.get(&address) {
+            let active_entries: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.contains_address(address))
+                .collect();
             tracing::debug!(
-                "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> {} entries",
+                "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> {} active entries",
                 address,
-                entries.len()
+                active_entries.len()
             );
-            entries.iter().collect()
+            active_entries
         } else {
             tracing::debug!(
                 "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> 0 entries",
@@ -146,15 +149,14 @@ impl LineMappingTable {
         }
 
         // Strategy 2: Basename candidates + suffix check (avoid global scans)
-        let basename = Path::new(file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(file_path);
+        let basename = path_match::file_name(file_path);
         if let Some(full_paths) = self.basename_to_paths.get(basename) {
-            let has_sep = file_path.contains('/') || file_path.contains('\\');
+            let has_sep = path_match::has_path_separator(file_path);
             if has_sep {
                 for full_path in full_paths {
-                    if full_path.ends_with(file_path) || file_path.ends_with(full_path) {
+                    if path_match::path_component_suffix_matches(full_path, file_path)
+                        || path_match::path_component_suffix_matches(file_path, full_path)
+                    {
                         if let Some(addresses) = self
                             .path_line_to_addresses
                             .get(&(full_path.clone(), line_number))
@@ -200,7 +202,9 @@ impl LineMappingTable {
             } else {
                 // Multiple files with same basename - try to match with partial path (best effort)
                 for full_path in full_paths {
-                    if full_path.ends_with(file_path) || file_path.ends_with(full_path) {
+                    if path_match::path_component_suffix_matches(full_path, file_path)
+                        || path_match::path_component_suffix_matches(file_path, full_path)
+                    {
                         if let Some(addresses) = self
                             .path_line_to_addresses
                             .get(&(full_path.clone(), line_number))
@@ -545,6 +549,23 @@ mod tests {
     }
 
     #[test]
+    fn lookup_addresses_by_path_requires_component_suffix_match() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let table = LineMappingTable::from_entries_with_scoped_manager(
+            vec![
+                line_entry(0x1000, "/src/myfoo/bar.c", 42, true),
+                line_entry(0x2000, "/src/foo/bar.c", 42, true),
+            ],
+            &scoped,
+        );
+
+        assert_eq!(
+            table.lookup_addresses_by_path("foo/bar.c", 42),
+            vec![0x2000]
+        );
+    }
+
+    #[test]
     fn lookup_line_does_not_cross_known_row_end() {
         let scoped = crate::index::ScopedFileIndexManager::new();
         let mut first = line_entry(0x1000, "/src/main.c", 10, true);
@@ -573,5 +594,21 @@ mod tests {
         assert!(table.lookup_line(0x1000).is_none());
         assert!(table.lookup_line(0x1fff).is_none());
         assert_eq!(table.lookup_line(0x2000).map(|entry| entry.line), Some(20));
+    }
+
+    #[test]
+    fn lookup_all_lines_at_address_ignores_zero_length_row() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let mut zero_length = line_entry(0x1000, "/src/main.c", 10, true);
+        zero_length.end_address = Some(0x1000);
+        let mut active = line_entry(0x1000, "/src/main.c", 11, true);
+        active.end_address = Some(0x1010);
+        let table =
+            LineMappingTable::from_entries_with_scoped_manager(vec![zero_length, active], &scoped);
+
+        let entries = table.lookup_all_lines_at_address(0x1000);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].line, 11);
     }
 }
