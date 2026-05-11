@@ -260,6 +260,67 @@ fn duplicate_line_row_address_for_source_line(
         })
 }
 
+fn line_sequence_end_and_gap_without_line_rows(binary_path: &Path) -> anyhow::Result<(u64, u64)> {
+    let dwarf = load_dwarf_from_binary(binary_path)?;
+    let mut non_end_addresses = HashSet::new();
+    let mut sequence_ranges = Vec::new();
+    let mut units = dwarf.units();
+
+    while let Some(header) = units.next()? {
+        let unit = dwarf.unit(header)?;
+        let Some(ref line_program) = unit.line_program else {
+            continue;
+        };
+        let (line_program, sequences) = line_program.clone().sequences()?;
+
+        for sequence in sequences {
+            let mut rows = line_program.resume_from(&sequence);
+            let mut sequence_start = None;
+            let mut sequence_end = None;
+
+            while let Some((_, row)) = rows.next_row()? {
+                if row.end_sequence() {
+                    sequence_end = Some(row.address());
+                    continue;
+                }
+
+                sequence_start.get_or_insert(row.address());
+                non_end_addresses.insert(row.address());
+            }
+
+            if let (Some(start), Some(end)) = (sequence_start, sequence_end) {
+                if start < end {
+                    sequence_ranges.push((start, end));
+                }
+            }
+        }
+    }
+
+    sequence_ranges.sort_unstable_by_key(|(start, _)| *start);
+    let Some((_, first_end)) = sequence_ranges.first().copied() else {
+        anyhow::bail!("{} has no line sequences", binary_path.display());
+    };
+    let mut covered_end = first_end;
+
+    for (next_start, next_end) in sequence_ranges.into_iter().skip(1) {
+        if covered_end.saturating_add(1) < next_start {
+            let end_address = covered_end;
+            let gap_address = covered_end + 1;
+            if !non_end_addresses.contains(&end_address)
+                && !non_end_addresses.contains(&gap_address)
+            {
+                return Ok((end_address, gap_address));
+            }
+        }
+        covered_end = covered_end.max(next_end);
+    }
+
+    anyhow::bail!(
+        "{} has no line-sequence gap without regular line rows",
+        binary_path.display()
+    );
+}
+
 fn partitioned_target_ranges_attr_encoding(
     binary_path: &Path,
 ) -> anyhow::Result<RangesAttrEncoding> {
@@ -357,6 +418,27 @@ async fn assert_partitioned_ranges_source_line_query_recovers_function_scope(
         }),
         "Expected partitioned_target scope recovery with parameter x for {scenario}. Results: {query_results:?}"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_source_lookup_ignores_line_sequence_end_and_gap() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::O3)?;
+    let (end_address, gap_address) = line_sequence_end_and_gap_without_line_rows(&binary_path)?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+
+    for address in [end_address, gap_address] {
+        let module_address = ghostscope_dwarf::ModuleAddress::new(binary_path.clone(), address);
+        let source_location = analyzer.lookup_source_location(&module_address);
+        assert!(
+            source_location.is_none(),
+            "Expected no source location for line-sequence boundary/gap address 0x{address:x}. Got {source_location:?}"
+        );
+    }
 
     Ok(())
 }

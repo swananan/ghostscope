@@ -2,7 +2,7 @@
 
 use crate::{
     binary::DwarfReader,
-    core::{FunctionDieKind, IndexEntry, Result},
+    core::{FunctionDieKind, IndexEntry, LineEntry, Result},
     index::{
         directory_from_index, resolve_file_path, LightweightFileIndex, LightweightIndex,
         LightweightIndexShard, LineMappingTable, ScopedFileIndexManager,
@@ -710,6 +710,18 @@ impl<'a> DwarfParser<'a> {
         }
     }
 
+    fn flush_pending_line_entries(
+        out: &mut Vec<LineEntry>,
+        pending: &mut Vec<LineEntry>,
+        end_address: Option<u64>,
+    ) {
+        for mut entry in std::mem::take(pending) {
+            // Equal endpoints are zero-length rows, not unknown-length rows.
+            entry.end_address = end_address;
+            out.push(entry);
+        }
+    }
+
     fn high_pc_offset_value(value: gimli::AttributeValue<DwarfReader>) -> Option<u64> {
         match value {
             gimli::AttributeValue::Udata(offset) => Some(offset),
@@ -1001,13 +1013,47 @@ impl<'a> DwarfParser<'a> {
                     let (line_program, sequences) = line_program.clone().sequences()?;
                     for seq in sequences {
                         let mut rows = line_program.resume_from(&seq);
+                        let mut pending_entries: Vec<LineEntry> = Vec::new();
+                        let mut pending_address: Option<u64> = None;
                         while let Some((_, line_row)) = rows.next_row()? {
+                            let row_address = line_row.address();
+                            if line_row.end_sequence() {
+                                Self::flush_pending_line_entries(
+                                    &mut shard.line_entries,
+                                    &mut pending_entries,
+                                    Some(row_address),
+                                );
+                                pending_address = None;
+                                continue;
+                            }
+
+                            if let Some(address) = pending_address {
+                                if row_address > address {
+                                    Self::flush_pending_line_entries(
+                                        &mut shard.line_entries,
+                                        &mut pending_entries,
+                                        Some(row_address),
+                                    );
+                                    pending_address = Some(row_address);
+                                } else if row_address < address {
+                                    Self::flush_pending_line_entries(
+                                        &mut shard.line_entries,
+                                        &mut pending_entries,
+                                        None,
+                                    );
+                                    pending_address = Some(row_address);
+                                }
+                            } else {
+                                pending_address = Some(row_address);
+                            }
+
                             let column = match line_row.column() {
                                 gimli::ColumnType::LeftEdge => 0,
                                 gimli::ColumnType::Column(x) => x.get(),
                             };
-                            shard.line_entries.push(crate::core::LineEntry {
-                                address: line_row.address(),
+                            pending_entries.push(LineEntry {
+                                address: row_address,
+                                end_address: None,
                                 file_path: String::new(),
                                 file_index: line_row.file_index(),
                                 compilation_unit: std::sync::Arc::from(cu_name.as_str()),
@@ -1017,6 +1063,11 @@ impl<'a> DwarfParser<'a> {
                                 prologue_end: line_row.prologue_end(),
                             });
                         }
+                        Self::flush_pending_line_entries(
+                            &mut shard.line_entries,
+                            &mut pending_entries,
+                            None,
+                        );
                     }
                 }
                 Ok(shard)
@@ -1313,6 +1364,34 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
     use tempfile::TempPath;
+
+    fn test_line_entry(address: u64) -> LineEntry {
+        LineEntry {
+            address,
+            end_address: None,
+            file_path: "/src/main.c".to_string(),
+            file_index: 1,
+            compilation_unit: Arc::from("main.c"),
+            line: 10,
+            column: 0,
+            is_stmt: true,
+            prologue_end: false,
+        }
+    }
+
+    #[test]
+    fn flush_pending_line_entries_keeps_equal_end_bounded() {
+        let mut out = Vec::new();
+        let mut pending = vec![test_line_entry(0x1000)];
+
+        DwarfParser::flush_pending_line_entries(&mut out, &mut pending, Some(0x1000));
+
+        assert!(pending.is_empty());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].end_address, Some(0x1000));
+        assert!(!out[0].contains_address(0x1000));
+        assert!(!out[0].contains_address(0x1001));
+    }
 
     fn build_variable_index_fixture() -> gimli::Dwarf<DwarfReader> {
         let encoding = gimli::Encoding {

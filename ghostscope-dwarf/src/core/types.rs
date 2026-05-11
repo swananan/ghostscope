@@ -138,6 +138,12 @@ pub struct IndexFlags {
 #[derive(Debug, Clone)]
 pub struct LineEntry {
     pub address: u64,
+    /// First address after this row's covered instruction range.
+    ///
+    /// DWARF line rows describe half-open ranges ending at the next row or the
+    /// sequence terminator. `None` is kept for synthetic/test rows and malformed
+    /// line programs where no end can be derived.
+    pub end_address: Option<u64>,
     pub file_path: String, // Full file path for direct lookup
     pub file_index: u64,   // Original DWARF file index (kept for compatibility)
     pub compilation_unit: std::sync::Arc<str>, // Pooled CU name to reduce duplication
@@ -145,6 +151,12 @@ pub struct LineEntry {
     pub column: u64,
     pub is_stmt: bool,
     pub prologue_end: bool,
+}
+
+impl LineEntry {
+    pub fn contains_address(&self, address: u64) -> bool {
+        address >= self.address && self.end_address.is_none_or(|end| address < end)
+    }
 }
 
 /// Program section classification for global/static variables
