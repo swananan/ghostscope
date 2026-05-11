@@ -1,9 +1,9 @@
 mod common;
 
-use common::{fixture_compiler_available, init, FixtureCompiler, FIXTURES};
+use common::{fixture_compiler_available, init, FixtureCompiler, OptimizationLevel, FIXTURES};
 use gimli::Reader;
 use object::{Object, ObjectSection, ObjectSymbol};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use tempfile::TempPath;
 
 // Keep these on the executable inline-body lines in inline_callsite_program.c.
 const INLINE_TRACE_LINE: u32 = 43;
+const COMPLEX_DUPLICATE_PC_LINE: u32 = 20;
 
 type TestReader = gimli::EndianArcSlice<gimli::RunTimeEndian>;
 
@@ -196,6 +197,69 @@ fn load_dwarf_from_binary(path: &Path) -> anyhow::Result<gimli::Dwarf<TestReader
     Ok(dwarf)
 }
 
+fn duplicate_line_row_address_for_source_line(
+    binary_path: &Path,
+    source_basename: &str,
+    target_line: u64,
+) -> anyhow::Result<u64> {
+    let dwarf = load_dwarf_from_binary(binary_path)?;
+    let mut rows_by_address: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut units = dwarf.units();
+
+    while let Some(header) = units.next()? {
+        let unit = dwarf.unit(header)?;
+        let Some(ref line_program) = unit.line_program else {
+            continue;
+        };
+        let line_header = line_program.header();
+        let (line_program, sequences) = line_program.clone().sequences()?;
+
+        for sequence in sequences {
+            let mut rows = line_program.resume_from(&sequence);
+            while let Some((_, row)) = rows.next_row()? {
+                if row.end_sequence() {
+                    continue;
+                }
+                let Some(line) = row.line().map(|line| line.get()) else {
+                    continue;
+                };
+                let Some(file) = row.file(line_header) else {
+                    continue;
+                };
+                let Ok(path) = dwarf.attr_string(&unit, file.path_name()) else {
+                    continue;
+                };
+                let Ok(path) = path.to_string_lossy() else {
+                    continue;
+                };
+                let basename_matches = Path::new(path.as_ref())
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(source_basename);
+                if basename_matches || path.as_ref().ends_with(source_basename) {
+                    rows_by_address.entry(row.address()).or_default().push(line);
+                }
+            }
+        }
+    }
+
+    rows_by_address
+        .into_iter()
+        .filter(|(_, lines)| {
+            lines.contains(&target_line) && lines.iter().any(|line| *line != target_line)
+        })
+        .map(|(address, _)| address)
+        .min()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no same-PC line rows for {}:{}",
+                binary_path.display(),
+                source_basename,
+                target_line
+            )
+        })
+}
+
 fn partitioned_target_ranges_attr_encoding(
     binary_path: &Path,
 ) -> anyhow::Result<RangesAttrEncoding> {
@@ -292,6 +356,42 @@ async fn assert_partitioned_ranges_source_line_query_recovers_function_scope(
                 && result.parameters.iter().any(|param| param.name == "x")
         }),
         "Expected partitioned_target scope recovery with parameter x for {scenario}. Results: {query_results:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_source_line_query_preserves_same_pc_line_candidate() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::O3)?;
+    let duplicate_pc = duplicate_line_row_address_for_source_line(
+        &binary_path,
+        "complex_types_program.c",
+        u64::from(COMPLEX_DUPLICATE_PC_LINE),
+    )?;
+
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let addrs = analyzer
+        .lookup_addresses_by_source_line("complex_types_program.c", COMPLEX_DUPLICATE_PC_LINE);
+    assert!(
+        addrs
+            .iter()
+            .any(|addr| addr.module_path == binary_path && addr.address == duplicate_pc),
+        "Expected source-line lookup to include duplicate-PC row 0x{duplicate_pc:x}. Results: {addrs:?}"
+    );
+
+    let query_results = analyzer
+        .query_source_line_best_effort("complex_types_program.c", COMPLEX_DUPLICATE_PC_LINE)?;
+    assert!(
+        query_results.iter().any(|result| {
+            result.module_path == binary_path
+                && result.address == duplicate_pc
+                && result.source_line == Some(COMPLEX_DUPLICATE_PC_LINE)
+        }),
+        "Expected source-line query to keep requested line {COMPLEX_DUPLICATE_PC_LINE} at duplicate PC 0x{duplicate_pc:x}. Results: {query_results:?}"
     );
 
     Ok(())

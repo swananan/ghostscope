@@ -1,6 +1,6 @@
 use super::LoadedObjfile;
 use crate::{core::SourceLocation, parser::SourceFile};
-use std::collections::HashSet;
+use std::{collections::HashSet, path::Path};
 
 mod file_selection_scoring {
     pub const SEARCH_RANGE_BYTES: u64 = 100;
@@ -31,6 +31,56 @@ impl LoadedObjfile {
 
         self.create_source_location_from_entry(best_entry)
     }
+
+    pub(crate) fn lookup_source_location_for_source_line(
+        &self,
+        address: u64,
+        file_path: &str,
+        line_number: u32,
+    ) -> Option<SourceLocation> {
+        let all_line_entries = self.line_mapping.lookup_all_lines_at_address(address);
+        let matching_entries: Vec<_> = all_line_entries
+            .iter()
+            .copied()
+            .filter(|entry| {
+                entry.line == u64::from(line_number)
+                    && self.line_entry_matches_requested_source(entry, file_path)
+            })
+            .collect();
+
+        if matching_entries.is_empty() {
+            return self.lookup_source_location(address);
+        }
+
+        let best_entry = self.select_best_line_entry(&matching_entries);
+        self.create_source_location_from_entry(best_entry)
+    }
+
+    fn line_entry_matches_requested_source(
+        &self,
+        entry: &crate::core::LineEntry,
+        requested_file_path: &str,
+    ) -> bool {
+        let Some(candidate_path) = self.get_file_path_for_entry(entry) else {
+            return false;
+        };
+        if candidate_path == requested_file_path
+            || candidate_path.ends_with(requested_file_path)
+            || requested_file_path.ends_with(&candidate_path)
+        {
+            return true;
+        }
+
+        let requested_basename = Path::new(requested_file_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(requested_file_path);
+        Path::new(&candidate_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(requested_basename)
+    }
+
     fn find_alternative_source_file<'a>(
         &'a self,
         entry: &'a crate::core::LineEntry,
@@ -134,7 +184,10 @@ impl LoadedObjfile {
                 score
             );
 
-            if score > best_score {
+            // Equal-scored rows are still distinct debug-line candidates. Prefer
+            // the later row to preserve the old single-entry map replacement
+            // behavior for generic PC lookups.
+            if score >= best_score {
                 best = entry;
                 best_score = score;
             }
