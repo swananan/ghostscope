@@ -85,6 +85,14 @@ impl<'ctx> MapManager<'ctx> {
         }
     }
 
+    fn map_definition_field_count(name: &str, map_type: BpfMapType) -> usize {
+        match map_type {
+            BpfMapType::Ringbuf => 2,
+            _ if matches!(name, "proc_module_offsets" | "pid_aliases") => 5,
+            _ => 4,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_map_definition(
         &mut self,
@@ -116,23 +124,13 @@ impl<'ctx> MapManager<'ctx> {
 
         // Values are conveyed by BTF; initializers can be null pointers.
 
-        // Create struct with appropriate fields based on map type
-        // Ringbuf only needs type and max_entries, others need all 4 fields
-        let (elements, initializer_values): (Vec<_>, Vec<_>) = match map_type {
-            BpfMapType::Ringbuf => (
-                vec![ptr_ty.into(), ptr_ty.into()],
-                vec![ptr_ty.const_null().into(), ptr_ty.const_null().into()],
-            ),
-            _ => (
-                vec![ptr_ty.into(), ptr_ty.into(), ptr_ty.into(), ptr_ty.into()],
-                vec![
-                    ptr_ty.const_null().into(),
-                    ptr_ty.const_null().into(),
-                    ptr_ty.const_null().into(),
-                    ptr_ty.const_null().into(),
-                ],
-            ),
-        };
+        // Keep the concrete map variable layout in sync with the BTF map
+        // definition. Pinned maps include the optional `pinning` field.
+        let field_count = Self::map_definition_field_count(&var_name, map_type);
+        let elements: Vec<_> = (0..field_count).map(|_| ptr_ty.into()).collect();
+        let initializer_values: Vec<_> = (0..field_count)
+            .map(|_| ptr_ty.const_null().into())
+            .collect();
         let struct_type = self.context.struct_type(&elements, false);
         let initializer = struct_type.const_named_struct(&initializer_values);
 
@@ -181,10 +179,6 @@ impl<'ctx> MapManager<'ctx> {
         // The kind_id for "dbg" in LLVM is typically 0
         map_var.set_metadata(di_global_variable.as_metadata_value(self.context), 0);
 
-        let field_count = match map_type {
-            BpfMapType::Ringbuf => 2,
-            _ => 4,
-        };
         info!(
             "Successfully created map: {} with {} fields",
             var_name, field_count
@@ -478,17 +472,9 @@ impl<'ctx> MapManager<'ctx> {
         // Convert members to DIType vector
         let member_types: Vec<_> = members.iter().map(|m| m.as_type()).collect();
 
-        // Total structure size: pointers (64-bit) per field
-        let (total_size_bits, field_count) = match map_type {
-            BpfMapType::Ringbuf => (128, 2), // 2 * 64 bits
-            _ => {
-                if matches!(map_name, "proc_module_offsets" | "pid_aliases") {
-                    (320, 5) // include 'pinning'
-                } else {
-                    (256, 4)
-                }
-            }
-        };
+        // Total structure size: pointers (64-bit) per field.
+        let field_count = Self::map_definition_field_count(map_name, map_type);
+        let total_size_bits = (field_count as u64) * 64;
 
         // Create the map structure type (anonymous like reference)
         let map_struct_type = di_builder.create_struct_type(
@@ -543,5 +529,30 @@ impl<'ctx> MapManager<'ctx> {
             SizedType::integer(32),
             SizedType::integer(value_size_bytes * 8),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BpfMapType, MapManager};
+
+    #[test]
+    fn pinned_maps_include_pinning_field_in_concrete_layout() {
+        assert_eq!(
+            MapManager::map_definition_field_count("proc_module_offsets", BpfMapType::Hash),
+            5
+        );
+        assert_eq!(
+            MapManager::map_definition_field_count("pid_aliases", BpfMapType::Hash),
+            5
+        );
+        assert_eq!(
+            MapManager::map_definition_field_count("event_accum_buffer", BpfMapType::PerCpuArray),
+            4
+        );
+        assert_eq!(
+            MapManager::map_definition_field_count("ringbuf", BpfMapType::Ringbuf),
+            2
+        );
     }
 }
