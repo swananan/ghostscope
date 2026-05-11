@@ -13,6 +13,7 @@ pub(crate) mod index;
 pub(crate) mod loader;
 pub(crate) mod objfile;
 pub(crate) mod parser;
+pub(crate) mod path_match;
 pub mod semantics;
 
 // Main entry point

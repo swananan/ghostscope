@@ -1,6 +1,6 @@
 use super::LoadedObjfile;
-use crate::{core::SourceLocation, parser::SourceFile};
-use std::{collections::HashSet, path::Path};
+use crate::{core::SourceLocation, parser::SourceFile, path_match};
+use std::collections::HashSet;
 
 mod file_selection_scoring {
     pub const SEARCH_RANGE_BYTES: u64 = 100;
@@ -64,21 +64,7 @@ impl LoadedObjfile {
         let Some(candidate_path) = self.get_file_path_for_entry(entry) else {
             return false;
         };
-        if candidate_path == requested_file_path
-            || candidate_path.ends_with(requested_file_path)
-            || requested_file_path.ends_with(&candidate_path)
-        {
-            return true;
-        }
-
-        let requested_basename = Path::new(requested_file_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(requested_file_path);
-        Path::new(&candidate_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            == Some(requested_basename)
+        path_match::source_path_matches(&candidate_path, requested_file_path)
     }
 
     fn find_alternative_source_file<'a>(
