@@ -246,6 +246,10 @@ pub struct Args {
     #[arg(long, value_name = "FORMAT", value_enum)]
     pub script_timestamp: Option<ScriptTimestampFormat>,
 
+    /// Maximum script events rendered per second in CLI mode before suppressing output. 0 disables the limiter.
+    #[arg(long = "script-output-events-per-sec", value_name = "N")]
+    pub script_output_events_per_sec: Option<u64>,
+
     /// Save LLVM IR files for each trace pattern (debug: true, release: false)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub save_llvm_ir: bool,
@@ -323,6 +327,7 @@ pub struct ParsedArgs {
     pub status_enabled: bool,
     pub has_explicit_status_flag: bool,
     pub script_timestamp: Option<ScriptTimestampFormat>,
+    pub script_output_events_per_sec: Option<u64>,
     pub should_save_llvm_ir: bool,
     pub should_save_ebpf: bool,
     pub should_save_ast: bool,
@@ -499,6 +504,7 @@ impl Args {
             status_enabled,
             has_explicit_status_flag,
             script_timestamp: parsed.script_timestamp,
+            script_output_events_per_sec: parsed.script_output_events_per_sec,
             should_save_llvm_ir,
             should_save_ebpf,
             should_save_ast,
@@ -839,12 +845,15 @@ mod tests {
             "plain".to_string(),
             "--script-timestamp".to_string(),
             "boot".to_string(),
+            "--script-output-events-per-sec".to_string(),
+            "123".to_string(),
         ]);
 
         match parsed {
             ParsedCommand::Trace(args) => {
                 assert_eq!(args.script_output, Some(ScriptOutputMode::Plain));
                 assert_eq!(args.script_timestamp, Some(ScriptTimestampFormat::Boot));
+                assert_eq!(args.script_output_events_per_sec, Some(123));
             }
             other => panic!("unexpected parse result: {other:?}"),
         }

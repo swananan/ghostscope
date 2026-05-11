@@ -66,40 +66,55 @@ pub struct ParsedTraceEvent {
 }
 
 impl ParsedTraceEvent {
-    /// Generate a formatted display output by combining format strings with variables
-    /// This handles the pattern: PrintString + PrintVariable sequence
-    pub fn to_formatted_output(&self) -> Vec<String> {
-        let mut output = Vec::new();
+    pub fn has_formatted_output(&self) -> bool {
+        self.instructions
+            .iter()
+            .any(|instruction| !matches!(instruction, ParsedInstruction::EndInstruction { .. }))
+    }
+
+    pub fn try_for_each_formatted_output<E>(
+        &self,
+        mut emit: impl FnMut(&str) -> Result<(), E>,
+    ) -> Result<(), E> {
         let mut i = 0;
 
         while i < self.instructions.len() {
             match &self.instructions[i] {
                 ParsedInstruction::PrintString { content } => {
-                    // Check if this looks like a format string (contains {})
                     if content.contains("{}") {
-                        // Try to find corresponding variables
                         let (formatted, consumed) =
                             self.format_string_with_variables(content, i + 1);
-                        output.push(formatted);
-                        i += consumed; // Skip the variables we consumed
+                        emit(&formatted)?;
+                        i += consumed;
                     } else {
-                        // Regular string, just add it
-                        output.push(content.clone());
+                        emit(content)?;
                         i += 1;
                     }
                 }
 
                 ParsedInstruction::EndInstruction { .. } => {
-                    // Skip EndInstruction - it's for protocol control, not user output
                     i += 1;
                 }
                 instruction => {
-                    // Other instructions (variables without format string, etc.)
-                    output.push(instruction.to_display_string());
+                    let line = instruction.to_display_string();
+                    emit(&line)?;
                     i += 1;
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// Generate a formatted display output by combining format strings with variables
+    /// This handles the pattern: PrintString + PrintVariable sequence
+    pub fn to_formatted_output(&self) -> Vec<String> {
+        let mut output = Vec::new();
+        let _ =
+            self.try_for_each_formatted_output(|line| -> Result<(), std::convert::Infallible> {
+                output.push(line.to_string());
+                Ok(())
+            });
 
         output
     }
@@ -113,29 +128,30 @@ impl ParsedTraceEvent {
         // Count placeholders in format string
         let placeholder_count = format_string.matches("{}").count();
 
-        // Collect variable values
-        let mut variables = Vec::new();
         let mut consumed = 1; // At least consume the format string itself
+        let mut result = String::with_capacity(format_string.len());
+        let mut remaining = format_string;
 
-        for i in start_index..(start_index + placeholder_count).min(self.instructions.len()) {
-            if let ParsedInstruction::PrintVariable {
+        for instruction_index in
+            start_index..(start_index + placeholder_count).min(self.instructions.len())
+        {
+            let Some(pos) = remaining.find("{}") else {
+                break;
+            };
+
+            if let Some(ParsedInstruction::PrintVariable {
                 formatted_value, ..
-            } = &self.instructions[i]
+            }) = self.instructions.get(instruction_index)
             {
-                variables.push(formatted_value.clone());
+                result.push_str(&remaining[..pos]);
+                result.push_str(formatted_value);
                 consumed += 1;
+                remaining = &remaining[pos + 2..];
             } else {
-                break; // Not a variable, stop collecting
+                break;
             }
         }
-
-        // Apply formatting
-        let mut result = format_string.to_string();
-        for value in variables {
-            if let Some(pos) = result.find("{}") {
-                result.replace_range(pos..pos + 2, &value);
-            }
-        }
+        result.push_str(remaining);
 
         (result, consumed)
     }
@@ -205,12 +221,14 @@ impl StreamingTraceParser {
 
         // Process buffer in a loop until we can't make progress
         loop {
-            let consumed = match &self.parse_state {
+            let state = std::mem::replace(&mut self.parse_state, ParseState::Complete);
+            let consumed = match state {
                 ParseState::WaitingForHeader => {
                     // Try to read header
                     let (header, _rest) = match TraceEventHeader::read_from_prefix(&self.buffer) {
                         Ok((h, r)) => (h, r),
                         Err(_) => {
+                            self.parse_state = ParseState::WaitingForHeader;
                             debug!(
                                 "Waiting for more data for header (have {} bytes, need {})",
                                 self.buffer.len(),
@@ -236,6 +254,7 @@ impl StreamingTraceParser {
                     let (message, _rest) = match TraceEventMessage::read_from_prefix(&self.buffer) {
                         Ok((m, r)) => (m, r),
                         Err(_) => {
+                            self.parse_state = ParseState::WaitingForMessage { header };
                             debug!(
                                 "Waiting for more data for message (have {} bytes, need {})",
                                 self.buffer.len(),
@@ -255,7 +274,7 @@ impl StreamingTraceParser {
                     );
 
                     self.parse_state = ParseState::WaitingForInstructions {
-                        header: *header,
+                        header,
                         message,
                         instructions: Vec::new(),
                     };
@@ -265,19 +284,17 @@ impl StreamingTraceParser {
                 ParseState::WaitingForInstructions {
                     header,
                     message,
-                    instructions,
+                    mut instructions,
                 } => {
                     // Try to parse instruction from buffer
                     match self.try_parse_instruction(&self.buffer, trace_context)? {
                         Some((parsed_instruction, consumed_bytes)) => {
-                            let mut new_instructions = instructions.clone();
-
                             // Check if this is EndInstruction
                             if matches!(
                                 parsed_instruction,
                                 ParsedInstruction::EndInstruction { .. }
                             ) {
-                                new_instructions.push(parsed_instruction);
+                                instructions.push(parsed_instruction);
 
                                 // Complete trace event
                                 let complete_event = ParsedTraceEvent {
@@ -285,7 +302,7 @@ impl StreamingTraceParser {
                                     timestamp: message.timestamp,
                                     pid: message.pid,
                                     tid: message.tid,
-                                    instructions: new_instructions,
+                                    instructions,
                                 };
 
                                 debug!(
@@ -324,17 +341,22 @@ impl StreamingTraceParser {
                                 return Ok(Some(complete_event));
                             } else {
                                 // Add instruction and continue waiting
-                                new_instructions.push(parsed_instruction);
+                                instructions.push(parsed_instruction);
 
                                 self.parse_state = ParseState::WaitingForInstructions {
-                                    header: *header,
-                                    message: *message,
-                                    instructions: new_instructions,
+                                    header,
+                                    message,
+                                    instructions,
                                 };
                                 consumed_bytes
                             }
                         }
                         None => {
+                            self.parse_state = ParseState::WaitingForInstructions {
+                                header,
+                                message,
+                                instructions,
+                            };
                             debug!("Waiting for more data for instruction");
                             return Ok(None);
                         }
@@ -895,5 +917,42 @@ mod tests {
             }
             other => panic!("unexpected last instruction: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_format_string_only_consumes_contiguous_variables() {
+        let event = ParsedTraceEvent {
+            trace_id: 1,
+            timestamp: 0,
+            pid: 10,
+            tid: 11,
+            instructions: vec![
+                ParsedInstruction::PrintString {
+                    content: "{} {}".to_string(),
+                },
+                ParsedInstruction::PrintString {
+                    content: "literal".to_string(),
+                },
+                ParsedInstruction::PrintVariable {
+                    name: "value".to_string(),
+                    type_encoding: TypeKind::I32,
+                    formatted_value: "42".to_string(),
+                    raw_data: vec![42],
+                },
+                ParsedInstruction::EndInstruction {
+                    total_instructions: 3,
+                    execution_status: 0,
+                },
+            ],
+        };
+
+        assert_eq!(
+            event.to_formatted_output(),
+            vec![
+                "{} {}".to_string(),
+                "literal".to_string(),
+                "value (I32): 42".to_string(),
+            ]
+        );
     }
 }

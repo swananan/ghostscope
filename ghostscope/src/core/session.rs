@@ -451,6 +451,7 @@ mod tests {
             status_enabled: true,
             has_explicit_status_flag: false,
             script_timestamp: None,
+            script_output_events_per_sec: None,
             should_save_llvm_ir: false,
             should_save_ebpf: false,
             should_save_ast: false,
