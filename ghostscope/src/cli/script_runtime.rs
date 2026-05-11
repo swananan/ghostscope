@@ -6,8 +6,10 @@ use anyhow::Result;
 use ghostscope_dwarf::ModuleLoadingEvent;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+const SCRIPT_OUTPUT_BACKPRESSURE_SLEEP: Duration = Duration::from_millis(10);
 
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> io::Result<&'static str> {
@@ -26,6 +28,96 @@ async fn wait_for_shutdown_signal() -> io::Result<&'static str> {
 async fn wait_for_shutdown_signal() -> io::Result<&'static str> {
     tokio::signal::ctrl_c().await?;
     Ok("Ctrl+C")
+}
+
+struct ScriptOutputRateLimiter {
+    max_events_per_sec: Option<u64>,
+    window_started_at: Instant,
+    emitted_in_window: u64,
+    suppressed_since_report: u64,
+    suppressed_total: u64,
+    last_report_at: Instant,
+}
+
+impl ScriptOutputRateLimiter {
+    fn new(configured_limit: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            max_events_per_sec: (configured_limit > 0).then_some(configured_limit),
+            window_started_at: now,
+            emitted_in_window: 0,
+            suppressed_since_report: 0,
+            suppressed_total: 0,
+            last_report_at: now,
+        }
+    }
+
+    fn should_render_event(&mut self, now: Instant) -> bool {
+        let Some(max_events_per_sec) = self.max_events_per_sec else {
+            return true;
+        };
+
+        if now.duration_since(self.window_started_at) >= Duration::from_secs(1) {
+            self.window_started_at = now;
+            self.emitted_in_window = 0;
+        }
+
+        if self.emitted_in_window < max_events_per_sec {
+            self.emitted_in_window += 1;
+            true
+        } else {
+            self.suppressed_since_report += 1;
+            self.suppressed_total += 1;
+            false
+        }
+    }
+
+    fn maybe_report(&mut self, now: Instant) {
+        if self.suppressed_since_report == 0
+            || now.duration_since(self.last_report_at) < Duration::from_secs(1)
+        {
+            return;
+        }
+
+        let Some(max_events_per_sec) = self.max_events_per_sec else {
+            return;
+        };
+
+        let suppressed = self.suppressed_since_report;
+        self.suppressed_since_report = 0;
+        self.last_report_at = now;
+
+        let message = format!(
+            "script output saturated: suppressed {suppressed} events in the last interval \
+             (total {}, limit {max_events_per_sec}/s); kernel buffers may also drop events",
+            self.suppressed_total
+        );
+        warn!("{message}");
+        eprintln!("ghostscope: {message}");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptOutputRateDecision {
+    Silent,
+    Render,
+    Suppress,
+}
+
+fn decide_script_output_rate(
+    event: &ghostscope_protocol::ParsedTraceEvent,
+    limiter: &mut ScriptOutputRateLimiter,
+    now: Instant,
+) -> ScriptOutputRateDecision {
+    if !event.has_formatted_output() {
+        return ScriptOutputRateDecision::Silent;
+    }
+
+    if limiter.should_render_event(now) {
+        ScriptOutputRateDecision::Render
+    } else {
+        ScriptOutputRateDecision::Suppress
+    }
 }
 
 /// Run GhostScope in command line mode with merged configuration
@@ -253,6 +345,9 @@ async fn run_cli_with_session(
             color_enabled: should_use_script_stdout_color(config),
         },
     );
+    let stdout = io::stdout();
+    let mut stdout = io::BufWriter::new(stdout.lock());
+    let mut output_rate_limiter = ScriptOutputRateLimiter::new(config.script_output_events_per_sec);
 
     let shutdown_signal = wait_for_shutdown_signal();
     tokio::pin!(shutdown_signal);
@@ -261,21 +356,40 @@ async fn run_cli_with_session(
             result = session.trace_manager.wait_for_all_events_async() => {
                 match result {
                     Ok(events) => {
+                        let mut wrote_output = false;
+                        let mut suppressed_output = false;
                         for event in events {
-                            let rendered_lines = output_renderer.render_event_lines(&event);
-
-                            if !rendered_lines.is_empty() {
-                                for line in rendered_lines {
-                                    println!("{line}");
+                            match decide_script_output_rate(
+                                &event,
+                                &mut output_rate_limiter,
+                                Instant::now(),
+                            ) {
+                                ScriptOutputRateDecision::Silent => {}
+                                ScriptOutputRateDecision::Render => {
+                                    match output_renderer.write_event(&event, &mut stdout) {
+                                        Ok(wrote) => wrote_output |= wrote,
+                                        Err(e) => warn!("Failed to write event output: {e}"),
+                                    }
                                 }
-                                // When stdout is piped (as in tests), Rust switches to block buffering.
-                                // Flush explicitly so short event bursts appear before the process exits.
-                                if let Err(e) = io::stdout().flush() {
-                                    warn!("Failed to flush event output: {e}");
+                                ScriptOutputRateDecision::Suppress => {
+                                    suppressed_output = true;
                                 }
                             }
 
                             debug!("Raw trace event: {:?}", event);
+                        }
+                        output_rate_limiter.maybe_report(Instant::now());
+                        // When stdout is piped (as in tests), Rust switches to block buffering.
+                        // Flush once per bounded event batch instead of once per event.
+                        if wrote_output {
+                            if let Err(e) = stdout.flush() {
+                                warn!("Failed to flush event output: {e}");
+                            }
+                        }
+                        if suppressed_output {
+                            tokio::time::sleep(SCRIPT_OUTPUT_BACKPRESSURE_SLEEP).await;
+                        } else {
+                            tokio::task::yield_now().await;
                         }
                     }
                     Err(e) => {
@@ -352,14 +466,19 @@ fn get_script_content_from_config(config: &ResolvedConfig) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_console_stderr_logging_active, should_print_cli_status_with_terminal};
+    use super::{
+        decide_script_output_rate, is_console_stderr_logging_active,
+        should_print_cli_status_with_terminal, ScriptOutputRateDecision, ScriptOutputRateLimiter,
+    };
     use crate::config::{
         runtime::RuntimeContext,
         settings::{EbpfConfig, LogLevel},
         CliColorMode, LayoutMode, ResolvedConfig, ScriptOutputMode, ScriptTimestampFormat,
         UserConfig,
     };
+    use ghostscope_protocol::{ParsedInstruction, ParsedTraceEvent};
     use std::path::PathBuf;
+    use std::time::Instant;
 
     #[test]
     fn console_stderr_logging_requires_logging_to_be_enabled() {
@@ -373,6 +492,45 @@ mod tests {
     fn script_output_modes_focus_on_stdout_rendering() {
         assert_eq!(ScriptOutputMode::Plain, ScriptOutputMode::Plain);
         assert_eq!(ScriptOutputMode::Pretty, ScriptOutputMode::Pretty);
+    }
+
+    fn event_with_instructions(instructions: Vec<ParsedInstruction>) -> ParsedTraceEvent {
+        ParsedTraceEvent {
+            trace_id: 1,
+            timestamp: 0,
+            pid: 1,
+            tid: 1,
+            instructions,
+        }
+    }
+
+    #[test]
+    fn silent_events_do_not_consume_script_output_quota() {
+        let mut limiter = ScriptOutputRateLimiter::new(1);
+        let now = Instant::now();
+        let silent_event = event_with_instructions(vec![ParsedInstruction::EndInstruction {
+            total_instructions: 0,
+            execution_status: 0,
+        }]);
+        let printed_event = event_with_instructions(vec![ParsedInstruction::PrintString {
+            content: "visible".to_string(),
+        }]);
+
+        for _ in 0..10 {
+            assert_eq!(
+                decide_script_output_rate(&silent_event, &mut limiter, now),
+                ScriptOutputRateDecision::Silent
+            );
+        }
+
+        assert_eq!(
+            decide_script_output_rate(&printed_event, &mut limiter, now),
+            ScriptOutputRateDecision::Render
+        );
+        assert_eq!(
+            decide_script_output_rate(&printed_event, &mut limiter, now),
+            ScriptOutputRateDecision::Suppress
+        );
     }
 
     fn sample_config(script_output_mode: ScriptOutputMode, script_status: bool) -> ResolvedConfig {
@@ -394,6 +552,7 @@ mod tests {
                 script_status,
                 script_timestamp_format: ScriptTimestampFormat::Local,
                 script_color_mode: CliColorMode::Auto,
+                script_output_events_per_sec: 10_000,
                 tui_mode: false,
                 should_save_llvm_ir: false,
                 should_save_ebpf: false,

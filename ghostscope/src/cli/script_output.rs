@@ -1,5 +1,6 @@
 use crate::config::{ScriptOutputMode, ScriptTimestampFormat};
 use ghostscope_protocol::ParsedTraceEvent;
+use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +31,7 @@ impl ScriptOutputRenderer {
         }
     }
 
+    #[cfg(test)]
     pub fn render_event_lines(&mut self, event: &ParsedTraceEvent) -> Vec<String> {
         match self.mode {
             ScriptOutputMode::Plain => {
@@ -50,6 +52,32 @@ impl ScriptOutputRenderer {
                 lines.push(self.render_pretty_header(event));
                 lines.extend(formatted_output.into_iter().map(|line| format!("  {line}")));
                 lines
+            }
+        }
+    }
+
+    pub fn write_event<W: Write>(
+        &mut self,
+        event: &ParsedTraceEvent,
+        writer: &mut W,
+    ) -> io::Result<bool> {
+        match self.mode {
+            ScriptOutputMode::Plain => {
+                let mut wrote = false;
+                event.try_for_each_formatted_output(|line| {
+                    wrote = true;
+                    writeln!(writer, "{line}")
+                })?;
+                Ok(wrote)
+            }
+            ScriptOutputMode::Pretty => {
+                if !event.has_formatted_output() {
+                    return Ok(false);
+                }
+
+                writeln!(writer, "{}", self.render_pretty_header(event))?;
+                event.try_for_each_formatted_output(|line| writeln!(writer, "  {line}"))?;
+                Ok(true)
             }
         }
     }

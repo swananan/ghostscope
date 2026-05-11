@@ -4,10 +4,13 @@ use anyhow::Result;
 use futures::future::{select_all, BoxFuture};
 use futures::FutureExt;
 use ghostscope_loader::GhostScopeLoader;
-use std::collections::HashMap;
+use ghostscope_protocol::ParsedTraceEvent;
+use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
+
+const MAX_AGGREGATED_EVENTS_PER_WAIT: usize = 1024;
 
 /// Manager for all active trace instances
 #[derive(Debug)]
@@ -18,6 +21,7 @@ pub struct TraceManager {
     no_trace_wait_notify: Notify,             // Notify when first trace is successfully enabled
     // Track creation timestamps for duration calculation
     trace_created_times: HashMap<u32, u64>,
+    pending_events: VecDeque<ParsedTraceEvent>,
 }
 
 /// Parameters for adding a new trace with a pre-allocated ID
@@ -43,6 +47,7 @@ impl TraceManager {
             target_to_trace_id: HashMap::new(),
             no_trace_wait_notify: Notify::new(),
             trace_created_times: HashMap::new(),
+            pending_events: VecDeque::new(),
         }
     }
 
@@ -103,6 +108,8 @@ impl TraceManager {
             self.target_to_trace_id.remove(&unique_target);
             // Remove creation time
             self.trace_created_times.remove(&trace_id);
+            self.pending_events
+                .retain(|event| event.trace_id != trace_id as u64);
 
             info!("Deleted trace {} with target '{}'", trace_id, trace.target);
             Ok(())
@@ -117,6 +124,7 @@ impl TraceManager {
         self.traces.clear();
         self.target_to_trace_id.clear();
         self.trace_created_times.clear();
+        self.pending_events.clear();
         info!("Deleted all {} traces", count);
         Ok(count)
     }
@@ -216,19 +224,13 @@ impl TraceManager {
     }
 
     /// Wait for events from all active traces using futures::select_all
-    pub async fn wait_for_all_events_async(
-        &mut self,
-    ) -> anyhow::Result<Vec<ghostscope_protocol::ParsedTraceEvent>> {
+    pub async fn wait_for_all_events_async(&mut self) -> anyhow::Result<Vec<ParsedTraceEvent>> {
         loop {
-            let futures: Vec<
-                BoxFuture<
-                    '_,
-                    (
-                        u32,
-                        anyhow::Result<Vec<ghostscope_protocol::ParsedTraceEvent>>,
-                    ),
-                >,
-            > = self
+            if let Some(events) = self.take_pending_events() {
+                return Ok(events);
+            }
+
+            let futures: Vec<BoxFuture<'_, (u32, anyhow::Result<Vec<ParsedTraceEvent>>)>> = self
                 .traces
                 .iter_mut()
                 .filter_map(|(&trace_id, trace)| {
@@ -249,10 +251,16 @@ impl TraceManager {
             let ((trace_id, result), _index, remaining) = select_all(futures).await;
 
             let mut aggregated_events = Vec::new();
+            let mut deferred_by_batch_limit = 0usize;
 
             match result {
                 Ok(events) => {
-                    aggregated_events.extend(events);
+                    deferred_by_batch_limit += append_with_limit(
+                        &mut aggregated_events,
+                        events,
+                        &mut self.pending_events,
+                        MAX_AGGREGATED_EVENTS_PER_WAIT,
+                    );
                 }
                 Err(e) => {
                     // Fatal errors should be propagated to the caller
@@ -265,10 +273,18 @@ impl TraceManager {
             }
 
             for future in remaining {
+                if aggregated_events.len() >= MAX_AGGREGATED_EVENTS_PER_WAIT {
+                    break;
+                }
                 if let Some((trace_id, result)) = future.now_or_never() {
                     match result {
                         Ok(events) => {
-                            aggregated_events.extend(events);
+                            deferred_by_batch_limit += append_with_limit(
+                                &mut aggregated_events,
+                                events,
+                                &mut self.pending_events,
+                                MAX_AGGREGATED_EVENTS_PER_WAIT,
+                            );
                         }
                         Err(e) => {
                             // Fatal errors should be propagated to the caller
@@ -283,15 +299,139 @@ impl TraceManager {
             }
 
             if !aggregated_events.is_empty() {
+                if deferred_by_batch_limit > 0 {
+                    debug!(
+                        "Trace manager batch limit reached ({} events returned, {} parsed events deferred)",
+                        aggregated_events.len(),
+                        deferred_by_batch_limit
+                    );
+                }
                 return Ok(aggregated_events);
             }
             // No events received after draining ready traces, continue looping.
         }
+    }
+
+    fn take_pending_events(&mut self) -> Option<Vec<ParsedTraceEvent>> {
+        if self.pending_events.is_empty() {
+            return None;
+        }
+
+        let take_count = self
+            .pending_events
+            .len()
+            .min(MAX_AGGREGATED_EVENTS_PER_WAIT);
+        let mut events = Vec::with_capacity(take_count);
+        for _ in 0..take_count {
+            if let Some(event) = self.pending_events.pop_front() {
+                events.push(event);
+            }
+        }
+        Some(events)
+    }
+}
+
+fn append_with_limit<T>(
+    dst: &mut Vec<T>,
+    mut src: Vec<T>,
+    pending: &mut VecDeque<T>,
+    limit: usize,
+) -> usize {
+    if dst.len() >= limit {
+        let deferred = src.len();
+        pending.extend(src);
+        return deferred;
+    }
+
+    let remaining = limit - dst.len();
+    if src.len() <= remaining {
+        dst.extend(src);
+        0
+    } else {
+        let deferred_events = src.split_off(remaining);
+        let deferred = deferred_events.len();
+        dst.extend(src);
+        pending.extend(deferred_events);
+        deferred
     }
 }
 
 impl Default for TraceManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_with_limit, TraceManager, MAX_AGGREGATED_EVENTS_PER_WAIT};
+    use ghostscope_protocol::ParsedTraceEvent;
+    use std::collections::VecDeque;
+
+    fn event(trace_id: u64) -> ParsedTraceEvent {
+        ParsedTraceEvent {
+            trace_id,
+            timestamp: 0,
+            pid: 0,
+            tid: 0,
+            instructions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn append_with_limit_preserves_capacity_under_limit() {
+        let mut dst = vec![1, 2];
+        let mut pending = VecDeque::new();
+        let deferred = append_with_limit(&mut dst, vec![3, 4], &mut pending, 5);
+
+        assert_eq!(deferred, 0);
+        assert_eq!(dst, vec![1, 2, 3, 4]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn append_with_limit_defers_overflow_items() {
+        let mut dst = vec![1, 2];
+        let mut pending = VecDeque::new();
+        let deferred = append_with_limit(&mut dst, vec![3, 4, 5], &mut pending, 4);
+
+        assert_eq!(deferred, 1);
+        assert_eq!(dst, vec![1, 2, 3, 4]);
+        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![5]);
+    }
+
+    #[test]
+    fn append_with_limit_defers_all_items_when_full() {
+        let mut dst = vec![1, 2];
+        let mut pending = VecDeque::new();
+        let deferred = append_with_limit(&mut dst, vec![3, 4], &mut pending, 2);
+
+        assert_eq!(deferred, 2);
+        assert_eq!(dst, vec![1, 2]);
+        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![3, 4]);
+    }
+
+    #[test]
+    fn pending_events_are_returned_before_polling_traces() {
+        let mut manager = TraceManager::new();
+        for i in 0..(MAX_AGGREGATED_EVENTS_PER_WAIT + 1) {
+            manager.pending_events.push_back(event(i as u64));
+        }
+
+        let first = manager.take_pending_events().unwrap();
+        assert_eq!(first.len(), MAX_AGGREGATED_EVENTS_PER_WAIT);
+        assert_eq!(first.first().map(|event| event.trace_id), Some(0));
+        assert_eq!(
+            first.last().map(|event| event.trace_id),
+            Some((MAX_AGGREGATED_EVENTS_PER_WAIT - 1) as u64)
+        );
+
+        let second = manager.take_pending_events().unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second.first().map(|event| event.trace_id),
+            Some(MAX_AGGREGATED_EVENTS_PER_WAIT as u64)
+        );
+        assert!(manager.take_pending_events().is_none());
     }
 }

@@ -29,6 +29,7 @@ pub struct UserConfig {
     pub script_status: bool,
     pub script_timestamp_format: ScriptTimestampFormat,
     pub script_color_mode: CliColorMode,
+    pub script_output_events_per_sec: u64,
     pub tui_mode: bool,
 
     // File saving options
@@ -165,6 +166,9 @@ impl UserConfig {
             script_status,
             script_timestamp_format: args.script_timestamp.unwrap_or(config.script.timestamp),
             script_color_mode: config.script.color,
+            script_output_events_per_sec: args
+                .script_output_events_per_sec
+                .unwrap_or(config.script.output_events_per_sec),
             tui_mode,
             should_save_llvm_ir,
             should_save_ebpf,

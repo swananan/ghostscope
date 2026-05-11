@@ -133,6 +133,10 @@ pub struct ScriptConfig {
     /// ANSI color mode for CLI script output/status rendering
     #[serde(default)]
     pub color: CliColorMode,
+    /// Maximum CLI script events rendered per second before output is suppressed.
+    /// Set to 0 to disable the limiter.
+    #[serde(default = "default_script_output_events_per_sec")]
+    pub output_events_per_sec: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -333,6 +337,10 @@ fn default_script_status() -> bool {
     true
 }
 
+fn default_script_output_events_per_sec() -> u64 {
+    10_000
+}
+
 fn default_debug_search_paths() -> Vec<String> {
     vec![
         "/usr/lib/debug".to_string(),
@@ -431,6 +439,7 @@ impl Default for ScriptConfig {
             status: default_script_status(),
             timestamp: ScriptTimestampFormat::Local,
             color: CliColorMode::Auto,
+            output_events_per_sec: default_script_output_events_per_sec(),
         }
     }
 }

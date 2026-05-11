@@ -33,6 +33,10 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tracing::{debug, error, info, warn};
 
+const MAX_EVENTS_PER_WAIT: usize = 128;
+const MAX_RINGBUF_RECORDS_PER_WAIT: usize = 256;
+const PERF_READ_BATCH_SIZE: usize = 64;
+
 // Export kernel capabilities detection
 mod kernel_caps;
 pub use kernel_caps::{KernelCapabilities, KernelCapabilityError};
@@ -73,6 +77,72 @@ struct PerfEventCpuBuffer {
     cpu_id: u32,
     buffer: aya::maps::perf::PerfEventArrayBuffer<MapData>,
     readiness: AsyncFd<PerfBufferFd>,
+}
+
+fn drain_perf_cpu_buffer(
+    entry: &mut PerfEventCpuBuffer,
+    parser: &mut StreamingTraceParser,
+    trace_context: &TraceContext,
+    events: &mut Vec<ParsedTraceEvent>,
+) -> Result<bool> {
+    use bytes::BytesMut;
+
+    let mut produced = false;
+    if events.len() >= MAX_EVENTS_PER_WAIT {
+        return Ok(false);
+    }
+
+    let remaining = MAX_EVENTS_PER_WAIT - events.len();
+    let read_batch = remaining.min(PERF_READ_BATCH_SIZE);
+    let mut read_bufs = (0..read_batch)
+        .map(|_| BytesMut::with_capacity(4096))
+        .collect::<Vec<_>>();
+
+    match entry.buffer.read_events(&mut read_bufs) {
+        Ok(result) => {
+            if result.read > 0 {
+                produced = true;
+                info!(
+                    "Read {} events from CPU {} buffer",
+                    result.read, entry.cpu_id
+                );
+            }
+            if result.lost > 0 {
+                warn!(
+                    "Lost {} events from CPU {} buffer",
+                    result.lost, entry.cpu_id
+                );
+            }
+
+            for (i, data) in read_bufs.iter().enumerate().take(result.read) {
+                if events.len() >= MAX_EVENTS_PER_WAIT {
+                    break;
+                }
+                debug!(
+                    "PerfEvent {}: {} bytes - {:02x?}",
+                    i,
+                    data.len(),
+                    &data[..data.len().min(32)]
+                );
+
+                match parser.process_segment(data, trace_context) {
+                    Ok(Some(parsed_event)) => events.push(parsed_event),
+                    Ok(None) => {}
+                    Err(e) => {
+                        let cpu = entry.cpu_id;
+                        return Err(LoaderError::Generic(format!(
+                            "Fatal: Failed to parse trace event from PerfEventArray CPU {cpu}: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to read from CPU {} buffer: {}", entry.cpu_id, e);
+        }
+    }
+
+    Ok(produced)
 }
 
 /// Compatibility shim that mimics Aya's newer attach location helper so we can keep
@@ -733,7 +803,7 @@ impl GhostScopeLoader {
             LoaderError::Generic("Event map not initialized. Call attach_uprobe first.".to_string())
         })?;
 
-        let mut events = Vec::new();
+        let mut events = Vec::with_capacity(MAX_EVENTS_PER_WAIT.min(128));
 
         match event_map {
             EventMap::RingBuf(ringbuf) => {
@@ -746,8 +816,16 @@ impl GhostScopeLoader {
                     .map_err(|e| LoaderError::Generic(format!("AsyncFd error: {e}")))?;
                 guard.clear_ready();
 
-                // Read all available events
-                while let Some(item) = ringbuf.next() {
+                // Drain a bounded batch. Under very hot probes the ringbuf may never
+                // become empty, so an unbounded drain would starve output and signals.
+                let mut records_read = 0;
+                while events.len() < MAX_EVENTS_PER_WAIT
+                    && records_read < MAX_RINGBUF_RECORDS_PER_WAIT
+                {
+                    let Some(item) = ringbuf.next() else {
+                        break;
+                    };
+                    records_read += 1;
                     match self.parser.process_segment(&item, trace_context) {
                         Ok(Some(parsed_event)) => events.push(parsed_event),
                         Ok(None) => {}
@@ -758,66 +836,29 @@ impl GhostScopeLoader {
                         }
                     }
                 }
+                if events.len() == MAX_EVENTS_PER_WAIT
+                    || records_read == MAX_RINGBUF_RECORDS_PER_WAIT
+                {
+                    debug!(
+                        "RingBuf batch limit reached ({} events, {} records); yielding to caller",
+                        events.len(),
+                        records_read
+                    );
+                }
             }
             EventMap::PerfEventArray { cpu_buffers, .. } => {
-                use bytes::BytesMut;
-
                 let parser = &mut self.parser;
-
-                let mut drain_buffer = |entry: &mut PerfEventCpuBuffer| -> Result<bool> {
-                    let mut produced = false;
-                    let mut read_bufs = vec![BytesMut::with_capacity(4096)];
-
-                    match entry.buffer.read_events(&mut read_bufs) {
-                        Ok(result) => {
-                            if result.read > 0 {
-                                produced = true;
-                                info!(
-                                    "Read {} events from CPU {} buffer",
-                                    result.read, entry.cpu_id
-                                );
-                            }
-                            if result.lost > 0 {
-                                warn!(
-                                    "Lost {} events from CPU {} buffer",
-                                    result.lost, entry.cpu_id
-                                );
-                            }
-
-                            for (i, data) in read_bufs.iter().enumerate().take(result.read) {
-                                debug!(
-                                    "PerfEvent {}: {} bytes - {:02x?}",
-                                    i,
-                                    data.len(),
-                                    &data[..data.len().min(32)]
-                                );
-
-                                match parser.process_segment(data, trace_context) {
-                                    Ok(Some(parsed_event)) => events.push(parsed_event),
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        let cpu = entry.cpu_id;
-                                        return Err(LoaderError::Generic(format!(
-                                            "Fatal: Failed to parse trace event from PerfEventArray CPU {cpu}: {e}"
-                                        )));
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to read from CPU {} buffer: {}", entry.cpu_id, e);
-                        }
-                    }
-
-                    Ok(produced)
-                };
 
                 loop {
                     // Drain any buffers that already report data without waiting.
                     let mut made_progress = false;
                     for entry in cpu_buffers.iter_mut() {
+                        if events.len() >= MAX_EVENTS_PER_WAIT {
+                            break;
+                        }
                         if entry.buffer.readable() {
-                            made_progress |= drain_buffer(entry)?;
+                            made_progress |=
+                                drain_perf_cpu_buffer(entry, parser, trace_context, &mut events)?;
                         }
                     }
 
@@ -847,21 +888,34 @@ impl GhostScopeLoader {
                     })?;
 
                     // Drain the buffer that triggered readiness.
-                    made_progress |= drain_buffer(
+                    made_progress |= drain_perf_cpu_buffer(
                         cpu_buffers
                             .get_mut(ready_idx)
                             .expect("ready index should be valid"),
+                        parser,
+                        trace_context,
+                        &mut events,
                     )?;
 
                     // Drain any other buffers now advertising data.
                     for (idx, entry) in cpu_buffers.iter_mut().enumerate() {
+                        if events.len() >= MAX_EVENTS_PER_WAIT {
+                            break;
+                        }
                         if idx == ready_idx || !entry.buffer.readable() {
                             continue;
                         }
-                        made_progress |= drain_buffer(entry)?;
+                        made_progress |=
+                            drain_perf_cpu_buffer(entry, parser, trace_context, &mut events)?;
                     }
 
                     if made_progress {
+                        if events.len() == MAX_EVENTS_PER_WAIT {
+                            debug!(
+                                "PerfEventArray event batch limit reached ({} events); yielding to caller",
+                                MAX_EVENTS_PER_WAIT
+                            );
+                        }
                         break;
                     }
                     // No events were produced despite readiness (eg. lost event markers).
