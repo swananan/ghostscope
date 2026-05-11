@@ -1028,8 +1028,8 @@ impl<'a> DwarfParser<'a> {
         // Collect CU headers once
         let mut headers: Vec<gimli::UnitHeader<DwarfReader>> = Vec::new();
         let mut units = self.dwarf.units();
-        while let Ok(Some(h)) = units.next() {
-            headers.push(h);
+        while let Some(header) = units.next()? {
+            headers.push(header);
         }
 
         // Sort headers by size (descending) for better load balance under work-stealing
@@ -1200,8 +1200,8 @@ impl<'a> DwarfParser<'a> {
         // Collect headers once
         let mut headers: Vec<gimli::UnitHeader<DwarfReader>> = Vec::new();
         let mut units = self.dwarf.units();
-        while let Ok(Some(h)) = units.next() {
-            headers.push(h);
+        while let Some(header) = units.next()? {
+            headers.push(header);
         }
 
         // Always process in parallel at CU granularity, and propagate per-CU errors
@@ -1477,6 +1477,18 @@ mod tests {
             .borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())))
     }
 
+    fn dwarf_with_debug_info_bytes(debug_info: Vec<u8>) -> gimli::Dwarf<DwarfReader> {
+        gimli::Dwarf::load(|id| {
+            let data = if id.name() == ".debug_info" {
+                debug_info.clone()
+            } else {
+                Vec::new()
+            };
+            Ok::<_, gimli::Error>(dwarf_reader_from_arc(Arc::<[u8]>::from(data)))
+        })
+        .unwrap()
+    }
+
     #[test]
     fn flush_pending_line_entries_keeps_equal_end_bounded() {
         let mut out = Vec::new();
@@ -1489,6 +1501,38 @@ mod tests {
         assert_eq!(out[0].end_address, Some(0x1000));
         assert!(!out[0].contains_address(0x1000));
         assert!(!out[0].contains_address(0x1001));
+    }
+
+    #[test]
+    fn parse_line_info_propagates_unit_header_errors() {
+        let dwarf = dwarf_with_debug_info_bytes(vec![0x0b, 0x00, 0x00, 0x00, 0x04]);
+        let parser = DwarfParser { dwarf: &dwarf };
+
+        let err = match parser.parse_line_info("malformed") {
+            Ok(_) => panic!("malformed unit header must not be treated as end-of-units"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.downcast_ref::<gimli::Error>().is_some(),
+            "expected gimli parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_debug_info_propagates_unit_header_errors() {
+        let dwarf = dwarf_with_debug_info_bytes(vec![0x0b, 0x00, 0x00, 0x00, 0x04]);
+        let parser = DwarfParser { dwarf: &dwarf };
+
+        let err = match parser.parse_debug_info("malformed") {
+            Ok(_) => panic!("malformed unit header must not be treated as end-of-units"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.downcast_ref::<gimli::Error>().is_some(),
+            "expected gimli parse error, got: {err}"
+        );
     }
 
     fn build_variable_index_fixture() -> gimli::Dwarf<DwarfReader> {
