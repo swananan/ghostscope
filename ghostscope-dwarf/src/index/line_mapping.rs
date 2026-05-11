@@ -91,7 +91,9 @@ impl LineMappingTable {
             .address_to_line_map
             .range(..=address)
             .next_back()
-            .and_then(|(_, entries)| Self::representative_entry(entries));
+            .and_then(|(_, entries)| {
+                Self::representative_entry(entries).filter(|entry| entry.contains_address(address))
+            });
 
         if let Some(entry) = result {
             tracing::debug!(
@@ -140,7 +142,7 @@ impl LineMappingTable {
             .get(&(file_path.to_string(), line_number))
         {
             tracing::debug!("Found addresses via exact path match: {}", file_path);
-            return self.filter_consecutive_addresses(addresses.clone());
+            return self.filter_consecutive_addresses(addresses.clone(), file_path, line_number);
         }
 
         // Strategy 2: Basename candidates + suffix check (avoid global scans)
@@ -162,7 +164,11 @@ impl LineMappingTable {
                                 file_path,
                                 full_path
                             );
-                            return self.filter_consecutive_addresses(addresses.clone());
+                            return self.filter_consecutive_addresses(
+                                addresses.clone(),
+                                full_path,
+                                line_number,
+                            );
                         }
                     }
                 }
@@ -185,7 +191,11 @@ impl LineMappingTable {
                         full_path,
                         addresses.len()
                     );
-                    return self.filter_consecutive_addresses(addresses.clone());
+                    return self.filter_consecutive_addresses(
+                        addresses.clone(),
+                        full_path,
+                        line_number,
+                    );
                 }
             } else {
                 // Multiple files with same basename - try to match with partial path (best effort)
@@ -200,7 +210,11 @@ impl LineMappingTable {
                                 file_path,
                                 full_path
                             );
-                            return self.filter_consecutive_addresses(addresses.clone());
+                            return self.filter_consecutive_addresses(
+                                addresses.clone(),
+                                full_path,
+                                line_number,
+                            );
                         }
                     }
                 }
@@ -213,7 +227,12 @@ impl LineMappingTable {
 
     /// Filter consecutive addresses to keep only statement boundaries
     /// This helps avoid setting multiple breakpoints on the same logical line
-    fn filter_consecutive_addresses(&self, addresses: Vec<u64>) -> Vec<u64> {
+    fn filter_consecutive_addresses(
+        &self,
+        addresses: Vec<u64>,
+        file_path: &str,
+        line_number: u64,
+    ) -> Vec<u64> {
         if addresses.is_empty() {
             return addresses;
         }
@@ -252,7 +271,9 @@ impl LineMappingTable {
                 // Single address - check if it's is_stmt
                 let addr = group[0];
                 if let Some(entries) = self.address_to_line_map.get(&addr) {
-                    if entries.iter().any(|entry| entry.is_stmt) {
+                    if entries.iter().any(|entry| {
+                        entry.is_stmt && entry.file_path == file_path && entry.line == line_number
+                    }) {
                         result.push(addr);
                     }
                     // Note: Unlike GDB, we still include non-is_stmt single addresses
@@ -272,7 +293,11 @@ impl LineMappingTable {
                 let mut selected = None;
                 for &addr in &group {
                     if let Some(entries) = self.address_to_line_map.get(&addr) {
-                        if entries.iter().any(|entry| entry.is_stmt) {
+                        if entries.iter().any(|entry| {
+                            entry.is_stmt
+                                && entry.file_path == file_path
+                                && entry.line == line_number
+                        }) {
                             selected = Some(addr);
                             break;
                         }
@@ -453,6 +478,7 @@ mod tests {
     fn line_entry(address: u64, file_path: &str, line: u64, is_stmt: bool) -> LineEntry {
         LineEntry {
             address,
+            end_address: None,
             file_path: file_path.to_string(),
             file_index: 1,
             compilation_unit: Arc::from("main.c"),
@@ -498,5 +524,54 @@ mod tests {
 
         assert_eq!(entry.file_path, "/src/include/header.h");
         assert_eq!(entry.line, 12);
+    }
+
+    #[test]
+    fn lookup_addresses_by_path_uses_stmt_rows_for_requested_line_only() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let table = LineMappingTable::from_entries_with_scoped_manager(
+            vec![
+                line_entry(0x1000, "/src/include/header.h", 12, true),
+                line_entry(0x1000, "/src/main.c", 42, false),
+                line_entry(0x1008, "/src/main.c", 42, true),
+            ],
+            &scoped,
+        );
+
+        assert_eq!(
+            table.lookup_addresses_by_path("/src/main.c", 42),
+            vec![0x1008]
+        );
+    }
+
+    #[test]
+    fn lookup_line_does_not_cross_known_row_end() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let mut first = line_entry(0x1000, "/src/main.c", 10, true);
+        first.end_address = Some(0x1010);
+        let mut second = line_entry(0x2000, "/src/main.c", 20, true);
+        second.end_address = Some(0x2010);
+        let table =
+            LineMappingTable::from_entries_with_scoped_manager(vec![first, second], &scoped);
+
+        assert_eq!(table.lookup_line(0x100f).map(|entry| entry.line), Some(10));
+        assert!(table.lookup_line(0x1010).is_none());
+        assert!(table.lookup_line(0x1fff).is_none());
+        assert_eq!(table.lookup_line(0x2000).map(|entry| entry.line), Some(20));
+    }
+
+    #[test]
+    fn lookup_line_ignores_zero_length_row() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let mut zero_length = line_entry(0x1000, "/src/main.c", 10, true);
+        zero_length.end_address = Some(0x1000);
+        let mut next = line_entry(0x2000, "/src/main.c", 20, true);
+        next.end_address = Some(0x2010);
+        let table =
+            LineMappingTable::from_entries_with_scoped_manager(vec![zero_length, next], &scoped);
+
+        assert!(table.lookup_line(0x1000).is_none());
+        assert!(table.lookup_line(0x1fff).is_none());
+        assert_eq!(table.lookup_line(0x2000).map(|entry| entry.line), Some(20));
     }
 }

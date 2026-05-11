@@ -232,8 +232,7 @@ async fn test_visible_variables_consumes_pc_context() -> anyhow::Result<()> {
         diagnostics
             .iter()
             .all(|diagnostic| diagnostic.pc == ctx.normalized_pc),
-        "diagnostics should be tied to the queried PC: {:?}",
-        diagnostics
+        "diagnostics should be tied to the queried PC: {diagnostics:?}"
     );
 
     Ok(())
