@@ -278,11 +278,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     /// Convert DWARF type size to MemoryAccessSize
-    fn dwarf_type_to_memory_access_size(&self, dwarf_type: &TypeInfo) -> MemoryAccessSize {
+    pub(super) fn dwarf_type_to_memory_access_size(
+        &self,
+        dwarf_type: &TypeInfo,
+    ) -> MemoryAccessSize {
         MemoryAccessSize::from_size(dwarf_type.size())
     }
 
-    fn sign_extend_memory_read_if_needed(
+    pub(super) fn sign_extend_memory_read_if_needed(
         &self,
         value: BasicValueEnum<'ctx>,
         dwarf_type: &TypeInfo,
@@ -310,6 +313,55 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_int_s_extend(narrowed, self.context.i64_type(), "signed_mem_sext")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         Ok(extended.into())
+    }
+
+    fn normalize_direct_integer_value_if_needed(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+        dwarf_type: Option<&TypeInfo>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let Some(c_type) = dwarf_type.and_then(ghostscope_dwarf::c_integer_comparison_type) else {
+            return Ok(value);
+        };
+        let BasicValueEnum::IntValue(int_value) = value else {
+            return Ok(value);
+        };
+
+        let bit_width = c_type.size.saturating_mul(8).clamp(1, 64) as u32;
+        let current_width = int_value.get_type().get_bit_width();
+        let narrow_type = self.context.custom_width_int_type(bit_width);
+        let narrowed = if current_width > bit_width {
+            self.builder
+                .build_int_truncate(int_value, narrow_type, "direct_int_trunc")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        } else if current_width < bit_width {
+            if c_type.is_unsigned {
+                self.builder
+                    .build_int_z_extend(int_value, narrow_type, "direct_int_zext_to_type")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            } else {
+                self.builder
+                    .build_int_s_extend(int_value, narrow_type, "direct_int_sext_to_type")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            }
+        } else {
+            int_value
+        };
+
+        if bit_width == 64 {
+            return Ok(narrowed.into());
+        }
+
+        let normalized = if c_type.is_unsigned {
+            self.builder
+                .build_int_z_extend(narrowed, self.context.i64_type(), "direct_int_zext")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        } else {
+            self.builder
+                .build_int_s_extend(narrowed, self.context.i64_type(), "direct_int_sext")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        };
+        Ok(normalized.into())
     }
 
     pub(super) fn variable_read_plan_to_materialization(
@@ -350,7 +402,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     ) -> Result<BasicValueEnum<'ctx>> {
         match &materialization.materialization {
             ghostscope_dwarf::VariableMaterialization::DirectValue { value } => {
-                self.planned_value_to_llvm_value(value, &materialization.name, status_ptr)
+                let value =
+                    self.planned_value_to_llvm_value(value, &materialization.name, status_ptr)?;
+                self.normalize_direct_integer_value_if_needed(
+                    value,
+                    materialization.dwarf_type.as_ref(),
+                )
             }
             ghostscope_dwarf::VariableMaterialization::UserMemoryRead { address } => {
                 let dwarf_type = materialization.dwarf_type.as_ref().ok_or_else(|| {
@@ -437,7 +494,108 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.generate_memory_read(addr, access_size, status_ptr)
         }?;
 
+        if let Some(bitfield_value) =
+            self.extract_bitfield_memory_read_if_needed(read_value, dwarf_type)?
+        {
+            return Ok(bitfield_value);
+        }
+
         self.sign_extend_memory_read_if_needed(read_value, dwarf_type, access_size)
+    }
+
+    fn extract_bitfield_memory_read_if_needed(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        dwarf_type: &TypeInfo,
+    ) -> Result<Option<BasicValueEnum<'ctx>>> {
+        let TypeInfo::BitfieldType {
+            underlying_type,
+            bit_offset,
+            bit_size,
+        } = ghostscope_dwarf::strip_type_aliases(dwarf_type)
+        else {
+            return Ok(None);
+        };
+
+        let bit_size = u32::from(*bit_size).min(64);
+        if bit_size == 0 {
+            return Ok(Some(self.context.i64_type().const_zero().into()));
+        }
+
+        let int_value = value.into_int_value();
+        let current_width = int_value.get_type().get_bit_width();
+        let int64 = if current_width < 64 {
+            self.builder
+                .build_int_z_extend(int_value, self.context.i64_type(), "bitfield_raw_zext")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        } else if current_width > 64 {
+            self.builder
+                .build_int_truncate(int_value, self.context.i64_type(), "bitfield_raw_trunc")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        } else {
+            int_value
+        };
+
+        let bit_offset = u32::from(*bit_offset);
+        if bit_offset >= 64 {
+            return Ok(Some(self.context.i64_type().const_zero().into()));
+        }
+
+        let shifted = if bit_offset == 0 {
+            int64
+        } else {
+            self.builder
+                .build_right_shift(
+                    int64,
+                    self.context
+                        .i64_type()
+                        .const_int(u64::from(bit_offset), false),
+                    false,
+                    "bitfield_shift",
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        };
+
+        let masked = if bit_size == 64 {
+            shifted
+        } else {
+            let mask = (1u64 << bit_size) - 1;
+            self.builder
+                .build_and(
+                    shifted,
+                    self.context.i64_type().const_int(mask, false),
+                    "bitfield_mask",
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        };
+
+        if bit_size < 64 && ghostscope_dwarf::is_c_signed_integer_type(underlying_type) {
+            let sign_shift = 64 - bit_size;
+            let shifted_left = self
+                .builder
+                .build_left_shift(
+                    masked,
+                    self.context
+                        .i64_type()
+                        .const_int(u64::from(sign_shift), false),
+                    "bitfield_sign_shift_left",
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let extended = self
+                .builder
+                .build_right_shift(
+                    shifted_left,
+                    self.context
+                        .i64_type()
+                        .const_int(u64::from(sign_shift), false),
+                    true,
+                    "bitfield_sign_extend",
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            return Ok(Some(extended.into()));
+        }
+
+        Ok(Some(masked.into()))
     }
 
     /// Execute a semantic runtime expression selected by DWARF read planning.
@@ -533,14 +691,22 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
                 PlanExprOp::Div => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        let result = self
-                            .builder
-                            .build_int_signed_div(a, b, "div")
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        let result = self.build_signed_int_div_via_udiv(a, b, "div")?;
                         stack.push(result);
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in Div".to_string(),
+                        ));
+                    }
+                }
+
+                PlanExprOp::Mod => {
+                    if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
+                        let result = self.build_signed_int_rem_via_urem(a, b, "mod")?;
+                        stack.push(result);
+                    } else {
+                        return Err(CodeGenError::LLVMError(
+                            "Stack underflow in Mod".to_string(),
                         ));
                     }
                 }
@@ -611,6 +777,109 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in ShiftRight".to_string(),
+                        ));
+                    }
+                }
+
+                PlanExprOp::Shra => {
+                    if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
+                        let result = self
+                            .builder
+                            .build_right_shift(a, b, true, "shra")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(result);
+                    } else {
+                        return Err(CodeGenError::LLVMError(
+                            "Stack underflow in ShiftRightArithmetic".to_string(),
+                        ));
+                    }
+                }
+
+                PlanExprOp::Not => {
+                    if let Some(a) = stack.pop() {
+                        let result = self
+                            .builder
+                            .build_not(a, "not")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(result);
+                    } else {
+                        return Err(CodeGenError::LLVMError(
+                            "Stack underflow in Not".to_string(),
+                        ));
+                    }
+                }
+
+                PlanExprOp::Neg => {
+                    if let Some(a) = stack.pop() {
+                        let result = self
+                            .builder
+                            .build_int_sub(self.context.i64_type().const_zero(), a, "neg")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(result);
+                    } else {
+                        return Err(CodeGenError::LLVMError(
+                            "Stack underflow in Neg".to_string(),
+                        ));
+                    }
+                }
+
+                PlanExprOp::Abs => {
+                    if let Some(a) = stack.pop() {
+                        let zero = self.context.i64_type().const_zero();
+                        let is_neg = self
+                            .builder
+                            .build_int_compare(inkwell::IntPredicate::SLT, a, zero, "abs_neg")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        let negated = self
+                            .builder
+                            .build_int_sub(zero, a, "abs_negated")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        let result = self
+                            .builder
+                            .build_select::<BasicValueEnum<'ctx>, _>(
+                                is_neg,
+                                negated.into(),
+                                a.into(),
+                                "abs",
+                            )
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                            .into_int_value();
+                        stack.push(result);
+                    } else {
+                        return Err(CodeGenError::LLVMError(
+                            "Stack underflow in Abs".to_string(),
+                        ));
+                    }
+                }
+
+                PlanExprOp::Eq
+                | PlanExprOp::Ne
+                | PlanExprOp::Lt
+                | PlanExprOp::Le
+                | PlanExprOp::Gt
+                | PlanExprOp::Ge => {
+                    if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
+                        let predicate = match op {
+                            PlanExprOp::Eq => inkwell::IntPredicate::EQ,
+                            PlanExprOp::Ne => inkwell::IntPredicate::NE,
+                            PlanExprOp::Lt => inkwell::IntPredicate::SLT,
+                            PlanExprOp::Le => inkwell::IntPredicate::SLE,
+                            PlanExprOp::Gt => inkwell::IntPredicate::SGT,
+                            PlanExprOp::Ge => inkwell::IntPredicate::SGE,
+                            _ => unreachable!(),
+                        };
+                        let cmp = self
+                            .builder
+                            .build_int_compare(predicate, a, b, "cmp")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        let result = self
+                            .builder
+                            .build_int_z_extend(cmp, self.context.i64_type(), "cmp_i64")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(result);
+                    } else {
+                        return Err(CodeGenError::LLVMError(
+                            "Stack underflow in comparison".to_string(),
                         ));
                     }
                 }
@@ -1272,18 +1541,44 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     Ok(Some(base))
                 }
                 crate::script::Expr::ArrayAccess(array, index) => {
-                    let Some(base) = append_segments(array, segments)? else {
-                        return Ok(None);
-                    };
                     let crate::script::Expr::Int(index) = index.as_ref() else {
                         return Err(CodeGenError::NotImplemented(
                             "Only literal integer array indices are supported (TODO)".to_string(),
                         ));
                     };
+
+                    if let Some((array_base, base_index)) =
+                        EbpfContext::<'static, 'static>::pointer_arithmetic_parts(array)
+                    {
+                        let Some(base) = append_segments(array_base, segments)? else {
+                            return Ok(None);
+                        };
+                        let index = base_index.checked_add(*index).ok_or_else(|| {
+                            CodeGenError::TypeError(
+                                "array index offset overflow after pointer arithmetic".to_string(),
+                            )
+                        })?;
+                        segments.push(VariableAccessSegment::ArrayIndex(index));
+                        return Ok(Some(base));
+                    }
+
+                    let Some(base) = append_segments(array, segments)? else {
+                        return Ok(None);
+                    };
                     segments.push(VariableAccessSegment::ArrayIndex(*index));
                     Ok(Some(base))
                 }
                 crate::script::Expr::PointerDeref(inner) => {
+                    if let Some((pointer_base, index)) =
+                        EbpfContext::<'static, 'static>::pointer_arithmetic_parts(inner)
+                    {
+                        let Some(base) = append_segments(pointer_base, segments)? else {
+                            return Ok(None);
+                        };
+                        segments.push(VariableAccessSegment::ArrayIndex(index));
+                        return Ok(Some(base));
+                    }
+
                     let Some(base) = append_segments(inner, segments)? else {
                         return Ok(None);
                     };
@@ -1305,6 +1600,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::script::BinaryOp;
     use crate::script::Expr;
     use ghostscope_dwarf::AddressExpr;
     use ghostscope_dwarf::PlanExprOp;
@@ -1381,6 +1677,57 @@ mod tests {
 
         assert!(matches!(err, CodeGenError::NotImplemented(_)));
         assert!(err.to_string().contains("literal integer array indices"));
+    }
+
+    #[test]
+    fn access_path_from_expr_folds_pointer_arithmetic_array_base() {
+        let expr = Expr::ArrayAccess(
+            Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Variable("numbers".to_string())),
+                    op: BinaryOp::Add,
+                    right: Box::new(Expr::Int(3)),
+                }),
+                op: BinaryOp::Subtract,
+                right: Box::new(Expr::Int(1)),
+            }),
+            Box::new(Expr::Int(2)),
+        );
+
+        let (base, path) = EbpfContext::<'static, 'static>::access_path_from_expr(&expr)
+            .expect("access path should parse")
+            .expect("expression should be flattenable");
+
+        assert_eq!(base, "numbers");
+        assert_eq!(path.segments, vec![VariableAccessSegment::ArrayIndex(4)]);
+        assert_eq!(
+            EbpfContext::<'static, 'static>::access_path_to_string(&base, &path),
+            "numbers[4]"
+        );
+    }
+
+    #[test]
+    fn access_path_from_expr_folds_pointer_arithmetic_deref() {
+        let expr = Expr::PointerDeref(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Variable("numbers".to_string())),
+                op: BinaryOp::Add,
+                right: Box::new(Expr::Int(3)),
+            }),
+            op: BinaryOp::Subtract,
+            right: Box::new(Expr::Int(1)),
+        }));
+
+        let (base, path) = EbpfContext::<'static, 'static>::access_path_from_expr(&expr)
+            .expect("access path should parse")
+            .expect("expression should be flattenable");
+
+        assert_eq!(base, "numbers");
+        assert_eq!(path.segments, vec![VariableAccessSegment::ArrayIndex(2)]);
+        assert_eq!(
+            EbpfContext::<'static, 'static>::access_path_to_string(&base, &path),
+            "numbers[2]"
+        );
     }
 
     #[test]
@@ -1533,6 +1880,177 @@ mod tests {
             .variable_read_plan_to_llvm_value(&plan, 0, None)
             .expect("absolute address value should lower");
         assert!(matches!(value, BasicValueEnum::IntValue(_)));
+    }
+
+    #[test]
+    fn runtime_computed_div_and_mod_lower_without_signed_ir_ops() {
+        let llctx = LlvmContext::create();
+        let opts = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&llctx, "runtime_div_mod", Some(0), &opts).expect("ctx");
+        ctx.create_basic_ebpf_function("f").expect("fn");
+
+        let ty = ghostscope_protocol::TypeInfo::BaseType {
+            name: "long".to_string(),
+            size: 8,
+            encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+        };
+        let div_plan = read_plan(
+            "div_value",
+            "long",
+            Some(ty.clone()),
+            VariableLocation::ComputedValue(vec![
+                PlanExprOp::LoadRegister(0),
+                PlanExprOp::PushConstant(-3),
+                PlanExprOp::Div,
+            ]),
+            Availability::Available,
+        );
+        let mod_plan = read_plan(
+            "mod_value",
+            "long",
+            Some(ty),
+            VariableLocation::ComputedValue(vec![
+                PlanExprOp::LoadRegister(0),
+                PlanExprOp::PushConstant(-3),
+                PlanExprOp::Mod,
+            ]),
+            Availability::Available,
+        );
+
+        let div_value = ctx
+            .variable_read_plan_to_llvm_value(&div_plan, 0, None)
+            .expect("DW_OP_div-style plan should lower");
+        let mod_value = ctx
+            .variable_read_plan_to_llvm_value(&mod_plan, 0, None)
+            .expect("DW_OP_mod-style plan should lower");
+        assert!(matches!(div_value, BasicValueEnum::IntValue(_)));
+        assert!(matches!(mod_value, BasicValueEnum::IntValue(_)));
+
+        let ir = ctx.module.print_to_string().to_string();
+        assert!(
+            !ir.contains(" sdiv "),
+            "runtime DWARF div should not emit LLVM signed division:\n{ir}"
+        );
+        assert!(
+            !ir.contains(" srem "),
+            "runtime DWARF mod should not emit LLVM signed remainder:\n{ir}"
+        );
+        assert!(
+            ir.contains(" udiv "),
+            "runtime DWARF div should lower through unsigned division:\n{ir}"
+        );
+        assert!(
+            ir.contains(" urem "),
+            "runtime DWARF mod should lower through unsigned remainder:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn runtime_computed_common_dwarf_ops_lower() {
+        let llctx = LlvmContext::create();
+        let opts = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&llctx, "runtime_common_ops", Some(0), &opts).expect("ctx");
+        ctx.create_basic_ebpf_function("f").expect("fn");
+
+        let ty = ghostscope_protocol::TypeInfo::BaseType {
+            name: "long".to_string(),
+            size: 8,
+            encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+        };
+        let cases = [
+            (
+                "shra_value",
+                vec![
+                    PlanExprOp::LoadRegister(0),
+                    PlanExprOp::PushConstant(1),
+                    PlanExprOp::Shra,
+                ],
+            ),
+            (
+                "not_value",
+                vec![PlanExprOp::LoadRegister(0), PlanExprOp::Not],
+            ),
+            (
+                "neg_value",
+                vec![PlanExprOp::LoadRegister(0), PlanExprOp::Neg],
+            ),
+            (
+                "abs_value",
+                vec![PlanExprOp::LoadRegister(0), PlanExprOp::Abs],
+            ),
+            (
+                "eq_value",
+                vec![
+                    PlanExprOp::LoadRegister(0),
+                    PlanExprOp::PushConstant(0),
+                    PlanExprOp::Eq,
+                ],
+            ),
+            (
+                "ne_value",
+                vec![
+                    PlanExprOp::LoadRegister(0),
+                    PlanExprOp::PushConstant(0),
+                    PlanExprOp::Ne,
+                ],
+            ),
+            (
+                "lt_value",
+                vec![
+                    PlanExprOp::LoadRegister(0),
+                    PlanExprOp::PushConstant(0),
+                    PlanExprOp::Lt,
+                ],
+            ),
+            (
+                "le_value",
+                vec![
+                    PlanExprOp::LoadRegister(0),
+                    PlanExprOp::PushConstant(0),
+                    PlanExprOp::Le,
+                ],
+            ),
+            (
+                "gt_value",
+                vec![
+                    PlanExprOp::LoadRegister(0),
+                    PlanExprOp::PushConstant(0),
+                    PlanExprOp::Gt,
+                ],
+            ),
+            (
+                "ge_value",
+                vec![
+                    PlanExprOp::LoadRegister(0),
+                    PlanExprOp::PushConstant(0),
+                    PlanExprOp::Ge,
+                ],
+            ),
+        ];
+
+        for (name, ops) in cases {
+            let plan = read_plan(
+                name,
+                "long",
+                Some(ty.clone()),
+                VariableLocation::ComputedValue(ops),
+                Availability::Available,
+            );
+            let value = ctx
+                .variable_read_plan_to_llvm_value(&plan, 0, None)
+                .unwrap_or_else(|err| panic!("{name} should lower: {err:?}"));
+            assert!(matches!(value, BasicValueEnum::IntValue(_)));
+        }
+
+        let ir = ctx.module.print_to_string().to_string();
+        assert!(
+            ir.contains(" ashr "),
+            "DW_OP_shra-style plan should emit arithmetic shift right:\n{ir}"
+        );
+        assert!(
+            ir.contains(" icmp "),
+            "comparison-style DWARF plans should emit integer compares:\n{ir}"
+        );
     }
 
     #[test]

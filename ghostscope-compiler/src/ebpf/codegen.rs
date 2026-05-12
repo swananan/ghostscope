@@ -464,6 +464,61 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             | E::ArrayAccess(_, _)
             | E::PointerDeref(_)
             | E::ChainAccess(_)) => {
+                if let E::ArrayAccess(array_expr, index_expr) = expr {
+                    if let Some((BasicValueEnum::IntValue(value), _element_type)) =
+                        self.compile_dynamic_array_access_value(array_expr, index_expr)?
+                    {
+                        let bitw = value.get_type().get_bit_width();
+                        let (kind, byte_len) = if bitw == 1 {
+                            (TypeKind::Bool, 1)
+                        } else if bitw <= 8 {
+                            (TypeKind::I8, 1)
+                        } else if bitw <= 16 {
+                            (TypeKind::I16, 2)
+                        } else if bitw <= 32 {
+                            (TypeKind::I32, 4)
+                        } else {
+                            (TypeKind::I64, 8)
+                        };
+                        return Ok(ComplexArg {
+                            var_name_index: self
+                                .trace_context
+                                .add_variable_name(self.expr_to_name(expr)),
+                            type_index: self.add_synthesized_type_index_for_kind(kind),
+                            access_path: Vec::new(),
+                            data_len: byte_len,
+                            source: ComplexArgSource::ComputedInt { value, byte_len },
+                        });
+                    }
+                }
+                if let E::MemberAccess(obj_expr, field) = expr {
+                    if let Some((BasicValueEnum::IntValue(value), _member_type)) =
+                        self.compile_dynamic_member_access_value(obj_expr, field)?
+                    {
+                        let bitw = value.get_type().get_bit_width();
+                        let (kind, byte_len) = if bitw == 1 {
+                            (TypeKind::Bool, 1)
+                        } else if bitw <= 8 {
+                            (TypeKind::I8, 1)
+                        } else if bitw <= 16 {
+                            (TypeKind::I16, 2)
+                        } else if bitw <= 32 {
+                            (TypeKind::I32, 4)
+                        } else {
+                            (TypeKind::I64, 8)
+                        };
+                        return Ok(ComplexArg {
+                            var_name_index: self
+                                .trace_context
+                                .add_variable_name(self.expr_to_name(expr)),
+                            type_index: self.add_synthesized_type_index_for_kind(kind),
+                            access_path: Vec::new(),
+                            data_len: byte_len,
+                            source: ComplexArgSource::ComputedInt { value, byte_len },
+                        });
+                    }
+                }
+
                 let plan = self
                     .query_dwarf_for_complex_expr_plan(expr)?
                     .ok_or_else(|| CodeGenError::VariableNotFound(format!("{expr:?}")))?;
@@ -485,120 +540,85 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
 
             // 7) Pointer arithmetic (ptr +/- K) → typed runtime read at computed address
-            E::BinaryOp { left, op, right } => {
-                use crate::script::ast::BinaryOp as BO;
+            E::BinaryOp { .. } => {
                 // Support: ptr + int, int + ptr, ptr - int (int may be negative)
                 // Only allow when ptr side resolves to DWARF pointer/array; the offset must be an integer literal for now.
                 // We emit a RuntimeRead with computed location, preserving the pointed-to DWARF type.
-                let (ptr_side, int_side, sign) = match (&**left, op, &**right) {
-                    (l, BO::Add, E::Int(k)) => (l, *k, 1),
-                    (E::Int(k), BO::Add, r) => (r, *k, 1),
-                    (l, BO::Subtract, E::Int(k)) => (l, *k, -1),
-                    _ => {
-                        // Fallback to generic expression handling below
-                        let compiled = self.compile_expr(expr)?;
-                        if let BasicValueEnum::IntValue(iv) = compiled {
-                            let bitw = iv.get_type().get_bit_width();
-                            let (kind, byte_len) = if bitw == 1 {
-                                (TypeKind::Bool, 1)
-                            } else if bitw <= 8 {
-                                (TypeKind::I8, 1)
-                            } else if bitw <= 16 {
-                                (TypeKind::I16, 2)
-                            } else if bitw <= 32 {
-                                (TypeKind::I32, 4)
-                            } else {
-                                (TypeKind::I64, 8)
-                            };
-                            return Ok(ComplexArg {
-                                var_name_index: self
-                                    .trace_context
-                                    .add_variable_name(self.expr_to_name(expr)),
-                                type_index: self.add_synthesized_type_index_for_kind(kind),
-                                access_path: Vec::new(),
-                                data_len: byte_len,
-                                source: ComplexArgSource::ComputedInt {
-                                    value: iv,
-                                    byte_len,
-                                },
-                            });
-                        } else {
-                            return Err(CodeGenError::TypeError(
-                                "Non-integer expression not supported in print".to_string(),
-                            ));
-                        }
-                    }
-                };
+                let pointer_arithmetic = self.pointer_arithmetic_parts_expanding_aliases(expr)?;
 
                 // Try DWARF resolution for the pointer side
-                if let Some(var) = self.query_dwarf_for_complex_expr(ptr_side)? {
-                    if var.dwarf_type.is_some() {
-                        let index = sign * int_side;
-                        let pointed_plan = var
-                            .plan_pointer_element_index(index)
-                            .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
-                        let pc_address = self.get_compile_time_context()?.pc_address;
-                        let materialized =
-                            self.variable_read_plan_to_materialization(pointed_plan, pc_address)?;
-                        let elem_ty = materialized.dwarf_type.clone().ok_or_else(|| {
-                            CodeGenError::DwarfError(
-                                "Expression has no DWARF type information".to_string(),
-                            )
-                        })?;
-                        let address = match materialized.materialization {
-                            ghostscope_dwarf::VariableMaterialization::UserMemoryRead {
-                                address,
-                            } => address,
-                            ghostscope_dwarf::VariableMaterialization::Unavailable {
-                                availability,
-                            } => {
-                                return Err(Self::dwarf_expression_unavailable_error(
-                                    &materialized.name,
-                                    &availability,
-                                    pc_address,
-                                ))
+                if let Some((ptr_side, index)) = pointer_arithmetic {
+                    if let Some(var) = self.query_dwarf_for_complex_expr(&ptr_side)? {
+                        if var
+                            .dwarf_type
+                            .as_ref()
+                            .is_some_and(ghostscope_dwarf::is_c_pointer_or_array_type)
+                        {
+                            let pointed_plan = var
+                                .plan_pointer_element_index(index)
+                                .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
+                            let pc_address = self.get_compile_time_context()?.pc_address;
+                            let materialized = self
+                                .variable_read_plan_to_materialization(pointed_plan, pc_address)?;
+                            let elem_ty = materialized.dwarf_type.clone().ok_or_else(|| {
+                                CodeGenError::DwarfError(
+                                    "Expression has no DWARF type information".to_string(),
+                                )
+                            })?;
+                            let address =
+                                match materialized.materialization {
+                                    ghostscope_dwarf::VariableMaterialization::UserMemoryRead {
+                                        address,
+                                    } => address,
+                                    ghostscope_dwarf::VariableMaterialization::Unavailable {
+                                        availability,
+                                    } => {
+                                        return Err(Self::dwarf_expression_unavailable_error(
+                                            &materialized.name,
+                                            &availability,
+                                            pc_address,
+                                        ))
+                                    }
+                                    _ => return Err(CodeGenError::DwarfError(
+                                        "pointer arithmetic did not produce an address-backed plan"
+                                            .to_string(),
+                                    )),
+                                };
+                            let data_len = Self::compute_read_size_for_type(&elem_ty);
+                            let module_hint = self.take_module_hint();
+                            if data_len == 0 {
+                                // Fallback for unsized/void targets: print computed address as pointer
+                                let ptr_ti = ghostscope_dwarf::TypeInfo::PointerType {
+                                    target_type: Box::new(elem_ty.clone()),
+                                    size: 8,
+                                };
+                                return Ok(ComplexArg {
+                                    var_name_index: self
+                                        .trace_context
+                                        .add_variable_name(self.expr_to_name(expr)),
+                                    type_index: self.trace_context.add_type(ptr_ti),
+                                    access_path: Vec::new(),
+                                    data_len: 8,
+                                    source: ComplexArgSource::AddressValue {
+                                        address,
+                                        module_for_offsets: module_hint,
+                                    },
+                                });
                             }
-                            _ => {
-                                return Err(CodeGenError::DwarfError(
-                                    "pointer arithmetic did not produce an address-backed plan"
-                                        .to_string(),
-                                ))
-                            }
-                        };
-                        let data_len = Self::compute_read_size_for_type(&elem_ty);
-                        let module_hint = self.take_module_hint();
-                        if data_len == 0 {
-                            // Fallback for unsized/void targets: print computed address as pointer
-                            let ptr_ti = ghostscope_dwarf::TypeInfo::PointerType {
-                                target_type: Box::new(elem_ty.clone()),
-                                size: 8,
-                            };
                             return Ok(ComplexArg {
                                 var_name_index: self
                                     .trace_context
                                     .add_variable_name(self.expr_to_name(expr)),
-                                type_index: self.trace_context.add_type(ptr_ti),
+                                type_index: self.trace_context.add_type(elem_ty.clone()),
                                 access_path: Vec::new(),
-                                data_len: 8,
-                                source: ComplexArgSource::AddressValue {
+                                data_len,
+                                source: ComplexArgSource::RuntimeRead {
                                     address,
+                                    dwarf_type: elem_ty,
                                     module_for_offsets: module_hint,
                                 },
                             });
                         }
-                        return Ok(ComplexArg {
-                            var_name_index: self
-                                .trace_context
-                                .add_variable_name(self.expr_to_name(expr)),
-                            type_index: self.trace_context.add_type(elem_ty.clone()),
-                            access_path: Vec::new(),
-                            data_len,
-                            source: ComplexArgSource::RuntimeRead {
-                                address,
-                                dwarf_type: elem_ty,
-                                module_for_offsets: module_hint,
-                            },
-                        });
                     }
                 }
 
@@ -1341,7 +1361,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// - AddressOf(...)
     /// - Member/Array/PointerDeref/Chain access
     /// - Variable that is a DWARF-backed symbol (not a script var)
-    /// - Simple constant-offset on top of an aliasy expression: alias + K (K >= 0)
+    /// - Offset arithmetic on top of an aliasy expression: alias +/- integer expression
     fn is_alias_candidate_expr(&mut self, expr: &crate::script::ast::Expr) -> bool {
         use crate::script::ast::BinaryOp as BO;
         use crate::script::ast::Expr as E;
@@ -1356,10 +1376,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 op: BO::Add,
                 right,
             } => {
-                let is_const_nonneg = |e: &E| matches!(e, E::Int(v) if *v >= 0);
-                (self.is_alias_candidate_expr(left) && is_const_nonneg(right))
-                    || (self.is_alias_candidate_expr(right) && is_const_nonneg(left))
+                let left_is_alias = self.is_alias_candidate_expr(left);
+                let right_is_alias = self.is_alias_candidate_expr(right);
+                (left_is_alias && !right_is_alias) || (right_is_alias && !left_is_alias)
             }
+            E::BinaryOp {
+                left,
+                op: BO::Subtract,
+                right,
+            } => self.is_alias_candidate_expr(left) && !self.is_alias_candidate_expr(right),
             // Otherwise, only keep address-like or aggregate DWARF expressions as aliases.
             // Scalar DWARF expressions should stay concrete so `let n = foo.len;` behaves
             // like an integer script variable and remains usable in capture-length formatting.
@@ -1710,6 +1735,47 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     /// Compile formatted print statement: collect all variable data and send as PrintComplexFormat instruction
+    fn resolve_memory_format_address(
+        &mut self,
+        expr: &crate::script::ast::Expr,
+    ) -> Result<IntValue<'ctx>> {
+        let val = self.compile_expr(expr).ok();
+        if let Some(BasicValueEnum::PointerValue(pv)) = val {
+            return self
+                .builder
+                .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
+                .map_err(|e| CodeGenError::Builder(e.to_string()));
+        }
+
+        if let Some(BasicValueEnum::IntValue(iv)) = val {
+            if let Some(var) = self.query_dwarf_for_complex_expr(expr)? {
+                if let Some(ref ty) = var.dwarf_type {
+                    if matches!(ty, ghostscope_dwarf::TypeInfo::PointerType { .. }) {
+                        let _ = self.take_module_hint();
+                        return Ok(iv);
+                    }
+                }
+            }
+        }
+
+        if let Ok(addr) = self.resolve_ptr_i64_from_expr(expr) {
+            let _ = self.take_module_hint();
+            return Ok(addr);
+        }
+
+        let var = self
+            .query_dwarf_for_complex_expr(expr)?
+            .ok_or_else(|| CodeGenError::VariableNotFound(format!("{expr:?}")))?;
+        let module_hint = self.take_module_hint();
+        let pc_address = self.get_compile_time_context()?.pc_address;
+        self.variable_read_plan_to_lvalue_address_with_hint(
+            &var,
+            pc_address,
+            None,
+            module_hint.as_deref(),
+        )
+    }
+
     fn compile_formatted_print(
         &mut self,
         format: &str,
@@ -1738,6 +1804,28 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             Static(usize),
             Star,
             Capture(String),
+        }
+
+        fn parse_static_len(spec: &str) -> Option<usize> {
+            if spec.chars().all(|c| c.is_ascii_digit()) {
+                return spec.parse::<usize>().ok();
+            }
+            if let Some(hex) = spec.strip_prefix("0x") {
+                if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return usize::from_str_radix(hex, 16).ok();
+                }
+            }
+            if let Some(oct) = spec.strip_prefix("0o") {
+                if !oct.is_empty() && oct.chars().all(|c| matches!(c, '0'..='7')) {
+                    return usize::from_str_radix(oct, 8).ok();
+                }
+            }
+            if let Some(bin) = spec.strip_prefix("0b") {
+                if !bin.is_empty() && bin.chars().all(|c| matches!(c, '0' | '1')) {
+                    return usize::from_str_radix(bin, 2).ok();
+                }
+            }
+            None
         }
 
         fn parse_slots(fmt: &str) -> Vec<(Conv, LenSpec)> {
@@ -1775,8 +1863,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 LenSpec::Star
                             } else if let Some(s) = r.strip_suffix('$') {
                                 LenSpec::Capture(s.to_string())
-                            } else if r.chars().all(|c| c.is_ascii_digit()) {
-                                LenSpec::Static(r.parse::<usize>().unwrap_or(0))
+                            } else if let Some(n) = parse_static_len(r) {
+                                LenSpec::Static(n)
                             } else {
                                 LenSpec::None
                             }
@@ -1854,48 +1942,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         LenSpec::Static(n) if ai < args.len() => {
                             // Resolve value expr address
                             let expr = &args[ai];
-                            // Try get pointer address directly from expr value
-                            let val = self.compile_expr(expr).ok();
-                            let mut addr_iv: Option<IntValue> = match val {
-                                Some(BasicValueEnum::PointerValue(pv)) => Some(
-                                    self.builder
-                                        .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
-                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
-                                ),
-                                _ => None,
-                            };
-                            // If compiled value is IntValue but DWARF type is a pointer, treat the IntValue as an address (pointer value)
-                            if addr_iv.is_none() {
-                                if let Some(BasicValueEnum::IntValue(iv)) = val {
-                                    if let Some(var) = self.query_dwarf_for_complex_expr(expr)? {
-                                        if let Some(ref t) = var.dwarf_type {
-                                            if matches!(
-                                                t,
-                                                ghostscope_dwarf::TypeInfo::PointerType { .. }
-                                            ) {
-                                                addr_iv = Some(iv);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            let addr_iv = if let Some(iv) = addr_iv {
-                                iv
-                            } else {
-                                // Fallback: DWARF address (for arrays/char[N])
-                                let var =
-                                    self.query_dwarf_for_complex_expr(expr)?.ok_or_else(|| {
-                                        CodeGenError::VariableNotFound(format!("{expr:?}"))
-                                    })?;
-                                let mod_hint = self.take_module_hint();
-                                let pc_address = self.get_compile_time_context()?.pc_address;
-                                self.variable_read_plan_to_lvalue_address_with_hint(
-                                    &var,
-                                    pc_address,
-                                    None,
-                                    mod_hint.as_deref(),
-                                )?
-                            };
+                            let addr_iv = self.resolve_memory_format_address(expr)?;
                             complex_args.push(ComplexArg {
                                 var_name_index: self
                                     .trace_context
@@ -1953,47 +2000,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
                             // value expression -> dynamic memdump with cap
                             let val_expr = &args[ai + 1];
-                            // Resolve base address either from pointer-typed value or DWARF evaluation
-                            let val = self.compile_expr(val_expr).ok();
-                            let mut addr_iv: Option<IntValue> = match val {
-                                Some(BasicValueEnum::PointerValue(pv)) => Some(
-                                    self.builder
-                                        .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
-                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
-                                ),
-                                _ => None,
-                            };
-                            if addr_iv.is_none() {
-                                if let Some(BasicValueEnum::IntValue(iv)) = val {
-                                    if let Some(var) =
-                                        self.query_dwarf_for_complex_expr(val_expr)?
-                                    {
-                                        if let Some(ref t) = var.dwarf_type {
-                                            if matches!(
-                                                t,
-                                                ghostscope_dwarf::TypeInfo::PointerType { .. }
-                                            ) {
-                                                addr_iv = Some(iv);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            let addr_iv = if let Some(iv) = addr_iv {
-                                iv
-                            } else {
-                                let var = self.query_dwarf_for_complex_expr(val_expr)?.ok_or_else(
-                                    || CodeGenError::VariableNotFound(format!("{val_expr:?}")),
-                                )?;
-                                let mod_hint = self.take_module_hint();
-                                let pc_address = self.get_compile_time_context()?.pc_address;
-                                self.variable_read_plan_to_lvalue_address_with_hint(
-                                    &var,
-                                    pc_address,
-                                    None,
-                                    mod_hint.as_deref(),
-                                )?
-                            };
+                            let addr_iv = self.resolve_memory_format_address(val_expr)?;
                             // Reserve up to configured per-arg cap for dynamic slices
                             let cap = self.compile_options.mem_dump_cap as usize;
                             complex_args.push(ComplexArg {
@@ -2066,46 +2073,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
                             // value
                             let val_expr = &args[ai];
-                            let val = self.compile_expr(val_expr).ok();
-                            let mut addr_iv: Option<IntValue> = match val {
-                                Some(BasicValueEnum::PointerValue(pv)) => Some(
-                                    self.builder
-                                        .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
-                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
-                                ),
-                                _ => None,
-                            };
-                            if addr_iv.is_none() {
-                                if let Some(BasicValueEnum::IntValue(iv)) = val {
-                                    if let Some(var) =
-                                        self.query_dwarf_for_complex_expr(val_expr)?
-                                    {
-                                        if let Some(ref t) = var.dwarf_type {
-                                            if matches!(
-                                                t,
-                                                ghostscope_dwarf::TypeInfo::PointerType { .. }
-                                            ) {
-                                                addr_iv = Some(iv);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            let addr_iv = if let Some(iv) = addr_iv {
-                                iv
-                            } else {
-                                let var = self.query_dwarf_for_complex_expr(val_expr)?.ok_or_else(
-                                    || CodeGenError::VariableNotFound(format!("{val_expr:?}")),
-                                )?;
-                                let mod_hint = self.take_module_hint();
-                                let pc_address = self.get_compile_time_context()?.pc_address;
-                                self.variable_read_plan_to_lvalue_address_with_hint(
-                                    &var,
-                                    pc_address,
-                                    None,
-                                    mod_hint.as_deref(),
-                                )?
-                            };
+                            let addr_iv = self.resolve_memory_format_address(val_expr)?;
                             let cap = self.compile_options.mem_dump_cap as usize;
                             complex_args.push(ComplexArg {
                                 var_name_index: self
@@ -5115,6 +5083,62 @@ mod tests {
         // Should treat tail as alias (not as value), thus compile_program succeeds
         let res = ctx.compile_program(&program, "alias_stage", &[s1, s2], None, None, None);
         assert!(res.is_ok(), "expected alias-to-alias staging to compile");
+    }
+
+    #[test]
+    fn alias_to_alias_with_negative_const_offset_is_alias_variable() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("ctx");
+        // let base = &buf[1]; let head = base + -1;
+        let base = crate::script::Statement::AliasDeclaration {
+            name: "base".to_string(),
+            target: crate::script::Expr::AddressOf(Box::new(crate::script::Expr::ArrayAccess(
+                Box::new(crate::script::Expr::Variable("buf".to_string())),
+                Box::new(crate::script::Expr::Int(1)),
+            ))),
+        };
+        let negative_one = crate::script::Expr::BinaryOp {
+            left: Box::new(crate::script::Expr::Int(0)),
+            op: crate::script::BinaryOp::Subtract,
+            right: Box::new(crate::script::Expr::Int(1)),
+        };
+        let head = crate::script::Statement::VarDeclaration {
+            name: "head".to_string(),
+            value: crate::script::Expr::BinaryOp {
+                left: Box::new(crate::script::Expr::Variable("base".to_string())),
+                op: crate::script::BinaryOp::Add,
+                right: Box::new(negative_one),
+            },
+        };
+        let program = crate::script::Program::new();
+        let res = ctx.compile_program(&program, "alias_neg_stage", &[base, head], None, None, None);
+        assert!(
+            res.is_ok(),
+            "expected alias plus negative literal staging to compile"
+        );
+    }
+
+    #[test]
+    fn pointer_arithmetic_parts_fold_negative_literal_offsets() {
+        let negative_one = crate::script::Expr::BinaryOp {
+            left: Box::new(crate::script::Expr::Int(0)),
+            op: crate::script::BinaryOp::Subtract,
+            right: Box::new(crate::script::Expr::Int(1)),
+        };
+        let expr = crate::script::Expr::BinaryOp {
+            left: Box::new(crate::script::Expr::BinaryOp {
+                left: Box::new(crate::script::Expr::Variable("p".to_string())),
+                op: crate::script::BinaryOp::Add,
+                right: Box::new(negative_one),
+            }),
+            op: crate::script::BinaryOp::Add,
+            right: Box::new(crate::script::Expr::Int(3)),
+        };
+        let (base, index) = EbpfContext::<'static, 'static>::pointer_arithmetic_parts(&expr)
+            .expect("pointer arithmetic parts");
+        assert!(matches!(base, crate::script::Expr::Variable(name) if name == "p"));
+        assert_eq!(index, 2);
     }
 
     #[test]

@@ -435,6 +435,26 @@ fn parse_expr(pair: Pair<Rule>) -> Result<Expr> {
 
 /// Determine if an expression should be treated as a DWARF alias binding.
 /// This is a purely syntactic check (parser phase) and does not consult DWARF.
+fn integer_literal_value(e: &Expr) -> Option<i64> {
+    use crate::script::ast::BinaryOp as BO;
+    use crate::script::ast::Expr as E;
+
+    match e {
+        E::Int(value) => Some(*value),
+        E::BinaryOp {
+            left,
+            op: BO::Add,
+            right,
+        } => integer_literal_value(left)?.checked_add(integer_literal_value(right)?),
+        E::BinaryOp {
+            left,
+            op: BO::Subtract,
+            right,
+        } => integer_literal_value(left)?.checked_sub(integer_literal_value(right)?),
+        _ => None,
+    }
+}
+
 fn is_alias_expr(e: &Expr) -> bool {
     use crate::script::ast::BinaryOp as BO;
     use crate::script::ast::Expr as E;
@@ -446,9 +466,8 @@ fn is_alias_expr(e: &Expr) -> bool {
             op: BO::Add,
             right,
         } => {
-            let is_nonneg_lit = |x: &E| matches!(x, E::Int(v) if *v >= 0);
-            (is_alias_expr(left) && is_nonneg_lit(right))
-                || (is_alias_expr(right) && is_nonneg_lit(left))
+            (is_alias_expr(left) && integer_literal_value(right).is_some())
+                || (is_alias_expr(right) && integer_literal_value(left).is_some())
         }
         _ => false,
     }
@@ -1038,21 +1057,39 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
             })
         }
         Rule::strncmp_call => {
-            // grammar: strncmp("(" expr "," expr "," expr ")") [len must be non-negative integer literal]
+            // grammar: strncmp("(" expr "," expr "," expr ")")
             let arg0 = parse_expr(it.next().ok_or(ParseError::InvalidExpression)?)?;
             let arg1 = parse_expr(it.next().ok_or(ParseError::InvalidExpression)?)?;
             let n_expr_parsed = parse_expr(it.next().ok_or(ParseError::InvalidExpression)?)?;
-            let n_val: i64 = match n_expr_parsed {
-                Expr::Int(v) if v >= 0 => v,
-                _ => {
-                    return Err(ParseError::TypeError(
-                        "strncmp third argument must be a non-negative integer literal".to_string(),
-                    ))
+            let literal_len_opt: Option<isize> = match &n_expr_parsed {
+                Expr::Int(n) => Some(*n as isize),
+                Expr::BinaryOp {
+                    left,
+                    op: BinaryOp::Subtract,
+                    right,
+                } => {
+                    if matches!(left.as_ref(), Expr::Int(0)) {
+                        if let Expr::Int(k) = right.as_ref() {
+                            Some(-(*k as isize))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 }
+                _ => None,
             };
+            if literal_len_opt.is_some_and(|n| n < 0) {
+                return Err(ParseError::TypeError(
+                    "strncmp third argument must be non-negative".to_string(),
+                ));
+            }
             // Optional constant fold when both sides are string literals
-            if let (Expr::String(a), Expr::String(b)) = (&arg0, &arg1) {
-                let ln = n_val.max(0) as usize;
+            if let (Expr::String(a), Expr::String(b), Expr::Int(n_val)) =
+                (&arg0, &arg1, &n_expr_parsed)
+            {
+                let ln = (*n_val).max(0) as usize;
                 let eq = a
                     .as_bytes()
                     .iter()
@@ -1062,7 +1099,7 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
             }
             Ok(Expr::BuiltinCall {
                 name: "strncmp".to_string(),
-                args: vec![arg0, arg1, Expr::Int(n_val)],
+                args: vec![arg0, arg1, n_expr_parsed],
             })
         }
         Rule::starts_with_call => {
@@ -1318,14 +1355,13 @@ fn parse_chain_access(pair: Pair<Rule>) -> Result<Expr> {
                 chain.push(inner_pair.as_str().to_string());
             }
             Rule::expr => {
-                // Support array index only at the end of the chain (Phase 1: require literal int)
+                // Array tail index can be a literal or a runtime expression.
                 let parsed = parse_expr(inner_pair)?;
-                if !matches!(parsed, Expr::Int(_)) {
-                    return Err(ParseError::UnsupportedFeature(
-                        "array index must be a literal integer (TODO: dynamic index)".to_string(),
-                    ));
-                }
-                opt_index = Some(parsed);
+                opt_index = Some(
+                    integer_literal_value(&parsed)
+                        .map(Expr::Int)
+                        .unwrap_or(parsed),
+                );
             }
             _ => {}
         }
@@ -1357,13 +1393,9 @@ fn parse_array_access(pair: Pair<Rule>) -> Result<Expr> {
 
     let _array_expr = Box::new(Expr::Variable(array_name.as_str().to_string()));
     let parsed_index = parse_expr(index_expr)?;
-
-    // Enforce: array index must be a literal integer at parse stage
-    if !matches!(parsed_index, Expr::Int(_)) {
-        return Err(ParseError::UnsupportedFeature(
-            "array index must be a literal integer (TODO: support non-literal)".to_string(),
-        ));
-    }
+    let parsed_index = integer_literal_value(&parsed_index)
+        .map(Expr::Int)
+        .unwrap_or(parsed_index);
 
     // Build base array access expression
     let mut expr = Expr::ArrayAccess(
@@ -1933,7 +1965,7 @@ trace foo {
 
     #[test]
     fn parse_strncmp_negative_len_rejected() {
-        // Third argument must be a non-negative integer literal
+        // Negative literal lengths are rejected early.
         let script = r#"
 trace foo {
     if strncmp(lhs, rhs, -1) { print "X"; }
@@ -1947,8 +1979,7 @@ trace foo {
     }
 
     #[test]
-    fn parse_strncmp_nonliteral_len_rejected_with_friendly_message() {
-        // len is variable -> reject with friendly message
+    fn parse_strncmp_accepts_nonliteral_len() {
         let script = r#"
 trace foo {
     let n = 3;
@@ -1956,15 +1987,7 @@ trace foo {
 }
 "#;
         let r = parse(script);
-        match r {
-            Err(ParseError::TypeError(msg)) => {
-                assert!(
-                    msg.contains("third argument must be a non-negative integer literal"),
-                    "{msg}"
-                );
-            }
-            other => panic!("expected TypeError for non-literal len, got {other:?}"),
-        }
+        assert!(r.is_ok(), "parse failed: {:?}", r.err());
     }
 
     #[test]
@@ -2143,32 +2166,74 @@ trace foo {
     }
 
     #[test]
-    fn parse_array_index_must_be_literal() {
+    fn parse_array_index_accepts_dynamic_expr() {
         // Dynamic index on top-level array
         let s1 = r#"
 trace foo {
     print arr[i];
 }
 "#;
-        let r1 = parse(s1);
-        assert!(r1.is_err(), "expected error for non-literal array index");
-        if let Err(ParseError::UnsupportedFeature(msg)) = r1 {
-            assert!(
-                msg.contains("array index must be a literal integer"),
-                "unexpected msg: {msg}"
-            );
+        let r1 = parse(s1).expect("dynamic top-level index should parse");
+        match r1.statements.first().expect("trace") {
+            Statement::TracePoint { body, .. } => match &body[0] {
+                Statement::Print(PrintStatement::ComplexVariable(Expr::ArrayAccess(_, index))) => {
+                    assert!(matches!(index.as_ref(), Expr::Variable(name) if name == "i"))
+                }
+                other => panic!("unexpected first print body: {other:?}"),
+            },
+            other => panic!("expected TracePoint, got {other:?}"),
         }
 
         // Dynamic index at chain tail
         let s2 = r#"
 trace foo {
-    print obj.arr[i];
+    print obj.arr[i - (i / 0x8) * 0x8];
 }
 "#;
-        let r2 = parse(s2);
-        assert!(r2.is_err(), "expected error for non-literal chain index");
-        if let Err(ParseError::UnsupportedFeature(msg)) = r2 {
-            assert!(msg.contains("literal integer"), "unexpected msg: {msg}");
+        let r2 = parse(s2).expect("dynamic chain index should parse");
+        match r2.statements.first().expect("trace") {
+            Statement::TracePoint { body, .. } => match &body[0] {
+                Statement::Print(PrintStatement::ComplexVariable(Expr::ArrayAccess(_, index))) => {
+                    assert!(matches!(index.as_ref(), Expr::BinaryOp { .. }))
+                }
+                other => panic!("unexpected first print body: {other:?}"),
+            },
+            other => panic!("expected TracePoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_index_accepts_constant_negative_literal() {
+        let script = r#"
+trace foo {
+    print arr[-0x1];
+    print obj.arr[0b10 - 0x3];
+}
+"#;
+        let prog = parse(script).expect("parse ok");
+        let trace = prog.statements.first().expect("trace");
+        match trace {
+            Statement::TracePoint { body, .. } => {
+                match &body[0] {
+                    Statement::Print(PrintStatement::ComplexVariable(Expr::ArrayAccess(
+                        _,
+                        index,
+                    ))) => {
+                        assert!(matches!(index.as_ref(), Expr::Int(-1)));
+                    }
+                    other => panic!("unexpected first print body: {other:?}"),
+                }
+                match &body[1] {
+                    Statement::Print(PrintStatement::ComplexVariable(Expr::ArrayAccess(
+                        _,
+                        index,
+                    ))) => {
+                        assert!(matches!(index.as_ref(), Expr::Int(-1)));
+                    }
+                    other => panic!("unexpected second print body: {other:?}"),
+                }
+            }
+            other => panic!("expected TracePoint, got {other:?}"),
         }
     }
 

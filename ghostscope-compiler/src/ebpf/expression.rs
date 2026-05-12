@@ -222,6 +222,145 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         false
     }
 
+    pub(crate) fn integer_literal_value(expr: &Expr) -> Option<i64> {
+        use crate::script::ast::BinaryOp as BO;
+        use crate::script::ast::Expr as E;
+
+        match expr {
+            E::Int(value) => Some(*value),
+            E::BinaryOp {
+                left,
+                op: BO::Add,
+                right,
+            } => {
+                Self::integer_literal_value(left)?.checked_add(Self::integer_literal_value(right)?)
+            }
+            E::BinaryOp {
+                left,
+                op: BO::Subtract,
+                right,
+            } => {
+                Self::integer_literal_value(left)?.checked_sub(Self::integer_literal_value(right)?)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn pointer_arithmetic_parts(expr: &Expr) -> Option<(&Expr, i64)> {
+        use crate::script::ast::Expr as E;
+
+        fn collect_offset(expr: &Expr, acc: i64) -> Option<(&Expr, i64)> {
+            use crate::script::ast::BinaryOp as BO;
+            use crate::script::ast::Expr as E;
+
+            match expr {
+                E::BinaryOp {
+                    left,
+                    op: BO::Add,
+                    right,
+                } => match (&**left, &**right) {
+                    (ptr_side, int_expr)
+                        if EbpfContext::<'static, 'static>::integer_literal_value(int_expr)
+                            .is_some() =>
+                    {
+                        let index =
+                            EbpfContext::<'static, 'static>::integer_literal_value(int_expr)?;
+                        collect_offset(ptr_side, acc.checked_add(index)?)
+                    }
+                    (int_expr, ptr_side)
+                        if EbpfContext::<'static, 'static>::integer_literal_value(int_expr)
+                            .is_some() =>
+                    {
+                        let index =
+                            EbpfContext::<'static, 'static>::integer_literal_value(int_expr)?;
+                        collect_offset(ptr_side, acc.checked_add(index)?)
+                    }
+                    _ => Some((expr, acc)),
+                },
+                E::BinaryOp {
+                    left,
+                    op: BO::Subtract,
+                    right,
+                } => match &**right {
+                    int_expr
+                        if EbpfContext::<'static, 'static>::integer_literal_value(int_expr)
+                            .is_some() =>
+                    {
+                        let index =
+                            EbpfContext::<'static, 'static>::integer_literal_value(int_expr)?;
+                        collect_offset(left, acc.checked_sub(index)?)
+                    }
+                    _ => Some((expr, acc)),
+                },
+                _ => Some((expr, acc)),
+            }
+        }
+
+        let E::BinaryOp { .. } = expr else {
+            return None;
+        };
+
+        let (base, index) = collect_offset(expr, 0)?;
+        match base {
+            E::BinaryOp { .. } => None,
+            _ => Some((base, index)),
+        }
+    }
+
+    pub(crate) fn pointer_arithmetic_parts_expanding_aliases(
+        &self,
+        expr: &Expr,
+    ) -> Result<Option<(Expr, i64)>> {
+        let Some((base, index)) = Self::pointer_arithmetic_parts(expr) else {
+            return Ok(None);
+        };
+
+        let mut base = base.clone();
+        let mut index = index;
+        let mut visited = std::collections::HashSet::new();
+
+        loop {
+            let Expr::Variable(name) = &base else {
+                break;
+            };
+            if !self.alias_variable_exists(name) {
+                break;
+            }
+            if !visited.insert(name.clone()) {
+                return Err(CodeGenError::TypeError(format!(
+                    "alias cycle detected for '{name}'"
+                )));
+            }
+            let Some(target) = self.get_alias_variable(name) else {
+                break;
+            };
+            if let Some((alias_base, alias_index)) = Self::pointer_arithmetic_parts(&target) {
+                index = alias_index.checked_add(index).ok_or_else(|| {
+                    CodeGenError::TypeError("pointer arithmetic offset overflow".to_string())
+                })?;
+                base = alias_base.clone();
+            } else {
+                base = target;
+            }
+        }
+
+        Ok(Some((base, index)))
+    }
+
+    fn is_dwarf_pointer_or_array_arg(&mut self, expr: &Expr) -> Result<bool> {
+        let Some(var) = self.query_dwarf_for_complex_expr(expr)? else {
+            return Ok(false);
+        };
+        let Some(ty) = var.dwarf_type.as_ref() else {
+            return Ok(false);
+        };
+        let ty = ghostscope_dwarf::strip_type_aliases(ty);
+        Ok(matches!(
+            ty,
+            DwarfType::PointerType { .. } | DwarfType::ArrayType { .. }
+        ))
+    }
+
     fn dwarf_integer_comparison_expr(&mut self, expr: &Expr) -> Option<CIntegerComparisonType> {
         if let Ok(Some(var)) = self.query_dwarf_for_complex_expr(expr) {
             if let Some(ref ty) = var.dwarf_type {
@@ -264,6 +403,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         if matches!(e, Expr::AddressOf(_)) {
             return Ok(());
         }
+        if let Some((ptr_side, _)) = self.pointer_arithmetic_parts_expanding_aliases(e)? {
+            if matches!(&ptr_side, Expr::AddressOf(_))
+                || self
+                    .is_dwarf_pointer_or_array_arg(&ptr_side)
+                    .unwrap_or(false)
+            {
+                return Ok(());
+            }
+        }
+        if self.is_dynamic_pointer_arithmetic_expr(e)?
+            || self.expands_to_nonliteral_pointer_arithmetic(e)?
+        {
+            return Ok(());
+        }
         match self.query_dwarf_for_complex_expr(e) {
             Ok(Some(var)) => {
                 let Some(ty) = var.dwarf_type.as_ref() else {
@@ -289,6 +442,98 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     "{where_ctx}: expression is not a pointer"
                 ))),
             },
+        }
+    }
+
+    fn is_dynamic_pointer_arithmetic_expr(&mut self, expr: &Expr) -> Result<bool> {
+        use crate::script::ast::BinaryOp as BO;
+        use crate::script::ast::Expr as E;
+
+        let E::BinaryOp { left, op, right } = expr else {
+            return Ok(false);
+        };
+
+        match op {
+            BO::Add => Ok(self.is_dynamic_indexable_pointer_base(left)?
+                || self.is_dynamic_indexable_pointer_base(right)?),
+            BO::Subtract => self.is_dynamic_indexable_pointer_base(left),
+            _ => Ok(false),
+        }
+    }
+
+    fn is_dynamic_indexable_pointer_base(&mut self, expr: &Expr) -> Result<bool> {
+        if matches!(expr, Expr::AddressOf(_)) {
+            return Ok(true);
+        }
+
+        if self
+            .query_dwarf_for_complex_expr(expr)
+            .ok()
+            .flatten()
+            .and_then(|var| var.dwarf_type)
+            .is_some_and(|ty| ghostscope_dwarf::is_c_pointer_or_array_type(&ty))
+        {
+            return Ok(true);
+        }
+
+        let expanded = self.expand_alias_variable_expr(expr)?;
+        if matches!(expanded, Expr::AddressOf(_)) {
+            return Ok(true);
+        }
+        let Some((base_expr, _static_index)) =
+            self.pointer_arithmetic_parts_expanding_aliases(&expanded)?
+        else {
+            return Ok(false);
+        };
+
+        Ok(self
+            .query_dwarf_for_complex_expr(&base_expr)
+            .ok()
+            .flatten()
+            .and_then(|var| var.dwarf_type)
+            .is_some_and(|ty| ghostscope_dwarf::is_c_pointer_or_array_type(&ty)))
+    }
+
+    fn expands_to_nonliteral_pointer_arithmetic(&mut self, expr: &Expr) -> Result<bool> {
+        let expanded = self.expand_alias_variable_expr(expr)?;
+        self.is_nonliteral_pointer_arithmetic_expr(&expanded)
+    }
+
+    fn is_nonliteral_pointer_arithmetic_expr(&mut self, expr: &Expr) -> Result<bool> {
+        use crate::script::ast::BinaryOp as BO;
+        use crate::script::ast::Expr as E;
+
+        let E::BinaryOp { left, op, right } = expr else {
+            return Ok(false);
+        };
+
+        match op {
+            BO::Add => {
+                let left_is_ptr = self.is_dynamic_indexable_pointer_base(left)?;
+                let right_is_ptr = self.is_dynamic_indexable_pointer_base(right)?;
+                let left_is_literal = Self::integer_literal_value(left).is_some();
+                let right_is_literal = Self::integer_literal_value(right).is_some();
+
+                if (left_is_ptr && !right_is_ptr && !right_is_literal)
+                    || (right_is_ptr && !left_is_ptr && !left_is_literal)
+                {
+                    return Ok(true);
+                }
+
+                Ok(self.expands_to_nonliteral_pointer_arithmetic(left)?
+                    || self.expands_to_nonliteral_pointer_arithmetic(right)?)
+            }
+            BO::Subtract => {
+                let left_is_ptr = self.is_dynamic_indexable_pointer_base(left)?;
+                let right_is_literal = Self::integer_literal_value(right).is_some();
+
+                if left_is_ptr && !right_is_literal {
+                    return Ok(true);
+                }
+
+                self.expands_to_nonliteral_pointer_arithmetic(left)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -370,6 +615,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 inner.as_ref()
             };
 
+            if let E::ArrayAccess(array_expr, index_expr) = resolved_inner {
+                if let Some((element_address, _element_type)) =
+                    self.compile_dynamic_array_element_address(array_expr, index_expr)?
+                {
+                    return Ok(element_address);
+                }
+            }
+
             if let Some(var) = self.query_dwarf_for_complex_expr(resolved_inner)? {
                 let module_hint = self.current_resolved_var_module_path.clone();
                 let status_ptr = if self.condition_context_active {
@@ -391,36 +644,81 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         }
 
+        if let Some(address) = self.dynamic_pointer_arithmetic_address(e)? {
+            return Ok(address);
+        }
+
+        if let Some((ptr_side, index)) = self.pointer_arithmetic_parts_expanding_aliases(e)? {
+            if matches!(&ptr_side, E::AddressOf(_)) {
+                let base =
+                    self.resolve_ptr_i64_from_expr_internal(&ptr_side, visited, depth + 1)?;
+                let off = self.context.i64_type().const_int(index as u64, false);
+                return self
+                    .builder
+                    .build_int_add(base, off, "ptr_add")
+                    .map_err(|err| CodeGenError::Builder(err.to_string()));
+            } else if let Some(var) = self.query_dwarf_for_complex_expr(&ptr_side)? {
+                if var.dwarf_type.is_some() {
+                    let pointed_plan = var
+                        .plan_pointer_element_index(index)
+                        .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
+                    let module_hint = self.current_resolved_var_module_path.clone();
+                    let status_ptr = if self.condition_context_active {
+                        Some(self.get_or_create_cond_error_global())
+                    } else {
+                        None
+                    };
+                    let pc_address = self.get_compile_time_context()?.pc_address;
+                    return self.variable_read_plan_to_lvalue_address_with_hint(
+                        &pointed_plan,
+                        pc_address,
+                        status_ptr,
+                        module_hint.as_deref(),
+                    );
+                }
+            }
+        }
+
         // Support constant-offset addressing: (alias_expr + K) or (K + alias_expr)
         if let E::BinaryOp { left, op, right } = e {
             if matches!(op, BO::Add) {
-                let is_nonneg_lit = |x: &E| matches!(x, E::Int(v) if *v >= 0);
                 // alias + K
-                if is_nonneg_lit(right) {
+                if let Some(k) = Self::integer_literal_value(right) {
                     if let Ok(base) =
                         self.resolve_ptr_i64_from_expr_internal(left, visited, depth + 1)
                     {
-                        if let E::Int(k) = &**right {
-                            let off = self.context.i64_type().const_int(*k as u64, false);
-                            return self
-                                .builder
-                                .build_int_add(base, off, "ptr_add")
-                                .map_err(|e| CodeGenError::Builder(e.to_string()));
-                        }
+                        let off = self.context.i64_type().const_int(k as u64, false);
+                        return self
+                            .builder
+                            .build_int_add(base, off, "ptr_add")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()));
                     }
                 }
                 // K + alias
-                if is_nonneg_lit(left) {
+                if let Some(k) = Self::integer_literal_value(left) {
                     if let Ok(base) =
                         self.resolve_ptr_i64_from_expr_internal(right, visited, depth + 1)
                     {
-                        if let E::Int(k) = &**left {
-                            let off = self.context.i64_type().const_int(*k as u64, false);
-                            return self
-                                .builder
-                                .build_int_add(base, off, "ptr_add")
-                                .map_err(|e| CodeGenError::Builder(e.to_string()));
-                        }
+                        let off = self.context.i64_type().const_int(k as u64, false);
+                        return self
+                            .builder
+                            .build_int_add(base, off, "ptr_add")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()));
+                    }
+                }
+            } else if matches!(op, BO::Subtract) {
+                if let Some(k) = Self::integer_literal_value(right) {
+                    if let Ok(base) =
+                        self.resolve_ptr_i64_from_expr_internal(left, visited, depth + 1)
+                    {
+                        let off = self
+                            .context
+                            .i64_type()
+                            .const_int(k.wrapping_neg() as u64, false);
+                        return self
+                            .builder
+                            .build_int_add(base, off, "ptr_sub")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()));
                     }
                 }
             }
@@ -488,6 +786,101 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             ))
         }
     }
+
+    fn dynamic_pointer_arithmetic_address(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<Option<IntValue<'ctx>>> {
+        use crate::script::ast::BinaryOp as BO;
+        use crate::script::ast::Expr as E;
+
+        let E::BinaryOp { left, op, right } = expr else {
+            return Ok(None);
+        };
+
+        match op {
+            BO::Add => {
+                if let Some(address) = self.dynamic_raw_address_candidate(left, right, false)? {
+                    return Ok(Some(address));
+                }
+                if let Some(address) = self.dynamic_raw_address_candidate(right, left, false)? {
+                    return Ok(Some(address));
+                }
+                if let Some(address) = self.dynamic_index_address_candidate(left, right)? {
+                    return Ok(Some(address));
+                }
+                self.dynamic_index_address_candidate(right, left)
+            }
+            BO::Subtract => {
+                if let Some(address) = self.dynamic_raw_address_candidate(left, right, true)? {
+                    return Ok(Some(address));
+                }
+                let negative_right = E::BinaryOp {
+                    left: Box::new(E::Int(0)),
+                    op: BO::Subtract,
+                    right: right.clone(),
+                };
+                self.dynamic_index_address_candidate(left, &negative_right)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn dynamic_raw_address_candidate(
+        &mut self,
+        base_expr: &Expr,
+        offset_expr: &Expr,
+        subtract: bool,
+    ) -> Result<Option<IntValue<'ctx>>> {
+        if Self::integer_literal_value(offset_expr).is_some() {
+            return Ok(None);
+        }
+
+        let expanded_base = self.expand_alias_variable_expr(base_expr)?;
+        if !matches!(expanded_base, Expr::AddressOf(_)) {
+            return Ok(None);
+        }
+
+        let base_address = self.resolve_ptr_i64_from_expr(&expanded_base)?;
+        let offset = match self.compile_expr(offset_expr)? {
+            BasicValueEnum::IntValue(value) => {
+                self.normalize_int_to_i64(value, "dynamic_raw_offset_i64")?
+            }
+            _ => {
+                return Err(CodeGenError::TypeError(
+                    "raw address offset expression must compile to an integer".to_string(),
+                ))
+            }
+        };
+        let offset = if subtract {
+            self.builder
+                .build_int_neg(offset, "dynamic_raw_offset_neg")
+                .map_err(|err| CodeGenError::Builder(err.to_string()))?
+        } else {
+            offset
+        };
+        let address = self
+            .builder
+            .build_int_add(base_address, offset, "dynamic_raw_address")
+            .map_err(|err| CodeGenError::Builder(err.to_string()))?;
+        Ok(Some(address))
+    }
+
+    fn dynamic_index_address_candidate(
+        &mut self,
+        base_expr: &Expr,
+        index_expr: &Expr,
+    ) -> Result<Option<IntValue<'ctx>>> {
+        match self.compile_dynamic_array_element_address(base_expr, index_expr) {
+            Ok(Some((address, _element_type))) => Ok(Some(address)),
+            Ok(None) => Ok(None),
+            Err(CodeGenError::VariableNotFound(_))
+            | Err(CodeGenError::VariableNotInScope(_))
+            | Err(CodeGenError::TypeError(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Builtin memcmp (boolean variant): returns true iff first `len` bytes equal.
     /// Supports dynamic `len` (expr), clamped to [0, compare_cap].
     fn compile_memcmp_builtin(
@@ -497,10 +890,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         len_expr: &Expr,
     ) -> Result<BasicValueEnum<'ctx>> {
         // Note: constant hex/len validation happens at parse-time; dynamic cases are handled at runtime by masking bytes.
-        // Important: Clear register cache to avoid reusing register values
-        // loaded in a previous basic block, which can violate SSA dominance
-        // when multiple memcmp calls appear in one function.
-        self.register_cache.clear();
 
         // Note: do not resolve pointers yet; if either side is hex("...") we will synthesize bytes
 
@@ -1006,11 +1395,80 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(phi.as_basic_value())
     }
     /// Builtin strncmp/starts_with implementation: bounded byte-compare without NUL requirement.
+    fn compile_bounded_compare_len_i32(
+        &mut self,
+        len_expr: &Expr,
+        max_len: u32,
+        name_prefix: &str,
+    ) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
+        let len_val = self.compile_expr(len_expr)?;
+        let len_iv = match len_val {
+            BasicValueEnum::IntValue(iv) => iv,
+            _ => {
+                return Err(CodeGenError::TypeError(format!(
+                    "{name_prefix} length must be an integer expression"
+                )))
+            }
+        };
+        let i32_ty = self.context.i32_type();
+        let len_i32 = if len_iv.get_type().get_bit_width() > 32 {
+            self.builder
+                .build_int_truncate(len_iv, i32_ty, &format!("{name_prefix}_len_trunc"))
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        } else if len_iv.get_type().get_bit_width() < 32 {
+            self.builder
+                .build_int_z_extend(len_iv, i32_ty, &format!("{name_prefix}_len_zext"))
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        } else {
+            len_iv
+        };
+        let zero_i32 = i32_ty.const_zero();
+        let is_neg = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                len_i32,
+                zero_i32,
+                &format!("{name_prefix}_len_neg"),
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let len_nn = self
+            .builder
+            .build_select(is_neg, zero_i32, len_i32, &format!("{name_prefix}_len_nn"))
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
+        let max_const = i32_ty.const_int(max_len as u64, false);
+        let gt = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::UGT,
+                len_nn,
+                max_const,
+                &format!("{name_prefix}_len_gt"),
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let bounded_len = self
+            .builder
+            .build_select(gt, max_const, len_nn, &format!("{name_prefix}_len_sel"))
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
+        let is_zero = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                bounded_len,
+                zero_i32,
+                &format!("{name_prefix}_len_is_zero"),
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        Ok((bounded_len, is_zero))
+    }
+
     fn compile_strncmp_builtin(
         &mut self,
         dwarf_expr: &Expr,
         lit: &str,
-        n: u32,
+        n_expr: &Expr,
     ) -> Result<BasicValueEnum<'ctx>> {
         // Fast path: if the first argument is a script string variable or a string literal,
         // perform a compile-time bounded comparison and return a constant boolean.
@@ -1034,20 +1492,71 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         };
 
         if let Some(bytes) = immediate_bytes_opt {
+            if let Expr::Int(n) = n_expr {
+                let n_usize = std::cmp::min(
+                    (*n).max(0) as usize,
+                    self.compile_options.compare_cap as usize,
+                );
+                let content_len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                let cmp_len = std::cmp::min(n_usize, std::cmp::min(content_len, lit.len()));
+                let equal = bytes.get(0..cmp_len).unwrap_or(&[])
+                    == lit.as_bytes().get(0..cmp_len).unwrap_or(&[]);
+                let bool_val = self
+                    .context
+                    .bool_type()
+                    .const_int(if equal { 1 } else { 0 }, false);
+                return Ok(bool_val.into());
+            }
+
             // Treat as bounded byte compare between two immediate strings
-            let lit_bytes = lit.as_bytes();
             let cap = self.compile_options.compare_cap as usize;
-            let n_usize = std::cmp::min(n as usize, cap);
-            // compute source content length up to NUL
             let content_len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            let cmp_len = std::cmp::min(n_usize, std::cmp::min(content_len, lit_bytes.len()));
-            let equal =
-                bytes.get(0..cmp_len).unwrap_or(&[]) == lit_bytes.get(0..cmp_len).unwrap_or(&[]);
-            let bool_val = self
-                .context
-                .bool_type()
-                .const_int(if equal { 1 } else { 0 }, false);
-            return Ok(bool_val.into());
+            let cmp_bound = std::cmp::min(cap, std::cmp::min(content_len, lit.len())) as u32;
+            if cmp_bound == 0 {
+                return Ok(self.context.bool_type().const_int(1, false).into());
+            }
+            let (bounded_len, _len_is_zero) =
+                self.compile_bounded_compare_len_i32(n_expr, cmp_bound, "strncmp")?;
+            let i32_ty = self.context.i32_type();
+            let i8_ty = self.context.i8_type();
+            let mut acc = i8_ty.const_zero();
+            for (i, (byte, lit_byte)) in bytes
+                .iter()
+                .copied()
+                .zip(lit.as_bytes().iter().copied())
+                .take(cmp_bound as usize)
+                .enumerate()
+            {
+                let active = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::UGT,
+                        bounded_len,
+                        i32_ty.const_int(i as u64, false),
+                        "strncmp_imm_active",
+                    )
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                let diff = i8_ty.const_int((byte ^ lit_byte) as u64, false);
+                let active_diff = self
+                    .builder
+                    .build_select(active, diff, i8_ty.const_zero(), "strncmp_imm_diff")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    .into_int_value();
+                acc = self
+                    .builder
+                    .build_or(acc, active_diff, "strncmp_imm_acc")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            }
+            let equal = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    acc,
+                    i8_ty.const_zero(),
+                    "strncmp_imm_eq",
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            return Ok(equal.into());
         }
 
         // Determine pointer value (i64) of the target memory (DWARF or alias)
@@ -1112,20 +1621,55 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         };
 
-        // Cap read length for safety
         let cap = self.compile_options.compare_cap;
-        let max_n = std::cmp::min(n, cap);
-        let lit_len = std::cmp::min(lit.len() as u32, cap);
-        let cmp_len = std::cmp::min(max_n, lit_len);
+        let cmp_bound = std::cmp::min(lit.len() as u32, cap);
+        if cmp_bound == 0 {
+            return Ok(self.context.bool_type().const_int(1, false).into());
+        }
+        let (bounded_len, len_is_zero) =
+            self.compile_bounded_compare_len_i32(n_expr, cmp_bound, "strncmp")?;
 
-        // Read bytes into buffer
-        let (buf_global, status, arr_ty) =
-            self.read_user_bytes_into_buffer(ptr_i64, cmp_len, "_gs_bi_strncmp")?;
+        let curr_block = self.builder.get_insert_block().unwrap();
+        let func = curr_block.get_parent().unwrap();
+        let zero_b = self.context.append_basic_block(func, "strncmp_len_zero");
+        let nz_b = self.context.append_basic_block(func, "strncmp_len_nz");
+        let final_b = self.context.append_basic_block(func, "strncmp_len_cont");
+        self.builder
+            .build_conditional_branch(len_is_zero, zero_b, nz_b)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        self.builder.position_at_end(zero_b);
+        let bool_true = self.context.bool_type().const_int(1, false);
+        self.builder
+            .build_unconditional_branch(final_b)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let zero_block = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(nz_b);
+
+        let (arr_ty, buf_global) = self.get_or_create_i8_buffer(cmp_bound, "_gs_bi_strncmp");
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let dst_ptr = self
+            .builder
+            .build_bit_cast(buf_global, ptr_ty, "strncmp_dst_ptr")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let src_ptr = self
+            .builder
+            .build_int_to_ptr(ptr_i64, ptr_ty, "strncmp_src_ptr")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let ret = self
+            .create_bpf_helper_call(
+                BPF_FUNC_probe_read_user as u64,
+                &[dst_ptr, bounded_len.into(), src_ptr.into()],
+                self.context.i64_type().into(),
+                "probe_read_user_strncmp",
+            )?
+            .into_int_value();
         let status_ok = self
             .builder
             .build_int_compare(
                 inkwell::IntPredicate::EQ,
-                status,
+                ret,
                 self.context.i64_type().const_zero(),
                 "rd_ok",
             )
@@ -1157,11 +1701,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.builder.position_at_end(cont_b);
         }
 
-        // XOR/OR accumulation over cmp_len bytes
+        // XOR/OR accumulation over the bounded maximum; inactive bytes do not contribute.
         let i32_ty = self.context.i32_type();
         let idx0 = i32_ty.const_zero();
         let mut acc = self.context.i8_type().const_zero();
-        for (i, b) in lit.as_bytes().iter().take(cmp_len as usize).enumerate() {
+        for (i, b) in lit.as_bytes().iter().take(cmp_bound as usize).enumerate() {
             let idx_i = i32_ty.const_int(i as u64, false);
             let ptr_i = unsafe {
                 self.builder
@@ -1181,6 +1725,25 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .builder
                 .build_xor(ch, expect, "diff")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let active = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::UGT,
+                    bounded_len,
+                    idx_i,
+                    "strncmp_byte_active",
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let diff = self
+                .builder
+                .build_select(
+                    active,
+                    diff,
+                    self.context.i8_type().const_zero(),
+                    "strncmp_active_diff",
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                .into_int_value();
             acc = self
                 .builder
                 .build_or(acc, diff, "acc_or")
@@ -1200,7 +1763,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .builder
             .build_and(status_ok, eq_bytes, "strncmp_and")
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        Ok(result.into())
+        self.builder
+            .build_unconditional_branch(final_b)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let nz_block = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(final_b);
+        let result_phi = self
+            .builder
+            .build_phi(self.context.bool_type(), "strncmp_result")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        result_phi.add_incoming(&[(&bool_true, zero_block), (&result, nz_block)]);
+        Ok(result_phi.as_basic_value())
     }
     /// Compile an expression
     pub fn compile_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>> {
@@ -1337,14 +1911,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             "strncmp expects 3 arguments".into(),
                         ));
                     }
-                    let n = match &args[2] {
-                        Expr::Int(v) if *v >= 0 => *v as u32,
-                        _ => {
-                            return Err(CodeGenError::TypeError(
-                                "strncmp length must be a non-negative integer literal".into(),
-                            ))
-                        }
-                    };
                     // Accept string on either side: string literal or script string variable
                     fn extract_script_string(
                         this: &mut EbpfContext<'_, '_>,
@@ -1369,14 +1935,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     let right_str = extract_script_string(self, &args[1]);
                     match (left_str, right_str) {
                         (Some(ls), Some(rs)) => {
-                            // Both sides strings -> compile-time fold
-                            let ln = n as usize;
-                            let eq = ls.as_bytes().iter().take(ln).eq(rs.as_bytes().iter().take(ln));
-                            let bv = self.context.bool_type().const_int(eq as u64, false);
-                            Ok(bv.into())
+                            let left_expr = Expr::String(ls);
+                            self.compile_strncmp_builtin(&left_expr, &rs, &args[2])
                         }
-                        (Some(ls), None) => self.compile_strncmp_builtin(&args[1], &ls, n),
-                        (None, Some(rs)) => self.compile_strncmp_builtin(&args[0], &rs, n),
+                        (Some(ls), None) => self.compile_strncmp_builtin(&args[1], &ls, &args[2]),
+                        (None, Some(rs)) => self.compile_strncmp_builtin(&args[0], &rs, &args[2]),
                         (None, None) => Err(CodeGenError::TypeError(
                             "strncmp requires at least one string argument (string literal or script string variable) as the first or second parameter".into(),
                         )),
@@ -1417,8 +1980,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             let bv = self.context.bool_type().const_int(ok as u64, false);
                             Ok(bv.into())
                         }
-                        (Some(a), None) => self.compile_strncmp_builtin(&args[1], &a, a.len() as u32),
-                        (None, Some(b)) => self.compile_strncmp_builtin(&args[0], &b, b.len() as u32),
+                        (Some(a), None) => {
+                            let n_expr = Expr::Int(a.len() as i64);
+                            self.compile_strncmp_builtin(&args[1], &a, &n_expr)
+                        }
+                        (None, Some(b)) => {
+                            let n_expr = Expr::Int(b.len() as i64);
+                            self.compile_strncmp_builtin(&args[0], &b, &n_expr)
+                        }
                         (None, None) => Err(CodeGenError::TypeError(
                             "starts_with requires at least one string argument (string literal or script string variable) as the first or second parameter".into(),
                         )),
@@ -1445,7 +2014,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     && (self.is_dwarf_aggregate_expr(left) || self.is_dwarf_aggregate_expr(right))
                 {
                     return Err(CodeGenError::TypeError(
-                        "Unsupported arithmetic/ordered comparison involving struct/union/array. Select a scalar field (e.g., 'obj.field'), or use '&expr + <non-negative literal>' in an alias/address context if you need a raw address."
+                        "Unsupported arithmetic/ordered comparison involving struct/union/array. Select a scalar field (e.g., 'obj.field'), or use '&expr +/- <integer literal>' in an alias/address context if you need a raw address."
                             .to_string(),
                     ));
                 }
@@ -1455,7 +2024,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     && (self.is_pointer_like_expr(left) || self.is_pointer_like_expr(right))
                 {
                     return Err(CodeGenError::TypeError(
-                        "Pointer ordered comparison ('<', '<=', '>', '>=') is not supported. Use '==' or '!=' to compare addresses. If you need to adjust an address, use '&expr + <non-negative literal>' in an alias/address context; to compare values, select a scalar field (e.g., 'obj.field')."
+                        "Pointer ordered comparison ('<', '<=', '>', '>=') is not supported. Use '==' or '!=' to compare addresses. If you need to adjust an address, use '&expr +/- <integer literal>' in an alias/address context; to compare values, select a scalar field (e.g., 'obj.field')."
                             .to_string(),
                     ));
                 }
@@ -1650,6 +2219,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 } else {
                     None
                 };
+                let unsigned_division_width = if matches!(op, BinaryOp::Divide) {
+                    self.unsigned_ordering_width_for_exprs(left, right)
+                } else {
+                    None
+                };
 
                 // Default eager evaluation for other binary ops
                 let left_val = self.compile_expr(left)?;
@@ -1659,6 +2233,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     op.clone(),
                     right_val,
                     unsigned_ordering_width,
+                    unsigned_division_width,
                 )
             }
             Expr::MemberAccess(_, _) => {
@@ -1809,7 +2384,137 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         op: BinaryOp,
         right: BasicValueEnum<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>> {
-        self.compile_binary_op_with_ordering(left, op, right, None)
+        self.compile_binary_op_with_ordering(left, op, right, None, None)
+    }
+
+    pub(crate) fn build_signed_int_div_via_udiv(
+        &mut self,
+        left: IntValue<'ctx>,
+        right: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>> {
+        let int_type = left.get_type();
+        let zero = int_type.const_zero();
+        let left_is_neg = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::SLT, left, zero, "sdiv_lhs_neg")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let right_is_neg = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::SLT, right, zero, "sdiv_rhs_neg")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let neg_left = self
+            .builder
+            .build_int_sub(zero, left, "sdiv_lhs_negated")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let neg_right = self
+            .builder
+            .build_int_sub(zero, right, "sdiv_rhs_negated")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let abs_left = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                left_is_neg,
+                neg_left.into(),
+                left.into(),
+                "sdiv_lhs_abs",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
+        let abs_right = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                right_is_neg,
+                neg_right.into(),
+                right.into(),
+                "sdiv_rhs_abs",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
+        let abs_quotient = self
+            .builder
+            .build_int_unsigned_div(abs_left, abs_right, "sdiv_abs_udiv")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let negative_result = self
+            .builder
+            .build_xor(left_is_neg, right_is_neg, "sdiv_result_neg")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let neg_quotient = self
+            .builder
+            .build_int_sub(zero, abs_quotient, "sdiv_negated")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        self.builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                negative_result,
+                neg_quotient.into(),
+                abs_quotient.into(),
+                name,
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))
+            .map(|value| value.into_int_value())
+    }
+
+    pub(crate) fn build_signed_int_rem_via_urem(
+        &mut self,
+        left: IntValue<'ctx>,
+        right: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>> {
+        let int_type = left.get_type();
+        let zero = int_type.const_zero();
+        let left_is_neg = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::SLT, left, zero, "srem_lhs_neg")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let right_is_neg = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::SLT, right, zero, "srem_rhs_neg")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let neg_left = self
+            .builder
+            .build_int_sub(zero, left, "srem_lhs_negated")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let neg_right = self
+            .builder
+            .build_int_sub(zero, right, "srem_rhs_negated")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let abs_left = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                left_is_neg,
+                neg_left.into(),
+                left.into(),
+                "srem_lhs_abs",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
+        let abs_right = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                right_is_neg,
+                neg_right.into(),
+                right.into(),
+                "srem_rhs_abs",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
+        let abs_remainder = self
+            .builder
+            .build_int_unsigned_rem(abs_left, abs_right, "srem_abs_urem")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let neg_remainder = self
+            .builder
+            .build_int_sub(zero, abs_remainder, "srem_negated")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        self.builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                left_is_neg,
+                neg_remainder.into(),
+                abs_remainder.into(),
+                name,
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))
+            .map(|value| value.into_int_value())
     }
 
     fn normalize_int_for_unsigned_compare(
@@ -1835,12 +2540,43 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
+    fn align_int_widths_for_binary_op(
+        &mut self,
+        left: IntValue<'ctx>,
+        right: IntValue<'ctx>,
+    ) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
+        let left_width = left.get_type().get_bit_width();
+        let right_width = right.get_type().get_bit_width();
+        if left_width == right_width {
+            return Ok((left, right));
+        }
+
+        let target_width = left_width.max(right_width);
+        let target_type = self.context.custom_width_int_type(target_width);
+        let left = if left_width < target_width {
+            self.builder
+                .build_int_z_extend(left, target_type, "lhs_width_align")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        } else {
+            left
+        };
+        let right = if right_width < target_width {
+            self.builder
+                .build_int_z_extend(right, target_type, "rhs_width_align")
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+        } else {
+            right
+        };
+        Ok((left, right))
+    }
+
     fn compile_binary_op_with_ordering(
         &mut self,
         left: BasicValueEnum<'ctx>,
         op: BinaryOp,
         right: BasicValueEnum<'ctx>,
         unsigned_ordering_width: Option<u32>,
+        unsigned_division_width: Option<u32>,
     ) -> Result<BasicValueEnum<'ctx>> {
         use inkwell::values::BasicValueEnum::*;
 
@@ -1869,6 +2605,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         match (left, right) {
             (IntValue(left_int), IntValue(right_int)) => {
+                let (left_int, right_int) =
+                    self.align_int_widths_for_binary_op(left_int, right_int)?;
                 let unsigned_cmp_values = if let Some(bit_width) = unsigned_ordering_width {
                     Some((
                         self.normalize_int_for_unsigned_compare(
@@ -1898,10 +2636,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         .builder
                         .build_int_mul(left_int, right_int, "mul")
                         .map_err(|e| CodeGenError::Builder(e.to_string()))?,
-                    BinaryOp::Divide => self
-                        .builder
-                        .build_int_signed_div(left_int, right_int, "div")
-                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                    BinaryOp::Divide => {
+                        if unsigned_division_width.is_some() {
+                            self.builder
+                                .build_int_unsigned_div(left_int, right_int, "div")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                        } else {
+                            self.build_signed_int_div_via_udiv(left_int, right_int, "div")?
+                        }
+                    }
                     // Comparison operators
                     BinaryOp::Equal => {
                         let result = self
@@ -2044,7 +2787,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         Ok(cmp.into())
                     }
                     _ => Err(CodeGenError::TypeError(
-                        "Unsupported operation between aggregate address/pointer and integer: only '==' and '!=' are allowed. If you meant to offset an address, use '&expr + <non-negative literal>' in an alias/address context, or access a scalar field.".to_string(),
+                        "Unsupported operation between aggregate address/pointer and integer: only '==' and '!=' are allowed. If you meant to offset an address, use '&expr +/- <integer literal>' in an alias/address context, or access a scalar field.".to_string(),
                     )),
                 }
             }
@@ -2070,7 +2813,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     Ok(cmp.into())
                 }
                 _ => Err(CodeGenError::TypeError(
-                    "Pointer ordered comparison ('<', '<=', '>', '>=') is not supported. Use '==' or '!=' to compare addresses. If you need to adjust an address, use '&expr + <non-negative literal>' in an alias/address context; to compare values, select a scalar field (e.g., 'obj.field')."
+                    "Pointer ordered comparison ('<', '<=', '>', '>=') is not supported. Use '==' or '!=' to compare addresses. If you need to adjust an address, use '&expr +/- <integer literal>' in an alias/address context; to compare values, select a scalar field (e.g., 'obj.field')."
                         .to_string(),
                 )),
             },
@@ -2210,6 +2953,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         array_expr: &Expr,
         index_expr: &Expr,
     ) -> Result<BasicValueEnum<'ctx>> {
+        if let Some((value, _element_type)) =
+            self.compile_dynamic_array_access_value(array_expr, index_expr)?
+        {
+            return Ok(value);
+        }
+
         // Create an ArrayAccess expression and use the unified DWARF compilation
         let array_access_expr =
             Expr::ArrayAccess(Box::new(array_expr.clone()), Box::new(index_expr.clone()));
@@ -2233,6 +2982,21 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             expr
         );
 
+        if let crate::script::Expr::ArrayAccess(array_expr, index_expr) = expr {
+            if let Some((value, _element_type)) =
+                self.compile_dynamic_array_access_value(array_expr, index_expr)?
+            {
+                return Ok(value);
+            }
+        }
+        if let crate::script::Expr::MemberAccess(obj_expr, field) = expr {
+            if let Some((value, _member_type)) =
+                self.compile_dynamic_member_access_value(obj_expr, field)?
+            {
+                return Ok(value);
+            }
+        }
+
         // Query DWARF for the complex expression
         let compile_context = self.get_compile_time_context()?.clone();
         let variable_plan = match self.query_dwarf_for_complex_expr(expr)? {
@@ -2255,6 +3019,617 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         );
 
         self.variable_materialization_to_llvm_value(&materialized, compile_context.pc_address, None)
+    }
+
+    pub(super) fn compile_dynamic_array_access_value(
+        &mut self,
+        array_expr: &Expr,
+        index_expr: &Expr,
+    ) -> Result<Option<(BasicValueEnum<'ctx>, DwarfType)>> {
+        let Some((element_address, element_type)) =
+            self.compile_dynamic_array_element_address(array_expr, index_expr)?
+        else {
+            return Ok(None);
+        };
+
+        let value = self.read_dynamic_address_value(element_address, &element_type)?;
+        Ok(Some((value, element_type)))
+    }
+
+    pub(super) fn compile_dynamic_member_access_value(
+        &mut self,
+        obj_expr: &Expr,
+        field: &str,
+    ) -> Result<Option<(BasicValueEnum<'ctx>, DwarfType)>> {
+        let Some((object_address, object_type)) = self.dynamic_lvalue_address_and_type(obj_expr)?
+        else {
+            return Ok(None);
+        };
+
+        let Some((element_address, element_type)) =
+            self.dynamic_member_base_address_and_type(object_address, object_type)?
+        else {
+            return Ok(None);
+        };
+        let (member_offset, member_type) =
+            self.dynamic_member_offset_and_type(&element_type, field)?;
+
+        let member_offset = self.context.i64_type().const_int(member_offset, false);
+        let member_address = self
+            .builder
+            .build_int_add(element_address, member_offset, "dynamic_member_address")
+            .map_err(|err| CodeGenError::Builder(err.to_string()))?;
+        let value = self.read_dynamic_address_value(member_address, &member_type)?;
+        Ok(Some((value, member_type)))
+    }
+
+    fn dynamic_lvalue_address_and_type(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<Option<(IntValue<'ctx>, DwarfType)>> {
+        if let Expr::ArrayAccess(array_expr, index_expr) = expr {
+            return self.compile_dynamic_array_element_address(array_expr, index_expr);
+        }
+
+        if self.expands_to_nonliteral_pointer_arithmetic(expr)? {
+            let Some((element_type, _stride)) = self.indexable_element_type_and_stride(expr)?
+            else {
+                return Ok(None);
+            };
+            let element_address = self.resolve_ptr_i64_from_expr(expr)?;
+            return Ok(Some((element_address, element_type)));
+        }
+
+        if let Expr::MemberAccess(obj_expr, field) = expr {
+            let Some((object_address, object_type)) =
+                self.dynamic_lvalue_address_and_type(obj_expr)?
+            else {
+                return Ok(None);
+            };
+            let Some((base_address, aggregate_type)) =
+                self.dynamic_member_base_address_and_type(object_address, object_type)?
+            else {
+                return Ok(None);
+            };
+            let (member_offset, member_type) =
+                self.dynamic_member_offset_and_type(&aggregate_type, field)?;
+            let member_offset = self.context.i64_type().const_int(member_offset, false);
+            let member_address = self
+                .builder
+                .build_int_add(base_address, member_offset, "dynamic_member_lvalue_address")
+                .map_err(|err| CodeGenError::Builder(err.to_string()))?;
+            return Ok(Some((member_address, member_type)));
+        }
+
+        Ok(None)
+    }
+
+    fn dynamic_member_base_address_and_type(
+        &mut self,
+        address: IntValue<'ctx>,
+        object_type: DwarfType,
+    ) -> Result<Option<(IntValue<'ctx>, DwarfType)>> {
+        let object_type = self.complete_dynamic_member_element_type(object_type);
+        match ghostscope_dwarf::strip_type_aliases(&object_type) {
+            DwarfType::StructType { .. } | DwarfType::UnionType { .. } => {
+                Ok(Some((address, object_type)))
+            }
+            DwarfType::PointerType { target_type, .. } => {
+                let pointer_value = self.read_dynamic_address_value(address, &object_type)?;
+                let pointer_value = match pointer_value {
+                    BasicValueEnum::IntValue(value) => {
+                        self.normalize_int_to_i64(value, "dynamic_member_pointer_i64")?
+                    }
+                    BasicValueEnum::PointerValue(value) => self
+                        .builder
+                        .build_ptr_to_int(
+                            value,
+                            self.context.i64_type(),
+                            "dynamic_member_pointer_ptr",
+                        )
+                        .map_err(|err| CodeGenError::Builder(err.to_string()))?,
+                    _ => {
+                        return Err(CodeGenError::TypeError(
+                            "dynamic member pointer base did not compile to an address".to_string(),
+                        ))
+                    }
+                };
+                let target_type =
+                    self.complete_dynamic_member_element_type(target_type.as_ref().clone());
+                Ok(Some((pointer_value, target_type)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn dynamic_member_offset_and_type(
+        &self,
+        aggregate_type: &DwarfType,
+        field: &str,
+    ) -> Result<(u64, DwarfType)> {
+        let aggregate_type = self.complete_dynamic_member_element_type(aggregate_type.clone());
+        match ghostscope_dwarf::strip_type_aliases(&aggregate_type) {
+            DwarfType::StructType { members, .. } | DwarfType::UnionType { members, .. } => {
+                let Some(member) = members.iter().find(|member| member.name == field) else {
+                    return Err(CodeGenError::DwarfError(format!(
+                        "member '{field}' not found on dynamic array element type '{}'",
+                        aggregate_type.type_name()
+                    )));
+                };
+                Ok((member.offset, member.member_type.clone()))
+            }
+            other => Err(CodeGenError::TypeError(format!(
+                "dynamic member access requires struct or union element type, got '{}'",
+                other.type_name()
+            ))),
+        }
+    }
+
+    fn compile_dynamic_array_element_address(
+        &mut self,
+        array_expr: &Expr,
+        index_expr: &Expr,
+    ) -> Result<Option<(IntValue<'ctx>, DwarfType)>> {
+        let literal_index = Self::integer_literal_value(index_expr);
+        let expanded_array_expr = self.expand_alias_variable_expr(array_expr)?;
+        let has_dynamic_base =
+            self.expands_to_nonliteral_pointer_arithmetic(&expanded_array_expr)?;
+
+        if literal_index.is_some() && !has_dynamic_base {
+            return Ok(None);
+        }
+
+        let compile_context = self.get_compile_time_context()?.clone();
+        let status_ptr = if self.condition_context_active {
+            Some(self.get_or_create_cond_error_global())
+        } else {
+            None
+        };
+
+        let (element_type, stride, base_address, static_index) = match self
+            .query_dwarf_for_complex_expr(array_expr)?
+        {
+            Some(array_plan) => {
+                let array_type = array_plan.dwarf_type.clone().ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "Array expression has no DWARF type information".to_string(),
+                    )
+                })?;
+                match ghostscope_dwarf::strip_type_aliases(&array_type) {
+                    DwarfType::ArrayType { element_type, .. } => {
+                        let module_hint = self.current_resolved_var_module_path.clone();
+                        let base_address = self.variable_read_plan_to_lvalue_address_with_hint(
+                            &array_plan,
+                            compile_context.pc_address,
+                            status_ptr,
+                            module_hint.as_deref(),
+                        )?;
+                        (
+                            element_type.as_ref().clone(),
+                            element_type.size().max(1),
+                            base_address,
+                            0,
+                        )
+                    }
+                    DwarfType::PointerType { target_type, .. } => {
+                        let pointer_value = self.variable_read_plan_to_llvm_value(
+                            &array_plan,
+                            compile_context.pc_address,
+                            status_ptr,
+                        )?;
+                        let base_address = match pointer_value {
+                            BasicValueEnum::IntValue(value) => {
+                                self.normalize_int_to_i64(value, "dynamic_array_base_i64")?
+                            }
+                            BasicValueEnum::PointerValue(value) => self
+                                .builder
+                                .build_ptr_to_int(
+                                    value,
+                                    self.context.i64_type(),
+                                    "dynamic_array_base_ptr",
+                                )
+                                .map_err(|err| CodeGenError::Builder(err.to_string()))?,
+                            _ => {
+                                return Err(CodeGenError::TypeError(
+                                    "array base pointer did not compile to an address".to_string(),
+                                ))
+                            }
+                        };
+                        (
+                            target_type.as_ref().clone(),
+                            target_type.size().max(1),
+                            base_address,
+                            0,
+                        )
+                    }
+                    other => {
+                        return Err(CodeGenError::TypeError(format!(
+                            "dynamic array index requires array or pointer type, got '{}'",
+                            other.type_name()
+                        )))
+                    }
+                }
+            }
+            None => {
+                if let Some((base_expr, static_index)) =
+                    self.pointer_arithmetic_parts_expanding_aliases(&expanded_array_expr)?
+                {
+                    let array_plan =
+                        self.query_dwarf_for_complex_expr(&base_expr)?
+                            .ok_or_else(|| {
+                                CodeGenError::VariableNotFound(Self::expr_to_debug_string(
+                                    &base_expr,
+                                ))
+                            })?;
+                    let array_type = array_plan.dwarf_type.clone().ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "Array expression has no DWARF type information".to_string(),
+                        )
+                    })?;
+                    match ghostscope_dwarf::strip_type_aliases(&array_type) {
+                        DwarfType::ArrayType { element_type, .. } => {
+                            let module_hint = self.current_resolved_var_module_path.clone();
+                            let base_address = self
+                                .variable_read_plan_to_lvalue_address_with_hint(
+                                    &array_plan,
+                                    compile_context.pc_address,
+                                    status_ptr,
+                                    module_hint.as_deref(),
+                                )?;
+                            (
+                                element_type.as_ref().clone(),
+                                element_type.size().max(1),
+                                base_address,
+                                static_index,
+                            )
+                        }
+                        DwarfType::PointerType { target_type, .. } => {
+                            let pointer_value = self.variable_read_plan_to_llvm_value(
+                                &array_plan,
+                                compile_context.pc_address,
+                                status_ptr,
+                            )?;
+                            let base_address = match pointer_value {
+                                BasicValueEnum::IntValue(value) => {
+                                    self.normalize_int_to_i64(value, "dynamic_array_base_i64")?
+                                }
+                                BasicValueEnum::PointerValue(value) => self
+                                    .builder
+                                    .build_ptr_to_int(
+                                        value,
+                                        self.context.i64_type(),
+                                        "dynamic_array_base_ptr",
+                                    )
+                                    .map_err(|err| CodeGenError::Builder(err.to_string()))?,
+                                _ => {
+                                    return Err(CodeGenError::TypeError(
+                                        "array base pointer did not compile to an address"
+                                            .to_string(),
+                                    ))
+                                }
+                            };
+                            (
+                                target_type.as_ref().clone(),
+                                target_type.size().max(1),
+                                base_address,
+                                static_index,
+                            )
+                        }
+                        other => {
+                            return Err(CodeGenError::TypeError(format!(
+                                "dynamic array index requires array or pointer type, got '{}'",
+                                other.type_name()
+                            )))
+                        }
+                    }
+                } else if has_dynamic_base {
+                    let (element_type, stride) = self
+                        .indexable_element_type_and_stride(&expanded_array_expr)?
+                        .ok_or_else(|| {
+                            CodeGenError::VariableNotFound(Self::expr_to_debug_string(array_expr))
+                        })?;
+                    let base_address = self.resolve_ptr_i64_from_expr(&expanded_array_expr)?;
+                    (element_type, stride, base_address, 0)
+                } else if let Some((base_address, array_type)) =
+                    self.dynamic_lvalue_address_and_type(&expanded_array_expr)?
+                {
+                    match ghostscope_dwarf::strip_type_aliases(&array_type) {
+                        DwarfType::ArrayType { element_type, .. } => (
+                            element_type.as_ref().clone(),
+                            element_type.size().max(1),
+                            base_address,
+                            0,
+                        ),
+                        DwarfType::PointerType { target_type, .. } => {
+                            let pointer_value =
+                                self.read_dynamic_address_value(base_address, &array_type)?;
+                            let base_address = match pointer_value {
+                                BasicValueEnum::IntValue(value) => self
+                                    .normalize_int_to_i64(value, "dynamic_array_member_ptr_i64")?,
+                                BasicValueEnum::PointerValue(value) => self
+                                    .builder
+                                    .build_ptr_to_int(
+                                        value,
+                                        self.context.i64_type(),
+                                        "dynamic_array_member_ptr",
+                                    )
+                                    .map_err(|err| CodeGenError::Builder(err.to_string()))?,
+                                _ => {
+                                    return Err(CodeGenError::TypeError(
+                                        "array member pointer did not compile to an address"
+                                            .to_string(),
+                                    ))
+                                }
+                            };
+                            (
+                                target_type.as_ref().clone(),
+                                target_type.size().max(1),
+                                base_address,
+                                0,
+                            )
+                        }
+                        other => {
+                            return Err(CodeGenError::TypeError(format!(
+                                "dynamic array index requires array or pointer type, got '{}'",
+                                other.type_name()
+                            )))
+                        }
+                    }
+                } else {
+                    return Err(CodeGenError::VariableNotFound(Self::expr_to_debug_string(
+                        array_expr,
+                    )));
+                }
+            }
+        };
+
+        let index_value = if let Some(index) = literal_index {
+            self.context.i64_type().const_int(index as u64, true)
+        } else {
+            match self.compile_expr(index_expr)? {
+                BasicValueEnum::IntValue(value) => {
+                    self.normalize_int_to_i64(value, "dynamic_array_index_i64")?
+                }
+                _ => {
+                    return Err(CodeGenError::TypeError(
+                        "array index expression must compile to an integer".to_string(),
+                    ))
+                }
+            }
+        };
+        let index_value = if static_index == 0 {
+            index_value
+        } else {
+            let static_index_value = self.context.i64_type().const_int(static_index as u64, true);
+            self.builder
+                .build_int_add(
+                    index_value,
+                    static_index_value,
+                    "dynamic_array_static_index",
+                )
+                .map_err(|err| CodeGenError::Builder(err.to_string()))?
+        };
+        let stride_value = self.context.i64_type().const_int(stride, false);
+        let byte_offset = self
+            .builder
+            .build_int_mul(index_value, stride_value, "dynamic_array_byte_offset")
+            .map_err(|err| CodeGenError::Builder(err.to_string()))?;
+        let element_address = self
+            .builder
+            .build_int_add(base_address, byte_offset, "dynamic_array_element_address")
+            .map_err(|err| CodeGenError::Builder(err.to_string()))?;
+
+        Ok(Some((element_address, element_type)))
+    }
+
+    fn indexable_element_type_and_stride(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<Option<(DwarfType, u64)>> {
+        use crate::script::ast::BinaryOp as BO;
+        use crate::script::ast::Expr as E;
+
+        let expanded = self.expand_alias_variable_expr(expr)?;
+
+        if let Some(plan) = self.query_dwarf_for_complex_expr(&expanded)? {
+            if let Some(dwarf_type) = plan.dwarf_type {
+                if let Some(info) = Self::element_type_and_stride_from_type(&dwarf_type) {
+                    return Ok(Some(info));
+                }
+            }
+        }
+
+        if let Some((base_expr, _static_index)) =
+            self.pointer_arithmetic_parts_expanding_aliases(&expanded)?
+        {
+            if let Some(plan) = self.query_dwarf_for_complex_expr(&base_expr)? {
+                if let Some(dwarf_type) = plan.dwarf_type {
+                    if let Some(info) = Self::element_type_and_stride_from_type(&dwarf_type) {
+                        return Ok(Some(info));
+                    }
+                }
+            }
+        }
+
+        match expanded {
+            E::BinaryOp {
+                ref left,
+                op: BO::Add,
+                ref right,
+            } => {
+                if let Some(info) = self.indexable_element_type_and_stride(left)? {
+                    return Ok(Some(info));
+                }
+                self.indexable_element_type_and_stride(right)
+            }
+            E::BinaryOp {
+                ref left,
+                op: BO::Subtract,
+                ..
+            } => self.indexable_element_type_and_stride(left),
+            _ => Ok(None),
+        }
+    }
+
+    fn element_type_and_stride_from_type(dwarf_type: &DwarfType) -> Option<(DwarfType, u64)> {
+        match ghostscope_dwarf::strip_type_aliases(dwarf_type) {
+            DwarfType::ArrayType { element_type, .. } => {
+                Some((element_type.as_ref().clone(), element_type.size().max(1)))
+            }
+            DwarfType::PointerType { target_type, .. } => {
+                Some((target_type.as_ref().clone(), target_type.size().max(1)))
+            }
+            _ => None,
+        }
+    }
+
+    fn complete_dynamic_member_element_type(&self, element_type: DwarfType) -> DwarfType {
+        let candidate_name = match ghostscope_dwarf::strip_type_aliases(&element_type) {
+            DwarfType::UnknownType { name } => Some(name.clone()),
+            _ => None,
+        };
+        let Some(candidate_name) = candidate_name else {
+            return element_type;
+        };
+        let Some(resolved) = self.resolve_named_aggregate_type_for_dynamic_member(&candidate_name)
+        else {
+            return element_type;
+        };
+
+        match element_type {
+            DwarfType::TypedefType { name, .. } => DwarfType::TypedefType {
+                name,
+                underlying_type: Box::new(resolved),
+            },
+            DwarfType::QualifiedType {
+                qualifier,
+                underlying_type,
+            } => DwarfType::QualifiedType {
+                qualifier,
+                underlying_type: Box::new(
+                    self.complete_dynamic_member_element_type(*underlying_type),
+                ),
+            },
+            _ => resolved,
+        }
+    }
+
+    fn resolve_named_aggregate_type_for_dynamic_member(&self, name: &str) -> Option<DwarfType> {
+        let analyzer = self.process_analyzer?;
+        let mut candidates = Vec::new();
+        let mut push_candidate = |candidate: &str| {
+            let candidate = candidate.trim();
+            if !candidate.is_empty() && candidate != "void" {
+                candidates.push(candidate.to_string());
+            }
+        };
+
+        push_candidate(name);
+        for prefix in [
+            "const ",
+            "volatile ",
+            "restrict ",
+            "struct ",
+            "class ",
+            "union ",
+        ] {
+            if let Some(stripped) = name.strip_prefix(prefix) {
+                push_candidate(stripped);
+            }
+        }
+
+        let module_path = self
+            .current_resolved_var_module_path
+            .clone()
+            .or_else(|| {
+                self.current_compile_time_context
+                    .as_ref()
+                    .map(|ctx| ctx.module_path.clone())
+            })
+            .map(std::path::PathBuf::from);
+
+        for candidate in candidates {
+            let in_module = module_path.as_ref().and_then(|module_path| {
+                analyzer
+                    .resolve_struct_type_shallow_by_name_in_module(module_path, &candidate)
+                    .or_else(|| {
+                        analyzer
+                            .resolve_union_type_shallow_by_name_in_module(module_path, &candidate)
+                    })
+            });
+            let resolved = in_module
+                .or_else(|| analyzer.resolve_struct_type_shallow_by_name(&candidate))
+                .or_else(|| analyzer.resolve_union_type_shallow_by_name(&candidate));
+            if let Some(resolved) = resolved.filter(|ty| ty.size() > 0) {
+                return Some(resolved);
+            }
+        }
+
+        None
+    }
+
+    fn read_dynamic_address_value(
+        &mut self,
+        address: IntValue<'ctx>,
+        dwarf_type: &DwarfType,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        if ghostscope_dwarf::is_c_aggregate_type(dwarf_type) {
+            let ptr_ty = self.context.ptr_type(AddressSpace::default());
+            let as_ptr = self
+                .builder
+                .build_int_to_ptr(address, ptr_ty, "dynamic_aggregate_ptr")
+                .map_err(|err| CodeGenError::Builder(err.to_string()))?;
+            return Ok(as_ptr.into());
+        }
+
+        let access_size = self.dwarf_type_to_memory_access_size(dwarf_type);
+        let value = if self.condition_context_active {
+            self.generate_memory_read_with_status(address, access_size)?
+        } else {
+            self.generate_memory_read(address, access_size, None)?
+        };
+        self.sign_extend_memory_read_if_needed(value, dwarf_type, access_size)
+    }
+
+    fn expand_alias_variable_expr(&self, expr: &Expr) -> Result<Expr> {
+        let mut expanded = expr.clone();
+        let mut visited = std::collections::HashSet::new();
+
+        loop {
+            let Expr::Variable(name) = &expanded else {
+                return Ok(expanded);
+            };
+            if !self.alias_variable_exists(name) {
+                return Ok(expanded);
+            }
+            if !visited.insert(name.clone()) {
+                return Err(CodeGenError::TypeError(format!(
+                    "alias cycle detected for '{name}'"
+                )));
+            }
+            let Some(target) = self.get_alias_variable(name) else {
+                return Ok(expanded);
+            };
+            expanded = target;
+        }
+    }
+
+    fn normalize_int_to_i64(&self, value: IntValue<'ctx>, name: &str) -> Result<IntValue<'ctx>> {
+        let width = value.get_type().get_bit_width();
+        if width == 64 {
+            return Ok(value);
+        }
+
+        if width < 64 {
+            return self
+                .builder
+                .build_int_s_extend(value, self.context.i64_type(), name)
+                .map_err(|err| CodeGenError::Builder(err.to_string()));
+        }
+
+        self.builder
+            .build_int_truncate(value, self.context.i64_type(), name)
+            .map_err(|err| CodeGenError::Builder(err.to_string()))
     }
 
     pub(crate) fn dwarf_expression_unavailable_error(

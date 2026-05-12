@@ -721,11 +721,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         reg_num: u16,
         pt_regs_ptr: PointerValue<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>> {
-        // Check cache first
-        if let Some(cached_value) = self.register_cache.get(&reg_num) {
-            return Ok((*cached_value).into());
-        }
-
         // Map DWARF register number to pt_regs offset
         let pt_regs_offset = self.dwarf_reg_to_pt_regs_offset(reg_num)?;
 
@@ -750,9 +745,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_load(i64_type, reg_ptr, &format!("reg_{reg_num}"))
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-        if let BasicValueEnum::IntValue(int_val) = reg_value {
-            // Cache the value
-            self.register_cache.insert(reg_num, int_val);
+        if let BasicValueEnum::IntValue(_) = reg_value {
             Ok(reg_value)
         } else {
             Err(CodeGenError::RegisterMappingError(format!(
@@ -1053,12 +1046,25 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Map DWARF register number to pt_regs offset (simplified)
     pub fn dwarf_reg_to_pt_regs_offset(&self, dwarf_reg: u16) -> Result<usize> {
         // Use platform-specific register mapping to get byte offset
-        let byte_offset = register_mapping::dwarf_reg_to_pt_regs_byte_offset(dwarf_reg)
-            .ok_or_else(|| {
-                CodeGenError::RegisterMappingError(format!(
-                    "Unsupported DWARF register: {dwarf_reg}"
-                ))
-            })?;
+        let byte_offset = register_mapping::dwarf_reg_to_pt_regs_byte_offset(dwarf_reg).ok_or_else(
+            || {
+                let reg_name = register_mapping::dwarf_reg_to_name(dwarf_reg);
+                if matches!(reg_name, Some(name) if name.starts_with("XMM")) {
+                    CodeGenError::RegisterMappingError(format!(
+                        "Unsupported DWARF register: {dwarf_reg} ({}) is a SIMD/FP register; uprobe pt_regs does not expose XMM register values, so optimized float by-value parameters are unavailable unless the compiler spills them to memory",
+                        reg_name.unwrap()
+                    ))
+                } else if let Some(reg_name) = reg_name {
+                    CodeGenError::RegisterMappingError(format!(
+                        "Unsupported DWARF register: {dwarf_reg} ({reg_name})"
+                    ))
+                } else {
+                    CodeGenError::RegisterMappingError(format!(
+                        "Unsupported DWARF register: {dwarf_reg}"
+                    ))
+                }
+            },
+        )?;
 
         // Convert byte offset to u64 array index for pt_regs access
         let u64_index = byte_offset / core::mem::size_of::<u64>();
