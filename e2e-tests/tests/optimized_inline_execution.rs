@@ -86,7 +86,7 @@ async fn test_optimized_inline_parameters_preserve_callsite_relationships() -> a
     //     lexical_block
     let target = spawn_inline_callsite_program(&binary_path).await?;
     let script = format!(
-        "trace inline_callsite_program.c:{INLINE_TRACE_LINE} {{\n    print \"ARGS:{{}}:{{}}:{{}}\", a, b, c;\n}}\n"
+        "trace inline_callsite_program.c:{INLINE_TRACE_LINE} {{\n    print \"ARGS:{{}}:{{}}:{{}}\", a, b, c;\n    print \"ARGDIV:{{}}:{{}}:{{}}\", a / 0x2, (b + -0b11) / -0x2, c / 0o3;\n}}\n"
     );
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_target(&script, 4, &target).await?;
@@ -99,18 +99,43 @@ async fn test_optimized_inline_parameters_preserve_callsite_relationships() -> a
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
     let re = Regex::new(r"ARGS:([0-9-]+):([0-9-]+):([0-9-]+)")?;
-    let mut seen = 0;
-    for caps in re.captures_iter(&stdout) {
-        let a: i64 = caps[1].parse()?;
-        let b: i64 = caps[2].parse()?;
-        let c: i64 = caps[3].parse()?;
+    let div_re = Regex::new(r"ARGDIV:([0-9-]+):([0-9-]+):([0-9-]+)")?;
+    let arg_samples: Vec<(i64, i64, i64)> = re
+        .captures_iter(&stdout)
+        .map(|caps| {
+            Ok((
+                caps[1].parse::<i64>()?,
+                caps[2].parse::<i64>()?,
+                caps[3].parse::<i64>()?,
+            ))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let div_samples: Vec<(i64, i64, i64)> = div_re
+        .captures_iter(&stdout)
+        .map(|caps| {
+            Ok((
+                caps[1].parse::<i64>()?,
+                caps[2].parse::<i64>()?,
+                caps[3].parse::<i64>()?,
+            ))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    assert!(
+        arg_samples.len() == div_samples.len(),
+        "Expected matching inline arg and division samples. STDOUT: {stdout}"
+    );
+    for ((a, b, c), (a_div_2, b_shift_div_neg_2, c_div_3)) in
+        arg_samples.iter().copied().zip(div_samples.iter().copied())
+    {
         assert_eq!(b, a + 1, "Expected b == a + 1. STDOUT: {stdout}");
         assert_eq!(c, a + 2, "Expected c == a + 2. STDOUT: {stdout}");
-        seen += 1;
+        assert_eq!(a_div_2, a / 2, "STDOUT: {stdout}");
+        assert_eq!(b_shift_div_neg_2, (b - 3) / -2, "STDOUT: {stdout}");
+        assert_eq!(c_div_3, c / 3, "STDOUT: {stdout}");
     }
 
     assert!(
-        seen >= 2,
+        arg_samples.len() >= 2,
         "Expected multiple inline arg events. STDOUT: {stdout}"
     );
     Ok(())
@@ -218,7 +243,7 @@ async fn test_optimized_inline_struct_member_access_resolves_inline_parameter_na
         );
     }
     let script = format!(
-        "trace inline_callsite_program.c:{INLINE_STATE_TRACE_LINE} {{\n    print \"STATE:{{}}:{{}}\", state.total_bytes, state.stream_id;\n}}\n"
+        "trace inline_callsite_program.c:{INLINE_STATE_TRACE_LINE} {{\n    let dyn_zero = delta - delta;\n    let state_dyn = state + dyn_zero;\n    print \"STATE:{{}}:{{}}\", state.total_bytes, state.stream_id;\n    print \"STATE_DIV:{{}}:{{}}\", state.total_bytes / 0xa, (state.stream_id + -0x10) / -0x7;\n    print \"STATE_DYN:{{}}:{{}}\", state_dyn.total_bytes, state[dyn_zero].stream_id;\n    print \"STATE_DYN_DIV:{{}}:{{}}\", state_dyn.total_bytes / 0xa, state_dyn[dyn_zero].stream_id / 0x1;\n}}\n"
     );
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_target(&script, 4, &target).await?;
@@ -239,21 +264,99 @@ async fn test_optimized_inline_struct_member_access_resolves_inline_parameter_na
     );
 
     let re = Regex::new(r"STATE:([0-9-]+):([0-9-]+)")?;
-    let mut seen = 0;
-    for caps in re.captures_iter(&stdout) {
-        let total_bytes: i64 = caps[1].parse()?;
-        let stream_id: i64 = caps[2].parse()?;
+    let div_re = Regex::new(r"STATE_DIV:([0-9-]+):([0-9-]+)")?;
+    let dyn_re = Regex::new(r"STATE_DYN:([0-9-]+):([0-9-]+)")?;
+    let dyn_div_re = Regex::new(r"STATE_DYN_DIV:([0-9-]+):([0-9-]+)")?;
+    let state_samples: Vec<(i64, i64)> = re
+        .captures_iter(&stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    let div_samples: Vec<(i64, i64)> = div_re
+        .captures_iter(&stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    let dyn_samples: Vec<(i64, i64)> = dyn_re
+        .captures_iter(&stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    let dyn_div_samples: Vec<(i64, i64)> = dyn_div_re
+        .captures_iter(&stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    assert!(
+        state_samples.len() == div_samples.len()
+            && state_samples.len() == dyn_samples.len()
+            && state_samples.len() == dyn_div_samples.len(),
+        "Expected matching inline state, dynamic state, and division samples. STDOUT: {stdout}"
+    );
+    for (
+        ((total_bytes, stream_id), (total_div_10, stream_shift_div_neg_7)),
+        ((dyn_total, dyn_stream), (dyn_total_div_10, dyn_stream_div_1)),
+    ) in state_samples
+        .iter()
+        .copied()
+        .zip(div_samples.iter().copied())
+        .zip(
+            dyn_samples
+                .iter()
+                .copied()
+                .zip(dyn_div_samples.iter().copied()),
+        )
+    {
         assert_eq!(
             total_bytes,
             (stream_id - 7) * 10,
             "Expected state.total_bytes == (state.stream_id - 7) * 10. STDOUT: {stdout}"
         );
-        seen += 1;
+        assert_eq!(dyn_total, total_bytes, "STDOUT: {stdout}");
+        assert_eq!(dyn_stream, stream_id, "STDOUT: {stdout}");
+        assert_eq!(total_div_10, total_bytes / 10, "STDOUT: {stdout}");
+        assert_eq!(
+            stream_shift_div_neg_7,
+            (stream_id - 16) / -7,
+            "STDOUT: {stdout}"
+        );
+        assert_eq!(dyn_total_div_10, total_bytes / 10, "STDOUT: {stdout}");
+        assert_eq!(dyn_stream_div_1, stream_id, "STDOUT: {stdout}");
     }
 
     assert!(
-        seen >= 2,
+        state_samples.len() >= 2,
         "Expected multiple inline struct member events. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_optimized_inline_struct_pointer_memory_formats() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("inline_callsite_program")?;
+    let target = spawn_inline_callsite_program(&binary_path).await?;
+    let script = format!(
+        "trace inline_callsite_program.c:{INLINE_STATE_TRACE_LINE} {{\n    print \"INLINE_STATE_PTR={{:p}}\", state + 0;\n    print \"INLINE_STATE_HEX={{:x.0x8}}\", state + 0;\n    if memcmp(state + 0, hex(\"1400000009000000\"), 0b1000) {{ print \"INLINE_STATE_MEM_OK\"; }}\n}}\n"
+    );
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(&script, 4, &target).await?;
+    target.terminate().await?;
+
+    if should_skip_for_ebpf_env(exit_code, &stderr) {
+        return Ok(());
+    }
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.contains("INLINE_STATE_PTR=0x"),
+        "Expected inline state pointer formatting. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("INLINE_STATE_HEX=14 00 00 00 09 00 00 00"),
+        "Expected inline state raw memory bytes. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("INLINE_STATE_MEM_OK"),
+        "Expected inline state memcmp marker. STDOUT: {stdout}"
     );
 
     Ok(())

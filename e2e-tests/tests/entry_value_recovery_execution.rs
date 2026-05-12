@@ -456,6 +456,9 @@ async fn test_non_inline_entry_value_recovers_touch_parameters_at_runtime() -> a
     let script = format!(
         "trace {FIXTURE_SOURCE}:{TOUCH_TRACE_LINE} {{
     print \"TOUCH:{{}}:{{}}:{{}}\", x, state.total_bytes, state.stream_id;
+    print \"TOUCH_CALC:{{}}:{{}}\", x * 0x3, state.total_bytes + (x * 0b11);
+    print \"TOUCH_DIV:{{}}:{{}}:{{}}\", x / 0x2, state.total_bytes / 0x5, (state.stream_id + -0x10) / 0x2;
+    if state.stream_id + -0x7 > 0 {{ print \"TOUCH_STREAM_OK\"; }}
 }}
 "
     );
@@ -503,8 +506,29 @@ async fn test_non_inline_entry_value_recovers_touch_parameters_at_runtime() -> a
     );
 
     let trace_re = Regex::new(r"TOUCH:([0-9-]+):([0-9-]+):([0-9-]+)")?;
+    let calc_re = Regex::new(r"TOUCH_CALC:([0-9-]+):([0-9-]+)")?;
+    let div_re = Regex::new(r"TOUCH_DIV:([0-9-]+):([0-9-]+):([0-9-]+)")?;
+    let calc_samples: Vec<(i64, i64)> = calc_re
+        .captures_iter(&ghostscope_stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    let div_samples: Vec<(i64, i64, i64)> = div_re
+        .captures_iter(&ghostscope_stdout)
+        .map(|caps| {
+            Ok((
+                caps[1].parse::<i64>()?,
+                caps[2].parse::<i64>()?,
+                caps[3].parse::<i64>()?,
+            ))
+        })
+        .collect::<anyhow::Result<_>>()?;
     let mut seen = 0;
-    for caps in trace_re.captures_iter(&ghostscope_stdout) {
+    for ((caps, (seed_times_3, total_plus_seed_times_3)), (seed_div, total_div, stream_neg_div)) in
+        trace_re
+            .captures_iter(&ghostscope_stdout)
+            .zip(calc_samples.iter().copied())
+            .zip(div_samples.iter().copied())
+    {
         let seed = caps[1].parse::<i64>()?;
         let total_bytes = caps[2].parse::<i64>()?;
         let stream_id = caps[3].parse::<i64>()?;
@@ -524,12 +548,47 @@ async fn test_non_inline_entry_value_recovers_touch_parameters_at_runtime() -> a
             actual.2, expected_result,
             "touch() recovered an inconsistent seed/result for seed={seed}; ghostscope stdout={ghostscope_stdout}"
         );
+        assert_eq!(
+            seed_times_3,
+            seed * 3,
+            "ghostscope stdout={ghostscope_stdout}"
+        );
+        assert_eq!(
+            total_plus_seed_times_3,
+            total_bytes + (seed * 3),
+            "ghostscope stdout={ghostscope_stdout}"
+        );
+        assert_eq!(seed_div, seed / 2, "ghostscope stdout={ghostscope_stdout}");
+        assert_eq!(
+            total_div,
+            total_bytes / 5,
+            "ghostscope stdout={ghostscope_stdout}"
+        );
+        assert_eq!(
+            stream_neg_div,
+            (stream_id - 16) / 2,
+            "ghostscope stdout={ghostscope_stdout}"
+        );
         seen += 1;
     }
 
     assert!(
         seen >= 2,
         "Expected multiple touch() trace events. GhostScope STDOUT: {ghostscope_stdout}\nTarget STDOUT: {target_stdout}"
+    );
+    assert_eq!(
+        calc_samples.len(),
+        seen,
+        "Expected matching TOUCH and TOUCH_CALC samples. GhostScope STDOUT: {ghostscope_stdout}"
+    );
+    assert_eq!(
+        div_samples.len(),
+        seen,
+        "Expected matching TOUCH and TOUCH_DIV samples. GhostScope STDOUT: {ghostscope_stdout}"
+    );
+    assert!(
+        ghostscope_stdout.contains("TOUCH_STREAM_OK"),
+        "Expected stream-id arithmetic comparison marker. GhostScope STDOUT: {ghostscope_stdout}"
     );
     Ok(())
 }
@@ -554,7 +613,11 @@ async fn test_post_call_entry_value_recovers_state_members_at_runtime() -> anyho
     let target = spawn_logged_target(&binary_path).await?;
     let script = format!(
         "trace {FIXTURE_SOURCE}:{POST_CALL_TRACE_LINE} {{
+    let total = state.total_bytes + state.stream_id;
     print \"POSTCALL:{{}}:{{}}\", state.total_bytes, state.stream_id;
+    print \"POSTCALL_CALC:{{}}:{{}}\", total, state.total_bytes - 0xa;
+    print \"POSTCALL_DIV:{{}}:{{}}\", state.total_bytes / 0x5, (state.stream_id + -0x10) / 0x2;
+    if state.stream_id == 0x8 || state.stream_id == 0x9 {{ print \"POSTCALL_STREAM_OK\"; }}
 }}
 "
     );
@@ -604,8 +667,22 @@ STDERR: {ghostscope_stderr}"
     );
 
     let trace_re = Regex::new(r"POSTCALL:([0-9-]+):([0-9-]+)")?;
+    let calc_re = Regex::new(r"POSTCALL_CALC:([0-9-]+):([0-9-]+)")?;
+    let div_re = Regex::new(r"POSTCALL_DIV:([0-9-]+):([0-9-]+)")?;
+    let calc_samples: Vec<(i64, i64)> = calc_re
+        .captures_iter(&ghostscope_stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    let div_samples: Vec<(i64, i64)> = div_re
+        .captures_iter(&ghostscope_stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
     let mut seen = 0;
-    for caps in trace_re.captures_iter(&ghostscope_stdout) {
+    for ((caps, (total, delta_from_first_state)), (total_div, stream_neg_div)) in trace_re
+        .captures_iter(&ghostscope_stdout)
+        .zip(calc_samples.iter().copied())
+        .zip(div_samples.iter().copied())
+    {
         let total_bytes = caps[1].parse::<i64>()?;
         let stream_id = caps[2].parse::<i64>()?;
         assert!(
@@ -614,6 +691,22 @@ STDERR: {ghostscope_stderr}"
                 .any(|actual| actual.0 == total_bytes && actual.1 == stream_id),
             "missing ACTUAL record for total_bytes={total_bytes}, stream_id={stream_id}; target stdout={target_stdout}"
         );
+        assert_eq!(
+            total,
+            total_bytes + stream_id,
+            "STDOUT: {ghostscope_stdout}"
+        );
+        assert_eq!(
+            delta_from_first_state,
+            total_bytes - 10,
+            "STDOUT: {ghostscope_stdout}"
+        );
+        assert_eq!(total_div, total_bytes / 5, "STDOUT: {ghostscope_stdout}");
+        assert_eq!(
+            stream_neg_div,
+            (stream_id - 16) / 2,
+            "STDOUT: {ghostscope_stdout}"
+        );
         seen += 1;
     }
 
@@ -621,6 +714,74 @@ STDERR: {ghostscope_stderr}"
         seen >= 2,
         "Expected multiple post-call trace events. GhostScope STDOUT: {ghostscope_stdout}
 Target STDOUT: {target_stdout}"
+    );
+    assert_eq!(
+        calc_samples.len(),
+        seen,
+        "Expected matching POSTCALL and POSTCALL_CALC samples. GhostScope STDOUT: {ghostscope_stdout}"
+    );
+    assert_eq!(
+        div_samples.len(),
+        seen,
+        "Expected matching POSTCALL and POSTCALL_DIV samples. GhostScope STDOUT: {ghostscope_stdout}"
+    );
+    assert!(
+        ghostscope_stdout.contains("POSTCALL_STREAM_OK"),
+        "Expected post-call stream-id comparison marker. GhostScope STDOUT: {ghostscope_stdout}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_post_call_entry_value_state_pointer_memory_formats() -> anyhow::Result<()> {
+    init();
+    if !fixture_compiler_available(FixtureCompiler::ClangDwarf5) {
+        eprintln!("Skipping entry_value memory-format test because clang is unavailable");
+        return Ok(());
+    }
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_compiler(FIXTURE_NAME, FixtureCompiler::ClangDwarf5)?;
+    let target = spawn_logged_target(&binary_path).await?;
+    let script = format!(
+        "trace {FIXTURE_SOURCE}:{POST_CALL_TRACE_LINE} {{
+    print \"POST_STATE_PTR={{:p}}\", state + 0;
+    print \"POST_STATE_HEX={{:x.0x8}}\", state + 0;
+    if memcmp(state + 0, hex(\"1400000009000000\"), 0x8) {{ print \"POST_STATE_20_9\"; }}
+    if memcmp(state + 0, hex(\"0a00000008000000\"), 0b1000) {{ print \"POST_STATE_10_8\"; }}
+}}
+"
+    );
+    let (exit_code, ghostscope_stdout, ghostscope_stderr) = GhostscopeRunner::new()
+        .with_script(&script)
+        .attach_to(&target.target)
+        .timeout_secs(4)
+        .enable_sysmon_shared_lib(false)
+        .run()
+        .await?;
+    let (_target_stdout, target_stderr) = target.terminate_and_collect().await?;
+
+    if should_skip_for_ebpf_env(exit_code, &ghostscope_stderr) {
+        return Ok(());
+    }
+
+    assert_eq!(
+        exit_code, 0,
+        "ghostscope stderr={ghostscope_stderr} ghostscope stdout={ghostscope_stdout} target stderr={target_stderr}"
+    );
+    assert!(
+        ghostscope_stdout.contains("POST_STATE_PTR=0x"),
+        "Expected entry_value state pointer formatting. STDOUT: {ghostscope_stdout}"
+    );
+    assert!(
+        ghostscope_stdout.contains("POST_STATE_HEX=14 00 00 00 09 00 00 00")
+            || ghostscope_stdout.contains("POST_STATE_HEX=0a 00 00 00 08 00 00 00"),
+        "Expected entry_value state raw memory bytes. STDOUT: {ghostscope_stdout}"
+    );
+    assert!(
+        ghostscope_stdout.contains("POST_STATE_20_9")
+            && ghostscope_stdout.contains("POST_STATE_10_8"),
+        "Expected both entry_value state memcmp markers. STDOUT: {ghostscope_stdout}"
     );
     Ok(())
 }
@@ -644,6 +805,9 @@ async fn test_entry_value_breg_stack_parameter_recovers_at_runtime() -> anyhow::
     let script = format!(
         "trace 0x{anchor_pc:x} {{
     print \"STACKPAYLOAD:{{}}\", payload;
+    print \"STACKPAYLOAD_CALC:{{}}:{{}}\", payload + 0x1, payload * 0b10;
+    print \"STACKPAYLOAD_DIV:{{}}\", payload / 0x2;
+    if payload > 0 {{ print \"STACKPAYLOAD_POS\"; }}
 }}
 "
     );
@@ -684,9 +848,23 @@ async fn test_entry_value_breg_stack_parameter_recovers_at_runtime() -> anyhow::
     );
 
     let trace_re = Regex::new(r"STACKPAYLOAD:([0-9-]+)")?;
+    let calc_re = Regex::new(r"STACKPAYLOAD_CALC:([0-9-]+):([0-9-]+)")?;
+    let div_re = Regex::new(r"STACKPAYLOAD_DIV:([0-9-]+)")?;
+    let calc_samples: Vec<(i64, i64)> = calc_re
+        .captures_iter(&ghostscope_stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    let div_samples: Vec<i64> = div_re
+        .captures_iter(&ghostscope_stdout)
+        .map(|caps| caps[1].parse::<i64>())
+        .collect::<Result<_, _>>()?;
     let mut next_actual_index = 0usize;
     let mut seen = 0;
-    for caps in trace_re.captures_iter(&ghostscope_stdout) {
+    for ((caps, (payload_plus_1, payload_times_2)), payload_div) in trace_re
+        .captures_iter(&ghostscope_stdout)
+        .zip(calc_samples.iter().copied())
+        .zip(div_samples.iter().copied())
+    {
         let payload = caps[1].parse::<i64>()?;
         let relative_index = actual_seeds[next_actual_index..]
             .iter()
@@ -695,14 +873,43 @@ async fn test_entry_value_breg_stack_parameter_recovers_at_runtime() -> anyhow::
                 anyhow::anyhow!(
                     "missing ordered ACTUAL seed for payload={payload}; ghostscope stdout={ghostscope_stdout} target stdout={target_stdout}"
                 )
-            })?;
+        })?;
         next_actual_index += relative_index + 1;
+        assert_eq!(
+            payload_plus_1,
+            payload + 1,
+            "ghostscope stdout={ghostscope_stdout}"
+        );
+        assert_eq!(
+            payload_times_2,
+            payload * 2,
+            "ghostscope stdout={ghostscope_stdout}"
+        );
+        assert_eq!(
+            payload_div,
+            payload / 2,
+            "ghostscope stdout={ghostscope_stdout}"
+        );
         seen += 1;
     }
 
     assert!(
         seen >= 2,
         "Expected multiple stack-parameter trace events. GhostScope STDOUT: {ghostscope_stdout}\nTarget STDOUT: {target_stdout}"
+    );
+    assert_eq!(
+        calc_samples.len(),
+        seen,
+        "Expected matching STACKPAYLOAD and STACKPAYLOAD_CALC samples. GhostScope STDOUT: {ghostscope_stdout}"
+    );
+    assert_eq!(
+        div_samples.len(),
+        seen,
+        "Expected matching STACKPAYLOAD and STACKPAYLOAD_DIV samples. GhostScope STDOUT: {ghostscope_stdout}"
+    );
+    assert!(
+        ghostscope_stdout.contains("STACKPAYLOAD_POS"),
+        "Expected stack payload comparison marker. GhostScope STDOUT: {ghostscope_stdout}"
     );
     Ok(())
 }

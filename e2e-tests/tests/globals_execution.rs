@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{init, FIXTURES};
+use common::{init, OptimizationLevel, FIXTURES};
 use regex::Regex;
 use std::path::Path;
 use std::time::Duration;
@@ -125,6 +125,290 @@ trace globals_program.c:32 {
     assert!(
         stdout.contains("HEX_LM_INFER"),
         "Expected HEX_LM_INFER. STDOUT: {stdout}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_globals_o3_pointer_arithmetic_memcmp_and_strncmp() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("globals_program", OptimizationLevel::O3)?;
+    let target = spawn_globals_program(&binary_path).await?;
+
+    let script = r#"
+trace globals_program.c:32 {
+    let n = 0b110;
+    print "GM_OFFSET_PTR={:p}", gm + 7;
+    print "GM_OFFSET_FMT={:s.0x6}", gm + 7;
+    print "GMSG_OFFSET_HEX={:x.0b110}", g_message + 7;
+    print "GM_OFFSET_STAR={:s.*}", n, gm + 7;
+    print "GMSG_OFFSET_CAPTURE={:x.n$}", g_message + 7;
+    let dyn_zero = G_STATE.counter - G_STATE.counter;
+    let dyn_gm_off = dyn_zero + 0x7;
+    let dyn_neg_len = dyn_zero - 0x5;
+    let dyn_long_len = dyn_gm_off + 0xff;
+    let dyn_gm = gm + dyn_gm_off;
+    let dyn_gmsg = g_message + dyn_gm_off;
+    print "GM_DYN_OFFSET_FMT={:s.0b110}", dyn_gm;
+    print "GM_DYN_OFFSET_HEX={:x.0x6}", dyn_gm;
+    print "GMSG_DYN_OFFSET_FMT={:s.0o6}", dyn_gmsg;
+    print "GMSG_DYN_OFFSET_HEX={:x.0b110}", dyn_gmsg;
+    print "GMSG_DYN_COMMUTED={:s.0x6}", dyn_gm_off + g_message;
+    print "O3_GY:{}", s.inner.y;
+    print "O3_LIBY:{}", LIB_STATE.inner.y;
+    print "O3_GX_CALC:{}:{}", s.inner.x, s.inner.x + 0x2;
+    print "O3_SLOT_CALC:{}:{}", g_slots[0x1].x, g_slots[0x1].x - 0b11;
+    print "O3_GARR1_CALC:{}:{}", G_STATE.array[0b1], G_STATE.array[0b1] + -0x1;
+    let dyn_slot_idx = g_slots[0x0].x / 0xa;
+    let dyn_garr_idx = G_STATE.counter - (G_STATE.counter / 0x4) * 0x4;
+    print "O3_DYN_SLOT:{}:{}", dyn_slot_idx, g_slots[dyn_slot_idx].x;
+    print "O3_DYN_SLOT_DIV:{}", g_slots[dyn_slot_idx].x / 0xa;
+    print "O3_DYN_GARR IDX={} VAL={}", dyn_garr_idx, G_STATE.array[dyn_garr_idx];
+    print "O3_DYN_GARR_DIV:{}", G_STATE.array[dyn_garr_idx] / 0x1;
+    print "O3_PTR_ALIAS:{}:{}:{}", *p_s_internal, *p_s_bss, *p_lib_internal;
+    print "O3_PTR_ALIAS_DIV:{}:{}:{}", *p_s_internal / 0x3, *p_s_bss / 0x3, *p_lib_internal / 0x5;
+    let slot_neg = g_slots[0x1].x + -0x40;
+    print "O3_GLOBAL_DIV:{}:{}:{}:{}", g_counter, g_counter / 0x2, G_STATE.counter, G_STATE.counter / 0b10;
+    print "O3_GLOBAL_SIGNED_DIV:{}:{}", slot_neg, slot_neg / 0x4;
+    if *p_s_internal / 0x3 >= 0x3 { print "O3_PTR_ALIAS_INTERNAL_DIV_OK"; }
+    if *p_s_bss / 0x3 >= 0x1 { print "O3_PTR_ALIAS_BSS_DIV_OK"; }
+    if *p_lib_internal / 0x5 >= 0x1 { print "O3_PTR_ALIAS_LIB_DIV_OK"; }
+    if g_counter / 0x2 >= 0x15 { print "O3_GCOUNTER_DIV_OK"; }
+    if G_STATE.array[0b1] / 0x2 >= 0x1 { print "O3_GARR1_DIV_OK"; }
+    if g_slots[dyn_slot_idx].x == 0x14 { print "O3_DYN_SLOT_OK"; }
+    if g_slots[dyn_slot_idx].x / 0xa == 0b10 { print "O3_DYN_SLOT_DIV_OK"; }
+    if G_STATE.array[dyn_garr_idx] / 0x1 >= 0x1 { print "O3_DYN_GARR_DIV_OK"; }
+    if slot_neg / 0x4 == -0xb { print "O3_SLOT_SIGNED_DIV_OK"; }
+    if memcmp(gm + 7, hex("476c6f62616c"), 0x6) { print "GM_OFFSET_HEX_OK"; }
+    if strncmp(gm + 7, "Global", 0b110) { print "GM_OFFSET_STR_OK"; }
+    if memcmp(g_message + 7, hex("476c6f62616c"), 0o6) { print "GMSG_OFFSET_HEX_OK"; }
+    if memcmp(dyn_gm, hex("476c6f62616c"), dyn_gm_off - 0x1) { print "GM_DYN_HEX_OK"; }
+    if strncmp(dyn_gmsg, "Global", dyn_gm_off - 0b1) { print "GMSG_DYN_STR_OK"; }
+    if strncmp(dyn_gm, "Mismatch", dyn_neg_len) { print "GM_DYN_NEG_LEN_OK"; }
+    if strncmp(dyn_gm, "Global", dyn_long_len) { print "GM_DYN_LONG_LEN_OK"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.contains("GM_OFFSET_PTR=0x"),
+        "Expected O3 pointer formatting for gm + 7. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GM_OFFSET_FMT=Global"),
+        "Expected O3 formatted string read from gm + 7. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GMSG_OFFSET_HEX=47 6c 6f 62 61 6c"),
+        "Expected O3 formatted hex read from g_message + 7. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GM_OFFSET_STAR=Global"),
+        "Expected O3 dynamic-length formatted string read from gm + 7. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GMSG_OFFSET_CAPTURE=47 6c 6f 62 61 6c"),
+        "Expected O3 named-length formatted hex read from g_message + 7. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GM_DYN_OFFSET_FMT=Global"),
+        "Expected O3 dynamic formatted string read from gm + dyn offset. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GM_DYN_OFFSET_HEX=47 6c 6f 62 61 6c"),
+        "Expected O3 dynamic formatted hex read from gm + dyn offset. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GMSG_DYN_OFFSET_FMT=Global"),
+        "Expected O3 dynamic formatted string read from g_message + dyn offset. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GMSG_DYN_OFFSET_HEX=47 6c 6f 62 61 6c"),
+        "Expected O3 dynamic formatted hex read from g_message + dyn offset. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GMSG_DYN_COMMUTED=Global"),
+        "Expected O3 commuted dynamic pointer arithmetic over g_message. STDOUT: {stdout}"
+    );
+    let gy_re = Regex::new(r"O3_GY:([0-9]+(?:\.[0-9]+)?)").unwrap();
+    let gy_values = gy_re
+        .captures_iter(&stdout)
+        .map(|caps| caps[1].parse::<f64>())
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        gy_values.len() >= 2,
+        "Expected repeated O3 executable global double member reads. STDOUT: {stdout}"
+    );
+    assert!(
+        (gy_values[1] - gy_values[0] - 0.5).abs() < f64::EPSILON,
+        "Expected O3 executable global double member to advance by 0.5 per tick. Values: {gy_values:?}. STDOUT: {stdout}"
+    );
+    let ly_re = Regex::new(r"O3_LIBY:([0-9]+(?:\.[0-9]+)?)").unwrap();
+    let ly_values = ly_re
+        .captures_iter(&stdout)
+        .map(|caps| caps[1].parse::<f64>())
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        ly_values.len() >= 2,
+        "Expected repeated O3 library global double member reads. STDOUT: {stdout}"
+    );
+    assert!(
+        (ly_values[1] - ly_values[0] - 1.25).abs() < f64::EPSILON,
+        "Expected O3 library global double member to advance by 1.25 per tick. Values: {ly_values:?}. STDOUT: {stdout}"
+    );
+    let gx_re = Regex::new(r"O3_GX_CALC:(-?[0-9]+):(-?[0-9]+)").unwrap();
+    assert!(
+        gx_re.captures_iter(&stdout).any(|caps| {
+            let base = caps[1].parse::<i64>().unwrap_or(i64::MIN);
+            let calc = caps[2].parse::<i64>().unwrap_or(i64::MAX);
+            calc == base + 2
+        }),
+        "Expected O3 global alias member arithmetic. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_SLOT_CALC:20:17"),
+        "Expected O3 top-level global struct-array member arithmetic. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYN_SLOT:1:20"),
+        "Expected O3 dynamic global struct-array member access. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYN_SLOT_DIV:2"),
+        "Expected O3 dynamic global struct-array member division. STDOUT: {stdout}"
+    );
+    let garr_re = Regex::new(r"O3_GARR1_CALC:(-?[0-9]+):(-?[0-9]+)").unwrap();
+    assert!(
+        garr_re.captures_iter(&stdout).any(|caps| {
+            let base = caps[1].parse::<i64>().unwrap_or(i64::MIN);
+            let calc = caps[2].parse::<i64>().unwrap_or(i64::MAX);
+            calc == base - 1
+        }),
+        "Expected O3 global array member arithmetic. STDOUT: {stdout}"
+    );
+    let dyn_garr_re = Regex::new(r"O3_DYN_GARR IDX=([0-9]+) VAL=(-?[0-9]+)").unwrap();
+    let dyn_garr_div_re = Regex::new(r"O3_DYN_GARR_DIV:(-?[0-9]+)").unwrap();
+    let dyn_garr_values: Vec<(i64, i64)> = dyn_garr_re
+        .captures_iter(&stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<Result<Vec<_>, anyhow::Error>>()?;
+    let dyn_garr_div_values = dyn_garr_div_re
+        .captures_iter(&stdout)
+        .map(|caps| caps[1].parse::<i64>())
+        .collect::<Result<Vec<_>, _>>()?;
+    anyhow::ensure!(
+        dyn_garr_values
+            .iter()
+            .zip(dyn_garr_div_values.iter())
+            .any(|(&(idx, val), &div)| (0..=3).contains(&idx) && div == val),
+        "Expected O3 dynamic global array index/division samples. Values={dyn_garr_values:?} Divs={dyn_garr_div_values:?} STDOUT: {stdout}"
+    );
+    let ptr_alias_re = Regex::new(r"O3_PTR_ALIAS:(-?[0-9]+):(-?[0-9]+):(-?[0-9]+)").unwrap();
+    let ptr_alias_samples: Vec<(i64, i64, i64)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let caps = ptr_alias_re.captures(line)?;
+            Some((
+                caps.get(1)?.as_str().parse::<i64>().ok()?,
+                caps.get(2)?.as_str().parse::<i64>().ok()?,
+                caps.get(3)?.as_str().parse::<i64>().ok()?,
+            ))
+        })
+        .collect();
+    anyhow::ensure!(
+        !ptr_alias_samples.is_empty(),
+        "Missing O3 pointer-alias samples. STDOUT: {stdout}"
+    );
+    let ptr_alias_div_re =
+        Regex::new(r"O3_PTR_ALIAS_DIV:(-?[0-9]+):(-?[0-9]+):(-?[0-9]+)").unwrap();
+    let ptr_alias_div_samples: Vec<(i64, i64, i64)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let caps = ptr_alias_div_re.captures(line)?;
+            Some((
+                caps.get(1)?.as_str().parse::<i64>().ok()?,
+                caps.get(2)?.as_str().parse::<i64>().ok()?,
+                caps.get(3)?.as_str().parse::<i64>().ok()?,
+            ))
+        })
+        .collect();
+    anyhow::ensure!(
+        !ptr_alias_div_samples.is_empty(),
+        "Missing O3 pointer-alias division samples. STDOUT: {stdout}"
+    );
+    assert!(
+        ptr_alias_samples
+            .iter()
+            .zip(ptr_alias_div_samples.iter())
+            .any(|(&(internal, bss, lib_internal), &(internal_div, bss_div, lib_div))| {
+                internal_div == internal / 3 && bss_div == bss / 3 && lib_div == lib_internal / 5
+            }),
+        "Expected O3 pointer-alias division to match runtime values. Alias={ptr_alias_samples:?} AliasDiv={ptr_alias_div_samples:?} STDOUT: {stdout}"
+    );
+    let global_div_re =
+        Regex::new(r"O3_GLOBAL_DIV:(-?[0-9]+):(-?[0-9]+):(-?[0-9]+):(-?[0-9]+)").unwrap();
+    assert!(
+        global_div_re.captures_iter(&stdout).any(|caps| {
+            let g_counter = caps[1].parse::<i64>().unwrap_or(i64::MIN);
+            let g_counter_div = caps[2].parse::<i64>().unwrap_or(i64::MAX);
+            let state_counter = caps[3].parse::<i64>().unwrap_or(i64::MIN);
+            let state_counter_div = caps[4].parse::<i64>().unwrap_or(i64::MAX);
+            g_counter_div == g_counter / 2 && state_counter_div == state_counter / 2
+        }),
+        "Expected O3 global division to match runtime counter values. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_GLOBAL_SIGNED_DIV:-44:-11"),
+        "Expected O3 global signed division over negative computed value. STDOUT: {stdout}"
+    );
+    for marker in [
+        "O3_PTR_ALIAS_INTERNAL_DIV_OK",
+        "O3_PTR_ALIAS_BSS_DIV_OK",
+        "O3_PTR_ALIAS_LIB_DIV_OK",
+        "O3_GCOUNTER_DIV_OK",
+        "O3_GARR1_DIV_OK",
+        "O3_DYN_SLOT_OK",
+        "O3_DYN_SLOT_DIV_OK",
+        "O3_DYN_GARR_DIV_OK",
+        "O3_SLOT_SIGNED_DIV_OK",
+    ] {
+        assert!(
+            stdout.contains(marker),
+            "Expected O3 global division marker {marker}. STDOUT: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("GM_OFFSET_HEX_OK"),
+        "Expected GM_OFFSET_HEX_OK. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GM_OFFSET_STR_OK"),
+        "Expected GM_OFFSET_STR_OK. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GMSG_OFFSET_HEX_OK"),
+        "Expected GMSG_OFFSET_HEX_OK. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GM_DYN_HEX_OK"),
+        "Expected GM_DYN_HEX_OK. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GMSG_DYN_STR_OK"),
+        "Expected GMSG_DYN_STR_OK. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GM_DYN_NEG_LEN_OK"),
+        "Expected dynamic negative strncmp length to clamp to zero. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("GM_DYN_LONG_LEN_OK"),
+        "Expected dynamic long strncmp length to clamp safely. STDOUT: {stdout}"
     );
     Ok(())
 }

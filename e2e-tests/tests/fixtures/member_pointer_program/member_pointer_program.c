@@ -64,7 +64,7 @@ __attribute__((noinline)) static void trace_member_pointer(int iter) {
     body_buf[0] = (iter & 1) ? 0x00 : 0x01;
     header_key_buf[0] = 'X';
 
-    /* Keep r, h, h.key.data, and r.header_in.pos live at this PC. */
+    asm volatile("" : : "r"(request_line_buf), "r"(header_key_buf), "r"(header_value_buf), "r"(body_buf) : "memory");
     volatile uintptr_t sink =
         (uintptr_t)r->request_line.data + (uintptr_t)h->key.data +
         (uintptr_t)r->header_in.pos + (uintptr_t)h->value.data;
