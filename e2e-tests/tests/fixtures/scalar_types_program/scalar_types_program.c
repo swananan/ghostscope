@@ -140,6 +140,18 @@ __attribute__((noinline)) static void scalar_stack_by_value(
     asm volatile("" ::: "memory");
 }
 
+__attribute__((noinline)) static void scalar_format_anchor(
+    volatile uint8_t *bufp,
+    volatile char *textp,
+    volatile int *lenp)
+{
+    uintptr_t mix = (uintptr_t)bufp;
+    mix ^= (uintptr_t)textp;
+    mix ^= (uintptr_t)lenp;
+    scalar_sink ^= mix;
+    asm volatile("" ::: "memory");
+}
+
 __attribute__((noinline)) static void scalar_probe(int iter)
 {
     volatile int8_t i8_neg = (int8_t)-5;
@@ -168,6 +180,15 @@ __attribute__((noinline)) static void scalar_probe(int iter)
     volatile float f32_neg_zero = -0.0f;
     volatile double f64_inf = __builtin_huge_val();
     volatile double f64_nan = __builtin_nan("");
+    static volatile uint8_t byte_pattern[16] = {
+        0xde, 0xad, 0xbe, 0xef, 0x00, 0x41, 0x7f, 0x80,
+        0x10, 0x20, 0x30, 0x40, 0xaa, 0xbb, 0xcc, 0xdd,
+    };
+    static volatile char text_pattern[16] = {
+        'H', 'e', 'l', 'l', 'o', 0x01, 'Z', 0,
+        'x', 'y', 'z', 0, 0, 0, 0, 0,
+    };
+    volatile int format_len = 5;
 
     scalar_anchor(
         &i8_neg,
@@ -227,6 +248,11 @@ __attribute__((noinline)) static void scalar_probe(int iter)
         u8_big,
         i32_neg,
         u64_big);
+
+    scalar_format_anchor(
+        byte_pattern,
+        text_pattern,
+        &format_len);
 }
 
 int main(void)

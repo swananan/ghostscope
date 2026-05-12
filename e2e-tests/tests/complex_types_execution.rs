@@ -75,6 +75,335 @@ trace update_complex {
 }
 
 #[tokio::test]
+async fn test_complex_o3_pointer_members_after_volatile_path() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::O3)?;
+    let target = spawn_complex_types_binary(&binary_path).await?;
+
+    let script = r#"
+trace complex_types_program.c:15 {
+    print "O3_COMPLEX I={} AGE={} DATA={} ACTIVE={} FLAGS={}", i, c.age, c.data.i, c.active, c.flags;
+    print "O3_COMPLEX_ARITH AGE1={} DATA2={} FLAGS1={}", c.age - 0x1, c.data.i + 0b10, c.flags + -0x1;
+    print "O3_COMPLEX_DIV AGE={} DATA={} FLAGS={}", c.age / 0x3, c.data.i / 0x2, c.flags / 0x2;
+    print "O3_FRIEND_MEMBERS AGE={} DATA={} FLAGS={}", c.friend_ref.age, c.friend_ref.data.i, c.friend_ref.flags;
+    print "O3_FRIEND_DIV AGE={} DATA={} FLAGS={}", c.friend_ref.age / 0x5, c.friend_ref.data.i / (i + 0x1), c.friend_ref.flags / -0x2;
+    let dyn_idx = i - (i / 0x8) * 0x8;
+    let dyn_zero = i - i;
+    let c_dyn = c + dyn_zero;
+    print "O3_DYNAMIC_ARR IDX={} VAL={}", dyn_idx, c.arr[dyn_idx];
+    print "O3_DYNAMIC_ARR_DIV:{}", c.arr[dyn_idx] / 0x2;
+    print "O3_C_DYN AGE={} DATA={} FLAGS={} ARR={}", c_dyn.age, c_dyn.data.i, c_dyn.flags, c_dyn.arr[dyn_idx];
+    print "O3_C_DYN_FRIEND DATA={} FLAGS={}", c_dyn.friend_ref.data.i, c_dyn.friend_ref.flags;
+    print "O3_NAME={:s.5}", &c.name[0];
+    print "O3_FRIEND={:p}", c.friend_ref;
+    if c.flags < 0 { print "O3_FLAGS_NEG"; }
+    if c.flags == -0x4 { print "O3_FLAGS_EQ_NEG4"; }
+    if c.flags / 0x2 == -0x2 { print "O3_FLAGS_DIV_NEG2"; }
+    if c.data.i / 0x2 >= 0 { print "O3_DATA_DIV_NONNEG"; }
+    if c.friend_ref.data.i == i { print "O3_FRIEND_DATA_EQ_I"; }
+    if c.friend_ref.flags / -0x2 >= -0x1 { print "O3_FRIEND_FLAGS_DIV_RANGE"; }
+    if c.arr[dyn_idx] / 0x2 == i { print "O3_DYNAMIC_ARR_DIV_OK"; }
+    if c_dyn.data.i == i { print "O3_C_DYN_DATA_EQ_I"; }
+    if c_dyn.arr[dyn_idx] / 0x2 == i { print "O3_C_DYN_ARR_OK"; }
+    if c_dyn.friend_ref.data.i == i { print "O3_C_DYN_FRIEND_DATA_EQ_I"; }
+    if c.active == 1 { print "O3_ACTIVE_ONE"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    use regex::Regex;
+    let re = Regex::new(
+        r"O3_COMPLEX I=([0-9]+)\s+AGE=([0-9]+)\s+DATA=(-?[0-9]+)\s+ACTIVE=([0-9]+)\s+FLAGS=(-?[0-9]+)",
+    )
+    .unwrap();
+    let samples: Vec<(u64, u64, i64, u64, i64)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let caps = re.captures(line)?;
+            Some((
+                caps.get(1)?.as_str().parse::<u64>().ok()?,
+                caps.get(2)?.as_str().parse::<u64>().ok()?,
+                caps.get(3)?.as_str().parse::<i64>().ok()?,
+                caps.get(4)?.as_str().parse::<u64>().ok()?,
+                caps.get(5)?.as_str().parse::<i64>().ok()?,
+            ))
+        })
+        .collect();
+    anyhow::ensure!(
+        !samples.is_empty(),
+        "Missing O3 complex member samples. STDOUT: {stdout}"
+    );
+
+    let saw_consistent_sample =
+        samples
+            .iter()
+            .any(|&(i_val, _age_val, data_val, active_val, flags_val)| {
+                let raw3 = (i_val & 7) as i64;
+                let expected_flags = if raw3 >= 4 { raw3 - 8 } else { raw3 };
+                data_val == i_val as i64 && active_val == (i_val & 1) && flags_val == expected_flags
+            });
+    assert!(
+        saw_consistent_sample,
+        "Expected a consistent O3 bitfield/data sample. Samples={samples:?} STDOUT: {stdout}"
+    );
+    let arith_re =
+        Regex::new(r"O3_COMPLEX_ARITH AGE1=(-?[0-9]+)\s+DATA2=(-?[0-9]+)\s+FLAGS1=(-?[0-9]+)")
+            .unwrap();
+    let arith_samples: Vec<(i64, i64, i64)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let caps = arith_re.captures(line)?;
+            Some((
+                caps.get(1)?.as_str().parse::<i64>().ok()?,
+                caps.get(2)?.as_str().parse::<i64>().ok()?,
+                caps.get(3)?.as_str().parse::<i64>().ok()?,
+            ))
+        })
+        .collect();
+    anyhow::ensure!(
+        !arith_samples.is_empty(),
+        "Missing O3 complex arithmetic samples. STDOUT: {stdout}"
+    );
+    let saw_consistent_arithmetic = samples.iter().zip(arith_samples.iter()).any(
+        |(
+            &(_i_val, age_val, data_val, _active_val, flags_val),
+            &(age_minus, data_plus, flags_minus),
+        )| {
+            age_minus == age_val as i64 - 1
+                && data_plus == data_val + 2
+                && flags_minus == flags_val - 1
+        },
+    );
+    assert!(
+        saw_consistent_arithmetic,
+        "Expected O3 member arithmetic to match printed member values. Samples={samples:?} Arith={arith_samples:?} STDOUT: {stdout}"
+    );
+    let div_re =
+        Regex::new(r"O3_COMPLEX_DIV AGE=(-?[0-9]+)\s+DATA=(-?[0-9]+)\s+FLAGS=(-?[0-9]+)").unwrap();
+    let div_samples: Vec<(i64, i64, i64)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let caps = div_re.captures(line)?;
+            Some((
+                caps.get(1)?.as_str().parse::<i64>().ok()?,
+                caps.get(2)?.as_str().parse::<i64>().ok()?,
+                caps.get(3)?.as_str().parse::<i64>().ok()?,
+            ))
+        })
+        .collect();
+    anyhow::ensure!(
+        !div_samples.is_empty(),
+        "Missing O3 complex division samples. STDOUT: {stdout}"
+    );
+    let saw_consistent_division = samples.iter().zip(div_samples.iter()).any(
+        |(
+            &(_i_val, age_val, data_val, _active_val, flags_val),
+            &(age_div, data_div, flags_div),
+        )| {
+            age_div == age_val as i64 / 3 && data_div == data_val / 2 && flags_div == flags_val / 2
+        },
+    );
+    assert!(
+        saw_consistent_division,
+        "Expected O3 member and bitfield division to match printed member values. Samples={samples:?} Div={div_samples:?} STDOUT: {stdout}"
+    );
+    let friend_re =
+        Regex::new(r"O3_FRIEND_MEMBERS AGE=([0-9]+)\s+DATA=(-?[0-9]+)\s+FLAGS=(-?[0-9]+)").unwrap();
+    let friend_samples: Vec<(u64, i64, i64)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let caps = friend_re.captures(line)?;
+            Some((
+                caps.get(1)?.as_str().parse::<u64>().ok()?,
+                caps.get(2)?.as_str().parse::<i64>().ok()?,
+                caps.get(3)?.as_str().parse::<i64>().ok()?,
+            ))
+        })
+        .collect();
+    anyhow::ensure!(
+        !friend_samples.is_empty(),
+        "Missing O3 friend member samples. STDOUT: {stdout}"
+    );
+    let saw_consistent_friend = samples.iter().zip(friend_samples.iter()).any(
+        |(
+            &(i_val, _age_val, _data_val, _active_val, _flags_val),
+            &(_friend_age, friend_data, friend_flags),
+        )| {
+            let raw3 = (i_val & 7) as i64;
+            let expected_flags = if raw3 >= 4 { raw3 - 8 } else { raw3 };
+            friend_data == i_val as i64 && friend_flags == expected_flags
+        },
+    );
+    assert!(
+        saw_consistent_friend,
+        "Expected O3 friend member chain to match loop state. Samples={samples:?} Friend={friend_samples:?} STDOUT: {stdout}"
+    );
+    let friend_div_re =
+        Regex::new(r"O3_FRIEND_DIV AGE=(-?[0-9]+)\s+DATA=(-?[0-9]+)\s+FLAGS=(-?[0-9]+)").unwrap();
+    let friend_div_samples: Vec<(i64, i64, i64)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let caps = friend_div_re.captures(line)?;
+            Some((
+                caps.get(1)?.as_str().parse::<i64>().ok()?,
+                caps.get(2)?.as_str().parse::<i64>().ok()?,
+                caps.get(3)?.as_str().parse::<i64>().ok()?,
+            ))
+        })
+        .collect();
+    anyhow::ensure!(
+        !friend_div_samples.is_empty(),
+        "Missing O3 friend division samples. STDOUT: {stdout}"
+    );
+    let saw_consistent_friend_division = samples
+        .iter()
+        .zip(friend_samples.iter())
+        .zip(friend_div_samples.iter())
+        .any(
+            |(
+                (
+                    &(i_val, _age_val, _data_val, _active_val, _flags_val),
+                    &(friend_age, friend_data, friend_flags),
+                ),
+                &(friend_age_div, friend_data_div, friend_flags_div),
+            )| {
+                friend_age_div == friend_age as i64 / 5
+                    && friend_data_div == friend_data / (i_val as i64 + 1)
+                    && friend_flags_div == friend_flags / -2
+            },
+        );
+    assert!(
+        saw_consistent_friend_division,
+        "Expected O3 friend member division to match printed friend values. Samples={samples:?} Friend={friend_samples:?} FriendDiv={friend_div_samples:?} STDOUT: {stdout}"
+    );
+    let dynamic_arr_re = Regex::new(r"O3_DYNAMIC_ARR IDX=([0-9]+)\s+VAL=(-?[0-9]+)").unwrap();
+    let dynamic_arr_samples: Vec<(u64, i64)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let caps = dynamic_arr_re.captures(line)?;
+            Some((
+                caps.get(1)?.as_str().parse::<u64>().ok()?,
+                caps.get(2)?.as_str().parse::<i64>().ok()?,
+            ))
+        })
+        .collect();
+    anyhow::ensure!(
+        !dynamic_arr_samples.is_empty(),
+        "Missing O3 dynamic array-index samples. STDOUT: {stdout}"
+    );
+    let dynamic_arr_div_re = Regex::new(r"O3_DYNAMIC_ARR_DIV:([0-9-]+)").unwrap();
+    let dynamic_arr_div_samples: Vec<i64> = dynamic_arr_div_re
+        .captures_iter(&stdout)
+        .map(|caps| caps[1].parse::<i64>())
+        .collect::<Result<Vec<_>, _>>()?;
+    anyhow::ensure!(
+        !dynamic_arr_div_samples.is_empty(),
+        "Missing O3 dynamic array-index division samples. STDOUT: {stdout}"
+    );
+    let saw_consistent_dynamic_arr = samples
+        .iter()
+        .zip(dynamic_arr_samples.iter())
+        .zip(dynamic_arr_div_samples.iter())
+        .any(
+            |(
+                (&(i_val, _age_val, _data_val, _active_val, _flags_val), &(idx, arr_val)),
+                &arr_div,
+            )| {
+                idx == (i_val & 7) && arr_val == (i_val as i64) * 2 && arr_div == i_val as i64
+            },
+        );
+    assert!(
+        saw_consistent_dynamic_arr,
+        "Expected O3 dynamic array index to match loop state. Samples={samples:?} DynamicArr={dynamic_arr_samples:?} DynamicArrDiv={dynamic_arr_div_samples:?} STDOUT: {stdout}"
+    );
+    for marker in [
+        "O3_FLAGS_NEG",
+        "O3_FLAGS_EQ_NEG4",
+        "O3_FLAGS_DIV_NEG2",
+        "O3_DATA_DIV_NONNEG",
+        "O3_FRIEND_DATA_EQ_I",
+        "O3_FRIEND_FLAGS_DIV_RANGE",
+        "O3_DYNAMIC_ARR_DIV_OK",
+        "O3_C_DYN_DATA_EQ_I",
+        "O3_C_DYN_ARR_OK",
+        "O3_C_DYN_FRIEND_DATA_EQ_I",
+        "O3_ACTIVE_ONE",
+    ] {
+        assert!(
+            stdout.contains(marker),
+            "Expected O3 bitfield comparison marker {marker}. STDOUT: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("O3_NAME=Alice") || stdout.contains("O3_NAME=Bob"),
+        "Expected optimized char array name formatting. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_FRIEND=0x"),
+        "Expected optimized friend_ref pointer formatting. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_complex_o3_memcmp_array_decay_and_base_lengths() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::O3)?;
+    let target = spawn_complex_types_binary(&binary_path).await?;
+
+    let script = r#"
+trace complex_types_program.c:15 {
+    if memcmp(&c.name[0], &c.name[0], 0x3) { print "O3_NAME_SELF_EQ"; }
+    if memcmp(c.arr, c.arr, 0b100) { print "O3_ARR_SELF_EQ"; }
+    let n = 3;
+    print "O3_NAME_HEX={:x.0x3}", &c.name[0];
+    print "O3_NAME_ASCII={:s.n$}", &c.name[0];
+    print "O3_ARR_HEX={:x.0x8}", c.arr;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    assert!(
+        stdout.contains("O3_NAME_SELF_EQ"),
+        "Expected optimized self memcmp for c.name. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_ARR_SELF_EQ"),
+        "Expected optimized array-decay memcmp for c.arr. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NAME_HEX=41 6c 69") || stdout.contains("O3_NAME_HEX=42 6f 62"),
+        "Expected optimized base-prefixed hex name bytes. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NAME_ASCII=Ali") || stdout.contains("O3_NAME_ASCII=Bob"),
+        "Expected optimized named-length ASCII formatting. STDOUT: {stdout}"
+    );
+
+    use regex::Regex;
+    let re_arr_hex = Regex::new(r"O3_ARR_HEX=(?:[0-9a-f]{2}\s+){7}[0-9a-f]{2}").unwrap();
+    assert!(
+        stdout.lines().any(|line| re_arr_hex.is_match(line)),
+        "Expected optimized array raw hex bytes. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_entry_prints() -> anyhow::Result<()> {
     init();
 

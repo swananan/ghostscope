@@ -210,6 +210,7 @@ async fn test_struct_pointer_addition_scales_by_type_size() -> anyhow::Result<()
 trace print_record {
     print record + 1;
     print record + 2;
+    print (record + 0x1) + 0b1;
 }
 "#;
 
@@ -228,6 +229,7 @@ trace print_record {
     // Gather addresses from failure lines for (record+1) and (record+2)
     let mut addr1: Option<u64> = None;
     let mut addr2: Option<u64> = None;
+    let mut addr_chain: Option<u64> = None;
     for line in stdout.lines() {
         let t = line.trim();
         if t.starts_with("(record+1) = ") || t.starts_with("(record + 1) = ") {
@@ -258,6 +260,24 @@ trace print_record {
                 }
             }
         }
+        if t.starts_with("((record+1)+1) = ")
+            || t.starts_with("((record + 1) + 1) = ")
+            || t.starts_with("((record+0x1)+0b1) = ")
+            || t.starts_with("((record + 0x1) + 0b1) = ")
+        {
+            if let Some(ix) = t.rfind("0x") {
+                let mut j = ix + 2;
+                let bytes = t.as_bytes();
+                while j < t.len() && bytes[j].is_ascii_hexdigit() {
+                    j += 1;
+                }
+                if j > ix + 2 {
+                    if let Ok(v) = u64::from_str_radix(&t[ix + 2..j], 16) {
+                        addr_chain = Some(v);
+                    }
+                }
+            }
+        }
     }
 
     if let (Some(a1), Some(a2)) = (addr1, addr2) {
@@ -266,6 +286,13 @@ trace print_record {
         assert_eq!(
             delta, 48,
             "expected address delta sizeof(DataRecord)=48 bytes (got {delta}).\nSTDOUT: {stdout}\nSTDERR: {stderr}"
+        );
+        let chain = addr_chain.ok_or_else(|| {
+            anyhow::anyhow!("missing nested record pointer address. STDOUT: {stdout}")
+        })?;
+        assert_eq!(
+            chain, a2,
+            "expected nested record pointer addition to equal record+2.\nSTDOUT: {stdout}\nSTDERR: {stderr}"
         );
     } else {
         // If we didn't observe failure lines with addresses, we cannot assert safely here.
@@ -927,6 +954,579 @@ trace nonexistent_function_12345 {
     } else {
         println!("⚠️  Expected 'No uprobe configurations' error, got: {stderr}");
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_o3_cross_object_register_args_and_string_pointer_formatting() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let opt_level = OptimizationLevel::O3;
+    let _ = get_global_test_pid_with_opt(opt_level).await?;
+
+    let script_content = r#"
+trace add_numbers {
+    print "O3_ADD:{}:{}:{}", a, b, a + b;
+    print "O3_DIV_DYNAMIC:{}:{}:{}", a, b, b / a;
+    if b == a * 2 { print "O3_ADD_OK"; }
+    if b / (b - a) >= 0x1 { print "O3_DIV_DYNAMIC_OK"; }
+}
+
+trace get_string_length {
+    let dyn_offset = 0xb + ($pid - $pid);
+    let dyn_prefix = ($pid - $pid) + str;
+    let dyn_tail = str + dyn_offset;
+    print "O3_STR={:s.0x9}", str;
+    print "O3_STR_DYN_PREFIX={:s.0x9}", dyn_prefix;
+    print "O3_STR_DYN_TAIL={:s.0x5}", dyn_tail;
+    if strncmp(str, "Iteration", 0x9) { print "O3_STR_OK"; }
+    if strncmp(str + 11, "value", 5) { print "O3_STR_OFFSET_OK"; }
+    if strncmp(dyn_prefix, "Iteration", 0b1001) { print "O3_STR_DYN_PREFIX_OK"; }
+    if strncmp(dyn_tail, "value", 0x5) { print "O3_STR_DYN_TAIL_OK"; }
+    if strncmp(dyn_offset + str, "value", 0o5) { print "O3_STR_DYN_COMMUTE_OK"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_opt(script_content, 4, opt_level).await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    assert!(
+        stdout.contains("O3_ADD_OK"),
+        "Expected O3 cross-object register argument comparison. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DIV_DYNAMIC_OK"),
+        "Expected O3 dynamic division marker. STDOUT: {stdout}"
+    );
+    let mut div_samples = 0;
+    for line in stdout.lines() {
+        let Some(sample) = line.trim().strip_prefix("O3_DIV_DYNAMIC:") else {
+            continue;
+        };
+        let fields: Vec<_> = sample.split(':').collect();
+        if fields.len() != 3 {
+            continue;
+        }
+        let a: i64 = fields[0].parse()?;
+        let b: i64 = fields[1].parse()?;
+        let quotient: i64 = fields[2].parse()?;
+        assert_ne!(a, 0, "STDOUT: {stdout}");
+        assert_eq!(quotient, b / a, "STDOUT: {stdout}");
+        div_samples += 1;
+    }
+    assert!(
+        div_samples >= 1,
+        "Expected O3 dynamic division samples. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_STR=Iteration"),
+        "Expected O3 string pointer formatting with hex static length. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_STR_DYN_PREFIX=Iteration"),
+        "Expected O3 dynamic string pointer alias formatting at prefix. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_STR_DYN_TAIL=value"),
+        "Expected O3 dynamic string pointer alias formatting at tail. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_STR_OK"),
+        "Expected O3 strncmp with hex static length. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_STR_OFFSET_OK"),
+        "Expected O3 strncmp on typed string pointer arithmetic. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_STR_DYN_PREFIX_OK")
+            && stdout.contains("O3_STR_DYN_TAIL_OK")
+            && stdout.contains("O3_STR_DYN_COMMUTE_OK"),
+        "Expected O3 dynamic string pointer alias strncmp markers. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_o3_guarded_dynamic_division_short_circuits_zero_denominator() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let opt_level = OptimizationLevel::O3;
+    let _ = get_global_test_pid_with_opt(opt_level).await?;
+
+    let script_content = r#"
+trace calculate_something {
+    let denom = b - a - 0x5;
+    if denom == 0 || a / denom > 0 { print "O3_DIV_GUARD_OR_OK"; }
+    if denom != 0 && a / denom > 0 { print "O3_DIV_GUARD_AND_BAD"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_opt(script_content, 4, opt_level).await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    assert!(
+        stdout.contains("O3_DIV_GUARD_OR_OK"),
+        "Expected short-circuit OR guard marker. STDOUT: {stdout}"
+    );
+    assert!(
+        !stdout.contains("O3_DIV_GUARD_AND_BAD"),
+        "AND guard should not execute division branch while denom is zero. STDOUT: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Guarded dynamic division should not emit ExprError. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_o3_local_int_array_decay_pointer_addition_and_memcmp() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let opt_level = OptimizationLevel::O3;
+    let _ = get_global_test_pid_with_opt(opt_level).await?;
+
+    let script_content = r#"
+trace sample_program.c:73 {
+    let p = numbers + 0x1;
+    let q = p;
+    let r = p - 0b1;
+    let s = p + -0x1;
+    let t = -0x1 + p;
+    let u = p - -0x1;
+    let byte_back = &numbers[0b10] + -0x4;
+    let byte_forward = &numbers[0x1] - -0x4;
+    let dyn_arr_idx = numbers[0x0] / 0xa;
+    let dyn_ptr_idx = (numbers[0b10] / numbers[0x0]) - 0b10;
+    let dyn_ptr = numbers + dyn_arr_idx;
+    let dyn_alias = p + dyn_ptr_idx;
+    let dyn_byte_off = dyn_arr_idx * 0x4;
+    let dyn_raw_addr = &numbers[0x0] + dyn_byte_off;
+    let dyn_raw_back = &numbers[0b10] - dyn_byte_off;
+    print "O3_NUM1:{}", numbers + 1;
+    print "O3_NUM2:{}", (numbers + 0x1) + 0b1;
+    print "O3_ALIAS_NUM2:{}", p + 0b1;
+    print "O3_MIXED_NUM2:{}", (numbers + 0x3) - 0b1;
+    print "O3_ALIAS_CHAIN_NUM2:{}", q + 0b1;
+    print "O3_INDEX_NUM2:{}", numbers[0b10];
+    print "O3_ALIAS_INDEX_NUM2:{}", p[0b1];
+    print "O3_ALIAS_CHAIN_INDEX_NUM2:{}", q[0b1];
+    print "O3_NEG_INDEX0:{}", p[-0x1];
+    print "O3_CONST_EXPR_INDEX_NUM2:{}", p[0x2 - 0b1];
+    print "O3_CONST_EXPR_CHAIN_INDEX_NUM2:{}", q[-0x1 + 0b10];
+    print "O3_DYNAMIC_INDEX:{}:{}:{}", dyn_arr_idx, numbers[dyn_arr_idx], p[dyn_ptr_idx];
+    print "O3_DYNAMIC_INDEX_CHAIN:{}:{}", q[dyn_ptr_idx], p[dyn_ptr_idx - 0x1];
+    print "O3_DYNAMIC_ALIAS_VALUE:{}:{}", dyn_ptr[0x1], dyn_ptr[dyn_arr_idx];
+    print "O3_DEREF_ALIAS1:{}", *p;
+    print "O3_DEREF_ALIAS_CHAIN2:{}", *(q + 0b1);
+    print "O3_NUM_DIV:{}:{}:{}", numbers[0b10] / numbers[0x0], p[0b1] / *p, *(q + 0b1) / (p[-0x1] + 0x5);
+    print "O3_DYNAMIC_INDEX_DIV:{}:{}", numbers[dyn_arr_idx + 0x1] / numbers[dyn_arr_idx], q[dyn_ptr_idx] / p[dyn_ptr_idx - 0x1];
+    print "O3_REBASED_NUM2:{}", r + 0x2;
+    print "O3_REBASED_INDEX2:{}", r[0x2];
+    print "O3_REBASED_DEREF2:{}", *(r + 0x2);
+    print "O3_NEGADD_NUM2:{}", s + 0b10;
+    print "O3_NEGADD_INDEX2:{}", s[0b10];
+    print "O3_LEFT_NEGADD_NUM2:{}", t + 0b10;
+    print "O3_SUB_NEG_NUM2:{}", u + 0x0;
+    print "O3_NUM_HEX={:x.0x8}", numbers;
+    print "O3_NUM_CHAIN_HEX={:x.0x4}", (numbers + 0x1) + 0b1;
+    print "O3_ALIAS_CHAIN_HEX={:x.0x4}", p + 0b1;
+    print "O3_MIXED_CHAIN_HEX={:x.0o4}", (numbers + 0x3) - 0b1;
+    print "O3_ALIAS_ALIAS_CHAIN_HEX={:x.0b100}", q + 0b1;
+    print "O3_DYNAMIC_INDEX_HEX={:x.0x4}", &numbers[dyn_arr_idx];
+    print "O3_DYNAMIC_ALIAS_INDEX_HEX={:x.0b100}", &p[dyn_ptr_idx];
+    print "O3_DYNAMIC_PTRADD_HEX={:x.0x4}", numbers + dyn_arr_idx;
+    print "O3_DYNAMIC_ALIAS_PTRADD_HEX={:x.0b100}", p + dyn_ptr_idx;
+    print "O3_DYNAMIC_ALIAS_DIRECT_HEX={:x.0x4}", dyn_ptr;
+    print "O3_DYNAMIC_ALIAS_INDEX_HEX={:x.0x4}", &dyn_ptr[0x1];
+    print "O3_DYNAMIC_ALIAS_DYN_INDEX_HEX={:x.0b100}", &dyn_ptr[dyn_arr_idx];
+    print "O3_DYNAMIC_ALIAS_PLUS_HEX={:x.0x4}", dyn_ptr + 0x1;
+    print "O3_DYNAMIC_ALIAS_SUB_HEX={:x.0x4}", dyn_alias - dyn_ptr_idx;
+    print "O3_DYNAMIC_ALIAS_COMMUTE_HEX={:x.0x4}", dyn_arr_idx + dyn_ptr;
+    print "O3_DYNAMIC_RAW_ADDR_HEX={:x.0x4}", dyn_raw_addr;
+    print "O3_DYNAMIC_RAW_BACK_HEX={:x.0b100}", dyn_raw_back;
+    print "O3_ADDR_ALIAS_INDEX_HEX={:x.0x4}", &p[0b1];
+    print "O3_ADDR_DEREF_HEX={:x.0b100}", &*(q + 0b1);
+    print "O3_NEGADD_HEX={:x.0x4}", s + 0b10;
+    print "O3_LEFT_NEGADD_HEX={:x.0x4}", t + 0b10;
+    print "O3_SUB_NEG_HEX={:x.0x4}", u + 0x0;
+    print "O3_BYTE_BACK_HEX={:x.0x4}", byte_back;
+    print "O3_BYTE_FORWARD_HEX={:x.0b100}", byte_forward;
+    print "O3_NEG_INDEX_HEX={:x.0x4}", &p[-0x1];
+    print "O3_CONST_EXPR_INDEX_HEX={:x.0o4}", &p[0x2 - 0b1];
+    print "O3_CONST_EXPR_CHAIN_INDEX_HEX={:x.0b100}", &q[-0x1 + 0b10];
+    if memcmp(numbers, hex("0a00000014000000"), 0x8) { print "O3_NUM_MEM_OK"; }
+    if memcmp(numbers + 1, hex("14000000"), 0b100) { print "O3_NUM_PTRADD_OK"; }
+    if memcmp((numbers + 0x1) + 0b1, hex("1e000000"), 0b100) { print "O3_NUM_CHAIN_PTRADD_OK"; }
+    if memcmp(p + 0b1, hex("1e000000"), 0b100) { print "O3_NUM_ALIAS_PTRADD_OK"; }
+    if memcmp((numbers + 0x3) - 0b1, hex("1e000000"), 0o4) { print "O3_NUM_MIXED_PTRADD_OK"; }
+    if memcmp(q + 0b1, hex("1e000000"), 0b100) { print "O3_NUM_ALIAS_CHAIN_PTRADD_OK"; }
+    if memcmp(r + 0x2, hex("1e000000"), 0x4) { print "O3_NUM_REBASED_PTRADD_OK"; }
+    if memcmp(&numbers[dyn_arr_idx], hex("14000000"), 0x4) { print "O3_DYNAMIC_INDEX_ADDR_OK"; }
+    if memcmp(&p[dyn_ptr_idx], hex("1e000000"), 0b100) { print "O3_DYNAMIC_ALIAS_INDEX_ADDR_OK"; }
+    if memcmp(numbers + dyn_arr_idx, hex("14000000"), 0x4) { print "O3_DYNAMIC_PTRADD_OK"; }
+    if memcmp(p + dyn_ptr_idx, hex("1e000000"), 0b100) { print "O3_DYNAMIC_ALIAS_PTRADD_OK"; }
+    if memcmp(dyn_ptr, hex("14000000"), 0x4) { print "O3_DYNAMIC_ALIAS_DIRECT_OK"; }
+    if memcmp(&dyn_ptr[0x1], hex("1e000000"), 0x4) { print "O3_DYNAMIC_ALIAS_INDEX_OK"; }
+    if memcmp(&dyn_ptr[dyn_arr_idx], hex("1e000000"), 0b100) { print "O3_DYNAMIC_ALIAS_DYN_INDEX_OK"; }
+    if memcmp(dyn_ptr + 0x1, hex("1e000000"), 0x4) { print "O3_DYNAMIC_ALIAS_PLUS_OK"; }
+    if memcmp(dyn_alias - dyn_ptr_idx, hex("14000000"), 0x4) { print "O3_DYNAMIC_ALIAS_SUB_OK"; }
+    if memcmp(dyn_arr_idx + dyn_ptr, hex("1e000000"), 0x4) { print "O3_DYNAMIC_ALIAS_COMMUTE_OK"; }
+    if memcmp(dyn_raw_addr, hex("14000000"), 0x4) { print "O3_DYNAMIC_RAW_ADDR_OK"; }
+    if memcmp(dyn_raw_back, hex("14000000"), 0b100) { print "O3_DYNAMIC_RAW_BACK_OK"; }
+    if memcmp(&p[0b1], hex("1e000000"), 0x4) { print "O3_ADDR_ALIAS_INDEX_OK"; }
+    if memcmp(&*(q + 0b1), hex("1e000000"), 0b100) { print "O3_ADDR_DEREF_OK"; }
+    if memcmp(s + 0b10, hex("1e000000"), 0x4) { print "O3_NEGADD_PTRADD_OK"; }
+    if memcmp(t + 0b10, hex("1e000000"), 0x4) { print "O3_LEFT_NEGADD_PTRADD_OK"; }
+    if memcmp(u + 0x0, hex("1e000000"), 0b100) { print "O3_SUB_NEG_PTRADD_OK"; }
+    if memcmp(byte_back, hex("14000000"), 0x4) { print "O3_BYTE_BACK_OK"; }
+    if memcmp(byte_forward, hex("1e000000"), 0b100) { print "O3_BYTE_FORWARD_OK"; }
+    if memcmp(&p[-0x1], hex("0a000000"), 0x4) { print "O3_NEG_INDEX_OK"; }
+    if memcmp(&p[0x2 - 0b1], hex("1e000000"), 0o4) { print "O3_CONST_EXPR_INDEX_OK"; }
+    if memcmp(&q[-0x1 + 0b10], hex("1e000000"), 0b100) { print "O3_CONST_EXPR_CHAIN_INDEX_OK"; }
+    if numbers[0b10] / numbers[0x0] == 0x3 { print "O3_NUM_DIV_INDEX_OK"; }
+    if p[0b1] / *p == 0b1 { print "O3_NUM_DIV_ALIAS_OK"; }
+    if *(q + 0b1) / (p[-0x1] + 0x5) == 0x2 { print "O3_NUM_DIV_MIXED_OK"; }
+    if numbers[dyn_arr_idx] == 0x14 { print "O3_DYNAMIC_INDEX_ARRAY_OK"; }
+    if p[dyn_ptr_idx] == 0x1e { print "O3_DYNAMIC_INDEX_PTR_OK"; }
+    if q[dyn_ptr_idx] / p[dyn_ptr_idx - 0x1] == 0x1 { print "O3_DYNAMIC_INDEX_DIV_OK"; }
+    if dyn_ptr[0x1] == 0x1e && dyn_ptr[dyn_arr_idx] == 0x1e { print "O3_DYNAMIC_ALIAS_VALUE_OK"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_opt(script_content, 4, opt_level).await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    assert!(
+        stdout.contains("O3_NUM1:20") || stdout.contains("O3_NUM1:(numbers+1) = 20"),
+        "Expected O3 pointer addition on int array to read the second element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM2:30") || stdout.contains("O3_NUM2:((numbers+1)+1) = 30"),
+        "Expected nested O3 pointer addition on int array to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_ALIAS_NUM2:30") || stdout.contains("O3_ALIAS_NUM2:(p+1) = 30"),
+        "Expected alias-based nested O3 pointer addition on int array to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_MIXED_NUM2:30")
+            || stdout.contains("O3_MIXED_NUM2:((numbers+3)-1) = 30"),
+        "Expected mixed +/- O3 pointer arithmetic on int array to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_ALIAS_CHAIN_NUM2:30")
+            || stdout.contains("O3_ALIAS_CHAIN_NUM2:(q+1) = 30"),
+        "Expected alias-of-alias O3 pointer arithmetic on int array to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_INDEX_NUM2:30"),
+        "Expected O3 binary array index on int array to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_ALIAS_INDEX_NUM2:30"),
+        "Expected O3 alias pointer array index to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_ALIAS_CHAIN_INDEX_NUM2:30"),
+        "Expected O3 alias-of-alias pointer array index to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NEG_INDEX0:10"),
+        "Expected O3 negative alias pointer array index to read the first element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_CONST_EXPR_INDEX_NUM2:30"),
+        "Expected O3 constant-expression alias pointer index to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_CONST_EXPR_CHAIN_INDEX_NUM2:30"),
+        "Expected O3 constant-expression alias-of-alias index to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_INDEX:1:20:30"),
+        "Expected dynamic array and alias pointer indexes to read second and third elements. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_INDEX_CHAIN:30:20"),
+        "Expected dynamic alias-of-alias pointer index and rebased dynamic index reads. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_ALIAS_VALUE:30:30"),
+        "Expected dynamic pointer alias literal and dynamic indexes to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DEREF_ALIAS1:20"),
+        "Expected O3 alias pointer dereference to read the second element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DEREF_ALIAS_CHAIN2:30"),
+        "Expected O3 alias-of-alias pointer arithmetic dereference to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_DIV:3:1:2"),
+        "Expected O3 local array indexed division results. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_INDEX_DIV:1:1"),
+        "Expected dynamic local array and alias pointer division results. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_REBASED_NUM2:30") || stdout.contains("O3_REBASED_NUM2:(r+2) = 30"),
+        "Expected O3 rebased subtraction alias pointer addition to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_REBASED_INDEX2:30"),
+        "Expected O3 rebased subtraction alias array index to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_REBASED_DEREF2:30"),
+        "Expected O3 rebased subtraction alias dereference to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NEGADD_NUM2:30") || stdout.contains("O3_NEGADD_NUM2:(s+2) = 30"),
+        "Expected O3 alias plus negative literal pointer addition to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NEGADD_INDEX2:30"),
+        "Expected O3 alias plus negative literal array index to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_LEFT_NEGADD_NUM2:30")
+            || stdout.contains("O3_LEFT_NEGADD_NUM2:(t+2) = 30"),
+        "Expected O3 negative-left alias pointer addition to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_SUB_NEG_NUM2:30") || stdout.contains("O3_SUB_NEG_NUM2:(u+0) = 30"),
+        "Expected O3 subtract-negative alias pointer arithmetic to read the third element. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_HEX=0a 00 00 00 14 00 00 00"),
+        "Expected O3 local int array hex memdump. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_CHAIN_HEX=1e 00 00 00"),
+        "Expected nested O3 pointer addition memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_ALIAS_CHAIN_HEX=1e 00 00 00"),
+        "Expected alias-based nested O3 pointer addition memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_MIXED_CHAIN_HEX=1e 00 00 00"),
+        "Expected mixed +/- O3 pointer addition memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_ALIAS_ALIAS_CHAIN_HEX=1e 00 00 00"),
+        "Expected alias-of-alias O3 pointer addition memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_INDEX_HEX=14 00 00 00"),
+        "Expected dynamic address-of local array index memdump to start at the second int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_ALIAS_INDEX_HEX=1e 00 00 00"),
+        "Expected dynamic address-of alias pointer index memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_PTRADD_HEX=14 00 00 00"),
+        "Expected dynamic local array pointer addition memdump to start at the second int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_ALIAS_PTRADD_HEX=1e 00 00 00"),
+        "Expected dynamic alias pointer addition memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_ALIAS_DIRECT_HEX=14 00 00 00"),
+        "Expected dynamic pointer alias memdump to start at the second int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_ALIAS_INDEX_HEX=1e 00 00 00"),
+        "Expected dynamic pointer alias literal index memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_ALIAS_DYN_INDEX_HEX=1e 00 00 00"),
+        "Expected dynamic pointer alias dynamic index memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_ALIAS_PLUS_HEX=1e 00 00 00"),
+        "Expected dynamic pointer alias plus literal memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_ALIAS_SUB_HEX=14 00 00 00"),
+        "Expected dynamic pointer alias subtraction memdump to start at the second int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_ALIAS_COMMUTE_HEX=1e 00 00 00"),
+        "Expected dynamic pointer alias commuted addition memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_RAW_ADDR_HEX=14 00 00 00"),
+        "Expected dynamic raw address byte-offset memdump to start at the second int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_RAW_BACK_HEX=14 00 00 00"),
+        "Expected dynamic raw address byte-offset subtraction memdump to start at the second int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_ADDR_ALIAS_INDEX_HEX=1e 00 00 00"),
+        "Expected address-of alias pointer indexing memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_ADDR_DEREF_HEX=1e 00 00 00"),
+        "Expected address-of pointer dereference memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NEGADD_HEX=1e 00 00 00"),
+        "Expected alias plus negative literal memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_LEFT_NEGADD_HEX=1e 00 00 00"),
+        "Expected negative-left alias pointer memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_SUB_NEG_HEX=1e 00 00 00"),
+        "Expected subtract-negative alias pointer memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_BYTE_BACK_HEX=14 00 00 00"),
+        "Expected raw address plus negative byte offset to start at the second int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_BYTE_FORWARD_HEX=1e 00 00 00"),
+        "Expected raw address subtract-negative byte offset to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NEG_INDEX_HEX=0a 00 00 00"),
+        "Expected address-of negative alias pointer index to start at the first int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_CONST_EXPR_INDEX_HEX=1e 00 00 00"),
+        "Expected constant-expression alias pointer index memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_CONST_EXPR_CHAIN_INDEX_HEX=1e 00 00 00"),
+        "Expected constant-expression alias-of-alias index memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_MEM_OK"),
+        "Expected O3 memcmp on local int array decay. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_PTRADD_OK"),
+        "Expected O3 memcmp on scaled int pointer addition. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_CHAIN_PTRADD_OK"),
+        "Expected O3 memcmp on nested scaled int pointer addition. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_ALIAS_PTRADD_OK"),
+        "Expected O3 memcmp on alias-based nested scaled int pointer addition. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_MIXED_PTRADD_OK"),
+        "Expected O3 memcmp on mixed +/- scaled int pointer addition. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_ALIAS_CHAIN_PTRADD_OK"),
+        "Expected O3 memcmp on alias-of-alias scaled int pointer addition. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_REBASED_PTRADD_OK"),
+        "Expected O3 memcmp on rebased subtraction alias pointer addition. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_INDEX_ADDR_OK")
+            && stdout.contains("O3_DYNAMIC_ALIAS_INDEX_ADDR_OK"),
+        "Expected O3 memcmp on dynamic address-of array and alias pointer indexes. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_PTRADD_OK") && stdout.contains("O3_DYNAMIC_ALIAS_PTRADD_OK"),
+        "Expected O3 memcmp on dynamic array and alias pointer addition. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_ALIAS_DIRECT_OK")
+            && stdout.contains("O3_DYNAMIC_ALIAS_INDEX_OK")
+            && stdout.contains("O3_DYNAMIC_ALIAS_DYN_INDEX_OK")
+            && stdout.contains("O3_DYNAMIC_ALIAS_PLUS_OK")
+            && stdout.contains("O3_DYNAMIC_ALIAS_SUB_OK")
+            && stdout.contains("O3_DYNAMIC_ALIAS_COMMUTE_OK"),
+        "Expected O3 memcmp on dynamic pointer aliases and follow-up arithmetic. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_RAW_ADDR_OK") && stdout.contains("O3_DYNAMIC_RAW_BACK_OK"),
+        "Expected O3 memcmp on dynamic raw address byte offsets. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_ADDR_ALIAS_INDEX_OK"),
+        "Expected O3 memcmp on address-of alias pointer indexing. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_ADDR_DEREF_OK"),
+        "Expected O3 memcmp on address-of pointer dereference. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NEGADD_PTRADD_OK"),
+        "Expected O3 memcmp on alias plus negative literal pointer arithmetic. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_LEFT_NEGADD_PTRADD_OK"),
+        "Expected O3 memcmp on negative-left alias pointer arithmetic. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_SUB_NEG_PTRADD_OK"),
+        "Expected O3 memcmp on subtract-negative alias pointer arithmetic. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_BYTE_BACK_OK"),
+        "Expected O3 memcmp on raw address plus negative byte offset. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_BYTE_FORWARD_OK"),
+        "Expected O3 memcmp on raw address subtract-negative byte offset. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NEG_INDEX_OK"),
+        "Expected O3 memcmp on address-of negative alias pointer index. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_CONST_EXPR_INDEX_OK"),
+        "Expected O3 memcmp on constant-expression alias pointer index. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_CONST_EXPR_CHAIN_INDEX_OK"),
+        "Expected O3 memcmp on constant-expression alias-of-alias index. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_DIV_INDEX_OK"),
+        "Expected O3 indexed local array division marker. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_DIV_ALIAS_OK"),
+        "Expected O3 alias local array division marker. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_NUM_DIV_MIXED_OK"),
+        "Expected O3 mixed local array division marker. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_INDEX_ARRAY_OK")
+            && stdout.contains("O3_DYNAMIC_INDEX_PTR_OK")
+            && stdout.contains("O3_DYNAMIC_INDEX_DIV_OK")
+            && stdout.contains("O3_DYNAMIC_ALIAS_VALUE_OK"),
+        "Expected O3 dynamic array and pointer index markers. STDOUT: {stdout}"
+    );
 
     Ok(())
 }

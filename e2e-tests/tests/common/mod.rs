@@ -27,8 +27,12 @@ lazy_static! {
     static ref COMPILE_MEMBER_POINTER_OPTIMIZED_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
     static ref COMPILE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_GLOBALS_OPTIMIZED_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
     static ref COMPILE_LATE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_SCALAR_TYPES_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_SCALAR_TYPES_OPTIMIZED_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
     static ref COMPILE_RUST_GLOBAL_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_INLINE_CALLSITE_DEFAULT_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
@@ -391,22 +395,60 @@ impl RegisteredFixture {
                 Ok(dir.join(bin_name))
             }
             RegisteredFixtureKind::Globals => {
-                ensure_globals_program_compiled()?;
-                Ok(dir.join("globals_program"))
+                let bin_name = match opt_level {
+                    OptimizationLevel::Debug => {
+                        ensure_globals_program_compiled()?;
+                        "globals_program"
+                    }
+                    OptimizationLevel::O1 => {
+                        ensure_globals_program_optimized_variants_compiled()?;
+                        "globals_program_o1"
+                    }
+                    OptimizationLevel::O2 => {
+                        ensure_globals_program_optimized_variants_compiled()?;
+                        "globals_program_o2"
+                    }
+                    OptimizationLevel::O3 => {
+                        ensure_globals_program_optimized_variants_compiled()?;
+                        "globals_program_o3"
+                    }
+                    OptimizationLevel::Stripped => {
+                        anyhow::bail!(
+                            "Stripped optimization level not supported for globals_program"
+                        )
+                    }
+                };
+                Ok(dir.join(bin_name))
             }
             RegisteredFixtureKind::LateGlobals => {
                 ensure_late_globals_program_compiled()?;
                 Ok(dir.join("late_globals_program"))
             }
             RegisteredFixtureKind::ScalarTypes => {
-                if !matches!(opt_level, OptimizationLevel::Debug) {
-                    anyhow::bail!(
-                        "Optimization level {} not supported for scalar_types_program",
-                        opt_level.description()
-                    );
-                }
-                ensure_scalar_types_program_compiled()?;
-                Ok(dir.join("scalar_types_program"))
+                let bin_name = match opt_level {
+                    OptimizationLevel::Debug => {
+                        ensure_scalar_types_program_compiled()?;
+                        "scalar_types_program"
+                    }
+                    OptimizationLevel::O1 => {
+                        ensure_scalar_types_program_optimized_variants_compiled()?;
+                        "scalar_types_program_o1"
+                    }
+                    OptimizationLevel::O2 => {
+                        ensure_scalar_types_program_optimized_variants_compiled()?;
+                        "scalar_types_program_o2"
+                    }
+                    OptimizationLevel::O3 => {
+                        ensure_scalar_types_program_optimized_variants_compiled()?;
+                        "scalar_types_program_o3"
+                    }
+                    OptimizationLevel::Stripped => {
+                        anyhow::bail!(
+                            "Stripped optimization level not supported for scalar_types_program"
+                        )
+                    }
+                };
+                Ok(dir.join(bin_name))
             }
             RegisteredFixtureKind::RustGlobal => {
                 ensure_rust_global_program_compiled()?;
@@ -636,7 +678,11 @@ pub fn ensure_test_program_compiled_with_opt(opt_level: OptimizationLevel) -> an
         }
         _ => {
             COMPILE_OPTIMIZED.call_once(|| {
-                let compile_result = compile_sample_program(opt_level);
+                let compile_result = compile_sample_program_variants(&[
+                    OptimizationLevel::O1,
+                    OptimizationLevel::O2,
+                    OptimizationLevel::O3,
+                ]);
                 *COMPILE_OPT_RESULT.lock().unwrap() = Some(compile_result);
             });
             match COMPILE_OPT_RESULT.lock().unwrap().as_ref() {
@@ -645,6 +691,51 @@ pub fn ensure_test_program_compiled_with_opt(opt_level: OptimizationLevel) -> an
                 None => panic!("Compilation result should be set after call_once"),
             }
         }
+    }
+}
+
+fn compile_sample_program_variants(opt_levels: &[OptimizationLevel]) -> anyhow::Result<()> {
+    let fixtures_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let sample_program_dir = fixtures_path.join("sample_program");
+    let outputs = opt_levels
+        .iter()
+        .map(|opt_level| sample_program_dir.join(opt_level.as_binary_name()))
+        .collect::<Vec<_>>();
+    if let Some(result) = use_precompiled_outputs("sample_program variants", &outputs) {
+        return result;
+    }
+
+    let requested = opt_levels
+        .iter()
+        .map(OptimizationLevel::description)
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("Compiling sample_program variants [{requested}] in {sample_program_dir:?}");
+
+    let mut command = Command::new("make");
+    for opt_level in opt_levels {
+        command.arg(opt_level.as_make_target());
+    }
+
+    let output = command
+        .current_dir(sample_program_dir)
+        .output()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to run make for sample_program variants [{requested}]: {}",
+                e
+            )
+        })?;
+
+    if output.status.success() {
+        println!("✓ Successfully compiled sample_program variants [{requested}]");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow::anyhow!(
+            "Failed to compile sample_program variants [{requested}]: {}",
+            stderr
+        ))
     }
 }
 
@@ -714,7 +805,11 @@ fn ensure_complex_program_compiled_with_opt(opt_level: OptimizationLevel) -> any
         }
         _ => {
             COMPILE_COMPLEX_OPT.call_once(|| {
-                let compile_result = compile_complex_program(opt_level);
+                let compile_result = compile_complex_program_variants(&[
+                    OptimizationLevel::O1,
+                    OptimizationLevel::O2,
+                    OptimizationLevel::O3,
+                ]);
                 *COMPILE_COMPLEX_OPT_RESULT.lock().unwrap() = Some(compile_result);
             });
             match COMPILE_COMPLEX_OPT_RESULT.lock().unwrap().as_ref() {
@@ -722,6 +817,18 @@ fn ensure_complex_program_compiled_with_opt(opt_level: OptimizationLevel) -> any
                 Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
                 None => panic!("Compilation result should be set after call_once"),
             }
+        }
+    }
+}
+
+fn complex_program_binary_name(opt_level: OptimizationLevel) -> anyhow::Result<&'static str> {
+    match opt_level {
+        OptimizationLevel::Debug => Ok("complex_types_program"),
+        OptimizationLevel::O1 => Ok("complex_types_program_o1"),
+        OptimizationLevel::O2 => Ok("complex_types_program_o2"),
+        OptimizationLevel::O3 => Ok("complex_types_program_o3"),
+        OptimizationLevel::Stripped => {
+            anyhow::bail!("Stripped optimization level not supported for complex_types_program")
         }
     }
 }
@@ -735,15 +842,7 @@ fn compile_complex_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
         opt_level.description()
     );
 
-    let target = match opt_level {
-        OptimizationLevel::Debug => "complex_types_program",
-        OptimizationLevel::O1 => "complex_types_program_o1",
-        OptimizationLevel::O2 => "complex_types_program_o2",
-        OptimizationLevel::O3 => "complex_types_program_o3",
-        OptimizationLevel::Stripped => {
-            anyhow::bail!("Stripped optimization level not supported for complex_types_program")
-        }
-    };
+    let target = complex_program_binary_name(opt_level)?;
     if let Some(result) =
         use_precompiled_outputs("complex_types_program", &[program_dir.join(target)])
     {
@@ -773,6 +872,50 @@ fn compile_complex_program(opt_level: OptimizationLevel) -> anyhow::Result<()> {
         Err(anyhow::anyhow!(
             "Failed to compile complex_types_program {}: {}",
             opt_level.description(),
+            stderr
+        ))
+    }
+}
+
+fn compile_complex_program_variants(opt_levels: &[OptimizationLevel]) -> anyhow::Result<()> {
+    let fixtures_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let program_dir = fixtures_path.join("complex_types_program");
+    let outputs = opt_levels
+        .iter()
+        .map(|opt_level| {
+            Ok::<_, anyhow::Error>(program_dir.join(complex_program_binary_name(*opt_level)?))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if let Some(result) = use_precompiled_outputs("complex_types_program variants", &outputs) {
+        return result;
+    }
+
+    let requested = opt_levels
+        .iter()
+        .map(OptimizationLevel::description)
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("Compiling complex_types_program variants [{requested}] in {program_dir:?}");
+
+    let mut command = Command::new("make");
+    for opt_level in opt_levels {
+        command.arg(complex_program_binary_name(*opt_level)?);
+    }
+
+    let output = command.current_dir(program_dir).output().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to run make for complex_types_program variants [{requested}]: {}",
+            e
+        )
+    })?;
+
+    if output.status.success() {
+        println!("✓ Successfully compiled complex_types_program variants [{requested}]");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow::anyhow!(
+            "Failed to compile complex_types_program variants [{requested}]: {}",
             stderr
         ))
     }
@@ -1060,8 +1203,10 @@ pub mod targets;
 pub mod termination;
 
 static COMPILE_GLOBALS: Once = Once::new();
+static COMPILE_GLOBALS_OPTIMIZED: Once = Once::new();
 static COMPILE_LATE_GLOBALS: Once = Once::new();
 static COMPILE_SCALAR_TYPES: Once = Once::new();
+static COMPILE_SCALAR_TYPES_OPTIMIZED: Once = Once::new();
 static COMPILE_RUST_GLOBAL: Once = Once::new();
 static COMPILE_INLINE_CALLSITE_DEFAULT: Once = Once::new();
 static COMPILE_INLINE_CALLSITE_CLANG_DWARF5: Once = Once::new();
@@ -1114,6 +1259,51 @@ fn ensure_globals_program_compiled() -> anyhow::Result<()> {
     }
 }
 
+fn ensure_globals_program_optimized_variants_compiled() -> anyhow::Result<()> {
+    COMPILE_GLOBALS_OPTIMIZED.call_once(|| {
+        let compile_result = (|| -> anyhow::Result<()> {
+            let base =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/globals_program");
+            let outputs = [
+                base.join("globals_program_o1"),
+                base.join("globals_program_o2"),
+                base.join("globals_program_o3"),
+                base.join("libgvars.so"),
+            ];
+            if let Some(result) =
+                use_precompiled_outputs("globals_program optimized variants", &outputs)
+            {
+                return result;
+            }
+
+            println!("Compiling globals_program optimized variants in {base:?}");
+            let out = Command::new("make")
+                .arg("globals_program_o1")
+                .arg("globals_program_o2")
+                .arg("globals_program_o3")
+                .current_dir(base)
+                .output()?;
+            if out.status.success() {
+                println!("✓ Successfully compiled globals_program optimized variants");
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(anyhow::anyhow!(
+                    "Failed to compile globals_program optimized variants: {}",
+                    stderr
+                ))
+            }
+        })();
+        *COMPILE_GLOBALS_OPTIMIZED_RESULT.lock().unwrap() = Some(compile_result);
+    });
+
+    match COMPILE_GLOBALS_OPTIMIZED_RESULT.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
 fn ensure_late_globals_program_compiled() -> anyhow::Result<()> {
     COMPILE_LATE_GLOBALS.call_once(|| {
         let compile_result = (|| -> anyhow::Result<()> {
@@ -1155,15 +1345,86 @@ fn ensure_late_globals_program_compiled() -> anyhow::Result<()> {
 
 fn ensure_scalar_types_program_compiled() -> anyhow::Result<()> {
     COMPILE_SCALAR_TYPES.call_once(|| {
-        let compile_result = compile_c_make_fixture(
+        let compile_result = compile_scalar_types_program_target(
             "scalar_types_program",
-            FixtureCompiler::Default,
-            "-Wall -Wextra -g -O0",
+            OptimizationLevel::Debug.description(),
         );
         *COMPILE_SCALAR_TYPES_RESULT.lock().unwrap() = Some(compile_result);
     });
 
     match COMPILE_SCALAR_TYPES_RESULT.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
+fn compile_scalar_types_program_target(target: &str, description: &str) -> anyhow::Result<()> {
+    let base =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scalar_types_program");
+    if let Some(result) = use_precompiled_outputs("scalar_types_program", &[base.join(target)]) {
+        return result;
+    }
+
+    println!("Compiling scalar_types_program {description} in {base:?}");
+    let out = Command::new("make")
+        .arg(target)
+        .current_dir(base)
+        .output()?;
+    if out.status.success() {
+        println!("✓ Successfully compiled scalar_types_program {description}");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(anyhow::anyhow!(
+            "Failed to compile scalar_types_program {description}: {}",
+            stderr
+        ))
+    }
+}
+
+fn ensure_scalar_types_program_optimized_variants_compiled() -> anyhow::Result<()> {
+    COMPILE_SCALAR_TYPES_OPTIMIZED.call_once(|| {
+        let compile_result = (|| -> anyhow::Result<()> {
+            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/scalar_types_program");
+            let outputs = [
+                base.join("scalar_types_program_o1"),
+                base.join("scalar_types_program_o2"),
+                base.join("scalar_types_program_o3"),
+            ];
+            if let Some(result) =
+                use_precompiled_outputs("scalar_types_program optimized variants", &outputs)
+            {
+                return result;
+            }
+
+            println!("Compiling scalar_types_program optimized variants in {base:?}");
+            let out = Command::new("make")
+                .arg("scalar_types_program_o1")
+                .arg("scalar_types_program_o2")
+                .arg("scalar_types_program_o3")
+                .current_dir(base)
+                .output()?;
+            if out.status.success() {
+                println!("✓ Successfully compiled scalar_types_program optimized variants");
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(anyhow::anyhow!(
+                    "Failed to compile scalar_types_program optimized variants: {}",
+                    stderr
+                ))
+            }
+        })();
+        *COMPILE_SCALAR_TYPES_OPTIMIZED_RESULT.lock().unwrap() = Some(compile_result);
+    });
+
+    match COMPILE_SCALAR_TYPES_OPTIMIZED_RESULT
+        .lock()
+        .unwrap()
+        .as_ref()
+    {
         Some(Ok(())) => Ok(()),
         Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
         None => panic!("Compilation result should be set after call_once"),

@@ -1,6 +1,6 @@
 mod common;
 
-use common::{init, FixtureCompiler};
+use common::{init, FixtureCompiler, OptimizationLevel};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -88,5 +88,86 @@ fn compiler_specific_builds_keep_sibling_fixture_outputs() -> anyhow::Result<()>
         clean_fixture_outputs(fixture_name)?;
     }
 
+    Ok(())
+}
+
+#[test]
+fn sample_program_optimized_build_compiles_all_variants() -> anyhow::Result<()> {
+    init();
+
+    clean_fixture_outputs("sample_program")?;
+
+    common::ensure_test_program_compiled_with_opt(OptimizationLevel::O2)?;
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join("sample_program");
+    for binary_name in [
+        "sample_program_o1",
+        "sample_program_o2",
+        "sample_program_o3",
+    ] {
+        assert!(
+            base.join(binary_name).exists(),
+            "{binary_name} should exist after compiling optimized sample variants"
+        );
+    }
+
+    clean_fixture_outputs("sample_program")?;
+    Ok(())
+}
+
+#[test]
+fn complex_program_optimized_build_compiles_all_variants() -> anyhow::Result<()> {
+    init();
+
+    clean_fixture_outputs("complex_types_program")?;
+
+    common::TestFixtures::new()
+        .get_test_binary_with_opt("complex_types_program", OptimizationLevel::O2)?;
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join("complex_types_program");
+    for binary_name in [
+        "complex_types_program_o1",
+        "complex_types_program_o2",
+        "complex_types_program_o3",
+    ] {
+        assert!(
+            base.join(binary_name).exists(),
+            "{binary_name} should exist after compiling optimized complex variants"
+        );
+    }
+
+    clean_fixture_outputs("complex_types_program")?;
+    Ok(())
+}
+
+#[test]
+fn globals_program_optimized_build_compiles_all_variants() -> anyhow::Result<()> {
+    init();
+
+    clean_fixture_outputs("globals_program")?;
+
+    common::TestFixtures::new()
+        .get_test_binary_with_opt("globals_program", OptimizationLevel::O2)?;
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join("globals_program");
+    for binary_name in [
+        "globals_program_o1",
+        "globals_program_o2",
+        "globals_program_o3",
+        "libgvars.so",
+    ] {
+        assert!(
+            base.join(binary_name).exists(),
+            "{binary_name} should exist after compiling optimized globals variants"
+        );
+    }
+
+    clean_fixture_outputs("globals_program")?;
     Ok(())
 }

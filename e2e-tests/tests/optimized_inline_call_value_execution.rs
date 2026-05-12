@@ -173,7 +173,7 @@ async fn test_optimized_inline_parameters_have_exact_values_before_internal_call
 
     let target = spawn_inline_call_value_program(&binary_path).await?;
     let script = format!(
-        "trace inline_call_value_program.c:{INLINE_BEFORE_CALL_TRACE_LINE} {{\n    print \"PRECALL:{{}}:{{}}\", original_x, original_y;\n}}\n"
+        "trace inline_call_value_program.c:{INLINE_BEFORE_CALL_TRACE_LINE} {{\n    print \"PRECALL:{{}}:{{}}\", original_x, original_y;\n    print \"PRECALC:{{}}:{{}}\", original_x + original_y, original_x - original_y;\n    print \"PRECALL_DIV:{{}}:{{}}\", original_x / 0b111, (original_x + -0x40) / -0x4;\n    if original_x == (original_y - 0xb) * 0x7 {{ print \"PRECALL_REL_OK\"; }}\n}}\n"
     );
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_target(&script, 4, &target).await?;
@@ -194,21 +194,53 @@ async fn test_optimized_inline_parameters_have_exact_values_before_internal_call
     );
 
     let re = Regex::new(r"PRECALL:([0-9-]+):([0-9-]+)")?;
-    let mut seen = 0;
-    for caps in re.captures_iter(&stdout) {
-        let original_x: i64 = caps[1].parse()?;
-        let original_y: i64 = caps[2].parse()?;
+    let calc_re = Regex::new(r"PRECALC:([0-9-]+):([0-9-]+)")?;
+    let calc_samples: Vec<(i64, i64)> = calc_re
+        .captures_iter(&stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    let div_re = Regex::new(r"PRECALL_DIV:([0-9-]+):([0-9-]+)")?;
+    let div_samples: Vec<(i64, i64)> = div_re
+        .captures_iter(&stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    let precall_samples: Vec<(i64, i64)> = re
+        .captures_iter(&stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    assert!(
+        precall_samples.len() == calc_samples.len() && precall_samples.len() == div_samples.len(),
+        "Expected matching pre-call value, arithmetic, and division samples. STDOUT: {stdout}"
+    );
+    for ((original_x, original_y), (sum, diff), (x_div_7, shifted_div_neg_4)) in precall_samples
+        .iter()
+        .copied()
+        .zip(calc_samples.iter().copied())
+        .zip(div_samples.iter().copied())
+        .map(|((values, calc), div)| (values, calc, div))
+    {
         assert_eq!(
             original_x,
             (original_y - 11) * 7,
             "Expected original_x/original_y to match wrapper(seed) on the pre-call line. STDOUT: {stdout}"
         );
-        seen += 1;
+        assert_eq!(sum, original_x + original_y, "STDOUT: {stdout}");
+        assert_eq!(diff, original_x - original_y, "STDOUT: {stdout}");
+        assert_eq!(x_div_7, original_x / 7, "STDOUT: {stdout}");
+        assert_eq!(
+            shifted_div_neg_4,
+            (original_x - 64) / -4,
+            "STDOUT: {stdout}"
+        );
     }
 
     assert!(
-        seen >= 2,
+        precall_samples.len() >= 2,
         "Expected multiple pre-call inline events. STDOUT: {stdout}\nSTDERR: {stderr}"
+    );
+    assert!(
+        stdout.contains("PRECALL_REL_OK"),
+        "Expected pre-call inline computed relation marker. STDOUT: {stdout}"
     );
     Ok(())
 }
@@ -356,7 +388,7 @@ async fn test_entry_value_recovers_outer_parameter_inside_optimized_inline_after
 
     let target = spawn_inline_call_value_program(&binary_path).await?;
     let script = format!(
-        "trace inline_call_value_program.c:{INLINE_AFTER_CALL_TRACE_LINE} {{\n    print \"POSTCALL:{{}}:{{}}\", seed, after_call;\n}}\n"
+        "trace inline_call_value_program.c:{INLINE_AFTER_CALL_TRACE_LINE} {{\n    print \"POSTCALL:{{}}:{{}}\", seed, after_call;\n    print \"POSTCALC:{{}}:{{}}\", seed * 0x7, after_call - 0b111;\n    print \"POSTDIV:{{}}:{{}}\", after_call / 0x5, (after_call + -0x7) / -0x3;\n    if after_call > seed {{ print \"POSTCALL_GT_SEED\"; }}\n}}\n"
     );
     let (exit_code, stdout, stderr) =
         run_ghostscope_with_script_for_target(&script, 4, &target).await?;
@@ -377,10 +409,32 @@ async fn test_entry_value_recovers_outer_parameter_inside_optimized_inline_after
     );
 
     let re = Regex::new(r"POSTCALL:([0-9-]+):([0-9-]+)")?;
-    let mut seen = 0;
-    for caps in re.captures_iter(&stdout) {
-        let seed: i64 = caps[1].parse()?;
-        let after_call: i64 = caps[2].parse()?;
+    let calc_re = Regex::new(r"POSTCALC:([0-9-]+):([0-9-]+)")?;
+    let calc_samples: Vec<(i64, i64)> = calc_re
+        .captures_iter(&stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    let div_re = Regex::new(r"POSTDIV:([0-9-]+):([0-9-]+)")?;
+    let div_samples: Vec<(i64, i64)> = div_re
+        .captures_iter(&stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    let postcall_samples: Vec<(i64, i64)> = re
+        .captures_iter(&stdout)
+        .map(|caps| Ok((caps[1].parse::<i64>()?, caps[2].parse::<i64>()?)))
+        .collect::<anyhow::Result<_>>()?;
+    assert!(
+        postcall_samples.len() == calc_samples.len() && postcall_samples.len() == div_samples.len(),
+        "Expected matching post-call value, arithmetic, and division samples. STDOUT: {stdout}"
+    );
+    for ((seed, after_call), (seed_times_7, after_minus_7), (after_div_5, combined_div_neg_3)) in
+        postcall_samples
+            .iter()
+            .copied()
+            .zip(calc_samples.iter().copied())
+            .zip(div_samples.iter().copied())
+            .map(|((values, calc), div)| (values, calc, div))
+    {
         let original_x = seed * 7;
         let original_y = seed + 11;
         let combined = (original_x + original_y) * (original_x - original_y);
@@ -389,12 +443,19 @@ async fn test_entry_value_recovers_outer_parameter_inside_optimized_inline_after
             combined + 7,
             "Expected seed/after_call to match wrapper(seed) on the first post-call line. STDOUT: {stdout}"
         );
-        seen += 1;
+        assert_eq!(seed_times_7, original_x, "STDOUT: {stdout}");
+        assert_eq!(after_minus_7, combined, "STDOUT: {stdout}");
+        assert_eq!(after_div_5, after_call / 5, "STDOUT: {stdout}");
+        assert_eq!(combined_div_neg_3, combined / -3, "STDOUT: {stdout}");
     }
 
     assert!(
-        seen >= 2,
+        postcall_samples.len() >= 2,
         "Expected multiple post-call entry_value events. STDOUT: {stdout}\nSTDERR: {stderr}"
+    );
+    assert!(
+        stdout.contains("POSTCALL_GT_SEED"),
+        "Expected post-call entry_value computed comparison marker. STDOUT: {stdout}"
     );
     Ok(())
 }

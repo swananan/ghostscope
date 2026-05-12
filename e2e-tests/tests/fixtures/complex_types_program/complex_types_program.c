@@ -3,7 +3,7 @@
 #include <string.h>
 #include "complex_types_program.h"
 
-void update_complex(struct Complex* c, int i) {
+__attribute__((noinline)) void update_complex(struct Complex* c, int i) {
     if (!c) return;
     c->age += 1;
     c->status = (i % 2) ? STATUS_ACTIVE : STATUS_INACTIVE;
@@ -12,7 +12,7 @@ void update_complex(struct Complex* c, int i) {
     c->active = (i & 1);
     c->flags = (i & 0x7);
     if (c->friend_ref) {
-        c->friend_ref->age += 1;
+        c->friend_ref->age += 1; GHOSTSCOPE_COMPLEX_TOUCH(c, i);
     }
 }
 
@@ -30,3 +30,4 @@ int main() {
     return 0;
 }
 
+volatile unsigned long long ghostscope_complex_sink;

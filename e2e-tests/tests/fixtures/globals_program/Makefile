@@ -10,6 +10,24 @@ SHARED_OBJ ?= gvars_lib.o
 
 all: $(BINARY) $(SHARED_LIB)
 
+globals_program_o1: globals_program_o1.o $(SHARED_LIB)
+	$(CC) $(BASE_CFLAGS) -O1 -o $@ $< -L. -lgvars -Wl,-rpath,'$$ORIGIN'
+
+globals_program_o2: globals_program_o2.o $(SHARED_LIB)
+	$(CC) $(BASE_CFLAGS) -O2 -o $@ $< -L. -lgvars -Wl,-rpath,'$$ORIGIN'
+
+globals_program_o3: globals_program_o3.o $(SHARED_LIB)
+	$(CC) $(BASE_CFLAGS) -O3 -o $@ $< -L. -lgvars -Wl,-rpath,'$$ORIGIN'
+
+globals_program_o1.o: globals_program.c globals_program.h globals_shared.h gvars_lib.h
+	$(CC) $(BASE_CFLAGS) -O1 -fPIC -c -o $@ globals_program.c
+
+globals_program_o2.o: globals_program.c globals_program.h globals_shared.h gvars_lib.h
+	$(CC) $(BASE_CFLAGS) -O2 -fPIC -c -o $@ globals_program.c
+
+globals_program_o3.o: globals_program.c globals_program.h globals_shared.h gvars_lib.h
+	$(CC) $(BASE_CFLAGS) -O3 -fPIC -c -o $@ globals_program.c
+
 # Shared library
 $(SHARED_LIB): $(SHARED_OBJ) globals_shared.h
 	$(CC) -shared -o $@ $(SHARED_OBJ)
@@ -25,6 +43,6 @@ $(OBJ): globals_program.c globals_program.h globals_shared.h gvars_lib.h
 	$(CC) $(CFLAGS) -c -o $@ globals_program.c
 
 clean:
-	rm -f *.o globals_program libgvars.so
+	rm -f *.o globals_program globals_program_o* libgvars.so
 
 .PHONY: clean all

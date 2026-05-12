@@ -23,7 +23,17 @@ struct Complex {
     struct Complex* friend_ref;
 };
 
+extern volatile unsigned long long ghostscope_complex_sink;
+
+#define GHOSTSCOPE_COMPLEX_TOUCH(c_, i_) \
+    do { \
+        ghostscope_complex_sink += (unsigned long long)(c_)->age + \
+                                   (unsigned long long)(c_)->data.i + \
+                                   (unsigned long long)(c_)->arr[(i_) % 8] + \
+                                   (unsigned long long)(c_)->active + \
+                                   (unsigned long long)(c_)->flags; \
+    } while (0)
+
 void update_complex(struct Complex* c, int i);
 
 #endif // COMPLEX_TYPES_PROGRAM_H
-
