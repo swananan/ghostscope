@@ -3341,6 +3341,21 @@ impl App {
         self.state.ebpf_panel.add_trace_event(trace_event);
     }
 
+    fn add_ebpf_runtime_warning(&mut self, content: String) {
+        let event = crate::model::panel_state::EbpfPanelState::runtime_warning_event(
+            content,
+            current_boot_timestamp_ns(),
+        );
+
+        if self.state.realtime_output_logger.enabled {
+            if let Err(e) = self.write_ebpf_event_to_output_log(&event) {
+                tracing::error!("Failed to write eBPF runtime warning to output log: {}", e);
+            }
+        }
+
+        self.state.ebpf_panel.add_trace_event(event);
+    }
+
     fn show_trace_backpressure_alert(
         &mut self,
         dropped_since_last: u64,
@@ -3361,6 +3376,10 @@ impl App {
             crate::action::ResponseType::Warning,
         );
         self.state.command_renderer.mark_pending_updates();
+
+        self.add_ebpf_runtime_warning(format!(
+            "Warning: TUI trace queue saturated; dropped {dropped_since_last} events before display in last 1s (total {dropped_total}, capacity {queue_capacity})"
+        ));
     }
 
     /// Format runtime status for display in command panel
@@ -3991,4 +4010,17 @@ impl App {
         self.terminal.show_cursor()?;
         Ok(())
     }
+}
+
+fn current_boot_timestamp_ns() -> u64 {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|contents| {
+            contents
+                .split_whitespace()
+                .next()
+                .and_then(|secs| secs.parse::<f64>().ok())
+        })
+        .map(|secs| (secs * 1_000_000_000.0) as u64)
+        .unwrap_or(0)
 }
