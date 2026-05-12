@@ -1,5 +1,5 @@
 use crate::action::ResponseType;
-use ghostscope_protocol::ParsedTraceEvent;
+use ghostscope_protocol::{ParsedInstruction, ParsedTraceEvent};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
@@ -178,6 +178,26 @@ impl EbpfPanelState {
         if self.display_mode == DisplayMode::AutoRefresh {
             self.scroll_to_bottom();
         }
+    }
+
+    pub fn runtime_warning_event(message: String, timestamp: u64) -> ParsedTraceEvent {
+        ParsedTraceEvent {
+            trace_id: 0,
+            timestamp,
+            pid: 0,
+            tid: 0,
+            instructions: vec![
+                ParsedInstruction::PrintString { content: message },
+                ParsedInstruction::EndInstruction {
+                    total_instructions: 1,
+                    execution_status: 1,
+                },
+            ],
+        }
+    }
+
+    pub fn add_runtime_warning_message(&mut self, message: String, timestamp: u64) {
+        self.add_trace_event(Self::runtime_warning_event(message, timestamp));
     }
 
     pub fn scroll_up(&mut self) {
@@ -1293,5 +1313,30 @@ impl CommandPanelState {
 impl Default for CommandPanelState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_warning_message_is_added_to_ebpf_panel() {
+        let mut state = EbpfPanelState::new_with_max_messages(10);
+
+        state.add_runtime_warning_message(
+            "Warning: TUI trace queue saturated; dropped 7 events before display".to_string(),
+            123_456,
+        );
+
+        let cached = state.trace_events.back().expect("warning event");
+        assert_eq!(cached.event.trace_id, 0);
+        assert_eq!(cached.event.timestamp, 123_456);
+        assert_eq!(cached.event.pid, 0);
+        assert_eq!(cached.event.tid, 0);
+        assert_eq!(
+            cached.event.to_formatted_output(),
+            vec!["Warning: TUI trace queue saturated; dropped 7 events before display".to_string()]
+        );
     }
 }
