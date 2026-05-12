@@ -425,17 +425,28 @@ impl ExpressionEvaluator {
         unit: Option<&gimli::Unit<DwarfReader>>,
         index: gimli::DebugAddrIndex<usize>,
     ) -> Result<u64> {
+        let op = Operation::<DwarfReader>::AddressIndex { index };
         let Some(dwarf) = dwarf else {
-            return Err(anyhow::anyhow!(
-                "DW_OP_addrx requires DWARF context to resolve .debug_addr index {:?}",
-                index
-            ));
+            return Err(
+                crate::dwarf_expr::ops::unsupported_operation_error_with_detail(
+                    "DWARF expression",
+                    &op,
+                    format!(
+                        "DW_OP_addrx requires DWARF context to resolve .debug_addr index {index:?}"
+                    ),
+                ),
+            );
         };
         let Some(unit) = unit else {
-            return Err(anyhow::anyhow!(
-                "DW_OP_addrx requires unit context to resolve .debug_addr index {:?}",
-                index
-            ));
+            return Err(
+                crate::dwarf_expr::ops::unsupported_operation_error_with_detail(
+                    "DWARF expression",
+                    &op,
+                    format!(
+                        "DW_OP_addrx requires unit context to resolve .debug_addr index {index:?}"
+                    ),
+                ),
+            );
         };
         dwarf.address(unit, index).map_err(|err| {
             anyhow::anyhow!("failed to resolve DW_OP_addrx index {:?}: {}", index, err)
