@@ -73,9 +73,6 @@ pub struct EbpfContext<'ctx, 'dw> {
     pub di_builder: DebugInfoBuilder<'ctx>,
     pub compile_unit: inkwell::debug_info::DICompileUnit<'ctx>,
 
-    // Register cache for pt_regs access
-    pub register_cache: HashMap<u16, IntValue<'ctx>>,
-
     // === Complete Variable Management System ===
     pub variables: HashMap<String, PointerValue<'ctx>>, // Variable name -> LLVM pointer
     pub var_types: HashMap<String, VarType>,            // Variable name -> type
@@ -194,7 +191,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             map_manager,
             di_builder,
             compile_unit,
-            register_cache: HashMap::new(),
 
             // Initialize variable management system
             variables: HashMap::new(),

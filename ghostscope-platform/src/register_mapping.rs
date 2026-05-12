@@ -124,6 +124,22 @@ pub fn dwarf_reg_to_name_x86_64(dwarf_reg: u16) -> Option<&'static str> {
         14 => Some("R14"), // DWARF 14 = R14
         15 => Some("R15"), // DWARF 15 = R15
         16 => Some("RIP"), // DWARF 16 = RIP
+        17 => Some("XMM0"),
+        18 => Some("XMM1"),
+        19 => Some("XMM2"),
+        20 => Some("XMM3"),
+        21 => Some("XMM4"),
+        22 => Some("XMM5"),
+        23 => Some("XMM6"),
+        24 => Some("XMM7"),
+        25 => Some("XMM8"),
+        26 => Some("XMM9"),
+        27 => Some("XMM10"),
+        28 => Some("XMM11"),
+        29 => Some("XMM12"),
+        30 => Some("XMM13"),
+        31 => Some("XMM14"),
+        32 => Some("XMM15"),
         _ => None,
     }
 }
@@ -159,6 +175,7 @@ mod tests {
         assert_eq!(dwarf_reg_to_pt_regs_byte_offset_x86_64(6), Some(32)); // RBP
         assert_eq!(dwarf_reg_to_pt_regs_byte_offset_x86_64(7), Some(152)); // RSP
         assert_eq!(dwarf_reg_to_pt_regs_byte_offset_x86_64(16), Some(128)); // RIP
+        assert_eq!(dwarf_reg_to_pt_regs_byte_offset_x86_64(17), None); // XMM0
 
         // Test invalid register
         assert_eq!(dwarf_reg_to_pt_regs_byte_offset_x86_64(99), None);
@@ -181,6 +198,8 @@ mod tests {
 
         // Test special registers
         assert_eq!(dwarf_reg_to_name_x86_64(16), Some("RIP"));
+        assert_eq!(dwarf_reg_to_name_x86_64(17), Some("XMM0"));
+        assert_eq!(dwarf_reg_to_name_x86_64(32), Some("XMM15"));
 
         // Test invalid register
         assert_eq!(dwarf_reg_to_name_x86_64(99), None);

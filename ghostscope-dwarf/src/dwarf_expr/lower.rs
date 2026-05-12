@@ -75,6 +75,7 @@ impl ExpressionEvaluator {
                     expr.0.endian(),
                     unit.encoding(),
                     Some(dwarf),
+                    Some(unit),
                     address,
                     get_cfa,
                     function_context,
@@ -166,6 +167,7 @@ impl ExpressionEvaluator {
                                 expr.0.endian(),
                                 unit.encoding(),
                                 Some(dwarf),
+                                Some(unit),
                                 address,
                                 get_cfa,
                                 function_context,
@@ -219,6 +221,7 @@ impl ExpressionEvaluator {
             endian,
             unit.encoding(),
             Some(dwarf),
+            Some(unit),
             address,
             get_cfa,
             function_context,
@@ -303,6 +306,7 @@ impl ExpressionEvaluator {
         endian: DwarfEndian,
         encoding: gimli::Encoding,
         dwarf: Option<&gimli::Dwarf<DwarfReader>>,
+        unit: Option<&gimli::Unit<DwarfReader>>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         function_context: Option<&FunctionBlocks>,
@@ -319,6 +323,7 @@ impl ExpressionEvaluator {
             endian,
             encoding,
             dwarf,
+            unit,
             address,
             get_cfa,
             function_context,
@@ -387,6 +392,12 @@ impl ExpressionEvaluator {
                     steps: vec![PlanExprOp::PushConstant(value)],
                 })
             }
+            EvaluationResult::DirectValue(DirectValueResult::RegisterValue(register)) => {
+                Some(CfaResult::RegisterPlusOffset {
+                    register,
+                    offset: 0,
+                })
+            }
             EvaluationResult::DirectValue(DirectValueResult::ImplicitValue(bytes))
                 if bytes.len() == 8 =>
             {
@@ -409,6 +420,28 @@ impl ExpressionEvaluator {
         steps
     }
 
+    fn resolve_address_index(
+        dwarf: Option<&gimli::Dwarf<DwarfReader>>,
+        unit: Option<&gimli::Unit<DwarfReader>>,
+        index: gimli::DebugAddrIndex<usize>,
+    ) -> Result<u64> {
+        let Some(dwarf) = dwarf else {
+            return Err(anyhow::anyhow!(
+                "DW_OP_addrx requires DWARF context to resolve .debug_addr index {:?}",
+                index
+            ));
+        };
+        let Some(unit) = unit else {
+            return Err(anyhow::anyhow!(
+                "DW_OP_addrx requires unit context to resolve .debug_addr index {:?}",
+                index
+            ));
+        };
+        dwarf.address(unit, index).map_err(|err| {
+            anyhow::anyhow!("failed to resolve DW_OP_addrx index {:?}: {}", index, err)
+        })
+    }
+
     fn has_piece_expression<R>(operations: &[ParsedOperation<R>]) -> bool
     where
         R: Reader<Offset = usize>,
@@ -428,6 +461,7 @@ impl ExpressionEvaluator {
     fn lower_parsed_operations<R>(
         operations: &[ParsedOperation<R>],
         dwarf: Option<&gimli::Dwarf<DwarfReader>>,
+        unit: Option<&gimli::Unit<DwarfReader>>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         depth: usize,
@@ -442,12 +476,13 @@ impl ExpressionEvaluator {
         // Fast path for single operations - avoid compute processing.
         if operations.len() == 1 {
             if let ParsedOperation::Operation(op) = &operations[0] {
-                return Self::handle_single_operation(op, dwarf, address, get_cfa, depth);
+                return Self::handle_single_operation(op, dwarf, unit, address, get_cfa, depth);
             }
         }
 
         let mut steps = Vec::new();
         let mut has_stack_value = false;
+        let mut has_link_time_address = false;
 
         for op in operations {
             match op {
@@ -536,6 +571,15 @@ impl ExpressionEvaluator {
                 ParsedOperation::Operation(Operation::SignedConstant { value }) => {
                     steps.push(PlanExprOp::PushConstant(*value));
                 }
+                ParsedOperation::Operation(Operation::Address { address }) => {
+                    steps.push(PlanExprOp::PushConstant(*address as i64));
+                    has_link_time_address = true;
+                }
+                ParsedOperation::Operation(Operation::AddressIndex { index }) => {
+                    let resolved = Self::resolve_address_index(dwarf, unit, *index)?;
+                    steps.push(PlanExprOp::PushConstant(resolved as i64));
+                    has_link_time_address = true;
+                }
                 ParsedOperation::Operation(Operation::StackValue) => {
                     has_stack_value = true;
                 }
@@ -595,6 +639,11 @@ impl ExpressionEvaluator {
                 }
                 PlanExprOp::PushConstant(val) => {
                     if has_stack_value {
+                        if has_link_time_address && *val >= 0 {
+                            return Ok(EvaluationResult::DirectValue(
+                                DirectValueResult::AbsoluteAddress(*val as u64),
+                            ));
+                        }
                         return Ok(EvaluationResult::DirectValue(DirectValueResult::Constant(
                             *val,
                         )));
@@ -626,6 +675,13 @@ impl ExpressionEvaluator {
         }
 
         if has_stack_value {
+            if has_link_time_address {
+                if let Some(address) = Self::fold_constant_steps_to_u64(&steps) {
+                    return Ok(EvaluationResult::DirectValue(
+                        DirectValueResult::AbsoluteAddress(address),
+                    ));
+                }
+            }
             Ok(EvaluationResult::DirectValue(
                 DirectValueResult::ComputedValue {
                     steps,
@@ -639,10 +695,28 @@ impl ExpressionEvaluator {
         }
     }
 
+    fn fold_constant_steps_to_u64(steps: &[PlanExprOp]) -> Option<u64> {
+        let mut stack = Vec::new();
+        for step in steps {
+            match step {
+                PlanExprOp::PushConstant(value) => stack.push(*value),
+                PlanExprOp::Add => {
+                    let rhs = stack.pop()?;
+                    let lhs = stack.pop()?;
+                    stack.push(lhs.saturating_add(rhs));
+                }
+                _ => return None,
+            }
+        }
+
+        (stack.len() == 1 && stack[0] >= 0).then_some(stack[0] as u64)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn lower_piece_expression<R>(
         operations: &[ParsedOperation<R>],
         dwarf: Option<&gimli::Dwarf<DwarfReader>>,
+        unit: Option<&gimli::Unit<DwarfReader>>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         depth: usize,
@@ -682,7 +756,7 @@ impl ExpressionEvaluator {
             let location = if segment.is_empty() {
                 EvaluationResult::Optimized
             } else {
-                Self::lower_parsed_operations(segment, dwarf, address, get_cfa, depth)?
+                Self::lower_parsed_operations(segment, dwarf, unit, address, get_cfa, depth)?
             };
 
             if matches!(location, EvaluationResult::Composite(_)) {
@@ -716,6 +790,7 @@ impl ExpressionEvaluator {
         endian: DwarfEndian,
         encoding: gimli::Encoding,
         dwarf: Option<&gimli::Dwarf<DwarfReader>>,
+        unit: Option<&gimli::Unit<DwarfReader>>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         function_context: Option<&FunctionBlocks>,
@@ -774,16 +849,17 @@ impl ExpressionEvaluator {
         debug!("Parsed {} operations in expression", operations.len());
 
         if Self::has_piece_expression(&operations) {
-            return Self::lower_piece_expression(&operations, dwarf, address, get_cfa, depth);
+            return Self::lower_piece_expression(&operations, dwarf, unit, address, get_cfa, depth);
         }
 
-        Self::lower_parsed_operations(&operations, dwarf, address, get_cfa, depth)
+        Self::lower_parsed_operations(&operations, dwarf, unit, address, get_cfa, depth)
     }
 
     /// Handle single DWARF operation - fast path without compute processing
     fn handle_single_operation<R>(
         op: &Operation<R>,
         dwarf: Option<&gimli::Dwarf<DwarfReader>>,
+        unit: Option<&gimli::Unit<DwarfReader>>,
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         depth: usize,
@@ -868,6 +944,16 @@ impl ExpressionEvaluator {
                 );
                 Ok(EvaluationResult::MemoryLocation(LocationResult::Address(
                     *address,
+                )))
+            }
+            Operation::AddressIndex { index } => {
+                let resolved = Self::resolve_address_index(dwarf, unit, *index)?;
+                debug!(
+                    "Single DW_OP_addrx {:?} -> 0x{:x} - direct memory address",
+                    index, resolved
+                );
+                Ok(EvaluationResult::MemoryLocation(LocationResult::Address(
+                    resolved,
                 )))
             }
 
@@ -1156,6 +1242,7 @@ impl ExpressionEvaluator {
                         location_list_entry.data.0.endian(),
                         unit.encoding(),
                         Some(dwarf),
+                        Some(unit),
                         address,
                         get_cfa,
                         function_context,
@@ -1231,6 +1318,7 @@ impl ExpressionEvaluator {
                                     data.0.endian(),
                                     unit.encoding(),
                                     Some(dwarf),
+                                    Some(unit),
                                     address,
                                     get_cfa,
                                     function_context,
@@ -1267,6 +1355,7 @@ impl ExpressionEvaluator {
                                     data.0.endian(),
                                     unit.encoding(),
                                     Some(dwarf),
+                                    Some(unit),
                                     address,
                                     get_cfa,
                                     function_context,
@@ -1306,6 +1395,7 @@ impl ExpressionEvaluator {
                                     data.0.endian(),
                                     unit.encoding(),
                                     Some(dwarf),
+                                    Some(unit),
                                     address,
                                     get_cfa,
                                     function_context,
@@ -1348,6 +1438,7 @@ impl ExpressionEvaluator {
                                         data.0.endian(),
                                         unit.encoding(),
                                         Some(dwarf),
+                                        Some(unit),
                                         address,
                                         get_cfa,
                                         function_context,
@@ -1391,6 +1482,7 @@ impl ExpressionEvaluator {
                                         data.0.endian(),
                                         unit.encoding(),
                                         Some(dwarf),
+                                        Some(unit),
                                         address,
                                         get_cfa,
                                         function_context,
@@ -1420,6 +1512,7 @@ impl ExpressionEvaluator {
                                 data.0.endian(),
                                 unit.encoding(),
                                 Some(dwarf),
+                                Some(unit),
                                 address,
                                 get_cfa,
                                 function_context,
@@ -1506,6 +1599,7 @@ mod tests {
             RunTimeEndian::Little,
             test_encoding(),
             None,
+            None,
             0,
             None,
             None,
@@ -1577,6 +1671,15 @@ mod tests {
                 "DW_OP_stack_value",
                 vec![constants::DW_OP_lit1.0, constants::DW_OP_stack_value.0],
                 EvaluationResult::DirectValue(DirectValueResult::Constant(1)),
+            ),
+            (
+                "DW_OP_addr stack value",
+                {
+                    let mut bytes = addr_expr(0x1234);
+                    bytes.push(constants::DW_OP_stack_value.0);
+                    bytes
+                },
+                EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1234)),
             ),
             (
                 "arithmetic stack value subset",
@@ -1683,6 +1786,7 @@ mod tests {
             RunTimeEndian::Little,
             test_encoding(),
             None,
+            None,
             0,
             Some(&get_cfa),
             None,
@@ -1697,6 +1801,21 @@ mod tests {
                 register: 7,
                 offset: Some(20),
                 size: None,
+            })
+        );
+    }
+
+    #[test]
+    fn dwarf_frame_base_reg_lowers_to_register_cfa() {
+        let cfa = ExpressionEvaluator::evaluation_result_to_cfa(EvaluationResult::DirectValue(
+            DirectValueResult::RegisterValue(6),
+        ));
+
+        assert_eq!(
+            cfa,
+            Some(CfaResult::RegisterPlusOffset {
+                register: 6,
+                offset: 0,
             })
         );
     }
@@ -1794,6 +1913,7 @@ mod tests {
             RunTimeEndian::Little,
             test_encoding(),
             None,
+            None,
             0,
             None,
             None,
@@ -1820,6 +1940,7 @@ mod tests {
             &expr_bytes,
             RunTimeEndian::Little,
             test_encoding(),
+            None,
             None,
             0,
             None,
@@ -1849,6 +1970,7 @@ mod tests {
             RunTimeEndian::Little,
             test_encoding(),
             None,
+            None,
             0,
             Some(&get_cfa),
             None,
@@ -1874,6 +1996,7 @@ mod tests {
             &expr_bytes,
             gimli::RunTimeEndian::Big,
             test_encoding(),
+            None,
             None,
             0,
             None,
