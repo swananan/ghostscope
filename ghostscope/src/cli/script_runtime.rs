@@ -348,6 +348,8 @@ async fn run_cli_with_session(
     let stdout = io::stdout();
     let mut stdout = io::BufWriter::new(stdout.lock());
     let mut output_rate_limiter = ScriptOutputRateLimiter::new(config.script_output_events_per_sec);
+    let mut ebpf_loss_report_ticker = tokio::time::interval(Duration::from_secs(1));
+    ebpf_loss_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let shutdown_signal = wait_for_shutdown_signal();
     tokio::pin!(shutdown_signal);
@@ -399,6 +401,10 @@ async fn run_cli_with_session(
                 }
             }
 
+            _ = ebpf_loss_report_ticker.tick() => {
+                report_ebpf_output_loss_reports(&mut session.trace_manager);
+            }
+
             signal = &mut shutdown_signal => {
                 match signal {
                     Ok(signal_name) => info!("Received {signal_name}, shutting down..."),
@@ -410,6 +416,20 @@ async fn run_cli_with_session(
     }
 
     Ok(())
+}
+
+fn report_ebpf_output_loss_reports(trace_manager: &mut crate::trace::TraceManager) {
+    for report in trace_manager.collect_event_loss_reports() {
+        let message = format!(
+            "eBPF output helper failed: trace #{} ({}) lost {} events in kernel before userspace delivery (total {})",
+            report.trace_id,
+            report.target_display,
+            report.lost_since_last,
+            report.lost_total
+        );
+        warn!("{message}");
+        eprintln!("ghostscope: {message}");
+    }
 }
 
 fn should_print_cli_status(config: &ResolvedConfig) -> bool {

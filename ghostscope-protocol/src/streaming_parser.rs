@@ -325,14 +325,10 @@ impl StreamingTraceParser {
                                         );
                                     }
                                     EventSource::PerfEventArray => {
-                                        // PerfEventArray: independent events, clear all to prevent pollution
-                                        let residual = self.buffer.len() - consumed_bytes;
-                                        if residual > 0 {
-                                            warn!(
-                                                "PerfEventArray mode: discarding {} residual bytes after event",
-                                                residual
-                                            );
-                                        }
+                                        // PerfEventArray sends each GhostScope event as one
+                                        // bpf_perf_event_output payload. Any bytes after our
+                                        // EndInstruction are perf record framing/alignment, not
+                                        // the start of another GhostScope event.
                                         self.buffer.clear();
                                         debug!("PerfEventArray mode: cleared buffer after complete event");
                                     }

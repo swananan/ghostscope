@@ -302,18 +302,15 @@ impl<'ctx> MapManager<'ctx> {
             "Creating event loss counter map: {} with {} max entries",
             name, max_entries
         );
-        // For event loss counter, key and value are both integers
-        // Key size is sizeof(event_loss_cnt_key_) * 8
-        // Value size is sizeof(event_loss_cnt_val_) * 8
         self.create_map_definition(
             module,
             di_builder,
             compile_unit,
             name,
-            BpfMapType::Array,
+            BpfMapType::PerCpuArray,
             max_entries,
-            SizedType::integer(64), // Assuming event_loss_cnt_key_ is u64
-            SizedType::integer(64), // Assuming event_loss_cnt_val_ is u64
+            SizedType::integer(32),
+            SizedType::integer(64),
         )
     }
 
@@ -548,6 +545,10 @@ mod tests {
         );
         assert_eq!(
             MapManager::map_definition_field_count("event_accum_buffer", BpfMapType::PerCpuArray),
+            4
+        );
+        assert_eq!(
+            MapManager::map_definition_field_count("event_loss_counters", BpfMapType::PerCpuArray),
             4
         );
         assert_eq!(

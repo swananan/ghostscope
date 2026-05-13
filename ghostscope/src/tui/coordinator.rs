@@ -401,6 +401,24 @@ async fn run_runtime_coordinator(
                         queue_capacity: trace_channel_capacity,
                     });
                 }
+
+                if let Some(ref mut session) = session {
+                    for report in session.trace_manager.collect_event_loss_reports() {
+                        warn!(
+                            "eBPF output helper loss detected: trace {} ({}) lost {} events in last interval (total {})",
+                            report.trace_id,
+                            report.target_display,
+                            report.lost_since_last,
+                            report.lost_total
+                        );
+                        let _ = runtime_channels.status_sender.send(RuntimeStatus::EbpfOutputLoss {
+                            trace_id: report.trace_id,
+                            target_display: report.target_display,
+                            lost_since_last: report.lost_since_last,
+                            lost_total: report.lost_total,
+                        });
+                    }
+                }
             }
         }
     }

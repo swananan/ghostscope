@@ -1167,6 +1167,98 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
+    fn increment_event_loss_counter(&mut self) -> Result<()> {
+        let i64_type = self.context.i64_type();
+
+        let counter_ptr = self.lookup_percpu_value_ptr("event_loss_counters", 0)?;
+        let current_fn = self
+            .builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| {
+                CodeGenError::LLVMError(
+                    "Cannot increment event loss counter outside a function".to_string(),
+                )
+            })?;
+        let counter_hit_block = self
+            .context
+            .append_basic_block(current_fn, "event_loss_counter_hit");
+        let counter_done_block = self
+            .context
+            .append_basic_block(current_fn, "event_loss_counter_done");
+        let is_null = self
+            .builder
+            .build_is_null(counter_ptr, "event_loss_counter_is_null")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(is_null, counter_done_block, counter_hit_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(counter_hit_block);
+        let current = self
+            .builder
+            .build_load(i64_type, counter_ptr, "event_loss_counter")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let next = self
+            .builder
+            .build_int_add(
+                current,
+                i64_type.const_int(1, false),
+                "event_loss_counter_next",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(counter_ptr, next)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(counter_done_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(counter_done_block);
+        Ok(())
+    }
+
+    fn record_event_output_loss_on_error(&mut self, output_result: IntValue<'ctx>) -> Result<()> {
+        let i64_type = self.context.i64_type();
+        let current_fn = self
+            .builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| {
+                CodeGenError::LLVMError(
+                    "Cannot record event output loss outside a function".to_string(),
+                )
+            })?;
+        let output_failed = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                output_result,
+                i64_type.const_zero(),
+                "event_output_failed",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let loss_block = self
+            .context
+            .append_basic_block(current_fn, "event_output_loss");
+        let cont_block = self
+            .context
+            .append_basic_block(current_fn, "event_output_after_loss_check");
+        self.builder
+            .build_conditional_branch(output_failed, loss_block, cont_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(loss_block);
+        self.increment_event_loss_counter()?;
+        self.builder
+            .build_unconditional_branch(cont_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(cont_block);
+        Ok(())
+    }
+
     /// Create ringbuf output using bpf_ringbuf_output (internal implementation)
     fn create_ringbuf_output_internal(
         &mut self,
@@ -1191,12 +1283,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             i64_type.const_zero().into(), // flags = 0
         ];
 
-        let _result = self.create_bpf_helper_call(
+        let result = self.create_bpf_helper_call(
             BPF_FUNC_ringbuf_output as u64,
             &args,
             i64_type.into(),
             "ringbuf_output",
         )?;
+        let BasicValueEnum::IntValue(result) = result else {
+            return Err(CodeGenError::LLVMError(
+                "bpf_ringbuf_output did not return integer".to_string(),
+            ));
+        };
+        self.record_event_output_loss_on_error(result)?;
 
         Ok(())
     }
@@ -1225,12 +1323,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             i64_type.const_zero().into(), // flags = 0
         ];
 
-        let _result = self.create_bpf_helper_call(
+        let result = self.create_bpf_helper_call(
             BPF_FUNC_ringbuf_output as u64,
             &args,
             i64_type.into(),
             "ringbuf_output",
         )?;
+        let BasicValueEnum::IntValue(result) = result else {
+            return Err(CodeGenError::LLVMError(
+                "bpf_ringbuf_output did not return integer".to_string(),
+            ));
+        };
+        self.record_event_output_loss_on_error(result)?;
 
         Ok(())
     }
@@ -1334,12 +1438,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             size.into(),
         ];
 
-        let _result = self.create_bpf_helper_call(
+        let result = self.create_bpf_helper_call(
             BPF_FUNC_perf_event_output as u64,
             &args,
             i64_type.into(),
             "perf_event_output",
         )?;
+        let BasicValueEnum::IntValue(result) = result else {
+            return Err(CodeGenError::LLVMError(
+                "bpf_perf_event_output did not return integer".to_string(),
+            ));
+        };
+        self.record_event_output_loss_on_error(result)?;
 
         Ok(())
     }
