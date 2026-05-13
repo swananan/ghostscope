@@ -1141,6 +1141,11 @@ impl ExpressionEvaluator {
                     },
                 ))
             }
+            EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(addr)) => {
+                Ok(EvaluationResult::DirectValue(
+                    DirectValueResult::AbsoluteAddress(checked_add_u64(addr, byte_offset)?),
+                ))
+            }
             EvaluationResult::Optimized => Ok(EvaluationResult::Optimized),
             EvaluationResult::Composite(_) => Err(anyhow::anyhow!(
                 "DW_OP_implicit_pointer target is a composite location"
@@ -1904,6 +1909,20 @@ mod tests {
             0x10,
         )
         .expect("static address should convert to an implicit pointer value");
+
+        assert_eq!(
+            result,
+            EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1244))
+        );
+    }
+
+    #[test]
+    fn implicit_pointer_accepts_target_absolute_address_value() {
+        let result = ExpressionEvaluator::addressable_location_to_pointer_value(
+            EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1234)),
+            0x10,
+        )
+        .expect("static address values should convert to an implicit pointer value");
 
         assert_eq!(
             result,
