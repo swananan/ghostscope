@@ -16,7 +16,7 @@
 //! adapts to the event source type automatically.
 
 use aya::{
-    maps::{perf::PerfEventArray, MapData, RingBuf},
+    maps::{perf::PerfEventArray, MapData, PerCpuArray, RingBuf},
     programs::{uprobe::UProbeLinkId, ProgramError, UProbe},
     Ebpf, EbpfLoader, VerifierLogLevel,
 };
@@ -36,6 +36,26 @@ use tracing::{debug, error, info, warn};
 const MAX_EVENTS_PER_WAIT: usize = 128;
 const MAX_RINGBUF_RECORDS_PER_WAIT: usize = 256;
 const PERF_READ_BATCH_SIZE: usize = 64;
+const EVENT_LOSS_OUTPUT_FAILURES_KEY: u32 = 0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EventLossStats {
+    pub output_failures: u64,
+}
+
+impl EventLossStats {
+    pub fn is_empty(self) -> bool {
+        self.output_failures == 0
+    }
+
+    pub fn saturating_sub(self, previous: Self) -> Self {
+        Self {
+            output_failures: self
+                .output_failures
+                .saturating_sub(previous.output_failures),
+        }
+    }
+}
 
 // Export kernel capabilities detection
 mod kernel_caps;
@@ -182,6 +202,8 @@ pub struct GhostScopeLoader {
     bpf: Ebpf,
     /// Event output map (RingBuf or PerfEventArray)
     event_map: Option<EventMap>,
+    /// eBPF-side output helper failure counters.
+    event_loss_counters: Option<PerCpuArray<MapData, u64>>,
     /// Active uprobe link
     uprobe_link: Option<UProbeLinkId>,
     /// Stored parameters for re-attaching uprobe
@@ -199,6 +221,7 @@ impl std::fmt::Debug for GhostScopeLoader {
         f.debug_struct("GhostScopeLoader")
             .field("bpf", &"<eBPF object>")
             .field("event_map", &self.event_map.is_some())
+            .field("event_loss_counters", &self.event_loss_counters.is_some())
             .field("uprobe_attached", &self.uprobe_link.is_some())
             .field("attachment_params", &self.attachment_params.is_some())
             .finish()
@@ -274,6 +297,7 @@ impl GhostScopeLoader {
                 Ok(Self {
                     bpf,
                     event_map: None,
+                    event_loss_counters: None,
                     uprobe_link: None,
                     attachment_params: None,
                     parser: StreamingTraceParser::new(),
@@ -602,6 +626,16 @@ impl GhostScopeLoader {
             ));
         };
 
+        self.event_loss_counters = if let Some(map) = self.bpf.take_map("event_loss_counters") {
+            info!("Initializing eBPF event loss counter map");
+            Some(map.try_into().map_err(|e| {
+                LoaderError::Generic(format!("Failed to convert event_loss_counters map: {e}"))
+            })?)
+        } else {
+            warn!("No eBPF event loss counter map found; kernel output loss stats unavailable");
+            None
+        };
+
         // Set parser event source based on map type
         let event_source = match &event_map {
             EventMap::RingBuf(_) => {
@@ -925,6 +959,22 @@ impl GhostScopeLoader {
         }
 
         Ok(events)
+    }
+
+    pub fn read_event_loss_stats(&self) -> Result<Option<EventLossStats>> {
+        let Some(counters) = &self.event_loss_counters else {
+            return Ok(None);
+        };
+
+        let values = counters
+            .get(&EVENT_LOSS_OUTPUT_FAILURES_KEY, 0)
+            .map_err(|e| {
+                LoaderError::Generic(format!("Failed to read event_loss_counters map: {e}"))
+            })?;
+
+        Ok(Some(EventLossStats {
+            output_failures: values.iter().copied().sum(),
+        }))
     }
 
     /// Set the trace context for parsing trace events

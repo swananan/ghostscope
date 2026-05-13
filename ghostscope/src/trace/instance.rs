@@ -1,5 +1,5 @@
 use anyhow::Result;
-use ghostscope_loader::GhostScopeLoader;
+use ghostscope_loader::{EventLossStats, GhostScopeLoader};
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -197,6 +197,14 @@ impl TraceInstance {
         } else {
             error!("No eBPF loader available for trace {}", self.trace_id);
             Err(anyhow::anyhow!("No eBPF loader available"))
+        }
+    }
+
+    pub fn read_event_loss_stats(&self) -> Result<Option<EventLossStats>> {
+        if let Some(loader) = &self.loader {
+            loader.read_event_loss_stats().map_err(Into::into)
+        } else {
+            Ok(None)
         }
     }
 }

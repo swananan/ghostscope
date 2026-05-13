@@ -3286,6 +3286,19 @@ impl App {
                     queue_capacity,
                 );
             }
+            RuntimeStatus::EbpfOutputLoss {
+                trace_id,
+                target_display,
+                lost_since_last,
+                lost_total,
+            } => {
+                self.show_ebpf_output_loss_alert(
+                    trace_id,
+                    target_display,
+                    lost_since_last,
+                    lost_total,
+                );
+            }
             _ => {
                 // Handle other runtime status messages (delegate to command panel or other components)
                 // For now, pass them to command panel for display
@@ -3379,6 +3392,33 @@ impl App {
 
         self.add_ebpf_runtime_warning(format!(
             "Warning: TUI trace queue saturated; dropped {dropped_since_last} events before display in last 1s (total {dropped_total}, capacity {queue_capacity})"
+        ));
+    }
+
+    fn show_ebpf_output_loss_alert(
+        &mut self,
+        trace_id: u32,
+        target_display: String,
+        lost_since_last: u64,
+        lost_total: u64,
+    ) {
+        let content = format!(
+            "⚠ eBPF output helper failed: trace #{trace_id} ({target_display}) lost {lost_since_last} events in kernel before userspace delivery (total {lost_total})"
+        );
+        let styled_lines =
+            crate::components::command_panel::ResponseFormatter::style_generic_message_lines(
+                &content,
+            );
+        crate::components::command_panel::ResponseFormatter::upsert_runtime_alert_with_style(
+            &mut self.state.command_panel,
+            content,
+            Some(styled_lines),
+            crate::action::ResponseType::Warning,
+        );
+        self.state.command_renderer.mark_pending_updates();
+
+        self.add_ebpf_runtime_warning(format!(
+            "Warning: eBPF output helper failed; trace #{trace_id} ({target_display}) lost {lost_since_last} events in kernel before userspace delivery (total {lost_total})"
         ));
     }
 

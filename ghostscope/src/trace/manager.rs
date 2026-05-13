@@ -3,7 +3,7 @@ use crate::trace::snapshot::{TraceSnapshot, TraceSummary};
 use anyhow::Result;
 use futures::future::{select_all, BoxFuture};
 use futures::FutureExt;
-use ghostscope_loader::GhostScopeLoader;
+use ghostscope_loader::{EventLossStats, GhostScopeLoader};
 use ghostscope_protocol::ParsedTraceEvent;
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +22,7 @@ pub struct TraceManager {
     // Track creation timestamps for duration calculation
     trace_created_times: HashMap<u32, u64>,
     pending_events: VecDeque<ParsedTraceEvent>,
+    last_reported_event_loss: HashMap<u32, EventLossStats>,
 }
 
 /// Parameters for adding a new trace with a pre-allocated ID
@@ -39,6 +40,14 @@ pub struct AddTraceParams {
     pub address_global_index: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventLossReport {
+    pub trace_id: u32,
+    pub target_display: String,
+    pub lost_since_last: u64,
+    pub lost_total: u64,
+}
+
 impl TraceManager {
     pub fn new() -> Self {
         Self {
@@ -48,6 +57,7 @@ impl TraceManager {
             no_trace_wait_notify: Notify::new(),
             trace_created_times: HashMap::new(),
             pending_events: VecDeque::new(),
+            last_reported_event_loss: HashMap::new(),
         }
     }
 
@@ -110,6 +120,7 @@ impl TraceManager {
             self.trace_created_times.remove(&trace_id);
             self.pending_events
                 .retain(|event| event.trace_id != trace_id as u64);
+            self.last_reported_event_loss.remove(&trace_id);
 
             info!("Deleted trace {} with target '{}'", trace_id, trace.target);
             Ok(())
@@ -125,6 +136,7 @@ impl TraceManager {
         self.target_to_trace_id.clear();
         self.trace_created_times.clear();
         self.pending_events.clear();
+        self.last_reported_event_loss.clear();
         info!("Deleted all {} traces", count);
         Ok(count)
     }
@@ -216,6 +228,44 @@ impl TraceManager {
             active,
             disabled,
         }
+    }
+
+    pub fn collect_event_loss_reports(&mut self) -> Vec<EventLossReport> {
+        let mut reports = Vec::new();
+
+        for (&trace_id, trace) in self.traces.iter() {
+            let stats = match trace.read_event_loss_stats() {
+                Ok(Some(stats)) => stats,
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(
+                        "Failed to read eBPF event loss counters for trace {}: {}",
+                        trace_id, err
+                    );
+                    continue;
+                }
+            };
+
+            let previous = self
+                .last_reported_event_loss
+                .get(&trace_id)
+                .copied()
+                .unwrap_or_default();
+            let delta = stats.saturating_sub(previous);
+            if delta.is_empty() {
+                continue;
+            }
+
+            self.last_reported_event_loss.insert(trace_id, stats);
+            reports.push(EventLossReport {
+                trace_id,
+                target_display: trace.target_display.clone(),
+                lost_since_last: delta.output_failures,
+                lost_total: stats.output_failures,
+            });
+        }
+
+        reports
     }
 
     /// Wait for the first trace to be enabled (for TUI mode to avoid busy waiting)

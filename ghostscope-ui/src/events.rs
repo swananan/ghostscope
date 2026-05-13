@@ -923,6 +923,13 @@ pub enum RuntimeStatus {
         dropped_total: u64,
         queue_capacity: usize,
     },
+    /// eBPF program failed to write events into the kernel output buffer.
+    EbpfOutputLoss {
+        trace_id: u32,
+        target_display: String,
+        lost_since_last: u64,
+        lost_total: u64,
+    },
 }
 
 /// Statistics for a loaded module
