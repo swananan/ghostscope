@@ -19,15 +19,15 @@ Inner g_slots[2] = {{10, 1.0}, {20, 2.0}}; // .data
 
 __attribute__((noinline)) static void tick_once(int i) {
     // Local aliases to globals to expose via DWARF at this PC
-    GlobalState* s = &G_STATE;
-    GlobalState* ls = &LIB_STATE;
-    volatile int* p_s_internal = &s_internal;
-    volatile int* p_s_bss = &s_bss_counter;
-    volatile int* p_lib_internal = lib_get_internal_counter_ptr();
-    const char* gm = g_message;
-    const char* lm = lib_message;
-    char* gb = g_bss_buffer;
-    char* lb = lib_bss;
+    GlobalState* volatile s = &G_STATE;
+    GlobalState* volatile ls = &LIB_STATE;
+    volatile int* volatile p_s_internal = &s_internal;
+    volatile int* volatile p_s_bss = &s_bss_counter;
+    volatile int* volatile p_lib_internal = lib_get_internal_counter_ptr();
+    const char* volatile gm = g_message;
+    const char* volatile lm = lib_message;
+    char* volatile gb = g_bss_buffer;
+    char* volatile lb = lib_bss;
     // mutate executable globals
     g_counter += 1;
     s_internal += 2; module_duplicate_counter += 11;
