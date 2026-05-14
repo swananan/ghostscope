@@ -1,7 +1,5 @@
 //! Precise semantic availability and diagnostic categories.
 
-use crate::core::EvaluationResult;
-
 /// Whether a semantic result is usable at the requested PC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Availability {
@@ -17,30 +15,6 @@ pub enum Availability {
 impl Availability {
     pub fn is_available(&self) -> bool {
         matches!(self, Self::Available | Self::PartiallyAvailable)
-    }
-
-    pub(crate) fn from_evaluation_result(result: &EvaluationResult) -> Self {
-        match result {
-            EvaluationResult::Optimized => Self::OptimizedOut,
-            EvaluationResult::Composite(pieces) => {
-                if pieces.is_empty() {
-                    Self::Available
-                } else if pieces
-                    .iter()
-                    .all(|piece| matches!(piece.location, EvaluationResult::Optimized))
-                {
-                    Self::OptimizedOut
-                } else if pieces
-                    .iter()
-                    .any(|piece| matches!(piece.location, EvaluationResult::Optimized))
-                {
-                    Self::PartiallyAvailable
-                } else {
-                    Self::Available
-                }
-            }
-            _ => Self::Available,
-        }
     }
 }
 
@@ -148,33 +122,33 @@ pub enum VerifierRisk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{DirectValueResult, PieceResult};
+    use crate::core::{PieceLocation, VariableLocation};
 
     #[test]
-    fn optimized_result_is_unavailable() {
+    fn optimized_location_is_unavailable() {
         assert_eq!(
-            Availability::from_evaluation_result(&EvaluationResult::Optimized),
+            Availability::from_variable_location(&VariableLocation::OptimizedOut),
             Availability::OptimizedOut
         );
     }
 
     #[test]
-    fn mixed_composite_result_is_partially_available() {
-        let result = EvaluationResult::Composite(vec![
-            PieceResult {
-                location: EvaluationResult::DirectValue(DirectValueResult::RegisterValue(0)),
-                size: 4,
-                bit_offset: None,
+    fn mixed_composite_location_is_partially_available() {
+        let location = VariableLocation::Pieces(vec![
+            PieceLocation {
+                location: Box::new(VariableLocation::RegisterValue { dwarf_reg: 0 }),
+                bit_size: 32,
+                bit_offset: 0,
             },
-            PieceResult {
-                location: EvaluationResult::Optimized,
-                size: 4,
-                bit_offset: Some(32),
+            PieceLocation {
+                location: Box::new(VariableLocation::OptimizedOut),
+                bit_size: 32,
+                bit_offset: 32,
             },
         ]);
 
         assert_eq!(
-            Availability::from_evaluation_result(&result),
+            Availability::from_variable_location(&location),
             Availability::PartiallyAvailable
         );
     }
