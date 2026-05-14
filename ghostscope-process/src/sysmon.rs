@@ -373,6 +373,8 @@ fn run_sysmon_loop(
     let mut bpf = loader.load(obj)?;
 
     // Configure optional exec comm filter when targeting executables (-t binary).
+    // This is only a first-pass narrowing filter in BPF; userspace still validates
+    // the proc comm and target module/path before inserting offsets or allowed PIDs.
     {
         let mut filter_bytes = [0u8; 16];
         let mut filter_len = 0usize;
@@ -380,7 +382,10 @@ fn run_sysmon_loop(
             if !crate::util::is_shared_object(tpath) {
                 if let Some(name) = tpath.file_name().and_then(|s| s.to_str()) {
                     let bytes = name.as_bytes();
-                    let len = bytes.len().min(filter_bytes.len());
+                    // task->comm stores at most TASK_COMM_LEN - 1 visible bytes plus NUL.
+                    // Keep the filter null-terminated so long executable basenames compare
+                    // against the same truncation that bpf_get_current_comm() returns.
+                    let len = bytes.len().min(filter_bytes.len() - 1);
                     filter_bytes[..len].copy_from_slice(&bytes[..len]);
                     filter_len = len;
                 } else {
@@ -471,16 +476,22 @@ fn run_sysmon_loop(
         }
     }
     tracing::info!("Sysmon: setup complete");
-    let mut last_module_refresh = Instant::now()
-        .checked_sub(MODULE_REFRESH_INTERVAL)
-        .unwrap_or_else(Instant::now);
+    // Initial prefill already ran above. Do not make the first periodic module
+    // refresh immediately due: for `-t executable`, the exec event is the fast
+    // path that inserts proc_module_offsets and allowed_pids. A fallback /proc
+    // scan here can delay a short-lived target past its only probe.
+    let mut last_module_refresh = Instant::now();
 
     // Event loop: prefer ringbuf; fallback to perf
     if let Some(map) = bpf.take_map("sysmon_events") {
         let mut rb: RingBuf<MapData> = map.try_into()?;
         loop {
             let mut had_event = false;
-            if let Some(item) = rb.next() {
+            // Drain queued lifecycle events before periodic refresh. In the
+            // short-lived `-t executable` path, sched_process_exec must be
+            // handled promptly so offsets are ready before the first uprobe.
+            while let Some(item) = rb.next() {
+                had_event = true;
                 if item.len() == core::mem::size_of::<SysEvent>() {
                     let ev = unsafe { core::ptr::read_unaligned(item.as_ptr() as *const SysEvent) };
                     if let Err(e) = ProcessSysmon::handle_event(&mgr, &target, &pending, &ev) {
@@ -492,7 +503,6 @@ fn run_sysmon_loop(
                         );
                     }
                     let _ = tx.send(ev);
-                    had_event = true;
                 }
             }
             poll_pending_offsets(&mgr, &pending);

@@ -366,6 +366,72 @@ trace globals_program.c:32 {
 
 #[tokio::test]
 #[serial(globals_target)]
+async fn test_t_mode_executable_late_start_short_lived_long_comm_globals_prints(
+) -> anyhow::Result<()> {
+    init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
+
+    let binary_path = FIXTURES.get_test_binary("short_lived_long_comm_program")?;
+    let basename = binary_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    assert!(basename.len() > 15);
+    let target_sandbox = prepare_late_start_launcher(&binary_path)?;
+
+    let script = r#"
+trace short_lived_probe {
+    print "VALUE:{}", short_lived_global;
+}
+"#;
+
+    let (exit_code, stdout, stderr, target_status) = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_target(&binary_path)
+        .timeout_secs(2)
+        .run_after_ready(|| {
+            // This is a pure `-t` regression: start the short-lived target in
+            // the configured target sandbox, but do not build a TargetHandle.
+            // The handle path waits for PID mapping state that this test does
+            // not need and the process may exit before that settle completes.
+            let binary_path = binary_path.clone();
+            let target_sandbox = target_sandbox.clone();
+            async move {
+                let bin_dir = binary_path
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("short-lived target has no parent directory"))?;
+                let output = common::targets::run_binary_to_completion(
+                    &target_sandbox,
+                    &binary_path,
+                    Some(bin_dir),
+                )?;
+                Ok(output.status)
+            }
+        })
+        .await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        target_status.success(),
+        "short-lived target exited with {target_status}; stderr={stderr} stdout={stdout}"
+    );
+
+    let re = Regex::new(r"VALUE:([0-9]+)").unwrap();
+    let saw_global = stdout
+        .lines()
+        .any(|line| re.captures(line).and_then(|c| c[1].parse::<i32>().ok()) == Some(41));
+    assert!(
+        saw_global,
+        "Late-start short-lived long comm: expected global output. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(globals_target)]
 async fn test_t_mode_library_late_start_globals_prints() -> anyhow::Result<()> {
     init();
     if skip_if_nested_t_mode_unsupported() {

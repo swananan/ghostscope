@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -173,6 +174,34 @@ pub(crate) fn ensure_target_binary_ready_for_default_sandbox(
     Ok(sandbox)
 }
 
+pub(crate) fn run_binary_to_completion(
+    sandbox: &SandboxHandle,
+    binary_path: &Path,
+    working_dir: Option<&Path>,
+) -> Result<Output> {
+    let binary_path = sandbox.path_in_sandbox(binary_path)?;
+    let working_dir = working_dir
+        .map(|path| sandbox.path_in_sandbox(path))
+        .transpose()?
+        .or_else(|| binary_path.parent().map(Path::to_path_buf));
+
+    // This helper intentionally does not construct TargetHandle. Short-lived
+    // `-t` targets do not need a PID handle, and TargetLauncher waits for
+    // `/proc/<pid>/status` so it can resolve PID mappings for `-p`-style
+    // assertions. That PID settle path can outlive a process that only fires
+    // one probe, while `-t` only needs the binary to execute in the target
+    // sandbox topology.
+    let command = match working_dir {
+        Some(dir) => format!(
+            "cd {} && exec {}",
+            shell_quote(&dir.display().to_string()),
+            shell_quote(&binary_path.display().to_string())
+        ),
+        None => format!("exec {}", shell_quote(&binary_path.display().to_string())),
+    };
+    sandbox.run_shell(&command)
+}
+
 impl TargetHandle {
     pub fn sandbox(&self) -> &SandboxHandle {
         &self.inner.sandbox
@@ -337,6 +366,10 @@ async fn spawn_binary_target(
             },
         }),
     })
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 
 fn default_target_launch_mode() -> Result<TargetLaunchMode> {
