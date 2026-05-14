@@ -1,8 +1,6 @@
 //! Neutral semantic plans produced before runtime-specific lowering.
 
-use crate::core::{
-    Availability, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, PlanExprOp,
-};
+use crate::core::{plan_expr_steps_to_expression, Availability, MemoryAccessSize, PlanExprOp};
 use std::fmt;
 
 /// Address expression that can be evaluated by a later lowering layer.
@@ -66,63 +64,11 @@ impl ParsedLocation {
             availability,
         }
     }
-
-    pub(crate) fn from_evaluation_result(result: &EvaluationResult) -> Self {
-        let location = VariableLocation::from_evaluation_result(result);
-        Self::new(location)
-    }
 }
 
 impl VariableLocation {
     pub(crate) fn availability(&self) -> Availability {
         Availability::from_variable_location(self)
-    }
-
-    pub(crate) fn from_evaluation_result(result: &EvaluationResult) -> Self {
-        match result {
-            EvaluationResult::DirectValue(direct) => Self::from_direct_value(direct),
-            EvaluationResult::MemoryLocation(location) => Self::from_location_result(location),
-            EvaluationResult::Optimized => Self::OptimizedOut,
-            EvaluationResult::Composite(pieces) => Self::Pieces(
-                pieces
-                    .iter()
-                    .map(|piece| PieceLocation {
-                        bit_offset: piece.bit_offset.unwrap_or(0).min(u32::MAX as u64) as u32,
-                        bit_size: piece.size.saturating_mul(8).min(u32::MAX as u64) as u32,
-                        location: Box::new(Self::from_evaluation_result(&piece.location)),
-                    })
-                    .collect(),
-            ),
-        }
-    }
-
-    fn from_direct_value(value: &DirectValueResult) -> Self {
-        match value {
-            DirectValueResult::Constant(value) => {
-                Self::ComputedValue(vec![PlanExprOp::PushConstant(*value)])
-            }
-            DirectValueResult::AbsoluteAddress(address) => {
-                Self::AbsoluteAddressValue(AddressExpr::constant(*address))
-            }
-            DirectValueResult::ImplicitValue(bytes) => Self::ImplicitValue(bytes.clone()),
-            DirectValueResult::RegisterValue(dwarf_reg) => Self::RegisterValue {
-                dwarf_reg: *dwarf_reg,
-            },
-            DirectValueResult::ComputedValue { steps, .. } => Self::ComputedValue(steps.clone()),
-        }
-    }
-
-    fn from_location_result(location: &LocationResult) -> Self {
-        match location {
-            LocationResult::Address(address) => Self::Address(AddressExpr::constant(*address)),
-            LocationResult::RegisterAddress {
-                register, offset, ..
-            } => Self::RegisterAddress {
-                dwarf_reg: *register,
-                offset: offset.unwrap_or(0),
-            },
-            LocationResult::ComputedLocation { steps } => Self::ComputedAddress(steps.clone()),
-        }
     }
 }
 
@@ -159,29 +105,17 @@ impl fmt::Display for VariableLocation {
                 write!(f, "[Memory] {}", location_display_for_address_expr(expr))
             }
             VariableLocation::AbsoluteAddressValue(expr) => {
-                write!(f, "[DirectValue] ")?;
-                if let [PlanExprOp::PushConstant(address)] = expr.steps.as_slice() {
-                    DirectValueResult::AbsoluteAddress(*address as u64).fmt(f)
-                } else {
-                    DirectValueResult::ComputedValue {
-                        steps: expr.steps.clone(),
-                        result_size: MemoryAccessSize::U64,
-                    }
-                    .fmt(f)
-                }
+                write!(f, "[DirectValue] {}", address_value_display(expr))
             }
             VariableLocation::RegisterValue { dwarf_reg } => {
-                write!(f, "[DirectValue] ")?;
-                DirectValueResult::RegisterValue(*dwarf_reg).fmt(f)
+                write!(f, "[DirectValue] {}", register_display(*dwarf_reg))
             }
             VariableLocation::RegisterAddress { dwarf_reg, offset } => {
-                write!(f, "[Memory] ")?;
-                LocationResult::RegisterAddress {
-                    register: *dwarf_reg,
-                    offset: Some(*offset),
-                    size: None,
-                }
-                .fmt(f)
+                write!(
+                    f,
+                    "[Memory] {}",
+                    register_address_display(*dwarf_reg, *offset)
+                )
             }
             VariableLocation::FrameBaseRelative { offset } => {
                 if *offset >= 0 {
@@ -191,23 +125,13 @@ impl fmt::Display for VariableLocation {
                 }
             }
             VariableLocation::ComputedValue(steps) => {
-                write!(f, "[DirectValue] ")?;
-                DirectValueResult::ComputedValue {
-                    steps: steps.clone(),
-                    result_size: MemoryAccessSize::U64,
-                }
-                .fmt(f)
+                write!(f, "[DirectValue] ={}", plan_expr_steps_to_expression(steps))
             }
             VariableLocation::ComputedAddress(steps) => {
-                write!(f, "[Memory] ")?;
-                LocationResult::ComputedLocation {
-                    steps: steps.clone(),
-                }
-                .fmt(f)
+                write!(f, "[Memory] @[{}]", plan_expr_steps_to_expression(steps))
             }
             VariableLocation::ImplicitValue(bytes) => {
-                write!(f, "[DirectValue] ")?;
-                DirectValueResult::ImplicitValue(bytes.clone()).fmt(f)
+                write!(f, "[DirectValue] {}", implicit_value_display(bytes))
             }
             VariableLocation::Pieces(pieces) => write!(f, "Composite[{} pieces]", pieces.len()),
             VariableLocation::OptimizedOut => write!(f, "<optimized out>"),
@@ -218,15 +142,46 @@ impl fmt::Display for VariableLocation {
 
 fn location_display_for_address_expr(expr: &AddressExpr) -> String {
     if let [PlanExprOp::PushConstant(address)] = expr.steps.as_slice() {
-        return format!("{}", LocationResult::Address(*address as u64));
+        return format!("@0x{:x}", *address as u64);
     }
 
-    format!(
-        "{}",
-        LocationResult::ComputedLocation {
-            steps: expr.steps.clone()
-        }
-    )
+    format!("@[{}]", plan_expr_steps_to_expression(&expr.steps))
+}
+
+fn address_value_display(expr: &AddressExpr) -> String {
+    if let [PlanExprOp::PushConstant(address)] = expr.steps.as_slice() {
+        return format!("&@0x{:x}", *address as u64);
+    }
+
+    format!("={}", plan_expr_steps_to_expression(&expr.steps))
+}
+
+fn register_display(dwarf_reg: u16) -> String {
+    ghostscope_platform::register_mapping::dwarf_reg_to_name(dwarf_reg)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("r{dwarf_reg}"))
+}
+
+fn register_address_display(dwarf_reg: u16, offset: i64) -> String {
+    let reg_name = register_display(dwarf_reg);
+    if offset >= 0 {
+        format!("@[{reg_name}+{offset}]")
+    } else {
+        format!("@[{reg_name}{offset}]")
+    }
+}
+
+fn implicit_value_display(bytes: &[u8]) -> String {
+    if bytes.len() > 8 {
+        return format!("implicit[{} bytes]", bytes.len());
+    }
+
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("implicit[{hex}]")
 }
 
 /// A memory read requested by a future runtime lowering pass.
@@ -234,55 +189,4 @@ fn location_display_for_address_expr(expr: &AddressExpr) -> String {
 pub struct UserMemoryRead {
     pub address: AddressExpr,
     pub size: MemoryAccessSize,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::{DirectValueResult, PieceResult};
-
-    #[test]
-    fn converts_register_address_location() {
-        let result = EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
-            register: 6,
-            offset: Some(-16),
-            size: None,
-        });
-
-        assert_eq!(
-            VariableLocation::from_evaluation_result(&result),
-            VariableLocation::RegisterAddress {
-                dwarf_reg: 6,
-                offset: -16
-            }
-        );
-    }
-
-    #[test]
-    fn converts_absolute_address_value_as_rebasable_value() {
-        let result = EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1234));
-
-        assert_eq!(
-            VariableLocation::from_evaluation_result(&result),
-            VariableLocation::AbsoluteAddressValue(AddressExpr::constant(0x1234))
-        );
-    }
-
-    #[test]
-    fn converts_composite_pieces() {
-        let result = EvaluationResult::Composite(vec![PieceResult {
-            location: EvaluationResult::DirectValue(DirectValueResult::RegisterValue(0)),
-            size: 4,
-            bit_offset: Some(32),
-        }]);
-
-        assert_eq!(
-            VariableLocation::from_evaluation_result(&result),
-            VariableLocation::Pieces(vec![PieceLocation {
-                bit_offset: 32,
-                bit_size: 32,
-                location: Box::new(VariableLocation::RegisterValue { dwarf_reg: 0 }),
-            }])
-        );
-    }
 }

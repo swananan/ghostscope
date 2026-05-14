@@ -1,12 +1,12 @@
 //! DWARF expression evaluator
 //!
-//! Converts raw DWARF location expressions into the crate's internal evaluator
-//! representation before semantic planning lowers them into read plans.
+//! Converts raw DWARF location expressions into semantic variable locations or
+//! lower-level expression ops. Raw expression results stay inside this layer.
 
 use crate::binary::{DwarfEndian, DwarfReader};
 use crate::core::{
-    CfaResult, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, PieceResult,
-    ParsedLocation, PlanExprOp, Result,
+    AddressExpr, CfaResult, DirectValueResult, LocationResult, MemoryAccessSize, ParsedLocation,
+    PieceLocation, PieceResult, PlanExprOp, RawExpressionResult, Result, VariableLocation,
 };
 use crate::dwarf_expr::{errors as expr_errors, modes::DwarfExprMode};
 use crate::index::{CfiIndex, FunctionBlocks};
@@ -49,7 +49,7 @@ impl ExpressionEvaluator {
             cfi_index,
             0,
         )?;
-        Ok(ParsedLocation::from_evaluation_result(&result))
+        Ok(Self::parsed_location_from_result(&result))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -62,7 +62,7 @@ impl ExpressionEvaluator {
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
         depth: usize,
-    ) -> Result<EvaluationResult> {
+    ) -> Result<RawExpressionResult> {
         // Get DW_AT_location attribute (follow origins/specification for inlined/declared vars)
         let location_attr =
             resolve_attr_with_unit_origins(entry, unit, gimli::constants::DW_AT_location)?;
@@ -144,22 +144,22 @@ impl ExpressionEvaluator {
                 )? {
                     let res = match cv {
                         gimli::AttributeValue::Udata(u) => {
-                            EvaluationResult::DirectValue(DirectValueResult::Constant(u as i64))
+                            RawExpressionResult::DirectValue(DirectValueResult::Constant(u as i64))
                         }
                         gimli::AttributeValue::Data1(d) => {
-                            EvaluationResult::DirectValue(DirectValueResult::Constant(d as i64))
+                            RawExpressionResult::DirectValue(DirectValueResult::Constant(d as i64))
                         }
                         gimli::AttributeValue::Data2(d) => {
-                            EvaluationResult::DirectValue(DirectValueResult::Constant(d as i64))
+                            RawExpressionResult::DirectValue(DirectValueResult::Constant(d as i64))
                         }
                         gimli::AttributeValue::Data4(d) => {
-                            EvaluationResult::DirectValue(DirectValueResult::Constant(d as i64))
+                            RawExpressionResult::DirectValue(DirectValueResult::Constant(d as i64))
                         }
                         gimli::AttributeValue::Data8(d) => {
-                            EvaluationResult::DirectValue(DirectValueResult::Constant(d as i64))
+                            RawExpressionResult::DirectValue(DirectValueResult::Constant(d as i64))
                         }
                         gimli::AttributeValue::Sdata(s) => {
-                            EvaluationResult::DirectValue(DirectValueResult::Constant(s))
+                            RawExpressionResult::DirectValue(DirectValueResult::Constant(s))
                         }
                         gimli::AttributeValue::Exprloc(expr) => {
                             // Some compilers may encode an implicit value via expression
@@ -175,21 +175,21 @@ impl ExpressionEvaluator {
                                 cfi_index,
                                 depth,
                             )? {
-                                EvaluationResult::DirectValue(v) => {
-                                    EvaluationResult::DirectValue(v)
+                                RawExpressionResult::DirectValue(v) => {
+                                    RawExpressionResult::DirectValue(v)
                                 }
                                 other => other,
                             }
                         }
                         gimli::AttributeValue::Block(bytes) => match bytes.to_slice() {
-                            Ok(b) => EvaluationResult::DirectValue(
+                            Ok(b) => RawExpressionResult::DirectValue(
                                 DirectValueResult::ImplicitValue(b.to_vec()),
                             ),
-                            Err(_) => EvaluationResult::Optimized,
+                            Err(_) => RawExpressionResult::Optimized,
                         },
                         other => {
                             debug!("Unhandled DW_AT_const_value form: {:?}", other);
-                            EvaluationResult::Optimized
+                            RawExpressionResult::Optimized
                         }
                     };
                     return Ok(res);
@@ -197,11 +197,11 @@ impl ExpressionEvaluator {
 
                 // No location means optimized out
                 trace!("No DW_AT_location attribute (even via origins); variable optimized out");
-                Ok(EvaluationResult::Optimized)
+                Ok(RawExpressionResult::Optimized)
             }
             Some(other) => {
                 warn!("Unexpected location attribute type: {:?}", other);
-                Ok(EvaluationResult::Optimized)
+                Ok(RawExpressionResult::Optimized)
             }
         }
     }
@@ -216,7 +216,7 @@ impl ExpressionEvaluator {
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
-    ) -> Result<EvaluationResult> {
+    ) -> Result<RawExpressionResult> {
         Self::parse_expression_with_context(
             expr_bytes,
             endian,
@@ -252,7 +252,7 @@ impl ExpressionEvaluator {
             function_context,
             cfi_index,
         )?;
-        Self::evaluation_result_to_steps(evaluation)
+        Self::raw_expression_result_to_steps(evaluation)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -276,7 +276,7 @@ impl ExpressionEvaluator {
             function_context,
             cfi_index,
         )?;
-        Ok(Self::evaluation_result_to_cfa(evaluation))
+        Ok(Self::raw_expression_result_to_cfa(evaluation))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -298,7 +298,7 @@ impl ExpressionEvaluator {
             function_context,
             cfi_index,
         )?;
-        Ok(Self::evaluation_result_to_cfa(evaluation))
+        Ok(Self::raw_expression_result_to_cfa(evaluation))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -313,9 +313,9 @@ impl ExpressionEvaluator {
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
         depth: usize,
-    ) -> Result<EvaluationResult> {
+    ) -> Result<RawExpressionResult> {
         if expr_bytes.is_empty() {
-            return Ok(EvaluationResult::Optimized);
+            return Ok(RawExpressionResult::Optimized);
         }
 
         // Parse all expressions through unified handler
@@ -333,46 +333,46 @@ impl ExpressionEvaluator {
         )
     }
 
-    fn evaluation_result_to_steps(evaluation: EvaluationResult) -> Result<Vec<PlanExprOp>> {
+    fn raw_expression_result_to_steps(evaluation: RawExpressionResult) -> Result<Vec<PlanExprOp>> {
         match evaluation {
-            EvaluationResult::DirectValue(DirectValueResult::RegisterValue(register)) => {
+            RawExpressionResult::DirectValue(DirectValueResult::RegisterValue(register)) => {
                 Ok(vec![PlanExprOp::LoadRegister(register)])
             }
-            EvaluationResult::DirectValue(DirectValueResult::Constant(value)) => {
+            RawExpressionResult::DirectValue(DirectValueResult::Constant(value)) => {
                 Ok(vec![PlanExprOp::PushConstant(value)])
             }
-            EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(address)) => {
+            RawExpressionResult::DirectValue(DirectValueResult::AbsoluteAddress(address)) => {
                 Ok(vec![PlanExprOp::PushConstant(address as i64)])
             }
-            EvaluationResult::DirectValue(DirectValueResult::ComputedValue { steps, .. }) => {
-                Ok(steps)
-            }
-            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+            RawExpressionResult::DirectValue(DirectValueResult::ComputedValue {
+                steps, ..
+            }) => Ok(steps),
+            RawExpressionResult::MemoryLocation(LocationResult::RegisterAddress {
                 register,
                 offset,
                 ..
             }) => Ok(Self::register_address_steps(register, offset)),
-            EvaluationResult::MemoryLocation(LocationResult::Address(address)) => {
+            RawExpressionResult::MemoryLocation(LocationResult::Address(address)) => {
                 Ok(vec![PlanExprOp::PushConstant(address as i64)])
             }
-            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
+            RawExpressionResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
                 Ok(steps)
             }
-            EvaluationResult::DirectValue(DirectValueResult::ImplicitValue(_)) => Err(
+            RawExpressionResult::DirectValue(DirectValueResult::ImplicitValue(_)) => Err(
                 anyhow::anyhow!("DWARF expression lowered to implicit bytes, not PlanExprOp[]"),
             ),
-            EvaluationResult::Optimized => Err(anyhow::anyhow!(
+            RawExpressionResult::Optimized => Err(anyhow::anyhow!(
                 "DWARF expression optimized out, no PlanExprOp[]"
             )),
-            EvaluationResult::Composite(_) => Err(anyhow::anyhow!(
+            RawExpressionResult::Composite(_) => Err(anyhow::anyhow!(
                 "composite DWARF expression cannot be represented as one PlanExprOp[]"
             )),
         }
     }
 
-    fn evaluation_result_to_cfa(evaluation: EvaluationResult) -> Option<CfaResult> {
+    fn raw_expression_result_to_cfa(evaluation: RawExpressionResult) -> Option<CfaResult> {
         match evaluation {
-            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+            RawExpressionResult::MemoryLocation(LocationResult::RegisterAddress {
                 register,
                 offset,
                 ..
@@ -380,26 +380,26 @@ impl ExpressionEvaluator {
                 register,
                 offset: offset.unwrap_or(0),
             }),
-            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
+            RawExpressionResult::MemoryLocation(LocationResult::ComputedLocation { steps }) => {
                 Some(CfaResult::Expression { steps })
             }
-            EvaluationResult::MemoryLocation(LocationResult::Address(address)) => {
+            RawExpressionResult::MemoryLocation(LocationResult::Address(address)) => {
                 Some(CfaResult::Expression {
                     steps: vec![PlanExprOp::PushConstant(address as i64)],
                 })
             }
-            EvaluationResult::DirectValue(DirectValueResult::Constant(value)) => {
+            RawExpressionResult::DirectValue(DirectValueResult::Constant(value)) => {
                 Some(CfaResult::Expression {
                     steps: vec![PlanExprOp::PushConstant(value)],
                 })
             }
-            EvaluationResult::DirectValue(DirectValueResult::RegisterValue(register)) => {
+            RawExpressionResult::DirectValue(DirectValueResult::RegisterValue(register)) => {
                 Some(CfaResult::RegisterPlusOffset {
                     register,
                     offset: 0,
                 })
             }
-            EvaluationResult::DirectValue(DirectValueResult::ImplicitValue(bytes))
+            RawExpressionResult::DirectValue(DirectValueResult::ImplicitValue(bytes))
                 if bytes.len() == 8 =>
             {
                 let mut value = [0u8; 8];
@@ -419,6 +419,65 @@ impl ExpressionEvaluator {
             steps.push(PlanExprOp::Add);
         }
         steps
+    }
+
+    fn parsed_location_from_result(result: &RawExpressionResult) -> ParsedLocation {
+        ParsedLocation::new(Self::variable_location_from_result(result))
+    }
+
+    fn variable_location_from_result(result: &RawExpressionResult) -> VariableLocation {
+        match result {
+            RawExpressionResult::DirectValue(direct) => Self::direct_value_location(direct),
+            RawExpressionResult::MemoryLocation(location) => Self::memory_location(location),
+            RawExpressionResult::Optimized => VariableLocation::OptimizedOut,
+            RawExpressionResult::Composite(pieces) => VariableLocation::Pieces(
+                pieces
+                    .iter()
+                    .map(|piece| PieceLocation {
+                        bit_offset: piece.bit_offset.unwrap_or(0).min(u32::MAX as u64) as u32,
+                        bit_size: piece.size.saturating_mul(8).min(u32::MAX as u64) as u32,
+                        location: Box::new(Self::variable_location_from_result(&piece.location)),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn direct_value_location(value: &DirectValueResult) -> VariableLocation {
+        match value {
+            DirectValueResult::Constant(value) => {
+                VariableLocation::ComputedValue(vec![PlanExprOp::PushConstant(*value)])
+            }
+            DirectValueResult::AbsoluteAddress(address) => {
+                VariableLocation::AbsoluteAddressValue(AddressExpr::constant(*address))
+            }
+            DirectValueResult::ImplicitValue(bytes) => {
+                VariableLocation::ImplicitValue(bytes.clone())
+            }
+            DirectValueResult::RegisterValue(dwarf_reg) => VariableLocation::RegisterValue {
+                dwarf_reg: *dwarf_reg,
+            },
+            DirectValueResult::ComputedValue { steps, .. } => {
+                VariableLocation::ComputedValue(steps.clone())
+            }
+        }
+    }
+
+    fn memory_location(location: &LocationResult) -> VariableLocation {
+        match location {
+            LocationResult::Address(address) => {
+                VariableLocation::Address(AddressExpr::constant(*address))
+            }
+            LocationResult::RegisterAddress {
+                register, offset, ..
+            } => VariableLocation::RegisterAddress {
+                dwarf_reg: *register,
+                offset: offset.unwrap_or(0),
+            },
+            LocationResult::ComputedLocation { steps } => {
+                VariableLocation::ComputedAddress(steps.clone())
+            }
+        }
     }
 
     fn resolve_address_index(
@@ -477,7 +536,7 @@ impl ExpressionEvaluator {
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         depth: usize,
-    ) -> Result<EvaluationResult>
+    ) -> Result<RawExpressionResult>
     where
         R: Reader<Offset = usize>,
     {
@@ -637,11 +696,11 @@ impl ExpressionEvaluator {
             match &steps[0] {
                 PlanExprOp::LoadRegister(reg) => {
                     if has_stack_value {
-                        return Ok(EvaluationResult::DirectValue(
+                        return Ok(RawExpressionResult::DirectValue(
                             DirectValueResult::RegisterValue(*reg),
                         ));
                     }
-                    return Ok(EvaluationResult::MemoryLocation(
+                    return Ok(RawExpressionResult::MemoryLocation(
                         LocationResult::RegisterAddress {
                             register: *reg,
                             offset: None,
@@ -652,17 +711,17 @@ impl ExpressionEvaluator {
                 PlanExprOp::PushConstant(val) => {
                     if has_stack_value {
                         if has_link_time_address && *val >= 0 {
-                            return Ok(EvaluationResult::DirectValue(
+                            return Ok(RawExpressionResult::DirectValue(
                                 DirectValueResult::AbsoluteAddress(*val as u64),
                             ));
                         }
-                        return Ok(EvaluationResult::DirectValue(DirectValueResult::Constant(
-                            *val,
-                        )));
+                        return Ok(RawExpressionResult::DirectValue(
+                            DirectValueResult::Constant(*val),
+                        ));
                     }
-                    return Ok(EvaluationResult::MemoryLocation(LocationResult::Address(
-                        *val as u64,
-                    )));
+                    return Ok(RawExpressionResult::MemoryLocation(
+                        LocationResult::Address(*val as u64),
+                    ));
                 }
                 _ => {}
             }
@@ -675,7 +734,7 @@ impl ExpressionEvaluator {
                 (&steps[0], &steps[1])
             {
                 if !has_stack_value {
-                    return Ok(EvaluationResult::MemoryLocation(
+                    return Ok(RawExpressionResult::MemoryLocation(
                         LocationResult::RegisterAddress {
                             register: *reg,
                             offset: Some(*offset),
@@ -689,19 +748,19 @@ impl ExpressionEvaluator {
         if has_stack_value {
             if has_link_time_address {
                 if let Some(address) = Self::fold_constant_steps_to_u64(&steps) {
-                    return Ok(EvaluationResult::DirectValue(
+                    return Ok(RawExpressionResult::DirectValue(
                         DirectValueResult::AbsoluteAddress(address),
                     ));
                 }
             }
-            Ok(EvaluationResult::DirectValue(
+            Ok(RawExpressionResult::DirectValue(
                 DirectValueResult::ComputedValue {
                     steps,
                     result_size: MemoryAccessSize::U64,
                 },
             ))
         } else {
-            Ok(EvaluationResult::MemoryLocation(
+            Ok(RawExpressionResult::MemoryLocation(
                 LocationResult::ComputedLocation { steps },
             ))
         }
@@ -732,7 +791,7 @@ impl ExpressionEvaluator {
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         depth: usize,
-    ) -> Result<EvaluationResult>
+    ) -> Result<RawExpressionResult>
     where
         R: Reader<Offset = usize>,
     {
@@ -766,12 +825,12 @@ impl ExpressionEvaluator {
 
             let segment = &operations[segment_start..idx];
             let location = if segment.is_empty() {
-                EvaluationResult::Optimized
+                RawExpressionResult::Optimized
             } else {
                 Self::lower_parsed_operations(segment, dwarf, unit, address, get_cfa, depth)?
             };
 
-            if matches!(location, EvaluationResult::Composite(_)) {
+            if matches!(location, RawExpressionResult::Composite(_)) {
                 return Err(anyhow::anyhow!(
                     "nested DW_OP_piece composite expressions are not supported"
                 ));
@@ -792,7 +851,7 @@ impl ExpressionEvaluator {
             ));
         }
 
-        Ok(EvaluationResult::Composite(pieces))
+        Ok(RawExpressionResult::Composite(pieces))
     }
 
     /// Parse a full multi-operation DWARF expression
@@ -808,7 +867,7 @@ impl ExpressionEvaluator {
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
         depth: usize,
-    ) -> Result<EvaluationResult> {
+    ) -> Result<RawExpressionResult> {
         let mut operations: Vec<ParsedOperation<_>> = Vec::new();
 
         // Parse all operations in the expression
@@ -846,7 +905,7 @@ impl ExpressionEvaluator {
                             });
                         }
                         crate::dwarf_expr::entry_value::LoweredEntryValue::Optimized => {
-                            return Ok(EvaluationResult::Optimized);
+                            return Ok(RawExpressionResult::Optimized);
                         }
                     }
                 }
@@ -875,7 +934,7 @@ impl ExpressionEvaluator {
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         depth: usize,
-    ) -> Result<EvaluationResult>
+    ) -> Result<RawExpressionResult>
     where
         R: gimli::Reader<Offset = usize>,
     {
@@ -885,7 +944,7 @@ impl ExpressionEvaluator {
             // Direct register value
             Operation::Register { register } => {
                 debug!("Single DW_OP_reg{} - direct register value", register.0);
-                Ok(EvaluationResult::DirectValue(
+                Ok(RawExpressionResult::DirectValue(
                     DirectValueResult::RegisterValue(register.0),
                 ))
             }
@@ -900,7 +959,7 @@ impl ExpressionEvaluator {
                     "Single DW_OP_breg{} with offset {} - memory location",
                     register.0, offset
                 );
-                Ok(EvaluationResult::MemoryLocation(
+                Ok(RawExpressionResult::MemoryLocation(
                     LocationResult::RegisterAddress {
                         register: register.0,
                         offset: if *offset != 0 { Some(*offset) } else { None },
@@ -922,7 +981,7 @@ impl ExpressionEvaluator {
                             CfaResult::RegisterPlusOffset {
                                 register,
                                 offset: cfa_offset,
-                            } => Ok(EvaluationResult::MemoryLocation(
+                            } => Ok(RawExpressionResult::MemoryLocation(
                                 LocationResult::RegisterAddress {
                                     register,
                                     offset: Some(cfa_offset.saturating_add(*offset)),
@@ -932,7 +991,7 @@ impl ExpressionEvaluator {
                             CfaResult::Expression { mut steps } => {
                                 steps.push(PlanExprOp::PushConstant(*offset));
                                 steps.push(PlanExprOp::Add);
-                                Ok(EvaluationResult::MemoryLocation(
+                                Ok(RawExpressionResult::MemoryLocation(
                                     LocationResult::ComputedLocation { steps },
                                 ))
                             }
@@ -954,9 +1013,9 @@ impl ExpressionEvaluator {
                     "Single DW_OP_addr at 0x{:x} - direct memory address",
                     address
                 );
-                Ok(EvaluationResult::MemoryLocation(LocationResult::Address(
-                    *address,
-                )))
+                Ok(RawExpressionResult::MemoryLocation(
+                    LocationResult::Address(*address),
+                ))
             }
             Operation::AddressIndex { index } => {
                 let resolved = Self::resolve_address_index(dwarf, unit, *index)?;
@@ -964,23 +1023,23 @@ impl ExpressionEvaluator {
                     "Single DW_OP_addrx {:?} -> 0x{:x} - direct memory address",
                     index, resolved
                 );
-                Ok(EvaluationResult::MemoryLocation(LocationResult::Address(
-                    resolved,
-                )))
+                Ok(RawExpressionResult::MemoryLocation(
+                    LocationResult::Address(resolved),
+                ))
             }
 
             // Constant values
             Operation::UnsignedConstant { value } => {
                 debug!("Single DW_OP_constu {} - constant value", value);
-                Ok(EvaluationResult::DirectValue(DirectValueResult::Constant(
-                    *value as i64,
-                )))
+                Ok(RawExpressionResult::DirectValue(
+                    DirectValueResult::Constant(*value as i64),
+                ))
             }
             Operation::SignedConstant { value } => {
                 debug!("Single DW_OP_const {} - constant value", value);
-                Ok(EvaluationResult::DirectValue(DirectValueResult::Constant(
-                    *value,
-                )))
+                Ok(RawExpressionResult::DirectValue(
+                    DirectValueResult::Constant(*value),
+                ))
             }
 
             // Implicit value - value is encoded in the expression
@@ -990,7 +1049,7 @@ impl ExpressionEvaluator {
                     "Single DW_OP_implicit_value - implicit value with {} bytes",
                     data_slice.len()
                 );
-                Ok(EvaluationResult::DirectValue(
+                Ok(RawExpressionResult::DirectValue(
                     DirectValueResult::ImplicitValue(data_slice.to_vec()),
                 ))
             }
@@ -1032,7 +1091,7 @@ impl ExpressionEvaluator {
         address: u64,
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         depth: usize,
-    ) -> Result<EvaluationResult> {
+    ) -> Result<RawExpressionResult> {
         if depth >= Self::MAX_IMPLICIT_POINTER_DEPTH {
             return Err(anyhow::anyhow!(
                 "DW_OP_implicit_pointer recursion depth exceeded"
@@ -1081,10 +1140,10 @@ impl ExpressionEvaluator {
     }
 
     fn addressable_location_to_pointer_value(
-        location: EvaluationResult,
+        location: RawExpressionResult,
         byte_offset: i64,
-    ) -> Result<EvaluationResult> {
-        use crate::core::{DirectValueResult, EvaluationResult, LocationResult, PlanExprOp};
+    ) -> Result<RawExpressionResult> {
+        use crate::core::{DirectValueResult, LocationResult, PlanExprOp, RawExpressionResult};
 
         fn checked_add_i64(base: i64, delta: i64) -> Result<i64> {
             base.checked_add(delta)
@@ -1102,23 +1161,23 @@ impl ExpressionEvaluator {
         }
 
         match location {
-            EvaluationResult::MemoryLocation(LocationResult::Address(addr)) => {
-                Ok(EvaluationResult::DirectValue(
+            RawExpressionResult::MemoryLocation(LocationResult::Address(addr)) => {
+                Ok(RawExpressionResult::DirectValue(
                     DirectValueResult::AbsoluteAddress(checked_add_u64(addr, byte_offset)?),
                 ))
             }
-            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+            RawExpressionResult::MemoryLocation(LocationResult::RegisterAddress {
                 register,
                 offset,
                 ..
             }) => {
                 let total_offset = checked_add_i64(offset.unwrap_or(0), byte_offset)?;
                 if total_offset == 0 {
-                    Ok(EvaluationResult::DirectValue(
+                    Ok(RawExpressionResult::DirectValue(
                         DirectValueResult::RegisterValue(register),
                     ))
                 } else {
-                    Ok(EvaluationResult::DirectValue(
+                    Ok(RawExpressionResult::DirectValue(
                         DirectValueResult::ComputedValue {
                             steps: vec![
                                 PlanExprOp::LoadRegister(register),
@@ -1130,28 +1189,28 @@ impl ExpressionEvaluator {
                     ))
                 }
             }
-            EvaluationResult::MemoryLocation(LocationResult::ComputedLocation { mut steps }) => {
+            RawExpressionResult::MemoryLocation(LocationResult::ComputedLocation { mut steps }) => {
                 if byte_offset != 0 {
                     steps.push(PlanExprOp::PushConstant(byte_offset));
                     steps.push(PlanExprOp::Add);
                 }
-                Ok(EvaluationResult::DirectValue(
+                Ok(RawExpressionResult::DirectValue(
                     DirectValueResult::ComputedValue {
                         steps,
                         result_size: MemoryAccessSize::U64,
                     },
                 ))
             }
-            EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(addr)) => {
-                Ok(EvaluationResult::DirectValue(
+            RawExpressionResult::DirectValue(DirectValueResult::AbsoluteAddress(addr)) => {
+                Ok(RawExpressionResult::DirectValue(
                     DirectValueResult::AbsoluteAddress(checked_add_u64(addr, byte_offset)?),
                 ))
             }
-            EvaluationResult::Optimized => Ok(EvaluationResult::Optimized),
-            EvaluationResult::Composite(_) => Err(anyhow::anyhow!(
+            RawExpressionResult::Optimized => Ok(RawExpressionResult::Optimized),
+            RawExpressionResult::Composite(_) => Err(anyhow::anyhow!(
                 "DW_OP_implicit_pointer target is a composite location"
             )),
-            EvaluationResult::DirectValue(_) => Err(anyhow::anyhow!(
+            RawExpressionResult::DirectValue(_) => Err(anyhow::anyhow!(
                 "DW_OP_implicit_pointer target has no addressable location"
             )),
         }
@@ -1166,7 +1225,7 @@ impl ExpressionEvaluator {
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
-    ) -> Result<EvaluationResult> {
+    ) -> Result<RawExpressionResult> {
         Self::parse_location_lists_with_depth(
             unit,
             dwarf,
@@ -1189,7 +1248,7 @@ impl ExpressionEvaluator {
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
         depth: usize,
-    ) -> Result<EvaluationResult> {
+    ) -> Result<RawExpressionResult> {
         debug!(
             "Getting location lists for offset 0x{:x} (dwarf.locations method)",
             offset.0
@@ -1208,7 +1267,7 @@ impl ExpressionEvaluator {
                     "Failed to get location lists for offset 0x{:x}: {:?}",
                     offset.0, e
                 );
-                return Ok(EvaluationResult::Optimized);
+                return Ok(RawExpressionResult::Optimized);
             }
         };
 
@@ -1271,7 +1330,8 @@ impl ExpressionEvaluator {
 
                     let contains_address = range_contains_pc(start_pc, end_pc, address);
 
-                    if contains_address && !matches!(location_expr, EvaluationResult::Optimized) {
+                    if contains_address && !matches!(location_expr, RawExpressionResult::Optimized)
+                    {
                         return Ok(location_expr);
                     }
                 }
@@ -1345,7 +1405,7 @@ impl ExpressionEvaluator {
 
                                 debug!("   Raw fallback expression result: {:?}", location_expr);
 
-                                if !matches!(location_expr, EvaluationResult::Optimized) {
+                                if !matches!(location_expr, RawExpressionResult::Optimized) {
                                     debug!(
                                         "Raw fallback matched StartLength entry at 0x{:x}-0x{:x}",
                                         start, end
@@ -1382,7 +1442,7 @@ impl ExpressionEvaluator {
 
                                 debug!("   Raw fallback expression result: {:?}", location_expr);
 
-                                if !matches!(location_expr, EvaluationResult::Optimized) {
+                                if !matches!(location_expr, RawExpressionResult::Optimized) {
                                     debug!(
                                         "Raw fallback matched StartEnd entry at 0x{:x}-0x{:x}",
                                         begin, end
@@ -1422,7 +1482,7 @@ impl ExpressionEvaluator {
 
                                 debug!("   Raw fallback expression result: {:?}", location_expr);
 
-                                if !matches!(location_expr, EvaluationResult::Optimized) {
+                                if !matches!(location_expr, RawExpressionResult::Optimized) {
                                     debug!(
                                         "Raw fallback matched OffsetPair entry at 0x{:x}-0x{:x}",
                                         start, end_addr
@@ -1468,7 +1528,7 @@ impl ExpressionEvaluator {
                                         location_expr
                                     );
 
-                                    if !matches!(location_expr, EvaluationResult::Optimized) {
+                                    if !matches!(location_expr, RawExpressionResult::Optimized) {
                                         debug!(
                                             "Raw fallback matched StartxLength entry at 0x{:x}-0x{:x}",
                                             start, end
@@ -1512,7 +1572,7 @@ impl ExpressionEvaluator {
                                         location_expr
                                     );
 
-                                    if !matches!(location_expr, EvaluationResult::Optimized) {
+                                    if !matches!(location_expr, RawExpressionResult::Optimized) {
                                         debug!(
                                             "Raw fallback matched StartxEndx entry at 0x{:x}-0x{:x}",
                                             start, end_addr
@@ -1539,7 +1599,7 @@ impl ExpressionEvaluator {
 
                             debug!("   Raw fallback expression result: {:?}", location_expr);
 
-                            if !matches!(location_expr, EvaluationResult::Optimized) {
+                            if !matches!(location_expr, RawExpressionResult::Optimized) {
                                 debug!("Raw fallback matched default location entry");
                                 return Ok(location_expr);
                             }
@@ -1554,7 +1614,7 @@ impl ExpressionEvaluator {
             "No valid location expressions found in {} entries at offset 0x{:x}",
             entry_count, offset.0
         );
-        Ok(EvaluationResult::Optimized)
+        Ok(RawExpressionResult::Optimized)
     }
 }
 
@@ -1562,8 +1622,8 @@ impl ExpressionEvaluator {
 mod tests {
     use super::ExpressionEvaluator;
     use crate::core::{
-        CfaResult, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize,
-        PieceResult, PlanExprOp,
+        AddressExpr, CfaResult, DirectValueResult, LocationResult, MemoryAccessSize, PieceLocation,
+        PieceResult, PlanExprOp, RawExpressionResult, VariableLocation,
     };
     use gimli::constants;
     use gimli::RunTimeEndian;
@@ -1592,6 +1652,51 @@ mod tests {
         out
     }
 
+    #[test]
+    fn converts_register_address_result_to_semantic_location() {
+        let result = RawExpressionResult::MemoryLocation(LocationResult::RegisterAddress {
+            register: 6,
+            offset: Some(-16),
+            size: None,
+        });
+
+        assert_eq!(
+            ExpressionEvaluator::variable_location_from_result(&result),
+            VariableLocation::RegisterAddress {
+                dwarf_reg: 6,
+                offset: -16
+            }
+        );
+    }
+
+    #[test]
+    fn converts_absolute_address_value_as_rebasable_value() {
+        let result = RawExpressionResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1234));
+
+        assert_eq!(
+            ExpressionEvaluator::variable_location_from_result(&result),
+            VariableLocation::AbsoluteAddressValue(AddressExpr::constant(0x1234))
+        );
+    }
+
+    #[test]
+    fn converts_composite_result_to_semantic_pieces() {
+        let result = RawExpressionResult::Composite(vec![PieceResult {
+            location: RawExpressionResult::DirectValue(DirectValueResult::RegisterValue(0)),
+            size: 4,
+            bit_offset: Some(32),
+        }]);
+
+        assert_eq!(
+            ExpressionEvaluator::variable_location_from_result(&result),
+            VariableLocation::Pieces(vec![PieceLocation {
+                bit_offset: 32,
+                bit_size: 32,
+                location: Box::new(VariableLocation::RegisterValue { dwarf_reg: 0 }),
+            }])
+        );
+    }
+
     fn encode_sleb(mut value: i64) -> Vec<u8> {
         let mut out = Vec::new();
         loop {
@@ -1610,7 +1715,7 @@ mod tests {
         out
     }
 
-    fn parse_test_expr(bytes: &[u8]) -> anyhow::Result<EvaluationResult> {
+    fn parse_test_expr(bytes: &[u8]) -> anyhow::Result<RawExpressionResult> {
         ExpressionEvaluator::parse_expression_with_context(
             bytes,
             RunTimeEndian::Little,
@@ -1650,12 +1755,12 @@ mod tests {
             (
                 "DW_OP_regN",
                 vec![constants::DW_OP_reg5.0],
-                EvaluationResult::DirectValue(DirectValueResult::RegisterValue(5)),
+                RawExpressionResult::DirectValue(DirectValueResult::RegisterValue(5)),
             ),
             (
                 "DW_OP_regx",
                 regx_expr(33),
-                EvaluationResult::DirectValue(DirectValueResult::RegisterValue(33)),
+                RawExpressionResult::DirectValue(DirectValueResult::RegisterValue(33)),
             ),
             (
                 "DW_OP_bregN",
@@ -1664,7 +1769,7 @@ mod tests {
                     bytes.extend(encode_sleb(8));
                     bytes
                 },
-                EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                RawExpressionResult::MemoryLocation(LocationResult::RegisterAddress {
                     register: 7,
                     offset: Some(8),
                     size: None,
@@ -1673,7 +1778,7 @@ mod tests {
             (
                 "DW_OP_bregx",
                 bregx_expr(33, -2),
-                EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+                RawExpressionResult::MemoryLocation(LocationResult::RegisterAddress {
                     register: 33,
                     offset: Some(-2),
                     size: None,
@@ -1682,12 +1787,12 @@ mod tests {
             (
                 "DW_OP_addr",
                 addr_expr(0x1234),
-                EvaluationResult::MemoryLocation(LocationResult::Address(0x1234)),
+                RawExpressionResult::MemoryLocation(LocationResult::Address(0x1234)),
             ),
             (
                 "DW_OP_stack_value",
                 vec![constants::DW_OP_lit1.0, constants::DW_OP_stack_value.0],
-                EvaluationResult::DirectValue(DirectValueResult::Constant(1)),
+                RawExpressionResult::DirectValue(DirectValueResult::Constant(1)),
             ),
             (
                 "DW_OP_addr stack value",
@@ -1696,7 +1801,7 @@ mod tests {
                     bytes.push(constants::DW_OP_stack_value.0);
                     bytes
                 },
-                EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1234)),
+                RawExpressionResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1234)),
             ),
             (
                 "arithmetic stack value subset",
@@ -1706,7 +1811,7 @@ mod tests {
                     constants::DW_OP_plus.0,
                     constants::DW_OP_stack_value.0,
                 ],
-                EvaluationResult::DirectValue(DirectValueResult::ComputedValue {
+                RawExpressionResult::DirectValue(DirectValueResult::ComputedValue {
                     steps: vec![
                         PlanExprOp::PushConstant(1),
                         PlanExprOp::PushConstant(2),
@@ -1718,7 +1823,7 @@ mod tests {
             (
                 "DW_OP_implicit_value",
                 vec![constants::DW_OP_implicit_value.0, 3, 0xaa, 0xbb, 0xcc],
-                EvaluationResult::DirectValue(DirectValueResult::ImplicitValue(vec![
+                RawExpressionResult::DirectValue(DirectValueResult::ImplicitValue(vec![
                     0xaa, 0xbb, 0xcc,
                 ])),
             ),
@@ -1737,28 +1842,32 @@ mod tests {
                     bytes.extend(encode_uleb(4));
                     bytes
                 },
-                EvaluationResult::Composite(vec![
+                RawExpressionResult::Composite(vec![
                     PieceResult {
-                        location: EvaluationResult::DirectValue(DirectValueResult::ComputedValue {
-                            steps: vec![
-                                PlanExprOp::LoadRegister(5),
-                                PlanExprOp::PushConstant(1),
-                                PlanExprOp::Add,
-                            ],
-                            result_size: MemoryAccessSize::U64,
-                        }),
+                        location: RawExpressionResult::DirectValue(
+                            DirectValueResult::ComputedValue {
+                                steps: vec![
+                                    PlanExprOp::LoadRegister(5),
+                                    PlanExprOp::PushConstant(1),
+                                    PlanExprOp::Add,
+                                ],
+                                result_size: MemoryAccessSize::U64,
+                            },
+                        ),
                         size: 4,
                         bit_offset: Some(0),
                     },
                     PieceResult {
-                        location: EvaluationResult::DirectValue(DirectValueResult::ComputedValue {
-                            steps: vec![
-                                PlanExprOp::LoadRegister(5),
-                                PlanExprOp::PushConstant(2),
-                                PlanExprOp::Add,
-                            ],
-                            result_size: MemoryAccessSize::U64,
-                        }),
+                        location: RawExpressionResult::DirectValue(
+                            DirectValueResult::ComputedValue {
+                                steps: vec![
+                                    PlanExprOp::LoadRegister(5),
+                                    PlanExprOp::PushConstant(2),
+                                    PlanExprOp::Add,
+                                ],
+                                result_size: MemoryAccessSize::U64,
+                            },
+                        ),
                         size: 4,
                         bit_offset: Some(32),
                     },
@@ -1771,8 +1880,8 @@ mod tests {
                     bytes.extend(encode_uleb(4));
                     bytes
                 },
-                EvaluationResult::Composite(vec![PieceResult {
-                    location: EvaluationResult::Optimized,
+                RawExpressionResult::Composite(vec![PieceResult {
+                    location: RawExpressionResult::Optimized,
                     size: 4,
                     bit_offset: Some(0),
                 }]),
@@ -1814,7 +1923,7 @@ mod tests {
 
         assert_eq!(
             result,
-            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+            RawExpressionResult::MemoryLocation(LocationResult::RegisterAddress {
                 register: 7,
                 offset: Some(20),
                 size: None,
@@ -1824,9 +1933,9 @@ mod tests {
 
     #[test]
     fn dwarf_frame_base_reg_lowers_to_register_cfa() {
-        let cfa = ExpressionEvaluator::evaluation_result_to_cfa(EvaluationResult::DirectValue(
-            DirectValueResult::RegisterValue(6),
-        ));
+        let cfa = ExpressionEvaluator::raw_expression_result_to_cfa(
+            RawExpressionResult::DirectValue(DirectValueResult::RegisterValue(6)),
+        );
 
         assert_eq!(
             cfa,
@@ -1906,28 +2015,28 @@ mod tests {
     #[test]
     fn implicit_pointer_to_static_storage_preserves_absolute_address_semantics() {
         let result = ExpressionEvaluator::addressable_location_to_pointer_value(
-            EvaluationResult::MemoryLocation(LocationResult::Address(0x1234)),
+            RawExpressionResult::MemoryLocation(LocationResult::Address(0x1234)),
             0x10,
         )
         .expect("static address should convert to an implicit pointer value");
 
         assert_eq!(
             result,
-            EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1244))
+            RawExpressionResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1244))
         );
     }
 
     #[test]
     fn implicit_pointer_accepts_target_absolute_address_value() {
         let result = ExpressionEvaluator::addressable_location_to_pointer_value(
-            EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1234)),
+            RawExpressionResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1234)),
             0x10,
         )
         .expect("static address values should convert to an implicit pointer value");
 
         assert_eq!(
             result,
-            EvaluationResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1244))
+            RawExpressionResult::DirectValue(DirectValueResult::AbsoluteAddress(0x1244))
         );
     }
 
@@ -2012,7 +2121,7 @@ mod tests {
 
         assert_eq!(
             result,
-            EvaluationResult::MemoryLocation(LocationResult::RegisterAddress {
+            RawExpressionResult::MemoryLocation(LocationResult::RegisterAddress {
                 register: 7,
                 offset: Some(i64::MAX),
                 size: None,
@@ -2039,7 +2148,7 @@ mod tests {
 
         assert_eq!(
             result,
-            EvaluationResult::MemoryLocation(LocationResult::Address(0x1234))
+            RawExpressionResult::MemoryLocation(LocationResult::Address(0x1234))
         );
     }
 }

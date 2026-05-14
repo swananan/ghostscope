@@ -1,8 +1,9 @@
-//! DWARF expression evaluation results
+//! DWARF expression planning primitives
 //!
-//! This module defines the internal representation produced while evaluating
-//! raw DWARF expressions. The semantic planning layer converts these results
-//! into public read plans before compiler code generation consumes them.
+//! This module keeps the expression op IR shared by DWARF lowering, semantic
+//! plans, CFI recovery, and compiler lowering. `RawExpressionResult` is a
+//! transient detail of DWARF expression lowering; semantic variable planning
+//! should traffic in `ParsedLocation`/`VariableLocation` instead.
 //!
 //! Design principles:
 //! 1. Preserve whether an expression describes a value or a location
@@ -12,9 +13,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Internal result of evaluating a DWARF expression
+/// Raw, short-lived result of evaluating a DWARF expression.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum EvaluationResult {
+pub(crate) enum RawExpressionResult {
     /// Direct value - expression result is the variable value (no memory read needed)
     DirectValue(DirectValueResult),
 
@@ -106,7 +107,7 @@ pub struct CallerFrameRecovery {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PieceResult {
     /// Location of this piece
-    pub(crate) location: EvaluationResult,
+    pub(crate) location: RawExpressionResult,
     /// Size in bytes
     pub(crate) size: u64,
     /// Bit offset within the piece (for bit fields)
@@ -452,6 +453,10 @@ impl DirectValueResult {
     }
 }
 
+pub(crate) fn plan_expr_steps_to_expression(steps: &[PlanExprOp]) -> String {
+    DirectValueResult::steps_to_expression(steps)
+}
+
 impl LocationResult {
     /// Convert compute steps to a human-readable expression (reuse from DirectValueResult)
     fn steps_to_expression(steps: &[PlanExprOp]) -> String {
@@ -459,13 +464,13 @@ impl LocationResult {
     }
 }
 
-impl fmt::Display for EvaluationResult {
+impl fmt::Display for RawExpressionResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EvaluationResult::DirectValue(dv) => write!(f, "[DirectValue] {dv}"),
-            EvaluationResult::MemoryLocation(loc) => write!(f, "[Memory] {loc}"),
-            EvaluationResult::Optimized => write!(f, "<optimized out>"),
-            EvaluationResult::Composite(pieces) => {
+            RawExpressionResult::DirectValue(dv) => write!(f, "[DirectValue] {dv}"),
+            RawExpressionResult::MemoryLocation(loc) => write!(f, "[Memory] {loc}"),
+            RawExpressionResult::Optimized => write!(f, "<optimized out>"),
+            RawExpressionResult::Composite(pieces) => {
                 write!(f, "Composite[{} pieces]", pieces.len())
             }
         }
