@@ -59,15 +59,25 @@ pub(crate) struct ParsedLocation {
 }
 
 impl ParsedLocation {
-    pub(crate) fn from_evaluation_result(result: &EvaluationResult) -> Self {
+    pub(crate) fn new(location: VariableLocation) -> Self {
+        let availability = location.availability();
         Self {
-            location: VariableLocation::from_evaluation_result(result),
-            availability: Availability::from_evaluation_result(result),
+            location,
+            availability,
         }
+    }
+
+    pub(crate) fn from_evaluation_result(result: &EvaluationResult) -> Self {
+        let location = VariableLocation::from_evaluation_result(result);
+        Self::new(location)
     }
 }
 
 impl VariableLocation {
+    pub(crate) fn availability(&self) -> Availability {
+        Availability::from_variable_location(self)
+    }
+
     pub(crate) fn from_evaluation_result(result: &EvaluationResult) -> Self {
         match result {
             EvaluationResult::DirectValue(direct) => Self::from_direct_value(direct),
@@ -112,6 +122,32 @@ impl VariableLocation {
                 offset: offset.unwrap_or(0),
             },
             LocationResult::ComputedLocation { steps } => Self::ComputedAddress(steps.clone()),
+        }
+    }
+}
+
+impl Availability {
+    pub(crate) fn from_variable_location(location: &VariableLocation) -> Self {
+        match location {
+            VariableLocation::OptimizedOut => Self::OptimizedOut,
+            VariableLocation::Pieces(pieces) => {
+                if pieces.is_empty() {
+                    Self::Available
+                } else if pieces
+                    .iter()
+                    .all(|piece| matches!(piece.location.as_ref(), VariableLocation::OptimizedOut))
+                {
+                    Self::OptimizedOut
+                } else if pieces
+                    .iter()
+                    .any(|piece| matches!(piece.location.as_ref(), VariableLocation::OptimizedOut))
+                {
+                    Self::PartiallyAvailable
+                } else {
+                    Self::Available
+                }
+            }
+            _ => Self::Available,
         }
     }
 }
