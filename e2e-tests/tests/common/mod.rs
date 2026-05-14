@@ -30,6 +30,8 @@ lazy_static! {
     static ref COMPILE_GLOBALS_OPTIMIZED_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
     static ref COMPILE_LATE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_SHORT_LIVED_LONG_COMM_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
     static ref COMPILE_SCALAR_TYPES_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_SCALAR_TYPES_OPTIMIZED_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
@@ -70,6 +72,7 @@ enum RegisteredFixtureKind {
     MemberPointer,
     Globals,
     LateGlobals,
+    ShortLivedLongComm,
     ScalarTypes,
     RustGlobal,
     InlineCallsite,
@@ -126,6 +129,12 @@ const REGISTERED_FIXTURES: &[RegisteredFixture] = &[
         directory: "late_globals_program",
         cleanup: CleanupCommand::Make,
         kind: RegisteredFixtureKind::LateGlobals,
+    },
+    RegisteredFixture {
+        name: "short_lived_long_comm_program",
+        directory: "short_lived_long_comm_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::ShortLivedLongComm,
     },
     RegisteredFixture {
         name: "scalar_types_program",
@@ -423,6 +432,10 @@ impl RegisteredFixture {
             RegisteredFixtureKind::LateGlobals => {
                 ensure_late_globals_program_compiled()?;
                 Ok(dir.join("late_globals_program"))
+            }
+            RegisteredFixtureKind::ShortLivedLongComm => {
+                ensure_short_lived_long_comm_program_compiled()?;
+                Ok(dir.join("short_lived_long_comm_program"))
             }
             RegisteredFixtureKind::ScalarTypes => {
                 let bin_name = match opt_level {
@@ -1205,6 +1218,7 @@ pub mod termination;
 static COMPILE_GLOBALS: Once = Once::new();
 static COMPILE_GLOBALS_OPTIMIZED: Once = Once::new();
 static COMPILE_LATE_GLOBALS: Once = Once::new();
+static COMPILE_SHORT_LIVED_LONG_COMM: Once = Once::new();
 static COMPILE_SCALAR_TYPES: Once = Once::new();
 static COMPILE_SCALAR_TYPES_OPTIMIZED: Once = Once::new();
 static COMPILE_RUST_GLOBAL: Once = Once::new();
@@ -1337,6 +1351,49 @@ fn ensure_late_globals_program_compiled() -> anyhow::Result<()> {
     });
 
     match COMPILE_LATE_GLOBALS_RESULT.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
+fn ensure_short_lived_long_comm_program_compiled() -> anyhow::Result<()> {
+    COMPILE_SHORT_LIVED_LONG_COMM.call_once(|| {
+        let compile_result = (|| -> anyhow::Result<()> {
+            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/short_lived_long_comm_program");
+            if let Some(result) = use_precompiled_outputs(
+                "short_lived_long_comm_program",
+                &[base.join("short_lived_long_comm_program")],
+            ) {
+                return result;
+            }
+            println!("Compiling short_lived_long_comm_program (Debug) in {base:?}");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(base.clone())
+                .status()
+                .is_ok();
+            let out = Command::new("make").arg("all").current_dir(base).output()?;
+            if out.status.success() {
+                println!("✓ Successfully compiled short_lived_long_comm_program");
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(anyhow::anyhow!(
+                    "Failed to compile short_lived_long_comm_program: {}",
+                    stderr
+                ))
+            }
+        })();
+        *COMPILE_SHORT_LIVED_LONG_COMM_RESULT.lock().unwrap() = Some(compile_result);
+    });
+
+    match COMPILE_SHORT_LIVED_LONG_COMM_RESULT
+        .lock()
+        .unwrap()
+        .as_ref()
+    {
         Some(Ok(())) => Ok(()),
         Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
         None => panic!("Compilation result should be set after call_once"),
