@@ -6,7 +6,7 @@
 use crate::binary::{DwarfEndian, DwarfReader};
 use crate::core::{
     CfaResult, DirectValueResult, EvaluationResult, LocationResult, MemoryAccessSize, PieceResult,
-    PlanExprOp, Result,
+    ParsedLocation, PlanExprOp, Result,
 };
 use crate::dwarf_expr::{errors as expr_errors, modes::DwarfExprMode};
 use crate::index::{CfiIndex, FunctionBlocks};
@@ -38,8 +38,8 @@ impl ExpressionEvaluator {
         get_cfa: Option<&dyn Fn(u64) -> Result<Option<crate::core::CfaResult>>>,
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
-    ) -> Result<EvaluationResult> {
-        Self::evaluate_location_with_depth(
+    ) -> Result<ParsedLocation> {
+        let result = Self::evaluate_location_result_with_depth(
             entry,
             unit,
             dwarf,
@@ -48,11 +48,12 @@ impl ExpressionEvaluator {
             function_context,
             cfi_index,
             0,
-        )
+        )?;
+        Ok(ParsedLocation::from_evaluation_result(&result))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn evaluate_location_with_depth(
+    fn evaluate_location_result_with_depth(
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         dwarf: &gimli::Dwarf<DwarfReader>,
@@ -1064,7 +1065,7 @@ impl ExpressionEvaluator {
         let entry = unit
             .entry(unit_offset)
             .map_err(|e| anyhow::anyhow!("DW_OP_implicit_pointer entry parse failed: {e}"))?;
-        let referenced = Self::evaluate_location_with_depth(
+        let referenced = Self::evaluate_location_result_with_depth(
             &entry,
             &unit,
             dwarf,

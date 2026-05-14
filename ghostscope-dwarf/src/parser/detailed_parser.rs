@@ -892,8 +892,7 @@ impl DetailedParser {
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
     ) -> Result<ParsedLocation> {
-        // Keep evaluator results behind the parser boundary.
-        let evaluation = ExpressionEvaluator::evaluate_location(
+        ExpressionEvaluator::evaluate_location(
             entry,
             unit,
             dwarf,
@@ -901,8 +900,7 @@ impl DetailedParser {
             get_cfa,
             function_context,
             cfi_index,
-        )?;
-        Ok(ParsedLocation::from_evaluation_result(&evaluation))
+        )
     }
 
     // extract_name removed; call resolve_name_with_origins directly when needed
