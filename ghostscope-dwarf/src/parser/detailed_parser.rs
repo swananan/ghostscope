@@ -892,7 +892,7 @@ impl DetailedParser {
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
     ) -> Result<ParsedLocation> {
-        ExpressionEvaluator::evaluate_location(
+        ExpressionEvaluator::lower_location(
             entry,
             unit,
             dwarf,
