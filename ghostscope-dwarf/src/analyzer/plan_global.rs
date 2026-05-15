@@ -166,7 +166,9 @@ impl DwarfAnalyzer {
                     var.dwarf_type = Some(ti);
                 }
             }
-            Ok(Self::read_plan_from_variable(var, provenance))
+            let mut plan = Self::read_plan_from_variable(var, provenance);
+            plan.module_path = Some(path_buf);
+            Ok(plan)
         } else {
             Err(anyhow::anyhow!(
                 "Module {} not loaded",

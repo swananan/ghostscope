@@ -76,3 +76,11 @@ int main() {
     }
     return 0;
 }
+
+struct AmbiguousDynamic {
+    int decoy;
+    int want;
+};
+
+__attribute__((used)) static volatile struct AmbiguousDynamic
+    main_ambiguous_dynamic_probe = {9001, 9002};

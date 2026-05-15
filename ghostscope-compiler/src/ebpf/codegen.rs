@@ -213,7 +213,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 if data_len == 0 {
                     return Err(CodeGenError::TypeSizeNotAvailable(display_name));
                 }
-                let module_hint = self.take_module_hint();
+                let module_hint =
+                    Self::module_path_for_offsets(materialized.module_path.as_deref());
                 Ok(ComplexArg {
                     var_name_index: self.trace_context.add_variable_name(display_name),
                     type_index: self.trace_context.add_type(dwarf_type.clone()),
@@ -444,7 +445,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         )))
                     }
                 };
-                let module_hint = self.take_module_hint();
+                let module_hint =
+                    Self::module_path_for_offsets(materialized.module_path.as_deref());
                 Ok(ComplexArg {
                     var_name_index: self
                         .trace_context
@@ -585,7 +587,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     )),
                                 };
                             let data_len = Self::compute_read_size_for_type(&elem_ty);
-                            let module_hint = self.take_module_hint();
+                            let module_hint =
+                                Self::module_path_for_offsets(materialized.module_path.as_deref());
                             if data_len == 0 {
                                 // Fallback for unsized/void targets: print computed address as pointer
                                 let ptr_ti = ghostscope_dwarf::TypeInfo::PointerType {
@@ -1751,7 +1754,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             if let Some(var) = self.query_dwarf_for_complex_expr(expr)? {
                 if let Some(ref ty) = var.dwarf_type {
                     if matches!(ty, ghostscope_dwarf::TypeInfo::PointerType { .. }) {
-                        let _ = self.take_module_hint();
                         return Ok(iv);
                     }
                 }
@@ -1759,21 +1761,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         if let Ok(addr) = self.resolve_ptr_i64_from_expr(expr) {
-            let _ = self.take_module_hint();
             return Ok(addr);
         }
 
         let var = self
             .query_dwarf_for_complex_expr(expr)?
             .ok_or_else(|| CodeGenError::VariableNotFound(format!("{expr:?}")))?;
-        let module_hint = self.take_module_hint();
         let pc_address = self.get_compile_time_context()?.pc_address;
-        self.variable_read_plan_to_lvalue_address_with_hint(
-            &var,
-            pc_address,
-            None,
-            module_hint.as_deref(),
-        )
+        self.variable_read_plan_to_lvalue_address(&var, pc_address, None)
     }
 
     fn compile_formatted_print(

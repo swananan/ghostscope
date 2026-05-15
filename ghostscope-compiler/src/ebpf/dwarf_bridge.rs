@@ -14,6 +14,10 @@ use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use tracing::{debug, warn};
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
+    pub(super) fn module_path_for_offsets(module_path: Option<&std::path::Path>) -> Option<String> {
+        module_path.map(|path| path.to_string_lossy().into_owned())
+    }
+
     /// Compute a stable cookie for a module when per-PID offsets are unavailable (via coordinator).
     fn fallback_cookie_from_module_path(&self, module_path: &str) -> u64 {
         module_probe::cookie_for_path(module_path)
@@ -44,6 +48,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         value: &ghostscope_dwarf::PlannedValue,
         var_name: &str,
         status_ptr: Option<PointerValue<'ctx>>,
+        module_hint: Option<&str>,
     ) -> Result<BasicValueEnum<'ctx>> {
         let pt_regs_ptr = self.get_pt_regs_parameter()?;
         match value {
@@ -72,6 +77,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     Some(*result_size),
                     runtime_status_ptr,
                     None,
+                    module_hint,
                 )
             }
             ghostscope_dwarf::PlannedValue::ImplicitBytes(bytes) => {
@@ -89,7 +95,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 } else {
                     status_ptr
                 };
-                self.planned_address_to_llvm_address(address, runtime_status_ptr, None)
+                self.planned_address_to_llvm_address(address, runtime_status_ptr, module_hint)
                     .map(Into::into)
             }
         }
@@ -133,6 +139,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     None,
                     status_ptr,
                     Some(runtime_base),
+                    module_hint,
                 )?;
                 match value {
                     BasicValueEnum::IntValue(value) => Ok(value),
@@ -142,7 +149,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 }
             }
             AddressOrigin::RuntimeDerived | AddressOrigin::Unknown => {
-                self.planned_address_without_rebase(address, pt_regs_ptr, status_ptr)
+                self.planned_address_without_rebase(address, pt_regs_ptr, status_ptr, module_hint)
             }
         }
     }
@@ -152,6 +159,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         address: &PlannedAddress,
         pt_regs_ptr: PointerValue<'ctx>,
         status_ptr: Option<PointerValue<'ctx>>,
+        module_hint: Option<&str>,
     ) -> Result<IntValue<'ctx>> {
         match &address.kind {
             PlannedAddressKind::Constant { address } => {
@@ -175,7 +183,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 }
             }
             PlannedAddressKind::RuntimeComputed { expr } => {
-                self.runtime_expr_to_unrebased_address(expr, pt_regs_ptr, status_ptr)
+                self.runtime_expr_to_unrebased_address(expr, pt_regs_ptr, status_ptr, module_hint)
             }
             PlannedAddressKind::FrameBaseRelative { .. } => Err(CodeGenError::NotImplemented(
                 "Frame-base-relative planned address requires resolved frame base".to_string(),
@@ -188,9 +196,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         expr: &RuntimeComputedExpr,
         pt_regs_ptr: PointerValue<'ctx>,
         status_ptr: Option<PointerValue<'ctx>>,
+        module_hint: Option<&str>,
     ) -> Result<IntValue<'ctx>> {
-        let val =
-            self.generate_runtime_expr_ops(expr.ops(), pt_regs_ptr, None, status_ptr, None)?;
+        let val = self.generate_runtime_expr_ops(
+            expr.ops(),
+            pt_regs_ptr,
+            None,
+            status_ptr,
+            None,
+            module_hint,
+        )?;
         match val {
             BasicValueEnum::IntValue(value) => Ok(value),
             _ => Err(CodeGenError::LLVMError(
@@ -208,7 +223,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let ctx = self.get_compile_time_context()?;
         let module_for_offsets = module_hint
             .map(|s| s.to_string())
-            .or_else(|| self.current_resolved_var_module_path.clone())
             .unwrap_or_else(|| ctx.module_path.clone());
         let st_code = self.section_code_for_address(&module_for_offsets, link_addr);
         let cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
@@ -217,7 +231,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
         self.store_offsets_unavailable_status(status_ptr, found_flag)?;
         self.store_offsets_found_flag(found_flag)?;
-        self.current_resolved_var_module_path = None;
         Ok(rt_addr)
     }
 
@@ -402,8 +415,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     ) -> Result<BasicValueEnum<'ctx>> {
         match &materialization.materialization {
             ghostscope_dwarf::VariableMaterialization::DirectValue { value } => {
-                let value =
-                    self.planned_value_to_llvm_value(value, &materialization.name, status_ptr)?;
+                let module_hint =
+                    Self::module_path_for_offsets(materialization.module_path.as_deref());
+                let value = self.planned_value_to_llvm_value(
+                    value,
+                    &materialization.name,
+                    status_ptr,
+                    module_hint.as_deref(),
+                )?;
                 self.normalize_direct_integer_value_if_needed(
                     value,
                     materialization.dwarf_type.as_ref(),
@@ -415,7 +434,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         "Expression has no DWARF type information".to_string(),
                     )
                 })?;
-                self.generate_memory_location_from_planned_address(address, dwarf_type, status_ptr)
+                let module_hint =
+                    Self::module_path_for_offsets(materialization.module_path.as_deref());
+                self.generate_memory_location_from_planned_address(
+                    address,
+                    dwarf_type,
+                    status_ptr,
+                    module_hint.as_deref(),
+                )
             }
             ghostscope_dwarf::VariableMaterialization::Unavailable { availability } => {
                 Err(Self::dwarf_expression_unavailable_error(
@@ -443,16 +469,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.variable_materialization_to_llvm_value(&materialized, pc_address, status_ptr)
     }
 
-    pub(super) fn variable_read_plan_to_lvalue_address_with_hint(
+    pub(super) fn variable_read_plan_to_lvalue_address(
         &mut self,
         plan: &VariableReadPlan,
         pc_address: u64,
         status_ptr: Option<PointerValue<'ctx>>,
-        module_hint: Option<&str>,
     ) -> Result<IntValue<'ctx>> {
+        let module_hint = Self::module_path_for_offsets(plan.module_path.as_deref());
         match plan.lvalue_address_plan() {
             LvalueAddressPlan::Address { address } => {
-                self.planned_address_to_llvm_address(&address, status_ptr, module_hint)
+                self.planned_address_to_llvm_address(&address, status_ptr, module_hint.as_deref())
             }
             LvalueAddressPlan::Unavailable { availability } => Err(
                 Self::dwarf_lvalue_address_unavailable_error(&plan.name, &availability, pc_address),
@@ -465,18 +491,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         address: &PlannedAddress,
         dwarf_type: &TypeInfo,
         status_ptr: Option<PointerValue<'ctx>>,
+        module_hint: Option<&str>,
     ) -> Result<BasicValueEnum<'ctx>> {
-        let module_hint = self.current_resolved_var_module_path.clone();
         let runtime_status_ptr = if self.condition_context_active {
             Some(self.get_or_create_cond_error_global())
         } else {
             status_ptr
         };
-        let addr = self.planned_address_to_llvm_address(
-            address,
-            runtime_status_ptr,
-            module_hint.as_deref(),
-        )?;
+        let addr =
+            self.planned_address_to_llvm_address(address, runtime_status_ptr, module_hint)?;
 
         if ghostscope_dwarf::is_c_aggregate_type(dwarf_type) {
             let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
@@ -606,6 +629,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         _result_size: Option<MemoryAccessSize>,
         status_ptr: Option<PointerValue<'ctx>>,
         initial_top: Option<IntValue<'ctx>>,
+        module_hint: Option<&str>,
     ) -> Result<BasicValueEnum<'ctx>> {
         // Implement stack-based computation
         let mut stack: Vec<IntValue<'ctx>> = Vec::new();
@@ -1054,6 +1078,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         pt_regs_ptr,
                         _result_size,
                         status_ptr,
+                        module_hint,
                     )?;
                     stack.push(value);
                 }
@@ -1085,6 +1110,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         pt_regs_ptr: PointerValue<'ctx>,
         result_size: Option<MemoryAccessSize>,
         status_ptr: Option<PointerValue<'ctx>>,
+        module_hint: Option<&str>,
     ) -> Result<IntValue<'ctx>> {
         if cases.is_empty() {
             return Err(CodeGenError::LLVMError(
@@ -1099,6 +1125,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 Some(MemoryAccessSize::U64),
                 status_ptr,
                 None,
+                module_hint,
             )?
             .into_int_value();
 
@@ -1117,8 +1144,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let module_for_offsets = {
             let ctx = self.get_compile_time_context()?;
-            self.current_resolved_var_module_path
-                .clone()
+            module_hint
+                .map(|module| module.to_string())
                 .unwrap_or_else(|| ctx.module_path.clone())
         };
         let module_cookie = self.cookie_for_module_or_fallback(&module_for_offsets);
@@ -1179,6 +1206,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     result_size,
                     status_ptr,
                     None,
+                    module_hint,
                 )?
                 .into_int_value();
             let case_value_block = self.builder.get_insert_block().ok_or_else(|| {
@@ -1413,13 +1441,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             return Ok(pc_plan);
         }
 
-        if let Some((global_module, plan)) = analyzer
+        if let Some((_global_module, plan)) = analyzer
             .plan_global_access_read_plan(&prefer_module, var_name, &VariableAccessPath::default())
             .map_err(|err| CodeGenError::DwarfError(err.to_string()))?
         {
             debug!("Found DWARF global '{}' via variable read plan", var_name);
-            self.current_resolved_var_module_path =
-                Some(global_module.to_string_lossy().to_string());
             return Ok(Some(plan));
         }
 
@@ -1484,12 +1510,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         }
 
-        if let Some((module_path, plan)) = analyzer
+        if let Some((_module_path, plan)) = analyzer
             .plan_global_access_read_plan(&prefer_module, base_name, access_path)
             .map_err(|err| CodeGenError::DwarfError(err.to_string()))?
         {
             debug!("Found DWARF global access '{path_text}' via variable read plan");
-            self.current_resolved_var_module_path = Some(module_path.to_string_lossy().to_string());
             return Ok(Some(plan));
         }
 
@@ -1619,6 +1644,7 @@ mod tests {
             name: name.to_string(),
             type_name: type_name.to_string(),
             access_path: VariableAccessPath::default(),
+            module_path: None,
             dwarf_type,
             declaration: None,
             type_id: None,
@@ -2158,6 +2184,7 @@ mod tests {
             name: "x".to_string(),
             type_name: "int".to_string(),
             access_path: VariableAccessPath::default(),
+            module_path: None,
             dwarf_type: Some(dwarf_type),
             declaration: None,
             type_id: None,
@@ -2193,6 +2220,7 @@ mod tests {
             name: "x".to_string(),
             type_name: "int".to_string(),
             access_path: VariableAccessPath::default(),
+            module_path: None,
             dwarf_type: Some(dwarf_type),
             declaration: None,
             type_id: None,
@@ -2264,7 +2292,7 @@ mod tests {
         );
 
         let addr = ctx
-            .variable_read_plan_to_lvalue_address_with_hint(&plan, 0x1234, None, None)
+            .variable_read_plan_to_lvalue_address(&plan, 0x1234, None)
             .expect("address-only read plan should not require DWARF type info");
 
         assert_eq!(addr.get_type().get_bit_width(), 64);
@@ -2286,7 +2314,7 @@ mod tests {
         );
 
         let err = ctx
-            .variable_read_plan_to_lvalue_address_with_hint(&plan, 0x1234, None, None)
+            .variable_read_plan_to_lvalue_address(&plan, 0x1234, None)
             .expect_err("unavailable lvalue plans should be rejected");
 
         assert!(matches!(err, CodeGenError::VariableUnavailable(_)));

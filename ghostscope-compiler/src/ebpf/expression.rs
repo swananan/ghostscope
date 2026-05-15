@@ -11,9 +11,27 @@ use ghostscope_dwarf::{
 };
 use inkwell::values::{BasicValueEnum, IntValue};
 use inkwell::AddressSpace;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 // compare cap is provided via compile_options.compare_cap (config: ebpf.compare_cap)
+
+#[derive(Clone)]
+struct DynamicTypeInfo {
+    dwarf_type: DwarfType,
+    module_path: Option<PathBuf>,
+}
+
+struct DynamicLvalue<'ctx> {
+    address: IntValue<'ctx>,
+    type_info: DynamicTypeInfo,
+}
+
+struct IndexableElementInfo {
+    element_type: DwarfType,
+    stride: u64,
+    module_path: Option<PathBuf>,
+}
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(crate) fn get_host_pid_tid_values(&mut self) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
@@ -585,18 +603,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     // Owned target for query
                     if let Some(target) = self.get_alias_variable(name) {
                         if let Some(var) = self.query_dwarf_for_complex_expr(&target)? {
-                            let module_hint = self.current_resolved_var_module_path.clone();
                             let status_ptr = if self.condition_context_active {
                                 Some(self.get_or_create_cond_error_global())
                             } else {
                                 None
                             };
                             let pc_address = self.get_compile_time_context()?.pc_address;
-                            return self.variable_read_plan_to_lvalue_address_with_hint(
-                                &var,
-                                pc_address,
-                                status_ptr,
-                                module_hint.as_deref(),
+                            return self.variable_read_plan_to_lvalue_address(
+                                &var, pc_address, status_ptr,
                             );
                         } else {
                             return Err(CodeGenError::TypeError(
@@ -616,27 +630,21 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             };
 
             if let E::ArrayAccess(array_expr, index_expr) = resolved_inner {
-                if let Some((element_address, _element_type)) =
+                if let Some(element_lvalue) =
                     self.compile_dynamic_array_element_address(array_expr, index_expr)?
                 {
-                    return Ok(element_address);
+                    return Ok(element_lvalue.address);
                 }
             }
 
             if let Some(var) = self.query_dwarf_for_complex_expr(resolved_inner)? {
-                let module_hint = self.current_resolved_var_module_path.clone();
                 let status_ptr = if self.condition_context_active {
                     Some(self.get_or_create_cond_error_global())
                 } else {
                     None
                 };
                 let pc_address = self.get_compile_time_context()?.pc_address;
-                return self.variable_read_plan_to_lvalue_address_with_hint(
-                    &var,
-                    pc_address,
-                    status_ptr,
-                    module_hint.as_deref(),
-                );
+                return self.variable_read_plan_to_lvalue_address(&var, pc_address, status_ptr);
             } else {
                 return Err(CodeGenError::TypeError(
                     "cannot take address of unresolved expression".into(),
@@ -662,18 +670,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     let pointed_plan = var
                         .plan_pointer_element_index(index)
                         .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
-                    let module_hint = self.current_resolved_var_module_path.clone();
                     let status_ptr = if self.condition_context_active {
                         Some(self.get_or_create_cond_error_global())
                     } else {
                         None
                     };
                     let pc_address = self.get_compile_time_context()?.pc_address;
-                    return self.variable_read_plan_to_lvalue_address_with_hint(
+                    return self.variable_read_plan_to_lvalue_address(
                         &pointed_plan,
                         pc_address,
                         status_ptr,
-                        module_hint.as_deref(),
                     );
                 }
             }
@@ -746,38 +752,26 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                     DwarfType::ArrayType { .. } => {
                         // Use the base address of the array as pointer
-                        let module_hint = self.current_resolved_var_module_path.clone();
                         let status_ptr = if self.condition_context_active {
                             Some(self.get_or_create_cond_error_global())
                         } else {
                             None
                         };
                         let pc_address = self.get_compile_time_context()?.pc_address;
-                        self.variable_read_plan_to_lvalue_address_with_hint(
-                            &var,
-                            pc_address,
-                            status_ptr,
-                            module_hint.as_deref(),
-                        )
+                        self.variable_read_plan_to_lvalue_address(&var, pc_address, status_ptr)
                     }
                     _ => Err(CodeGenError::TypeError(
                         "DWARF value is not pointer/array".into(),
                     )),
                 }
             } else {
-                let module_hint = self.current_resolved_var_module_path.clone();
                 let status_ptr = if self.condition_context_active {
                     Some(self.get_or_create_cond_error_global())
                 } else {
                     None
                 };
                 let pc_address = self.get_compile_time_context()?.pc_address;
-                self.variable_read_plan_to_lvalue_address_with_hint(
-                    &var,
-                    pc_address,
-                    status_ptr,
-                    module_hint.as_deref(),
-                )
+                self.variable_read_plan_to_lvalue_address(&var, pc_address, status_ptr)
             }
         } else {
             // No DWARF-backed address and not an address-of/alias+const: reject script-level pointers.
@@ -872,7 +866,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         index_expr: &Expr,
     ) -> Result<Option<IntValue<'ctx>>> {
         match self.compile_dynamic_array_element_address(base_expr, index_expr) {
-            Ok(Some((address, _element_type))) => Ok(Some(address)),
+            Ok(Some(element_lvalue)) => Ok(Some(element_lvalue.address)),
             Ok(None) => Ok(None),
             Err(CodeGenError::VariableNotFound(_))
             | Err(CodeGenError::VariableNotInScope(_))
@@ -1584,19 +1578,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             }
                         }
                         DwarfType::ArrayType { .. } => {
-                            let module_hint = self.current_resolved_var_module_path.clone();
                             let status_ptr = if self.condition_context_active {
                                 Some(self.get_or_create_cond_error_global())
                             } else {
                                 None
                             };
                             let pc_address = self.get_compile_time_context()?.pc_address;
-                            self.variable_read_plan_to_lvalue_address_with_hint(
-                                &var,
-                                pc_address,
-                                status_ptr,
-                                module_hint.as_deref(),
-                            )?
+                            self.variable_read_plan_to_lvalue_address(&var, pc_address, status_ptr)?
                         }
                         _ => {
                             // Not a pointer/array -> treat as error
@@ -2245,7 +2233,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 self.compile_dwarf_expression(expr)
             }
             Expr::AddressOf(inner) => {
-                // Address-of with ASLR-aware hint: compute runtime address using module hint
+                // Address-of computes runtime addresses using the module origin carried by the plan.
                 // Transparently support alias variables: &alias -> address of aliased DWARF expression
                 let target_inner: &Expr = if let Expr::Variable(var_name) = inner.as_ref() {
                     if self.alias_variable_exists(var_name) {
@@ -2253,8 +2241,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         let aliased = self
                             .get_alias_variable(var_name)
                             .expect("alias existence just checked");
-                        // First perform the DWARF query so that current_resolved_var_module_path
-                        // is set for the aliased symbol's module; then capture the hint.
                         let var =
                             self.query_dwarf_for_complex_expr(&aliased)?
                                 .ok_or_else(|| {
@@ -2262,14 +2248,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                         "cannot take address of unresolved expression".to_string(),
                                     )
                                 })?;
-                        let module_hint = self.current_resolved_var_module_path.clone();
                         let pc_address = self.get_compile_time_context()?.pc_address;
-                        match self.variable_read_plan_to_lvalue_address_with_hint(
-                            &var,
-                            pc_address,
-                            None,
-                            module_hint.as_deref(),
-                        ) {
+                        match self.variable_read_plan_to_lvalue_address(&var, pc_address, None) {
                             Ok(addr_i64) => {
                                 let ptr_ty = self.context.ptr_type(AddressSpace::default());
                                 let as_ptr = self
@@ -2298,15 +2278,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             "cannot take address of unresolved expression".to_string(),
                         )
                     })?;
-                // Use current resolved hint if available (set during DWARF resolution)
-                let module_hint = self.current_resolved_var_module_path.clone();
                 let pc_address = self.get_compile_time_context()?.pc_address;
-                match self.variable_read_plan_to_lvalue_address_with_hint(
-                    &var,
-                    pc_address,
-                    None,
-                    module_hint.as_deref(),
-                ) {
+                match self.variable_read_plan_to_lvalue_address(&var, pc_address, None) {
                     Ok(addr_i64) => {
                         let ptr_ty = self.context.ptr_type(AddressSpace::default());
                         let as_ptr = self
@@ -3026,14 +2999,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         array_expr: &Expr,
         index_expr: &Expr,
     ) -> Result<Option<(BasicValueEnum<'ctx>, DwarfType)>> {
-        let Some((element_address, element_type)) =
+        let Some(element_lvalue) =
             self.compile_dynamic_array_element_address(array_expr, index_expr)?
         else {
             return Ok(None);
         };
 
-        let value = self.read_dynamic_address_value(element_address, &element_type)?;
-        Ok(Some((value, element_type)))
+        let value = self.read_dynamic_address_value(
+            element_lvalue.address,
+            &element_lvalue.type_info.dwarf_type,
+        )?;
+        Ok(Some((value, element_lvalue.type_info.dwarf_type)))
     }
 
     pub(super) fn compile_dynamic_member_access_value(
@@ -3041,23 +3017,24 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         obj_expr: &Expr,
         field: &str,
     ) -> Result<Option<(BasicValueEnum<'ctx>, DwarfType)>> {
-        let Some((object_address, object_type)) = self.dynamic_lvalue_address_and_type(obj_expr)?
-        else {
+        let Some(object_lvalue) = self.dynamic_lvalue_address_and_type(obj_expr)? else {
             return Ok(None);
         };
 
-        let Some((element_address, element_type)) =
-            self.dynamic_member_base_address_and_type(object_address, object_type)?
-        else {
+        let Some(element_lvalue) = self.dynamic_member_base_address_and_type(object_lvalue)? else {
             return Ok(None);
         };
         let (member_offset, member_type) =
-            self.dynamic_member_offset_and_type(&element_type, field)?;
+            self.dynamic_member_offset_and_type(&element_lvalue.type_info, field)?;
 
         let member_offset = self.context.i64_type().const_int(member_offset, false);
         let member_address = self
             .builder
-            .build_int_add(element_address, member_offset, "dynamic_member_address")
+            .build_int_add(
+                element_lvalue.address,
+                member_offset,
+                "dynamic_member_address",
+            )
             .map_err(|err| CodeGenError::Builder(err.to_string()))?;
         let value = self.read_dynamic_address_value(member_address, &member_type)?;
         Ok(Some((value, member_type)))
@@ -3066,39 +3043,51 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     fn dynamic_lvalue_address_and_type(
         &mut self,
         expr: &Expr,
-    ) -> Result<Option<(IntValue<'ctx>, DwarfType)>> {
+    ) -> Result<Option<DynamicLvalue<'ctx>>> {
         if let Expr::ArrayAccess(array_expr, index_expr) = expr {
             return self.compile_dynamic_array_element_address(array_expr, index_expr);
         }
 
         if self.expands_to_nonliteral_pointer_arithmetic(expr)? {
-            let Some((element_type, _stride)) = self.indexable_element_type_and_stride(expr)?
-            else {
+            let Some(element_info) = self.indexable_element_type_and_stride(expr)? else {
                 return Ok(None);
             };
             let element_address = self.resolve_ptr_i64_from_expr(expr)?;
-            return Ok(Some((element_address, element_type)));
+            return Ok(Some(DynamicLvalue {
+                address: element_address,
+                type_info: DynamicTypeInfo {
+                    dwarf_type: element_info.element_type,
+                    module_path: element_info.module_path,
+                },
+            }));
         }
 
         if let Expr::MemberAccess(obj_expr, field) = expr {
-            let Some((object_address, object_type)) =
-                self.dynamic_lvalue_address_and_type(obj_expr)?
-            else {
+            let Some(object_lvalue) = self.dynamic_lvalue_address_and_type(obj_expr)? else {
                 return Ok(None);
             };
-            let Some((base_address, aggregate_type)) =
-                self.dynamic_member_base_address_and_type(object_address, object_type)?
+            let Some(base_lvalue) = self.dynamic_member_base_address_and_type(object_lvalue)?
             else {
                 return Ok(None);
             };
             let (member_offset, member_type) =
-                self.dynamic_member_offset_and_type(&aggregate_type, field)?;
+                self.dynamic_member_offset_and_type(&base_lvalue.type_info, field)?;
             let member_offset = self.context.i64_type().const_int(member_offset, false);
             let member_address = self
                 .builder
-                .build_int_add(base_address, member_offset, "dynamic_member_lvalue_address")
+                .build_int_add(
+                    base_lvalue.address,
+                    member_offset,
+                    "dynamic_member_lvalue_address",
+                )
                 .map_err(|err| CodeGenError::Builder(err.to_string()))?;
-            return Ok(Some((member_address, member_type)));
+            return Ok(Some(DynamicLvalue {
+                address: member_address,
+                type_info: DynamicTypeInfo {
+                    dwarf_type: member_type,
+                    module_path: base_lvalue.type_info.module_path,
+                },
+            }));
         }
 
         Ok(None)
@@ -3106,16 +3095,24 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     fn dynamic_member_base_address_and_type(
         &mut self,
-        address: IntValue<'ctx>,
-        object_type: DwarfType,
-    ) -> Result<Option<(IntValue<'ctx>, DwarfType)>> {
-        let object_type = self.complete_dynamic_member_element_type(object_type);
+        object: DynamicLvalue<'ctx>,
+    ) -> Result<Option<DynamicLvalue<'ctx>>> {
+        let module_path = object.type_info.module_path.clone();
+        let object_type = self.complete_dynamic_member_element_type(
+            object.type_info.dwarf_type,
+            module_path.as_deref(),
+        );
         match ghostscope_dwarf::strip_type_aliases(&object_type) {
-            DwarfType::StructType { .. } | DwarfType::UnionType { .. } => {
-                Ok(Some((address, object_type)))
-            }
+            DwarfType::StructType { .. } | DwarfType::UnionType { .. } => Ok(Some(DynamicLvalue {
+                address: object.address,
+                type_info: DynamicTypeInfo {
+                    dwarf_type: object_type,
+                    module_path,
+                },
+            })),
             DwarfType::PointerType { target_type, .. } => {
-                let pointer_value = self.read_dynamic_address_value(address, &object_type)?;
+                let pointer_value =
+                    self.read_dynamic_address_value(object.address, &object_type)?;
                 let pointer_value = match pointer_value {
                     BasicValueEnum::IntValue(value) => {
                         self.normalize_int_to_i64(value, "dynamic_member_pointer_i64")?
@@ -3134,9 +3131,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         ))
                     }
                 };
-                let target_type =
-                    self.complete_dynamic_member_element_type(target_type.as_ref().clone());
-                Ok(Some((pointer_value, target_type)))
+                let target_type = self.complete_dynamic_member_element_type(
+                    target_type.as_ref().clone(),
+                    module_path.as_deref(),
+                );
+                Ok(Some(DynamicLvalue {
+                    address: pointer_value,
+                    type_info: DynamicTypeInfo {
+                        dwarf_type: target_type,
+                        module_path,
+                    },
+                }))
             }
             _ => Ok(None),
         }
@@ -3144,10 +3149,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     fn dynamic_member_offset_and_type(
         &self,
-        aggregate_type: &DwarfType,
+        aggregate: &DynamicTypeInfo,
         field: &str,
     ) -> Result<(u64, DwarfType)> {
-        let aggregate_type = self.complete_dynamic_member_element_type(aggregate_type.clone());
+        let aggregate_type = self.complete_dynamic_member_element_type(
+            aggregate.dwarf_type.clone(),
+            aggregate.module_path.as_deref(),
+        );
         match ghostscope_dwarf::strip_type_aliases(&aggregate_type) {
             DwarfType::StructType { members, .. } | DwarfType::UnionType { members, .. } => {
                 let Some(member) = members.iter().find(|member| member.name == field) else {
@@ -3169,7 +3177,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         &mut self,
         array_expr: &Expr,
         index_expr: &Expr,
-    ) -> Result<Option<(IntValue<'ctx>, DwarfType)>> {
+    ) -> Result<Option<DynamicLvalue<'ctx>>> {
         let literal_index = Self::integer_literal_value(index_expr);
         let expanded_array_expr = self.expand_alias_variable_expr(array_expr)?;
         let has_dynamic_base =
@@ -3186,10 +3194,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             None
         };
 
-        let (element_type, stride, base_address, static_index) = match self
+        let (element_info, base_address, static_index) = match self
             .query_dwarf_for_complex_expr(array_expr)?
         {
             Some(array_plan) => {
+                let module_path = array_plan.module_path.clone();
                 let array_type = array_plan.dwarf_type.clone().ok_or_else(|| {
                     CodeGenError::DwarfError(
                         "Array expression has no DWARF type information".to_string(),
@@ -3197,16 +3206,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 })?;
                 match ghostscope_dwarf::strip_type_aliases(&array_type) {
                     DwarfType::ArrayType { element_type, .. } => {
-                        let module_hint = self.current_resolved_var_module_path.clone();
-                        let base_address = self.variable_read_plan_to_lvalue_address_with_hint(
+                        let base_address = self.variable_read_plan_to_lvalue_address(
                             &array_plan,
                             compile_context.pc_address,
                             status_ptr,
-                            module_hint.as_deref(),
                         )?;
                         (
-                            element_type.as_ref().clone(),
-                            element_type.size().max(1),
+                            IndexableElementInfo {
+                                element_type: element_type.as_ref().clone(),
+                                stride: element_type.size().max(1),
+                                module_path,
+                            },
                             base_address,
                             0,
                         )
@@ -3236,8 +3246,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             }
                         };
                         (
-                            target_type.as_ref().clone(),
-                            target_type.size().max(1),
+                            IndexableElementInfo {
+                                element_type: target_type.as_ref().clone(),
+                                stride: target_type.size().max(1),
+                                module_path,
+                            },
                             base_address,
                             0,
                         )
@@ -3261,6 +3274,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     &base_expr,
                                 ))
                             })?;
+                    let module_path = array_plan.module_path.clone();
                     let array_type = array_plan.dwarf_type.clone().ok_or_else(|| {
                         CodeGenError::DwarfError(
                             "Array expression has no DWARF type information".to_string(),
@@ -3268,17 +3282,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     })?;
                     match ghostscope_dwarf::strip_type_aliases(&array_type) {
                         DwarfType::ArrayType { element_type, .. } => {
-                            let module_hint = self.current_resolved_var_module_path.clone();
-                            let base_address = self
-                                .variable_read_plan_to_lvalue_address_with_hint(
-                                    &array_plan,
-                                    compile_context.pc_address,
-                                    status_ptr,
-                                    module_hint.as_deref(),
-                                )?;
+                            let base_address = self.variable_read_plan_to_lvalue_address(
+                                &array_plan,
+                                compile_context.pc_address,
+                                status_ptr,
+                            )?;
                             (
-                                element_type.as_ref().clone(),
-                                element_type.size().max(1),
+                                IndexableElementInfo {
+                                    element_type: element_type.as_ref().clone(),
+                                    stride: element_type.size().max(1),
+                                    module_path,
+                                },
                                 base_address,
                                 static_index,
                             )
@@ -3309,8 +3323,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 }
                             };
                             (
-                                target_type.as_ref().clone(),
-                                target_type.size().max(1),
+                                IndexableElementInfo {
+                                    element_type: target_type.as_ref().clone(),
+                                    stride: target_type.size().max(1),
+                                    module_path,
+                                },
                                 base_address,
                                 static_index,
                             )
@@ -3323,26 +3340,32 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         }
                     }
                 } else if has_dynamic_base {
-                    let (element_type, stride) = self
+                    let element_info = self
                         .indexable_element_type_and_stride(&expanded_array_expr)?
                         .ok_or_else(|| {
                             CodeGenError::VariableNotFound(Self::expr_to_debug_string(array_expr))
                         })?;
                     let base_address = self.resolve_ptr_i64_from_expr(&expanded_array_expr)?;
-                    (element_type, stride, base_address, 0)
-                } else if let Some((base_address, array_type)) =
+                    (element_info, base_address, 0)
+                } else if let Some(array_lvalue) =
                     self.dynamic_lvalue_address_and_type(&expanded_array_expr)?
                 {
-                    match ghostscope_dwarf::strip_type_aliases(&array_type) {
+                    let module_path = array_lvalue.type_info.module_path.clone();
+                    match ghostscope_dwarf::strip_type_aliases(&array_lvalue.type_info.dwarf_type) {
                         DwarfType::ArrayType { element_type, .. } => (
-                            element_type.as_ref().clone(),
-                            element_type.size().max(1),
-                            base_address,
+                            IndexableElementInfo {
+                                element_type: element_type.as_ref().clone(),
+                                stride: element_type.size().max(1),
+                                module_path,
+                            },
+                            array_lvalue.address,
                             0,
                         ),
                         DwarfType::PointerType { target_type, .. } => {
-                            let pointer_value =
-                                self.read_dynamic_address_value(base_address, &array_type)?;
+                            let pointer_value = self.read_dynamic_address_value(
+                                array_lvalue.address,
+                                &array_lvalue.type_info.dwarf_type,
+                            )?;
                             let base_address = match pointer_value {
                                 BasicValueEnum::IntValue(value) => self
                                     .normalize_int_to_i64(value, "dynamic_array_member_ptr_i64")?,
@@ -3362,8 +3385,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 }
                             };
                             (
-                                target_type.as_ref().clone(),
-                                target_type.size().max(1),
+                                IndexableElementInfo {
+                                    element_type: target_type.as_ref().clone(),
+                                    stride: target_type.size().max(1),
+                                    module_path,
+                                },
                                 base_address,
                                 0,
                             )
@@ -3409,7 +3435,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 )
                 .map_err(|err| CodeGenError::Builder(err.to_string()))?
         };
-        let stride_value = self.context.i64_type().const_int(stride, false);
+        let stride_value = self
+            .context
+            .i64_type()
+            .const_int(element_info.stride, false);
         let byte_offset = self
             .builder
             .build_int_mul(index_value, stride_value, "dynamic_array_byte_offset")
@@ -3419,22 +3448,32 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_int_add(base_address, byte_offset, "dynamic_array_element_address")
             .map_err(|err| CodeGenError::Builder(err.to_string()))?;
 
-        Ok(Some((element_address, element_type)))
+        Ok(Some(DynamicLvalue {
+            address: element_address,
+            type_info: DynamicTypeInfo {
+                dwarf_type: element_info.element_type,
+                module_path: element_info.module_path,
+            },
+        }))
     }
 
     fn indexable_element_type_and_stride(
         &mut self,
         expr: &Expr,
-    ) -> Result<Option<(DwarfType, u64)>> {
+    ) -> Result<Option<IndexableElementInfo>> {
         use crate::script::ast::BinaryOp as BO;
         use crate::script::ast::Expr as E;
 
         let expanded = self.expand_alias_variable_expr(expr)?;
 
         if let Some(plan) = self.query_dwarf_for_complex_expr(&expanded)? {
-            if let Some(dwarf_type) = plan.dwarf_type {
-                if let Some(info) = Self::element_type_and_stride_from_type(&dwarf_type) {
-                    return Ok(Some(info));
+            if let Some(dwarf_type) = plan.dwarf_type.as_ref() {
+                if let Some(info) = Self::element_type_and_stride_from_type(dwarf_type) {
+                    return Ok(Some(IndexableElementInfo {
+                        element_type: info.0,
+                        stride: info.1,
+                        module_path: plan.module_path,
+                    }));
                 }
             }
         }
@@ -3443,9 +3482,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.pointer_arithmetic_parts_expanding_aliases(&expanded)?
         {
             if let Some(plan) = self.query_dwarf_for_complex_expr(&base_expr)? {
-                if let Some(dwarf_type) = plan.dwarf_type {
-                    if let Some(info) = Self::element_type_and_stride_from_type(&dwarf_type) {
-                        return Ok(Some(info));
+                if let Some(dwarf_type) = plan.dwarf_type.as_ref() {
+                    if let Some(info) = Self::element_type_and_stride_from_type(dwarf_type) {
+                        return Ok(Some(IndexableElementInfo {
+                            element_type: info.0,
+                            stride: info.1,
+                            module_path: plan.module_path,
+                        }));
                     }
                 }
             }
@@ -3483,7 +3526,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
-    fn complete_dynamic_member_element_type(&self, element_type: DwarfType) -> DwarfType {
+    fn complete_dynamic_member_element_type(
+        &self,
+        element_type: DwarfType,
+        module_path: Option<&Path>,
+    ) -> DwarfType {
         let candidate_name = match ghostscope_dwarf::strip_type_aliases(&element_type) {
             DwarfType::UnknownType { name } => Some(name.clone()),
             _ => None,
@@ -3491,7 +3538,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let Some(candidate_name) = candidate_name else {
             return element_type;
         };
-        let Some(resolved) = self.resolve_named_aggregate_type_for_dynamic_member(&candidate_name)
+        let Some(resolved) =
+            self.resolve_named_aggregate_type_for_dynamic_member(&candidate_name, module_path)
         else {
             return element_type;
         };
@@ -3507,14 +3555,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             } => DwarfType::QualifiedType {
                 qualifier,
                 underlying_type: Box::new(
-                    self.complete_dynamic_member_element_type(*underlying_type),
+                    self.complete_dynamic_member_element_type(*underlying_type, module_path),
                 ),
             },
             _ => resolved,
         }
     }
 
-    fn resolve_named_aggregate_type_for_dynamic_member(&self, name: &str) -> Option<DwarfType> {
+    fn resolve_named_aggregate_type_for_dynamic_member(
+        &self,
+        name: &str,
+        module_path: Option<&Path>,
+    ) -> Option<DwarfType> {
         let analyzer = self.process_analyzer?;
         let mut candidates = Vec::new();
         let mut push_candidate = |candidate: &str| {
@@ -3538,18 +3590,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         }
 
-        let module_path = self
-            .current_resolved_var_module_path
-            .clone()
-            .or_else(|| {
-                self.current_compile_time_context
-                    .as_ref()
-                    .map(|ctx| ctx.module_path.clone())
-            })
-            .map(std::path::PathBuf::from);
+        let fallback_module_path = if module_path.is_none() {
+            self.current_compile_time_context
+                .as_ref()
+                .map(|ctx| PathBuf::from(&ctx.module_path))
+        } else {
+            None
+        };
+        let module_path = module_path.or(fallback_module_path.as_deref());
 
         for candidate in candidates {
-            let in_module = module_path.as_ref().and_then(|module_path| {
+            let in_module = module_path.and_then(|module_path| {
                 analyzer
                     .resolve_struct_type_shallow_by_name_in_module(module_path, &candidate)
                     .or_else(|| {
@@ -3934,19 +3985,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     // Return const false (or true if '!=' requested)
                     return Ok((if is_equal { zero } else { one }).into());
                 }
-                let module_hint = self.current_resolved_var_module_path.clone();
                 let status_ptr = if self.condition_context_active {
                     Some(self.get_or_create_cond_error_global())
                 } else {
                     None
                 };
                 let pc_address = self.get_compile_time_context()?.pc_address;
-                let addr = self.variable_read_plan_to_lvalue_address_with_hint(
-                    &var,
-                    pc_address,
-                    status_ptr,
-                    module_hint.as_deref(),
-                )?;
+                let addr =
+                    self.variable_read_plan_to_lvalue_address(&var, pc_address, status_ptr)?;
                 // Read exactly L+1 bytes
                 let (buf_global, status, arr_ty) =
                     self.read_user_bytes_into_buffer(addr, lit_len + 1, "_gs_arrbuf")?;
@@ -4031,19 +4077,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .map_err(|e| CodeGenError::Builder(e.to_string()))?
             }
             None => {
-                let module_hint = self.current_resolved_var_module_path.clone();
                 let status_ptr = if self.condition_context_active {
                     Some(self.get_or_create_cond_error_global())
                 } else {
                     None
                 };
                 let pc_address = self.get_compile_time_context()?.pc_address;
-                let addr = self.variable_read_plan_to_lvalue_address_with_hint(
-                    &var,
-                    pc_address,
-                    status_ptr,
-                    module_hint.as_deref(),
-                )?;
+                let addr =
+                    self.variable_read_plan_to_lvalue_address(&var, pc_address, status_ptr)?;
                 // Fallback using type_name string
                 match parse_type_name(&var.type_name) {
                     ParsedKind::PtrChar => {

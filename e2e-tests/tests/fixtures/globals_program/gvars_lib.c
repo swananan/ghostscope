@@ -1,6 +1,17 @@
 #include "gvars_lib.h"
 #include <string.h>
 
+struct AmbiguousDynamic {
+    int want;
+    int decoy;
+};
+
+struct AmbiguousDynamic lib_ambiguous_dynamic_items[2] = {
+    {701, 1701},
+    {702, 1702},
+};
+struct AmbiguousDynamic* LIB_AMBIGUOUS_DYNAMIC = lib_ambiguous_dynamic_items;
+
 // Visible globals
 int lib_counter = 100;                 // .data
 const char lib_message[] = "LIB_MESSAGE"; // .rodata

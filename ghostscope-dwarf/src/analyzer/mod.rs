@@ -1220,6 +1220,7 @@ mod tests {
             name: name.to_string(),
             type_name: "int".to_string(),
             access_path: crate::VariableAccessPath::default(),
+            module_path: None,
             dwarf_type: Some(crate::TypeInfo::BaseType {
                 name: "int".to_string(),
                 size: 4,

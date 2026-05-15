@@ -141,6 +141,7 @@ impl DwarfAnalyzer {
             end: ctx.normalized_pc,
         });
         plan.inline_context = ctx.inline_chain.last().and_then(|frame| frame.context);
+        plan.module_path = ctx.address_space.module_path.clone();
         plan
     }
 

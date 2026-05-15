@@ -85,7 +85,6 @@ pub struct EbpfContext<'ctx, 'dw> {
 
     // === New instruction-based compilation system ===
     pub trace_context: ghostscope_protocol::TraceContext, // Trace context for optimized transmission
-    pub current_resolved_var_module_path: Option<String>,
 
     // Per-invocation stack key for proc_module_offsets lookups (allocated in entry block)
     // Backed by `[4 x i32]`, so consumers may only assume i32 alignment.
@@ -204,7 +203,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
             // Initialize new instruction-based compilation system
             trace_context: ghostscope_protocol::TraceContext::new(),
-            current_resolved_var_module_path: None,
             pm_key_alloca: None,
             event_offset_alloca: None,
             compile_time_event_bytes_upper_bound: 0,
@@ -304,11 +302,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.current_compile_time_context
             .as_ref()
             .ok_or_else(|| CodeGenError::DwarfError("No compile-time context set".to_string()))
-    }
-
-    /// Take and clear the current module hint for offsets (if any)
-    pub fn take_module_hint(&mut self) -> Option<String> {
-        self.current_resolved_var_module_path.take()
     }
 
     /// Declare trace_printk eBPF helper function
