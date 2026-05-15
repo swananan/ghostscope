@@ -79,7 +79,7 @@ trace /home/user/project/src/utils.c:100 {
 
 #### Address
 ```ghostscope
-// Module‑relative address (DWARF PC)
+// Module-relative virtual address (DWARF/symbol PC)
 trace 0x401234 {
     print "Hit address";
 }
@@ -93,6 +93,7 @@ trace libc.so.6:0x1234 {
 Notes:
 - For `0xADDR`, the default module depends on startup mode: `-t <binary>` uses `<binary>`; `-p <pid>` uses the main executable.
 - `module_suffix:0xADDR` allows selecting a module by full path or unique suffix; ambiguous suffixes will list candidates.
+- Address trace targets always use the module's DWARF/symbol virtual address. Do not pass a raw ELF file offset or a runtime ASLR-adjusted address from `/proc/<pid>/maps`; GhostScope converts the virtual address to the uprobe file offset internally.
 
 ## Source Language Support
 
