@@ -7,6 +7,7 @@ use crate::core::{
 };
 use crate::semantics::{strip_type_aliases, PcRange};
 use crate::TypeInfo;
+use std::path::PathBuf;
 
 /// Owned semantic view returned by PC-context variable queries.
 #[derive(Debug, Clone, PartialEq)]
@@ -174,6 +175,7 @@ pub struct VariableMaterializationPlan {
     pub name: String,
     pub type_name: String,
     pub access_path: VariableAccessPath,
+    pub module_path: Option<PathBuf>,
     pub dwarf_type: Option<TypeInfo>,
     pub availability: Availability,
     pub lowering: VariableLoweringPlan,
@@ -186,6 +188,7 @@ pub struct VariableReadPlan {
     pub name: String,
     pub type_name: String,
     pub access_path: VariableAccessPath,
+    pub module_path: Option<PathBuf>,
     pub dwarf_type: Option<TypeInfo>,
     pub declaration: Option<DieRef>,
     pub type_id: Option<TypeId>,
@@ -297,6 +300,7 @@ impl VariableReadPlan {
             name: variable.name,
             type_name: variable.type_name,
             access_path: VariableAccessPath::default(),
+            module_path: None,
             dwarf_type: variable.dwarf_type,
             declaration: variable.declaration,
             type_id: variable.type_id,
@@ -429,6 +433,7 @@ impl VariableReadPlan {
             name: self.name.clone(),
             type_name: self.type_name.clone(),
             access_path: self.access_path.clone(),
+            module_path: self.module_path.clone(),
             dwarf_type: self.dwarf_type.clone(),
             availability: lowering.availability.clone(),
             lowering,
@@ -1222,6 +1227,7 @@ mod tests {
             name: "value".to_string(),
             type_name: "int".to_string(),
             access_path: VariableAccessPath::default(),
+            module_path: None,
             dwarf_type: None,
             declaration: None,
             type_id: None,
@@ -1399,6 +1405,19 @@ mod tests {
             }
             other => panic!("unexpected materialization: {other:?}"),
         }
+    }
+
+    #[test]
+    fn materialization_plan_preserves_module_path_origin() {
+        let mut plan = read_plan(VariableLocation::Address(AddressExpr::constant(0x1000)));
+        plan.module_path = Some(PathBuf::from("/tmp/libstate.so"));
+
+        let materialized = plan.materialization_plan(&capabilities(true));
+
+        assert_eq!(
+            materialized.module_path,
+            Some(PathBuf::from("/tmp/libstate.so"))
+        );
     }
 
     #[test]
