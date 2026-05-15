@@ -190,7 +190,7 @@ uprobe_register(inode, 0x1234)
 ```
 
 Note
-- Script/CLI address targets use module-relative virtual addresses (DWARF PCs). That is, in a script `trace libc.so.6:0xADDR { ... }` or `trace 0xADDR { ... }`, the `0xADDR` is the module's DWARF PC. GhostScope converts this virtual address to the ELF file offset internally (for both PIE and non-PIE) before attaching the uprobe. Do not confuse this with raw file offsets.
+- Script/CLI address targets use module-relative virtual addresses (DWARF/symbol PCs). That is, in a script `trace libc.so.6:0xADDR { ... }` or `trace 0xADDR { ... }`, the `0xADDR` is the module's DWARF/symbol PC. GhostScope converts this virtual address to the ELF file offset internally (for both PIE and non-PIE) before attaching the uprobe. Do not confuse this with raw file offsets or runtime ASLR-adjusted addresses from `/proc/<pid>/maps`.
 
 ### 4. ASLR's Impact on Uprobe
 

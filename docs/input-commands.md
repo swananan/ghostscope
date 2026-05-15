@@ -31,6 +31,7 @@ t <target> [index]          # Short form
     - `0xADDR`: Module-relative virtual address (DWARF PC). Default module depends on startup mode:
       - `-t <binary>`: defaults to `<binary>` (including `.so`)
       - `-p <pid>`: defaults to the process’s main executable
+      - This is not a raw ELF file offset or a runtime ASLR-adjusted address from `/proc/<pid>/maps`.
     - `module_suffix:0xADDR`: Address in a specific module. The module part supports full path or unique suffix matching; ambiguous suffixes will be reported with candidates.
 
 **Examples:**
@@ -350,8 +351,8 @@ Display executable file information including:
 - Launch mode (PID mode or static analysis mode)
 
 **Output:**
-- **ELF virtual addresses**: For `-t` mode (static analysis)
-- **Runtime loaded addresses**: For `-p` mode (attached to process)
+- **Module virtual addresses**: The addresses shown for functions, lines, and `info address` are DWARF/symbol PCs that can be used in `trace 0xADDR` or `trace module:0xADDR`.
+- **Runtime mapping information**: `-p` mode may also show process mapping/load information, but address trace inputs still use module virtual addresses, not ASLR-adjusted runtime addresses.
 - **Debug link**: Shows separate debug file path if using .gnu_debuglink
 
 **Examples:**
@@ -446,6 +447,8 @@ i a <0xADDR | module_suffix:0xADDR> [v]    # Short form
 - `<0xADDR>`: Module-relative virtual address (DWARF/symbol PC) in hex. If no module is specified, the default module applies (see below).
 - `module_suffix:0xADDR`: Address in a specific module. The module part supports full path or unique suffix matching; ambiguity will be reported with candidates.
 - `[verbose|v]`: Optional. Show DWARF location expressions (hidden by default).
+
+Address arguments are not raw ELF file offsets and are not runtime ASLR-adjusted addresses from `/proc/<pid>/maps`. GhostScope converts the module virtual address to the uprobe file offset internally.
 
 **Defaults and modes:**
 - Launched with `-t <binary>` (target mode): the default module is `<binary>`.

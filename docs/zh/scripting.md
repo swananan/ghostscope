@@ -79,7 +79,7 @@ trace /home/user/project/src/utils.c:100 {
 
 #### 地址
 ```ghostscope
-// 按模块相对地址（DWARF PC）追踪
+// 按模块相对虚拟地址（DWARF/符号表 PC）追踪
 trace 0x401234 {
     print "命中地址";
 }
@@ -93,6 +93,7 @@ trace libc.so.6:0x1234 {
 说明：
 - `0xADDR` 的默认模块取决于启动模式：`-t <binary>` 使用 `<binary>`；`-p <pid>` 使用主可执行文件。
 - `模块后缀:0xADDR` 可通过“全路径”或“唯一后缀”选中模块；若后缀不唯一，会提示候选项。
+- 地址 trace 目标始终使用该模块的 DWARF/符号表虚拟地址。不要填写原始 ELF 文件偏移，也不要填写 `/proc/<pid>/maps` 中 ASLR 后的运行时地址；GhostScope 会在内部把虚拟地址转换为 uprobe 需要的文件偏移。
 
 ## 源语言支持现状
 
