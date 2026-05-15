@@ -29,8 +29,8 @@ enum ParsedOperation<R: Reader<Offset = usize>> {
 impl ExpressionEvaluator {
     const MAX_IMPLICIT_POINTER_DEPTH: usize = 8;
 
-    /// Evaluate a variable's location from its DIE attributes
-    pub fn evaluate_location(
+    /// Lower a variable's location from its DIE attributes into a semantic location.
+    pub fn lower_location(
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         dwarf: &gimli::Dwarf<DwarfReader>,
@@ -39,7 +39,7 @@ impl ExpressionEvaluator {
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&CfiIndex>,
     ) -> Result<ParsedLocation> {
-        let result = Self::evaluate_location_result_with_depth(
+        let result = Self::lower_location_raw_with_depth(
             entry,
             unit,
             dwarf,
@@ -53,7 +53,7 @@ impl ExpressionEvaluator {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn evaluate_location_result_with_depth(
+    fn lower_location_raw_with_depth(
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         dwarf: &gimli::Dwarf<DwarfReader>,
@@ -1124,7 +1124,7 @@ impl ExpressionEvaluator {
         let entry = unit
             .entry(unit_offset)
             .map_err(|e| anyhow::anyhow!("DW_OP_implicit_pointer entry parse failed: {e}"))?;
-        let referenced = Self::evaluate_location_result_with_depth(
+        let referenced = Self::lower_location_raw_with_depth(
             &entry,
             &unit,
             dwarf,
@@ -1622,8 +1622,9 @@ impl ExpressionEvaluator {
 mod tests {
     use super::ExpressionEvaluator;
     use crate::core::{
-        AddressExpr, CfaResult, DirectValueResult, LocationResult, MemoryAccessSize, PieceLocation,
-        PieceResult, PlanExprOp, RawExpressionResult, VariableLocation,
+        AddressExpr, Availability, CfaResult, DirectValueResult, LocationResult, MemoryAccessSize,
+        ParsedLocation, PieceLocation, PieceResult, PlanExprOp, RawExpressionResult,
+        VariableLocation,
     };
     use gimli::constants;
     use gimli::RunTimeEndian;
@@ -1730,6 +1731,11 @@ mod tests {
         )
     }
 
+    fn lower_test_expr(bytes: &[u8]) -> anyhow::Result<ParsedLocation> {
+        let raw = parse_test_expr(bytes)?;
+        Ok(ExpressionEvaluator::parsed_location_from_result(&raw))
+    }
+
     fn addr_expr(address: u64) -> Vec<u8> {
         let mut bytes = vec![constants::DW_OP_addr.0];
         bytes.extend(address.to_le_bytes());
@@ -1747,6 +1753,74 @@ mod tests {
         bytes.extend(encode_uleb(register));
         bytes.extend(encode_sleb(offset));
         bytes
+    }
+
+    #[test]
+    fn dwarf_expression_lowering_returns_register_value_parsed_location() {
+        let parsed = lower_test_expr(&[constants::DW_OP_reg5.0])
+            .expect("DW_OP_reg5 should lower to ParsedLocation");
+
+        assert_eq!(
+            parsed.location,
+            VariableLocation::RegisterValue { dwarf_reg: 5 }
+        );
+        assert_eq!(parsed.availability, Availability::Available);
+    }
+
+    #[test]
+    fn dwarf_expression_lowering_returns_register_address_parsed_location() {
+        let parsed = lower_test_expr(&bregx_expr(6, -16))
+            .expect("DW_OP_bregx should lower to ParsedLocation");
+
+        assert_eq!(
+            parsed.location,
+            VariableLocation::RegisterAddress {
+                dwarf_reg: 6,
+                offset: -16
+            }
+        );
+        assert_eq!(parsed.availability, Availability::Available);
+    }
+
+    #[test]
+    fn dwarf_expression_lowering_returns_stack_value_parsed_location() {
+        let parsed = lower_test_expr(&[constants::DW_OP_lit1.0, constants::DW_OP_stack_value.0])
+            .expect("DW_OP_stack_value should lower to ParsedLocation");
+
+        assert_eq!(
+            parsed.location,
+            VariableLocation::ComputedValue(vec![PlanExprOp::PushConstant(1)])
+        );
+        assert_eq!(parsed.availability, Availability::Available);
+    }
+
+    #[test]
+    fn dwarf_expression_lowering_marks_mixed_pieces_partially_available() {
+        let mut bytes = vec![constants::DW_OP_piece.0];
+        bytes.extend(encode_uleb(4));
+        bytes.push(constants::DW_OP_reg0.0);
+        bytes.push(constants::DW_OP_piece.0);
+        bytes.extend(encode_uleb(4));
+
+        let parsed = lower_test_expr(&bytes)
+            .expect("mixed DW_OP_piece expression should lower to ParsedLocation");
+
+        assert_eq!(
+            parsed.location,
+            VariableLocation::Pieces(vec![
+                PieceLocation {
+                    bit_offset: 0,
+                    bit_size: 32,
+                    location: Box::new(VariableLocation::OptimizedOut),
+                },
+                PieceLocation {
+                    bit_offset: 32,
+                    bit_size: 32,
+                    location: Box::new(VariableLocation::RegisterValue { dwarf_reg: 0 }),
+                },
+            ])
+        );
+        assert_eq!(parsed.availability, Availability::PartiallyAvailable);
     }
 
     #[test]
