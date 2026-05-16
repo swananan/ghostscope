@@ -14,9 +14,9 @@ categories.workspace = true
 description = "Compiles GhostScope trace definitions into DWARF-aware eBPF programs ready for injection."
 
 [dependencies]
-inkwell = { version = "0.6.0", features = ["llvm18-1", "target-bpf"] }
-pest = "2.7"
-pest_derive = "2.7"
+inkwell = { version = "0.9.0", features = ["llvm18-1", "target-bpf"] }
+pest = "2.8"
+pest_derive = "2.8"
 tracing = { workspace = true }
 tracing-log = { workspace = true }
 thiserror = { workspace = true }

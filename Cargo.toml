@@ -43,23 +43,23 @@ keywords = ["ebpf", "gdb", "dwarf", "debugger"]
 categories = ["development-tools::debugging", "development-tools::profiling"]
 
 [workspace.dependencies]
-log = "0.4.22"
+log = "0.4.29"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-anyhow = "1.0.93"
-tracing = "0.1.41"
+anyhow = "1.0.102"
+tracing = "0.1.44"
 tracing-log = "0.2.0"
-thiserror = "2.0.12"
-tokio = { version = "1.0", features = ["full"] }
+thiserror = "2.0.18"
+tokio = { version = "1.50", features = ["full"] }
 chrono = { version = "0.4", features = ["serde", "clock"] }
 futures = "0.3"
 futures-util = "0.3"
 crossterm = { version = "0.29", features = ["event-stream"] }
-clap = { version = "4.0", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
-dirs = "5.0"
-object = "0.36"
+toml = "1.1"
+dirs = "6.0"
+object = "0.39"
 
 gimli = "0.33.0"
 aya = { git = "https://github.com/aya-rs/aya.git", rev = "5dd4bd440bdf0e29a695cad088fdb1716229633b" }
@@ -68,8 +68,8 @@ aya-ebpf-bindings = { git = "https://github.com/aya-rs/aya.git", rev = "5dd4bd44
 aya-build = { git = "https://github.com/aya-rs/aya.git", rev = "5dd4bd440bdf0e29a695cad088fdb1716229633b" }
 
 # Test dependencies
-tempfile = "3.8"
+tempfile = "3.27"
 lazy_static = "1.4"
-serial_test = "3.0"
+serial_test = "3.4"
 criterion = "0.5"
 scopeguard = "1.2"

@@ -25,8 +25,8 @@ ghostscope-protocol = { version = "0.1.4", path = "../ghostscope-protocol" }
 ghostscope-process = { version = "0.1.4", path = "../ghostscope-process" }
 ghostscope-debuginfod = { version = "0.1.4", path = "../ghostscope-debuginfod" }
 rustc-demangle = "0.1"
-cpp_demangle = "0.4"
-rayon = "1.10"
+cpp_demangle = "0.5"
+rayon = "1.12"
 
 # For parallel loading
 tokio.workspace = true
@@ -40,7 +40,7 @@ libc = "0.2"
 crc32fast = "1.4"
 
 # For home directory expansion in debug search paths
-dirs = "5.0"
+dirs = "6.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }
