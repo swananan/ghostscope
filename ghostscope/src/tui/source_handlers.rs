@@ -1,5 +1,4 @@
 use crate::core::GhostSession;
-use crate::source_path::apply_substitutions_to_directory;
 use ghostscope_ui::{events::*, RuntimeChannels, RuntimeStatus};
 use std::collections::HashSet;
 use tracing::info;
@@ -227,28 +226,12 @@ fn get_grouped_source_files_info(session: &GhostSession) -> anyhow::Result<Vec<S
                 // 3. Search directories by basename (srcpath add)
                 let dwarf_full_path = format!("{}/{}", file.directory, file.basename);
 
-                let (resolved_dir, resolved_basename) = if let Some(resolved_path) =
-                    session.source_path_resolver.resolve(&dwarf_full_path)
-                {
-                    // Successfully resolved - extract directory and basename from resolved path
-                    let resolved_str = resolved_path.to_string_lossy().to_string();
-                    if let Some(last_slash) = resolved_str.rfind('/') {
-                        let dir = resolved_str[..last_slash].to_string();
-                        let basename = resolved_str[last_slash + 1..].to_string();
-                        (dir, basename)
-                    } else {
-                        // No directory separator - use current dir
-                        (".".to_string(), resolved_str)
-                    }
-                } else {
-                    // Resolution failed - use substitution-only fallback for directory
-                    // This maintains backward compatibility with pure substitution approach
-                    let resolved_dir = apply_substitutions_to_directory(
-                        &session.source_path_resolver,
+                let (resolved_dir, resolved_basename) =
+                    session.source_path_resolver.resolve_dwarf_path_for_display(
+                        &dwarf_full_path,
                         &file.directory,
+                        &file.basename,
                     );
-                    (resolved_dir, file.basename.clone())
-                };
 
                 let key = format!("{resolved_dir}:{resolved_basename}");
                 if seen.insert(key) {

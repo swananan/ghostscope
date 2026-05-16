@@ -17,9 +17,11 @@ use std::sync::Arc;
 mod module_resolution;
 mod plan_global;
 mod plan_pc;
+mod source_resolution;
 mod type_lookup;
 
 pub use module_resolution::ModuleDefaultPolicy;
+pub use source_resolution::{SourceLineAddressSearch, SourceLineQuerySearch};
 
 #[cfg(test)]
 use crate::{
