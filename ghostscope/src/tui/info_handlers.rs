@@ -432,9 +432,6 @@ fn try_get_line_debug_info(
         .as_mut()
         .ok_or_else(|| "Debug information not available. DWARF symbols may not be loaded or initialization failed.".to_string())?;
 
-    use std::collections::HashSet;
-    use std::path::PathBuf;
-
     // Parse original input once
     let (orig_file, line_part) = target
         .rsplit_once(':')
@@ -443,67 +440,38 @@ fn try_get_line_debug_info(
         .parse::<u32>()
         .map_err(|_| format!("Invalid line number '{line_part}' in target '{target}'"))?;
 
-    // Build candidate DWARF file paths in priority order
-    let mut candidates: Vec<String> = Vec::new();
+    let source_line = process_analyzer
+        .resolve_source_line_query_best_effort(
+            session
+                .source_path_resolver
+                .source_line_candidates(orig_file, process_analyzer),
+            line_number,
+            target_path.as_deref(),
+        )
+        .map_err(|e| format!("Failed to analyze {orig_file}:{line_number}: {e}"))?;
 
-    // 1) Reverse-map absolute local paths to DWARF paths (if applicable)
-    if let Some(dwarf_path) = session.source_path_resolver.reverse_map_to_dwarf(orig_file) {
-        candidates.push(dwarf_path);
+    if !source_line.addresses.is_empty() {
+        let file_path = source_line
+            .file_path
+            .clone()
+            .unwrap_or_else(|| orig_file.to_string());
+        let cand_target = format!("{file_path}:{line_number}");
+        return Ok(build_source_location_target_debug_info(
+            cand_target,
+            file_path,
+            line_number,
+            source_line.addresses,
+        ));
     }
 
-    // 2) If user provided a relative path, combine with each substitution's 'from' (DWARF comp_dir)
-    if !orig_file.starts_with('/') {
-        let rules = session.source_path_resolver.get_all_rules();
-        for sub in rules.substitutions {
-            let joined = PathBuf::from(&sub.from).join(orig_file);
-            candidates.push(joined.to_string_lossy().to_string());
-        }
-
-        // 2b) Also combine with all DWARF-reported directories (comp_dir) from analyzer's file index
-        if let Ok(grouped) = process_analyzer.get_grouped_file_info_by_module() {
-            for (_module_path, files) in grouped {
-                for f in files {
-                    let joined = PathBuf::from(&f.directory).join(orig_file);
-                    candidates.push(joined.to_string_lossy().to_string());
-                }
-            }
-        }
+    if source_line.raw_address_count > 0 {
+        let target_path = target_path.as_deref().unwrap_or("<unknown>");
+        return Err(format!(
+            "Cannot resolve any address for {orig_file}:{line_number} in -t target '{target_path}'"
+        ));
     }
 
-    // 3) Always try original input (might already be full DWARF path)
-    candidates.push(orig_file.to_string());
-
-    // Deduplicate while preserving order
-    let mut seen = HashSet::new();
-    candidates.retain(|c| seen.insert(c.clone()));
-
-    // Probe candidates until we find addresses
-    for cand in &candidates {
-        let query_results = process_analyzer
-            .query_source_line_best_effort(cand, line_number)
-            .map_err(|e| format!("Failed to analyze {cand}:{line_number}: {e}"))?;
-        let query_results = process_analyzer
-            .filter_address_results_to_target(query_results, target_path.as_deref())
-            .map_err(|e| e.to_string())?;
-        if !query_results.is_empty() {
-            let cand_target = format!("{cand}:{line_number}");
-            return Ok(build_source_location_target_debug_info(
-                cand_target,
-                cand.to_string(),
-                line_number,
-                query_results,
-            ));
-        }
-    }
-
-    // Fallback to previous behavior (with reverse-map if available)
-    let final_target =
-        if let Some(dwarf_path) = session.source_path_resolver.reverse_map_to_dwarf(orig_file) {
-            format!("{dwarf_path}:{line_number}")
-        } else {
-            target.to_string()
-        };
-    handle_source_location_target(process_analyzer, &final_target, target_path.as_deref())
+    Err(process_analyzer.describe_source_line_failure(orig_file, line_number))
 }
 
 fn unique_module_count(addresses: &[AddressQueryResult]) -> usize {
@@ -689,45 +657,4 @@ fn handle_function_target(
         .query_function_best_effort(function_name)
         .map_err(|e| format!("Failed to analyze function '{function_name}': {e}"))?;
     handle_function_query_result(process_analyzer, query_result, target_path)
-}
-
-/// Handle source location target (file:line)
-fn handle_source_location_target(
-    process_analyzer: &mut ghostscope_dwarf::DwarfAnalyzer,
-    target: &str,
-    target_path: Option<&str>,
-) -> Result<TargetDebugInfo, String> {
-    let (file_path, line_part) = target
-        .rsplit_once(':')
-        .ok_or_else(|| format!("Invalid target format '{target}'. Expected format: file:line"))?;
-    let line_number = line_part
-        .parse::<u32>()
-        .map_err(|_| format!("Invalid line number '{line_part}' in target '{target}'"))?;
-
-    let query_results = process_analyzer
-        .query_source_line_best_effort(file_path, line_number)
-        .map_err(|e| format!("Failed to analyze {file_path}:{line_number}: {e}"))?;
-    let raw_address_count = query_results.len();
-    let query_results = process_analyzer
-        .filter_address_results_to_target(query_results, target_path)
-        .map_err(|e| e.to_string())?;
-
-    if query_results.is_empty() {
-        if raw_address_count > 0 {
-            let target_path = target_path.unwrap_or("<unknown>");
-            return Err(format!(
-                "Cannot resolve any address for {file_path}:{line_number} in -t target '{target_path}'"
-            ));
-        }
-        return Err(format!(
-            "Cannot resolve any address for {file_path}:{line_number}"
-        ));
-    }
-
-    Ok(build_source_location_target_debug_info(
-        target.to_string(),
-        file_path.to_string(),
-        line_number,
-        query_results,
-    ))
 }

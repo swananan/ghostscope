@@ -1,5 +1,6 @@
 use crate::config::settings::SourceConfig;
 use ghostscope_ui::events::{PathSubstitution, SourcePathInfo};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
@@ -227,13 +228,73 @@ impl SourcePathResolver {
         }
         None
     }
+
+    /// Build source-line query candidates for a user-provided path.
+    ///
+    /// SourcePathResolver owns local filesystem to DWARF path mapping, while
+    /// DwarfAnalyzer owns DWARF path matching and basename/suffix expansion.
+    pub fn source_line_candidates(
+        &self,
+        input_path: &str,
+        analyzer: &ghostscope_dwarf::DwarfAnalyzer,
+    ) -> Vec<String> {
+        let mut candidates = Vec::new();
+
+        if let Some(dwarf_path) = self.reverse_map_to_dwarf(input_path) {
+            candidates.push(dwarf_path);
+        }
+
+        if !Path::new(input_path).is_absolute() {
+            for sub in self
+                .runtime_substitutions
+                .iter()
+                .chain(self.config_substitutions.iter())
+            {
+                let joined = PathBuf::from(&sub.from).join(input_path);
+                candidates.push(joined.to_string_lossy().to_string());
+            }
+        }
+
+        candidates.extend(analyzer.source_line_candidates(input_path));
+        candidates.push(input_path.to_string());
+
+        let mut seen = HashSet::new();
+        candidates
+            .retain(|candidate| !candidate.trim().is_empty() && seen.insert(candidate.clone()));
+        candidates
+    }
+
+    /// Resolve a DWARF source path for UI display.
+    pub fn resolve_dwarf_path_for_display(
+        &self,
+        dwarf_full_path: &str,
+        fallback_directory: &str,
+        fallback_basename: &str,
+    ) -> (String, String) {
+        if let Some(resolved_path) = self.resolve(dwarf_full_path) {
+            return split_display_path(&resolved_path);
+        }
+
+        (
+            self.try_substitute_path(fallback_directory)
+                .unwrap_or_else(|| fallback_directory.to_string()),
+            fallback_basename.to_string(),
+        )
+    }
 }
 
-/// Apply substitutions to directory path only (for info source)
-pub fn apply_substitutions_to_directory(resolver: &SourcePathResolver, directory: &str) -> String {
-    resolver
-        .try_substitute_path(directory)
-        .unwrap_or_else(|| directory.to_string())
+fn split_display_path(path: &Path) -> (String, String) {
+    let basename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+    let directory = path
+        .parent()
+        .map(|parent| parent.to_string_lossy().to_string())
+        .filter(|parent| !parent.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+    (directory, basename)
 }
 
 #[cfg(test)]
@@ -292,20 +353,32 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_substitutions_to_directory() {
+    fn test_resolve_dwarf_path_for_display_substitutes_directory() {
         let resolver = create_test_resolver(vec![("/usr/src/debug", "/home/user/sources")], vec![]);
 
         // Should substitute
-        let result = apply_substitutions_to_directory(&resolver, "/usr/src/debug/myproject");
-        assert_eq!(result, "/home/user/sources/myproject");
+        let (dir, basename) = resolver.resolve_dwarf_path_for_display(
+            "/usr/src/debug/myproject/main.c",
+            "/usr/src/debug/myproject",
+            "main.c",
+        );
+        assert_eq!(dir, "/home/user/sources/myproject");
+        assert_eq!(basename, "main.c");
 
         // Should not substitute (no boundary)
-        let result2 = apply_substitutions_to_directory(&resolver, "/usr/src/debug-backup");
-        assert_eq!(result2, "/usr/src/debug-backup");
+        let (dir, basename) = resolver.resolve_dwarf_path_for_display(
+            "/usr/src/debug-backup/main.c",
+            "/usr/src/debug-backup",
+            "main.c",
+        );
+        assert_eq!(dir, "/usr/src/debug-backup");
+        assert_eq!(basename, "main.c");
 
         // Should not substitute (no match)
-        let result3 = apply_substitutions_to_directory(&resolver, "/other/path");
-        assert_eq!(result3, "/other/path");
+        let (dir, basename) =
+            resolver.resolve_dwarf_path_for_display("/other/path/main.c", "/other/path", "main.c");
+        assert_eq!(dir, "/other/path");
+        assert_eq!(basename, "main.c");
     }
 
     #[test]

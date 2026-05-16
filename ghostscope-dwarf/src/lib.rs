@@ -23,7 +23,7 @@ pub mod analyzer;
 pub use analyzer::{
     AddressQueryResult, DwarfAnalyzer, FunctionQueryResult, MainExecutableInfo,
     ModuleDefaultPolicy, ModuleLoadingEvent, ModuleLoadingStats, ModuleStats, SharedLibraryInfo,
-    SimpleFileInfo,
+    SimpleFileInfo, SourceLineAddressSearch, SourceLineQuerySearch,
 };
 
 // Re-export essential core and semantic support types.
