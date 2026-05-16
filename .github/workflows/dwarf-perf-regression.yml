@@ -32,7 +32,7 @@ jobs:
       DWARF_PERF_CHANGED_FILES: ${{ github.workspace }}/.tmp/dwarf-perf-changed-files.txt
     steps:
       - name: Checkout head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: head
@@ -71,7 +71,7 @@ jobs:
 
       - name: Checkout base
         if: steps.detect.outputs.base_supported == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: base
@@ -86,10 +86,10 @@ jobs:
           sudo apt-get install -y llvm-18-dev libpolly-18-dev jq
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-dwarf-perf-cargo-registry-${{ hashFiles('head/Cargo.lock') }}
@@ -97,7 +97,7 @@ jobs:
             ${{ runner.os }}-dwarf-perf-cargo-registry-
 
       - name: Cache cargo index
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-dwarf-perf-cargo-index-${{ hashFiles('head/Cargo.lock') }}
@@ -105,7 +105,7 @@ jobs:
             ${{ runner.os }}-dwarf-perf-cargo-index-
 
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.target_tmp/dwarf-perf-regression
           key: ${{ runner.os }}-dwarf-perf-target-${{ hashFiles('head/Cargo.lock') }}
@@ -363,7 +363,7 @@ jobs:
 
       - name: Upload perf artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dwarf-perf-regression-${{ github.event.pull_request.number }}
           path: |

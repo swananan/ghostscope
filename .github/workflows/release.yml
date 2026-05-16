@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Use GHCR base image (pinned digest)
       run: |
@@ -49,7 +49,7 @@ jobs:
         ls -lh ./target/release/ghostscope
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: ghostscope-x86_64-linux-gnu
         path: target/release/ghostscope

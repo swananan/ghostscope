@@ -37,7 +37,7 @@ jobs:
             target_mode: child-container
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -49,10 +49,10 @@ jobs:
           sudo apt-get install -y llvm-18-dev libpolly-18-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -60,7 +60,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Cache cargo index
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
@@ -68,7 +68,7 @@ jobs:
             ${{ runner.os }}-cargo-index-
 
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target
           key: ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-target-${{ hashFiles('**/Cargo.lock') }}
@@ -77,7 +77,7 @@ jobs:
 
       - name: Cache fixture archive
         id: fixture-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: e2e-tests/.fixture-cache/fixture-binaries.tar
           key: ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-fixtures-${{ env.FIXTURE_COMPILER_CACHE_REV }}-${{ hashFiles('e2e-tests/cache-fixtures.sh', 'e2e-tests/compile-fixtures.sh', 'e2e-tests/tests/fixtures/**/*.c', 'e2e-tests/tests/fixtures/**/*.h', 'e2e-tests/tests/fixtures/**/*.cpp', 'e2e-tests/tests/fixtures/**/*.rs', 'e2e-tests/tests/fixtures/**/Makefile', 'e2e-tests/tests/fixtures/**/Cargo.toml', 'e2e-tests/tests/fixtures/**/Cargo.lock') }}
@@ -149,7 +149,7 @@ jobs:
             target_mode: same
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -161,10 +161,10 @@ jobs:
           sudo apt-get install -y llvm-18-dev libpolly-18-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -172,7 +172,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Cache cargo index
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
@@ -180,7 +180,7 @@ jobs:
             ${{ runner.os }}-cargo-index-
 
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target
           key: ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-target-${{ hashFiles('**/Cargo.lock') }}
@@ -189,7 +189,7 @@ jobs:
 
       - name: Cache fixture archive
         id: fixture-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: e2e-tests/.fixture-cache/fixture-binaries.tar
           key: ${{ runner.os }}-${{ github.job }}-${{ matrix.name }}-fixtures-${{ env.FIXTURE_COMPILER_CACHE_REV }}-${{ hashFiles('e2e-tests/cache-fixtures.sh', 'e2e-tests/compile-fixtures.sh', 'e2e-tests/tests/fixtures/**/*.c', 'e2e-tests/tests/fixtures/**/*.h', 'e2e-tests/tests/fixtures/**/*.cpp', 'e2e-tests/tests/fixtures/**/*.rs', 'e2e-tests/tests/fixtures/**/Makefile', 'e2e-tests/tests/fixtures/**/Cargo.toml', 'e2e-tests/tests/fixtures/**/Cargo.lock') }}

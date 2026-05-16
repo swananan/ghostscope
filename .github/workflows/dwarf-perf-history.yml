@@ -36,14 +36,14 @@ jobs:
       DWARF_PERF_SITE_DIR: ${{ github.workspace }}/.tmp/dwarf-perf-site
       DWARF_PERF_HISTORY_BRANCH: dwarf-perf-history-data
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           fetch-depth: 0
 
       - name: Configure GitHub Pages
         id: pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Install LLVM 18 and jq
         run: |
@@ -53,10 +53,10 @@ jobs:
           sudo apt-get install -y llvm-18-dev libpolly-18-dev jq
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-dwarf-perf-history-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -64,7 +64,7 @@ jobs:
             ${{ runner.os }}-dwarf-perf-history-cargo-registry-
 
       - name: Cache cargo index
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-dwarf-perf-history-cargo-index-${{ hashFiles('**/Cargo.lock') }}
@@ -72,7 +72,7 @@ jobs:
             ${{ runner.os }}-dwarf-perf-history-cargo-index-
 
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.target_tmp/dwarf-perf-history
           key: ${{ runner.os }}-dwarf-perf-history-target-${{ hashFiles('**/Cargo.lock') }}
@@ -166,7 +166,7 @@ jobs:
         run: rm -rf "$DWARF_PERF_SITE_DIR/.git"
 
       - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: ${{ github.workspace }}/.tmp/dwarf-perf-site
 
@@ -183,7 +183,7 @@ jobs:
 
       - name: Upload history artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dwarf-perf-history-${{ github.run_id }}
           path: |
@@ -203,4 +203,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
