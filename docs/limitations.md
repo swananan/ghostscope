@@ -54,6 +54,7 @@ GhostScope scans `/proc/PID/maps` at startup to obtain loaded dynamic library in
 - **Executable targets**: When `-t` points to an executable (`-t /path/to/app`), GhostScope treats that binary as the primary module and globals are supported by default.
 - **Shared-library targets (existing processes)**: If GhostScope starts after the library has already been mapped (e.g., tracing a running process that loaded `libfoo.so` earlier), globals work without extra steps.
 - **Shared-library targets (new processes)**: For processes that start after GhostScope, enable `--enable-sysmon-shared-lib` (or the matching config option) so globals can be resolved. This incurs extra system-wide work, so expect higher overhead on hosts with frequent process churn.
+- **Target-scoped PID runs (`-t ... -p ...`)**: sysmon is not needed or started. `-t` chooses the module used for function/source/address target resolution, while `-p` supplies the concrete process mappings and PID filter.
 
 > **Note**: The current sysmon pipeline still assumes the library is mapped when the exec event is handled; if a loader pulls it in much later, offsets are not retried yet.
 

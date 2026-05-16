@@ -1,7 +1,44 @@
 use crate::core::GhostSession;
 use ghostscope_dwarf::{AddressQueryResult, FunctionQueryResult};
 use ghostscope_ui::{events::*, RuntimeChannels, RuntimeStatus};
+use std::path::Path;
 use tracing::info;
+
+fn paths_equivalent<P: AsRef<Path>, Q: AsRef<Path>>(left: P, right: Q) -> bool {
+    let left = left.as_ref();
+    let right = right.as_ref();
+    if left == right {
+        return true;
+    }
+
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn module_spec_matches_path(module_path: &str, module_spec: &str) -> bool {
+    let spec = module_spec.trim();
+    if spec.is_empty() {
+        return false;
+    }
+
+    paths_equivalent(module_path, spec) || module_path.ends_with(spec)
+}
+
+fn filter_address_results_to_target(
+    addresses: Vec<AddressQueryResult>,
+    target_path: Option<&str>,
+) -> Vec<AddressQueryResult> {
+    let Some(target_path) = target_path else {
+        return addresses;
+    };
+
+    addresses
+        .into_iter()
+        .filter(|address| paths_equivalent(&address.module_path, target_path))
+        .collect()
+}
 
 /// Handle InfoTrace command
 pub async fn handle_info_trace(
@@ -345,11 +382,40 @@ pub async fn handle_info_address(
         for lib in analyzer.get_shared_library_info() {
             modules.push(lib.library_path);
         }
+        if let Ok(grouped) = analyzer.get_grouped_file_info_by_module() {
+            modules.extend(grouped.into_iter().map(|(module_path, _files)| module_path));
+        }
+        modules.sort();
+        modules.dedup();
+
+        if let Some(target_path) = sess.target_binary.as_deref() {
+            let target_module = modules
+                .iter()
+                .find(|module_path| paths_equivalent(module_path, target_path))
+                .cloned()
+                .unwrap_or_else(|| target_path.to_string());
+
+            if let Some(spec) = module_spec {
+                let spec = spec.trim();
+                if !module_spec_matches_path(&target_module, spec)
+                    && !module_spec_matches_path(target_path, spec)
+                {
+                    return Err(format!(
+                        "Module '{spec}' is outside -t target '{target_module}'. When -t and -p are combined, -t takes precedence for address queries."
+                    ));
+                }
+            }
+
+            return Ok(target_module);
+        }
 
         if let Some(spec) = module_spec {
             let spec = spec.trim();
             // Exact match first
-            if let Some(found) = modules.iter().find(|p| p.as_str() == spec) {
+            if let Some(found) = modules
+                .iter()
+                .find(|module_path| paths_equivalent(module_path, spec))
+            {
                 return Ok(found.clone());
             }
             // Suffix match
@@ -372,12 +438,6 @@ pub async fn handle_info_address(
             }
         } else {
             // No module specified: choose default based on mode
-            if sess.is_target_mode() {
-                // -t mode: default to the target binary
-                if let Some(bin) = &sess.target_binary {
-                    return Ok(bin.clone());
-                }
-            }
             // Otherwise use main executable
             analyzer
                 .get_main_executable()
@@ -462,12 +522,13 @@ fn try_get_function_debug_info(
             .to_string()
     })?;
 
+    let target_path = session.target_binary.clone();
     let process_analyzer = session
         .process_analyzer
         .as_mut()
         .ok_or_else(|| "Debug information not available. DWARF symbols may not be loaded or initialization failed.".to_string())?;
 
-    handle_function_target(process_analyzer, function_name)
+    handle_function_target(process_analyzer, function_name, target_path.as_deref())
 }
 
 /// Try to get debug info for a source line (file:line)
@@ -480,6 +541,7 @@ fn try_get_line_debug_info(
             .to_string()
     })?;
 
+    let target_path = session.target_binary.clone();
     let process_analyzer = session
         .process_analyzer
         .as_mut()
@@ -535,6 +597,7 @@ fn try_get_line_debug_info(
         let query_results = process_analyzer
             .query_source_line_best_effort(cand, line_number)
             .map_err(|e| format!("Failed to analyze {cand}:{line_number}: {e}"))?;
+        let query_results = filter_address_results_to_target(query_results, target_path.as_deref());
         if !query_results.is_empty() {
             let cand_target = format!("{cand}:{line_number}");
             return Ok(build_source_location_target_debug_info(
@@ -553,7 +616,7 @@ fn try_get_line_debug_info(
         } else {
             target.to_string()
         };
-    handle_source_location_target(process_analyzer, &final_target)
+    handle_source_location_target(process_analyzer, &final_target, target_path.as_deref())
 }
 
 fn unique_module_count(addresses: &[AddressQueryResult]) -> usize {
@@ -666,26 +729,36 @@ fn build_target_debug_info_from_query_results(
 
 fn handle_function_query_result(
     query_result: FunctionQueryResult,
+    target_path: Option<&str>,
 ) -> Result<TargetDebugInfo, String> {
-    if query_result.addresses.is_empty() {
+    let raw_address_count = query_result.addresses.len();
+    let addresses = filter_address_results_to_target(query_result.addresses, target_path);
+    if raw_address_count == 0 {
         return Err(format!(
             "Function '{}' not found in any loaded module",
             query_result.function_name
+        ));
+    }
+    if raw_address_count > 0 && addresses.is_empty() {
+        let target = target_path.unwrap_or("<unknown>");
+        return Err(format!(
+            "Function '{}' was found, but not in -t target '{}'",
+            query_result.function_name, target
         ));
     }
 
     info!(
         "Found function '{}' at {} address(es) across {} modules",
         query_result.function_name,
-        query_result.addresses.len(),
-        unique_module_count(&query_result.addresses)
+        addresses.len(),
+        unique_module_count(&addresses)
     );
 
     let function_name = query_result.function_name.clone();
     Ok(build_target_debug_info_from_query_results(
         function_name.clone(),
         TargetType::Function,
-        query_result.addresses,
+        addresses,
         None,
         None,
         Some(function_name),
@@ -720,17 +793,19 @@ fn build_source_location_target_debug_info(
 fn handle_function_target(
     process_analyzer: &mut ghostscope_dwarf::DwarfAnalyzer,
     function_name: &str,
+    target_path: Option<&str>,
 ) -> Result<TargetDebugInfo, String> {
     let query_result = process_analyzer
         .query_function_best_effort(function_name)
         .map_err(|e| format!("Failed to analyze function '{function_name}': {e}"))?;
-    handle_function_query_result(query_result)
+    handle_function_query_result(query_result, target_path)
 }
 
 /// Handle source location target (file:line)
 fn handle_source_location_target(
     process_analyzer: &mut ghostscope_dwarf::DwarfAnalyzer,
     target: &str,
+    target_path: Option<&str>,
 ) -> Result<TargetDebugInfo, String> {
     let (file_path, line_part) = target
         .rsplit_once(':')
@@ -742,8 +817,16 @@ fn handle_source_location_target(
     let query_results = process_analyzer
         .query_source_line_best_effort(file_path, line_number)
         .map_err(|e| format!("Failed to analyze {file_path}:{line_number}: {e}"))?;
+    let raw_address_count = query_results.len();
+    let query_results = filter_address_results_to_target(query_results, target_path);
 
     if query_results.is_empty() {
+        if raw_address_count > 0 {
+            let target_path = target_path.unwrap_or("<unknown>");
+            return Err(format!(
+                "Cannot resolve any address for {file_path}:{line_number} in -t target '{target_path}'"
+            ));
+        }
         return Err(format!(
             "Cannot resolve any address for {file_path}:{line_number}"
         ));

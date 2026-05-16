@@ -82,6 +82,9 @@ pub struct CompileOptions {
     pub save_ebpf: bool,
     pub save_ast: bool,
     pub binary_path_hint: Option<String>,
+    /// Explicit `-t` target path. When present, trace target resolution is
+    /// scoped to this module even if DWARF was loaded from a `-p` PID.
+    pub target_binary_path: Option<String>,
     pub ringbuf_size: u64,
     pub proc_module_offsets_max_entries: u64,
     pub perf_page_count: u32,
@@ -126,6 +129,7 @@ impl Default for CompileOptions {
             save_ebpf: false,
             save_ast: false,
             binary_path_hint: None,
+            target_binary_path: None,
             ringbuf_size: 262144,                  // 256KB
             proc_module_offsets_max_entries: 4096, // Default
             perf_page_count: 64,                   // 64 pages = 256KB per CPU

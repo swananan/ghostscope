@@ -142,6 +142,10 @@ impl GhostSession {
             } else {
                 info!("Sysmon not started (-t shared library disabled by config)");
             }
+        } else if s.proc_pid().is_some() && s.target_binary.is_some() {
+            info!("Sysmon not started (-t target scoped by -p)");
+        } else if s.proc_pid().is_some() {
+            info!("Sysmon not started (-p mode)");
         } else {
             info!("Sysmon not started (no -t target)");
         }
@@ -187,8 +191,12 @@ impl GhostSession {
             sysmon.start();
             s.sysmon = Some(Arc::new(Mutex::new(sysmon)));
             info!("Sysmon started (-t mode)");
-        } else {
+        } else if s.proc_pid().is_some() && s.target_binary.is_some() {
+            info!("Sysmon not started (-t target scoped by -p)");
+        } else if s.proc_pid().is_some() {
             info!("Sysmon not started (-p mode)");
+        } else {
+            info!("Sysmon not started (no -t target)");
         }
         s
     }

@@ -3,7 +3,7 @@
 //! Shared asynchronous runner for invoking the `ghostscope` CLI from tests.
 //!
 //! Features:
-//! - Attach by PID or by target path (exactly one required)
+//! - Attach by PID, target path, or both for target-scoped PID runs
 //! - Optional sandbox backend for GhostScope itself (host by default)
 //! - Configurable timeout (overall cap) and optional PerfEventArray backend
 //! - Consistent flags: disable artifact saving by default; logging opt-in
@@ -205,8 +205,12 @@ impl GhostscopeRunner {
         let by_attached_target = self.attach_target.is_some();
         let by_target = self.target.is_some();
         anyhow::ensure!(
-            (by_pid as usize) + (by_attached_target as usize) + (by_target as usize) == 1,
-            "Must set exactly one of pid, attached target, or target path"
+            by_pid || by_attached_target || by_target,
+            "Must set pid, attached target, target path, or a target path plus one PID source"
+        );
+        anyhow::ensure!(
+            !(by_pid && by_attached_target),
+            "Must set at most one PID source: pid or attached target"
         );
 
         let _target_sandbox_guard = if let Some(ref target) = self.target {
@@ -225,6 +229,10 @@ impl GhostscopeRunner {
         let script_path = sandbox.path_in_sandbox(script_file.path())?;
 
         let mut args: Vec<OsString> = Vec::new();
+        if let Some(ref target) = self.target {
+            args.push(OsString::from("-t"));
+            args.push(sandbox.path_in_sandbox(target)?.into_os_string());
+        }
         if let Some(pid) = self.pid {
             args.push(OsString::from("-p"));
             args.push(OsString::from(pid.to_string()));
@@ -232,9 +240,6 @@ impl GhostscopeRunner {
             let pid = target.visible_pid_from(&sandbox)?;
             args.push(OsString::from("-p"));
             args.push(OsString::from(pid.to_string()));
-        } else if let Some(ref target) = self.target {
-            args.push(OsString::from("-t"));
-            args.push(sandbox.path_in_sandbox(target)?.into_os_string());
         }
 
         args.push(OsString::from("--script-file"));

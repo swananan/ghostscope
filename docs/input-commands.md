@@ -31,8 +31,11 @@ t <target> [index]          # Short form
     - `0xADDR`: Module-relative virtual address (DWARF PC). Default module depends on startup mode:
       - `-t <binary>`: defaults to `<binary>` (including `.so`)
       - `-p <pid>`: defaults to the process’s main executable
+      - `-t <binary> -p <pid>`: defaults to `<binary>`; `-p` only limits events to that PID
       - This is not a raw ELF file offset or a runtime ASLR-adjusted address from `/proc/<pid>/maps`.
-    - `module_suffix:0xADDR`: Address in a specific module. The module part supports full path or unique suffix matching; ambiguous suffixes will be reported with candidates.
+    - `module_suffix:0xADDR`: Address in a specific module. The module part supports full path or unique suffix matching; ambiguous suffixes will be reported with candidates. In `-t -p` sessions, the module must match the `-t` target.
+
+When `-t` and `-p` are both present, function, source-line, and address trace targets are all resolved inside the `-t` module. `-p` only limits runtime events to that process.
 
 **Examples:**
 ```
@@ -453,6 +456,7 @@ Address arguments are not raw ELF file offsets and are not runtime ASLR-adjusted
 **Defaults and modes:**
 - Launched with `-t <binary>` (target mode): the default module is `<binary>`.
 - Launched with `-p <pid>` (PID mode): the default module is the main executable of the process. For library addresses, specify the module via suffix or use `-t` with that `.so`.
+- Launched with both `-t <binary>` and `-p <pid>`: the default module is `<binary>` and `-p` only limits runtime events to that PID.
 
 **Description:**
 Shows per-module debug info for a given address: resolves function name (if any), source file:line (if available), and variables/parameters visible at that PC. Also displays the underlying module to attach and performs module suffix matching.
