@@ -3590,26 +3590,28 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         }
 
-        let fallback_module_path = if module_path.is_none() {
-            self.current_compile_time_context
-                .as_ref()
-                .map(|ctx| PathBuf::from(&ctx.module_path))
-        } else {
-            None
-        };
-        let module_path = module_path.or(fallback_module_path.as_deref());
+        let fallback_module_path = self
+            .current_compile_time_context
+            .as_ref()
+            .map(|ctx| PathBuf::from(&ctx.module_path));
+        let lookup_module_path = module_path.or(fallback_module_path.as_deref());
 
         for candidate in candidates {
-            let in_module = module_path.and_then(|module_path| {
-                analyzer
+            if let Some(module_path) = lookup_module_path {
+                let resolved = analyzer
                     .resolve_struct_type_shallow_by_name_in_module(module_path, &candidate)
                     .or_else(|| {
                         analyzer
                             .resolve_union_type_shallow_by_name_in_module(module_path, &candidate)
-                    })
-            });
-            let resolved = in_module
-                .or_else(|| analyzer.resolve_struct_type_shallow_by_name(&candidate))
+                    });
+                if let Some(resolved) = resolved.filter(|ty| ty.size() > 0) {
+                    return Some(resolved);
+                }
+                continue;
+            }
+
+            let resolved = analyzer
+                .resolve_struct_type_shallow_by_name(&candidate)
                 .or_else(|| analyzer.resolve_union_type_shallow_by_name(&candidate));
             if let Some(resolved) = resolved.filter(|ty| ty.size() > 0) {
                 return Some(resolved);
