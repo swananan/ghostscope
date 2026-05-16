@@ -15,12 +15,12 @@ description = "Terminal user interface that streams GhostScope traces with async
 
 [dependencies]
 ghostscope-protocol = { version = "0.1.4", path = "../ghostscope-protocol" }
-ratatui = "0.28"
+ratatui = "0.30"
 crossterm = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
-unicode-width = "0.1"
+unicode-width = "0.2"
 regex = "1.10"
