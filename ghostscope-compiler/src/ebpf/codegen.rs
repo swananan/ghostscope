@@ -758,7 +758,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let total_size = header_size + total_data_length;
 
         // Reserve space directly in the per-CPU accumulation buffer
-        let inst_buffer = self.reserve_instruction_region(total_size as u64);
+        let inst_buffer = self
+            .reserve_instruction_region_or_return_zero(total_size as u64)?
+            .into_value_after_runtime_returns();
 
         // Write InstructionHeader.inst_type
         let inst_type_val = self
@@ -2370,7 +2372,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let total_size = std::mem::size_of::<InstructionHeader>() + inst_data_size;
 
         // Reserve buffer directly in accumulation buffer to avoid extra copy
-        let buffer = self.reserve_instruction_region(total_size as u64);
+        let buffer = self
+            .reserve_instruction_region_or_return_zero(total_size as u64)?
+            .into_value_after_runtime_returns();
 
         // Avoid memset; global buffer is zero-initialized
 
@@ -3426,10 +3430,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // Allocate instruction structure on eBPF stack
         // Reserve space in accumulation buffer for this instruction
-        let inst_buffer = self.reserve_instruction_region(
-            (std::mem::size_of::<InstructionHeader>() + std::mem::size_of::<PrintStringIndexData>())
-                as u64,
-        );
+        let inst_buffer = self
+            .reserve_instruction_region_or_return_zero(
+                (std::mem::size_of::<InstructionHeader>()
+                    + std::mem::size_of::<PrintStringIndexData>()) as u64,
+            )?
+            .into_value_after_runtime_returns();
 
         // Clear memory with static size
         let _inst_size = self.context.i64_type().const_int(
@@ -3541,11 +3547,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         failing_addr_iv: inkwell::values::IntValue<'ctx>,
     ) -> Result<()> {
         // Reserve space in accumulation buffer for this instruction
-        let inst_buffer = self.reserve_instruction_region(
-            (std::mem::size_of::<InstructionHeader>()
-                + std::mem::size_of::<ghostscope_protocol::trace_event::ExprErrorData>())
-                as u64,
-        );
+        let inst_buffer = self
+            .reserve_instruction_region_or_return_zero(
+                (std::mem::size_of::<InstructionHeader>()
+                    + std::mem::size_of::<ghostscope_protocol::trace_event::ExprErrorData>())
+                    as u64,
+            )?
+            .into_value_after_runtime_returns();
 
         // Store instruction type at offset 0
         let inst_type_val = self
@@ -3774,11 +3782,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         };
 
         // Reserve space directly in per-CPU accumulation buffer
-        let inst_buffer = self.reserve_instruction_region(
-            (std::mem::size_of::<InstructionHeader>()
-                + std::mem::size_of::<PrintVariableIndexData>()
-                + data_size as usize) as u64,
-        );
+        let inst_buffer = self
+            .reserve_instruction_region_or_return_zero(
+                (std::mem::size_of::<InstructionHeader>()
+                    + std::mem::size_of::<PrintVariableIndexData>()
+                    + data_size as usize) as u64,
+            )?
+            .into_value_after_runtime_returns();
 
         // Avoid memset; global buffer is zero-initialized
 
@@ -4176,10 +4186,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         info!("Generating Backtrace instruction: depth={}", depth);
 
         // Reserve space directly for Backtrace instruction
-        let inst_buffer = self.reserve_instruction_region(
-            (std::mem::size_of::<InstructionHeader>() + std::mem::size_of::<BacktraceData>())
-                as u64,
-        );
+        let inst_buffer = self
+            .reserve_instruction_region_or_return_zero(
+                (std::mem::size_of::<InstructionHeader>() + std::mem::size_of::<BacktraceData>())
+                    as u64,
+            )?
+            .into_value_after_runtime_returns();
 
         // Write InstructionHeader.inst_type
         let inst_type_ptr = unsafe {
@@ -4335,7 +4347,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         );
 
         // Reserve space now that sizes are known
-        let inst_buffer = self.reserve_instruction_region(total_size as u64);
+        let inst_buffer = self
+            .reserve_instruction_region_or_return_zero(total_size as u64)?
+            .into_value_after_runtime_returns();
 
         // Avoid memset; reserved map value bytes are zero-initialized
 
