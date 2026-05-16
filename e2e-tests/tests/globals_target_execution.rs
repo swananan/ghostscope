@@ -246,6 +246,61 @@ trace lib_tick {
 
 #[tokio::test]
 #[serial(globals_target)]
+async fn test_t_p_mode_bare_address_uses_target_library() -> anyhow::Result<()> {
+    init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let lib_path = bin_dir.join("libgvars.so");
+    let target = spawn_globals_program(&binary_path).await?;
+    let pid = visible_pid_for_target(&target)?;
+
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lib_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load DWARF for libgvars.so: {e}"))?;
+    let lib_tick_addr = analyzer
+        .lookup_function_addresses("lib_tick")
+        .first()
+        .map(|addr| addr.address)
+        .ok_or_else(|| anyhow::anyhow!("lib_tick not found in libgvars.so"))?;
+
+    let script = format!(
+        r#"
+trace 0x{lib_tick_addr:x} {{
+    print "PID:{{}} LC:{{}}", $pid, LIB_STATE.counter;
+}}
+"#
+    );
+
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(&script)
+        .with_target(&lib_path)
+        .attach_to(&target)
+        .timeout_secs(2)
+        .enable_sysmon_shared_lib(false)
+        .run()
+        .await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    let re = Regex::new(r"PID:([0-9]+) LC:([0-9]+)").unwrap();
+    let saw_target_pid = stdout.lines().any(|line| {
+        re.captures(line)
+            .and_then(|caps| caps[1].parse::<u32>().ok())
+            .is_some_and(|event_pid| event_pid == pid)
+    });
+    assert!(
+        saw_target_pid,
+        "No libgvars.so events for target PID. STDOUT: {stdout}\nSTDERR: {stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(globals_target)]
 async fn test_t_mode_executable_rodata_and_struct_pretty() -> anyhow::Result<()> {
     init();
     if skip_if_nested_t_mode_unsupported() {

@@ -133,7 +133,7 @@ pub struct Args {
     /// 1. Current working directory
     /// 2. Same directory as the ghostscope command
     ///
-    /// - Can be used together with -p to filter events for a specific PID
+    /// - Can be used together with -p to trace this target module in a specific PID
     #[arg(long, short = 't', value_name = "PATH")]
     pub target: Option<String>,
 

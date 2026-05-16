@@ -48,6 +48,7 @@ sudo ghostscope -t /usr/lib/libexample.so
 - **When to use**: You want to catch process startup events or trace multiple instances
 - **Advantage**: Can capture events from process initialization, perfect for debugging startup issues
 - **Note**: Will trace ALL processes using this binary/library, which may generate more events
+- **Target-scoped PID variant**: Use `-t /path/to/module -p <PID>` when you want `-t` target resolution for one module but only one running process's events. In this variant, `-t` takes precedence and `sysmon` is not started.
 
 #### Important Notes
 

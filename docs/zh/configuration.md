@@ -42,7 +42,9 @@ ghostscope --target <PATH>
 # 2. ghostscope 可执行文件所在目录
 # 3. 如果未找到则转换为绝对路径
 
-# 两者可以一起使用进行 PID 过滤
+# 两者可以一起使用：在一个运行中 PID 内追踪 -t 指定的模块。
+# 这种形式下，函数/源码行/地址目标解析一律以 -t 为准，
+# -p 只负责把运行时事件限制到该进程；sysmon 不会启动。
 ghostscope -t /usr/bin/myapp -p 1234
 
 # 启动新进程
@@ -172,7 +174,8 @@ ghostscope --source-panel       # 显示源码面板
 # 警告：仅用于测试目的。即使在内核 >= 5.8 上也强制使用 PerfEventArray
 ghostscope --force-perf-event-array
 
-# 当 -t 目标是共享库（.so）时启动 sysmon，用于维护动态库全局变量的偏移
+# 当独立 -t 目标是共享库（.so）时启动 sysmon。
+# -t 与 -p 同时使用时不需要。
 # 警告：该选项会全局附加 sched 的 exec/fork/exit tracepoint，在进程频繁
 # 启动/退出的主机上可能带来一定性能开销。默认关闭。
 ghostscope --enable-sysmon-shared-lib
@@ -218,7 +221,7 @@ ghostscope bpffs prune --dry-run --json
 | 选项 | 简写 | 说明 | 默认值 |
 |------|------|------|--------|
 | `--pid <PID>` | `-p` | 要附加的进程 ID | 无 |
-| `--target <PATH>` | `-t` | 目标可执行文件或库 | 无 |
+| `--target <PATH>` | `-t` | 目标可执行文件或库。与 `-p` 同时使用时，`-t` 限定 trace 目标解析，`-p` 只提供 PID 过滤。 | 无 |
 | `--script <SCRIPT>` | `-s` | 要执行的内联脚本 | 无 |
 | `--script-file <PATH>` | | 要执行的脚本文件 | 无 |
 | `--script-help` | | 输出内嵌的脚本语言参考并退出 | 关 |
@@ -250,7 +253,7 @@ ghostscope bpffs prune --dry-run --json
 | `--source-panel` | | 显示源码面板 | 开 |
 | `--config <PATH>` | | 自定义配置文件 | 自动检测 |
 | `--force-perf-event-array` | | 强制 PerfEventArray（测试） | 关 |
-| `--enable-sysmon-shared-lib` | | -t 目标为共享库时，支持全局变量探测 | 关 |
+| `--enable-sysmon-shared-lib` | | 独立 `-t` 目标为共享库时启动 sysmon，以支持未来进程中的全局变量探测。`-t -p` 不需要。 | 关 |
 | `[BINARY] [ARGS...]` | | 启动目标程序并传递位置参数 | 无 |
 | `--args <PROGRAM> [ARGS...]` | | 分隔 GhostScope 选项和目标程序参数 | 无 |
 
@@ -477,7 +480,9 @@ max_trace_event_size = 32768
 # 有性能开销，仅应用于兼容性测试。
 force_perf_event_array = false  # 默认（根据内核版本自动检测）
 
-# 当 -t 目标为共享库（.so）时启动 sysmon eBPF，用于维护动态库全局变量的 ASLR 偏移。
+# 当独立 -t 目标为共享库（.so）时启动 sysmon eBPF，
+# 用于维护后续启动进程里动态库的 ASLR 偏移。
+# -t 与 -p 同时使用时不会使用 sysmon，因为 PID 已经提供具体进程映射。
 # 启用后会注册系统范围的 sched tracepoint，进程频繁创建/退出的环境下可能带来性能开销。
 enable_sysmon_for_shared_lib = false  # 默认关闭
 ```

@@ -91,8 +91,9 @@ trace libc.so.6:0x1234 {
 ```
 
 Notes:
-- For `0xADDR`, the default module depends on startup mode: `-t <binary>` uses `<binary>`; `-p <pid>` uses the main executable.
-- `module_suffix:0xADDR` allows selecting a module by full path or unique suffix; ambiguous suffixes will list candidates.
+- When `-t` and `-p` are both present, all trace patterns (function, source line, bare address, and module-qualified address) are resolved inside the `-t` target. `-p` only limits runtime events to that process.
+- For `0xADDR`, the default module depends on startup mode: `-t <binary>` uses `<binary>`; `-p <pid>` uses the main executable. If `-t` and `-p` are both present, `-t` wins and `-p` only limits runtime events to that PID.
+- `module_suffix:0xADDR` allows selecting a module by full path or unique suffix; ambiguous suffixes will list candidates. In `-t -p` sessions, the module must match the `-t` target.
 - Address trace targets always use the module's DWARF/symbol virtual address. Do not pass a raw ELF file offset or a runtime ASLR-adjusted address from `/proc/<pid>/maps`; GhostScope converts the virtual address to the uprobe file offset internally.
 
 ## Source Language Support

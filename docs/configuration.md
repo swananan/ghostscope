@@ -41,7 +41,9 @@ ghostscope --target <PATH>
 # 2. Same directory as ghostscope executable
 # 3. Converts to absolute path if not found
 
-# Both can be used together for PID filtering
+# Both can be used together to trace the -t module inside one running PID.
+# In this form, -t wins for function/source/address target resolution and
+# -p only scopes runtime events to that process. sysmon is not started.
 ghostscope -t /usr/bin/myapp -p 1234
 
 # Launch a new process
@@ -171,7 +173,8 @@ ghostscope --source-panel       # Show source panel
 # WARNING: Testing purposes only. Forces PerfEventArray even on kernels >= 5.8
 ghostscope --force-perf-event-array
 
-# Start sysmon for -t when target is a shared library (.so)
+# Start sysmon for standalone -t when target is a shared library (.so).
+# Not needed when -t is combined with -p.
 # WARNING: Attaches system-wide sched tracepoints (exec/fork/exit) and may add
 # overhead on hosts with high process churn. Default is OFF.
 ghostscope --enable-sysmon-shared-lib
@@ -217,7 +220,7 @@ Behavior:
 | Option | Short | Description | Default |
 |--------|-------|-------------|---------|
 | `--pid <PID>` | `-p` | Process ID to attach to | None |
-| `--target <PATH>` | `-t` | Target executable or library | None |
+| `--target <PATH>` | `-t` | Target executable or library. With `-p`, this scopes trace target resolution while `-p` supplies PID filtering. | None |
 | `--script <SCRIPT>` | `-s` | Inline script to execute | None |
 | `--script-file <PATH>` | | Script file to execute | None |
 | `--script-help` | | Print the embedded script language reference and exit | Off |
@@ -249,7 +252,7 @@ Behavior:
 | `--source-panel` | | Show source panel | On |
 | `--config <PATH>` | | Custom config file | Auto-detect |
 | `--force-perf-event-array` | | Force PerfEventArray (testing) | Off |
-| `--enable-sysmon-shared-lib` | | Start sysmon for -t shared library, so global variables can be traced | Off |
+| `--enable-sysmon-shared-lib` | | Start sysmon for standalone `-t` shared library, so globals can be traced in future processes. Not needed with `-t -p`. | Off |
 | `[BINARY] [ARGS...]` | | Launch target program with positional arguments | None |
 | `--args <PROGRAM> [ARGS...]` | | Separate GhostScope options from target program arguments | None |
 
@@ -482,8 +485,10 @@ max_trace_event_size = 32768
 # overhead compared to RingBuf and should only be used for compatibility testing.
 force_perf_event_array = false  # Default (auto-detect based on kernel version)
 
-# Start sysmon eBPF for -t when the target is a shared library (.so).
+# Start sysmon eBPF for standalone -t when the target is a shared library (.so).
 # Maintains ASLR offsets for late-start processes loading the library.
+# Not used when -t is combined with -p, because the PID already provides the
+# concrete process mappings.
 # This enables system-wide sched tracepoints and may impact performance
 # when process churn is high.
 enable_sysmon_for_shared_lib = false  # Default

@@ -6,19 +6,17 @@ use tracing::warn;
 
 /// Derive a short binary path hint for compiler options and logging.
 /// Priority:
-/// 1) If started with target file mode (-t), use the target binary's file stem.
+/// 1) If started with an explicit target file (-t), use the target binary's file stem.
 /// 2) Else, use the main executable from the DWARF analyzer (file stem).
 /// 3) Fallback to "unknown" if neither is available.
 pub fn derive_binary_path_hint(session: &GhostSession) -> Option<String> {
-    // Prefer explicit target in -t mode
-    if session.is_target_mode() {
-        if let Some(ref target) = session.target_binary {
-            if let Some(stem) = std::path::Path::new(target)
-                .file_stem()
-                .and_then(|s| s.to_str())
-            {
-                return Some(stem.to_string());
-            }
+    // Prefer explicit -t target, including combined -t/-p sessions.
+    if let Some(ref target) = session.target_binary {
+        if let Some(stem) = std::path::Path::new(target)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        {
+            return Some(stem.to_string());
         }
     }
 

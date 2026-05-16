@@ -253,6 +253,7 @@ impl ResolvedConfig {
             save_ebpf,
             save_ast,
             binary_path_hint,
+            target_binary_path: self.target_path.clone(),
             ringbuf_size: self.ebpf_config.ringbuf_size,
             proc_module_offsets_max_entries: self.ebpf_config.proc_module_offsets_max_entries,
             perf_page_count: self.ebpf_config.perf_page_count,

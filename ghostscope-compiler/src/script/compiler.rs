@@ -352,6 +352,133 @@ impl<'a> AstCompiler<'a> {
         )
     }
 
+    fn configured_target_path(&self) -> Option<&str> {
+        self.compile_options
+            .target_binary_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    }
+
+    fn loaded_module_paths(analyzer: &ghostscope_dwarf::DwarfAnalyzer) -> Vec<String> {
+        let mut modules: Vec<String> = Vec::new();
+        if let Some(main) = analyzer.get_main_executable() {
+            modules.push(main.path);
+        }
+        modules.extend(
+            analyzer
+                .get_shared_library_info()
+                .into_iter()
+                .map(|lib| lib.library_path),
+        );
+        if let Ok(grouped) = analyzer.get_grouped_file_info_by_module() {
+            modules.extend(grouped.into_iter().map(|(module_path, _files)| module_path));
+        }
+        modules.sort();
+        modules.dedup();
+        modules
+    }
+
+    fn paths_equivalent<P: AsRef<Path>, Q: AsRef<Path>>(left: P, right: Q) -> bool {
+        let left = left.as_ref();
+        let right = right.as_ref();
+        if left == right {
+            return true;
+        }
+
+        match (left.canonicalize(), right.canonicalize()) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    fn module_spec_matches_path(module_path: &str, module_spec: &str) -> bool {
+        let spec = module_spec.trim();
+        if spec.is_empty() {
+            return false;
+        }
+
+        Self::paths_equivalent(module_path, spec) || module_path.ends_with(spec)
+    }
+
+    fn resolve_loaded_module_by_spec(
+        analyzer: &ghostscope_dwarf::DwarfAnalyzer,
+        module_spec: &str,
+    ) -> Result<String, CompileError> {
+        let modules = Self::loaded_module_paths(analyzer);
+
+        if let Some(found) = modules
+            .iter()
+            .find(|module_path| Self::paths_equivalent(module_path, module_spec))
+        {
+            return Ok(found.clone());
+        }
+
+        let candidates: Vec<String> = modules
+            .into_iter()
+            .filter(|module_path| module_path.ends_with(module_spec))
+            .collect();
+
+        match candidates.len() {
+            0 => Err(CompileError::Other(format!(
+                "Module '{module_spec}' not found among loaded modules. Use full path or a unique suffix."
+            ))),
+            1 => Ok(candidates[0].clone()),
+            _ => {
+                let mut sample = candidates.clone();
+                sample.truncate(5);
+                Err(CompileError::Other(format!(
+                    "Ambiguous module suffix '{}'. Candidates:\n  - {}\nPlease use a more specific suffix or full path.",
+                    module_spec,
+                    sample.join("\n  - ")
+                )))
+            }
+        }
+    }
+
+    fn resolve_target_module_path(&self) -> Result<Option<String>, CompileError> {
+        let Some(target_path) = self.configured_target_path() else {
+            return Ok(None);
+        };
+        let Some(analyzer) = self.process_analyzer else {
+            return Err(CompileError::Other(
+                "No process analyzer available to resolve -t target".to_string(),
+            ));
+        };
+
+        let matches: Vec<String> = Self::loaded_module_paths(analyzer)
+            .into_iter()
+            .filter(|module_path| Self::paths_equivalent(module_path, target_path))
+            .collect();
+
+        match matches.len() {
+            0 => Err(CompileError::Other(format!(
+                "Target '{target_path}' from -t is not loaded in the analyzed modules. When -t and -p are combined, -t scopes trace target resolution and -p only supplies PID filtering."
+            ))),
+            1 => Ok(Some(matches[0].clone())),
+            _ => Err(CompileError::Other(format!(
+                "Target '{target_path}' from -t matches multiple loaded modules; use a more specific path."
+            ))),
+        }
+    }
+
+    fn filter_module_addresses_to_target(
+        &self,
+        module_addresses: Vec<ghostscope_dwarf::ModuleAddress>,
+        target_module_path: Option<&str>,
+    ) -> Vec<ghostscope_dwarf::ModuleAddress> {
+        let Some(target_module_path) = target_module_path else {
+            return module_addresses;
+        };
+
+        module_addresses
+            .into_iter()
+            .filter(|module_address| {
+                Self::paths_equivalent(&module_address.module_path, target_module_path)
+            })
+            .collect()
+    }
+
     /// Process a trace point: resolve target + generate eBPF in one step
     fn process_trace_point(
         &mut self,
@@ -375,6 +502,22 @@ impl<'a> AstCompiler<'a> {
                 if module_addresses.is_empty() {
                     let detailed = self.describe_source_line_failure(file_path, *line_number);
                     return Err(CompileError::Other(detailed));
+                }
+
+                let target_module_path = self.resolve_target_module_path()?;
+                let original_address_count = module_addresses.len();
+                let module_addresses = self.filter_module_addresses_to_target(
+                    module_addresses,
+                    target_module_path.as_deref(),
+                );
+                if original_address_count > 0 && module_addresses.is_empty() {
+                    let target = target_module_path
+                        .as_deref()
+                        .or_else(|| self.configured_target_path())
+                        .unwrap_or("<unknown>");
+                    return Err(CompileError::Other(format!(
+                        "No addresses resolved for source line {file_path}:{line_number} in -t target '{target}'. When -t and -p are combined, -t takes precedence for trace target resolution."
+                    )));
                 }
 
                 debug!(
@@ -478,10 +621,14 @@ impl<'a> AstCompiler<'a> {
             }
             TracePattern::Address(addr) => {
                 // Resolve default module path
-                // Prefer main executable; if unavailable (e.g., -t <lib>.so),
-                // fall back to the single loaded shared library (target module).
+                // Prefer the explicit -t target, including combined -t/-p
+                // sessions. Without -t, use the PID main executable; if
+                // unavailable (e.g., -t <lib>.so without a target option in
+                // legacy callers), fall back to a single loaded shared library.
                 let module_path: Option<String> = if let Some(analyzer) = &self.process_analyzer {
-                    if let Some(main) = analyzer.get_main_executable() {
+                    if let Some(target_module) = self.resolve_target_module_path()? {
+                        Some(target_module)
+                    } else if let Some(main) = analyzer.get_main_executable() {
                         Some(main.path)
                     } else {
                         let libs = analyzer.get_shared_library_info();
@@ -546,42 +693,19 @@ impl<'a> AstCompiler<'a> {
                 }
             }
             TracePattern::AddressInModule { module, address } => {
-                // Resolve module path by exact or suffix match across loaded modules
+                // Resolve module path by exact or suffix match across loaded modules.
+                // If -t is configured, keep resolution scoped to that target.
                 let module_path = if let Some(analyzer) = &self.process_analyzer {
-                    let mut modules: Vec<String> = Vec::new();
-                    if let Some(main) = analyzer.get_main_executable() {
-                        modules.push(main.path);
-                    }
-                    for lib in analyzer.get_shared_library_info() {
-                        modules.push(lib.library_path);
-                    }
-
-                    // exact match
-                    if let Some(found) = modules.iter().find(|p| p.as_str() == module) {
-                        found.clone()
-                    } else {
-                        // suffix match
-                        let candidates: Vec<String> = modules
-                            .into_iter()
-                            .filter(|p| p.ends_with(module))
-                            .collect();
-                        match candidates.len() {
-                            0 => {
-                                return Err(CompileError::Other(format!(
-                                    "Module '{module}' not found among loaded modules. Use full path or a unique suffix."
-                                )));
-                            }
-                            1 => candidates[0].clone(),
-                            _ => {
-                                let mut sample = candidates.clone();
-                                sample.truncate(5);
-                                return Err(CompileError::Other(format!(
-                                    "Ambiguous module suffix '{}'. Candidates:\n  - {}\nPlease use a more specific suffix or full path.",
-                                    module,
-                                    sample.join("\n  - ")
-                                )));
-                            }
+                    if let Some(target_module) = self.resolve_target_module_path()? {
+                        if Self::module_spec_matches_path(&target_module, module) {
+                            target_module
+                        } else {
+                            return Err(CompileError::Other(format!(
+                                "Module '{module}' is outside -t target '{target_module}'. When -t and -p are combined, -t takes precedence for trace target resolution."
+                            )));
                         }
+                    } else {
+                        Self::resolve_loaded_module_by_spec(analyzer, module)?
                     }
                 } else {
                     return Err(CompileError::Other(
@@ -645,6 +769,22 @@ impl<'a> AstCompiler<'a> {
                     // Strict behavior: fail this trace point immediately instead of skipping silently
                     return Err(CompileError::Other(format!(
                         "No addresses resolved for function '{func_name}' - function not found in debug symbols"
+                    )));
+                }
+
+                let target_module_path = self.resolve_target_module_path()?;
+                let original_address_count = module_addresses.len();
+                let module_addresses = self.filter_module_addresses_to_target(
+                    module_addresses,
+                    target_module_path.as_deref(),
+                );
+                if original_address_count > 0 && module_addresses.is_empty() {
+                    let target = target_module_path
+                        .as_deref()
+                        .or_else(|| self.configured_target_path())
+                        .unwrap_or("<unknown>");
+                    return Err(CompileError::Other(format!(
+                        "No addresses resolved for function '{func_name}' in -t target '{target}'. When -t and -p are combined, -t takes precedence for trace target resolution."
                     )));
                 }
 
