@@ -44,7 +44,7 @@ categories = ["development-tools::debugging", "development-tools::profiling"]
 
 [workspace.dependencies]
 log = "0.4.22"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 anyhow = "1.0.93"
 tracing = "0.1.41"
 tracing-log = "0.2.0"
@@ -53,7 +53,7 @@ tokio = { version = "1.0", features = ["full"] }
 chrono = { version = "0.4", features = ["serde", "clock"] }
 futures = "0.3"
 futures-util = "0.3"
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 clap = { version = "4.0", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
