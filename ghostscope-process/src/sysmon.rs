@@ -340,7 +340,11 @@ fn run_sysmon_loop(
     perf_pages: Option<usize>,
     tx: mpsc::Sender<SysEvent>,
 ) -> anyhow::Result<()> {
-    use aya::maps::{perf::PerfEventArray, ring_buf::RingBuf, Array, MapData};
+    use aya::maps::{
+        perf::{PerfEvent, PerfEventArray},
+        ring_buf::RingBuf,
+        Array, MapData,
+    };
     use aya::programs::TracePoint;
     use aya::{include_bytes_aligned, EbpfLoader, VerifierLogLevel};
     use log::{log_enabled, Level as LogLevel};
@@ -368,8 +372,16 @@ fn run_sysmon_loop(
         loader.verifier_log_level(VerifierLogLevel::DEBUG | VerifierLogLevel::STATS);
         tracing::info!("Sysmon verifier logs: DEBUG (release/info)");
     }
-    // Reuse pinned maps by name under our per-process dir
-    loader.map_pin_path(crate::pinned_bpf_maps::proc_offsets_pin_dir()?);
+    // Reuse pinned maps by name under our per-process dir.
+    let pin_dir = crate::pinned_bpf_maps::proc_offsets_pin_dir()?;
+    loader.map_pin_path(
+        crate::pinned_bpf_maps::ALLOWED_PIDS_MAP_NAME,
+        pin_dir.join(crate::pinned_bpf_maps::ALLOWED_PIDS_MAP_NAME),
+    );
+    loader.map_pin_path(
+        crate::pinned_bpf_maps::TARGET_EXEC_COMM_MAP_NAME,
+        pin_dir.join(crate::pinned_bpf_maps::TARGET_EXEC_COMM_MAP_NAME),
+    );
     let mut bpf = loader.load(obj)?;
 
     // Configure optional exec comm filter when targeting executables (-t binary).
@@ -530,30 +542,40 @@ fn run_sysmon_loop(
                 if !buf.readable() {
                     continue;
                 }
-                let mut read_bufs = vec![bytes::BytesMut::with_capacity(256)];
-                match buf.read_events(&mut read_bufs) {
-                    Ok(res) => {
-                        for data in read_bufs.iter().take(res.read.min(read_bufs.len())) {
-                            if data.len() == core::mem::size_of::<SysEvent>() {
-                                let ev = unsafe {
-                                    core::ptr::read_unaligned(data.as_ptr() as *const SysEvent)
-                                };
-                                if let Err(e) =
-                                    ProcessSysmon::handle_event(&mgr, &target, &pending, &ev)
-                                {
-                                    tracing::debug!(
-                                        "Sysmon: handle_event failed (perf) for pid {} kind {}: {}",
-                                        ev.tgid,
-                                        ev.kind,
-                                        e
-                                    );
-                                }
-                                let _ = tx.send(ev);
+                buf.for_each(|event| match event {
+                    PerfEvent::Sample { head, tail } => {
+                        let mut raw = [0u8; core::mem::size_of::<SysEvent>()];
+                        let mut copied = 0;
+                        for chunk in [head, tail] {
+                            let remaining = raw.len().saturating_sub(copied);
+                            if remaining == 0 {
+                                break;
                             }
+                            let take = chunk.len().min(remaining);
+                            raw[copied..copied + take].copy_from_slice(&chunk[..take]);
+                            copied += take;
+                        }
+                        if copied == raw.len() {
+                            let ev = unsafe {
+                                core::ptr::read_unaligned(raw.as_ptr() as *const SysEvent)
+                            };
+                            if let Err(e) =
+                                ProcessSysmon::handle_event(&mgr, &target, &pending, &ev)
+                            {
+                                tracing::debug!(
+                                    "Sysmon: handle_event failed (perf) for pid {} kind {}: {}",
+                                    ev.tgid,
+                                    ev.kind,
+                                    e
+                                );
+                            }
+                            let _ = tx.send(ev);
                         }
                     }
-                    Err(e) => warn!("Perf read_events failed: {}", e),
-                }
+                    PerfEvent::Lost { count } => {
+                        warn!("Perf event buffer lost {} sysmon events", count);
+                    }
+                });
             }
             poll_pending_offsets(&mgr, &pending);
             refresh_target_module_offsets(&mgr, target.as_deref(), &mut last_module_refresh);

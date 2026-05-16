@@ -16,8 +16,14 @@
 //! adapts to the event source type automatically.
 
 use aya::{
-    maps::{perf::PerfEventArray, MapData, PerCpuArray, RingBuf},
-    programs::{uprobe::UProbeLinkId, ProgramError, UProbe},
+    maps::{
+        perf::{PerfEvent, PerfEventArray},
+        MapData, PerCpuArray, RingBuf,
+    },
+    programs::{
+        uprobe::{UProbeLinkId, UProbeScope},
+        ProgramError, UProbe,
+    },
     Ebpf, EbpfLoader, VerifierLogLevel,
 };
 use ghostscope_protocol::{ParsedTraceEvent, StreamingTraceParser, TraceContext};
@@ -25,10 +31,12 @@ use log::log_enabled;
 use log::Level as LogLevel;
 use std::convert::TryInto;
 use std::future::poll_fn;
+use std::num::NonZeroU32;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::task::Poll;
+use std::{io, ops::ControlFlow};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tracing::{debug, error, info, warn};
@@ -72,7 +80,7 @@ use uprobe::UprobeAttachmentParams;
 // Use shared map types from ghostscope-process
 use ghostscope_process::pinned_bpf_maps::{
     bpffs_mount_hint_for_pin_path, pid_aliases_pin_path, proc_offsets_pin_dir,
-    proc_offsets_pin_path,
+    proc_offsets_pin_path, PID_ALIASES_MAP_NAME, PROC_OFFSETS_MAP_NAME,
 };
 
 /// Event output map type wrapper
@@ -105,61 +113,70 @@ fn drain_perf_cpu_buffer(
     trace_context: &TraceContext,
     events: &mut Vec<ParsedTraceEvent>,
 ) -> Result<bool> {
-    use bytes::BytesMut;
-
     let mut produced = false;
     if events.len() >= MAX_EVENTS_PER_WAIT {
         return Ok(false);
     }
 
-    let remaining = MAX_EVENTS_PER_WAIT - events.len();
-    let read_batch = remaining.min(PERF_READ_BATCH_SIZE);
-    let mut read_bufs = (0..read_batch)
-        .map(|_| BytesMut::with_capacity(4096))
-        .collect::<Vec<_>>();
-
-    match entry.buffer.read_events(&mut read_bufs) {
-        Ok(result) => {
-            if result.read > 0 {
-                produced = true;
-                info!(
-                    "Read {} events from CPU {} buffer",
-                    result.read, entry.cpu_id
-                );
-            }
-            if result.lost > 0 {
-                warn!(
-                    "Lost {} events from CPU {} buffer",
-                    result.lost, entry.cpu_id
-                );
+    let cpu = entry.cpu_id;
+    let drain_result = entry.buffer.try_fold(
+        (0usize, 0u64),
+        |(mut read_count, mut lost_count), event| {
+            if events.len() >= MAX_EVENTS_PER_WAIT || read_count >= PERF_READ_BATCH_SIZE {
+                return ControlFlow::Break(Ok((read_count, lost_count)));
             }
 
-            for (i, data) in read_bufs.iter().enumerate().take(result.read) {
-                if events.len() >= MAX_EVENTS_PER_WAIT {
-                    break;
-                }
-                debug!(
-                    "PerfEvent {}: {} bytes - {:02x?}",
-                    i,
-                    data.len(),
-                    &data[..data.len().min(32)]
-                );
+            match event {
+                PerfEvent::Sample { head, tail } => {
+                    read_count += 1;
+                    produced = true;
+                    debug!(
+                        "PerfEvent {}: {} bytes - {:02x?}",
+                        read_count - 1,
+                        head.len() + tail.len(),
+                        &head[..head.len().min(32)]
+                    );
 
-                match parser.process_segment(data, trace_context) {
-                    Ok(Some(parsed_event)) => events.push(parsed_event),
-                    Ok(None) => {}
-                    Err(e) => {
-                        let cpu = entry.cpu_id;
-                        return Err(LoaderError::Generic(format!(
-                            "Fatal: Failed to parse trace event from PerfEventArray CPU {cpu}: {e}"
-                        )));
+                    for segment in [head, tail] {
+                        if segment.is_empty() {
+                            continue;
+                        }
+                        match parser.process_segment(segment, trace_context) {
+                            Ok(Some(parsed_event)) => events.push(parsed_event),
+                            Ok(None) => {}
+                            Err(e) => {
+                                return ControlFlow::Break(Err(LoaderError::Generic(format!(
+                                    "Fatal: Failed to parse trace event from PerfEventArray CPU {cpu}: {e}"
+                                ))));
+                            }
+                        }
                     }
                 }
+                PerfEvent::Lost { count } => {
+                    lost_count = lost_count.saturating_add(count);
+                }
             }
-        }
-        Err(e) => {
-            warn!("Failed to read from CPU {} buffer: {}", entry.cpu_id, e);
-        }
+
+            ControlFlow::Continue((read_count, lost_count))
+        },
+    );
+
+    let (read_count, lost_count) = match drain_result {
+        ControlFlow::Continue(counts) => counts,
+        ControlFlow::Break(result) => result?,
+    };
+
+    if read_count > 0 {
+        info!(
+            "Read {} events from CPU {} buffer",
+            read_count, entry.cpu_id
+        );
+    }
+    if lost_count > 0 {
+        warn!(
+            "Lost {} events from CPU {} buffer",
+            lost_count, entry.cpu_id
+        );
     }
 
     Ok(produced)
@@ -179,9 +196,28 @@ impl<'a> UProbeAttachLocation<'a> {
         target: T,
         pid: Option<i32>,
     ) -> std::result::Result<UProbeLinkId, ProgramError> {
+        let scope = uprobe_scope(pid)?;
         match self {
-            Self::AbsoluteOffset(offset) => program.attach(None, offset, target, pid),
-            Self::Function(fn_name) => program.attach(Some(fn_name), 0, target, pid),
+            Self::AbsoluteOffset(offset) => program.attach(offset, target, scope),
+            Self::Function(fn_name) => program.attach(fn_name, target, scope),
+        }
+    }
+}
+
+fn uprobe_scope(pid: Option<i32>) -> std::result::Result<UProbeScope, ProgramError> {
+    match pid {
+        None => Ok(UProbeScope::AllProcesses),
+        Some(pid) => {
+            let pid = u32::try_from(pid)
+                .ok()
+                .and_then(NonZeroU32::new)
+                .ok_or_else(|| {
+                    ProgramError::IOError(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid uprobe PID scope: {pid}"),
+                    ))
+                })?;
+            Ok(UProbeScope::OneProcess(pid))
         }
     }
 }
@@ -285,7 +321,8 @@ impl GhostScopeLoader {
             LoaderError::Generic(format!("Failed to resolve pinned map directory: {e}"))
         })?;
         if pin_dir.exists() {
-            loader.map_pin_path(&pin_dir);
+            loader.map_pin_path(PROC_OFFSETS_MAP_NAME, pin_path);
+            loader.map_pin_path(PID_ALIASES_MAP_NAME, alias_pin_path);
             tracing::info!(
                 "Configured map pin directory for reuse: {}",
                 pin_dir.display()

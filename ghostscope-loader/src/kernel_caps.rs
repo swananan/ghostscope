@@ -1,10 +1,5 @@
-use aya::maps::MapData;
-use aya_obj::{
-    generated::bpf_map_type::{BPF_MAP_TYPE_PERF_EVENT_ARRAY, BPF_MAP_TYPE_RINGBUF},
-    generated::{bpf_attr, bpf_cmd, bpf_insn, bpf_prog_type},
-    maps::PinningType,
-    EbpfSectionKind, Map,
-};
+use aya::{maps::MapType, sys::is_map_supported};
+use aya_obj::generated::{bpf_attr, bpf_cmd, bpf_insn, bpf_prog_type};
 use libc::SYS_bpf;
 use std::{fmt, sync::OnceLock};
 use tracing::{error, info, warn};
@@ -185,79 +180,36 @@ fn detect_perf_only_capabilities() -> Result<KernelCapabilities, KernelCapabilit
 
 /// Detect RingBuf support by attempting to create a minimal map
 fn detect_ringbuf_support() -> bool {
-    info!("Probing kernel RingBuf support by attempting map creation...");
-
-    // Create a minimal RingBuf map definition (4KB)
-    let obj_map = Map::Legacy(aya_obj::maps::LegacyMap {
-        section_index: 0,
-        section_kind: EbpfSectionKind::Maps,
-        symbol_index: None,
-        def: aya_obj::maps::bpf_map_def {
-            map_type: BPF_MAP_TYPE_RINGBUF as u32,
-            key_size: 0,       // RingBuf doesn't use key
-            value_size: 0,     // RingBuf doesn't use value
-            max_entries: 4096, // 4KB minimal size
-            map_flags: 0,
-            id: 0,
-            pinning: PinningType::None,
-        },
-        data: Vec::new(),
-    });
-
-    // Try to create the map
-    match MapData::create(obj_map, "probe_ringbuf", None) {
-        Ok(_map) => {
-            // Map was created successfully, RingBuf is supported
-            // The map will be automatically dropped and closed
-            info!("RingBuf map creation succeeded - RingBuf is supported");
-            true
-        }
-        Err(e) => {
-            // Map creation failed, likely due to unsupported map type
-            info!(
-                "RingBuf map creation failed (this is normal on kernels < 5.8): {}",
-                e
-            );
-            false
-        }
-    }
+    detect_map_support(
+        MapType::RingBuf,
+        "RingBuf",
+        "this is normal on kernels < 5.8",
+    )
 }
 
 /// Detect PerfEventArray support by attempting to create a minimal map
 fn detect_perf_event_array_support() -> bool {
-    info!("Probing kernel PerfEventArray support by attempting map creation...");
+    detect_map_support(
+        MapType::PerfEventArray,
+        "PerfEventArray",
+        "kernel may be older than 4.3",
+    )
+}
 
-    // Create a minimal PerfEventArray map definition
-    let obj_map = Map::Legacy(aya_obj::maps::LegacyMap {
-        section_index: 0,
-        section_kind: EbpfSectionKind::Maps,
-        symbol_index: None,
-        def: aya_obj::maps::bpf_map_def {
-            map_type: BPF_MAP_TYPE_PERF_EVENT_ARRAY as u32,
-            key_size: 4,    // key is u32
-            value_size: 4,  // value is u32 (file descriptor)
-            max_entries: 0, // 0 means auto-detect number of CPUs
-            map_flags: 0,
-            id: 0,
-            pinning: PinningType::None,
-        },
-        data: Vec::new(),
-    });
+fn detect_map_support(map_type: MapType, label: &str, unsupported_context: &str) -> bool {
+    info!("Probing kernel {label} support via aya::sys::is_map_supported...");
 
-    // Try to create the map
-    match MapData::create(obj_map, "probe_perf_event_array", None) {
-        Ok(_map) => {
-            // Map was created successfully, PerfEventArray is supported
-            // The map will be automatically dropped and closed
-            info!("PerfEventArray map creation succeeded - PerfEventArray is supported");
+    match is_map_supported(map_type) {
+        Ok(true) => {
+            info!("{label} map support probe succeeded - {label} is supported");
             true
         }
-        Err(e) => {
-            // Map creation failed, likely due to unsupported map type
-            error!(
-                "PerfEventArray map creation failed (kernel may be older than 4.3): {}",
-                e
-            );
+        Ok(false) => {
+            info!("{label} map support probe reported unsupported ({unsupported_context})");
+            false
+        }
+        Err(err) => {
+            warn!("{label} map support probe failed unexpectedly: {err}");
             false
         }
     }

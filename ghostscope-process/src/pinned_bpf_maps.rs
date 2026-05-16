@@ -158,6 +158,7 @@ pub fn proc_offsets_pin_dir() -> anyhow::Result<PathBuf> {
 pub const PROC_OFFSETS_MAP_NAME: &str = "proc_module_offsets";
 pub const ALLOWED_PIDS_MAP_NAME: &str = "allowed_pids";
 pub const PID_ALIASES_MAP_NAME: &str = "pid_aliases";
+pub const TARGET_EXEC_COMM_MAP_NAME: &str = "target_exec_comm";
 
 fn bpffs_is_mounted() -> bool {
     let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
@@ -301,6 +302,7 @@ pub fn ensure_pinned_proc_offsets_exists(max_entries: u32) -> anyhow::Result<()>
             id: 0,
             pinning: aya_obj::maps::PinningType::None,
         },
+        inner_def: None,
         data: Vec::new(),
     });
 
@@ -479,6 +481,7 @@ pub fn ensure_pinned_allowed_pids_exists(max_entries: u32) -> anyhow::Result<()>
             id: 0,
             pinning: aya_obj::maps::PinningType::None,
         },
+        inner_def: None,
         data: Vec::new(),
     });
 
@@ -559,6 +562,7 @@ pub fn ensure_pinned_pid_aliases_exists(max_entries: u32) -> anyhow::Result<()> 
             id: 0,
             pinning: aya_obj::maps::PinningType::None,
         },
+        inner_def: None,
         data: Vec::new(),
     });
 
