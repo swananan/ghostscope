@@ -21,8 +21,9 @@ pub mod analyzer;
 
 // Re-export main public API only
 pub use analyzer::{
-    AddressQueryResult, DwarfAnalyzer, FunctionQueryResult, MainExecutableInfo, ModuleLoadingEvent,
-    ModuleLoadingStats, ModuleStats, SharedLibraryInfo, SimpleFileInfo,
+    AddressQueryResult, DwarfAnalyzer, FunctionQueryResult, MainExecutableInfo,
+    ModuleDefaultPolicy, ModuleLoadingEvent, ModuleLoadingStats, ModuleStats, SharedLibraryInfo,
+    SimpleFileInfo,
 };
 
 // Re-export essential core and semantic support types.
