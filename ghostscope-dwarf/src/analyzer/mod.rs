@@ -14,9 +14,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod module_resolution;
 mod plan_global;
 mod plan_pc;
 mod type_lookup;
+
+pub use module_resolution::ModuleDefaultPolicy;
 
 #[cfg(test)]
 use crate::{

@@ -1,44 +1,7 @@
 use crate::core::GhostSession;
-use ghostscope_dwarf::{AddressQueryResult, FunctionQueryResult};
+use ghostscope_dwarf::{AddressQueryResult, FunctionQueryResult, ModuleDefaultPolicy};
 use ghostscope_ui::{events::*, RuntimeChannels, RuntimeStatus};
-use std::path::Path;
 use tracing::info;
-
-fn paths_equivalent<P: AsRef<Path>, Q: AsRef<Path>>(left: P, right: Q) -> bool {
-    let left = left.as_ref();
-    let right = right.as_ref();
-    if left == right {
-        return true;
-    }
-
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    }
-}
-
-fn module_spec_matches_path(module_path: &str, module_spec: &str) -> bool {
-    let spec = module_spec.trim();
-    if spec.is_empty() {
-        return false;
-    }
-
-    paths_equivalent(module_path, spec) || module_path.ends_with(spec)
-}
-
-fn filter_address_results_to_target(
-    addresses: Vec<AddressQueryResult>,
-    target_path: Option<&str>,
-) -> Vec<AddressQueryResult> {
-    let Some(target_path) = target_path else {
-        return addresses;
-    };
-
-    addresses
-        .into_iter()
-        .filter(|address| paths_equivalent(&address.module_path, target_path))
-        .collect()
-}
 
 /// Handle InfoTrace command
 pub async fn handle_info_trace(
@@ -368,86 +331,6 @@ pub async fn handle_info_address(
         }
     }
 
-    // Helper: resolve module path by exact or suffix match
-    fn resolve_module_path(
-        analyzer: &ghostscope_dwarf::DwarfAnalyzer,
-        sess: &GhostSession,
-        module_spec: Option<&str>,
-    ) -> Result<String, String> {
-        // Build module list: main + shared libraries
-        let mut modules: Vec<String> = Vec::new();
-        if let Some(main) = analyzer.get_main_executable() {
-            modules.push(main.path);
-        }
-        for lib in analyzer.get_shared_library_info() {
-            modules.push(lib.library_path);
-        }
-        if let Ok(grouped) = analyzer.get_grouped_file_info_by_module() {
-            modules.extend(grouped.into_iter().map(|(module_path, _files)| module_path));
-        }
-        modules.sort();
-        modules.dedup();
-
-        if let Some(target_path) = sess.target_binary.as_deref() {
-            let target_module = modules
-                .iter()
-                .find(|module_path| paths_equivalent(module_path, target_path))
-                .cloned()
-                .unwrap_or_else(|| target_path.to_string());
-
-            if let Some(spec) = module_spec {
-                let spec = spec.trim();
-                if !module_spec_matches_path(&target_module, spec)
-                    && !module_spec_matches_path(target_path, spec)
-                {
-                    return Err(format!(
-                        "Module '{spec}' is outside -t target '{target_module}'. When -t and -p are combined, -t takes precedence for address queries."
-                    ));
-                }
-            }
-
-            return Ok(target_module);
-        }
-
-        if let Some(spec) = module_spec {
-            let spec = spec.trim();
-            // Exact match first
-            if let Some(found) = modules
-                .iter()
-                .find(|module_path| paths_equivalent(module_path, spec))
-            {
-                return Ok(found.clone());
-            }
-            // Suffix match
-            let candidates: Vec<String> =
-                modules.into_iter().filter(|p| p.ends_with(spec)).collect();
-            match candidates.len() {
-                0 => Err(format!(
-                    "Module '{spec}' not found among loaded modules. Use full path or a unique suffix."
-                )),
-                1 => Ok(candidates[0].clone()),
-                _ => {
-                    let mut sample = candidates.clone();
-                    sample.truncate(5);
-                    Err(format!(
-                        "Ambiguous module suffix '{}'. Candidates:\n  - {}\nPlease use a more specific suffix or full path.",
-                        spec,
-                        sample.join("\n  - ")
-                    ))
-                }
-            }
-        } else {
-            // No module specified: choose default based on mode
-            // Otherwise use main executable
-            analyzer
-                .get_main_executable()
-                .map(|m| m.path)
-                .ok_or_else(|| {
-                    "No default module available. Start with -p <pid> or -t <binary>.".to_string()
-                })
-        }
-    }
-
     let result = (|| -> Result<TargetDebugInfo, String> {
         let sess = session.as_mut().ok_or_else(|| {
             "No active debugging session. Target process may not be attached or DWARF symbols are unavailable.".to_string()
@@ -466,16 +349,18 @@ pub async fn handle_info_address(
         };
 
         let vaddr = parse_addr(addr_str)?;
-        let module_path = resolve_module_path(analyzer, sess, module_spec)?;
+        let module_path = analyzer
+            .resolve_address_module(
+                module_spec,
+                sess.target_binary.as_deref(),
+                ModuleDefaultPolicy::MainExecutableOnly,
+            )
+            .map_err(|e| e.to_string())?;
+        let module_display = module_path.to_string_lossy().to_string();
 
-        let address_info = sess
-            .process_analyzer
-            .as_mut()
-            .unwrap()
-            .query_address(&module_path, vaddr)
-            .map_err(|e| {
-                format!("Failed to analyze address 0x{vaddr:x} in module '{module_path}': {e}")
-            })?;
+        let address_info = analyzer.query_address(&module_path, vaddr).map_err(|e| {
+            format!("Failed to analyze address 0x{vaddr:x} in module '{module_display}': {e}")
+        })?;
 
         Ok(TargetDebugInfo {
             target: if let Some(ms) = module_spec {
@@ -597,7 +482,9 @@ fn try_get_line_debug_info(
         let query_results = process_analyzer
             .query_source_line_best_effort(cand, line_number)
             .map_err(|e| format!("Failed to analyze {cand}:{line_number}: {e}"))?;
-        let query_results = filter_address_results_to_target(query_results, target_path.as_deref());
+        let query_results = process_analyzer
+            .filter_address_results_to_target(query_results, target_path.as_deref())
+            .map_err(|e| e.to_string())?;
         if !query_results.is_empty() {
             let cand_target = format!("{cand}:{line_number}");
             return Ok(build_source_location_target_debug_info(
@@ -728,11 +615,14 @@ fn build_target_debug_info_from_query_results(
 }
 
 fn handle_function_query_result(
+    process_analyzer: &ghostscope_dwarf::DwarfAnalyzer,
     query_result: FunctionQueryResult,
     target_path: Option<&str>,
 ) -> Result<TargetDebugInfo, String> {
     let raw_address_count = query_result.addresses.len();
-    let addresses = filter_address_results_to_target(query_result.addresses, target_path);
+    let addresses = process_analyzer
+        .filter_address_results_to_target(query_result.addresses, target_path)
+        .map_err(|e| e.to_string())?;
     if raw_address_count == 0 {
         return Err(format!(
             "Function '{}' not found in any loaded module",
@@ -798,7 +688,7 @@ fn handle_function_target(
     let query_result = process_analyzer
         .query_function_best_effort(function_name)
         .map_err(|e| format!("Failed to analyze function '{function_name}': {e}"))?;
-    handle_function_query_result(query_result, target_path)
+    handle_function_query_result(process_analyzer, query_result, target_path)
 }
 
 /// Handle source location target (file:line)
@@ -818,7 +708,9 @@ fn handle_source_location_target(
         .query_source_line_best_effort(file_path, line_number)
         .map_err(|e| format!("Failed to analyze {file_path}:{line_number}: {e}"))?;
     let raw_address_count = query_results.len();
-    let query_results = filter_address_results_to_target(query_results, target_path);
+    let query_results = process_analyzer
+        .filter_address_results_to_target(query_results, target_path)
+        .map_err(|e| e.to_string())?;
 
     if query_results.is_empty() {
         if raw_address_count > 0 {
