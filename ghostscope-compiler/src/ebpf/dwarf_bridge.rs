@@ -3,7 +3,7 @@
 //! This module handles integration with DWARF debug information for
 //! variable type resolution and read-plan lowering.
 
-use super::context::{CodeGenError, EbpfContext, Result};
+use super::context::{CodeGenError, EbpfContext, Result, RuntimeAddress};
 use ghostscope_dwarf::{
     AddressOrigin, Availability, EntryValueCase, LvalueAddressPlan, MemoryAccessSize, PlanExprOp,
     PlannedAddress, PlannedAddressKind, RuntimeComputedExpr, SectionType, TypeInfo,
@@ -79,6 +79,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     None,
                     module_hint,
                 )
+                .map(|value| value.value.into())
             }
             ghostscope_dwarf::PlannedValue::ImplicitBytes(bytes) => {
                 debug!("Generating implicit value: {} bytes", bytes.len());
@@ -95,20 +96,19 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 } else {
                     status_ptr
                 };
-                self.planned_address_to_llvm_address(address, runtime_status_ptr, module_hint)
-                    .map(Into::into)
+                self.resolve_planned_address(address, runtime_status_ptr, module_hint)
+                    .map(|address| address.value.into())
             }
         }
     }
 
-    pub fn planned_address_to_llvm_address(
+    pub(crate) fn resolve_planned_address(
         &mut self,
         address: &PlannedAddress,
         status_ptr: Option<PointerValue<'ctx>>,
         module_hint: Option<&str>,
-    ) -> Result<IntValue<'ctx>> {
+    ) -> Result<RuntimeAddress<'ctx>> {
         let pt_regs_ptr = self.get_pt_regs_parameter()?;
-        self.store_offsets_found_const(true)?;
 
         match address.origin {
             AddressOrigin::LinkTime => {
@@ -141,12 +141,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     Some(runtime_base),
                     module_hint,
                 )?;
-                match value {
-                    BasicValueEnum::IntValue(value) => Ok(value),
-                    _ => Err(CodeGenError::LLVMError(
-                        "Computed address did not produce integer".to_string(),
-                    )),
-                }
+                Ok(value)
             }
             AddressOrigin::RuntimeDerived | AddressOrigin::Unknown => {
                 self.planned_address_without_rebase(address, pt_regs_ptr, status_ptr, module_hint)
@@ -160,22 +155,24 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         pt_regs_ptr: PointerValue<'ctx>,
         status_ptr: Option<PointerValue<'ctx>>,
         module_hint: Option<&str>,
-    ) -> Result<IntValue<'ctx>> {
+    ) -> Result<RuntimeAddress<'ctx>> {
         match &address.kind {
-            PlannedAddressKind::Constant { address } => {
-                Ok(self.context.i64_type().const_int(*address, false))
-            }
+            PlannedAddressKind::Constant { address } => Ok(RuntimeAddress::available(
+                self.context.i64_type().const_int(*address, false),
+                self.context,
+            )),
             PlannedAddressKind::RegisterOffset { dwarf_reg, offset } => {
                 let reg_val = self.load_register_value(*dwarf_reg, pt_regs_ptr)?;
                 if let BasicValueEnum::IntValue(reg_i) = reg_val {
-                    if *offset != 0 {
+                    let value = if *offset != 0 {
                         let ofs_val = self.context.i64_type().const_int(*offset as u64, true);
                         self.builder
                             .build_int_add(reg_i, ofs_val, "addr_with_offset")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))
                     } else {
                         Ok(reg_i)
-                    }
+                    }?;
+                    Ok(RuntimeAddress::available(value, self.context))
                 } else {
                     Err(CodeGenError::RegisterMappingError(
                         "Register value is not integer".to_string(),
@@ -197,21 +194,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         pt_regs_ptr: PointerValue<'ctx>,
         status_ptr: Option<PointerValue<'ctx>>,
         module_hint: Option<&str>,
-    ) -> Result<IntValue<'ctx>> {
-        let val = self.generate_runtime_expr_ops(
-            expr.ops(),
-            pt_regs_ptr,
-            None,
-            status_ptr,
-            None,
-            module_hint,
-        )?;
-        match val {
-            BasicValueEnum::IntValue(value) => Ok(value),
-            _ => Err(CodeGenError::LLVMError(
-                "Computed address did not produce integer".to_string(),
-            )),
-        }
+    ) -> Result<RuntimeAddress<'ctx>> {
+        self.generate_runtime_expr_ops(expr.ops(), pt_regs_ptr, None, status_ptr, None, module_hint)
     }
 
     fn runtime_address_from_link_time_address(
@@ -219,7 +203,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         link_addr: u64,
         status_ptr: Option<PointerValue<'ctx>>,
         module_hint: Option<&str>,
-    ) -> Result<IntValue<'ctx>> {
+    ) -> Result<RuntimeAddress<'ctx>> {
         let ctx = self.get_compile_time_context()?;
         let module_for_offsets = module_hint
             .map(|s| s.to_string())
@@ -230,8 +214,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let (rt_addr, found_flag) =
             self.generate_runtime_address_from_offsets(link_val, st_code, cookie)?;
         self.store_offsets_unavailable_status(status_ptr, found_flag)?;
-        self.store_offsets_found_flag(found_flag)?;
-        Ok(rt_addr)
+        Ok(RuntimeAddress::with_offsets_found(rt_addr, found_flag))
     }
 
     fn store_offsets_unavailable_status(
@@ -469,16 +452,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.variable_materialization_to_llvm_value(&materialized, pc_address, status_ptr)
     }
 
-    pub(super) fn variable_read_plan_to_lvalue_address(
+    pub(super) fn variable_read_plan_to_runtime_address(
         &mut self,
         plan: &VariableReadPlan,
         pc_address: u64,
         status_ptr: Option<PointerValue<'ctx>>,
-    ) -> Result<IntValue<'ctx>> {
+    ) -> Result<RuntimeAddress<'ctx>> {
         let module_hint = Self::module_path_for_offsets(plan.module_path.as_deref());
         match plan.lvalue_address_plan() {
             LvalueAddressPlan::Address { address } => {
-                self.planned_address_to_llvm_address(&address, status_ptr, module_hint.as_deref())
+                self.resolve_planned_address(&address, status_ptr, module_hint.as_deref())
             }
             LvalueAddressPlan::Unavailable { availability } => Err(
                 Self::dwarf_lvalue_address_unavailable_error(&plan.name, &availability, pc_address),
@@ -498,14 +481,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         } else {
             status_ptr
         };
-        let addr =
-            self.planned_address_to_llvm_address(address, runtime_status_ptr, module_hint)?;
+        let addr = self.resolve_planned_address(address, runtime_status_ptr, module_hint)?;
 
         if ghostscope_dwarf::is_c_aggregate_type(dwarf_type) {
             let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
             let as_ptr = self
                 .builder
-                .build_int_to_ptr(addr, ptr_ty, "aggregate_addr_as_ptr")
+                .build_int_to_ptr(addr.value, ptr_ty, "aggregate_addr_as_ptr")
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
             return Ok(as_ptr.into());
         }
@@ -628,11 +610,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         pt_regs_ptr: PointerValue<'ctx>,
         _result_size: Option<MemoryAccessSize>,
         status_ptr: Option<PointerValue<'ctx>>,
-        initial_top: Option<IntValue<'ctx>>,
+        initial_top: Option<RuntimeAddress<'ctx>>,
         module_hint: Option<&str>,
-    ) -> Result<BasicValueEnum<'ctx>> {
+    ) -> Result<RuntimeAddress<'ctx>> {
         // Implement stack-based computation
-        let mut stack: Vec<IntValue<'ctx>> = Vec::new();
+        let mut stack: Vec<RuntimeAddress<'ctx>> = Vec::new();
         // Track a runtime null-pointer flag from dereference steps; when true, subsequent
         // arithmetic will be masked to zero to avoid reads at small offsets from NULL.
         let mut deref_null_flag: Option<inkwell::values::IntValue> = None;
@@ -645,7 +627,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 PlanExprOp::LoadRegister(dwarf_reg) => {
                     let reg_value = self.load_register_value(*dwarf_reg, pt_regs_ptr)?;
                     if let BasicValueEnum::IntValue(int_val) = reg_value {
-                        stack.push(int_val);
+                        stack.push(RuntimeAddress::available(int_val, self.context));
                     } else {
                         return Err(CodeGenError::RegisterMappingError(format!(
                             "Register {dwarf_reg} did not return integer value"
@@ -655,14 +637,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
                 PlanExprOp::PushConstant(value) => {
                     let const_val = self.context.i64_type().const_int(*value as u64, true);
-                    stack.push(const_val);
+                    stack.push(RuntimeAddress::available(const_val, self.context));
                 }
 
                 PlanExprOp::Add => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let sum_val = self
                             .builder
-                            .build_int_add(a, b, "add")
+                            .build_int_add(a.value, b.value, "add")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        let guard = self
+                            .builder
+                            .build_and(a.offsets_found, b.offsets_found, "add_guard")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                         if let Some(nf) = deref_null_flag {
                             let masked_bv = self
@@ -674,9 +660,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     "add_masked",
                                 )
                                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            stack.push(masked_bv.into_int_value());
+                            stack.push(RuntimeAddress::with_offsets_found(
+                                masked_bv.into_int_value(),
+                                guard,
+                            ));
                         } else {
-                            stack.push(sum_val);
+                            stack.push(RuntimeAddress::with_offsets_found(sum_val, guard));
                         }
                     } else {
                         return Err(CodeGenError::LLVMError(
@@ -689,9 +678,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
-                            .build_int_sub(a, b, "sub")
+                            .build_int_sub(a.value, b.value, "sub")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        stack.push(result);
+                        let guard = self
+                            .builder
+                            .build_and(a.offsets_found, b.offsets_found, "sub_guard")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(RuntimeAddress::with_offsets_found(result, guard));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in Sub".to_string(),
@@ -703,9 +696,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
-                            .build_int_mul(a, b, "mul")
+                            .build_int_mul(a.value, b.value, "mul")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        stack.push(result);
+                        let guard = self
+                            .builder
+                            .build_and(a.offsets_found, b.offsets_found, "mul_guard")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(RuntimeAddress::with_offsets_found(result, guard));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in Mul".to_string(),
@@ -715,8 +712,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
                 PlanExprOp::Div => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        let result = self.build_signed_int_div_via_udiv(a, b, "div")?;
-                        stack.push(result);
+                        let result = self.build_signed_int_div_via_udiv(a.value, b.value, "div")?;
+                        let guard = self
+                            .builder
+                            .build_and(a.offsets_found, b.offsets_found, "div_guard")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(RuntimeAddress::with_offsets_found(result, guard));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in Div".to_string(),
@@ -726,8 +727,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
                 PlanExprOp::Mod => {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
-                        let result = self.build_signed_int_rem_via_urem(a, b, "mod")?;
-                        stack.push(result);
+                        let result = self.build_signed_int_rem_via_urem(a.value, b.value, "mod")?;
+                        let guard = self
+                            .builder
+                            .build_and(a.offsets_found, b.offsets_found, "mod_guard")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(RuntimeAddress::with_offsets_found(result, guard));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in Mod".to_string(),
@@ -739,9 +744,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
-                            .build_and(a, b, "and")
+                            .build_and(a.value, b.value, "and")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        stack.push(result);
+                        let guard = self
+                            .builder
+                            .build_and(a.offsets_found, b.offsets_found, "and_guard")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(RuntimeAddress::with_offsets_found(result, guard));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in BitwiseAnd".to_string(),
@@ -753,9 +762,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
-                            .build_or(a, b, "or")
+                            .build_or(a.value, b.value, "or")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        stack.push(result);
+                        let guard = self
+                            .builder
+                            .build_and(a.offsets_found, b.offsets_found, "or_guard")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(RuntimeAddress::with_offsets_found(result, guard));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in BitwiseOr".to_string(),
@@ -767,9 +780,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
-                            .build_xor(a, b, "xor")
+                            .build_xor(a.value, b.value, "xor")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        stack.push(result);
+                        let guard = self
+                            .builder
+                            .build_and(a.offsets_found, b.offsets_found, "xor_guard")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(RuntimeAddress::with_offsets_found(result, guard));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in BitwiseXor".to_string(),
@@ -781,9 +798,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
-                            .build_left_shift(a, b, "shl")
+                            .build_left_shift(a.value, b.value, "shl")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        stack.push(result);
+                        let guard = self
+                            .builder
+                            .build_and(a.offsets_found, b.offsets_found, "shl_guard")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(RuntimeAddress::with_offsets_found(result, guard));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in ShiftLeft".to_string(),
@@ -795,9 +816,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
-                            .build_right_shift(a, b, false, "shr")
+                            .build_right_shift(a.value, b.value, false, "shr")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        stack.push(result);
+                        let guard = self
+                            .builder
+                            .build_and(a.offsets_found, b.offsets_found, "shr_guard")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(RuntimeAddress::with_offsets_found(result, guard));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in ShiftRight".to_string(),
@@ -809,9 +834,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) {
                         let result = self
                             .builder
-                            .build_right_shift(a, b, true, "shra")
+                            .build_right_shift(a.value, b.value, true, "shra")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        stack.push(result);
+                        let guard = self
+                            .builder
+                            .build_and(a.offsets_found, b.offsets_found, "shra_guard")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(RuntimeAddress::with_offsets_found(result, guard));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in ShiftRightArithmetic".to_string(),
@@ -823,9 +852,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if let Some(a) = stack.pop() {
                         let result = self
                             .builder
-                            .build_not(a, "not")
+                            .build_not(a.value, "not")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        stack.push(result);
+                        stack.push(a.with_value(result));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in Not".to_string(),
@@ -837,9 +866,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if let Some(a) = stack.pop() {
                         let result = self
                             .builder
-                            .build_int_sub(self.context.i64_type().const_zero(), a, "neg")
+                            .build_int_sub(self.context.i64_type().const_zero(), a.value, "neg")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        stack.push(result);
+                        stack.push(a.with_value(result));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in Neg".to_string(),
@@ -852,23 +881,23 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         let zero = self.context.i64_type().const_zero();
                         let is_neg = self
                             .builder
-                            .build_int_compare(inkwell::IntPredicate::SLT, a, zero, "abs_neg")
+                            .build_int_compare(inkwell::IntPredicate::SLT, a.value, zero, "abs_neg")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                         let negated = self
                             .builder
-                            .build_int_sub(zero, a, "abs_negated")
+                            .build_int_sub(zero, a.value, "abs_negated")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                         let result = self
                             .builder
                             .build_select::<BasicValueEnum<'ctx>, _>(
                                 is_neg,
                                 negated.into(),
-                                a.into(),
+                                a.value.into(),
                                 "abs",
                             )
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                             .into_int_value();
-                        stack.push(result);
+                        stack.push(a.with_value(result));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in Abs".to_string(),
@@ -894,13 +923,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         };
                         let cmp = self
                             .builder
-                            .build_int_compare(predicate, a, b, "cmp")
+                            .build_int_compare(predicate, a.value, b.value, "cmp")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                         let result = self
                             .builder
                             .build_int_z_extend(cmp, self.context.i64_type(), "cmp_i64")
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        stack.push(result);
+                        let guard = self
+                            .builder
+                            .build_and(a.offsets_found, b.offsets_found, "cmp_guard")
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                        stack.push(RuntimeAddress::with_offsets_found(result, guard));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in comparison".to_string(),
@@ -916,7 +949,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             .builder
                             .build_int_compare(
                                 inkwell::IntPredicate::EQ,
-                                addr,
+                                addr.value,
                                 zero64,
                                 "is_null_deref",
                             )
@@ -1060,7 +1093,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 .build_store(sp, new_status_bv)
                                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                         }
-                        stack.push(merged);
+                        stack.push(RuntimeAddress::with_offsets_found(
+                            merged,
+                            addr.offsets_found,
+                        ));
                     } else {
                         return Err(CodeGenError::LLVMError(
                             "Stack underflow in LoadMemory".to_string(),
@@ -1080,7 +1116,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         status_ptr,
                         module_hint,
                     )?;
-                    stack.push(value);
+                    stack.push(RuntimeAddress::available(value, self.context));
                 }
 
                 // Add catch-all for unimplemented operations
@@ -1094,7 +1130,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         if stack.len() == 1 {
-            Ok(stack.pop().unwrap().into())
+            Ok(stack.pop().unwrap())
         } else {
             Err(CodeGenError::LLVMError(format!(
                 "Invalid stack state after computation: {} elements remaining",
@@ -1127,7 +1163,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 None,
                 module_hint,
             )?
-            .into_int_value();
+            .value;
 
         let current_block = self.builder.get_insert_block().ok_or_else(|| {
             CodeGenError::LLVMError("No insertion block for EntryValueLookup".to_string())
@@ -1185,6 +1221,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     &format!("entry_value_match_{index}"),
                 )
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let is_match = self
+                .builder
+                .build_and(
+                    is_match,
+                    found_flag,
+                    &format!("entry_value_match_ready_{index}"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
             let case_bb = self
                 .context
                 .append_basic_block(current_fn, &format!("entry_value_case_{index}"));
@@ -1208,7 +1252,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     None,
                     module_hint,
                 )?
-                .into_int_value();
+                .value;
             let case_value_block = self.builder.get_insert_block().ok_or_else(|| {
                 CodeGenError::LLVMError(
                     "No insertion block after EntryValueLookup case".to_string(),
@@ -2268,9 +2312,46 @@ mod tests {
         let address = PlannedAddress::from_location(location)
             .expect("computed location should materialize as a planned address");
         let addr = ctx
-            .planned_address_to_llvm_address(&address, None, None)
+            .resolve_planned_address(&address, None, None)
             .expect("computed address with mid-stream dereference should compile");
-        assert_eq!(addr.get_type().get_bit_width(), 64);
+        assert_eq!(addr.value.get_type().get_bit_width(), 64);
+        assert_eq!(addr.offsets_found.get_type().get_bit_width(), 1);
+        assert!(
+            ctx.module
+                .print_to_string()
+                .to_string()
+                .contains("add_guard"),
+            "trailing arithmetic should preserve the address availability guard"
+        );
+    }
+
+    #[test]
+    fn planned_address_lowering_does_not_emit_offsets_global() {
+        let llctx = LlvmContext::create();
+        let opts = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&llctx, "explicit_addr_guard", Some(0), &opts).expect("ctx");
+        ctx.create_basic_ebpf_function("f").expect("fn");
+        ctx.__test_ensure_proc_offsets_map().expect("map");
+        ctx.__test_alloc_pm_key().expect("pm_key");
+        ctx.set_compile_time_context(0x1234, "/nonexistent/module".to_string());
+
+        let address =
+            PlannedAddress::from_location(VariableLocation::Address(AddressExpr::constant(0x1000)))
+                .expect("constant address should materialize as a planned address");
+
+        let addr = ctx
+            .resolve_planned_address(&address, None, None)
+            .expect("link-time address should lower with an explicit guard");
+
+        assert_eq!(addr.value.get_type().get_bit_width(), 64);
+        assert_eq!(addr.offsets_found.get_type().get_bit_width(), 1);
+        assert!(
+            !ctx.module
+                .print_to_string()
+                .to_string()
+                .contains("_gs_offsets_found"),
+            "address availability should be threaded explicitly instead of using a module global"
+        );
     }
 
     #[test]
@@ -2292,10 +2373,10 @@ mod tests {
         );
 
         let addr = ctx
-            .variable_read_plan_to_lvalue_address(&plan, 0x1234, None)
+            .variable_read_plan_to_runtime_address(&plan, 0x1234, None)
             .expect("address-only read plan should not require DWARF type info");
 
-        assert_eq!(addr.get_type().get_bit_width(), 64);
+        assert_eq!(addr.value.get_type().get_bit_width(), 64);
     }
 
     #[test]
@@ -2314,7 +2395,7 @@ mod tests {
         );
 
         let err = ctx
-            .variable_read_plan_to_lvalue_address(&plan, 0x1234, None)
+            .variable_read_plan_to_runtime_address(&plan, 0x1234, None)
             .expect_err("unavailable lvalue plans should be rejected");
 
         assert!(matches!(err, CodeGenError::VariableUnavailable(_)));

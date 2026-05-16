@@ -3,7 +3,7 @@
 //! This module handles eBPF helper function calls, register mapping, and pt_regs
 //! access for different target architectures.
 
-use super::context::{CodeGenError, EbpfContext, Result};
+use super::context::{CodeGenError, EbpfContext, Result, RuntimeAddress};
 use aya_ebpf_bindings::bindings::bpf_func_id::{
     BPF_FUNC_get_current_pid_tgid, BPF_FUNC_ktime_get_ns, BPF_FUNC_map_lookup_elem,
     BPF_FUNC_perf_event_output, BPF_FUNC_probe_read_user, BPF_FUNC_probe_read_user_str,
@@ -237,9 +237,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     /// Read a user C-string into a static buffer using bpf_probe_read_user_str.
     /// Returns (buffer_ptr, len_including_nul).
-    pub fn read_user_cstr_into_buffer(
+    pub(crate) fn read_user_cstr_into_buffer(
         &mut self,
-        src_addr: inkwell::values::IntValue<'ctx>,
+        src_addr: RuntimeAddress<'ctx>,
         size: u32,
         name_prefix: &str,
     ) -> Result<(
@@ -257,15 +257,35 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let src_ptr = self
             .builder
-            .build_int_to_ptr(src_addr, ptr_ty, "src_ptr")
+            .build_int_to_ptr(src_addr.value, ptr_ty, "src_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let src_ptr = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                src_addr.offsets_found,
+                src_ptr.into(),
+                ptr_ty.const_null().into(),
+                "cstr_src_or_null",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_pointer_value();
 
         // Helper signature: long fn(void *dst, u32 size, const void *src)
         let i64_ty = self.context.i64_type();
         let i32_ty = self.context.i32_type();
+        let effective_size = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                src_addr.offsets_found,
+                i32_ty.const_int(size as u64, false).into(),
+                i32_ty.const_zero().into(),
+                "cstr_size_or_zero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
         let args: [inkwell::values::BasicValueEnum; 3] = [
             dst_ptr,
-            i32_ty.const_int(size as u64, false).into(),
+            effective_size.into(),
             inkwell::values::BasicValueEnum::PointerValue(src_ptr),
         ];
         let ret = self.create_bpf_helper_call(
@@ -281,14 +301,24 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "probe_read_user_str did not return integer".to_string(),
             ));
         };
+        let len = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                src_addr.offsets_found,
+                len.into(),
+                i64_ty.const_zero().into(),
+                "cstr_len_or_zero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
         Ok((buf_global, len, arr_ty))
     }
 
     /// Read raw user bytes into a static buffer using bpf_probe_read_user.
     /// Returns (buffer_ptr, status==0?).
-    pub fn read_user_bytes_into_buffer(
+    pub(crate) fn read_user_bytes_into_buffer(
         &mut self,
-        src_addr: inkwell::values::IntValue<'ctx>,
+        src_addr: RuntimeAddress<'ctx>,
         size: u32,
         name_prefix: &str,
     ) -> Result<(
@@ -307,12 +337,32 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let src_ptr = self
             .builder
-            .build_int_to_ptr(src_addr, ptr_ty, "src_ptr")
+            .build_int_to_ptr(src_addr.value, ptr_ty, "src_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let src_ptr = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                src_addr.offsets_found,
+                src_ptr.into(),
+                ptr_ty.const_null().into(),
+                "bytes_src_or_null",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_pointer_value();
+        let effective_size = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                src_addr.offsets_found,
+                i32_ty.const_int(size as u64, false).into(),
+                i32_ty.const_zero().into(),
+                "bytes_size_or_zero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
 
         let args: [inkwell::values::BasicValueEnum; 3] = [
             dst_ptr,
-            i32_ty.const_int(size as u64, false).into(),
+            effective_size.into(),
             inkwell::values::BasicValueEnum::PointerValue(src_ptr),
         ];
         // Helper returns long (0 on success, -errno on failure)
@@ -329,6 +379,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "probe_read_user did not return integer".to_string(),
             ));
         };
+        let status = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                src_addr.offsets_found,
+                status.into(),
+                i64_ty.const_int(u64::MAX, true).into(),
+                "bytes_status_or_missing_offsets",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
         Ok((buf_global, status, arr_ty))
     }
     /// Compute runtime address from link-time address using proc_module_offsets map
@@ -712,7 +772,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         flag_phi.add_incoming(&[(&one, found_block), (&zero, miss_block)]);
         let found_flag = flag_phi.as_basic_value().into_int_value();
 
-        self.store_offsets_found_flag(found_flag)?;
         Ok((final_addr, found_flag))
     }
     /// Load a register value from pt_regs
@@ -756,13 +815,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     fn probe_read_user_core(
         &mut self,
-        addr: IntValue<'ctx>,
+        address: RuntimeAddress<'ctx>,
         size: MemoryAccessSize,
         name_suffix: &str,
     ) -> Result<ProbeReadResult<'ctx>> {
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
-        let offsets_found = self.load_offsets_found_flag()?;
+        let offsets_found = address.offsets_found;
         let not_found = self
             .builder
             .build_not(offsets_found, "offsets_miss")
@@ -776,7 +835,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let base_src_ptr = self
             .builder
-            .build_int_to_ptr(addr, ptr_type, "src_ptr")
+            .build_int_to_ptr(address.value, ptr_type, "src_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let null_ptr = ptr_type.const_null();
         let src_ptr = self
@@ -969,9 +1028,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     /// Generate memory read using bpf_probe_read_user
-    pub fn generate_memory_read(
+    pub(crate) fn generate_memory_read(
         &mut self,
-        addr: IntValue<'ctx>,
+        address: RuntimeAddress<'ctx>,
         size: MemoryAccessSize,
         status_ptr: Option<PointerValue<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
@@ -980,7 +1039,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             loaded_i64,
             combined_fail,
             not_found,
-        } = self.probe_read_user_core(addr, size, "probe_read_user")?;
+        } = self.probe_read_user_core(address, size, "probe_read_user")?;
 
         if let Some(status_ptr) = status_ptr {
             self.store_variable_read_status(
@@ -1006,9 +1065,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     /// Generate memory read with runtime status capture (for control-flow conditions).
     /// On helper failure, sets condition error code (if active) and returns zero value.
-    pub fn generate_memory_read_with_status(
+    pub(crate) fn generate_memory_read_with_status(
         &mut self,
-        addr: IntValue<'ctx>,
+        address: RuntimeAddress<'ctx>,
         size: MemoryAccessSize,
     ) -> Result<BasicValueEnum<'ctx>> {
         let zero_const = self.context.i64_type().const_zero();
@@ -1016,7 +1075,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             loaded_i64,
             combined_fail,
             ..
-        } = self.probe_read_user_core(addr, size, "probe_read_user_cf")?;
+        } = self.probe_read_user_core(address, size, "probe_read_user_cf")?;
 
         let cur_block = self.builder.get_insert_block().unwrap();
         let func = cur_block.get_parent().unwrap();
@@ -1027,7 +1086,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder.position_at_end(set_block);
         let _ = self.set_condition_error_if_unset(2u8);
-        let _ = self.set_condition_error_addr_if_unset(addr);
+        let _ = self.set_condition_error_addr_if_unset(address.value);
         self.builder
             .build_unconditional_branch(cont_block)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;

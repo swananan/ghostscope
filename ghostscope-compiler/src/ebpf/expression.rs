@@ -2,7 +2,7 @@
 //!
 //! This module handles compilation of various expression types to LLVM IR.
 
-use super::context::{CodeGenError, EbpfContext, Result};
+use super::context::{CodeGenError, EbpfContext, Result, RuntimeAddress};
 use crate::script::{BinaryOp, Expr};
 use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use ghostscope_dwarf::{
@@ -23,7 +23,7 @@ struct DynamicTypeInfo {
 }
 
 struct DynamicLvalue<'ctx> {
-    address: IntValue<'ctx>,
+    address: RuntimeAddress<'ctx>,
     type_info: DynamicTypeInfo,
 }
 
@@ -561,16 +561,24 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         &mut self,
         e: &Expr,
     ) -> Result<inkwell::values::IntValue<'ctx>> {
-        let mut visited = std::collections::HashSet::new();
-        self.resolve_ptr_i64_from_expr_internal(e, &mut visited, 0)
+        self.resolve_runtime_address_from_expr(e)
+            .map(|address| address.value)
     }
 
-    fn resolve_ptr_i64_from_expr_internal(
+    pub(crate) fn resolve_runtime_address_from_expr(
+        &mut self,
+        e: &Expr,
+    ) -> Result<RuntimeAddress<'ctx>> {
+        let mut visited = std::collections::HashSet::new();
+        self.resolve_runtime_address_from_expr_internal(e, &mut visited, 0)
+    }
+
+    fn resolve_runtime_address_from_expr_internal(
         &mut self,
         e: &Expr,
         visited: &mut std::collections::HashSet<String>,
         depth: usize,
-    ) -> Result<inkwell::values::IntValue<'ctx>> {
+    ) -> Result<RuntimeAddress<'ctx>> {
         use crate::script::ast::BinaryOp as BO;
         use crate::script::ast::Expr as E;
         use inkwell::values::BasicValueEnum::*;
@@ -589,7 +597,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     )));
                 }
                 if let Some(target) = self.get_alias_variable(name) {
-                    let r = self.resolve_ptr_i64_from_expr_internal(&target, visited, depth + 1);
+                    let r = self.resolve_runtime_address_from_expr_internal(
+                        &target,
+                        visited,
+                        depth + 1,
+                    );
                     visited.remove(name);
                     return r;
                 }
@@ -609,7 +621,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 None
                             };
                             let pc_address = self.get_compile_time_context()?.pc_address;
-                            return self.variable_read_plan_to_lvalue_address(
+                            return self.variable_read_plan_to_runtime_address(
                                 &var, pc_address, status_ptr,
                             );
                         } else {
@@ -644,7 +656,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     None
                 };
                 let pc_address = self.get_compile_time_context()?.pc_address;
-                return self.variable_read_plan_to_lvalue_address(&var, pc_address, status_ptr);
+                return self.variable_read_plan_to_runtime_address(&var, pc_address, status_ptr);
             } else {
                 return Err(CodeGenError::TypeError(
                     "cannot take address of unresolved expression".into(),
@@ -659,12 +671,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         if let Some((ptr_side, index)) = self.pointer_arithmetic_parts_expanding_aliases(e)? {
             if matches!(&ptr_side, E::AddressOf(_)) {
                 let base =
-                    self.resolve_ptr_i64_from_expr_internal(&ptr_side, visited, depth + 1)?;
+                    self.resolve_runtime_address_from_expr_internal(&ptr_side, visited, depth + 1)?;
                 let off = self.context.i64_type().const_int(index as u64, false);
-                return self
+                let value = self
                     .builder
-                    .build_int_add(base, off, "ptr_add")
-                    .map_err(|err| CodeGenError::Builder(err.to_string()));
+                    .build_int_add(base.value, off, "ptr_add")
+                    .map_err(|err| CodeGenError::Builder(err.to_string()))?;
+                return Ok(base.with_value(value));
             } else if let Some(var) = self.query_dwarf_for_complex_expr(&ptr_side)? {
                 if var.dwarf_type.is_some() {
                     let pointed_plan = var
@@ -676,7 +689,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         None
                     };
                     let pc_address = self.get_compile_time_context()?.pc_address;
-                    return self.variable_read_plan_to_lvalue_address(
+                    return self.variable_read_plan_to_runtime_address(
                         &pointed_plan,
                         pc_address,
                         status_ptr,
@@ -691,40 +704,43 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 // alias + K
                 if let Some(k) = Self::integer_literal_value(right) {
                     if let Ok(base) =
-                        self.resolve_ptr_i64_from_expr_internal(left, visited, depth + 1)
+                        self.resolve_runtime_address_from_expr_internal(left, visited, depth + 1)
                     {
                         let off = self.context.i64_type().const_int(k as u64, false);
-                        return self
+                        let value = self
                             .builder
-                            .build_int_add(base, off, "ptr_add")
-                            .map_err(|e| CodeGenError::Builder(e.to_string()));
+                            .build_int_add(base.value, off, "ptr_add")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        return Ok(base.with_value(value));
                     }
                 }
                 // K + alias
                 if let Some(k) = Self::integer_literal_value(left) {
                     if let Ok(base) =
-                        self.resolve_ptr_i64_from_expr_internal(right, visited, depth + 1)
+                        self.resolve_runtime_address_from_expr_internal(right, visited, depth + 1)
                     {
                         let off = self.context.i64_type().const_int(k as u64, false);
-                        return self
+                        let value = self
                             .builder
-                            .build_int_add(base, off, "ptr_add")
-                            .map_err(|e| CodeGenError::Builder(e.to_string()));
+                            .build_int_add(base.value, off, "ptr_add")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        return Ok(base.with_value(value));
                     }
                 }
             } else if matches!(op, BO::Subtract) {
                 if let Some(k) = Self::integer_literal_value(right) {
                     if let Ok(base) =
-                        self.resolve_ptr_i64_from_expr_internal(left, visited, depth + 1)
+                        self.resolve_runtime_address_from_expr_internal(left, visited, depth + 1)
                     {
                         let off = self
                             .context
                             .i64_type()
                             .const_int(k.wrapping_neg() as u64, false);
-                        return self
+                        let value = self
                             .builder
-                            .build_int_add(base, off, "ptr_sub")
-                            .map_err(|e| CodeGenError::Builder(e.to_string()));
+                            .build_int_add(base.value, off, "ptr_sub")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        return Ok(base.with_value(value));
                     }
                 }
             }
@@ -740,10 +756,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         let val_any =
                             self.variable_read_plan_to_llvm_value(&var, pc_address, None)?;
                         match val_any {
-                            IntValue(iv) => Ok(iv),
+                            IntValue(iv) => Ok(RuntimeAddress::available(iv, self.context)),
                             PointerValue(pv) => self
                                 .builder
                                 .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
+                                .map(|value| RuntimeAddress::available(value, self.context))
                                 .map_err(|e| CodeGenError::Builder(e.to_string())),
                             _ => Err(CodeGenError::TypeError(
                                 "DWARF value is not pointer/integer".into(),
@@ -758,7 +775,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             None
                         };
                         let pc_address = self.get_compile_time_context()?.pc_address;
-                        self.variable_read_plan_to_lvalue_address(&var, pc_address, status_ptr)
+                        self.variable_read_plan_to_runtime_address(&var, pc_address, status_ptr)
                     }
                     _ => Err(CodeGenError::TypeError(
                         "DWARF value is not pointer/array".into(),
@@ -771,7 +788,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     None
                 };
                 let pc_address = self.get_compile_time_context()?.pc_address;
-                self.variable_read_plan_to_lvalue_address(&var, pc_address, status_ptr)
+                self.variable_read_plan_to_runtime_address(&var, pc_address, status_ptr)
             }
         } else {
             // No DWARF-backed address and not an address-of/alias+const: reject script-level pointers.
@@ -784,7 +801,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     fn dynamic_pointer_arithmetic_address(
         &mut self,
         expr: &Expr,
-    ) -> Result<Option<IntValue<'ctx>>> {
+    ) -> Result<Option<RuntimeAddress<'ctx>>> {
         use crate::script::ast::BinaryOp as BO;
         use crate::script::ast::Expr as E;
 
@@ -825,7 +842,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         base_expr: &Expr,
         offset_expr: &Expr,
         subtract: bool,
-    ) -> Result<Option<IntValue<'ctx>>> {
+    ) -> Result<Option<RuntimeAddress<'ctx>>> {
         if Self::integer_literal_value(offset_expr).is_some() {
             return Ok(None);
         }
@@ -835,7 +852,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             return Ok(None);
         }
 
-        let base_address = self.resolve_ptr_i64_from_expr(&expanded_base)?;
+        let base_address = self.resolve_runtime_address_from_expr(&expanded_base)?;
         let offset = match self.compile_expr(offset_expr)? {
             BasicValueEnum::IntValue(value) => {
                 self.normalize_int_to_i64(value, "dynamic_raw_offset_i64")?
@@ -855,16 +872,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         };
         let address = self
             .builder
-            .build_int_add(base_address, offset, "dynamic_raw_address")
+            .build_int_add(base_address.value, offset, "dynamic_raw_address")
             .map_err(|err| CodeGenError::Builder(err.to_string()))?;
-        Ok(Some(address))
+        Ok(Some(base_address.with_value(address)))
     }
 
     fn dynamic_index_address_candidate(
         &mut self,
         base_expr: &Expr,
         index_expr: &Expr,
-    ) -> Result<Option<IntValue<'ctx>>> {
+    ) -> Result<Option<RuntimeAddress<'ctx>>> {
         match self.compile_dynamic_array_element_address(base_expr, index_expr) {
             Ok(Some(element_lvalue)) => Ok(Some(element_lvalue.address)),
             Ok(None) => Ok(None),
@@ -1023,15 +1040,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.context.bool_type().const_int(1, false)
         } else {
             // Resolve pointer for A and read from user memory
-            let ptr_a = self.resolve_ptr_i64_from_expr(a_expr)?;
-            let offsets_found_a = self.load_offsets_found_flag()?;
+            let ptr_a = self.resolve_runtime_address_from_expr(a_expr)?;
+            let offsets_found_a = ptr_a.offsets_found;
             let dst_a = self
                 .builder
                 .build_bit_cast(buf_a, ptr_ty, "memcmp_dst_a")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
             let base_src_a = self
                 .builder
-                .build_int_to_ptr(ptr_a, ptr_ty, "memcmp_src_a")
+                .build_int_to_ptr(ptr_a.value, ptr_ty, "memcmp_src_a")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
             let null_ptr = ptr_ty.const_null();
             let src_a = self
@@ -1101,15 +1118,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.context.bool_type().const_int(1, false)
         } else {
             // Resolve pointer for B and read from user memory
-            let ptr_b = self.resolve_ptr_i64_from_expr(b_expr)?;
-            let offsets_found_b = self.load_offsets_found_flag()?;
+            let ptr_b = self.resolve_runtime_address_from_expr(b_expr)?;
+            let offsets_found_b = ptr_b.offsets_found;
             let dst_b = self
                 .builder
                 .build_bit_cast(buf_b, ptr_ty, "memcmp_dst_b")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
             let base_src_b = self
                 .builder
-                .build_int_to_ptr(ptr_b, ptr_ty, "memcmp_src_b")
+                .build_int_to_ptr(ptr_b.value, ptr_ty, "memcmp_src_b")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
             let null_ptr = ptr_ty.const_null();
             let src_b = self
@@ -1565,10 +1582,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             let val_any =
                                 self.variable_read_plan_to_llvm_value(&var, pc_address, None)?;
                             match val_any {
-                                BasicValueEnum::IntValue(iv) => iv,
+                                BasicValueEnum::IntValue(iv) => {
+                                    RuntimeAddress::available(iv, self.context)
+                                }
                                 BasicValueEnum::PointerValue(pv) => self
                                     .builder
                                     .build_ptr_to_int(pv, self.context.i64_type(), "ptr_as_i64")
+                                    .map(|value| RuntimeAddress::available(value, self.context))
                                     .map_err(|e| CodeGenError::Builder(e.to_string()))?,
                                 _ => {
                                     return Err(CodeGenError::TypeError(
@@ -1584,7 +1604,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 None
                             };
                             let pc_address = self.get_compile_time_context()?.pc_address;
-                            self.variable_read_plan_to_lvalue_address(&var, pc_address, status_ptr)?
+                            self.variable_read_plan_to_runtime_address(
+                                &var, pc_address, status_ptr,
+                            )?
                         }
                         _ => {
                             // Not a pointer/array -> treat as error
@@ -1601,7 +1623,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
             None => {
                 // Generic pointer expr (e.g., alias); resolve to i64
-                self.resolve_ptr_i64_from_expr(dwarf_expr).map_err(|_| {
+                self.resolve_runtime_address_from_expr(dwarf_expr).map_err(|_| {
                     CodeGenError::TypeError(
                         "strncmp requires at least one string argument, and the other side must be an address expression (DWARF pointer/array or alias)".to_string(),
                     )
@@ -1641,19 +1663,39 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .builder
             .build_bit_cast(buf_global, ptr_ty, "strncmp_dst_ptr")
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let base_src_ptr = self
+            .builder
+            .build_int_to_ptr(ptr_i64.value, ptr_ty, "strncmp_src_ptr")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
         let src_ptr = self
             .builder
-            .build_int_to_ptr(ptr_i64, ptr_ty, "strncmp_src_ptr")
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                ptr_i64.offsets_found,
+                base_src_ptr.into(),
+                ptr_ty.const_null().into(),
+                "strncmp_src_or_null",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_pointer_value();
+        let effective_len = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                ptr_i64.offsets_found,
+                bounded_len.into(),
+                self.context.i32_type().const_zero().into(),
+                "strncmp_len_or_zero",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+            .into_int_value();
         let ret = self
             .create_bpf_helper_call(
                 BPF_FUNC_probe_read_user as u64,
-                &[dst_ptr, bounded_len.into(), src_ptr.into()],
+                &[dst_ptr, effective_len.into(), src_ptr.into()],
                 self.context.i64_type().into(),
                 "probe_read_user_strncmp",
             )?
             .into_int_value();
-        let status_ok = self
+        let read_ok = self
             .builder
             .build_int_compare(
                 inkwell::IntPredicate::EQ,
@@ -1661,6 +1703,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 self.context.i64_type().const_zero(),
                 "rd_ok",
             )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let status_ok = self
+            .builder
+            .build_and(read_ok, ptr_i64.offsets_found, "strncmp_ok_with_offsets")
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
         // If in condition context and read failed, set condition error code = 1 (ProbeReadFailed)
@@ -1679,7 +1725,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.builder.position_at_end(set_b);
             // VariableStatus::ReadError = 2
             let _ = self.set_condition_error_if_unset(2u8);
-            let _ = self.set_condition_error_addr_if_unset(ptr_i64);
+            let _ = self.set_condition_error_addr_if_unset(ptr_i64.value);
             // flags: bit0 = read failure for strncmp
             let one = self.context.i8_type().const_int(1, false);
             let _ = self.or_condition_error_flags(one);
@@ -2249,12 +2295,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     )
                                 })?;
                         let pc_address = self.get_compile_time_context()?.pc_address;
-                        match self.variable_read_plan_to_lvalue_address(&var, pc_address, None) {
-                            Ok(addr_i64) => {
+                        match self.variable_read_plan_to_runtime_address(&var, pc_address, None) {
+                            Ok(address) => {
                                 let ptr_ty = self.context.ptr_type(AddressSpace::default());
                                 let as_ptr = self
                                     .builder
-                                    .build_int_to_ptr(addr_i64, ptr_ty, "addr_as_ptr")
+                                    .build_int_to_ptr(address.value, ptr_ty, "addr_as_ptr")
                                     .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                                 return Ok(as_ptr.into());
                             }
@@ -2279,12 +2325,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         )
                     })?;
                 let pc_address = self.get_compile_time_context()?.pc_address;
-                match self.variable_read_plan_to_lvalue_address(&var, pc_address, None) {
-                    Ok(addr_i64) => {
+                match self.variable_read_plan_to_runtime_address(&var, pc_address, None) {
+                    Ok(address) => {
                         let ptr_ty = self.context.ptr_type(AddressSpace::default());
                         let as_ptr = self
                             .builder
-                            .build_int_to_ptr(addr_i64, ptr_ty, "addr_as_ptr")
+                            .build_int_to_ptr(address.value, ptr_ty, "addr_as_ptr")
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         Ok(as_ptr.into())
                     }
@@ -3031,12 +3077,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let member_address = self
             .builder
             .build_int_add(
-                element_lvalue.address,
+                element_lvalue.address.value,
                 member_offset,
                 "dynamic_member_address",
             )
             .map_err(|err| CodeGenError::Builder(err.to_string()))?;
-        let value = self.read_dynamic_address_value(member_address, &member_type)?;
+        let value = self.read_dynamic_address_value(
+            element_lvalue.address.with_value(member_address),
+            &member_type,
+        )?;
         Ok(Some((value, member_type)))
     }
 
@@ -3052,7 +3101,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             let Some(element_info) = self.indexable_element_type_and_stride(expr)? else {
                 return Ok(None);
             };
-            let element_address = self.resolve_ptr_i64_from_expr(expr)?;
+            let element_address = self.resolve_runtime_address_from_expr(expr)?;
             return Ok(Some(DynamicLvalue {
                 address: element_address,
                 type_info: DynamicTypeInfo {
@@ -3076,13 +3125,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             let member_address = self
                 .builder
                 .build_int_add(
-                    base_lvalue.address,
+                    base_lvalue.address.value,
                     member_offset,
                     "dynamic_member_lvalue_address",
                 )
                 .map_err(|err| CodeGenError::Builder(err.to_string()))?;
             return Ok(Some(DynamicLvalue {
-                address: member_address,
+                address: base_lvalue.address.with_value(member_address),
                 type_info: DynamicTypeInfo {
                     dwarf_type: member_type,
                     module_path: base_lvalue.type_info.module_path,
@@ -3136,7 +3185,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     module_path.as_deref(),
                 );
                 Ok(Some(DynamicLvalue {
-                    address: pointer_value,
+                    address: RuntimeAddress::available(pointer_value, self.context),
                     type_info: DynamicTypeInfo {
                         dwarf_type: target_type,
                         module_path,
@@ -3206,7 +3255,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 })?;
                 match ghostscope_dwarf::strip_type_aliases(&array_type) {
                     DwarfType::ArrayType { element_type, .. } => {
-                        let base_address = self.variable_read_plan_to_lvalue_address(
+                        let base_address = self.variable_read_plan_to_runtime_address(
                             &array_plan,
                             compile_context.pc_address,
                             status_ptr,
@@ -3228,9 +3277,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             status_ptr,
                         )?;
                         let base_address = match pointer_value {
-                            BasicValueEnum::IntValue(value) => {
-                                self.normalize_int_to_i64(value, "dynamic_array_base_i64")?
-                            }
+                            BasicValueEnum::IntValue(value) => RuntimeAddress::available(
+                                self.normalize_int_to_i64(value, "dynamic_array_base_i64")?,
+                                self.context,
+                            ),
                             BasicValueEnum::PointerValue(value) => self
                                 .builder
                                 .build_ptr_to_int(
@@ -3238,6 +3288,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     self.context.i64_type(),
                                     "dynamic_array_base_ptr",
                                 )
+                                .map(|value| RuntimeAddress::available(value, self.context))
                                 .map_err(|err| CodeGenError::Builder(err.to_string()))?,
                             _ => {
                                 return Err(CodeGenError::TypeError(
@@ -3282,7 +3333,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     })?;
                     match ghostscope_dwarf::strip_type_aliases(&array_type) {
                         DwarfType::ArrayType { element_type, .. } => {
-                            let base_address = self.variable_read_plan_to_lvalue_address(
+                            let base_address = self.variable_read_plan_to_runtime_address(
                                 &array_plan,
                                 compile_context.pc_address,
                                 status_ptr,
@@ -3304,9 +3355,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 status_ptr,
                             )?;
                             let base_address = match pointer_value {
-                                BasicValueEnum::IntValue(value) => {
-                                    self.normalize_int_to_i64(value, "dynamic_array_base_i64")?
-                                }
+                                BasicValueEnum::IntValue(value) => RuntimeAddress::available(
+                                    self.normalize_int_to_i64(value, "dynamic_array_base_i64")?,
+                                    self.context,
+                                ),
                                 BasicValueEnum::PointerValue(value) => self
                                     .builder
                                     .build_ptr_to_int(
@@ -3314,6 +3366,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                         self.context.i64_type(),
                                         "dynamic_array_base_ptr",
                                     )
+                                    .map(|value| RuntimeAddress::available(value, self.context))
                                     .map_err(|err| CodeGenError::Builder(err.to_string()))?,
                                 _ => {
                                     return Err(CodeGenError::TypeError(
@@ -3345,7 +3398,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         .ok_or_else(|| {
                             CodeGenError::VariableNotFound(Self::expr_to_debug_string(array_expr))
                         })?;
-                    let base_address = self.resolve_ptr_i64_from_expr(&expanded_array_expr)?;
+                    let base_address =
+                        self.resolve_runtime_address_from_expr(&expanded_array_expr)?;
                     (element_info, base_address, 0)
                 } else if let Some(array_lvalue) =
                     self.dynamic_lvalue_address_and_type(&expanded_array_expr)?
@@ -3367,8 +3421,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 &array_lvalue.type_info.dwarf_type,
                             )?;
                             let base_address = match pointer_value {
-                                BasicValueEnum::IntValue(value) => self
-                                    .normalize_int_to_i64(value, "dynamic_array_member_ptr_i64")?,
+                                BasicValueEnum::IntValue(value) => RuntimeAddress::available(
+                                    self.normalize_int_to_i64(
+                                        value,
+                                        "dynamic_array_member_ptr_i64",
+                                    )?,
+                                    self.context,
+                                ),
                                 BasicValueEnum::PointerValue(value) => self
                                     .builder
                                     .build_ptr_to_int(
@@ -3376,6 +3435,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                         self.context.i64_type(),
                                         "dynamic_array_member_ptr",
                                     )
+                                    .map(|value| RuntimeAddress::available(value, self.context))
                                     .map_err(|err| CodeGenError::Builder(err.to_string()))?,
                                 _ => {
                                     return Err(CodeGenError::TypeError(
@@ -3445,11 +3505,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|err| CodeGenError::Builder(err.to_string()))?;
         let element_address = self
             .builder
-            .build_int_add(base_address, byte_offset, "dynamic_array_element_address")
+            .build_int_add(
+                base_address.value,
+                byte_offset,
+                "dynamic_array_element_address",
+            )
             .map_err(|err| CodeGenError::Builder(err.to_string()))?;
 
         Ok(Some(DynamicLvalue {
-            address: element_address,
+            address: base_address.with_value(element_address),
             type_info: DynamicTypeInfo {
                 dwarf_type: element_info.element_type,
                 module_path: element_info.module_path,
@@ -3623,14 +3687,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     fn read_dynamic_address_value(
         &mut self,
-        address: IntValue<'ctx>,
+        address: RuntimeAddress<'ctx>,
         dwarf_type: &DwarfType,
     ) -> Result<BasicValueEnum<'ctx>> {
         if ghostscope_dwarf::is_c_aggregate_type(dwarf_type) {
             let ptr_ty = self.context.ptr_type(AddressSpace::default());
             let as_ptr = self
                 .builder
-                .build_int_to_ptr(address, ptr_ty, "dynamic_aggregate_ptr")
+                .build_int_to_ptr(address.value, ptr_ty, "dynamic_aggregate_ptr")
                 .map_err(|err| CodeGenError::Builder(err.to_string()))?;
             return Ok(as_ptr.into());
         }
@@ -3879,8 +3943,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 };
                 let need = lit_len + 1;
-                let (buf_global, ret_len, arr_ty) =
-                    self.read_user_cstr_into_buffer(ptr_i64, need, "_gs_strbuf")?;
+                let (buf_global, ret_len, arr_ty) = self.read_user_cstr_into_buffer(
+                    RuntimeAddress::available(ptr_i64, self.context),
+                    need,
+                    "_gs_strbuf",
+                )?;
 
                 // ret_len must equal L+1
                 let i64_ty = self.context.i64_type();
@@ -3994,7 +4061,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 };
                 let pc_address = self.get_compile_time_context()?.pc_address;
                 let addr =
-                    self.variable_read_plan_to_lvalue_address(&var, pc_address, status_ptr)?;
+                    self.variable_read_plan_to_runtime_address(&var, pc_address, status_ptr)?;
                 // Read exactly L+1 bytes
                 let (buf_global, status, arr_ty) =
                     self.read_user_bytes_into_buffer(addr, lit_len + 1, "_gs_arrbuf")?;
@@ -4086,7 +4153,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 };
                 let pc_address = self.get_compile_time_context()?.pc_address;
                 let addr =
-                    self.variable_read_plan_to_lvalue_address(&var, pc_address, status_ptr)?;
+                    self.variable_read_plan_to_runtime_address(&var, pc_address, status_ptr)?;
                 // Fallback using type_name string
                 match parse_type_name(&var.type_name) {
                     ParsedKind::PtrChar => {
@@ -4105,8 +4172,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             }
                         };
                         let need = lit_len + 1;
-                        let (buf_global, ret_len, arr_ty) =
-                            self.read_user_cstr_into_buffer(ptr_i64, need, "_gs_strbuf")?;
+                        let (buf_global, ret_len, arr_ty) = self.read_user_cstr_into_buffer(
+                            RuntimeAddress::available(ptr_i64, self.context),
+                            need,
+                            "_gs_strbuf",
+                        )?;
 
                         let i64_ty = self.context.i64_type();
                         let expect_len = i64_ty.const_int(need as u64, false);

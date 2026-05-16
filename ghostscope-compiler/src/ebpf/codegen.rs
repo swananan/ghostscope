@@ -3,7 +3,7 @@
 //! This module handles the conversion from statements to compiled instructions
 //! and generates LLVM IR for individual instructions.
 
-use super::context::{CodeGenError, EbpfContext, Result};
+use super::context::{CodeGenError, EbpfContext, Result, RuntimeAddress};
 use crate::script::{PrintStatement, Program, Statement};
 use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use ghostscope_protocol::trace_event::{
@@ -35,12 +35,12 @@ enum ComplexArgSource<'ctx> {
     },
     /// Memory dump from a pointer/byte address with a static length
     MemDump {
-        src_addr: inkwell::values::IntValue<'ctx>,
+        address: RuntimeAddress<'ctx>,
         len: usize,
     },
     /// Memory dump with dynamic runtime length; bytes read up to min(len_value, max_len)
     MemDumpDynamic {
-        src_addr: inkwell::values::IntValue<'ctx>,
+        address: RuntimeAddress<'ctx>,
         len_value: inkwell::values::IntValue<'ctx>,
         max_len: usize,
     },
@@ -1741,34 +1741,37 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     fn resolve_memory_format_address(
         &mut self,
         expr: &crate::script::ast::Expr,
-    ) -> Result<IntValue<'ctx>> {
-        let val = self.compile_expr(expr).ok();
-        if let Some(BasicValueEnum::PointerValue(pv)) = val {
-            return self
-                .builder
-                .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
-                .map_err(|e| CodeGenError::Builder(e.to_string()));
-        }
-
-        if let Some(BasicValueEnum::IntValue(iv)) = val {
-            if let Some(var) = self.query_dwarf_for_complex_expr(expr)? {
-                if let Some(ref ty) = var.dwarf_type {
-                    if matches!(ty, ghostscope_dwarf::TypeInfo::PointerType { .. }) {
-                        return Ok(iv);
-                    }
-                }
-            }
-        }
-
-        if let Ok(addr) = self.resolve_ptr_i64_from_expr(expr) {
+    ) -> Result<RuntimeAddress<'ctx>> {
+        if let Ok(addr) = self.resolve_runtime_address_from_expr(expr) {
             return Ok(addr);
         }
 
-        let var = self
-            .query_dwarf_for_complex_expr(expr)?
-            .ok_or_else(|| CodeGenError::VariableNotFound(format!("{expr:?}")))?;
-        let pc_address = self.get_compile_time_context()?.pc_address;
-        self.variable_read_plan_to_lvalue_address(&var, pc_address, None)
+        let dwarf_error = match self.query_dwarf_for_complex_expr(expr) {
+            Ok(Some(var)) => {
+                let pc_address = self.get_compile_time_context()?.pc_address;
+                return self.variable_read_plan_to_runtime_address(&var, pc_address, None);
+            }
+            Ok(None) => None,
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "DWARF address resolution unavailable for memory format expression; trying script value fallback"
+                );
+                Some(err)
+            }
+        };
+
+        match self.compile_expr(expr)? {
+            BasicValueEnum::PointerValue(pv) => self
+                .builder
+                .build_ptr_to_int(pv, self.context.i64_type(), "ptr_to_i64")
+                .map(|value| RuntimeAddress::available(value, self.context))
+                .map_err(|e| CodeGenError::Builder(e.to_string())),
+            _ => {
+                Err(dwarf_error
+                    .unwrap_or_else(|| CodeGenError::VariableNotFound(format!("{expr:?}"))))
+            }
+        }
     }
 
     fn compile_formatted_print(
@@ -1958,7 +1961,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 access_path: Vec::new(),
                                 data_len: n,
                                 source: ComplexArgSource::MemDump {
-                                    src_addr: addr_iv,
+                                    address: addr_iv,
                                     len: n,
                                 },
                             });
@@ -2018,7 +2021,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 access_path: Vec::new(),
                                 data_len: cap,
                                 source: ComplexArgSource::MemDumpDynamic {
-                                    src_addr: addr_iv,
+                                    address: addr_iv,
                                     len_value: len_iv,
                                     max_len: cap,
                                 },
@@ -2090,7 +2093,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 access_path: Vec::new(),
                                 data_len: cap,
                                 source: ComplexArgSource::MemDumpDynamic {
-                                    src_addr: addr_iv,
+                                    address: addr_iv,
                                     len_value: len_iv,
                                     max_len: cap,
                                 },
@@ -2655,7 +2658,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                     // data_len already set to reserved_len
                 }
-                ComplexArgSource::MemDump { src_addr, len } => {
+                ComplexArgSource::MemDump { address, len } => {
                     // Directly probe-read into payload to avoid byte-wise copies
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());
                     let i64_ty = self.context.i64_type();
@@ -2668,9 +2671,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     let base_src_ptr = self
                         .builder
-                        .build_int_to_ptr(*src_addr, ptr_ty, "md_src_ptr")
+                        .build_int_to_ptr(address.value, ptr_ty, "md_src_ptr")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let offsets_found = self.load_offsets_found_flag()?;
+                    let offsets_found = address.offsets_found;
                     let not_found = self
                         .builder
                         .build_not(offsets_found, "md_offsets_miss")
@@ -2796,7 +2799,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         )
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     self.builder
-                        .build_store(addr_ptr, *src_addr)
+                        .build_store(addr_ptr, address.value)
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     self.mark_any_fail()?;
                     self.builder
@@ -2805,7 +2808,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     self.builder.position_at_end(cont_b);
                 }
                 ComplexArgSource::MemDumpDynamic {
-                    src_addr,
+                    address,
                     len_value,
                     max_len: _,
                 } => {
@@ -2899,9 +2902,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());
                     let base_src_ptr = self
                         .builder
-                        .build_int_to_ptr(*src_addr, ptr_ty, "mdd_src_ptr")
+                        .build_int_to_ptr(address.value, ptr_ty, "mdd_src_ptr")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let offsets_found = self.load_offsets_found_flag()?;
+                    let offsets_found = address.offsets_found;
                     let not_found = self
                         .builder
                         .build_not(offsets_found, "mdd_dyn_offsets_miss")
@@ -3022,7 +3025,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             )
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                         self.builder
-                            .build_store(addr_ptr, *src_addr)
+                            .build_store(addr_ptr, address.value)
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     }
                     self.mark_any_fail()?;
@@ -3216,12 +3219,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         .build_bit_cast(var_data_ptr, ptr_type, "dst_ptr")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     let size_val = i32_type.const_int(a.data_len as u64, false);
-                    let src_addr = self.planned_address_to_llvm_address(
+                    let src_addr = self.resolve_planned_address(
                         address,
                         Some(apl_ptr),
                         module_for_offsets.as_deref(),
                     )?;
-                    let offsets_found = self.load_offsets_found_flag()?;
+                    let offsets_found = src_addr.offsets_found;
                     let current_block = self.builder.get_insert_block().unwrap();
                     let current_fn = current_block.get_parent().unwrap();
                     let cont2_block = self.context.append_basic_block(current_fn, "after_read");
@@ -3242,7 +3245,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     self.builder.position_at_end(found_block);
                     let src_ptr = self
                         .builder
-                        .build_int_to_ptr(src_addr, ptr_type, "src_ptr")
+                        .build_int_to_ptr(src_addr.value, ptr_type, "src_ptr")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
                     // status_ptr was stored in apl_ptr earlier (we named it status_ptr)
@@ -3250,7 +3253,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     let zero64 = i64_type.const_zero();
                     let is_null = self
                         .builder
-                        .build_int_compare(inkwell::IntPredicate::EQ, src_addr, zero64, "is_null")
+                        .build_int_compare(
+                            inkwell::IntPredicate::EQ,
+                            src_addr.value,
+                            zero64,
+                            "is_null",
+                        )
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     let null_block = self.context.append_basic_block(current_fn, "null_deref");
                     let read_block = self.context.append_basic_block(current_fn, "read_user");
@@ -3345,7 +3353,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         .map_err(|e| {
                             CodeGenError::LLVMError(format!("Failed to cast addr ptr: {e}"))
                         })?;
-                    let src_as_i64 = src_addr;
+                    let src_as_i64 = src_addr.value;
                     self.builder
                         .build_store(addr_ptr, src_as_i64)
                         .map_err(|e| {
@@ -3382,7 +3390,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     address,
                     module_for_offsets,
                 } => {
-                    let addr = self.planned_address_to_llvm_address(
+                    let addr = self.resolve_planned_address(
                         address,
                         Some(apl_ptr),
                         module_for_offsets.as_deref(),
@@ -3396,7 +3404,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         )
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     self.builder
-                        .build_store(cast_ptr, addr)
+                        .build_store(cast_ptr, addr.value)
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     // header already set to reserved_len (8)
                 }
@@ -4612,9 +4620,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // Compute source address with ASLR-aware helper, honoring module hint
         // Prefer a previously recorded module path for offsets; fall back handled in helper
-        let src_addr =
-            self.planned_address_to_llvm_address(address, Some(status_ptr), module_hint)?;
-        tracing::trace!(src_addr = %{src_addr}, "generate_print_complex_variable_runtime: computed src_addr");
+        let src_addr = self.resolve_planned_address(address, Some(status_ptr), module_hint)?;
+        tracing::trace!(src_addr = %src_addr.value, "generate_print_complex_variable_runtime: computed src_addr");
 
         // Setup common types and casts
         let ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -4627,9 +4634,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let size_val = i32_type.const_int(data_len as u64, false);
         let src_ptr = self
             .builder
-            .build_int_to_ptr(src_addr, ptr_type, "src_ptr")
+            .build_int_to_ptr(src_addr.value, ptr_type, "src_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let offsets_found = self.load_offsets_found_flag()?;
+        let offsets_found = src_addr.offsets_found;
         let current_block = self.builder.get_insert_block().unwrap();
         let current_fn = current_block.get_parent().unwrap();
         let cont_block = self.context.append_basic_block(current_fn, "after_read");
@@ -4652,7 +4659,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let zero64 = i64_type.const_zero();
         let is_null = self
             .builder
-            .build_int_compare(inkwell::IntPredicate::EQ, src_addr, zero64, "is_null")
+            .build_int_compare(inkwell::IntPredicate::EQ, src_addr.value, zero64, "is_null")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let null_block = self.context.append_basic_block(current_fn, "null_deref");
         let read_block = self.context.append_basic_block(current_fn, "read_user");
@@ -4773,7 +4780,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast addr ptr: {e}")))?;
         self.builder
-            .build_store(addr_ptr, src_addr)
+            .build_store(addr_ptr, src_addr.value)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store addr: {e}")))?;
         // mark fail
         self.mark_any_fail()?;
