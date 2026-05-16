@@ -8,8 +8,10 @@ use ghostscope_process::is_shared_object;
 use regex::Regex;
 use serial_test::serial;
 use std::env;
-use std::path::Path;
+use std::os::unix::fs as unix_fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tempfile::Builder;
 
 fn visible_pid_for_target(target: &common::targets::TargetHandle) -> anyhow::Result<u32> {
     target.visible_pid_from(&common::sandbox::SandboxHandle::default_ghostscope()?)
@@ -58,6 +60,13 @@ fn ghostscope_log_path() -> anyhow::Result<std::path::PathBuf> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("failed to resolve workspace root for ghostscope.log"))?
         .join("ghostscope.log"))
+}
+
+fn workspace_root() -> anyhow::Result<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve workspace root"))
 }
 
 fn skip_if_nested_t_mode_unsupported() -> bool {
@@ -244,6 +253,19 @@ trace lib_tick {
     Ok(())
 }
 
+fn assert_saw_lib_counter_for_host_pid(stdout: &str, stderr: &str, host_pid: u32) {
+    let re = Regex::new(r"PID:([0-9]+) HP:([0-9]+) LC:([0-9]+)").unwrap();
+    let saw_target_pid = stdout.lines().any(|line| {
+        re.captures(line)
+            .and_then(|caps| caps[2].parse::<u32>().ok())
+            .is_some_and(|event_host_pid| event_host_pid == host_pid)
+    });
+    assert!(
+        saw_target_pid,
+        "No libgvars.so events for target PID. STDOUT: {stdout}\nSTDERR: {stderr}"
+    );
+}
+
 #[tokio::test]
 #[serial(globals_target)]
 async fn test_t_p_mode_bare_address_uses_target_library() -> anyhow::Result<()> {
@@ -256,7 +278,7 @@ async fn test_t_p_mode_bare_address_uses_target_library() -> anyhow::Result<()> 
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let lib_path = bin_dir.join("libgvars.so");
     let target = spawn_globals_program(&binary_path).await?;
-    let pid = visible_pid_for_target(&target)?;
+    let host_pid = target.host_pid();
 
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lib_path)
         .await
@@ -270,7 +292,7 @@ async fn test_t_p_mode_bare_address_uses_target_library() -> anyhow::Result<()> 
     let script = format!(
         r#"
 trace 0x{lib_tick_addr:x} {{
-    print "PID:{{}} LC:{{}}", $pid, LIB_STATE.counter;
+    print "PID:{{}} HP:{{}} LC:{{}}", $pid, $host_pid, LIB_STATE.counter;
 }}
 "#
     );
@@ -286,16 +308,59 @@ trace 0x{lib_tick_addr:x} {{
     target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
-    let re = Regex::new(r"PID:([0-9]+) LC:([0-9]+)").unwrap();
-    let saw_target_pid = stdout.lines().any(|line| {
-        re.captures(line)
-            .and_then(|caps| caps[1].parse::<u32>().ok())
-            .is_some_and(|event_pid| event_pid == pid)
-    });
-    assert!(
-        saw_target_pid,
-        "No libgvars.so events for target PID. STDOUT: {stdout}\nSTDERR: {stderr}"
+    assert_saw_lib_counter_for_host_pid(&stdout, &stderr, host_pid);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(globals_target)]
+async fn test_t_p_mode_module_address_accepts_target_symlink_name() -> anyhow::Result<()> {
+    init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let bin_dir = binary_path.parent().unwrap().to_path_buf();
+    let lib_path = bin_dir.join("libgvars.so");
+    let temp_dir = Builder::new()
+        .prefix(".ghostscope-test-target-")
+        .tempdir_in(workspace_root()?)?;
+    let target_symlink = temp_dir.path().join("libgvars_alias.so");
+    unix_fs::symlink(&lib_path, &target_symlink)?;
+
+    let target = spawn_globals_program(&binary_path).await?;
+    let host_pid = target.host_pid();
+
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lib_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load DWARF for libgvars.so: {e}"))?;
+    let lib_tick_addr = analyzer
+        .lookup_function_addresses("lib_tick")
+        .first()
+        .map(|addr| addr.address)
+        .ok_or_else(|| anyhow::anyhow!("lib_tick not found in libgvars.so"))?;
+
+    let script = format!(
+        r#"
+trace libgvars_alias.so:0x{lib_tick_addr:x} {{
+    print "PID:{{}} HP:{{}} LC:{{}}", $pid, $host_pid, LIB_STATE.counter;
+}}
+"#
     );
+
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(&script)
+        .with_target(&target_symlink)
+        .attach_to(&target)
+        .timeout_secs(2)
+        .enable_sysmon_shared_lib(false)
+        .run()
+        .await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    assert_saw_lib_counter_for_host_pid(&stdout, &stderr, host_pid);
     Ok(())
 }
 

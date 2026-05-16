@@ -401,6 +401,14 @@ impl<'a> AstCompiler<'a> {
         Self::paths_equivalent(module_path, spec) || module_path.ends_with(spec)
     }
 
+    fn module_spec_matches_target(&self, target_module_path: &str, module_spec: &str) -> bool {
+        Self::module_spec_matches_path(target_module_path, module_spec)
+            || self
+                .configured_target_path()
+                .map(|target_path| Self::module_spec_matches_path(target_path, module_spec))
+                .unwrap_or(false)
+    }
+
     fn resolve_loaded_module_by_spec(
         analyzer: &ghostscope_dwarf::DwarfAnalyzer,
         module_spec: &str,
@@ -697,7 +705,7 @@ impl<'a> AstCompiler<'a> {
                 // If -t is configured, keep resolution scoped to that target.
                 let module_path = if let Some(analyzer) = &self.process_analyzer {
                     if let Some(target_module) = self.resolve_target_module_path()? {
-                        if Self::module_spec_matches_path(&target_module, module) {
+                        if self.module_spec_matches_target(&target_module, module) {
                             target_module
                         } else {
                             return Err(CompileError::Other(format!(
