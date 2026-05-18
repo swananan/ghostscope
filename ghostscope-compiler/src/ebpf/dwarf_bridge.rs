@@ -1104,6 +1104,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 }
 
+                PlanExprOp::FormTlsAddress => {
+                    if let Some(tls_offset) = stack.pop() {
+                        let tls_address =
+                            self.generate_static_tls_address(tls_offset, module_hint)?;
+                        stack.push(tls_address);
+                    } else {
+                        return Err(CodeGenError::LLVMError(
+                            "Stack underflow in FormTlsAddress".to_string(),
+                        ));
+                    }
+                }
+
                 PlanExprOp::EntryValueLookup {
                     caller_pc_steps,
                     cases,

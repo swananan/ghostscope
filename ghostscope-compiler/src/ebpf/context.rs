@@ -121,6 +121,9 @@ pub struct EbpfContext<'ctx, 'dw> {
     // Per-invocation stack key for proc_module_offsets lookups (allocated in entry block)
     // Backed by `[4 x i32]`, so consumers may only assume i32 alignment.
     pub pm_key_alloca: Option<inkwell::values::PointerValue<'ctx>>,
+    // Per-invocation 8-byte scratch for thread-pointer/TLS helper reads,
+    // allocated lazily only for programs that actually lower TLS variables.
+    pub(super) tls_scratch_alloca: Option<inkwell::values::PointerValue<'ctx>>,
     // Per-invocation event accumulation offset (u32) stored on stack (entry block)
     pub event_offset_alloca: Option<inkwell::values::PointerValue<'ctx>>,
     // Compile-time upper bound for bytes that may already be reserved in the current trace event.
@@ -233,6 +236,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             // Initialize new instruction-based compilation system
             trace_context: ghostscope_protocol::TraceContext::new(),
             pm_key_alloca: None,
+            tls_scratch_alloca: None,
             event_offset_alloca: None,
             compile_time_event_bytes_upper_bound: 0,
             compile_options: compile_options.clone(),

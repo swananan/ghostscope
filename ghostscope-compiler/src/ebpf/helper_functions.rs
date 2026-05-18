@@ -5,9 +5,9 @@
 
 use super::context::{CodeGenError, EbpfContext, Result, RuntimeAddress};
 use aya_ebpf_bindings::bindings::bpf_func_id::{
-    BPF_FUNC_get_current_pid_tgid, BPF_FUNC_ktime_get_ns, BPF_FUNC_map_lookup_elem,
-    BPF_FUNC_perf_event_output, BPF_FUNC_probe_read_user, BPF_FUNC_probe_read_user_str,
-    BPF_FUNC_ringbuf_output,
+    BPF_FUNC_get_current_pid_tgid, BPF_FUNC_get_current_task, BPF_FUNC_ktime_get_ns,
+    BPF_FUNC_map_lookup_elem, BPF_FUNC_perf_event_output, BPF_FUNC_probe_read_kernel,
+    BPF_FUNC_probe_read_user, BPF_FUNC_probe_read_user_str, BPF_FUNC_ringbuf_output,
 };
 use ghostscope_dwarf::MemoryAccessSize;
 use ghostscope_platform::register_mapping;
@@ -23,6 +23,36 @@ struct ProbeReadResult<'ctx> {
 }
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
+    fn get_or_create_tls_scratch_buffer(&mut self) -> Result<PointerValue<'ctx>> {
+        if let Some(alloca) = self.tls_scratch_alloca {
+            return Ok(alloca);
+        }
+
+        let current_block = self.builder.get_insert_block().ok_or_else(|| {
+            CodeGenError::LLVMError("no current block for TLS scratch allocation".to_string())
+        })?;
+        let current_fn = current_block.get_parent().ok_or_else(|| {
+            CodeGenError::LLVMError("no current function for TLS scratch allocation".to_string())
+        })?;
+        let entry_block = current_fn.get_first_basic_block().ok_or_else(|| {
+            CodeGenError::LLVMError("no entry block for TLS scratch allocation".to_string())
+        })?;
+
+        if let Some(first_instruction) = entry_block.get_first_instruction() {
+            self.builder.position_before(&first_instruction);
+        } else {
+            self.builder.position_at_end(entry_block);
+        }
+        let scratch = self
+            .builder
+            .build_alloca(self.context.i64_type(), "tls_scratch")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder.position_at_end(current_block);
+
+        self.tls_scratch_alloca = Some(scratch);
+        Ok(scratch)
+    }
+
     fn get_probe_read_scratch_buffer(
         &mut self,
         result_size: usize,
@@ -1213,6 +1243,153 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "bpf_get_current_pid_tgid did not return integer".to_string(),
             ))
         }
+    }
+
+    pub(crate) fn generate_static_tls_address(
+        &mut self,
+        tls_offset: RuntimeAddress<'ctx>,
+        module_hint: Option<&str>,
+    ) -> Result<RuntimeAddress<'ctx>> {
+        let module_path = match module_hint {
+            Some(module_path) => module_path.to_string(),
+            None => self.get_compile_time_context()?.module_path.clone(),
+        };
+        if ghostscope_process::is_shared_object(std::path::Path::new(&module_path)) {
+            return Err(CodeGenError::NotImplemented(format!(
+                "dynamic/shared-library TLS is not supported yet for DW_OP_form_tls_address in {module_path}; only x86_64 executable static TLS is currently supported"
+            )));
+        }
+        let tls_bias =
+            ghostscope_platform::static_tls_bias_for_elf(std::path::Path::new(&module_path))
+                .map_err(|err| {
+                    CodeGenError::LLVMError(format!(
+                        "failed to read static TLS layout for {module_path}: {err}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    CodeGenError::LLVMError(format!(
+                        "module {module_path} does not contain a PT_TLS segment"
+                    ))
+                })?;
+        let fsbase_offset = ghostscope_platform::current_task_fsbase_offset().map_err(|err| {
+            CodeGenError::LLVMError(format!(
+                "failed to resolve task_struct.thread.fsbase offset from kernel BTF: {err}"
+            ))
+        })?;
+
+        let i64_type = self.context.i64_type();
+        let i32_type = self.context.i32_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let task_ptr_value = self.create_bpf_helper_call(
+            BPF_FUNC_get_current_task as u64,
+            &[],
+            i64_type.into(),
+            "current_task",
+        )?;
+        let BasicValueEnum::IntValue(task_ptr_int) = task_ptr_value else {
+            return Err(CodeGenError::LLVMError(
+                "bpf_get_current_task did not return integer".to_string(),
+            ));
+        };
+        let fsbase_field_addr = self
+            .builder
+            .build_int_add(
+                task_ptr_int,
+                i64_type.const_int(fsbase_offset, false),
+                "task_fsbase_addr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let src_ptr = self
+            .builder
+            .build_int_to_ptr(fsbase_field_addr, ptr_type, "task_fsbase_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let scratch_buffer = self.get_or_create_tls_scratch_buffer()?;
+        let dst_ptr = self
+            .builder
+            .build_bit_cast(scratch_buffer, ptr_type, "tls_fsbase_dst")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let helper_id = i64_type.const_int(BPF_FUNC_probe_read_kernel as u64, false);
+        let helper_fn_type =
+            i32_type.fn_type(&[ptr_type.into(), i32_type.into(), ptr_type.into()], false);
+        let helper_fn_ptr = self
+            .builder
+            .build_int_to_ptr(helper_id, ptr_type, "probe_read_kernel_fn")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let call_args: Vec<BasicMetadataValueEnum> = vec![
+            dst_ptr.into(),
+            i32_type.const_int(8, false).into(),
+            src_ptr.into(),
+        ];
+        let call_site = self
+            .builder
+            .build_indirect_call(
+                helper_fn_type,
+                helper_fn_ptr,
+                &call_args,
+                "probe_read_kernel_result",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let ret_i32 = call_site
+            .try_as_basic_value()
+            .left()
+            .ok_or_else(|| {
+                CodeGenError::LLVMError("Expected integer return from helper".to_string())
+            })?
+            .into_int_value();
+        let read_ok = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                ret_i32,
+                i32_type.const_zero(),
+                "tls_fsbase_read_ok",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let read_fail = self
+            .builder
+            .build_not(read_ok, "tls_fsbase_read_fail")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.update_any_fail_flag(read_fail, "tls_fsbase")?;
+
+        let typed_ptr = self
+            .builder
+            .build_bit_cast(scratch_buffer, ptr_type, "tls_fsbase_typed_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_pointer_value();
+        let fsbase = self
+            .builder
+            .build_load(i64_type, typed_ptr, "tls_fsbase")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let tls_base = self
+            .builder
+            .build_int_add(
+                fsbase,
+                i64_type.const_int(tls_bias as u64, true),
+                "tls_static_base",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let tls_addr = self
+            .builder
+            .build_int_add(tls_base, tls_offset.value, "tls_addr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let offsets_found = self
+            .builder
+            .build_and(tls_offset.offsets_found, read_ok, "tls_addr_available")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let value = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                offsets_found,
+                tls_addr.into(),
+                i64_type.const_zero().into(),
+                "tls_addr_or_zero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+
+        Ok(RuntimeAddress::with_offsets_found(value, offsets_found))
     }
 
     /// Create event output using either RingBuf or PerfEventArray based on compile options

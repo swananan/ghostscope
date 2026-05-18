@@ -811,6 +811,7 @@ fn link_time_base_and_runtime_tail(steps: &[PlanExprOp]) -> Option<(u64, &[PlanE
             PlanExprOp::LoadRegister(_) => {
                 break;
             }
+            PlanExprOp::FormTlsAddress => return None,
             PlanExprOp::Dereference { .. } => {
                 return Some((*base as u64, &steps[1..]));
             }
@@ -825,6 +826,7 @@ fn steps_reference_runtime_state(steps: &[PlanExprOp]) -> bool {
     steps.iter().any(|step| match step {
         PlanExprOp::LoadRegister(_)
         | PlanExprOp::Dereference { .. }
+        | PlanExprOp::FormTlsAddress
         | PlanExprOp::EntryValueLookup { .. } => true,
         PlanExprOp::If {
             then_branch,
