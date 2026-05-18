@@ -166,7 +166,13 @@ print "h={:x.16}", p;
 
 ### DWARF Variables
 
-DWARF variables include locals, parameters, and globals from the traced program.
+DWARF variables are program variables recovered from debug information at the probe point. They include:
+
+- **Locals and parameters** visible at the current PC.
+- **Ordinary globals and static variables** from the target executable or loaded shared libraries.
+- **Static TLS variables**, when the compiler/debug info represents them as a fixed current-thread TLS location that GhostScope can lower for the target architecture.
+
+Dynamic TLS is different from static TLS. Shared-library `__thread` variables and Rust `thread_local!` values that require ELF `general-dynamic` or `local-dynamic` TLS resolution are not supported and must not be treated as ordinary globals. See [Limitations](limitations.md#10-thread-local-storage-tls-variables).
 
 #### DWARF Types
 
@@ -726,6 +732,7 @@ trace foo {
 5. Limited arithmetic (no bitwise operators yet)
 6. No dynamic memory allocation in eBPF
 7. Uneven source-language coverage: C works best; C++ and Rust currently rely mostly on automatic demangling plus DWARF-layout-based access, with most language-specific features unsupported
+8. Dynamic TLS variables are unsupported: shared-library `__thread` variables and Rust `thread_local!` values that require ELF `general-dynamic` or `local-dynamic` TLS resolution cannot be treated as ordinary globals
 
 ## Best Practices
 

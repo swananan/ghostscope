@@ -60,7 +60,17 @@ GhostScope 启动时会扫描进程的 `/proc/PID/maps` 获取已加载的动态
 
 > **说明**：目前 sysmon 假设共享库在 exec 事件处理时已经映射；若动态加载发生得更晚，目前不会自动重试。
 
-### 10. 容器 / WSL 场景下 `-p <pid>` 模式的软限制
+### 10. 线程局部存储（TLS）变量
+
+线程局部变量不是普通全局变量：每个线程都有一份独立实例。Static TLS 变量是当前支持的子集：当编译器/调试信息把它表示成当前线程内可固定寻址的 TLS 位置，并且 GhostScope 能针对目标架构降为 eBPF 读取计划时支持。
+
+共享库中的 dynamic TLS 目前尚不支持，包括 ELF `general-dynamic` 或 `local-dynamic` TLS 模型下的变量，例如很多共享库里的 `__thread` 变量和 Rust `thread_local!` 值。
+
+GhostScope 不能把这类变量解析成 `module_base + symbol_offset`，因为这样可能读到错误地址。正确的 dynamic TLS 解析需要从当前线程的 thread pointer 出发，沿运行时 DTV（dynamic thread vector）找到对应模块的 TLS block，再叠加变量偏移。GhostScope 当前不会在目标进程内调用 `__tls_get_addr()`，也不会复刻 libc / 动态链接器的这条查找路径。
+
+如果检测到 TLS 变量但当前无法建模，应当将其视为不支持或不可用，而不是按普通全局变量处理。
+
+### 11. 容器 / WSL 场景下 `-p <pid>` 模式的软限制
 
 - 容器 / WSL 场景、PID namespace 术语、场景矩阵，以及当前实现限制的完整说明，见 [容器环境](container.md)。
 - 参考 [PID namespaces 手册](https://www.man7.org/linux/man-pages/man7/pid_namespaces.7.html)、[WSL issue #12408](https://github.com/microsoft/WSL/issues/12408) 和 [WSL issue #12115](https://github.com/microsoft/WSL/issues/12115)。

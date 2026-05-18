@@ -58,7 +58,17 @@ GhostScope scans `/proc/PID/maps` at startup to obtain loaded dynamic library in
 
 > **Note**: The current sysmon pipeline still assumes the library is mapped when the exec event is handled; if a loader pulls it in much later, offsets are not retried yet.
 
-### 10. `-p <pid>` Mode inside Containers or WSL
+### 10. Thread-Local Storage (TLS) Variables
+
+Thread-local variables are not ordinary globals: each thread owns a distinct instance. Static TLS variables are the supported subset when the compiler/debug info represents them as a fixed current-thread TLS location that GhostScope can lower for the target architecture.
+
+Dynamic TLS from shared libraries is currently unsupported. This includes variables compiled with ELF `general-dynamic` or `local-dynamic` TLS models, such as many shared-library `__thread` variables and Rust `thread_local!` values.
+
+GhostScope must not resolve these variables as `module_base + symbol_offset`, because that can read the wrong address. Correct dynamic TLS resolution requires following the current thread's thread pointer through the runtime DTV (dynamic thread vector) to the module-specific TLS block, then applying the variable offset. GhostScope does not currently reconstruct that libc / dynamic-linker lookup path or call `__tls_get_addr()` inside the target process.
+
+If a TLS variable is detected but cannot be modeled, treat it as unsupported or unavailable rather than as a normal global variable.
+
+### 11. `-p <pid>` Mode inside Containers or WSL
 
 - See [Container Environments](container.md) for the full explanation of container / WSL scenarios, PID namespace terminology, the scenario matrix, and current implementation limits.
 - See [PID namespaces manual](https://www.man7.org/linux/man-pages/man7/pid_namespaces.7.html), [WSL issue #12408](https://github.com/microsoft/WSL/issues/12408), and [WSL issue #12115](https://github.com/microsoft/WSL/issues/12115) for background.

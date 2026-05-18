@@ -166,7 +166,13 @@ print "h={:x.16}", p;
 
 ### DWARF 变量
 
-DWARF 变量其实就是被跟踪的程序里面定义的**局部变量、参数和全局变量**，这类变量都是根据 DWARF 信息获取，所以在这里被统称为 DWARF 变量。
+DWARF 变量是 GhostScope 根据探针位置上的调试信息还原出来的被追踪程序变量，包括：
+
+- **局部变量和参数**：当前 PC 位置可见的局部变量、函数参数。
+- **普通全局变量和静态变量**：来自目标可执行文件或已加载共享库。
+- **Static TLS 变量**：当编译器/调试信息把它表示成当前线程内可固定寻址的 TLS 位置，并且 GhostScope 能针对目标架构降为 eBPF 读取计划时支持。
+
+Dynamic TLS 与 static TLS 不同。共享库中的 `__thread` 变量，以及需要 ELF `general-dynamic` 或 `local-dynamic` TLS 解析的 Rust `thread_local!` 值，目前不支持，也不能按普通全局变量处理。更多细节见[使用限制](limitations.md#10-线程局部存储tls变量)。
 
 #### DWARF 变量类型
 
@@ -781,6 +787,7 @@ trace foo {
 5. **有限的算术运算**：仅支持基本运算，不支持位运算
 6. **无动态内存**：不能分配内存
 7. **源语言支持不均衡**：C 支持最好；C++ 和 Rust 目前主要依赖自动 demangle 和基于 DWARF 布局的访问，大多数语言特性尚未支持
+8. **不支持 Dynamic TLS 变量**：共享库中的 `__thread` 变量，以及需要 ELF `general-dynamic` 或 `local-dynamic` TLS 解析的 Rust `thread_local!` 值，不能按普通全局变量处理
 
 ## 最佳实践
 
