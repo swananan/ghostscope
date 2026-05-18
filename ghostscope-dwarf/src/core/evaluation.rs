@@ -140,6 +140,12 @@ pub enum PlanExprOp {
         size: MemoryAccessSize,
     },
 
+    /// Convert a target-module TLS offset into the current thread's address.
+    ///
+    /// This models DW_OP_form_tls_address. Runtime lowering is responsible for
+    /// combining the offset with the thread pointer for the traced thread.
+    FormTlsAddress,
+
     /// Binary arithmetic operations (pop 2, push 1)
     Add,
     Sub,
@@ -355,6 +361,13 @@ impl DirectValueResult {
                         stack.push(format!("*({a} as {size})"));
                     } else {
                         stack.push(format!("*(? as {size})"));
+                    }
+                }
+                PlanExprOp::FormTlsAddress => {
+                    if let Some(a) = stack.pop() {
+                        stack.push(format!("tls({a})"));
+                    } else {
+                        stack.push("tls(?)".to_string());
                     }
                 }
                 PlanExprOp::Dup => {
@@ -597,6 +610,7 @@ impl fmt::Display for PlanExprOp {
             }
             PlanExprOp::PushConstant(v) => write!(f, "push {v}"),
             PlanExprOp::Dereference { size } => write!(f, "deref {size}"),
+            PlanExprOp::FormTlsAddress => write!(f, "form_tls_address"),
             PlanExprOp::Add => write!(f, "add"),
             PlanExprOp::Sub => write!(f, "sub"),
             PlanExprOp::Mul => write!(f, "mul"),

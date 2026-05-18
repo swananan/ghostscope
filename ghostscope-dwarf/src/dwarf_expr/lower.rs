@@ -676,6 +676,9 @@ impl ExpressionEvaluator {
                     };
                     steps.push(PlanExprOp::Dereference { size: mem_size });
                 }
+                ParsedOperation::Operation(Operation::TLS) => {
+                    steps.push(PlanExprOp::FormTlsAddress);
+                }
                 ParsedOperation::Operation(Operation::Nop) => {}
                 ParsedOperation::Operation(op) => {
                     return Err(crate::dwarf_expr::ops::unsupported_operation_error(

@@ -32,6 +32,7 @@ lazy_static! {
     static ref COMPILE_LATE_GLOBALS_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_SHORT_LIVED_LONG_COMM_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
+    static ref COMPILE_C_MULTITHREAD_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_SCALAR_TYPES_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_SCALAR_TYPES_OPTIMIZED_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
@@ -73,6 +74,7 @@ enum RegisteredFixtureKind {
     Globals,
     LateGlobals,
     ShortLivedLongComm,
+    CMultithread,
     ScalarTypes,
     RustGlobal,
     InlineCallsite,
@@ -135,6 +137,12 @@ const REGISTERED_FIXTURES: &[RegisteredFixture] = &[
         directory: "short_lived_long_comm_program",
         cleanup: CleanupCommand::Make,
         kind: RegisteredFixtureKind::ShortLivedLongComm,
+    },
+    RegisteredFixture {
+        name: "c_multithread_program",
+        directory: "c_multithread_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::CMultithread,
     },
     RegisteredFixture {
         name: "scalar_types_program",
@@ -436,6 +444,10 @@ impl RegisteredFixture {
             RegisteredFixtureKind::ShortLivedLongComm => {
                 ensure_short_lived_long_comm_program_compiled()?;
                 Ok(dir.join("short_lived_long_comm_program"))
+            }
+            RegisteredFixtureKind::CMultithread => {
+                ensure_c_multithread_program_compiled()?;
+                Ok(dir.join("c_multithread_program"))
             }
             RegisteredFixtureKind::ScalarTypes => {
                 let bin_name = match opt_level {
@@ -1219,6 +1231,7 @@ static COMPILE_GLOBALS: Once = Once::new();
 static COMPILE_GLOBALS_OPTIMIZED: Once = Once::new();
 static COMPILE_LATE_GLOBALS: Once = Once::new();
 static COMPILE_SHORT_LIVED_LONG_COMM: Once = Once::new();
+static COMPILE_C_MULTITHREAD: Once = Once::new();
 static COMPILE_SCALAR_TYPES: Once = Once::new();
 static COMPILE_SCALAR_TYPES_OPTIMIZED: Once = Once::new();
 static COMPILE_RUST_GLOBAL: Once = Once::new();
@@ -1394,6 +1407,23 @@ fn ensure_short_lived_long_comm_program_compiled() -> anyhow::Result<()> {
         .unwrap()
         .as_ref()
     {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
+fn ensure_c_multithread_program_compiled() -> anyhow::Result<()> {
+    COMPILE_C_MULTITHREAD.call_once(|| {
+        let compile_result = compile_c_make_fixture(
+            "c_multithread_program",
+            FixtureCompiler::Default,
+            "-Wall -Wextra -g -O0 -pthread",
+        );
+        *COMPILE_C_MULTITHREAD_RESULT.lock().unwrap() = Some(compile_result);
+    });
+
+    match COMPILE_C_MULTITHREAD_RESULT.lock().unwrap().as_ref() {
         Some(Ok(())) => Ok(()),
         Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
         None => panic!("Compilation result should be set after call_once"),

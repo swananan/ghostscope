@@ -102,12 +102,13 @@ GhostScope's script syntax is source-language agnostic, but real-world support d
 
 | Source language | Support level | What to expect |
 | --- | --- | --- |
-| C | Best | This is the primary target. Plain locals, globals, pointers, arrays, structs, enums, and C strings map most directly to the current DWARF readers and script operators. |
+| C | Best | This is the primary target. Plain locals, globals, x86_64 executable static thread-local variables, pointers, arrays, structs, enums, and C strings map most directly to the current DWARF readers and script operators. |
 | C++ | Limited | Automatic demangling is supported for function names in `trace ...` patterns and for global/static variable lookup. Beyond name resolution, most C++-specific language features are not modeled yet, so the best results come from simple, C-like layouts and scalar fields. |
 | Rust | Limited | Automatic demangling is supported for function names in `trace ...` patterns and for global/static variable lookup. Beyond name resolution, most Rust-specific language features are not modeled yet, so the best results come from plain globals, scalar fields, and straightforward struct layouts. |
 
 Practical guidance:
 - Prefer C targets when you need the highest success rate for complex DWARF expressions.
+- GhostScope recognizes `DW_OP_form_tls_address`, which is used for both static and dynamic TLS. Runtime address resolution currently supports only x86_64 executable static TLS; dynamic/shared-library TLS is not modeled yet.
 - For C++ and Rust, think of GhostScope as "DWARF layout aware" rather than "language semantics aware".
 - In C++ and Rust, start from demangled function/global names, then probe simple fields first. If name lookup is ambiguous, fall back to line- or address-based trace patterns.
 

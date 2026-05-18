@@ -43,6 +43,8 @@ Uses ring buffer to pass events between eBPF programs and userspace. If event ge
 ### 6. DWARF Support Coverage
 Primarily tested and validated with DWARF 5 format. Theoretically supports DWARF 2-5, but other versions may have compatibility issues. Some DWARF expression instructions are not yet supported for conversion to eBPF (purely due to implementation not being completed yet) and will provide clear error messages when encountered.
 
+GhostScope recognizes `DW_OP_form_tls_address`, but the runtime TLS address resolver currently handles only x86_64 executable static TLS. GhostScope resolves the current thread's TLS base at probe time, so a trace running on different pthreads reads each thread's own TLS instance for that supported executable case. The same DWARF operation is also used for dynamic/shared-library TLS; those cases require DTV/module TLS lookup and are not modeled yet, so GhostScope rejects shared-object TLS instead of guessing an address.
+
 ### 7. Highly Optimized Code Support
 Compiler optimizations (-O2, -O3) can cause variables to be optimized away or generate complex DWARF expressions. GhostScope will attempt to parse them, including inline function support, but some variables may be inaccessible (shown as OptimizedOut) because the compiler optimized them away.
 

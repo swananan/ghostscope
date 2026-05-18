@@ -64,6 +64,9 @@ run_make_fixture late_globals_program all
 run_make_fixture short_lived_long_comm_program clean
 run_make_fixture short_lived_long_comm_program all
 
+run_make_fixture c_multithread_program clean
+run_make_fixture c_multithread_program all
+
 run_make_fixture scalar_types_program clean
 run_make_fixture scalar_types_program all
 

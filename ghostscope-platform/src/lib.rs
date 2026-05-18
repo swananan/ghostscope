@@ -7,6 +7,7 @@
 /// - Type definitions for cross-crate compatibility
 pub mod calling_convention;
 pub mod register_mapping;
+pub mod tls;
 pub mod types;
 
 // Re-export key types and traits for convenience
@@ -15,4 +16,5 @@ pub use register_mapping::{
     dwarf_reg_to_name, dwarf_reg_to_name_x86_64, dwarf_reg_to_pt_regs_byte_offset,
     dwarf_reg_to_pt_regs_byte_offset_x86_64, pt_regs_indices,
 };
+pub use tls::{current_task_fsbase_offset, static_tls_bias_for_elf, TlsLayoutError};
 pub use types::{CodeReader, PlatformError, SourceLocation};
