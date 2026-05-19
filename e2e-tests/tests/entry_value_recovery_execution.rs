@@ -488,7 +488,7 @@ async fn test_non_inline_entry_value_recovers_touch_parameters_at_runtime() -> a
         .with_script(&script)
         .attach_to(&target.target)
         .timeout_secs(4)
-        .enable_sysmon_shared_lib(false)
+        .enable_sysmon_for_target(false)
         .run()
         .await?;
     let (target_stdout, target_stderr) = target.terminate_and_collect().await?;
@@ -647,7 +647,7 @@ async fn test_post_call_entry_value_recovers_state_members_at_runtime() -> anyho
         .with_script(&script)
         .attach_to(&target.target)
         .timeout_secs(4)
-        .enable_sysmon_shared_lib(false)
+        .enable_sysmon_for_target(false)
         .run()
         .await?;
     let (target_stdout, target_stderr) = target.terminate_and_collect().await?;
@@ -778,7 +778,7 @@ async fn test_post_call_entry_value_state_pointer_memory_formats() -> anyhow::Re
         .with_script(&script)
         .attach_to(&target.target)
         .timeout_secs(4)
-        .enable_sysmon_shared_lib(false)
+        .enable_sysmon_for_target(false)
         .run()
         .await?;
     let (_target_stdout, target_stderr) = target.terminate_and_collect().await?;
@@ -837,7 +837,7 @@ async fn test_entry_value_breg_stack_parameter_recovers_at_runtime() -> anyhow::
         .with_script(&script)
         .attach_to(&target.target)
         .timeout_secs(4)
-        .enable_sysmon_shared_lib(false)
+        .enable_sysmon_for_target(false)
         .run()
         .await?;
     let (target_stdout, target_stderr) = target.terminate_and_collect().await?;

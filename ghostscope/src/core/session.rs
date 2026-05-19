@@ -112,18 +112,11 @@ impl GhostSession {
             }
         }
 
-        // Start sysmon:
-        // -t executable: always start (PID collection is constrained in eBPF)
-        // -t shared library: start only if enabled in config
+        // Start sysmon for standalone -t only. Combined -t -p uses the PID for
+        // concrete process mappings and does not need system-wide lifecycle tracking.
         if s.proc_pid().is_none() && s.target_binary.is_some() {
             let tpath = PathBuf::from(s.target_binary.as_ref().unwrap());
-            let is_shared = ghostscope_process::is_shared_object(&tpath);
-            let should_start = if is_shared {
-                config.ebpf_config.enable_sysmon_for_shared_lib
-            } else {
-                true
-            };
-            if should_start {
+            if config.ebpf_config.enable_sysmon_for_target {
                 let cfg = SysmonConfig {
                     target_module: Some(tpath.clone()),
                     proc_offsets_max_entries: config.ebpf_config.proc_module_offsets_max_entries
@@ -134,13 +127,14 @@ impl GhostSession {
                 let mut sysmon = ProcessSysmon::new(mgr, cfg);
                 sysmon.start();
                 s.sysmon = Some(Arc::new(Mutex::new(sysmon)));
+                let is_shared = ghostscope_process::is_shared_object(&tpath);
                 if is_shared {
                     info!("Sysmon started (-t shared library)");
                 } else {
                     info!("Sysmon started (-t executable)");
                 }
             } else {
-                info!("Sysmon not started (-t shared library disabled by config)");
+                info!("Sysmon not started (-t disabled by config)");
             }
         } else if s.proc_pid().is_some() && s.target_binary.is_some() {
             info!("Sysmon not started (-t target scoped by -p)");
@@ -465,7 +459,7 @@ mod tests {
             should_save_ast: false,
             layout_mode: crate::config::LayoutMode::Horizontal,
             force_perf_event_array: false,
-            enable_sysmon_for_shared_lib: false,
+            enable_sysmon_for_target: false,
             allow_loose_debug_match: false,
             debuginfod: None,
             debuginfod_urls: Vec::new(),

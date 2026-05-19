@@ -257,7 +257,7 @@ pub fn init() {
             .with_target("/")
             .with_cli_args([std::ffi::OsString::from("--help")])
             .force_perf_event_array(false)
-            .enable_sysmon_shared_lib(false);
+            .enable_sysmon_for_target(false);
 
         let _use_pid_check: fn(u32) -> bool = host_pid_is_running;
         let _use_compiler_check: fn(FixtureCompiler) -> bool = fixture_compiler_available;

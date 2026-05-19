@@ -425,7 +425,7 @@ It mainly listens for:
 - `fork`
 - `exit`
 
-In the current implementation, `-p` mode does not start this pipeline. A combined `-t <path> -p <pid>` run also does not start `sysmon`: `-t` scopes function/source/address target resolution to one module, while `-p` supplies the concrete process mappings and PID filter. `sysmon` mainly serves standalone `-t` mode, especially when GhostScope needs to keep module offsets, allowlists, and exit cleanup up to date after the target starts.
+In the current implementation, standalone `-t` starts this pipeline by default unless `enable_sysmon_for_target = false` is set in config. `-p` mode does not start it. A combined `-t <path> -p <pid>` run also does not start `sysmon`: `-t` scopes function/source/address target resolution to one module, while `-p` supplies the concrete process mappings and PID filter. `sysmon` mainly serves standalone `-t` mode, especially when GhostScope needs to keep module offsets, allowlists, and exit cleanup up to date after the target starts.
 
 #### Which PID View sysmon Depends On
 

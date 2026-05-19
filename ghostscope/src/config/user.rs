@@ -193,8 +193,8 @@ impl UserConfig {
                 if args.force_perf_event_array {
                     ebpf_config.force_perf_event_array = true;
                 }
-                if args.enable_sysmon_for_shared_lib {
-                    ebpf_config.enable_sysmon_for_shared_lib = true;
+                if args.enable_sysmon_for_target {
+                    ebpf_config.enable_sysmon_for_target = true;
                 }
                 ebpf_config
             },
