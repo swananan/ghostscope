@@ -2059,6 +2059,23 @@ trace foo {
     }
 
     #[test]
+    fn parse_identifiers_can_start_with_underscore() {
+        let function = r#"trace __UpdateTicketInformation { print "OK"; }"#;
+        assert!(parse(function).is_ok());
+
+        let wildcard = r#"trace __builtin_* { print "W"; }"#;
+        assert!(parse(wildcard).is_ok());
+
+        let script = r#"
+trace _start {
+    let _ticket = __dwarf_value;
+    print _ticket;
+}
+"#;
+        assert!(parse(script).is_ok());
+    }
+
+    #[test]
     fn parse_module_hex_address_overflow_should_error() {
         // Address exceeds u64 (17 hex digits) -> parse error, not 0 fallback
         let s = r#"trace libfoo.so:0x10000000000000000 { print "X"; }"#;
