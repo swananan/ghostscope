@@ -10,7 +10,7 @@ path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-aya-ebpf = { git = "https://github.com/aya-rs/aya.git", rev = "5dd4bd440bdf0e29a695cad088fdb1716229633b" }
+aya-ebpf = { git = "https://github.com/aya-rs/aya.git", rev = "27483d75b34ab0a120f8c49575018d7d0688b938" }
 
 [profile.release]
 debug = false

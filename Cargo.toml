@@ -62,10 +62,10 @@ dirs = "5.0"
 object = "0.36"
 
 gimli = "0.33.0"
-aya = { git = "https://github.com/aya-rs/aya.git", rev = "5dd4bd440bdf0e29a695cad088fdb1716229633b" }
-aya-obj = { git = "https://github.com/aya-rs/aya.git", rev = "5dd4bd440bdf0e29a695cad088fdb1716229633b" }
-aya-ebpf-bindings = { git = "https://github.com/aya-rs/aya.git", rev = "5dd4bd440bdf0e29a695cad088fdb1716229633b" }
-aya-build = { git = "https://github.com/aya-rs/aya.git", rev = "5dd4bd440bdf0e29a695cad088fdb1716229633b" }
+aya = { git = "https://github.com/aya-rs/aya.git", rev = "27483d75b34ab0a120f8c49575018d7d0688b938" }
+aya-obj = { git = "https://github.com/aya-rs/aya.git", rev = "27483d75b34ab0a120f8c49575018d7d0688b938" }
+aya-ebpf-bindings = { git = "https://github.com/aya-rs/aya.git", rev = "27483d75b34ab0a120f8c49575018d7d0688b938" }
+aya-build = { git = "https://github.com/aya-rs/aya.git", rev = "27483d75b34ab0a120f8c49575018d7d0688b938" }
 
 # Test dependencies
 tempfile = "3.8"

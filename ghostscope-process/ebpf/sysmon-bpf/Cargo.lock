@@ -11,7 +11,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 [[package]]
 name = "aya-build"
 version = "0.1.3"
-source = "git+https://github.com/aya-rs/aya.git?rev=5dd4bd440bdf0e29a695cad088fdb1716229633b#5dd4bd440bdf0e29a695cad088fdb1716229633b"
+source = "git+https://github.com/aya-rs/aya.git?rev=27483d75b34ab0a120f8c49575018d7d0688b938#27483d75b34ab0a120f8c49575018d7d0688b938"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -22,7 +22,7 @@ dependencies = [
 [[package]]
 name = "aya-ebpf"
 version = "0.1.2"
-source = "git+https://github.com/aya-rs/aya.git?rev=5dd4bd440bdf0e29a695cad088fdb1716229633b#5dd4bd440bdf0e29a695cad088fdb1716229633b"
+source = "git+https://github.com/aya-rs/aya.git?rev=27483d75b34ab0a120f8c49575018d7d0688b938#27483d75b34ab0a120f8c49575018d7d0688b938"
 dependencies = [
  "aya-build",
  "aya-ebpf-bindings",
@@ -34,7 +34,7 @@ dependencies = [
 [[package]]
 name = "aya-ebpf-bindings"
 version = "0.1.2"
-source = "git+https://github.com/aya-rs/aya.git?rev=5dd4bd440bdf0e29a695cad088fdb1716229633b#5dd4bd440bdf0e29a695cad088fdb1716229633b"
+source = "git+https://github.com/aya-rs/aya.git?rev=27483d75b34ab0a120f8c49575018d7d0688b938#27483d75b34ab0a120f8c49575018d7d0688b938"
 dependencies = [
  "aya-build",
  "aya-ebpf-cty",
@@ -43,7 +43,7 @@ dependencies = [
 [[package]]
 name = "aya-ebpf-cty"
 version = "0.2.3"
-source = "git+https://github.com/aya-rs/aya.git?rev=5dd4bd440bdf0e29a695cad088fdb1716229633b#5dd4bd440bdf0e29a695cad088fdb1716229633b"
+source = "git+https://github.com/aya-rs/aya.git?rev=27483d75b34ab0a120f8c49575018d7d0688b938#27483d75b34ab0a120f8c49575018d7d0688b938"
 dependencies = [
  "aya-build",
 ]
@@ -51,7 +51,7 @@ dependencies = [
 [[package]]
 name = "aya-ebpf-macros"
 version = "0.1.2"
-source = "git+https://github.com/aya-rs/aya.git?rev=5dd4bd440bdf0e29a695cad088fdb1716229633b#5dd4bd440bdf0e29a695cad088fdb1716229633b"
+source = "git+https://github.com/aya-rs/aya.git?rev=27483d75b34ab0a120f8c49575018d7d0688b938#27483d75b34ab0a120f8c49575018d7d0688b938"
 dependencies = [
  "proc-macro2",
  "proc-macro2-diagnostics",

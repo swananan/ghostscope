@@ -1,6 +1,8 @@
-use aya::{maps::MapType, sys::is_map_supported};
-use aya_obj::generated::{bpf_attr, bpf_cmd, bpf_insn, bpf_prog_type};
-use libc::SYS_bpf;
+use aya::{
+    maps::MapType,
+    programs::ProgramType,
+    sys::{is_helper_supported, is_map_supported, BpfHelper},
+};
 use std::{fmt, sync::OnceLock};
 use tracing::{error, info, warn};
 
@@ -216,62 +218,27 @@ fn detect_map_support(map_type: MapType, label: &str, unsupported_context: &str)
 }
 
 fn detect_ns_current_pid_tgid_helper_support() -> bool {
-    const BPF_FUNC_GET_NS_CURRENT_PID_TGID: i32 = 120;
+    info!(
+        "Probing kernel bpf_get_ns_current_pid_tgid helper support via aya::sys::is_helper_supported..."
+    );
 
-    let insns = [
-        make_bpf_insn(0x85, 0, 0, 0, BPF_FUNC_GET_NS_CURRENT_PID_TGID),
-        make_bpf_insn(0x95, 0, 0, 0, 0),
-    ];
-
-    let license = b"GPL\0";
-    let mut log_buf = [0u8; 4096];
-    let mut attr = unsafe { std::mem::zeroed::<bpf_attr>() };
-    unsafe {
-        let u = &mut attr.__bindgen_anon_3;
-        u.prog_type = bpf_prog_type::BPF_PROG_TYPE_KPROBE as u32;
-        u.insn_cnt = insns.len() as u32;
-        u.insns = insns.as_ptr() as u64;
-        u.license = license.as_ptr() as u64;
-        u.log_level = 1;
-        u.log_buf = log_buf.as_mut_ptr() as u64;
-        u.log_size = log_buf.len() as u32;
+    match is_helper_supported(
+        ProgramType::KProbe,
+        BpfHelper::BPF_FUNC_get_ns_current_pid_tgid,
+    ) {
+        Ok(true) => {
+            info!(
+                "bpf_get_ns_current_pid_tgid helper support probe succeeded - helper is supported"
+            );
+            true
+        }
+        Ok(false) => {
+            info!("bpf_get_ns_current_pid_tgid helper support probe reported unsupported");
+            false
+        }
+        Err(err) => {
+            warn!("bpf_get_ns_current_pid_tgid helper support probe failed unexpectedly: {err}");
+            false
+        }
     }
-
-    let ret = unsafe {
-        libc::syscall(
-            SYS_bpf as libc::c_long,
-            bpf_cmd::BPF_PROG_LOAD as libc::c_long,
-            &mut attr as *mut _ as *mut libc::c_void,
-            std::mem::size_of::<bpf_attr>(),
-        )
-    };
-
-    if ret >= 0 {
-        let fd = ret as libc::c_int;
-        let _ = unsafe { libc::close(fd) };
-        return true;
-    }
-
-    let log = String::from_utf8_lossy(&log_buf);
-    if log.contains("invalid func ")
-        || log.contains("unknown func ")
-        || log.contains("program of this type cannot use helper ")
-    {
-        return false;
-    }
-
-    // If verifier produced any non-empty diagnostics but not "unknown helper" patterns,
-    // treat it as supported (typically argument/type mismatch with a known helper).
-    let has_any_log = !log.trim_matches(char::from(0)).trim().is_empty();
-    has_any_log
-}
-
-fn make_bpf_insn(code: u8, dst_reg: u8, src_reg: u8, off: i16, imm: i32) -> bpf_insn {
-    let mut insn = unsafe { std::mem::zeroed::<bpf_insn>() };
-    insn.code = code;
-    insn.set_dst_reg(dst_reg);
-    insn.set_src_reg(src_reg);
-    insn.off = off;
-    insn.imm = imm;
-    insn
 }
