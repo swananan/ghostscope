@@ -18,10 +18,13 @@ use object::{Object, ObjectSymbol};
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
-use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const FIXTURE_NAME: &str = "entry_value_recovery_program";
@@ -34,6 +37,7 @@ const BREG_FUNCTION_NAME: &str = "stack_entry_target";
 const BREG_ANCHOR_NAME: &str = "entry_value_breg_anchor";
 
 static BREG_CLANG_FIXTURE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+static RUNTIME_LOG_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct LoggedTarget {
     target: TargetHandle,
@@ -381,10 +385,28 @@ exec {binary} >>{stdout} 2>>{stderr}
 }
 
 fn create_runtime_log_dir(base: &Path) -> anyhow::Result<PathBuf> {
-    let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let path = base.join(format!(".ghostscope-entry-value-runtime-{unique}"));
-    fs::create_dir(&path)?;
-    Ok(path)
+    let pid = std::process::id();
+    for _ in 0..128 {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let sequence = RUNTIME_LOG_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = base.join(format!(
+            ".ghostscope-entry-value-runtime-{pid}-{unique}-{sequence}"
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to create runtime log dir {}", path.display())
+                });
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "failed to create unique runtime log dir under {} after repeated collisions",
+        base.display()
+    )
 }
 
 fn write_wrapper_script(path: &Path, contents: &str) -> anyhow::Result<()> {
