@@ -173,11 +173,12 @@ ghostscope --source-panel       # Show source panel
 # WARNING: Testing purposes only. Forces PerfEventArray even on kernels >= 5.8
 ghostscope --force-perf-event-array
 
-# Start sysmon for standalone -t when target is a shared library (.so).
-# Not needed when -t is combined with -p.
+# Standalone -t starts sysmon by default. It is not used when -t is
+# combined with -p because the PID already provides concrete process mappings.
 # WARNING: Attaches system-wide sched tracepoints (exec/fork/exit) and may add
-# overhead on hosts with high process churn. Default is OFF.
-ghostscope --enable-sysmon-shared-lib
+# overhead on hosts with high process churn. Set enable_sysmon_for_target=false
+# in config to disable it; this flag can re-enable it for one run.
+ghostscope --enable-sysmon-for-target
 ```
 
 ### BPFFS Maintenance
@@ -252,7 +253,7 @@ Behavior:
 | `--source-panel` | | Show source panel | On |
 | `--config <PATH>` | | Custom config file | Auto-detect |
 | `--force-perf-event-array` | | Force PerfEventArray (testing) | Off |
-| `--enable-sysmon-shared-lib` | | Start sysmon for standalone `-t` shared library, so globals can be traced in future processes. Not needed with `-t -p`. | Off |
+| `--enable-sysmon-for-target` | | Re-enable sysmon for standalone `-t` when config disables it. Standalone `-t` enables sysmon by default; `-t -p` does not use it. | Off |
 | `[BINARY] [ARGS...]` | | Launch target program with positional arguments | None |
 | `--args <PROGRAM> [ARGS...]` | | Separate GhostScope options from target program arguments | None |
 
@@ -485,13 +486,13 @@ max_trace_event_size = 32768
 # overhead compared to RingBuf and should only be used for compatibility testing.
 force_perf_event_array = false  # Default (auto-detect based on kernel version)
 
-# Start sysmon eBPF for standalone -t when the target is a shared library (.so).
-# Maintains ASLR offsets for late-start processes loading the library.
+# Start sysmon eBPF for standalone -t targets.
+# Maintains ASLR offsets for late-start processes loading the target.
 # Not used when -t is combined with -p, because the PID already provides the
 # concrete process mappings.
 # This enables system-wide sched tracepoints and may impact performance
 # when process churn is high.
-enable_sysmon_for_shared_lib = false  # Default
+enable_sysmon_for_target = true  # Default
 ```
 
 ### Configuration Examples
@@ -573,6 +574,7 @@ mem_dump_cap = 512
 compare_cap = 32       # Smaller compare cap for minimal overhead
 max_trace_event_size = 16384
 proc_module_offsets_max_entries = 1024  # Single process only
+enable_sysmon_for_target = false        # Disable standalone -t lifecycle tracking
 
 [general]
 log_level = "error"

@@ -4,7 +4,6 @@
 mod common;
 
 use common::{init, FIXTURES};
-use ghostscope_process::is_shared_object;
 use regex::Regex;
 use serial_test::serial;
 use std::env;
@@ -22,12 +21,10 @@ async fn run_ghostscope_with_script_for_target(
     timeout_secs: u64,
     target_path: &std::path::Path,
 ) -> anyhow::Result<(i32, String, String)> {
-    let enable_sysmon = is_shared_object(target_path);
     common::runner::GhostscopeRunner::new()
         .with_script(script_content)
         .with_target(target_path)
         .timeout_secs(timeout_secs)
-        .enable_sysmon_shared_lib(enable_sysmon)
         .run()
         .await
 }
@@ -302,7 +299,7 @@ trace 0x{lib_tick_addr:x} {{
         .with_target(&lib_path)
         .attach_to(&target)
         .timeout_secs(2)
-        .enable_sysmon_shared_lib(false)
+        .enable_sysmon_for_target(false)
         .run()
         .await?;
     target.terminate().await?;
@@ -354,7 +351,7 @@ trace libgvars_alias.so:0x{lib_tick_addr:x} {{
         .with_target(&target_symlink)
         .attach_to(&target)
         .timeout_secs(2)
-        .enable_sysmon_shared_lib(false)
+        .enable_sysmon_for_target(false)
         .run()
         .await?;
     target.terminate().await?;
@@ -575,7 +572,7 @@ trace lib_tick {
             .with_script(script)
             .with_target(&lib_path)
             .timeout_secs(12)
-            .enable_sysmon_shared_lib(true),
+            .enable_sysmon_for_target(true),
         &binary_path,
     )
     .await?;
@@ -698,7 +695,7 @@ trace lib_tick {
             .with_script(script)
             .with_target(&lib_path)
             .timeout_secs(8)
-            .enable_sysmon_shared_lib(false),
+            .disable_sysmon_for_target(true),
         &binary_path,
     )
     .await?;

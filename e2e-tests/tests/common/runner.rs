@@ -49,7 +49,8 @@ pub struct GhostscopeRunner {
     timeout_secs: u64,
     force_perf_event_array: bool,
     log_level: Option<String>,
-    enable_sysmon_shared_lib: bool,
+    enable_sysmon_for_target: bool,
+    disable_sysmon_for_target: bool,
     enable_file_logging: bool,
     enable_console_logging: bool,
     sandbox: Option<SandboxHandle>,
@@ -66,7 +67,8 @@ impl Default for GhostscopeRunner {
             timeout_secs: 3,
             force_perf_event_array: false,
             log_level: None,
-            enable_sysmon_shared_lib: false,
+            enable_sysmon_for_target: false,
+            disable_sysmon_for_target: false,
             enable_file_logging: false,
             enable_console_logging: false,
             sandbox: None,
@@ -118,8 +120,13 @@ impl GhostscopeRunner {
         self
     }
 
-    pub fn enable_sysmon_shared_lib(mut self, yes: bool) -> Self {
-        self.enable_sysmon_shared_lib = yes;
+    pub fn enable_sysmon_for_target(mut self, yes: bool) -> Self {
+        self.enable_sysmon_for_target = yes;
+        self
+    }
+
+    pub fn disable_sysmon_for_target(mut self, yes: bool) -> Self {
+        self.disable_sysmon_for_target = yes;
         self
     }
 
@@ -227,6 +234,13 @@ impl GhostscopeRunner {
         use std::io::Write as _;
         script_file.write_all(self.script_content.as_bytes())?;
         let script_path = sandbox.path_in_sandbox(script_file.path())?;
+        let sysmon_config_file = if self.disable_sysmon_for_target {
+            let mut file = create_config_file()?;
+            file.write_all(b"[ebpf]\nenable_sysmon_for_target = false\n")?;
+            Some(file)
+        } else {
+            None
+        };
 
         let mut args: Vec<OsString> = Vec::new();
         if let Some(ref target) = self.target {
@@ -244,6 +258,14 @@ impl GhostscopeRunner {
 
         args.push(OsString::from("--script-file"));
         args.push(script_path.into_os_string());
+        if let Some(config_file) = sysmon_config_file.as_ref() {
+            args.push(OsString::from("--config"));
+            args.push(
+                sandbox
+                    .path_in_sandbox(config_file.path())?
+                    .into_os_string(),
+            );
+        }
 
         if let Some(level) = &logging.level {
             args.push(OsString::from("--log-level"));
@@ -256,8 +278,8 @@ impl GhostscopeRunner {
             args.push(OsString::from("--emit-ready-marker"));
             args.push(OsString::from(marker));
         }
-        if self.enable_sysmon_shared_lib {
-            args.push(OsString::from("--enable-sysmon-shared-lib"));
+        if self.enable_sysmon_for_target {
+            args.push(OsString::from("--enable-sysmon-for-target"));
         }
         if logging.enable_logging {
             args.push(OsString::from("--log"));
@@ -717,6 +739,18 @@ fn create_script_file() -> Result<NamedTempFile> {
     Builder::new()
         .prefix(".ghostscope-test-script-")
         .suffix(".gs")
+        .tempfile_in(repo_root)
+        .map_err(Into::into)
+}
+
+fn create_config_file() -> Result<NamedTempFile> {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve repo root for temp config file"))?
+        .to_path_buf();
+    Builder::new()
+        .prefix(".ghostscope-test-config-")
+        .suffix(".toml")
         .tempfile_in(repo_root)
         .map_err(Into::into)
 }

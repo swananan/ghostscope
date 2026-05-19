@@ -17,7 +17,7 @@ async fn run_ghostscope_with_script_for_target(
         .with_script(script_content)
         .attach_to(target)
         .timeout_secs(timeout_secs)
-        .enable_sysmon_shared_lib(false)
+        .enable_sysmon_for_target(false)
         .run()
         .await
 }
@@ -32,7 +32,7 @@ async fn run_ghostscope_with_script_for_target_perf(
         .attach_to(target)
         .timeout_secs(timeout_secs)
         .force_perf_event_array(true)
-        .enable_sysmon_shared_lib(false)
+        .enable_sysmon_for_target(false)
         .run()
         .await
 }

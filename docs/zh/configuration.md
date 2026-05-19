@@ -174,11 +174,12 @@ ghostscope --source-panel       # 显示源码面板
 # 警告：仅用于测试目的。即使在内核 >= 5.8 上也强制使用 PerfEventArray
 ghostscope --force-perf-event-array
 
-# 当独立 -t 目标是共享库（.so）时启动 sysmon。
-# -t 与 -p 同时使用时不需要。
+# 独立 -t 默认启动 sysmon。-t 与 -p 同时使用时不会使用 sysmon，
+# 因为 PID 已经提供了具体进程映射。
 # 警告：该选项会全局附加 sched 的 exec/fork/exit tracepoint，在进程频繁
-# 启动/退出的主机上可能带来一定性能开销。默认关闭。
-ghostscope --enable-sysmon-shared-lib
+# 启动/退出的主机上可能带来一定性能开销。可在配置中设置
+# enable_sysmon_for_target=false 关闭；该选项可为单次运行重新开启。
+ghostscope --enable-sysmon-for-target
 ```
 
 ### BPFFS 维护
@@ -253,7 +254,7 @@ ghostscope bpffs prune --dry-run --json
 | `--source-panel` | | 显示源码面板 | 开 |
 | `--config <PATH>` | | 自定义配置文件 | 自动检测 |
 | `--force-perf-event-array` | | 强制 PerfEventArray（测试） | 关 |
-| `--enable-sysmon-shared-lib` | | 独立 `-t` 目标为共享库时启动 sysmon，以支持未来进程中的全局变量探测。`-t -p` 不需要。 | 关 |
+| `--enable-sysmon-for-target` | | 当配置关闭 sysmon 时，重新为独立 `-t` 开启 sysmon。独立 `-t` 默认开启；`-t -p` 不使用 sysmon。 | 关 |
 | `[BINARY] [ARGS...]` | | 启动目标程序并传递位置参数 | 无 |
 | `--args <PROGRAM> [ARGS...]` | | 分隔 GhostScope 选项和目标程序参数 | 无 |
 
@@ -480,11 +481,11 @@ max_trace_event_size = 32768
 # 有性能开销，仅应用于兼容性测试。
 force_perf_event_array = false  # 默认（根据内核版本自动检测）
 
-# 当独立 -t 目标为共享库（.so）时启动 sysmon eBPF，
-# 用于维护后续启动进程里动态库的 ASLR 偏移。
+# 为独立 -t 目标启动 sysmon eBPF，
+# 用于维护后续启动进程里目标模块的 ASLR 偏移。
 # -t 与 -p 同时使用时不会使用 sysmon，因为 PID 已经提供具体进程映射。
 # 启用后会注册系统范围的 sched tracepoint，进程频繁创建/退出的环境下可能带来性能开销。
-enable_sysmon_for_shared_lib = false  # 默认关闭
+enable_sysmon_for_target = true  # 默认开启
 ```
 
 ### 配置示例
@@ -566,6 +567,7 @@ mem_dump_cap = 512
 compare_cap = 32       # 降低内置比较上限以减小开销
 max_trace_event_size = 16384
 proc_module_offsets_max_entries = 1024  # 仅单进程
+enable_sysmon_for_target = false        # 关闭独立 -t 生命周期跟踪
 
 [general]
 log_level = "error"

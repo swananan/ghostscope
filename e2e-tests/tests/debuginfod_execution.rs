@@ -86,7 +86,7 @@ trace add_numbers {
         .with_script(script_content)
         .attach_to(&target)
         .timeout_secs(4)
-        .enable_sysmon_shared_lib(false)
+        .enable_sysmon_for_target(false)
         .with_cli_args(cli_args)
         .run()
         .await?;

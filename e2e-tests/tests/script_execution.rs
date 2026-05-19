@@ -427,7 +427,7 @@ async fn run_ghostscope_with_script_opt(
         .with_script(script_content)
         .attach_to(&target)
         .timeout_secs(timeout_secs)
-        .enable_sysmon_shared_lib(false)
+        .enable_sysmon_for_target(false)
         .run()
         .await
 }
@@ -2089,7 +2089,7 @@ async fn run_ghostscope_with_specific_pid(
         .with_script(script_content)
         .with_pid(target_pid)
         .timeout_secs(timeout_secs)
-        .enable_sysmon_shared_lib(false)
+        .enable_sysmon_for_target(false)
         .run()
         .await
 }
@@ -2103,7 +2103,7 @@ async fn run_ghostscope_attached_to_target(
         .with_script(script_content)
         .attach_to(target)
         .timeout_secs(timeout_secs)
-        .enable_sysmon_shared_lib(false)
+        .enable_sysmon_for_target(false)
         .run()
         .await
 }
