@@ -113,7 +113,7 @@ address_of = { "&" ~ ( "(" ~ expr ~ ")" | complex_variable | identifier ) }
 add_op = { "+" | "-" }
 mul_op = { "*" | "/" }
 
-identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 // Integer literals
 int = @{ ASCII_DIGIT+ }
 hex_int = @{ "0x" ~ ASCII_HEX_DIGIT+ }
