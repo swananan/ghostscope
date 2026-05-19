@@ -54,9 +54,9 @@
 - Do not claim validation that was not actually executed.
 - Keep user-facing messages concise and concrete.
 - When a commit is requested, use conventional commits format.
-- Format the subject as `<type>: <imperative summary>`.
+- Format the subject as `<type>: <imperative summary>` and use it to state what the patch does.
 - Keep the subject concise and specific, use a lowercase type, and do not end the subject with a period.
 - Avoid vague subjects such as `update stuff` or `fix issue`.
-- Add a body only when the reason, scope, or risk is not obvious from the subject. Keep the body short and focused on why the change exists.
+- Add a body only when the reason, scope, or risk is not obvious from the subject. Use it to explain why the change is necessary, including relevant design trade-offs and side effects.
 - Wrap commit body lines at 80 columns or fewer.
 - Prefer one logical change per commit.
