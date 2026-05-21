@@ -12,14 +12,30 @@ pub mod plan;
 pub mod symbol_names;
 pub mod types;
 
-pub use demangle::*;
-pub use diagnostic::*;
-pub use errors::*;
-pub use evaluation::*;
-pub use ids::*;
-pub use plan::*;
-pub(crate) use symbol_names::*;
-pub use types::*;
+pub use demangle::is_likely_mangled;
+pub use diagnostic::{
+    AmbiguityReason, Availability, HelperMode, Provenance, RuntimeCapabilities, RuntimeRequirement,
+    TargetArch, UnsupportedReason, VerifierRisk,
+};
+pub use errors::{DwarfError, Result};
+pub(crate) use evaluation::{
+    plan_expr_steps_to_expression, DirectValueResult, LocationResult, PieceResult,
+    RawExpressionResult,
+};
+pub use evaluation::{
+    CallerFrameRecovery, CfaResult, EntryValueCase, MemoryAccessSize, PlanExprOp,
+};
+pub use ids::{CuId, DieRef, FunctionId, InlineContextId, ModuleId, ScopeId, TypeId, VariableId};
+pub(crate) use plan::ParsedLocation;
+pub use plan::{AddressExpr, PieceLocation, VariableLocation};
+pub(crate) use symbol_names::{
+    demangled_name, extract_name_fragments, normalize_demangled_signature,
+    symbol_name_matches_query,
+};
+pub use types::{
+    FunctionDieKind, FunctionInfo, GlobalVariableInfo, IndexEntry, IndexFlags, LineEntry,
+    ModuleAddress, SectionType, SourceLocation,
+};
 
 pub(crate) fn attr_u64(value: gimli::AttributeValue<DwarfReader>) -> Option<u64> {
     match value {

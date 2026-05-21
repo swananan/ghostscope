@@ -14,16 +14,16 @@ pub(crate) mod loader;
 pub(crate) mod objfile;
 pub(crate) mod parser;
 pub(crate) mod path_match;
-pub mod semantics;
+pub(crate) mod semantics;
 
 // Main entry point
-pub mod analyzer;
+pub(crate) mod analyzer;
 
 // Re-export main public API only
 pub use analyzer::{
-    AddressQueryResult, DwarfAnalyzer, FunctionQueryResult, MainExecutableInfo,
-    ModuleDefaultPolicy, ModuleLoadingEvent, ModuleLoadingStats, ModuleStats, SharedLibraryInfo,
-    SimpleFileInfo, SourceLineAddressSearch, SourceLineQuerySearch,
+    AddressQueryResult, AnalyzerStats, DwarfAnalyzer, ExecutableFileInfo, FunctionQueryResult,
+    MainExecutableInfo, ModuleDefaultPolicy, ModuleLoadingEvent, ModuleLoadingStats, ModuleStats,
+    SectionInfo, SharedLibraryInfo, SimpleFileInfo, SourceLineAddressSearch, SourceLineQuerySearch,
 };
 
 // Re-export essential core and semantic support types.

@@ -11,5 +11,7 @@ pub(crate) use detailed_parser::ParsedVariable;
 // Internal re-exports for crate use
 pub(crate) use crate::dwarf_expr::ExpressionEvaluator;
 pub(crate) use detailed_parser::DetailedParser;
-pub(crate) use fast_parser::*;
+pub(crate) use fast_parser::{
+    CompilationUnit, DebugParseResult, DwarfParseResult, DwarfParser, LineParseResult, SourceFile,
+};
 pub(crate) use range_extractor::RangeExtractor;

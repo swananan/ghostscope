@@ -1255,8 +1255,9 @@ mod tests {
     fn fragment_candidates_match_demangled_function_queries() {
         let mangled = "_ZN2ns6Widget3runEv".to_string();
         let demangled =
-            crate::core::demangle_by_lang(Some(gimli::DW_LANG_C_plus_plus_17), &mangled).unwrap();
-        let leaf = crate::core::demangled_leaf(&demangled);
+            crate::core::demangle::demangle_by_lang(Some(gimli::DW_LANG_C_plus_plus_17), &mangled)
+                .unwrap();
+        let leaf = crate::core::demangle::demangled_leaf(&demangled);
 
         let mut functions = HashMap::new();
         functions.insert(
@@ -1293,7 +1294,8 @@ mod tests {
     #[test]
     fn fragment_candidates_match_rust_v0_demangled_function_queries() {
         let mangled = "_RNvCs73fAdSrgOJL_4test4main".to_string();
-        let demangled = crate::core::demangle_by_lang(Some(gimli::DW_LANG_Rust), &mangled).unwrap();
+        let demangled =
+            crate::core::demangle::demangle_by_lang(Some(gimli::DW_LANG_Rust), &mangled).unwrap();
 
         let mut functions = HashMap::new();
         functions.insert(
@@ -1326,7 +1328,8 @@ mod tests {
     fn scan_fallback_matches_substitution_heavy_cpp_queries() {
         let mangled = "_ZNSt6vectorIiSaIiEE3endEv".to_string();
         let demangled =
-            crate::core::demangle_by_lang(Some(gimli::DW_LANG_C_plus_plus_17), &mangled).unwrap();
+            crate::core::demangle::demangle_by_lang(Some(gimli::DW_LANG_C_plus_plus_17), &mangled)
+                .unwrap();
 
         let mut functions = HashMap::new();
         functions.insert(
