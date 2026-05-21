@@ -7,4 +7,4 @@ pub(crate) mod loading;
 pub(crate) mod source_location;
 pub(crate) mod variables;
 
-pub(crate) use loaded::*;
+pub(crate) use loaded::LoadedObjfile;
