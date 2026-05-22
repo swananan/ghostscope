@@ -153,32 +153,23 @@ mod tests {
     use crate::script::ast::Expr;
 
     #[test]
-    fn test_count_placeholders() {
+    fn test_count_placeholders() -> Result<(), ParseError> {
         // Basic cases
+        assert_eq!(FormatValidator::count_required_args("hello world")?, (0, 0));
+        assert_eq!(FormatValidator::count_required_args("hello {}")?, (1, 0));
+        assert_eq!(FormatValidator::count_required_args("{} {}")?, (2, 0));
         assert_eq!(
-            FormatValidator::count_required_args("hello world").unwrap(),
-            (0, 0)
-        );
-        assert_eq!(
-            FormatValidator::count_required_args("hello {}").unwrap(),
-            (1, 0)
-        );
-        assert_eq!(
-            FormatValidator::count_required_args("{} {}").unwrap(),
-            (2, 0)
-        );
-        assert_eq!(
-            FormatValidator::count_required_args("pid: {}, name: {}").unwrap(),
+            FormatValidator::count_required_args("pid: {}, name: {}")?,
             (2, 0)
         );
 
         // Escape sequences
         assert_eq!(
-            FormatValidator::count_required_args("use {{}} for braces").unwrap(),
+            FormatValidator::count_required_args("use {{}} for braces")?,
             (0, 0)
         );
         assert_eq!(
-            FormatValidator::count_required_args("value: {}, braces: {{}}").unwrap(),
+            FormatValidator::count_required_args("value: {}, braces: {{}}")?,
             (1, 0)
         );
 
@@ -187,48 +178,19 @@ mod tests {
         assert!(FormatValidator::count_required_args("unmatched }").is_err());
 
         // Extended specifiers
-        assert_eq!(
-            FormatValidator::count_required_args("{:x}").unwrap(),
-            (1, 0)
-        );
-        assert_eq!(
-            FormatValidator::count_required_args("{:X}").unwrap(),
-            (1, 0)
-        );
-        assert_eq!(
-            FormatValidator::count_required_args("{:p}").unwrap(),
-            (1, 0)
-        );
-        assert_eq!(
-            FormatValidator::count_required_args("{:s}").unwrap(),
-            (1, 0)
-        );
-        assert_eq!(
-            FormatValidator::count_required_args("{:x.16}").unwrap(),
-            (1, 0)
-        );
-        assert_eq!(
-            FormatValidator::count_required_args("{:s.*}").unwrap(),
-            (1, 1)
-        );
-        assert_eq!(
-            FormatValidator::count_required_args("{:x.len$}").unwrap(),
-            (1, 0)
-        );
+        assert_eq!(FormatValidator::count_required_args("{:x}")?, (1, 0));
+        assert_eq!(FormatValidator::count_required_args("{:X}")?, (1, 0));
+        assert_eq!(FormatValidator::count_required_args("{:p}")?, (1, 0));
+        assert_eq!(FormatValidator::count_required_args("{:s}")?, (1, 0));
+        assert_eq!(FormatValidator::count_required_args("{:x.16}")?, (1, 0));
+        assert_eq!(FormatValidator::count_required_args("{:s.*}")?, (1, 1));
+        assert_eq!(FormatValidator::count_required_args("{:x.len$}")?, (1, 0));
         // Static length with hex/oct/bin
-        assert_eq!(
-            FormatValidator::count_required_args("{:x.0x10}").unwrap(),
-            (1, 0)
-        );
-        assert_eq!(
-            FormatValidator::count_required_args("{:s.0o20}").unwrap(),
-            (1, 0)
-        );
-        assert_eq!(
-            FormatValidator::count_required_args("{:X.0b1000}").unwrap(),
-            (1, 0)
-        );
+        assert_eq!(FormatValidator::count_required_args("{:x.0x10}")?, (1, 0));
+        assert_eq!(FormatValidator::count_required_args("{:s.0o20}")?, (1, 0));
+        assert_eq!(FormatValidator::count_required_args("{:X.0b1000}")?, (1, 0));
         assert!(FormatValidator::count_required_args("{:x.1a$}").is_err());
+        Ok(())
     }
 
     #[test]

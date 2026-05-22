@@ -955,12 +955,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             )
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-                        let cur_fn = self
-                            .builder
-                            .get_insert_block()
-                            .unwrap()
-                            .get_parent()
-                            .unwrap();
+                        let cur_fn = self.current_function("generate dereference runtime check")?;
                         let null_bb = self.context.append_basic_block(cur_fn, "deref_null");
                         let read_bb = self.context.append_basic_block(cur_fn, "deref_read");
                         let cont_bb = self.context.append_basic_block(cur_fn, "deref_cont");
@@ -1142,7 +1137,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         if stack.len() == 1 {
-            Ok(stack.pop().unwrap())
+            let value = stack.pop().ok_or_else(|| {
+                CodeGenError::LLVMError("Stack underflow after runtime computation".to_string())
+            })?;
+            Ok(value)
         } else {
             Err(CodeGenError::LLVMError(format!(
                 "Invalid stack state after computation: {} elements remaining",

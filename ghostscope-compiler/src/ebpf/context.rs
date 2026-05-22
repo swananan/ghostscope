@@ -6,6 +6,7 @@
 use super::maps::MapManager;
 use crate::script::{VarType, VariableContext};
 use ghostscope_dwarf::DwarfAnalyzer;
+use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::debug_info::DebugInfoBuilder;
@@ -424,14 +425,21 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.trace_context.clone()
     }
 
+    pub(crate) fn current_insert_block(&self, op: &str) -> Result<BasicBlock<'ctx>> {
+        self.builder
+            .get_insert_block()
+            .ok_or_else(|| CodeGenError::Builder(format!("{op} requires an active insert block")))
+    }
+
+    pub(crate) fn current_function(&self, op: &str) -> Result<FunctionValue<'ctx>> {
+        self.current_insert_block(op)?
+            .get_parent()
+            .ok_or_else(|| CodeGenError::Builder(format!("{op} requires a parent function")))
+    }
+
     /// Get pt_regs parameter from current function
     pub fn get_pt_regs_parameter(&self) -> Result<PointerValue<'ctx>> {
-        let current_function = self
-            .builder
-            .get_insert_block()
-            .ok_or_else(|| CodeGenError::Builder("No current basic block".to_string()))?
-            .get_parent()
-            .ok_or_else(|| CodeGenError::Builder("No parent function".to_string()))?;
+        let current_function = self.current_function("get pt_regs parameter")?;
 
         let pt_regs_param = current_function
             .get_first_param()
@@ -660,12 +668,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         info!("Adding host TGID filter for filter PID: {}", filter_pid);
 
         // Get current function and entry block
-        let current_fn = self
-            .builder
-            .get_insert_block()
-            .unwrap()
-            .get_parent()
-            .unwrap();
+        let current_fn = self.current_function("add host pid filter")?;
 
         // Create basic blocks for control flow
         let continue_block = self

@@ -173,12 +173,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         };
 
-        let helper_fn = self
-            .builder
-            .get_insert_block()
-            .unwrap()
-            .get_parent()
-            .unwrap();
+        let helper_fn = self.current_function("lookup proc pid alias")?;
         let alias_hit_block = self
             .context
             .append_basic_block(helper_fn, &format!("{name_prefix}_alias_hit"));
@@ -220,13 +215,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_unconditional_branch(alias_cont_block)
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let alias_hit_end = self.builder.get_insert_block().unwrap();
+        let alias_hit_end = self.current_insert_block("finish pid alias hit block")?;
 
         self.builder.position_at_end(alias_miss_block);
         self.builder
             .build_unconditional_branch(alias_cont_block)
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let alias_miss_end = self.builder.get_insert_block().unwrap();
+        let alias_miss_end = self.current_insert_block("finish pid alias miss block")?;
 
         self.builder.position_at_end(alias_cont_block);
         let alias_phi = self
@@ -637,30 +632,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .ok_or_else(|| CodeGenError::LLVMError("map_lookup_elem returned void".to_string()))?;
 
         let null_ptr = ptr_type.const_null();
-        let found_block = self.context.append_basic_block(
-            self.builder
-                .get_insert_block()
-                .unwrap()
-                .get_parent()
-                .unwrap(),
-            "found_offsets",
-        );
-        let miss_block = self.context.append_basic_block(
-            self.builder
-                .get_insert_block()
-                .unwrap()
-                .get_parent()
-                .unwrap(),
-            "miss_offsets",
-        );
-        let cont_block = self.context.append_basic_block(
-            self.builder
-                .get_insert_block()
-                .unwrap()
-                .get_parent()
-                .unwrap(),
-            "cont_offsets",
-        );
+        let current_fn = self.current_function("generate module offset lookup")?;
+        let found_block = self.context.append_basic_block(current_fn, "found_offsets");
+        let miss_block = self.context.append_basic_block(current_fn, "miss_offsets");
+        let cont_block = self.context.append_basic_block(current_fn, "cont_offsets");
 
         // Compare against NULL
         let val_ptr = if let BasicValueEnum::PointerValue(p) = val_ptr_any {
@@ -1107,8 +1082,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             ..
         } = self.probe_read_user_core(address, size, "probe_read_user_cf")?;
 
-        let cur_block = self.builder.get_insert_block().unwrap();
-        let func = cur_block.get_parent().unwrap();
+        let func = self.current_function("generate memory read with status")?;
         let set_block = self.context.append_basic_block(func, "set_cond_err");
         let cont_block = self.context.append_basic_block(func, "read_cont");
         self.builder
@@ -1135,25 +1109,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Map DWARF register number to pt_regs offset (simplified)
     pub fn dwarf_reg_to_pt_regs_offset(&self, dwarf_reg: u16) -> Result<usize> {
         // Use platform-specific register mapping to get byte offset
-        let byte_offset = register_mapping::dwarf_reg_to_pt_regs_byte_offset(dwarf_reg).ok_or_else(
-            || {
-                let reg_name = register_mapping::dwarf_reg_to_name(dwarf_reg);
-                if matches!(reg_name, Some(name) if name.starts_with("XMM")) {
+        let byte_offset = register_mapping::dwarf_reg_to_pt_regs_byte_offset(dwarf_reg)
+            .ok_or_else(|| match register_mapping::dwarf_reg_to_name(dwarf_reg) {
+                Some(reg_name) if reg_name.starts_with("XMM") => {
                     CodeGenError::RegisterMappingError(format!(
-                        "Unsupported DWARF register: {dwarf_reg} ({}) is a SIMD/FP register; uprobe pt_regs does not expose XMM register values, so optimized float by-value parameters are unavailable unless the compiler spills them to memory",
-                        reg_name.unwrap()
-                    ))
-                } else if let Some(reg_name) = reg_name {
-                    CodeGenError::RegisterMappingError(format!(
-                        "Unsupported DWARF register: {dwarf_reg} ({reg_name})"
-                    ))
-                } else {
-                    CodeGenError::RegisterMappingError(format!(
-                        "Unsupported DWARF register: {dwarf_reg}"
+                        "Unsupported DWARF register: {dwarf_reg} ({reg_name}) is a SIMD/FP register; uprobe pt_regs does not expose XMM register values, so optimized float by-value parameters are unavailable unless the compiler spills them to memory"
                     ))
                 }
-            },
-        )?;
+                Some(reg_name) => CodeGenError::RegisterMappingError(format!(
+                    "Unsupported DWARF register: {dwarf_reg} ({reg_name})"
+                )),
+                None => CodeGenError::RegisterMappingError(format!(
+                    "Unsupported DWARF register: {dwarf_reg}"
+                )),
+            })?;
 
         // Convert byte offset to u64 array index for pt_regs access
         let u64_index = byte_offset / core::mem::size_of::<u64>();
