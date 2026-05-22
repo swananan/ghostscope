@@ -2729,8 +2729,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         .builder
                         .build_and(ok_pred, offsets_found, "md_ok_with_offsets")
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let curr = self.builder.get_insert_block().unwrap();
-                    let func = curr.get_parent().unwrap();
+                    let func = self.current_function("compile memdump status branch")?;
                     let ok_b = self.context.append_basic_block(func, "md_ok");
                     let err_b = self.context.append_basic_block(func, "md_err");
                     let cont_b = self.context.append_basic_block(func, "md_cont");
@@ -2861,8 +2860,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         .into_int_value();
 
                     // If effective length is zero, mark status and skip read.
-                    let curr = self.builder.get_insert_block().unwrap();
-                    let func = curr.get_parent().unwrap();
+                    let func = self.current_function("compile memdump dynamic length branch")?;
                     let zero_b = self.context.append_basic_block(func, "mdd_len_zero");
                     let read_b = self.context.append_basic_block(func, "mdd_len_read");
                     let cont_b = self.context.append_basic_block(func, "mdd_cont");
@@ -3229,8 +3227,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         module_for_offsets.as_deref(),
                     )?;
                     let offsets_found = src_addr.offsets_found;
-                    let current_block = self.builder.get_insert_block().unwrap();
-                    let current_fn = current_block.get_parent().unwrap();
+                    let current_fn = self.current_function("compile complex variable read")?;
                     let cont2_block = self.context.append_basic_block(current_fn, "after_read");
                     let skip_block = self.context.append_basic_block(current_fn, "offsets_skip");
                     let found_block = self.context.append_basic_block(current_fn, "offsets_found");
@@ -4651,8 +4648,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_int_to_ptr(src_addr.value, ptr_type, "src_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let offsets_found = src_addr.offsets_found;
-        let current_block = self.builder.get_insert_block().unwrap();
-        let current_fn = current_block.get_parent().unwrap();
+        let current_fn = self.current_function("generate print complex variable runtime")?;
         let cont_block = self.context.append_basic_block(current_fn, "after_read");
         let skip_block = self.context.append_basic_block(current_fn, "offsets_skip");
         let found_block = self.context.append_basic_block(current_fn, "offsets_found");

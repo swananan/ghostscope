@@ -968,8 +968,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "memcmp_len_is_zero",
             )
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let curr_block = self.builder.get_insert_block().unwrap();
-        let func = curr_block.get_parent().unwrap();
+        let func = self.current_function("compile memcmp length branch")?;
         let zero_b = self.context.append_basic_block(func, "memcmp_len_zero");
         let nz_b = self.context.append_basic_block(func, "memcmp_len_nz");
         let cont_b = self.context.append_basic_block(func, "memcmp_len_cont");
@@ -983,7 +982,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_unconditional_branch(cont_b)
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let zero_block = self.builder.get_insert_block().unwrap();
+        let zero_block = self.current_insert_block("finish memcmp zero-length block")?;
 
         // Non-zero branch: perform reads and compare
         self.builder.position_at_end(nz_b);
@@ -1192,8 +1191,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .builder
                 .build_or(not_a, not_b, "memcmp_any_fail")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-            let cur_block = self.builder.get_insert_block().unwrap();
-            let func = cur_block.get_parent().unwrap();
+            let func = self.current_function("compile memcmp condition error branch")?;
             let set_b = self.context.append_basic_block(func, "memcmp_set_err");
             let cont_b = self.context.append_basic_block(func, "memcmp_cont");
             self.builder
@@ -1211,12 +1209,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .builder
                 .build_not(ok_b, "memcmp_fail_b_val")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-            let cur_fn = self
-                .builder
-                .get_insert_block()
-                .unwrap()
-                .get_parent()
-                .unwrap();
+            let cur_fn = self.current_function("compile memcmp failure address branch")?;
             let set_a_bb = self.context.append_basic_block(cur_fn, "set_addr_a");
             let check_b_bb = self.context.append_basic_block(cur_fn, "check_fail_b");
             let set_b_bb = self.context.append_basic_block(cur_fn, "set_addr_b");
@@ -1394,7 +1387,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_unconditional_branch(cont_b)
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let nz_block = self.builder.get_insert_block().unwrap();
+        let nz_block = self.current_insert_block("finish memcmp non-zero block")?;
 
         // Merge
         self.builder.position_at_end(cont_b);
@@ -1639,8 +1632,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let (bounded_len, len_is_zero) =
             self.compile_bounded_compare_len_i32(n_expr, cmp_bound, "strncmp")?;
 
-        let curr_block = self.builder.get_insert_block().unwrap();
-        let func = curr_block.get_parent().unwrap();
+        let func = self.current_function("compile strncmp length branch")?;
         let zero_b = self.context.append_basic_block(func, "strncmp_len_zero");
         let nz_b = self.context.append_basic_block(func, "strncmp_len_nz");
         let final_b = self.context.append_basic_block(func, "strncmp_len_cont");
@@ -1653,7 +1645,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_unconditional_branch(final_b)
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let zero_block = self.builder.get_insert_block().unwrap();
+        let zero_block = self.current_insert_block("finish strncmp zero-length block")?;
 
         self.builder.position_at_end(nz_b);
 
@@ -1711,8 +1703,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // If in condition context and read failed, set condition error code = 1 (ProbeReadFailed)
         if self.condition_context_active {
-            let cur_block = self.builder.get_insert_block().unwrap();
-            let func = cur_block.get_parent().unwrap();
+            let func = self.current_function("compile strncmp condition error branch")?;
             let set_b = self.context.append_basic_block(func, "strncmp_set_err");
             let cont_b = self.context.append_basic_block(func, "strncmp_cont");
             let not_ok = self
@@ -1800,7 +1791,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_unconditional_branch(final_b)
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-        let nz_block = self.builder.get_insert_block().unwrap();
+        let nz_block = self.current_insert_block("finish strncmp non-zero block")?;
 
         self.builder.position_at_end(final_b);
         let result_phi = self
