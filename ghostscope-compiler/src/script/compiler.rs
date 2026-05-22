@@ -114,6 +114,12 @@ impl<'a> AstCompiler<'a> {
 
         // AST will be saved immediately when we know the target details in generate_ebpf_for_target
 
+        if program.statements.is_empty() {
+            return Err(CompileError::Other(
+                "script must contain at least one top-level trace statement".to_string(),
+            ));
+        }
+
         // Single-pass traversal: process each statement immediately
         // Continue processing even if some trace points fail
         let mut successful_trace_points = 0;
@@ -195,8 +201,9 @@ impl<'a> AstCompiler<'a> {
                     }
                 }
                 _ => {
-                    warn!("Skipping non-trace statement: {:?}", stmt);
-                    // TODO: Non-trace statements are ignored in current implementation
+                    let message = Self::top_level_statement_error(stmt);
+                    error!("{message}");
+                    return Err(CompileError::Other(message));
                 }
             }
         }
@@ -261,6 +268,21 @@ impl<'a> AstCompiler<'a> {
             .as_deref()
             .map(str::trim)
             .filter(|path| !path.is_empty())
+    }
+
+    fn top_level_statement_error(statement: &Statement) -> String {
+        let kind = match statement {
+            Statement::Print(_) => "print",
+            Statement::Backtrace => "backtrace",
+            Statement::Expr(_) => "expression",
+            Statement::VarDeclaration { .. } | Statement::AliasDeclaration { .. } => "let",
+            Statement::If { .. } => "if",
+            Statement::Block(_) => "block",
+            Statement::TracePoint { .. } => "trace",
+        };
+        format!(
+            "top-level {kind} statement is not allowed in a script file; put executable statements inside a trace block, for example: trace <target> {{ ... }}"
+        )
     }
 
     /// Process a trace point: resolve target + generate eBPF in one step
