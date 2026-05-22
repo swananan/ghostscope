@@ -883,6 +883,36 @@ trace calculate_something {
 }
 
 #[tokio::test]
+async fn test_top_level_non_trace_statement_is_rejected() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let script_content = r#"
+print "orphan output";
+"#;
+
+    println!("=== Top-level Non-trace Statement Test ===");
+
+    let (exit_code, stdout, stderr) = run_ghostscope_with_script(script_content, 5).await?;
+
+    println!("Exit code: {exit_code}");
+    println!("STDOUT: {stdout}");
+    println!("STDERR: {stderr}");
+    println!("==========================================");
+
+    assert_ne!(
+        exit_code, 0,
+        "top-level non-trace statements should fail. stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("top-level") && stderr.contains("trace"),
+        "expected a top-level trace error. stderr={stderr} stdout={stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_format_mismatch() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();
