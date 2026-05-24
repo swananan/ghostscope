@@ -3,7 +3,10 @@
 //! Converts PrintComplexVariable/PrintComplexFormat payloads into formatted text in user space.
 
 use crate::trace_context::TraceContext;
-use crate::trace_event::VariableStatus;
+use crate::trace_event::{
+    VariableStatus, VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET,
+    VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET, VARIABLE_READ_ERROR_PAYLOAD_LEN,
+};
 use crate::type_info::TypeInfo;
 
 // Removed legacy simple variable wrapper; use complex paths only.
@@ -616,11 +619,21 @@ impl FormatPrinter {
         }
 
         // Build error prefix based on status and optional payload (errno:i32 + addr:u64)
-        let (errno, addr) = if data.len() >= 12 {
-            let errno = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            let addr = u64::from_le_bytes([
-                data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
-            ]);
+        let (errno, addr) = if data.len() >= VARIABLE_READ_ERROR_PAYLOAD_LEN {
+            let errno_start = VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET;
+            let errno_end = errno_start + std::mem::size_of::<i32>();
+            let addr_start = VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET;
+            let addr_end = addr_start + std::mem::size_of::<u64>();
+            let errno = i32::from_le_bytes(
+                data[errno_start..errno_end]
+                    .try_into()
+                    .expect("read-error errno payload length checked"),
+            );
+            let addr = u64::from_le_bytes(
+                data[addr_start..addr_end]
+                    .try_into()
+                    .expect("read-error addr payload length checked"),
+            );
             (Some(errno), Some(addr))
         } else {
             (None, None)

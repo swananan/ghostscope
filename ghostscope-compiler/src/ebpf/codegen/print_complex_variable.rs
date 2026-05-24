@@ -29,15 +29,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_store(inst_buffer, inst_type_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
-        // Write data_length (u16) at offset 1
+        // Write data_length (u16)
         // SAFETY: inst_buffer points at a reserved PrintComplexVariable instruction
-        // region and offset 1 is the InstructionHeader data_length field.
+        // region and the offset is derived from InstructionHeader.
         let data_length_ptr = unsafe {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
                     inst_buffer,
-                    &[self.context.i32_type().const_int(1, false)],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(INSTRUCTION_HEADER_DATA_LENGTH_OFFSET as u64, false)],
                     "data_length_ptr",
                 )
                 .map_err(|e| {
@@ -382,8 +385,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let header_size = std::mem::size_of::<InstructionHeader>();
         let data_struct_size = std::mem::size_of::<PrintComplexVariableData>();
-        // Reserve enough space to hold either the value (read_len) or an error payload (12 bytes)
-        let reserved_payload = std::cmp::max(data_len, 12);
+        // Reserve enough space to hold either the value (read_len) or an error payload.
+        let reserved_payload = std::cmp::max(data_len, VARIABLE_READ_ERROR_PAYLOAD_LEN);
         let total_data_length = data_struct_size + access_path_len + reserved_payload;
         let total_size = header_size + total_data_length;
         tracing::trace!(
@@ -416,15 +419,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         );
 
         // Write InstructionHeader
-        // data_length field (u16) at offset 1
         // SAFETY: inst_buffer points at a reserved PrintComplexVariable instruction
-        // region and offset 1 is the InstructionHeader data_length field.
+        // region and the offset is derived from InstructionHeader.
         let data_length_ptr = unsafe {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
                     inst_buffer,
-                    &[self.context.i32_type().const_int(1, false)],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(INSTRUCTION_HEADER_DATA_LENGTH_OFFSET as u64, false)],
                     "data_length_ptr",
                 )
                 .map_err(|e| {
@@ -788,7 +793,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_conditional_branch(is_err, err_block, ok_block)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-        // Error: status=2 (read_user failed); attach errno+addr payload and set data_len=12
+        // Error: status=2 (read_user failed); attach errno+addr payload.
         self.builder.position_at_end(err_block);
         // Only set ReadError if status is still Ok (preserve OffsetsUnavailable etc.)
         let cur_status1 = self
@@ -816,18 +821,34 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_store(status_ptr, new_status1)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        // data_len = 12 (errno:i32 + addr:u64)
+        // data_len = errno:i32 + addr:u64
         self.builder
             .build_store(
                 data_len_ptr_cast,
-                self.context.i16_type().const_int(12, false),
+                self.context
+                    .i16_type()
+                    .const_int(VARIABLE_READ_ERROR_PAYLOAD_LEN as u64, false),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        // write errno at [0..4]
+        // write errno field
+        // SAFETY: variable_data_ptr points at the read-error payload.
+        let errno_ptr_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    variable_data_ptr,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET as u64, false)],
+                    "errno_ptr_i8",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get errno GEP: {e}")))?
+        };
         let errno_ptr = self
             .builder
             .build_pointer_cast(
-                variable_data_ptr,
+                errno_ptr_i8,
                 self.context.ptr_type(AddressSpace::default()),
                 "errno_ptr",
             )
@@ -836,14 +857,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_store(errno_ptr, errno)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store errno: {e}")))?;
-        // write addr at [4..12]
-        // SAFETY: the error payload reserves 12 bytes, so addr starts at byte 4.
+        // write addr field
+        // SAFETY: the error payload reserves enough bytes for the addr field.
         let addr_ptr_i8 = unsafe {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
                     variable_data_ptr,
-                    &[self.context.i32_type().const_int(4, false)],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET as u64, false)],
                     "addr_ptr_i8",
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get addr GEP: {e}")))?
