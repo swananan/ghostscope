@@ -504,20 +504,24 @@ impl StreamingTraceParser {
                 let mut data_offset = std::mem::size_of::<PrintComplexFormatData>();
 
                 for _ in 0..format_data.arg_count {
-                    if data_offset + 7 > inst_data.len() {
+                    if data_offset + PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET > inst_data.len() {
                         return Err("Invalid PrintComplexFormat argument data".to_string());
                     }
 
                     // Read complex variable header: var_name_index, type_index, access_path_len, status
-                    let var_name_index =
-                        u16::from_le_bytes([inst_data[data_offset], inst_data[data_offset + 1]]);
-                    let type_index = u16::from_le_bytes([
-                        inst_data[data_offset + 2],
-                        inst_data[data_offset + 3],
+                    let var_name_index = u16::from_le_bytes([
+                        inst_data[data_offset + PRINT_COMPLEX_FORMAT_ARG_VAR_NAME_INDEX_OFFSET],
+                        inst_data[data_offset + PRINT_COMPLEX_FORMAT_ARG_VAR_NAME_INDEX_OFFSET + 1],
                     ]);
-                    let access_path_len = inst_data[data_offset + 4] as usize;
-                    let status = inst_data[data_offset + 5];
-                    data_offset += 6; // 2+2+1(status)+1(ap_len)
+                    let type_index = u16::from_le_bytes([
+                        inst_data[data_offset + PRINT_COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET],
+                        inst_data[data_offset + PRINT_COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET + 1],
+                    ]);
+                    let access_path_len = inst_data
+                        [data_offset + PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_LEN_OFFSET]
+                        as usize;
+                    let status = inst_data[data_offset + PRINT_COMPLEX_FORMAT_ARG_STATUS_OFFSET];
+                    data_offset += PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET;
 
                     // Read access path
                     if data_offset + access_path_len > inst_data.len() {
@@ -528,12 +532,12 @@ impl StreamingTraceParser {
                     data_offset += access_path_len;
 
                     // Read data length
-                    if data_offset + 2 > inst_data.len() {
+                    if data_offset + PRINT_COMPLEX_FORMAT_ARG_DATA_LEN_SIZE > inst_data.len() {
                         return Err("Invalid PrintComplexFormat data length".to_string());
                     }
                     let data_len =
                         u16::from_le_bytes([inst_data[data_offset], inst_data[data_offset + 1]]);
-                    data_offset += 2;
+                    data_offset += PRINT_COMPLEX_FORMAT_ARG_DATA_LEN_SIZE;
 
                     // Read variable data
                     if data_offset + data_len as usize > inst_data.len() {
