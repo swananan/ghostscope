@@ -77,7 +77,7 @@ jobs:
             ${{ runner.os }}-${{ github.job }}-target-
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
 
   test:
     name: Test Suite

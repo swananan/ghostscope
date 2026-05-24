@@ -266,7 +266,7 @@ pub fn init() {
     });
 
     // Register an atexit cleanup to remove built fixtures after all tests
-    REGISTER_CLEANUP.call_once(|| unsafe {
+    REGISTER_CLEANUP.call_once(|| {
         extern "C" fn cleanup_fixtures() {
             if preserve_precompiled_fixtures() {
                 return;
@@ -277,7 +277,11 @@ pub fn init() {
                 fixture.cleanup(&base);
             }
         }
-        libc::atexit(cleanup_fixtures);
+        // SAFETY: cleanup_fixtures has C ABI, captures no Rust references, and
+        // remains available for the process lifetime.
+        unsafe {
+            libc::atexit(cleanup_fixtures);
+        }
     });
 }
 

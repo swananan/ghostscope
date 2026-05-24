@@ -36,11 +36,17 @@ static mut TARGET_EXEC_COMM: Array<[u8; 16]> = Array::pinned(1, 0);
 fn write_event(ctx: &TracePointContext, mut ev: SysEvent) {
     // Prefer direct helper to avoid large memcpy/memmove codegen
     let size = core::mem::size_of::<SysEvent>() as u64;
+    // SAFETY: eBPF map statics are accessed only through BPF helper-compatible
+    // pointers while the verifier controls program concurrency.
     let map_ptr = unsafe { core::ptr::addr_of_mut!(SYS_EVENTS) } as *mut _;
     let data_ptr = &mut ev as *mut _ as *mut _;
+    // SAFETY: map_ptr points to SYS_EVENTS and data_ptr/size describe the local
+    // SysEvent value for the duration of the helper call.
     let ret = unsafe { aya_ebpf::helpers::bpf_ringbuf_output(map_ptr, data_ptr, size, 0) };
     if ret < 0 {
         // Fallback to perf event if ringbuf output fails
+        // SAFETY: SYS_EVENTS_PERF is the statically declared BPF perf map and ev
+        // remains valid for the helper call.
         let _ = unsafe { SYS_EVENTS_PERF.output(ctx, &mut ev, 0) };
     }
 }
@@ -54,8 +60,14 @@ fn current_tgid() -> u32 {
 
 #[inline(always)]
 fn exec_comm_matches() -> bool {
+    // SAFETY: TARGET_EXEC_COMM is a single-entry BPF array; get_ptr returns None
+    // when index 0 is unavailable.
     let filter = match unsafe { TARGET_EXEC_COMM.get_ptr(0) } {
-        Some(ptr) => unsafe { *ptr },
+        Some(ptr) => {
+            // SAFETY: get_ptr returned a valid pointer to the array value for this
+            // helper invocation; [u8; 16] is Copy.
+            unsafe { *ptr }
+        }
         None => return true,
     };
     if filter[0] == 0 {
@@ -93,6 +105,8 @@ pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
 #[tracepoint(name = "sched_process_fork", category = "sched")]
 pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
     let pid = current_tgid();
+    // SAFETY: ALLOWED_PIDS is the statically declared BPF hash map; aya's map API
+    // performs verifier-compatible map lookup for the stack key.
     unsafe {
         if ALLOWED_PIDS.get(&pid).is_none() {
             return 0;
@@ -106,6 +120,8 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
 #[tracepoint(name = "sched_process_exit", category = "sched")]
 pub fn sched_process_exit(ctx: TracePointContext) -> u32 {
     let pid = current_tgid();
+    // SAFETY: ALLOWED_PIDS is the statically declared BPF hash map; aya's map API
+    // performs verifier-compatible map lookup for the stack key.
     unsafe {
         if ALLOWED_PIDS.get(&pid).is_none() {
             return 0;
@@ -119,5 +135,6 @@ pub fn sched_process_exit(ctx: TracePointContext) -> u32 {
 // Required by aya-bpf for panic handling in no_std
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
+    // SAFETY: eBPF programs cannot unwind; this panic handler marks the path unreachable.
     unsafe { core::hint::unreachable_unchecked() }
 }

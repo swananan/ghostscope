@@ -71,6 +71,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
         // Store data_length field of InstructionHeader
+        // SAFETY: inst_buffer points at a reserved PrintVariableIndex instruction
+        // region and data_length is within InstructionHeader.
         let data_length_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -104,6 +106,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
         // Write PrintVariableIndexData after InstructionHeader
+        // SAFETY: variable_data_start is exactly after InstructionHeader in the
+        // reserved instruction region.
         let variable_data_start = unsafe {
             self.builder
                 .build_gep(
@@ -121,6 +125,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         };
 
         // Store var_name_index using correct offset
+        // SAFETY: var_name_index offset is within PrintVariableIndexData.
         let var_name_index_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -155,6 +160,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store var_name_index: {e}")))?;
 
         // Store type_encoding using correct offset
+        // SAFETY: type_encoding offset is within PrintVariableIndexData.
         let type_encoding_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -179,6 +185,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_encoding: {e}")))?;
 
         // Store data_len using correct offset
+        // SAFETY: data_len offset is within PrintVariableIndexData.
         let data_len_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -206,6 +213,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {e}")))?;
 
         // Store type_index using correct offset
+        // SAFETY: type_index offset is within PrintVariableIndexData.
         let type_index_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -235,6 +243,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store type_index: {e}")))?;
 
         // Store status (set to 0)
+        // SAFETY: status offset is within PrintVariableIndexData.
         let status_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -259,6 +268,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let var_data = self.resolve_variable_value(var_name, type_encoding, Some(status_ptr))?;
 
         // Store actual variable data after PrintVariableIndexData structure
+        // SAFETY: var_data_ptr starts after PrintVariableIndexData inside the
+        // reserved instruction region, which included data_size bytes.
         let var_data_ptr = unsafe {
             self.builder
                 .build_gep(

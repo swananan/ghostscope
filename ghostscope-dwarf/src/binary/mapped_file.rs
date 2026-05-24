@@ -16,6 +16,9 @@ impl MappedFile {
     pub fn open<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = std::fs::File::open(&path)?;
+        // SAFETY: The file is opened read-only and this type exposes the mapping
+        // immutably for object/DWARF parsing; callers must not concurrently modify
+        // the mapped file while the mapping is alive.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
         Ok(Self { data: mmap, path })
     }
@@ -70,7 +73,10 @@ impl Deref for DwarfBytes {
     }
 }
 
+// SAFETY: DwarfBytes dereferences into Arc-backed storage, so the slice address
+// remains stable across moves of the DwarfBytes value.
 unsafe impl gimli::StableDeref for DwarfBytes {}
+// SAFETY: Cloning DwarfBytes clones the Arc backing store and preserves stable deref.
 unsafe impl gimli::CloneStableDeref for DwarfBytes {}
 
 pub(crate) type DwarfEndian = gimli::RunTimeEndian;

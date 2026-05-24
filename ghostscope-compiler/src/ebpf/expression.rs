@@ -149,6 +149,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
+        // SAFETY: key_alloca temporarily holds the two-field pid namespace helper
+        // result, so [0, 0] addresses the pid field.
         let ns_pid_ptr = unsafe {
             self.builder.build_gep(
                 key_arr_ty,
@@ -158,6 +160,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
         }
         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        // SAFETY: key_alloca temporarily holds the two-field pid namespace helper
+        // result, so [0, 1] addresses the tgid field.
         let ns_tgid_ptr = unsafe {
             self.builder.build_gep(
                 key_arr_ty,
@@ -1025,6 +1029,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             let idx0 = i32_ty.const_zero();
             for i in 0..(cap as usize) {
                 let idx_i = i32_ty.const_int(i as u64, false);
+                // SAFETY: buf_a is a cap-sized array and i is bounded by cap.
                 let pa = unsafe {
                     self.builder
                         .build_gep(arr_a_ty, buf_a, &[idx0, idx_i], &format!("hex_a_i{i}"))
@@ -1103,6 +1108,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             let idx0 = i32_ty.const_zero();
             for i in 0..(cap as usize) {
                 let idx_i = i32_ty.const_int(i as u64, false);
+                // SAFETY: buf_b is a cap-sized array and i is bounded by cap.
                 let pb = unsafe {
                     self.builder
                         .build_gep(arr_b_ty, buf_b, &[idx0, idx_i], &format!("hex_b_i{i}"))
@@ -1328,6 +1334,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
             // a[i]
+            // SAFETY: i is bounded by cmp_bound, which is clamped to the buffer cap.
             let pa = unsafe {
                 self.builder
                     .build_gep(arr_a_ty, buf_a, &[idx0, idx_i], &format!("memcmp_a_i{i}"))
@@ -1342,6 +1349,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 _ => return Err(CodeGenError::LLVMError("memcmp load a != i8".into())),
             };
             // b[i]
+            // SAFETY: i is bounded by cmp_bound, which is clamped to the buffer cap.
             let pb = unsafe {
                 self.builder
                     .build_gep(arr_b_ty, buf_b, &[idx0, idx_i], &format!("memcmp_b_i{i}"))
@@ -1732,6 +1740,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let mut acc = self.context.i8_type().const_zero();
         for (i, b) in lit.as_bytes().iter().take(cmp_bound as usize).enumerate() {
             let idx_i = i32_ty.const_int(i as u64, false);
+            // SAFETY: i is bounded by cmp_bound, which is clamped to the buffer cap.
             let ptr_i = unsafe {
                 self.builder
                     .build_gep(arr_ty, buf_global, &[idx0, idx_i], "ch_ptr")
@@ -3952,6 +3961,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 let i32_ty = self.context.i32_type();
                 let idx0 = i32_ty.const_zero();
                 let idx_l = i32_ty.const_int(lit_len as u64, false);
+                // SAFETY: the string read requested lit_len + 1 bytes, so index
+                // lit_len is within the scratch buffer.
                 let char_ptr = unsafe {
                     self.builder
                         .build_gep(arr_ty, buf_global, &[idx0, idx_l], "nul_ptr")
@@ -3979,6 +3990,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 let mut acc = self.context.i8_type().const_zero();
                 for (i, b) in lit_bytes.iter().enumerate() {
                     let idx_i = i32_ty.const_int(i as u64, false);
+                    // SAFETY: lit_bytes length is bounded by the scratch buffer size.
                     let ptr_i = unsafe {
                         self.builder
                             .build_gep(arr_ty, buf_global, &[idx0, idx_i], "ch_ptr")
@@ -4070,6 +4082,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 let i32_ty = self.context.i32_type();
                 let idx0 = i32_ty.const_zero();
                 let idx_l = i32_ty.const_int(lit_len as u64, false);
+                // SAFETY: the string read requested lit_len + 1 bytes, so index
+                // lit_len is within the scratch buffer.
                 let char_ptr = unsafe {
                     self.builder
                         .build_gep(arr_ty, buf_global, &[idx0, idx_l], "nul_ptr")
@@ -4096,6 +4110,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 let mut acc = self.context.i8_type().const_zero();
                 for (i, b) in lit_bytes.iter().enumerate() {
                     let idx_i = i32_ty.const_int(i as u64, false);
+                    // SAFETY: lit_bytes length is bounded by the scratch buffer size.
                     let ptr_i = unsafe {
                         self.builder
                             .build_gep(arr_ty, buf_global, &[idx0, idx_i], "ch_ptr")
@@ -4184,6 +4199,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         let i32_ty = self.context.i32_type();
                         let idx0 = i32_ty.const_zero();
                         let idx_l = i32_ty.const_int(lit_len as u64, false);
+                        // SAFETY: the string read requested lit_len + 1 bytes, so
+                        // index lit_len is within the scratch buffer.
                         let char_ptr = unsafe {
                             self.builder
                                 .build_gep(arr_ty, buf_global, &[idx0, idx_l], "nul_ptr")
@@ -4214,6 +4231,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         let mut acc = self.context.i8_type().const_zero();
                         for (i, b) in lit_bytes.iter().enumerate() {
                             let idx_i = i32_ty.const_int(i as u64, false);
+                            // SAFETY: lit_bytes length is bounded by the scratch buffer size.
                             let ptr_i = unsafe {
                                 self.builder
                                     .build_gep(arr_ty, buf_global, &[idx0, idx_i], "ch_ptr")
@@ -4279,6 +4297,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         let i32_ty = self.context.i32_type();
                         let idx0 = i32_ty.const_zero();
                         let idx_l = i32_ty.const_int(lit_len as u64, false);
+                        // SAFETY: the string read requested lit_len + 1 bytes, so
+                        // index lit_len is within the scratch buffer.
                         let char_ptr = unsafe {
                             self.builder
                                 .build_gep(arr_ty, buf_global, &[idx0, idx_l], "nul_ptr")
@@ -4308,6 +4328,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         let mut acc = self.context.i8_type().const_zero();
                         for (i, b) in lit_bytes.iter().enumerate() {
                             let idx_i = i32_ty.const_int(i as u64, false);
+                            // SAFETY: lit_bytes length is bounded by the scratch buffer size.
                             let ptr_i = unsafe {
                                 self.builder
                                     .build_gep(arr_ty, buf_global, &[idx0, idx_i], "ch_ptr")

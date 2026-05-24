@@ -28,6 +28,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
         // data_length
+        // SAFETY: inst_buffer points at a reserved ExprError instruction region
+        // and data_length is within InstructionHeader.
         let data_length_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -61,6 +63,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // Payload fields after header
         // string_index at offset sizeof(InstructionHeader) + 0 (u16)
+        // SAFETY: the payload immediately follows InstructionHeader in the
+        // reserved ExprError instruction region.
         let si_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -95,6 +99,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store string_index: {e}")))?;
 
         // error_code at +2, flags at +3
+        // SAFETY: error_code offset is within ExprErrorData in the reserved payload.
         let ec_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -125,6 +130,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_store(ec_ptr, ec_i8)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store error_code: {e}")))?;
+        // SAFETY: flags offset is within ExprErrorData in the reserved payload.
         let fl_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -155,6 +161,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store flags: {e}")))?;
 
         // failing_addr at +4 (u64)
+        // SAFETY: failing_addr offset is within ExprErrorData in the reserved payload.
         let addr_ptr = unsafe {
             self.builder
                 .build_gep(

@@ -6,6 +6,7 @@ const TERMINATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[cfg(unix)]
 pub(crate) fn send_sigterm(pid: u32, label: &str) -> anyhow::Result<()> {
+    // SAFETY: libc::kill has no pointer arguments; pid and signal are plain values.
     let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     if rc == 0 {
         return Ok(());

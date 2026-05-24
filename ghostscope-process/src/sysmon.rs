@@ -505,6 +505,8 @@ fn run_sysmon_loop(
             while let Some(item) = rb.next() {
                 had_event = true;
                 if item.len() == core::mem::size_of::<SysEvent>() {
+                    // SAFETY: The ring buffer sample length was checked to match SysEvent;
+                    // read_unaligned handles any alignment from the byte slice.
                     let ev = unsafe { core::ptr::read_unaligned(item.as_ptr() as *const SysEvent) };
                     if let Err(e) = ProcessSysmon::handle_event(&mgr, &target, &pending, &ev) {
                         tracing::debug!(
@@ -556,6 +558,8 @@ fn run_sysmon_loop(
                             copied += take;
                         }
                         if copied == raw.len() {
+                            // SAFETY: raw is exactly the size of SysEvent and read_unaligned
+                            // handles the byte array's alignment.
                             let ev = unsafe {
                                 core::ptr::read_unaligned(raw.as_ptr() as *const SysEvent)
                             };
