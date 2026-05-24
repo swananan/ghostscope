@@ -61,6 +61,7 @@ fn effective_capabilities() -> Option<u64> {
 /// Ensure the current process has the privileges required for eBPF interaction.
 /// Exits with an error message if neither root nor sufficient capabilities are present.
 pub fn ensure_privileges() {
+    // SAFETY: geteuid has no preconditions and does not dereference user pointers.
     let euid = unsafe { libc::geteuid() };
     if euid == 0 {
         return;

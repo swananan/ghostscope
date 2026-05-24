@@ -224,7 +224,9 @@ pub struct ProcModuleOffsetsValue {
     pub bss: u64,
 }
 
+// SAFETY: ProcModuleKey is repr(C), Copy, and contains only plain integer fields.
 unsafe impl aya::Pod for ProcModuleKey {}
+// SAFETY: ProcModuleOffsetsValue is repr(C), Copy, and contains only plain integer fields.
 unsafe impl aya::Pod for ProcModuleOffsetsValue {}
 
 #[repr(C)]
@@ -233,6 +235,7 @@ pub struct PidAliasValue {
     pub proc_pid: u32,
 }
 
+// SAFETY: PidAliasValue is repr(C), Copy, and contains only a plain integer field.
 unsafe impl aya::Pod for PidAliasValue {}
 
 impl ProcModuleOffsetsValue {

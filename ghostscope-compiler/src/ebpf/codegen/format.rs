@@ -475,6 +475,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_store(buffer, inst_type_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
         // data_length at +1
+        // SAFETY: buffer points at a reserved PrintComplexFormat instruction
+        // region and offset 1 is the InstructionHeader data_length field.
         let data_length_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -504,6 +506,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
         // Write PrintComplexFormatData at offset 4
+        // SAFETY: PrintComplexFormatData starts immediately after InstructionHeader
+        // at offset 4 in the reserved instruction region.
         let data_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -534,6 +538,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_store(fsi_ptr, fsi_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store fsi: {e}")))?;
         // arg_count (u8) at +2
+        // SAFETY: arg_count offset is within PrintComplexFormatData.
         let arg_cnt_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -558,6 +563,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             let reserved_len = effective_reserved[arg_index];
 
             // Base pointer = data_ptr + offset
+            // SAFETY: offset is advanced by the statically computed per-argument
+            // payload sizes and remains within the reserved instruction region.
             let arg_base = unsafe {
                 self.builder
                     .build_gep(
@@ -590,6 +597,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to store vni: {e}")))?;
 
             // type_index(u16) at +2
+            // SAFETY: type_index offset is within the per-argument payload header.
             let ti_ptr = unsafe {
                 self.builder
                     .build_gep(
@@ -618,6 +626,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to store ti: {e}")))?;
 
             // status(u8) at +5
+            // SAFETY: status offset is within the per-argument payload header.
             let apl_ptr = unsafe {
                 self.builder
                     .build_gep(
@@ -635,6 +644,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {e}")))?;
 
             // access_path_len(u8) at +4
+            // SAFETY: access_path_len offset is within the per-argument payload header.
             let apl_ptr2 = unsafe {
                 self.builder
                     .build_gep(
@@ -656,6 +666,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
             // access_path bytes at +6..+6+len
             for (i, b) in a.access_path.iter().enumerate() {
+                // SAFETY: i is bounded by access_path.len(), which was included in
+                // the per-argument reserved payload length.
                 let byte_ptr = unsafe {
                     self.builder
                         .build_gep(
@@ -676,6 +688,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
 
             // data_len(u16) at +6+path_len (store reserved_len to keep layout consistent)
+            // SAFETY: data_len follows the access path bytes inside the reserved
+            // per-argument payload.
             let dl_ptr = unsafe {
                 self.builder
                     .build_gep(
@@ -707,6 +721,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {e}")))?;
 
             // variable data starts at +8+path_len
+            // SAFETY: var_data_ptr follows the per-argument header and access path
+            // inside the reserved payload.
             let var_data_ptr = unsafe {
                 self.builder
                     .build_gep(
@@ -728,6 +744,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             match &a.source {
                 ComplexArgSource::ImmediateBytes { bytes, .. } => {
                     for (i, b) in bytes.iter().enumerate() {
+                        // SAFETY: i is bounded by bytes.len(), and immediate bytes
+                        // are included in the per-argument reserved payload.
                         let byte_ptr = unsafe {
                             self.builder
                                 .build_gep(
@@ -874,6 +892,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     self.builder
                         .build_store(errno_ptr, errno)
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    // SAFETY: read-error payload reserves 12 bytes, so addr starts
+                    // at byte 4 after the errno field.
                     let addr_ptr_i8 = unsafe {
                         self.builder
                             .build_gep(
@@ -1099,6 +1119,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                     }
                     if eff_max_len as usize >= DYNAMIC_READ_ERROR_PAYLOAD_LEN {
+                        // SAFETY: eff_max_len is at least the 12-byte read-error
+                        // payload, so addr starts at byte 4 after errno.
                         let addr_ptr_i8 = unsafe {
                             self.builder
                                 .build_gep(
@@ -1281,6 +1303,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                         &format!("expr_byte_{i}"),
                                     )
                                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                // SAFETY: i is bounded by n, the immediate payload
+                                // size reserved for this argument.
                                 let byte_ptr = unsafe {
                                     self.builder
                                         .build_gep(
@@ -1423,6 +1447,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         CodeGenError::LLVMError(format!("Failed to store errno: {e}"))
                     })?;
                     // write addr at [4..12]
+                    // SAFETY: read-error payload reserves 12 bytes, so addr starts
+                    // at byte 4 after the errno field.
                     let addr_ptr_i8 = unsafe {
                         self.builder
                             .build_gep(

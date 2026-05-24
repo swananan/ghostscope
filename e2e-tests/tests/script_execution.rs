@@ -396,6 +396,8 @@ fn ensure_global_cleanup_registered() {
             println!("🧹 Global cleanup completed");
         }
 
+        // SAFETY: cleanup_on_exit has C ABI, captures no Rust references, and
+        // remains available for the process lifetime.
         unsafe {
             libc::atexit(cleanup_on_exit);
         }

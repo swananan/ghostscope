@@ -114,6 +114,8 @@ pub mod math {
 }
 
 fn touch_globals() -> i32 {
+    // SAFETY: This single-threaded fixture mutates its own static test globals to
+    // keep DWARF global-variable scenarios observable.
     unsafe {
         G_COUNTER = G_COUNTER.wrapping_add(1);
         CONFIG.a = CONFIG.a.wrapping_add(1);

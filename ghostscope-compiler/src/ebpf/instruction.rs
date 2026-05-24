@@ -170,6 +170,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .builder
             .build_int_z_extend(offset_val, i64_ty, "off64")
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to extend offset: {e}")))?;
+        // SAFETY: the reserve bounds check proved offset_val..offset_val+size fits
+        // inside the accumulation buffer.
         let dest_i8 = unsafe {
             self.builder
                 .build_gep(self.context.i8_type(), accum_buffer, &[off64], "dest_i8")
@@ -363,6 +365,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // timestamp at offset 8
         let timestamp = self.get_current_timestamp()?;
+        // SAFETY: message_buffer points at a reserved trace event header region
+        // and the timestamp offset is within that header.
         let timestamp_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -393,6 +397,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let (event_pid, event_tid) = self.get_host_pid_tid_values()?;
 
         // Store pid at offset 16
+        // SAFETY: message_buffer points at a reserved trace event header region
+        // and the pid offset is within that header.
         let pid_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -419,6 +425,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store pid: {e}")))?;
 
         // Store tid at offset 20
+        // SAFETY: message_buffer points at a reserved trace event header region
+        // and the tid offset is within that header.
         let tid_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -476,6 +484,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
         // data_length at offset 1
+        // SAFETY: end_buffer points at a reserved EndInstruction region and
+        // data_length is within InstructionHeader.
         let data_length_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -509,6 +519,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // Write EndInstructionData at offset 4
         // total_instructions
+        // SAFETY: EndInstructionData starts at END_INSTRUCTION_DATA_OFFSET inside
+        // the reserved EndInstruction region.
         let total_instructions_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -545,6 +557,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             })?;
 
         // execution_status at offset 6
+        // SAFETY: execution_status offset is within EndInstructionData in the
+        // reserved EndInstruction region.
         let status_ptr = unsafe {
             self.builder
                 .build_gep(

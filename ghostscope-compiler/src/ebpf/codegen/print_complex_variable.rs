@@ -30,6 +30,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
         // Write data_length (u16) at offset 1
+        // SAFETY: inst_buffer points at a reserved PrintComplexVariable instruction
+        // region and offset 1 is the InstructionHeader data_length field.
         let data_length_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -60,6 +62,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
         // Data pointer (after header)
+        // SAFETY: data_ptr starts immediately after InstructionHeader in the
+        // reserved instruction region.
         let data_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -78,6 +82,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .const_int(var_name_index as u64, false);
         let var_name_index_off =
             std::mem::offset_of!(PrintComplexVariableData, var_name_index) as u64;
+        // SAFETY: var_name_index_off is generated from PrintComplexVariableData.
         let var_name_index_ptr_i8 = unsafe {
             self.builder
                 .build_gep(
@@ -106,6 +111,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // type_index (u16)
         let type_index_offset = std::mem::offset_of!(PrintComplexVariableData, type_index) as u64;
+        // SAFETY: type_index_offset is generated from PrintComplexVariableData.
         let type_index_ptr_i8 = unsafe {
             self.builder
                 .build_gep(
@@ -134,6 +140,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // access_path_len (u8) = 0
         let access_path_len_off =
             std::mem::offset_of!(PrintComplexVariableData, access_path_len) as u64;
+        // SAFETY: access_path_len_off is generated from PrintComplexVariableData.
         let access_path_len_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -157,6 +164,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // status (u8) = 0
         let status_off = std::mem::offset_of!(PrintComplexVariableData, status) as u64;
+        // SAFETY: status_off is generated from PrintComplexVariableData.
         let status_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -173,6 +181,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // data_len (u16)
         let data_len_off = std::mem::offset_of!(PrintComplexVariableData, data_len) as u64;
+        // SAFETY: data_len_off is generated from PrintComplexVariableData.
         let data_len_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -199,6 +208,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {e}")))?;
 
         // variable data starts right after PrintComplexVariableData (no access path)
+        // SAFETY: total_size reserved byte_len bytes after PrintComplexVariableData.
         let var_data_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -321,6 +331,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             &format!("expr_byte_{i}"),
                         )
                         .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    // SAFETY: i is bounded by byte_len and var_data_ptr covers byte_len bytes.
                     let byte_ptr = unsafe {
                         self.builder
                             .build_gep(
@@ -406,6 +417,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // Write InstructionHeader
         // data_length field (u16) at offset 1
+        // SAFETY: inst_buffer points at a reserved PrintComplexVariable instruction
+        // region and offset 1 is the InstructionHeader data_length field.
         let data_length_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -440,6 +453,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         );
 
         // Data pointer (after header)
+        // SAFETY: data_ptr starts immediately after InstructionHeader in the
+        // reserved instruction region.
         let data_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -459,6 +474,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Store var_name_index at offset offsetof(PrintComplexVariableData, var_name_index)
         let var_name_index_off =
             std::mem::offset_of!(PrintComplexVariableData, var_name_index) as u64;
+        // SAFETY: var_name_index_off is generated from PrintComplexVariableData.
         let var_name_index_ptr_i8 = unsafe {
             self.builder
                 .build_gep(
@@ -492,6 +508,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // type_index (u16) right after var_name_index
         // type_index at offset offsetof(PrintComplexVariableData, type_index) = 2
         let type_index_offset = std::mem::offset_of!(PrintComplexVariableData, type_index) as u64;
+        // SAFETY: type_index_offset is generated from PrintComplexVariableData.
         let type_index_ptr_i8 = unsafe {
             self.builder
                 .build_gep(
@@ -528,6 +545,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // access_path_len at offset offsetof(..., access_path_len)
         let access_path_len_off =
             std::mem::offset_of!(PrintComplexVariableData, access_path_len) as u64;
+        // SAFETY: access_path_len_off is generated from PrintComplexVariableData.
         let access_path_len_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -560,6 +578,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // status (u8) at offset offsetof(..., status)
         let status_off = std::mem::offset_of!(PrintComplexVariableData, status) as u64;
+        // SAFETY: status_off is generated from PrintComplexVariableData.
         let status_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -583,6 +602,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // data_len (u16)
         let data_len_off = std::mem::offset_of!(PrintComplexVariableData, data_len) as u64;
+        // SAFETY: data_len_off is generated from PrintComplexVariableData.
         let data_len_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -615,6 +635,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Optimized-out case is handled earlier by resolving to an OptimizedOut type and ImmediateBytes path.
 
         // access_path bytes start after PrintComplexVariableData
+        // SAFETY: total_size reserved access_path_len bytes after PrintComplexVariableData.
         let access_path_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -633,6 +654,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // Copy access path bytes
         for (i, &byte) in access_path_bytes.iter().enumerate().take(access_path_len) {
+            // SAFETY: i is bounded by access_path_len and access_path_ptr covers that region.
             let byte_ptr = unsafe {
                 self.builder
                     .build_gep(
@@ -655,6 +677,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         // Variable data starts after access_path
+        // SAFETY: variable_data_ptr starts after the reserved access_path bytes and
+        // total_size reserved the payload region.
         let variable_data_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -813,6 +837,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_store(errno_ptr, errno)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store errno: {e}")))?;
         // write addr at [4..12]
+        // SAFETY: the error payload reserves 12 bytes, so addr starts at byte 4.
         let addr_ptr_i8 = unsafe {
             self.builder
                 .build_gep(

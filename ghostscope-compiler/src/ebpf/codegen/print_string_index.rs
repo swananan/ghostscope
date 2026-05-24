@@ -28,6 +28,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // Fill instruction header using byte offsets
         // inst_type at offset 0 (first field of InstructionHeader)
+        // SAFETY: inst_buffer points at a reserved PrintStringIndex instruction
+        // region and inst_type is within InstructionHeader.
         let inst_type_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -49,6 +51,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_store(inst_type_ptr, inst_type_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
+        // SAFETY: inst_buffer points at a reserved PrintStringIndex instruction
+        // region and data_length is within InstructionHeader.
         let data_length_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -81,6 +85,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
         // Fill string index data (after InstructionHeader)
+        // SAFETY: the string index payload starts immediately after InstructionHeader
+        // in the reserved PrintStringIndex instruction region.
         let string_index_ptr = unsafe {
             self.builder
                 .build_gep(

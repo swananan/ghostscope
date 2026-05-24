@@ -71,6 +71,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 let i32_type = self.context.i32_type();
                 let key_arr_ty = i32_type.array_type(4);
                 let zero = i32_type.const_zero();
+                // SAFETY: pm_key_alloca is a [4 x i32] entry-block alloca and
+                // [0, 0] addresses its first byte-compatible element.
                 return unsafe {
                     self.builder
                         .build_gep(
@@ -121,6 +123,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         })?;
         let key_arr_ty = i32_type.array_type(4);
         let zero = i32_type.const_zero();
+        // SAFETY: key_alloca is the [4 x i32] pm_key stack slot and [0, 0]
+        // addresses the pid key element.
         let key_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -452,6 +456,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         })?;
         // Get i32* to the first element (&key[0])
         let zero = i32_type.const_zero();
+        // SAFETY: key_alloca is the [4 x i32] pm_key stack slot and [0, 0]
+        // addresses the first element.
         let base_i32_ptr = unsafe {
             self.builder
                 .build_gep(key_arr_ty, key_alloca, &[zero, zero], "pm_key_i32_ptr")
@@ -534,6 +540,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     "offset_ns_helper_ok",
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            // SAFETY: key_alloca temporarily holds the two-field pid namespace
+            // helper result, so [0, 1] addresses the tgid field.
             let ns_tgid_ptr = unsafe {
                 self.builder.build_gep(
                     key_arr_ty,
@@ -568,6 +576,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // Zero padding at key[1] for deterministic key bytes
         let idx1 = i32_type.const_int(1, false);
+        // SAFETY: base_i32_ptr points to key[0] of a four-element i32 array; index
+        // 1 is the padding field.
         let pad_ptr = unsafe {
             self.builder
                 .build_gep(self.context.i32_type(), base_i32_ptr, &[idx1], "pad_ptr")
@@ -583,6 +593,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let idx2 = i32_type.const_int(2, false);
         let idx3 = i32_type.const_int(3, false);
         // key[1] left as padding = 0 by default
+        // SAFETY: base_i32_ptr points to key[0] of a four-element i32 array; index
+        // 2 is the low cookie word.
         let cookie_lo_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -593,6 +605,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 )
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
         };
+        // SAFETY: base_i32_ptr points to key[0] of a four-element i32 array; index
+        // 3 is the high cookie word.
         let cookie_hi_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -673,6 +687,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
          -> Result<IntValue<'ctx>> {
             // GEP in i64 element space
             let idx_i32 = ctx.context.i32_type().const_int(idx, false);
+            // SAFETY: val_u64_ptr points at ProcModuleOffsetsValue, represented as
+            // four contiguous u64 fields; idx is one of 0..=3.
             let field_ptr = unsafe {
                 ctx.builder
                     .build_gep(ctx.context.i64_type(), base, &[idx_i32], "field_ptr_i64")
@@ -792,6 +808,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let i64_type = self.context.i64_type();
         let offset_value = i64_type.const_int(pt_regs_offset as u64, false);
 
+        // SAFETY: pt_regs_offset was converted to a u64 slot index by the platform
+        // register mapping, so the generated access targets a pt_regs register slot.
         let reg_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -1567,6 +1585,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             CodeGenError::LLVMError("pm_key not allocated in entry block".to_string())
         })?;
         let zero = i32_ty.const_zero();
+        // SAFETY: key_alloca is the [4 x i32] pm_key stack slot and [0, 0]
+        // addresses the first key element.
         let base_i32_ptr = unsafe {
             self.builder
                 .build_gep(key_arr_ty, key_alloca, &[zero, zero], "percpu_key_i32_ptr")

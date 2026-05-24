@@ -806,6 +806,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
         self.builder.position_at_end(helper_ok_block);
+        // SAFETY: pidns_info_alloca has the pid namespace helper result layout
+        // [pid, tgid], so [0, 1] addresses the tgid field.
         let tgid_ptr = unsafe {
             self.builder.build_gep(
                 pidns_info_ty,

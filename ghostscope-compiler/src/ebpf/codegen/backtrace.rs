@@ -17,6 +17,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .into_value_after_runtime_returns();
 
         // Write InstructionHeader.inst_type
+        // SAFETY: inst_buffer points at a reserved instruction region and the
+        // offset is within InstructionHeader.
         let inst_type_ptr = unsafe {
             self.builder
                 .build_gep(
@@ -39,6 +41,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
         // Write InstructionHeader.data_length (u16)
+        // SAFETY: inst_buffer points at a reserved instruction region and the
+        // data_length offset is within InstructionHeader.
         let data_length_ptr = unsafe {
             self.builder
                 .build_gep(

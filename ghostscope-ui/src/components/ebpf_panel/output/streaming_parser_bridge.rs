@@ -79,6 +79,8 @@ mod tests {
         };
 
         // Convert header to bytes
+        // SAFETY: test_header lives for the duration of header_bytes and the slice
+        // length is exactly the size of TraceEventHeader.
         let header_bytes = unsafe {
             std::slice::from_raw_parts(
                 &test_header as *const _ as *const u8,

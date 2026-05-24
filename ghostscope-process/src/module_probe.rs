@@ -49,6 +49,9 @@ impl ModuleProbe {
         let ino = meta.ino();
         let metadata_cookie = ((dev & 0xffff_ffff) << 32) | (ino & 0xffff_ffff);
 
+        // SAFETY: The descriptor is a validated read-only regular file. This code
+        // only exposes the mapping immutably for object parsing; callers must not
+        // concurrently modify the mapped file while the mapping is alive.
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
         Ok(Self {
