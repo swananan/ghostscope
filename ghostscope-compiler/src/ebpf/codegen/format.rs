@@ -1,5 +1,118 @@
 use super::*;
 
+const COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET: usize = 2;
+const COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET: usize = 2;
+const COMPLEX_FORMAT_ARG_ACCESS_PATH_LEN_OFFSET: usize = 4;
+const COMPLEX_FORMAT_ARG_STATUS_OFFSET: usize = 5;
+const COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET: usize = 6;
+const COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ComplexFormatArgLayout {
+    header_len: usize,
+    reserved_len: usize,
+}
+
+struct ComplexFormatLayout {
+    arg_count: u8,
+    args: Vec<ComplexFormatArgLayout>,
+    inst_data_size: usize,
+    total_size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ComplexFormatArgPointers<'ctx> {
+    status_ptr: PointerValue<'ctx>,
+    var_data_ptr: PointerValue<'ctx>,
+}
+
+fn complex_format_arg_header_len(arg: &ComplexArg<'_>) -> usize {
+    COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN + arg.access_path.len()
+}
+
+fn complex_format_static_payload_len(arg: &ComplexArg<'_>) -> Option<usize> {
+    match &arg.source {
+        ComplexArgSource::ImmediateBytes { bytes } => Some(bytes.len()),
+        ComplexArgSource::AddressValue { .. } => Some(8),
+        ComplexArgSource::RuntimeRead { .. } => {
+            Some(std::cmp::max(arg.data_len, DYNAMIC_READ_ERROR_PAYLOAD_LEN))
+        }
+        ComplexArgSource::ComputedInt { byte_len, .. } => Some(*byte_len),
+        ComplexArgSource::MemDump { len, .. } => {
+            Some(std::cmp::max(*len, DYNAMIC_READ_ERROR_PAYLOAD_LEN))
+        }
+        ComplexArgSource::MemDumpDynamic { .. } => None,
+    }
+}
+
+fn plan_complex_format_layout(
+    max_trace_event_size: usize,
+    bytes_reserved_so_far: usize,
+    complex_args: &[ComplexArg<'_>],
+) -> ComplexFormatLayout {
+    let instruction_budget =
+        print_complex_format_instruction_budget(max_trace_event_size, bytes_reserved_so_far);
+    let fixed_overhead =
+        std::mem::size_of::<InstructionHeader>() + std::mem::size_of::<PrintComplexFormatData>();
+
+    let mut arg_count = 0u8;
+    let mut headers_total = 0usize;
+    let mut static_payload_total = 0usize;
+    let mut dynamic_max_lens = Vec::new();
+    let mut arg_payload_plans = Vec::with_capacity(complex_args.len());
+
+    for arg in complex_args {
+        let header_len = complex_format_arg_header_len(arg);
+        headers_total += header_len;
+
+        let static_payload_len = complex_format_static_payload_len(arg);
+        if let Some(payload_len) = static_payload_len {
+            static_payload_total += payload_len;
+        } else if let ComplexArgSource::MemDumpDynamic { max_len, .. } = &arg.source {
+            dynamic_max_lens.push(*max_len);
+        }
+
+        arg_payload_plans.push((header_len, static_payload_len));
+        arg_count = arg_count.saturating_add(1);
+    }
+
+    // Static payload keeps its existing layout; dynamic payload shares the remaining
+    // instruction budget fairly so later {:s.*}/{:x.*} arguments do not get starved.
+    let remaining_for_payload = instruction_budget
+        .saturating_sub(fixed_overhead)
+        .saturating_sub(headers_total)
+        .saturating_sub(static_payload_total);
+    let dynamic_reservations =
+        allocate_dynamic_payload_reservations(&dynamic_max_lens, remaining_for_payload);
+    let mut dynamic_reservations_iter = dynamic_reservations.into_iter();
+
+    let args = arg_payload_plans
+        .into_iter()
+        .map(|(header_len, static_payload_len)| {
+            let reserved_len =
+                static_payload_len.unwrap_or_else(|| dynamic_reservations_iter.next().unwrap_or(0));
+            ComplexFormatArgLayout {
+                header_len,
+                reserved_len,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let total_args_payload = args
+        .iter()
+        .map(|arg_layout| arg_layout.header_len + arg_layout.reserved_len)
+        .sum::<usize>();
+    let inst_data_size = std::mem::size_of::<PrintComplexFormatData>() + total_args_payload;
+    let total_size = std::mem::size_of::<InstructionHeader>() + inst_data_size;
+
+    ComplexFormatLayout {
+        arg_count,
+        args,
+        inst_data_size,
+        total_size,
+    }
+}
+
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Compile formatted print statement: collect all variable data and send as PrintComplexFormat instruction
     pub(super) fn resolve_memory_format_address(
@@ -380,101 +493,22 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.generate_print_complex_format_instruction(format_string_index, &complex_args)?;
         Ok(1)
     }
-    /// Generate eBPF code for PrintComplexFormat instruction with runtime reads for variables
-    pub(super) fn generate_print_complex_format_instruction(
+
+    fn write_complex_format_instruction_header(
         &mut self,
+        buffer: PointerValue<'ctx>,
         format_string_index: u16,
-        complex_args: &[ComplexArg<'ctx>],
-    ) -> Result<()> {
-        use InstructionType::PrintComplexFormat as IT;
-
-        // Keep a single formatted print within the remaining event budget on the current
-        // control-flow path, while still leaving room for EndInstruction.
-        let instruction_budget = print_complex_format_instruction_budget(
-            self.compile_options.max_trace_event_size as usize,
-            self.compile_time_event_bytes_upper_bound,
-        );
-        let fixed_overhead = std::mem::size_of::<InstructionHeader>()
-            + std::mem::size_of::<PrintComplexFormatData>();
-
-        // First pass: accumulate header bytes and static payload, record dynamic args
-        let mut arg_count = 0u8;
-        let mut headers_total = 0usize;
-        let mut static_payload_total = 0usize;
-        let mut dynamic_max_lens: Vec<usize> = Vec::new();
-        let mut header_lens: Vec<usize> = Vec::with_capacity(complex_args.len());
-        for a in complex_args {
-            // Header bytes per-arg: var_name_index(2) + type_index(2) + access_path_len(1) + status(1) + data_len(2) + access_path
-            let header_len = 2 + 2 + 1 + 1 + 2 + a.access_path.len();
-            header_lens.push(header_len);
-            headers_total += header_len;
-
-            match &a.source {
-                ComplexArgSource::ImmediateBytes { bytes } => static_payload_total += bytes.len(),
-                ComplexArgSource::AddressValue { .. } => static_payload_total += 8,
-                ComplexArgSource::RuntimeRead { .. } => {
-                    static_payload_total +=
-                        std::cmp::max(a.data_len, DYNAMIC_READ_ERROR_PAYLOAD_LEN)
-                }
-                ComplexArgSource::ComputedInt { byte_len, .. } => static_payload_total += *byte_len,
-                ComplexArgSource::MemDump { len, .. } => {
-                    static_payload_total += std::cmp::max(*len, DYNAMIC_READ_ERROR_PAYLOAD_LEN)
-                }
-                ComplexArgSource::MemDumpDynamic { max_len, .. } => dynamic_max_lens.push(*max_len),
-            }
-            arg_count = arg_count.saturating_add(1);
-        }
-
-        // Static payload keeps its existing layout; dynamic payload shares the remaining
-        // instruction budget fairly so later {:s.*}/{:x.*} arguments do not get starved.
-        let remaining_for_payload = instruction_budget
-            .saturating_sub(fixed_overhead)
-            .saturating_sub(headers_total)
-            .saturating_sub(static_payload_total);
-        let dynamic_reservations =
-            allocate_dynamic_payload_reservations(&dynamic_max_lens, remaining_for_payload);
-        let mut dynamic_reservations_iter = dynamic_reservations.into_iter();
-
-        // Second pass: decide effective reserved payload for each arg
-        // Default to computed static payload; dynamic args share the event-derived budget
-        let mut effective_reserved: Vec<usize> = Vec::with_capacity(complex_args.len());
-        for a in complex_args {
-            let reserved = match &a.source {
-                ComplexArgSource::ImmediateBytes { bytes } => bytes.len(),
-                ComplexArgSource::AddressValue { .. } => 8,
-                ComplexArgSource::RuntimeRead { .. } => {
-                    std::cmp::max(a.data_len, DYNAMIC_READ_ERROR_PAYLOAD_LEN)
-                }
-                ComplexArgSource::ComputedInt { byte_len, .. } => *byte_len,
-                ComplexArgSource::MemDump { len, .. } => {
-                    std::cmp::max(*len, DYNAMIC_READ_ERROR_PAYLOAD_LEN)
-                }
-                ComplexArgSource::MemDumpDynamic { .. } => {
-                    dynamic_reservations_iter.next().unwrap_or(0)
-                }
-            };
-            effective_reserved.push(reserved);
-        }
-
-        // Now compute final inst_data_size using effective reservations
-        let total_args_payload: usize =
-            header_lens.iter().sum::<usize>() + effective_reserved.iter().sum::<usize>();
-        let inst_data_size = std::mem::size_of::<PrintComplexFormatData>() + total_args_payload;
-        let total_size = std::mem::size_of::<InstructionHeader>() + inst_data_size;
-
-        // Reserve buffer directly in accumulation buffer to avoid extra copy
-        let buffer = self
-            .reserve_instruction_region_or_return_zero(total_size as u64)?
-            .into_value_after_runtime_returns();
-
-        // Avoid memset; global buffer is zero-initialized
-
-        // Write InstructionHeader
-        let inst_type_val = self.context.i8_type().const_int(IT as u8 as u64, false);
+        arg_count: u8,
+        inst_data_size: usize,
+    ) -> Result<PointerValue<'ctx>> {
+        let inst_type_val = self
+            .context
+            .i8_type()
+            .const_int(InstructionType::PrintComplexFormat as u8 as u64, false);
         self.builder
             .build_store(buffer, inst_type_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
-        // data_length at +1
+
         // SAFETY: buffer points at a reserved PrintComplexFormat instruction
         // region and offset 1 is the InstructionHeader data_length field.
         let data_length_ptr = unsafe {
@@ -505,7 +539,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_store(data_length_i16_ptr, data_length_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
-        // Write PrintComplexFormatData at offset 4
         // SAFETY: PrintComplexFormatData starts immediately after InstructionHeader
         // at offset 4 in the reserved instruction region.
         let data_ptr = unsafe {
@@ -521,7 +554,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 })?
         };
 
-        // format_string_index (u16) at +0
         let fsi_ptr = self
             .builder
             .build_pointer_cast(
@@ -537,14 +569,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_store(fsi_ptr, fsi_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store fsi: {e}")))?;
-        // arg_count (u8) at +2
+
         // SAFETY: arg_count offset is within PrintComplexFormatData.
         let arg_cnt_ptr = unsafe {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
                     data_ptr,
-                    &[self.context.i32_type().const_int(2, false)],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET as u64, false)],
                     "arg_count_ptr",
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get arg_count GEP: {e}")))?
@@ -556,982 +591,1107 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store arg_count: {e}")))?;
 
-        // Start of variable payload after PrintComplexFormatData — use computed effective reservations
-        let mut offset = std::mem::size_of::<PrintComplexFormatData>();
-        for (arg_index, a) in complex_args.iter().enumerate() {
-            // Per-arg reserved payload length
-            let reserved_len = effective_reserved[arg_index];
+        Ok(data_ptr)
+    }
 
-            // Base pointer = data_ptr + offset
-            // SAFETY: offset is advanced by the statically computed per-argument
-            // payload sizes and remains within the reserved instruction region.
-            let arg_base = unsafe {
-                self.builder
-                    .build_gep(
-                        self.context.i8_type(),
-                        data_ptr,
-                        &[self.context.i32_type().const_int(offset as u64, false)],
-                        "arg_base",
-                    )
-                    .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to get arg_base GEP: {e}"))
-                    })?
-            };
+    fn write_complex_format_arg_header(
+        &mut self,
+        data_ptr: PointerValue<'ctx>,
+        offset: usize,
+        arg: &ComplexArg<'ctx>,
+        reserved_len: usize,
+    ) -> Result<ComplexFormatArgPointers<'ctx>> {
+        // SAFETY: offset is advanced by the statically computed per-argument
+        // payload sizes and remains within the reserved instruction region.
+        let arg_base = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self.context.i32_type().const_int(offset as u64, false)],
+                    "arg_base",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get arg_base GEP: {e}")))?
+        };
 
-            // var_name_index(u16) at +0
-            let vni_cast = self
-                .builder
-                .build_pointer_cast(
+        let vni_cast = self
+            .builder
+            .build_pointer_cast(
+                arg_base,
+                self.context.ptr_type(AddressSpace::default()),
+                "vni_cast",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast vni ptr: {e}")))?;
+        self.builder
+            .build_store(
+                vni_cast,
+                self.context
+                    .i16_type()
+                    .const_int(arg.var_name_index as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store vni: {e}")))?;
+
+        // SAFETY: type_index offset is within the per-argument payload header.
+        let ti_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
                     arg_base,
-                    self.context.ptr_type(AddressSpace::default()),
-                    "vni_cast",
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET as u64, false)],
+                    "ti_ptr",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast vni ptr: {e}")))?;
-            self.builder
-                .build_store(
-                    vni_cast,
-                    self.context
-                        .i16_type()
-                        .const_int(a.var_name_index as u64, false),
-                )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store vni: {e}")))?;
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get ti GEP: {e}")))?
+        };
+        let ti_cast = self
+            .builder
+            .build_pointer_cast(
+                ti_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "ti_cast",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast ti ptr: {e}")))?;
+        self.builder
+            .build_store(
+                ti_cast,
+                self.context
+                    .i16_type()
+                    .const_int(arg.type_index as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store ti: {e}")))?;
 
-            // type_index(u16) at +2
-            // SAFETY: type_index offset is within the per-argument payload header.
-            let ti_ptr = unsafe {
+        // SAFETY: status offset is within the per-argument payload header.
+        let status_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    arg_base,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(COMPLEX_FORMAT_ARG_STATUS_OFFSET as u64, false)],
+                    "status_ptr",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {e}")))?
+        };
+        self.builder
+            .build_store(status_ptr, self.context.i8_type().const_int(0, false))
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {e}")))?;
+
+        // SAFETY: access_path_len offset is within the per-argument payload header.
+        let access_path_len_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    arg_base,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(COMPLEX_FORMAT_ARG_ACCESS_PATH_LEN_OFFSET as u64, false)],
+                    "apl_ptr",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get apl GEP: {e}")))?
+        };
+        self.builder
+            .build_store(
+                access_path_len_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(arg.access_path.len() as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store apl: {e}")))?;
+
+        for (i, b) in arg.access_path.iter().enumerate() {
+            // SAFETY: i is bounded by access_path.len(), which was included in
+            // the per-argument reserved payload length.
+            let byte_ptr = unsafe {
                 self.builder
                     .build_gep(
                         self.context.i8_type(),
                         arg_base,
-                        &[self.context.i32_type().const_int(2, false)],
-                        "ti_ptr",
-                    )
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get ti GEP: {e}")))?
-            };
-            let ti_cast = self
-                .builder
-                .build_pointer_cast(
-                    ti_ptr,
-                    self.context.ptr_type(AddressSpace::default()),
-                    "ti_cast",
-                )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast ti ptr: {e}")))?;
-            self.builder
-                .build_store(
-                    ti_cast,
-                    self.context
-                        .i16_type()
-                        .const_int(a.type_index as u64, false),
-                )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store ti: {e}")))?;
-
-            // status(u8) at +5
-            // SAFETY: status offset is within the per-argument payload header.
-            let apl_ptr = unsafe {
-                self.builder
-                    .build_gep(
-                        self.context.i8_type(),
-                        arg_base,
-                        &[self.context.i32_type().const_int(5, false)],
-                        "status_ptr",
+                        &[self
+                            .context
+                            .i32_type()
+                            .const_int((COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET + i) as u64, false)],
+                        &format!("ap_byte_{i}"),
                     )
                     .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to get status GEP: {e}"))
+                        CodeGenError::LLVMError(format!("Failed to get ap byte GEP: {e}"))
                     })?
             };
             self.builder
-                .build_store(apl_ptr, self.context.i8_type().const_int(0, false))
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store status: {e}")))?;
+                .build_store(byte_ptr, self.context.i8_type().const_int(*b as u64, false))
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store ap byte: {e}")))?;
+        }
 
-            // access_path_len(u8) at +4
-            // SAFETY: access_path_len offset is within the per-argument payload header.
-            let apl_ptr2 = unsafe {
+        // SAFETY: data_len follows the access path bytes inside the reserved
+        // per-argument payload.
+        let data_len_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    arg_base,
+                    &[self.context.i32_type().const_int(
+                        (COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET + arg.access_path.len()) as u64,
+                        false,
+                    )],
+                    "dl_ptr",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get dl GEP: {e}")))?
+        };
+        let data_len_cast = self
+            .builder
+            .build_pointer_cast(
+                data_len_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "dl_cast",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast dl ptr: {e}")))?;
+        self.builder
+            .build_store(
+                data_len_cast,
+                self.context
+                    .i16_type()
+                    .const_int(reserved_len as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {e}")))?;
+
+        // SAFETY: var_data_ptr follows the per-argument header and access path
+        // inside the reserved payload.
+        let var_data_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    arg_base,
+                    &[self.context.i32_type().const_int(
+                        (COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN + arg.access_path.len()) as u64,
+                        false,
+                    )],
+                    "var_data_ptr",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get var_data GEP: {e}")))?
+        };
+
+        Ok(ComplexFormatArgPointers {
+            status_ptr,
+            var_data_ptr,
+        })
+    }
+
+    fn emit_complex_format_immediate_bytes(
+        &mut self,
+        var_data_ptr: PointerValue<'ctx>,
+        bytes: &[u8],
+    ) -> Result<()> {
+        for (i, b) in bytes.iter().enumerate() {
+            // SAFETY: i is bounded by bytes.len(), and immediate bytes are
+            // included in the per-argument reserved payload.
+            let byte_ptr = unsafe {
                 self.builder
                     .build_gep(
                         self.context.i8_type(),
-                        arg_base,
-                        &[self.context.i32_type().const_int(4, false)],
-                        "apl_ptr",
+                        var_data_ptr,
+                        &[self.context.i32_type().const_int(i as u64, false)],
+                        &format!("var_byte_{i}"),
                     )
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get apl GEP: {e}")))?
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to get var byte GEP: {e}"))
+                    })?
             };
             self.builder
-                .build_store(
-                    apl_ptr2,
-                    self.context
-                        .i8_type()
-                        .const_int(a.access_path.len() as u64, false),
-                )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store apl: {e}")))?;
+                .build_store(byte_ptr, self.context.i8_type().const_int(*b as u64, false))
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store var byte: {e}")))?;
+        }
+        Ok(())
+    }
 
-            // access_path bytes at +6..+6+len
-            for (i, b) in a.access_path.iter().enumerate() {
-                // SAFETY: i is bounded by access_path.len(), which was included in
-                // the per-argument reserved payload length.
-                let byte_ptr = unsafe {
+    fn emit_complex_format_computed_int(
+        &mut self,
+        var_data_ptr: PointerValue<'ctx>,
+        value: IntValue<'ctx>,
+        byte_len: usize,
+    ) -> Result<()> {
+        // Write computed integer into payload buffer based on requested byte_len.
+        // Ensure the destination pointer element type matches the stored value type.
+        match byte_len {
+            1 => {
+                let bitw = value.get_type().get_bit_width();
+                let v = if bitw == 1 {
+                    // Bool: zero-extend to keep 0/1 in payload
                     self.builder
-                        .build_gep(
-                            self.context.i8_type(),
-                            arg_base,
-                            &[self.context.i32_type().const_int((6 + i) as u64, false)],
-                            &format!("ap_byte_{i}"),
-                        )
-                        .map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to get ap byte GEP: {e}"))
-                        })?
+                        .build_int_z_extend(value, self.context.i8_type(), "expr_zext_bool_i8")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else if bitw < 8 {
+                    self.builder
+                        .build_int_s_extend(value, self.context.i8_type(), "expr_sext_i8")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else if bitw > 8 {
+                    self.builder
+                        .build_int_truncate(value, self.context.i8_type(), "expr_trunc_i8")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else {
+                    value
                 };
                 self.builder
-                    .build_store(byte_ptr, self.context.i8_type().const_int(*b as u64, false))
-                    .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to store ap byte: {e}"))
-                    })?;
+                    .build_store(var_data_ptr, v)
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
             }
-
-            // data_len(u16) at +6+path_len (store reserved_len to keep layout consistent)
-            // SAFETY: data_len follows the access path bytes inside the reserved
-            // per-argument payload.
-            let dl_ptr = unsafe {
+            2 => {
+                let bitw = value.get_type().get_bit_width();
+                let v = if bitw < 16 {
+                    self.builder
+                        .build_int_s_extend(value, self.context.i16_type(), "expr_sext_i16")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else if bitw > 16 {
+                    self.builder
+                        .build_int_truncate(value, self.context.i16_type(), "expr_trunc_i16")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else {
+                    value
+                };
+                let i16_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                let cast_ptr = self
+                    .builder
+                    .build_pointer_cast(var_data_ptr, i16_ptr_ty, "expr_i16_ptr")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                 self.builder
-                    .build_gep(
-                        self.context.i8_type(),
-                        arg_base,
-                        &[self
-                            .context
-                            .i32_type()
-                            .const_int((6 + a.access_path.len()) as u64, false)],
-                        "dl_ptr",
-                    )
-                    .map_err(|e| CodeGenError::LLVMError(format!("Failed to get dl GEP: {e}")))?
-            };
-            let dl_cast = self
+                    .build_store(cast_ptr, v)
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            }
+            4 => {
+                let bitw = value.get_type().get_bit_width();
+                let v = if bitw < 32 {
+                    self.builder
+                        .build_int_s_extend(value, self.context.i32_type(), "expr_sext_i32")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else if bitw > 32 {
+                    self.builder
+                        .build_int_truncate(value, self.context.i32_type(), "expr_trunc_i32")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else {
+                    value
+                };
+                let i32_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                let cast_ptr = self
+                    .builder
+                    .build_pointer_cast(var_data_ptr, i32_ptr_ty, "expr_i32_ptr")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                self.builder
+                    .build_store(cast_ptr, v)
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            }
+            8 => {
+                let v64 = if value.get_type().get_bit_width() < 64 {
+                    self.builder
+                        .build_int_s_extend(value, self.context.i64_type(), "expr_sext")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else {
+                    value
+                };
+                let i64_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                let cast_ptr = self
+                    .builder
+                    .build_pointer_cast(var_data_ptr, i64_ptr_ty, "expr_i64_ptr")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                self.builder
+                    .build_store(cast_ptr, v64)
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            }
+            n => {
+                let v64 = if value.get_type().get_bit_width() < 64 {
+                    self.builder
+                        .build_int_z_extend(value, self.context.i64_type(), "expr_zext_fallback")
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                } else {
+                    value
+                };
+                for i in 0..n {
+                    let shift = self.context.i64_type().const_int((i * 8) as u64, false);
+                    let shifted = self
+                        .builder
+                        .build_right_shift(v64, shift, false, &format!("expr_shr_{i}"))
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    let byte = self
+                        .builder
+                        .build_int_truncate(
+                            shifted,
+                            self.context.i8_type(),
+                            &format!("expr_byte_{i}"),
+                        )
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                    // SAFETY: i is bounded by n, the immediate payload size reserved
+                    // for this argument.
+                    let byte_ptr = unsafe {
+                        self.builder
+                            .build_gep(
+                                self.context.i8_type(),
+                                var_data_ptr,
+                                &[self.context.i32_type().const_int(i as u64, false)],
+                                &format!("expr_byte_ptr_{i}"),
+                            )
+                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                    };
+                    self.builder
+                        .build_store(byte_ptr, byte)
+                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_complex_format_address_value(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        var_data_ptr: PointerValue<'ctx>,
+        address: &ghostscope_dwarf::PlannedAddress,
+        module_for_offsets: Option<&str>,
+    ) -> Result<()> {
+        let addr = self.resolve_planned_address(address, Some(status_ptr), module_for_offsets)?;
+        let cast_ptr = self
+            .builder
+            .build_pointer_cast(
+                var_data_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "addr_store_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(cast_ptr, addr.value)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn emit_complex_format_memdump(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        var_data_ptr: PointerValue<'ctx>,
+        address: &RuntimeAddress<'ctx>,
+        len: usize,
+    ) -> Result<()> {
+        // Branchy emitters must leave the builder at their continuation block so
+        // the caller can append the next formatted argument.
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let i32_ty = self.context.i32_type();
+
+        let dst_ptr = self
+            .builder
+            .build_pointer_cast(var_data_ptr, ptr_ty, "md_dst_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let base_src_ptr = self
+            .builder
+            .build_int_to_ptr(address.value, ptr_ty, "md_src_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let offsets_found = address.offsets_found;
+        let not_found = self
+            .builder
+            .build_not(offsets_found, "md_offsets_miss")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let null_ptr = ptr_ty.const_null();
+        let src_ptr = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                offsets_found,
+                base_src_ptr.into(),
+                null_ptr.into(),
+                "md_src_or_null",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_pointer_value();
+        let len_const = i32_ty.const_int(len as u64, false);
+        let zero_i32 = i32_ty.const_zero();
+        let effective_len = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                offsets_found,
+                len_const.into(),
+                zero_i32.into(),
+                "md_len_or_zero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let ret = self
+            .create_bpf_helper_call(
+                BPF_FUNC_probe_read_user as u64,
+                &[dst_ptr.into(), effective_len.into(), src_ptr.into()],
+                i64_ty.into(),
+                "probe_read_user_memdump",
+            )?
+            .into_int_value();
+
+        let ok_pred = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::EQ, ret, i64_ty.const_zero(), "md_ok")
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let ok = self
+            .builder
+            .build_and(ok_pred, offsets_found, "md_ok_with_offsets")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let func = self.current_function("compile memdump status branch")?;
+        let ok_b = self.context.append_basic_block(func, "md_ok");
+        let err_b = self.context.append_basic_block(func, "md_err");
+        let cont_b = self.context.append_basic_block(func, "md_cont");
+        self.builder
+            .build_conditional_branch(ok, ok_b, err_b)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(ok_b);
+        self.builder
+            .build_unconditional_branch(cont_b)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(err_b);
+        let offsets_err_b = self.context.append_basic_block(func, "md_offsets_err");
+        let helper_err_b = self.context.append_basic_block(func, "md_helper_err");
+        self.builder
+            .build_conditional_branch(not_found, offsets_err_b, helper_err_b)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(offsets_err_b);
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::OffsetsUnavailable as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(cont_b)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(helper_err_b);
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::ReadError as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let errno_ptr = self
+            .builder
+            .build_pointer_cast(
+                var_data_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "errno_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let errno = self.build_errno_i32(ret, "errno_i32")?;
+        self.builder
+            .build_store(errno_ptr, errno)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        // SAFETY: read-error payload reserves 12 bytes, so addr starts at byte 4
+        // after the errno field.
+        let addr_ptr_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    var_data_ptr,
+                    &[self.context.i32_type().const_int(4, false)],
+                    "addr_ptr_i8",
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        };
+        let addr_ptr = self
+            .builder
+            .build_pointer_cast(
+                addr_ptr_i8,
+                self.context.ptr_type(AddressSpace::default()),
+                "addr_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(addr_ptr, address.value)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(cont_b)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(cont_b);
+        Ok(())
+    }
+
+    fn emit_complex_format_memdump_dynamic(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        var_data_ptr: PointerValue<'ctx>,
+        address: &RuntimeAddress<'ctx>,
+        len_value: IntValue<'ctx>,
+        reserved_len: usize,
+    ) -> Result<()> {
+        // Branchy emitters must leave the builder at their continuation block so
+        // the caller can append the next formatted argument.
+        let eff_max_len = reserved_len as u32;
+        let i32_ty = self.context.i32_type();
+        let rlen_i32 = if len_value.get_type().get_bit_width() > 32 {
+            self.builder
+                .build_int_truncate(len_value, i32_ty, "mdd_len_trunc")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        } else if len_value.get_type().get_bit_width() < 32 {
+            self.builder
+                .build_int_z_extend(len_value, i32_ty, "mdd_len_zext")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        } else {
+            len_value
+        };
+
+        let zero_i32 = i32_ty.const_zero();
+        let is_neg = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                rlen_i32,
+                zero_i32,
+                "mdd_len_neg",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let rlen_nn = self
+            .builder
+            .build_select(is_neg, zero_i32, rlen_i32, "mdd_len_nn")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+
+        let max_const = i32_ty.const_int(eff_max_len as u64, false);
+        let gt = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::UGT, rlen_nn, max_const, "mdd_gt")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let sel_len = self
+            .builder
+            .build_select(gt, max_const, rlen_nn, "mdd_rlen")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+
+        let func = self.current_function("compile memdump dynamic length branch")?;
+        let zero_b = self.context.append_basic_block(func, "mdd_len_zero");
+        let read_b = self.context.append_basic_block(func, "mdd_len_read");
+        let cont_b = self.context.append_basic_block(func, "mdd_cont");
+        let is_zero = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                sel_len,
+                i32_ty.const_zero(),
+                "mdd_len_zero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(is_zero, zero_b, read_b)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(zero_b);
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::ZeroLength as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(cont_b)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(read_b);
+        let dst_ptr = self
+            .builder
+            .build_bit_cast(
+                var_data_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "mdd_dst_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let base_src_ptr = self
+            .builder
+            .build_int_to_ptr(address.value, ptr_ty, "mdd_src_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let offsets_found = address.offsets_found;
+        let not_found = self
+            .builder
+            .build_not(offsets_found, "mdd_dyn_offsets_miss")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let null_ptr = ptr_ty.const_null();
+        let src_ptr = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                offsets_found,
+                base_src_ptr.into(),
+                null_ptr.into(),
+                "mdd_src_or_null",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_pointer_value();
+        let zero_i32 = self.context.i32_type().const_zero();
+        let effective_len = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                offsets_found,
+                sel_len.into(),
+                zero_i32.into(),
+                "mdd_len_or_zero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let ret = self
+            .create_bpf_helper_call(
+                BPF_FUNC_probe_read_user as u64,
+                &[dst_ptr, effective_len.into(), src_ptr.into()],
+                self.context.i64_type().into(),
+                "probe_read_user_dyn",
+            )?
+            .into_int_value();
+        let ok_pred = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                ret,
+                self.context.i64_type().const_zero(),
+                "mdd_ok",
+            )
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        let ok = self
+            .builder
+            .build_and(ok_pred, offsets_found, "mdd_ok_with_offsets")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let ok_b = self.context.append_basic_block(func, "mdd_ok");
+        let err_b = self.context.append_basic_block(func, "mdd_err");
+        self.builder
+            .build_conditional_branch(ok, ok_b, err_b)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(ok_b);
+        self.builder
+            .build_unconditional_branch(cont_b)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(err_b);
+        let offsets_err_b = self.context.append_basic_block(func, "mdd_offsets_err");
+        let helper_err_b = self.context.append_basic_block(func, "mdd_helper_err");
+        self.builder
+            .build_conditional_branch(not_found, offsets_err_b, helper_err_b)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(offsets_err_b);
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::OffsetsUnavailable as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(cont_b)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(helper_err_b);
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::ReadError as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        if eff_max_len >= 4 {
+            let errno_ptr = self
                 .builder
                 .build_pointer_cast(
-                    dl_ptr,
+                    var_data_ptr,
                     self.context.ptr_type(AddressSpace::default()),
-                    "dl_cast",
+                    "mdd_errno_ptr",
                 )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast dl ptr: {e}")))?;
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let errno = self.build_errno_i32(ret, "mdd_errno_i32")?;
             self.builder
-                .build_store(
-                    dl_cast,
-                    self.context
-                        .i16_type()
-                        .const_int(reserved_len as u64, false),
-                )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_len: {e}")))?;
-
-            // variable data starts at +8+path_len
-            // SAFETY: var_data_ptr follows the per-argument header and access path
-            // inside the reserved payload.
-            let var_data_ptr = unsafe {
+                .build_store(errno_ptr, errno)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        }
+        if eff_max_len as usize >= DYNAMIC_READ_ERROR_PAYLOAD_LEN {
+            // SAFETY: eff_max_len is at least the 12-byte read-error payload, so
+            // addr starts at byte 4 after errno.
+            let addr_ptr_i8 = unsafe {
                 self.builder
                     .build_gep(
                         self.context.i8_type(),
-                        arg_base,
-                        &[self
-                            .context
-                            .i32_type()
-                            .const_int((8 + a.access_path.len()) as u64, false)],
-                        "var_data_ptr",
+                        var_data_ptr,
+                        &[self.context.i32_type().const_int(4, false)],
+                        "mdd_addr_ptr_i8",
                     )
-                    .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to get var_data GEP: {e}"))
-                    })?
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             };
+            let addr_ptr = self
+                .builder
+                .build_pointer_cast(
+                    addr_ptr_i8,
+                    self.context.ptr_type(AddressSpace::default()),
+                    "mdd_addr_ptr",
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            self.builder
+                .build_store(addr_ptr, address.value)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        }
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(cont_b)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-            // No dynamic cursor; we keep a compile-time offset and use reserved_len for layout
+        self.builder.position_at_end(cont_b);
+        Ok(())
+    }
 
-            match &a.source {
-                ComplexArgSource::ImmediateBytes { bytes, .. } => {
-                    for (i, b) in bytes.iter().enumerate() {
-                        // SAFETY: i is bounded by bytes.len(), and immediate bytes
-                        // are included in the per-argument reserved payload.
-                        let byte_ptr = unsafe {
-                            self.builder
-                                .build_gep(
-                                    self.context.i8_type(),
-                                    var_data_ptr,
-                                    &[self.context.i32_type().const_int(i as u64, false)],
-                                    &format!("var_byte_{i}"),
-                                )
-                                .map_err(|e| {
-                                    CodeGenError::LLVMError(format!(
-                                        "Failed to get var byte GEP: {e}"
-                                    ))
-                                })?
-                        };
-                        self.builder
-                            .build_store(
-                                byte_ptr,
-                                self.context.i8_type().const_int(*b as u64, false),
-                            )
-                            .map_err(|e| {
-                                CodeGenError::LLVMError(format!("Failed to store var byte: {e}"))
-                            })?;
-                    }
-                    // data_len already set to reserved_len
-                }
-                ComplexArgSource::MemDump { address, len } => {
-                    // Directly probe-read into payload to avoid byte-wise copies
-                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                    let i64_ty = self.context.i64_type();
-                    let i32_ty = self.context.i32_type();
+    fn emit_complex_format_runtime_read(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        var_data_ptr: PointerValue<'ctx>,
+        address: &ghostscope_dwarf::PlannedAddress,
+        dwarf_type: &ghostscope_dwarf::TypeInfo,
+        module_for_offsets: Option<&str>,
+        data_len: usize,
+    ) -> Result<()> {
+        // Branchy emitters must leave the builder at their continuation block so
+        // the caller can append the next formatted argument.
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let i32_type = self.context.i32_type();
+        let i64_type = self.context.i64_type();
+        let dst_ptr = self
+            .builder
+            .build_bit_cast(var_data_ptr, ptr_type, "dst_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let size_val = i32_type.const_int(data_len as u64, false);
+        let src_addr =
+            self.resolve_planned_address(address, Some(status_ptr), module_for_offsets)?;
+        let offsets_found = src_addr.offsets_found;
+        let current_fn = self.current_function("compile complex variable read")?;
+        let cont2_block = self.context.append_basic_block(current_fn, "after_read");
+        let skip_block = self.context.append_basic_block(current_fn, "offsets_skip");
+        let found_block = self.context.append_basic_block(current_fn, "offsets_found");
+        self.builder
+            .build_conditional_branch(offsets_found, found_block, skip_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-                    // Helper: long bpf_probe_read_user(void *dst, u32 size, const void *src)
-                    let dst_ptr = self
-                        .builder
-                        .build_pointer_cast(var_data_ptr, ptr_ty, "md_dst_ptr")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let base_src_ptr = self
-                        .builder
-                        .build_int_to_ptr(address.value, ptr_ty, "md_src_ptr")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let offsets_found = address.offsets_found;
-                    let not_found = self
-                        .builder
-                        .build_not(offsets_found, "md_offsets_miss")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let null_ptr = ptr_ty.const_null();
-                    let src_ptr = self
-                        .builder
-                        .build_select::<BasicValueEnum<'ctx>, _>(
-                            offsets_found,
-                            base_src_ptr.into(),
-                            null_ptr.into(),
-                            "md_src_or_null",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                        .into_pointer_value();
-                    let len_const = i32_ty.const_int(*len as u64, false);
-                    let zero_i32 = i32_ty.const_zero();
-                    let effective_len = self
-                        .builder
-                        .build_select::<BasicValueEnum<'ctx>, _>(
-                            offsets_found,
-                            len_const.into(),
-                            zero_i32.into(),
-                            "md_len_or_zero",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                        .into_int_value();
-                    let ret = self
-                        .create_bpf_helper_call(
-                            aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user
-                                as u64,
-                            &[dst_ptr.into(), effective_len.into(), src_ptr.into()],
-                            i64_ty.into(),
-                            "probe_read_user_memdump",
-                        )?
-                        .into_int_value();
+        self.builder.position_at_end(skip_block);
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(cont2_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-                    // Branch on ret == 0 and offsets available
-                    let ok_pred = self
-                        .builder
-                        .build_int_compare(
-                            inkwell::IntPredicate::EQ,
-                            ret,
-                            i64_ty.const_zero(),
-                            "md_ok",
-                        )
-                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-                    let ok = self
-                        .builder
-                        .build_and(ok_pred, offsets_found, "md_ok_with_offsets")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let func = self.current_function("compile memdump status branch")?;
-                    let ok_b = self.context.append_basic_block(func, "md_ok");
-                    let err_b = self.context.append_basic_block(func, "md_err");
-                    let cont_b = self.context.append_basic_block(func, "md_cont");
-                    self.builder
-                        .build_conditional_branch(ok, ok_b, err_b)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    // ok: nothing extra to do
-                    self.builder.position_at_end(ok_b);
-                    self.builder
-                        .build_unconditional_branch(cont_b)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    // err: either offsets missing or helper failure
-                    self.builder.position_at_end(err_b);
-                    let offsets_err_b = self.context.append_basic_block(func, "md_offsets_err");
-                    let helper_err_b = self.context.append_basic_block(func, "md_helper_err");
-                    self.builder
-                        .build_conditional_branch(not_found, offsets_err_b, helper_err_b)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder.position_at_end(offsets_err_b);
-                    self.builder
-                        .build_store(
-                            apl_ptr,
-                            self.context
-                                .i8_type()
-                                .const_int(VariableStatus::OffsetsUnavailable as u64, false),
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.mark_any_fail()?;
-                    self.builder
-                        .build_unconditional_branch(cont_b)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder.position_at_end(helper_err_b);
-                    self.builder
-                        .build_store(
-                            apl_ptr,
-                            self.context
-                                .i8_type()
-                                .const_int(VariableStatus::ReadError as u64, false),
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    // write errno + addr (12 bytes) to var_data_ptr; reserved sizing ensures this fits
-                    let errno_ptr = self
-                        .builder
-                        .build_pointer_cast(
-                            var_data_ptr,
-                            self.context.ptr_type(AddressSpace::default()),
-                            "errno_ptr",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let errno = self.build_errno_i32(ret, "errno_i32")?;
-                    self.builder
-                        .build_store(errno_ptr, errno)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    // SAFETY: read-error payload reserves 12 bytes, so addr starts
-                    // at byte 4 after the errno field.
-                    let addr_ptr_i8 = unsafe {
-                        self.builder
-                            .build_gep(
-                                self.context.i8_type(),
-                                var_data_ptr,
-                                &[self.context.i32_type().const_int(4, false)],
-                                "addr_ptr_i8",
-                            )
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                    };
-                    let addr_ptr = self
-                        .builder
-                        .build_pointer_cast(
-                            addr_ptr_i8,
-                            self.context.ptr_type(AddressSpace::default()),
-                            "addr_ptr",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder
-                        .build_store(addr_ptr, address.value)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.mark_any_fail()?;
-                    self.builder
-                        .build_unconditional_branch(cont_b)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder.position_at_end(cont_b);
-                }
-                ComplexArgSource::MemDumpDynamic {
-                    address,
-                    len_value,
-                    max_len: _,
-                } => {
-                    // Clamp runtime read to effective reserved length for this arg
-                    let eff_max_len = effective_reserved[arg_index] as u32;
-                    // Read up to rlen=min(len_value, max_len) into helper buffer, then copy bytes into payload
-                    let i32_ty = self.context.i32_type();
-                    let rlen_i32 = if len_value.get_type().get_bit_width() > 32 {
-                        self.builder
-                            .build_int_truncate(*len_value, i32_ty, "mdd_len_trunc")
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                    } else if len_value.get_type().get_bit_width() < 32 {
-                        self.builder
-                            .build_int_z_extend(*len_value, i32_ty, "mdd_len_zext")
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                    } else {
-                        *len_value
-                    };
-                    // clamp negative to 0
-                    let zero_i32 = i32_ty.const_zero();
-                    let is_neg = self
-                        .builder
-                        .build_int_compare(
-                            inkwell::IntPredicate::SLT,
-                            rlen_i32,
-                            zero_i32,
-                            "mdd_len_neg",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let rlen_nn = self
-                        .builder
-                        .build_select(is_neg, zero_i32, rlen_i32, "mdd_len_nn")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                        .into_int_value();
+        self.builder.position_at_end(found_block);
+        let src_ptr = self
+            .builder
+            .build_int_to_ptr(src_addr.value, ptr_type, "src_ptr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let zero64 = i64_type.const_zero();
+        let is_null = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::EQ, src_addr.value, zero64, "is_null")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let null_block = self.context.append_basic_block(current_fn, "null_deref");
+        let read_block = self.context.append_basic_block(current_fn, "read_user");
+        self.builder
+            .build_conditional_branch(is_null, null_block, read_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-                    // Bound length by the reserved space (already ensures >= 12B when possible)
-                    let max_const = i32_ty.const_int(eff_max_len as u64, false);
-                    let gt = self
-                        .builder
-                        .build_int_compare(inkwell::IntPredicate::UGT, rlen_nn, max_const, "mdd_gt")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let sel_len = self
-                        .builder
-                        .build_select(gt, max_const, rlen_nn, "mdd_rlen")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                        .into_int_value();
+        self.builder.position_at_end(null_block);
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::NullDeref as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(cont2_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-                    // If effective length is zero, mark status and skip read.
-                    let func = self.current_function("compile memdump dynamic length branch")?;
-                    let zero_b = self.context.append_basic_block(func, "mdd_len_zero");
-                    let read_b = self.context.append_basic_block(func, "mdd_len_read");
-                    let cont_b = self.context.append_basic_block(func, "mdd_cont");
-                    let is_zero = self
-                        .builder
-                        .build_int_compare(
-                            inkwell::IntPredicate::EQ,
-                            sel_len,
-                            i32_ty.const_zero(),
-                            "mdd_len_zero",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder
-                        .build_conditional_branch(is_zero, zero_b, read_b)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder.position_at_end(read_block);
+        let ret = self
+            .create_bpf_helper_call(
+                BPF_FUNC_probe_read_user as u64,
+                &[dst_ptr, size_val.into(), src_ptr.into()],
+                i32_type.into(),
+                "probe_read_user",
+            )?
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                ret,
+                i32_type.const_zero(),
+                "ret_lt_zero",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let err_block = self.context.append_basic_block(current_fn, "read_err");
+        let ok_block = self.context.append_basic_block(current_fn, "read_ok");
+        self.builder
+            .build_conditional_branch(is_err, err_block, ok_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-                    // Zero-length branch: set status=ZeroLength and continue.
-                    self.builder.position_at_end(zero_b);
-                    self.builder
-                        .build_store(
-                            apl_ptr,
-                            self.context
-                                .i8_type()
-                                .const_int(VariableStatus::ZeroLength as u64, false),
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder
-                        .build_unconditional_branch(cont_b)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder.position_at_end(err_block);
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::ReadError as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let i32_ptr = self
+            .builder
+            .build_pointer_cast(
+                var_data_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "errno_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast errno ptr: {e}")))?;
+        self.builder
+            .build_store(i32_ptr, ret)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store errno: {e}")))?;
+        // SAFETY: read-error payload reserves 12 bytes, so addr starts at byte 4
+        // after the errno field.
+        let addr_ptr_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    var_data_ptr,
+                    &[i32_type.const_int(4, false)],
+                    "addr_ptr_i8",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get addr gep: {e}")))?
+        };
+        let addr_ptr = self
+            .builder
+            .build_pointer_cast(
+                addr_ptr_i8,
+                self.context.ptr_type(AddressSpace::default()),
+                "addr_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast addr ptr: {e}")))?;
+        self.builder
+            .build_store(addr_ptr, src_addr.value)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store addr: {e}")))?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(cont2_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-                    // Non-zero path: perform probe_read_user directly into var_data_ptr
-                    self.builder.position_at_end(read_b);
-                    let dst_ptr = self
-                        .builder
-                        .build_bit_cast(
-                            var_data_ptr,
-                            self.context.ptr_type(AddressSpace::default()),
-                            "mdd_dst_ptr",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                    let base_src_ptr = self
-                        .builder
-                        .build_int_to_ptr(address.value, ptr_ty, "mdd_src_ptr")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let offsets_found = address.offsets_found;
-                    let not_found = self
-                        .builder
-                        .build_not(offsets_found, "mdd_dyn_offsets_miss")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let null_ptr = ptr_ty.const_null();
-                    let src_ptr = self
-                        .builder
-                        .build_select::<BasicValueEnum<'ctx>, _>(
-                            offsets_found,
-                            base_src_ptr.into(),
-                            null_ptr.into(),
-                            "mdd_src_or_null",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                        .into_pointer_value();
-                    let zero_i32 = self.context.i32_type().const_zero();
-                    let effective_len = self
-                        .builder
-                        .build_select::<BasicValueEnum<'ctx>, _>(
-                            offsets_found,
-                            sel_len.into(),
-                            zero_i32.into(),
-                            "mdd_len_or_zero",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                        .into_int_value();
-                    let ret = self
-                        .create_bpf_helper_call(
-                            BPF_FUNC_probe_read_user as u64,
-                            &[dst_ptr, effective_len.into(), src_ptr.into()],
-                            self.context.i64_type().into(),
-                            "probe_read_user_dyn",
-                        )?
-                        .into_int_value();
-                    let ok_pred = self
-                        .builder
-                        .build_int_compare(
-                            inkwell::IntPredicate::EQ,
-                            ret,
-                            self.context.i64_type().const_zero(),
-                            "mdd_ok",
-                        )
-                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-                    let ok = self
-                        .builder
-                        .build_and(ok_pred, offsets_found, "mdd_ok_with_offsets")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let ok_b = self.context.append_basic_block(func, "mdd_ok");
-                    let err_b = self.context.append_basic_block(func, "mdd_err");
-                    self.builder
-                        .build_conditional_branch(ok, ok_b, err_b)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    // ok: data already in var_data_ptr
-                    self.builder.position_at_end(ok_b);
-                    self.builder
-                        .build_unconditional_branch(cont_b)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    // err: status+errno+addr (clamped by reserved sizing)
-                    self.builder.position_at_end(err_b);
-                    let offsets_err_b = self.context.append_basic_block(func, "mdd_offsets_err");
-                    let helper_err_b = self.context.append_basic_block(func, "mdd_helper_err");
-                    self.builder
-                        .build_conditional_branch(not_found, offsets_err_b, helper_err_b)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder.position_at_end(offsets_err_b);
-                    self.builder
-                        .build_store(
-                            apl_ptr,
-                            self.context
-                                .i8_type()
-                                .const_int(VariableStatus::OffsetsUnavailable as u64, false),
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.mark_any_fail()?;
-                    self.builder
-                        .build_unconditional_branch(cont_b)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder.position_at_end(helper_err_b);
-                    self.builder
-                        .build_store(
-                            apl_ptr,
-                            self.context
-                                .i8_type()
-                                .const_int(VariableStatus::ReadError as u64, false),
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    if eff_max_len >= 4 {
-                        let errno_ptr = self
-                            .builder
-                            .build_pointer_cast(
-                                var_data_ptr,
-                                self.context.ptr_type(AddressSpace::default()),
-                                "mdd_errno_ptr",
-                            )
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        let errno = self.build_errno_i32(ret, "mdd_errno_i32")?;
-                        self.builder
-                            .build_store(errno_ptr, errno)
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    }
-                    if eff_max_len as usize >= DYNAMIC_READ_ERROR_PAYLOAD_LEN {
-                        // SAFETY: eff_max_len is at least the 12-byte read-error
-                        // payload, so addr starts at byte 4 after errno.
-                        let addr_ptr_i8 = unsafe {
-                            self.builder
-                                .build_gep(
-                                    self.context.i8_type(),
-                                    var_data_ptr,
-                                    &[self.context.i32_type().const_int(4, false)],
-                                    "mdd_addr_ptr_i8",
-                                )
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                        };
-                        let addr_ptr = self
-                            .builder
-                            .build_pointer_cast(
-                                addr_ptr_i8,
-                                self.context.ptr_type(AddressSpace::default()),
-                                "mdd_addr_ptr",
-                            )
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        self.builder
-                            .build_store(addr_ptr, address.value)
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    }
-                    self.mark_any_fail()?;
-                    self.builder
-                        .build_unconditional_branch(cont_b)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder.position_at_end(cont_b);
-                }
-                ComplexArgSource::ComputedInt { value, byte_len } => {
-                    // Write computed integer into payload buffer based on requested byte_len
-                    // Ensure the destination pointer element type matches the stored value type.
-                    match *byte_len {
-                        1 => {
-                            let bitw = value.get_type().get_bit_width();
-                            let v = if bitw == 1 {
-                                // Bool: zero-extend to keep 0/1 in payload
-                                self.builder
-                                    .build_int_z_extend(
-                                        *value,
-                                        self.context.i8_type(),
-                                        "expr_zext_bool_i8",
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                            } else if bitw < 8 {
-                                self.builder
-                                    .build_int_s_extend(
-                                        *value,
-                                        self.context.i8_type(),
-                                        "expr_sext_i8",
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                            } else if bitw > 8 {
-                                // wider than i8 -> truncate
-                                self.builder
-                                    .build_int_truncate(
-                                        *value,
-                                        self.context.i8_type(),
-                                        "expr_trunc_i8",
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                            } else {
-                                // exactly i8
-                                *value
-                            };
-                            // var_data_ptr is i8* already; store directly
-                            self.builder
-                                .build_store(var_data_ptr, v)
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        }
-                        2 => {
-                            let bitw = value.get_type().get_bit_width();
-                            let v = if bitw < 16 {
-                                self.builder
-                                    .build_int_s_extend(
-                                        *value,
-                                        self.context.i16_type(),
-                                        "expr_sext_i16",
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                            } else if bitw > 16 {
-                                self.builder
-                                    .build_int_truncate(
-                                        *value,
-                                        self.context.i16_type(),
-                                        "expr_trunc_i16",
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                            } else {
-                                // equal width: i16
-                                *value
-                            };
-                            let i16_ptr_ty = self.context.ptr_type(AddressSpace::default());
-                            let cast_ptr = self
-                                .builder
-                                .build_pointer_cast(var_data_ptr, i16_ptr_ty, "expr_i16_ptr")
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            self.builder
-                                .build_store(cast_ptr, v)
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        }
-                        4 => {
-                            let bitw = value.get_type().get_bit_width();
-                            let v = if bitw < 32 {
-                                self.builder
-                                    .build_int_s_extend(
-                                        *value,
-                                        self.context.i32_type(),
-                                        "expr_sext_i32",
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                            } else if bitw > 32 {
-                                self.builder
-                                    .build_int_truncate(
-                                        *value,
-                                        self.context.i32_type(),
-                                        "expr_trunc_i32",
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                            } else {
-                                // equal width: i32
-                                *value
-                            };
-                            let i32_ptr_ty = self.context.ptr_type(AddressSpace::default());
-                            let cast_ptr = self
-                                .builder
-                                .build_pointer_cast(var_data_ptr, i32_ptr_ty, "expr_i32_ptr")
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            self.builder
-                                .build_store(cast_ptr, v)
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        }
-                        8 => {
-                            let v64 = if value.get_type().get_bit_width() < 64 {
-                                self.builder
-                                    .build_int_s_extend(
-                                        *value,
-                                        self.context.i64_type(),
-                                        "expr_sext",
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                            } else {
-                                *value
-                            };
-                            let i64_ptr_ty = self.context.ptr_type(AddressSpace::default());
-                            let cast_ptr = self
-                                .builder
-                                .build_pointer_cast(var_data_ptr, i64_ptr_ty, "expr_i64_ptr")
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            self.builder
-                                .build_store(cast_ptr, v64)
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        }
-                        n => {
-                            // Fallback: write the lowest n bytes little-endian
-                            // Truncate/extend to 64-bit, then emit byte stores
-                            let v64 = if value.get_type().get_bit_width() < 64 {
-                                self.builder
-                                    .build_int_z_extend(
-                                        *value,
-                                        self.context.i64_type(),
-                                        "expr_zext_fallback",
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                            } else {
-                                *value
-                            };
-                            for i in 0..n {
-                                // Extract byte i
-                                let shift =
-                                    self.context.i64_type().const_int((i * 8) as u64, false);
-                                let shifted = self
-                                    .builder
-                                    .build_right_shift(v64, shift, false, &format!("expr_shr_{i}"))
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                let byte = self
-                                    .builder
-                                    .build_int_truncate(
-                                        shifted,
-                                        self.context.i8_type(),
-                                        &format!("expr_byte_{i}"),
-                                    )
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                                // SAFETY: i is bounded by n, the immediate payload
-                                // size reserved for this argument.
-                                let byte_ptr = unsafe {
-                                    self.builder
-                                        .build_gep(
-                                            self.context.i8_type(),
-                                            var_data_ptr,
-                                            &[self.context.i32_type().const_int(i as u64, false)],
-                                            &format!("expr_byte_ptr_{i}"),
-                                        )
-                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                                };
-                                self.builder
-                                    .build_store(byte_ptr, byte)
-                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            }
-                        }
-                    }
-                }
-                ComplexArgSource::RuntimeRead {
-                    address,
-                    dwarf_type,
-                    module_for_offsets,
-                } => {
-                    // Read from user memory at runtime via BPF helper
-                    let ptr_type = self.context.ptr_type(AddressSpace::default());
-                    let i32_type = self.context.i32_type();
-                    let i64_type = self.context.i64_type();
-                    let dst_ptr = self
-                        .builder
-                        .build_bit_cast(var_data_ptr, ptr_type, "dst_ptr")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let size_val = i32_type.const_int(a.data_len as u64, false);
-                    let src_addr = self.resolve_planned_address(
-                        address,
-                        Some(apl_ptr),
-                        module_for_offsets.as_deref(),
-                    )?;
-                    let offsets_found = src_addr.offsets_found;
-                    let current_fn = self.current_function("compile complex variable read")?;
-                    let cont2_block = self.context.append_basic_block(current_fn, "after_read");
-                    let skip_block = self.context.append_basic_block(current_fn, "offsets_skip");
-                    let found_block = self.context.append_basic_block(current_fn, "offsets_found");
-                    self.builder
-                        .build_conditional_branch(offsets_found, found_block, skip_block)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder.position_at_end(ok_block);
+        if data_len < dwarf_type.size() as usize {
+            self.builder
+                .build_store(
+                    status_ptr,
+                    self.context
+                        .i8_type()
+                        .const_int(VariableStatus::Truncated as u64, false),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            self.mark_any_success()?;
+            self.mark_any_fail()?;
+        } else {
+            self.mark_any_success()?;
+        }
+        self.builder
+            .build_unconditional_branch(cont2_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-                    // Offsets missing: record failure and continue without helper access.
-                    self.builder.position_at_end(skip_block);
-                    self.mark_any_fail()?;
-                    self.builder
-                        .build_unconditional_branch(cont2_block)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder.position_at_end(cont2_block);
+        Ok(())
+    }
 
-                    // Offsets found: proceed with null check and helper call.
-                    self.builder.position_at_end(found_block);
-                    let src_ptr = self
-                        .builder
-                        .build_int_to_ptr(src_addr.value, ptr_type, "src_ptr")
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+    fn emit_complex_format_arg_source(
+        &mut self,
+        arg: &ComplexArg<'ctx>,
+        arg_ptrs: ComplexFormatArgPointers<'ctx>,
+        reserved_len: usize,
+    ) -> Result<()> {
+        let status_ptr = arg_ptrs.status_ptr;
+        let var_data_ptr = arg_ptrs.var_data_ptr;
 
-                    // status_ptr was stored in apl_ptr earlier (we named it status_ptr)
-                    // Build NULL check
-                    let zero64 = i64_type.const_zero();
-                    let is_null = self
-                        .builder
-                        .build_int_compare(
-                            inkwell::IntPredicate::EQ,
-                            src_addr.value,
-                            zero64,
-                            "is_null",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let null_block = self.context.append_basic_block(current_fn, "null_deref");
-                    let read_block = self.context.append_basic_block(current_fn, "read_user");
-                    self.builder
-                        .build_conditional_branch(is_null, null_block, read_block)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
-                    // NULL path: status=1, keep reserved_len in header, no data write (buffer pre-zeroed)
-                    self.builder.position_at_end(null_block);
-                    self.builder
-                        .build_store(
-                            apl_ptr,
-                            self.context
-                                .i8_type()
-                                .const_int(VariableStatus::NullDeref as u64, false),
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.mark_any_fail()?;
-                    self.builder
-                        .build_unconditional_branch(cont2_block)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
-                    // Read path
-                    self.builder.position_at_end(read_block);
-                    let ret = self
-                        .create_bpf_helper_call(
-                            BPF_FUNC_probe_read_user as u64,
-                            &[dst_ptr, size_val.into(), src_ptr.into()],
-                            i32_type.into(),
-                            "probe_read_user",
-                        )?
-                        .into_int_value();
-                    let is_err = self
-                        .builder
-                        .build_int_compare(
-                            inkwell::IntPredicate::SLT,
-                            ret,
-                            i32_type.const_zero(),
-                            "ret_lt_zero",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    let err_block = self.context.append_basic_block(current_fn, "read_err");
-                    let ok_block = self.context.append_basic_block(current_fn, "read_ok");
-                    self.builder
-                        .build_conditional_branch(is_err, err_block, ok_block)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
-                    // Error branch: status=2 (read_user failed); write errno+addr payload at start; header keeps reserved_len
-                    self.builder.position_at_end(err_block);
-                    self.builder
-                        .build_store(
-                            apl_ptr,
-                            self.context
-                                .i8_type()
-                                .const_int(VariableStatus::ReadError as u64, false),
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    // write errno at [0..4]
-                    let i32_ptr = self
-                        .builder
-                        .build_pointer_cast(
-                            var_data_ptr,
-                            self.context.ptr_type(AddressSpace::default()),
-                            "errno_ptr",
-                        )
-                        .map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to cast errno ptr: {e}"))
-                        })?;
-                    self.builder.build_store(i32_ptr, ret).map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to store errno: {e}"))
-                    })?;
-                    // write addr at [4..12]
-                    // SAFETY: read-error payload reserves 12 bytes, so addr starts
-                    // at byte 4 after the errno field.
-                    let addr_ptr_i8 = unsafe {
-                        self.builder
-                            .build_gep(
-                                self.context.i8_type(),
-                                var_data_ptr,
-                                &[i32_type.const_int(4, false)],
-                                "addr_ptr_i8",
-                            )
-                            .map_err(|e| {
-                                CodeGenError::LLVMError(format!("Failed to get addr gep: {e}"))
-                            })?
-                    };
-                    let addr_ptr = self
-                        .builder
-                        .build_pointer_cast(
-                            addr_ptr_i8,
-                            self.context.ptr_type(AddressSpace::default()),
-                            "addr_ptr",
-                        )
-                        .map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to cast addr ptr: {e}"))
-                        })?;
-                    let src_as_i64 = src_addr.value;
-                    self.builder
-                        .build_store(addr_ptr, src_as_i64)
-                        .map_err(|e| {
-                            CodeGenError::LLVMError(format!("Failed to store addr: {e}"))
-                        })?;
-                    self.mark_any_fail()?;
-                    self.builder
-                        .build_unconditional_branch(cont2_block)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
-                    // OK branch: success or truncated (header keeps reserved_len)
-                    self.builder.position_at_end(ok_block);
-                    if a.data_len < dwarf_type.size() as usize {
-                        self.builder
-                            .build_store(
-                                apl_ptr,
-                                self.context
-                                    .i8_type()
-                                    .const_int(VariableStatus::Truncated as u64, false),
-                            )
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        self.mark_any_success()?;
-                        self.mark_any_fail()?;
-                    } else {
-                        self.mark_any_success()?;
-                    }
-                    self.builder
-                        .build_unconditional_branch(cont2_block)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
-                    self.builder.position_at_end(cont2_block);
-                }
-                ComplexArgSource::AddressValue {
-                    address,
-                    module_for_offsets,
-                } => {
-                    let addr = self.resolve_planned_address(
-                        address,
-                        Some(apl_ptr),
-                        module_for_offsets.as_deref(),
-                    )?;
-                    let cast_ptr = self
-                        .builder
-                        .build_pointer_cast(
-                            var_data_ptr,
-                            self.context.ptr_type(AddressSpace::default()),
-                            "addr_store_ptr",
-                        )
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    self.builder
-                        .build_store(cast_ptr, addr.value)
-                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                    // header already set to reserved_len (8)
-                }
+        match &arg.source {
+            ComplexArgSource::ImmediateBytes { bytes, .. } => {
+                self.emit_complex_format_immediate_bytes(var_data_ptr, bytes)
             }
-            // Advance compile-time offset by header_len + reserved_len
-            offset += 2 + 2 + 1 + 1 + a.access_path.len() + 2 + reserved_len;
+            ComplexArgSource::MemDump { address, len } => {
+                self.emit_complex_format_memdump(status_ptr, var_data_ptr, address, *len)
+            }
+            ComplexArgSource::MemDumpDynamic {
+                address,
+                len_value,
+                max_len: _,
+            } => self.emit_complex_format_memdump_dynamic(
+                status_ptr,
+                var_data_ptr,
+                address,
+                *len_value,
+                reserved_len,
+            ),
+            ComplexArgSource::ComputedInt { value, byte_len } => {
+                self.emit_complex_format_computed_int(var_data_ptr, *value, *byte_len)
+            }
+            ComplexArgSource::RuntimeRead {
+                address,
+                dwarf_type,
+                module_for_offsets,
+            } => self.emit_complex_format_runtime_read(
+                status_ptr,
+                var_data_ptr,
+                address,
+                dwarf_type,
+                module_for_offsets.as_deref(),
+                arg.data_len,
+            ),
+            ComplexArgSource::AddressValue {
+                address,
+                module_for_offsets,
+            } => self.emit_complex_format_address_value(
+                status_ptr,
+                var_data_ptr,
+                address,
+                module_for_offsets.as_deref(),
+            ),
+        }
+    }
+
+    /// Generate eBPF code for PrintComplexFormat instruction with runtime reads for variables
+    pub(super) fn generate_print_complex_format_instruction(
+        &mut self,
+        format_string_index: u16,
+        complex_args: &[ComplexArg<'ctx>],
+    ) -> Result<()> {
+        let layout = plan_complex_format_layout(
+            self.compile_options.max_trace_event_size as usize,
+            self.compile_time_event_bytes_upper_bound,
+            complex_args,
+        );
+
+        // Reserve buffer directly in accumulation buffer to avoid extra copy
+        let buffer = self
+            .reserve_instruction_region_or_return_zero(layout.total_size as u64)?
+            .into_value_after_runtime_returns();
+
+        // Avoid memset; global buffer is zero-initialized
+        let data_ptr = self.write_complex_format_instruction_header(
+            buffer,
+            format_string_index,
+            layout.arg_count,
+            layout.inst_data_size,
+        )?;
+
+        // Start of variable payload after PrintComplexFormatData.
+        let mut offset = std::mem::size_of::<PrintComplexFormatData>();
+        for (a, arg_layout) in complex_args.iter().zip(layout.args.iter()) {
+            let reserved_len = arg_layout.reserved_len;
+            let arg_ptrs =
+                self.write_complex_format_arg_header(data_ptr, offset, a, reserved_len)?;
+            self.emit_complex_format_arg_source(a, arg_ptrs, reserved_len)?;
+            offset += arg_layout.header_len + arg_layout.reserved_len;
         }
 
         // Already accumulated; EndInstruction will send the whole event
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod complex_format_layout_tests {
+    use super::*;
+    use inkwell::context::Context;
+
+    fn immediate_arg<'ctx>(bytes: &[u8], access_path: Vec<u8>) -> ComplexArg<'ctx> {
+        ComplexArg {
+            var_name_index: 0,
+            type_index: 0,
+            access_path,
+            data_len: bytes.len(),
+            source: ComplexArgSource::ImmediateBytes {
+                bytes: bytes.to_vec(),
+            },
+        }
+    }
+
+    fn dynamic_memdump_arg<'ctx>(context: &'ctx Context, max_len: usize) -> ComplexArg<'ctx> {
+        ComplexArg {
+            var_name_index: 0,
+            type_index: 0,
+            access_path: Vec::new(),
+            data_len: max_len,
+            source: ComplexArgSource::MemDumpDynamic {
+                address: RuntimeAddress::available(context.i64_type().const_zero(), context),
+                len_value: context.i64_type().const_int(max_len as u64, false),
+                max_len,
+            },
+        }
+    }
+
+    #[test]
+    fn complex_format_layout_records_per_arg_lengths() {
+        let context = Context::create();
+        let args = vec![
+            immediate_arg(&[1, 2, 3], vec![7, 8]),
+            dynamic_memdump_arg(&context, 64),
+        ];
+
+        let layout = plan_complex_format_layout(4096, 0, &args);
+
+        assert_eq!(layout.arg_count, 2);
+        assert_eq!(
+            layout.args,
+            vec![
+                ComplexFormatArgLayout {
+                    header_len: COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN + 2,
+                    reserved_len: 3,
+                },
+                ComplexFormatArgLayout {
+                    header_len: COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN,
+                    reserved_len: 64,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn complex_format_layout_shares_dynamic_budget_in_arg_layouts() {
+        let context = Context::create();
+        let args = vec![
+            dynamic_memdump_arg(&context, 256),
+            dynamic_memdump_arg(&context, 256),
+        ];
+        let desired_dynamic_budget = DYNAMIC_READ_ERROR_PAYLOAD_LEN * args.len();
+        let fixed_overhead = std::mem::size_of::<InstructionHeader>()
+            + std::mem::size_of::<PrintComplexFormatData>();
+        let headers_total = args
+            .iter()
+            .map(complex_format_arg_header_len)
+            .sum::<usize>();
+        let end_instruction_size =
+            std::mem::size_of::<InstructionHeader>() + std::mem::size_of::<EndInstructionData>();
+        let max_trace_event_size =
+            end_instruction_size + fixed_overhead + headers_total + desired_dynamic_budget;
+
+        let layout = plan_complex_format_layout(max_trace_event_size, 0, &args);
+
+        assert_eq!(
+            layout
+                .args
+                .iter()
+                .map(|arg_layout| arg_layout.reserved_len)
+                .collect::<Vec<_>>(),
+            vec![
+                DYNAMIC_READ_ERROR_PAYLOAD_LEN,
+                DYNAMIC_READ_ERROR_PAYLOAD_LEN,
+            ]
+        );
     }
 }

@@ -11,7 +11,7 @@ use ghostscope_protocol::trace_event::{
     PrintComplexVariableData, PrintStringIndexData, PrintVariableIndexData, VariableStatus,
 };
 use ghostscope_protocol::{InstructionType, TraceContext, TypeKind};
-use inkwell::values::{BasicValueEnum, IntValue};
+use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use inkwell::AddressSpace;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
