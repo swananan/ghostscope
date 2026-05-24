@@ -103,6 +103,37 @@ pub struct PrintComplexFormatData {
                                   //  access_path:bytes, data_len:u16, data:bytes] * arg_count
 }
 
+/// Fixed prefix for each PrintComplexFormat argument.
+///
+/// The full argument is variable-length:
+/// `PrintComplexFormatArgPrefix`, then `access_path`, then `data_len:u16`,
+/// then `data`.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
+pub struct PrintComplexFormatArgPrefix {
+    pub var_name_index: u16,
+    pub type_index: u16,
+    pub access_path_len: u8,
+    pub status: u8,
+}
+
+pub const PRINT_COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET: usize =
+    std::mem::offset_of!(PrintComplexFormatData, arg_count);
+
+pub const PRINT_COMPLEX_FORMAT_ARG_VAR_NAME_INDEX_OFFSET: usize =
+    std::mem::offset_of!(PrintComplexFormatArgPrefix, var_name_index);
+pub const PRINT_COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET: usize =
+    std::mem::offset_of!(PrintComplexFormatArgPrefix, type_index);
+pub const PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_LEN_OFFSET: usize =
+    std::mem::offset_of!(PrintComplexFormatArgPrefix, access_path_len);
+pub const PRINT_COMPLEX_FORMAT_ARG_STATUS_OFFSET: usize =
+    std::mem::offset_of!(PrintComplexFormatArgPrefix, status);
+pub const PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET: usize =
+    std::mem::size_of::<PrintComplexFormatArgPrefix>();
+pub const PRINT_COMPLEX_FORMAT_ARG_DATA_LEN_SIZE: usize = std::mem::size_of::<u16>();
+pub const PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN: usize =
+    PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET + PRINT_COMPLEX_FORMAT_ARG_DATA_LEN_SIZE;
+
 // Note: historical PrintVariableError has been removed; per-variable errors
 // are carried via status in PrintVariableIndex/ComplexFormat.
 
@@ -194,5 +225,17 @@ mod tests {
             execution_status: 0,
         };
         assert_eq!(inst.instruction_type(), InstructionType::EndInstruction);
+    }
+
+    #[test]
+    fn print_complex_format_arg_layout_constants_match_wire_format() {
+        assert_eq!(PRINT_COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET, 2);
+        assert_eq!(PRINT_COMPLEX_FORMAT_ARG_VAR_NAME_INDEX_OFFSET, 0);
+        assert_eq!(PRINT_COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET, 2);
+        assert_eq!(PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_LEN_OFFSET, 4);
+        assert_eq!(PRINT_COMPLEX_FORMAT_ARG_STATUS_OFFSET, 5);
+        assert_eq!(PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET, 6);
+        assert_eq!(PRINT_COMPLEX_FORMAT_ARG_DATA_LEN_SIZE, 2);
+        assert_eq!(PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN, 8);
     }
 }

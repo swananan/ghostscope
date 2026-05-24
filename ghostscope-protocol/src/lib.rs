@@ -14,8 +14,13 @@ pub mod type_info;
 pub use type_kind::{consts, TypeKind};
 
 pub use trace_event::{
-    EndInstructionData, InstructionHeader, InstructionType, PrintStringIndexData,
-    PrintVariableIndexData, TraceEventHeader, TraceEventMessage, VariableStatus,
+    EndInstructionData, InstructionHeader, InstructionType, PrintComplexFormatArgPrefix,
+    PrintStringIndexData, PrintVariableIndexData, TraceEventHeader, TraceEventMessage,
+    VariableStatus, PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_LEN_OFFSET,
+    PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET, PRINT_COMPLEX_FORMAT_ARG_DATA_LEN_SIZE,
+    PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN, PRINT_COMPLEX_FORMAT_ARG_STATUS_OFFSET,
+    PRINT_COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET, PRINT_COMPLEX_FORMAT_ARG_VAR_NAME_INDEX_OFFSET,
+    PRINT_COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET,
 };
 
 pub use trace_context::TraceContext;

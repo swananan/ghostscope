@@ -9,6 +9,9 @@ use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use ghostscope_protocol::trace_event::{
     BacktraceData, EndInstructionData, InstructionHeader, PrintComplexFormatData,
     PrintComplexVariableData, PrintStringIndexData, PrintVariableIndexData, VariableStatus,
+    PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_LEN_OFFSET, PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET,
+    PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN, PRINT_COMPLEX_FORMAT_ARG_STATUS_OFFSET,
+    PRINT_COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET, PRINT_COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET,
 };
 use ghostscope_protocol::{InstructionType, TraceContext, TypeKind};
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};

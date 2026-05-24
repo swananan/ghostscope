@@ -1,12 +1,5 @@
 use super::*;
 
-const COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET: usize = 2;
-const COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET: usize = 2;
-const COMPLEX_FORMAT_ARG_ACCESS_PATH_LEN_OFFSET: usize = 4;
-const COMPLEX_FORMAT_ARG_STATUS_OFFSET: usize = 5;
-const COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET: usize = 6;
-const COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN: usize = 8;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ComplexFormatArgLayout {
     header_len: usize,
@@ -27,7 +20,7 @@ struct ComplexFormatArgPointers<'ctx> {
 }
 
 fn complex_format_arg_header_len(arg: &ComplexArg<'_>) -> usize {
-    COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN + arg.access_path.len()
+    PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN + arg.access_path.len()
 }
 
 fn complex_format_static_payload_len(arg: &ComplexArg<'_>) -> Option<usize> {
@@ -579,7 +572,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     &[self
                         .context
                         .i32_type()
-                        .const_int(COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET as u64, false)],
+                        .const_int(PRINT_COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET as u64, false)],
                     "arg_count_ptr",
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get arg_count GEP: {e}")))?
@@ -640,7 +633,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     &[self
                         .context
                         .i32_type()
-                        .const_int(COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET as u64, false)],
+                        .const_int(PRINT_COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET as u64, false)],
                     "ti_ptr",
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get ti GEP: {e}")))?
@@ -671,7 +664,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     &[self
                         .context
                         .i32_type()
-                        .const_int(COMPLEX_FORMAT_ARG_STATUS_OFFSET as u64, false)],
+                        .const_int(PRINT_COMPLEX_FORMAT_ARG_STATUS_OFFSET as u64, false)],
                     "status_ptr",
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {e}")))?
@@ -686,10 +679,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .build_gep(
                     self.context.i8_type(),
                     arg_base,
-                    &[self
-                        .context
-                        .i32_type()
-                        .const_int(COMPLEX_FORMAT_ARG_ACCESS_PATH_LEN_OFFSET as u64, false)],
+                    &[self.context.i32_type().const_int(
+                        PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_LEN_OFFSET as u64,
+                        false,
+                    )],
                     "apl_ptr",
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get apl GEP: {e}")))?
@@ -711,10 +704,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .build_gep(
                         self.context.i8_type(),
                         arg_base,
-                        &[self
-                            .context
-                            .i32_type()
-                            .const_int((COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET + i) as u64, false)],
+                        &[self.context.i32_type().const_int(
+                            (PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET + i) as u64,
+                            false,
+                        )],
                         &format!("ap_byte_{i}"),
                     )
                     .map_err(|e| {
@@ -734,7 +727,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     self.context.i8_type(),
                     arg_base,
                     &[self.context.i32_type().const_int(
-                        (COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET + arg.access_path.len()) as u64,
+                        (PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET + arg.access_path.len())
+                            as u64,
                         false,
                     )],
                     "dl_ptr",
@@ -766,7 +760,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     self.context.i8_type(),
                     arg_base,
                     &[self.context.i32_type().const_int(
-                        (COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN + arg.access_path.len()) as u64,
+                        (PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN + arg.access_path.len()) as u64,
                         false,
                     )],
                     "var_data_ptr",
@@ -1650,11 +1644,11 @@ mod complex_format_layout_tests {
             layout.args,
             vec![
                 ComplexFormatArgLayout {
-                    header_len: COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN + 2,
+                    header_len: PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN + 2,
                     reserved_len: 3,
                 },
                 ComplexFormatArgLayout {
-                    header_len: COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN,
+                    header_len: PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN,
                     reserved_len: 64,
                 },
             ]
