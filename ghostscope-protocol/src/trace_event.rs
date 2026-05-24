@@ -44,6 +44,14 @@ pub struct InstructionHeader {
     pub reserved: u8,
 }
 
+pub const INSTRUCTION_HEADER_SIZE: usize = std::mem::size_of::<InstructionHeader>();
+pub const INSTRUCTION_HEADER_INST_TYPE_OFFSET: usize =
+    std::mem::offset_of!(InstructionHeader, inst_type);
+pub const INSTRUCTION_HEADER_DATA_LENGTH_OFFSET: usize =
+    std::mem::offset_of!(InstructionHeader, data_length);
+pub const INSTRUCTION_HEADER_RESERVED_OFFSET: usize =
+    std::mem::offset_of!(InstructionHeader, reserved);
+
 /// Per-variable runtime status for data acquisition
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +67,20 @@ pub enum VariableStatus {
     /// Requested dynamic length is <= 0; no bytes were read
     ZeroLength = 6,
 }
+
+/// Payload carried by ReadError variable statuses.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+pub struct VariableReadErrorPayload {
+    pub errno: i32,
+    pub addr: u64,
+}
+
+pub const VARIABLE_READ_ERROR_PAYLOAD_LEN: usize = std::mem::size_of::<VariableReadErrorPayload>();
+pub const VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET: usize =
+    std::mem::offset_of!(VariableReadErrorPayload, errno);
+pub const VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET: usize =
+    std::mem::offset_of!(VariableReadErrorPayload, addr);
 
 /// Print string instruction data (most optimized)
 #[repr(C, packed)]
@@ -165,6 +187,12 @@ pub struct EndInstructionData {
     pub reserved: u8,            // Padding for alignment
 }
 
+pub const END_INSTRUCTION_DATA_OFFSET: usize = INSTRUCTION_HEADER_SIZE;
+pub const END_INSTRUCTION_TOTAL_INSTRUCTIONS_OFFSET: usize =
+    std::mem::offset_of!(EndInstructionData, total_instructions);
+pub const END_INSTRUCTION_EXECUTION_STATUS_OFFSET: usize =
+    std::mem::offset_of!(EndInstructionData, execution_status);
+
 /// High-level instruction representation for compilation and parsing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Instruction {
@@ -228,7 +256,17 @@ mod tests {
     }
 
     #[test]
-    fn print_complex_format_arg_layout_constants_match_wire_format() {
+    fn protocol_layout_constants_match_wire_format() {
+        assert_eq!(INSTRUCTION_HEADER_SIZE, 4);
+        assert_eq!(INSTRUCTION_HEADER_INST_TYPE_OFFSET, 0);
+        assert_eq!(INSTRUCTION_HEADER_DATA_LENGTH_OFFSET, 1);
+        assert_eq!(INSTRUCTION_HEADER_RESERVED_OFFSET, 3);
+        assert_eq!(END_INSTRUCTION_DATA_OFFSET, 4);
+        assert_eq!(END_INSTRUCTION_TOTAL_INSTRUCTIONS_OFFSET, 0);
+        assert_eq!(END_INSTRUCTION_EXECUTION_STATUS_OFFSET, 2);
+        assert_eq!(VARIABLE_READ_ERROR_PAYLOAD_LEN, 12);
+        assert_eq!(VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET, 0);
+        assert_eq!(VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET, 4);
         assert_eq!(PRINT_COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET, 2);
         assert_eq!(PRINT_COMPLEX_FORMAT_ARG_VAR_NAME_INDEX_OFFSET, 0);
         assert_eq!(PRINT_COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET, 2);

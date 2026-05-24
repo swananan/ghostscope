@@ -28,11 +28,11 @@ fn complex_format_static_payload_len(arg: &ComplexArg<'_>) -> Option<usize> {
         ComplexArgSource::ImmediateBytes { bytes } => Some(bytes.len()),
         ComplexArgSource::AddressValue { .. } => Some(8),
         ComplexArgSource::RuntimeRead { .. } => {
-            Some(std::cmp::max(arg.data_len, DYNAMIC_READ_ERROR_PAYLOAD_LEN))
+            Some(std::cmp::max(arg.data_len, VARIABLE_READ_ERROR_PAYLOAD_LEN))
         }
         ComplexArgSource::ComputedInt { byte_len, .. } => Some(*byte_len),
         ComplexArgSource::MemDump { len, .. } => {
-            Some(std::cmp::max(*len, DYNAMIC_READ_ERROR_PAYLOAD_LEN))
+            Some(std::cmp::max(*len, VARIABLE_READ_ERROR_PAYLOAD_LEN))
         }
         ComplexArgSource::MemDumpDynamic { .. } => None,
     }
@@ -503,13 +503,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store inst_type: {e}")))?;
 
         // SAFETY: buffer points at a reserved PrintComplexFormat instruction
-        // region and offset 1 is the InstructionHeader data_length field.
+        // region and the offset is derived from InstructionHeader.
         let data_length_ptr = unsafe {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
                     buffer,
-                    &[self.context.i32_type().const_int(1, false)],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(INSTRUCTION_HEADER_DATA_LENGTH_OFFSET as u64, false)],
                     "data_length_ptr",
                 )
                 .map_err(|e| {
@@ -532,14 +535,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_store(data_length_i16_ptr, data_length_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
-        // SAFETY: PrintComplexFormatData starts immediately after InstructionHeader
-        // at offset 4 in the reserved instruction region.
+        // SAFETY: PrintComplexFormatData starts immediately after InstructionHeader.
         let data_ptr = unsafe {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
                     buffer,
-                    &[self.context.i32_type().const_int(4, false)],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(INSTRUCTION_HEADER_SIZE as u64, false)],
                     "pcf_data_ptr",
                 )
                 .map_err(|e| {
@@ -1067,10 +1072,24 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .const_int(VariableStatus::ReadError as u64, false),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        // SAFETY: var_data_ptr points at the read-error payload.
+        let errno_ptr_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    var_data_ptr,
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET as u64, false)],
+                    "errno_ptr_i8",
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        };
         let errno_ptr = self
             .builder
             .build_pointer_cast(
-                var_data_ptr,
+                errno_ptr_i8,
                 self.context.ptr_type(AddressSpace::default()),
                 "errno_ptr",
             )
@@ -1079,14 +1098,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_store(errno_ptr, errno)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        // SAFETY: read-error payload reserves 12 bytes, so addr starts at byte 4
-        // after the errno field.
+        // SAFETY: read-error payload reserves enough bytes for the addr field.
         let addr_ptr_i8 = unsafe {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
                     var_data_ptr,
-                    &[self.context.i32_type().const_int(4, false)],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET as u64, false)],
                     "addr_ptr_i8",
                 )
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
@@ -1295,11 +1316,27 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .const_int(VariableStatus::ReadError as u64, false),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        if eff_max_len >= 4 {
+        if eff_max_len as usize
+            >= VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET + std::mem::size_of::<i32>()
+        {
+            // SAFETY: var_data_ptr points at the read-error payload.
+            let errno_ptr_i8 = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        var_data_ptr,
+                        &[self
+                            .context
+                            .i32_type()
+                            .const_int(VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET as u64, false)],
+                        "mdd_errno_ptr_i8",
+                    )
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            };
             let errno_ptr = self
                 .builder
                 .build_pointer_cast(
-                    var_data_ptr,
+                    errno_ptr_i8,
                     self.context.ptr_type(AddressSpace::default()),
                     "mdd_errno_ptr",
                 )
@@ -1309,15 +1346,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .build_store(errno_ptr, errno)
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         }
-        if eff_max_len as usize >= DYNAMIC_READ_ERROR_PAYLOAD_LEN {
-            // SAFETY: eff_max_len is at least the 12-byte read-error payload, so
-            // addr starts at byte 4 after errno.
+        if eff_max_len as usize >= VARIABLE_READ_ERROR_PAYLOAD_LEN {
+            // SAFETY: eff_max_len is at least the read-error payload length.
             let addr_ptr_i8 = unsafe {
                 self.builder
                     .build_gep(
                         self.context.i8_type(),
                         var_data_ptr,
-                        &[self.context.i32_type().const_int(4, false)],
+                        &[self
+                            .context
+                            .i32_type()
+                            .const_int(VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET as u64, false)],
                         "mdd_addr_ptr_i8",
                     )
                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
@@ -1442,10 +1481,21 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .const_int(VariableStatus::ReadError as u64, false),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        // SAFETY: var_data_ptr points at the read-error payload.
+        let errno_ptr_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    var_data_ptr,
+                    &[i32_type.const_int(VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET as u64, false)],
+                    "errno_ptr_i8",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get errno gep: {e}")))?
+        };
         let i32_ptr = self
             .builder
             .build_pointer_cast(
-                var_data_ptr,
+                errno_ptr_i8,
                 self.context.ptr_type(AddressSpace::default()),
                 "errno_ptr",
             )
@@ -1453,14 +1503,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_store(i32_ptr, ret)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store errno: {e}")))?;
-        // SAFETY: read-error payload reserves 12 bytes, so addr starts at byte 4
-        // after the errno field.
+        // SAFETY: read-error payload reserves enough bytes for the addr field.
         let addr_ptr_i8 = unsafe {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
                     var_data_ptr,
-                    &[i32_type.const_int(4, false)],
+                    &[i32_type.const_int(VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET as u64, false)],
                     "addr_ptr_i8",
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get addr gep: {e}")))?
@@ -1662,7 +1711,7 @@ mod complex_format_layout_tests {
             dynamic_memdump_arg(&context, 256),
             dynamic_memdump_arg(&context, 256),
         ];
-        let desired_dynamic_budget = DYNAMIC_READ_ERROR_PAYLOAD_LEN * args.len();
+        let desired_dynamic_budget = VARIABLE_READ_ERROR_PAYLOAD_LEN * args.len();
         let fixed_overhead = std::mem::size_of::<InstructionHeader>()
             + std::mem::size_of::<PrintComplexFormatData>();
         let headers_total = args
@@ -1683,8 +1732,8 @@ mod complex_format_layout_tests {
                 .map(|arg_layout| arg_layout.reserved_len)
                 .collect::<Vec<_>>(),
             vec![
-                DYNAMIC_READ_ERROR_PAYLOAD_LEN,
-                DYNAMIC_READ_ERROR_PAYLOAD_LEN,
+                VARIABLE_READ_ERROR_PAYLOAD_LEN,
+                VARIABLE_READ_ERROR_PAYLOAD_LEN,
             ]
         );
     }

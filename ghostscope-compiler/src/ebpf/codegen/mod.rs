@@ -9,9 +9,12 @@ use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use ghostscope_protocol::trace_event::{
     BacktraceData, EndInstructionData, InstructionHeader, PrintComplexFormatData,
     PrintComplexVariableData, PrintStringIndexData, PrintVariableIndexData, VariableStatus,
+    INSTRUCTION_HEADER_DATA_LENGTH_OFFSET, INSTRUCTION_HEADER_SIZE,
     PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_LEN_OFFSET, PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET,
     PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN, PRINT_COMPLEX_FORMAT_ARG_STATUS_OFFSET,
     PRINT_COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET, PRINT_COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET,
+    VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET, VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET,
+    VARIABLE_READ_ERROR_PAYLOAD_LEN,
 };
 use ghostscope_protocol::{InstructionType, TraceContext, TypeKind};
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
@@ -70,8 +73,6 @@ struct ComplexArg<'ctx> {
     data_len: usize,
     source: ComplexArgSource<'ctx>,
 }
-
-const DYNAMIC_READ_ERROR_PAYLOAD_LEN: usize = 12;
 
 fn print_complex_format_instruction_budget(
     max_trace_event_size: usize,
@@ -132,8 +133,8 @@ fn allocate_dynamic_payload_reservations(max_lens: &[usize], available: usize) -
         return vec![0; max_lens.len()];
     }
 
-    let base_caps = vec![DYNAMIC_READ_ERROR_PAYLOAD_LEN; max_lens.len()];
-    let base_budget = available.min(DYNAMIC_READ_ERROR_PAYLOAD_LEN.saturating_mul(max_lens.len()));
+    let base_caps = vec![VARIABLE_READ_ERROR_PAYLOAD_LEN; max_lens.len()];
+    let base_budget = available.min(VARIABLE_READ_ERROR_PAYLOAD_LEN.saturating_mul(max_lens.len()));
     let mut reservations = distribute_budget_fairly(&base_caps, base_budget);
     let remaining_budget = available.saturating_sub(reservations.iter().sum::<usize>());
     if remaining_budget == 0 {
@@ -145,7 +146,7 @@ fn allocate_dynamic_payload_reservations(max_lens: &[usize], available: usize) -
         .zip(reservations.iter())
         .map(|(max_len, reserved)| {
             max_len
-                .max(&DYNAMIC_READ_ERROR_PAYLOAD_LEN)
+                .max(&VARIABLE_READ_ERROR_PAYLOAD_LEN)
                 .saturating_sub(*reserved)
         })
         .collect();

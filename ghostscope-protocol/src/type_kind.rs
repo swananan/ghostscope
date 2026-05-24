@@ -159,8 +159,7 @@ pub mod consts {
         std::mem::size_of::<crate::trace_event::TraceEventHeader>();
 
     /// Instruction header size
-    pub const INSTRUCTION_HEADER_SIZE: usize =
-        std::mem::size_of::<crate::trace_event::InstructionHeader>();
+    pub const INSTRUCTION_HEADER_SIZE: usize = crate::trace_event::INSTRUCTION_HEADER_SIZE;
 
     /// Print variable index data size (extended with type_index)
     pub const PRINT_VARIABLE_INDEX_DATA_SIZE: usize =
@@ -173,12 +172,17 @@ pub mod consts {
     pub const TRACE_EVENT_MESSAGE_TID_OFFSET: usize = 20;
 
     // InstructionHeader field offsets
-    pub const INSTRUCTION_HEADER_INST_TYPE_OFFSET: usize = 0;
-    pub const INSTRUCTION_HEADER_DATA_LENGTH_OFFSET: usize = 1;
-    pub const INSTRUCTION_HEADER_RESERVED_OFFSET: usize = 3;
+    pub const INSTRUCTION_HEADER_INST_TYPE_OFFSET: usize =
+        crate::trace_event::INSTRUCTION_HEADER_INST_TYPE_OFFSET;
+    pub const INSTRUCTION_HEADER_DATA_LENGTH_OFFSET: usize =
+        crate::trace_event::INSTRUCTION_HEADER_DATA_LENGTH_OFFSET;
+    pub const INSTRUCTION_HEADER_RESERVED_OFFSET: usize =
+        crate::trace_event::INSTRUCTION_HEADER_RESERVED_OFFSET;
 
     // EndInstructionData relative offset from InstructionHeader start
-    pub const END_INSTRUCTION_DATA_OFFSET: usize = 4;
-    pub const END_INSTRUCTION_TOTAL_INSTRUCTIONS_OFFSET: usize = 0; // Within EndInstructionData
-    pub const END_INSTRUCTION_EXECUTION_STATUS_OFFSET: usize = 2; // Within EndInstructionData
+    pub const END_INSTRUCTION_DATA_OFFSET: usize = crate::trace_event::END_INSTRUCTION_DATA_OFFSET;
+    pub const END_INSTRUCTION_TOTAL_INSTRUCTIONS_OFFSET: usize =
+        crate::trace_event::END_INSTRUCTION_TOTAL_INSTRUCTIONS_OFFSET; // Within EndInstructionData
+    pub const END_INSTRUCTION_EXECUTION_STATUS_OFFSET: usize =
+        crate::trace_event::END_INSTRUCTION_EXECUTION_STATUS_OFFSET; // Within EndInstructionData
 }
