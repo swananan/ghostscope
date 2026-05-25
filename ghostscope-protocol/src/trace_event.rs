@@ -9,6 +9,9 @@ pub struct TraceEventHeader {
     pub magic: u32,
 }
 
+pub const TRACE_EVENT_HEADER_SIZE: usize = std::mem::size_of::<TraceEventHeader>();
+pub const TRACE_EVENT_HEADER_MAGIC_OFFSET: usize = std::mem::offset_of!(TraceEventHeader, magic);
+
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 pub struct TraceEventMessage {
@@ -18,6 +21,14 @@ pub struct TraceEventMessage {
     pub tid: u32,
     // Followed by variable-length instruction sequence ending with EndInstruction
 }
+
+pub const TRACE_EVENT_MESSAGE_SIZE: usize = std::mem::size_of::<TraceEventMessage>();
+pub const TRACE_EVENT_MESSAGE_TRACE_ID_OFFSET: usize =
+    std::mem::offset_of!(TraceEventMessage, trace_id);
+pub const TRACE_EVENT_MESSAGE_TIMESTAMP_OFFSET: usize =
+    std::mem::offset_of!(TraceEventMessage, timestamp);
+pub const TRACE_EVENT_MESSAGE_PID_OFFSET: usize = std::mem::offset_of!(TraceEventMessage, pid);
+pub const TRACE_EVENT_MESSAGE_TID_OFFSET: usize = std::mem::offset_of!(TraceEventMessage, tid);
 
 /// Instruction types for trace events
 #[repr(u8)]
@@ -178,6 +189,15 @@ pub struct ExprErrorData {
     pub failing_addr: u64, // Optional: address involved in failure (0 if unknown)
 }
 
+pub const EXPR_ERROR_DATA_SIZE: usize = std::mem::size_of::<ExprErrorData>();
+pub const EXPR_ERROR_DATA_STRING_INDEX_OFFSET: usize =
+    std::mem::offset_of!(ExprErrorData, string_index);
+pub const EXPR_ERROR_DATA_ERROR_CODE_OFFSET: usize =
+    std::mem::offset_of!(ExprErrorData, error_code);
+pub const EXPR_ERROR_DATA_FLAGS_OFFSET: usize = std::mem::offset_of!(ExprErrorData, flags);
+pub const EXPR_ERROR_DATA_FAILING_ADDR_OFFSET: usize =
+    std::mem::offset_of!(ExprErrorData, failing_addr);
+
 /// End instruction data - marks the end of instruction sequence
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
@@ -257,6 +277,13 @@ mod tests {
 
     #[test]
     fn protocol_layout_constants_match_wire_format() {
+        assert_eq!(TRACE_EVENT_HEADER_SIZE, 4);
+        assert_eq!(TRACE_EVENT_HEADER_MAGIC_OFFSET, 0);
+        assert_eq!(TRACE_EVENT_MESSAGE_SIZE, 24);
+        assert_eq!(TRACE_EVENT_MESSAGE_TRACE_ID_OFFSET, 0);
+        assert_eq!(TRACE_EVENT_MESSAGE_TIMESTAMP_OFFSET, 8);
+        assert_eq!(TRACE_EVENT_MESSAGE_PID_OFFSET, 16);
+        assert_eq!(TRACE_EVENT_MESSAGE_TID_OFFSET, 20);
         assert_eq!(INSTRUCTION_HEADER_SIZE, 4);
         assert_eq!(INSTRUCTION_HEADER_INST_TYPE_OFFSET, 0);
         assert_eq!(INSTRUCTION_HEADER_DATA_LENGTH_OFFSET, 1);
@@ -267,6 +294,11 @@ mod tests {
         assert_eq!(VARIABLE_READ_ERROR_PAYLOAD_LEN, 12);
         assert_eq!(VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET, 0);
         assert_eq!(VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET, 4);
+        assert_eq!(EXPR_ERROR_DATA_SIZE, 12);
+        assert_eq!(EXPR_ERROR_DATA_STRING_INDEX_OFFSET, 0);
+        assert_eq!(EXPR_ERROR_DATA_ERROR_CODE_OFFSET, 2);
+        assert_eq!(EXPR_ERROR_DATA_FLAGS_OFFSET, 3);
+        assert_eq!(EXPR_ERROR_DATA_FAILING_ADDR_OFFSET, 4);
         assert_eq!(PRINT_COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET, 2);
         assert_eq!(PRINT_COMPLEX_FORMAT_ARG_VAR_NAME_INDEX_OFFSET, 0);
         assert_eq!(PRINT_COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET, 2);

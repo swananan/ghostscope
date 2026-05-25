@@ -12,9 +12,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Reserve space in accumulation buffer for this instruction
         let inst_buffer = self
             .reserve_instruction_region_or_return_zero(
-                (std::mem::size_of::<InstructionHeader>()
-                    + std::mem::size_of::<ghostscope_protocol::trace_event::ExprErrorData>())
-                    as u64,
+                (INSTRUCTION_HEADER_SIZE + EXPR_ERROR_DATA_SIZE) as u64,
             )?
             .into_value_after_runtime_returns();
 
@@ -35,10 +33,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .build_gep(
                     self.context.i8_type(),
                     inst_buffer,
-                    &[self.context.i32_type().const_int(
-                        std::mem::offset_of!(InstructionHeader, data_length) as u64,
-                        false,
-                    )],
+                    &[self
+                        .context
+                        .i32_type()
+                        .const_int(INSTRUCTION_HEADER_DATA_LENGTH_OFFSET as u64, false)],
                     "exprerr_data_length_ptr",
                 )
                 .map_err(|e| {
@@ -53,16 +51,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "exprerr_data_length_i16_ptr",
             )
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast data_length ptr: {e}")))?;
-        let data_length_val = self.context.i16_type().const_int(
-            std::mem::size_of::<ghostscope_protocol::trace_event::ExprErrorData>() as u64,
-            false,
-        );
+        let data_length_val = self
+            .context
+            .i16_type()
+            .const_int(EXPR_ERROR_DATA_SIZE as u64, false);
         self.builder
             .build_store(data_length_i16_ptr, data_length_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store data_length: {e}")))?;
 
         // Payload fields after header
-        // string_index at offset sizeof(InstructionHeader) + 0 (u16)
         // SAFETY: the payload immediately follows InstructionHeader in the
         // reserved ExprError instruction region.
         let si_ptr = unsafe {
@@ -70,10 +67,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .build_gep(
                     self.context.i8_type(),
                     inst_buffer,
-                    &[self
-                        .context
-                        .i32_type()
-                        .const_int(std::mem::size_of::<InstructionHeader>() as u64, false)],
+                    &[self.context.i32_type().const_int(
+                        (INSTRUCTION_HEADER_SIZE + EXPR_ERROR_DATA_STRING_INDEX_OFFSET) as u64,
+                        false,
+                    )],
                     "exprerr_si_ptr",
                 )
                 .map_err(|e| {
@@ -98,17 +95,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_store(si_i16_ptr, si_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store string_index: {e}")))?;
 
-        // error_code at +2, flags at +3
         // SAFETY: error_code offset is within ExprErrorData in the reserved payload.
         let ec_ptr = unsafe {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
                     inst_buffer,
-                    &[self
-                        .context
-                        .i32_type()
-                        .const_int((std::mem::size_of::<InstructionHeader>() + 2) as u64, false)],
+                    &[self.context.i32_type().const_int(
+                        (INSTRUCTION_HEADER_SIZE + EXPR_ERROR_DATA_ERROR_CODE_OFFSET) as u64,
+                        false,
+                    )],
                     "exprerr_ec_ptr",
                 )
                 .map_err(|e| {
@@ -136,10 +132,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .build_gep(
                     self.context.i8_type(),
                     inst_buffer,
-                    &[self
-                        .context
-                        .i32_type()
-                        .const_int((std::mem::size_of::<InstructionHeader>() + 3) as u64, false)],
+                    &[self.context.i32_type().const_int(
+                        (INSTRUCTION_HEADER_SIZE + EXPR_ERROR_DATA_FLAGS_OFFSET) as u64,
+                        false,
+                    )],
                     "exprerr_flags_ptr",
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get flags GEP: {e}")))?
@@ -160,17 +156,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_store(fl_ptr, fl_i8)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store flags: {e}")))?;
 
-        // failing_addr at +4 (u64)
         // SAFETY: failing_addr offset is within ExprErrorData in the reserved payload.
         let addr_ptr = unsafe {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
                     inst_buffer,
-                    &[self
-                        .context
-                        .i32_type()
-                        .const_int((std::mem::size_of::<InstructionHeader>() + 4) as u64, false)],
+                    &[self.context.i32_type().const_int(
+                        (INSTRUCTION_HEADER_SIZE + EXPR_ERROR_DATA_FAILING_ADDR_OFFSET) as u64,
+                        false,
+                    )],
                     "exprerr_addr_ptr",
                 )
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get addr GEP: {e}")))?
