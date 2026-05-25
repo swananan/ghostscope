@@ -9,6 +9,8 @@ use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use ghostscope_protocol::trace_event::{
     BacktraceData, EndInstructionData, InstructionHeader, PrintComplexFormatData,
     PrintComplexVariableData, PrintStringIndexData, PrintVariableIndexData, VariableStatus,
+    EXPR_ERROR_DATA_ERROR_CODE_OFFSET, EXPR_ERROR_DATA_FAILING_ADDR_OFFSET,
+    EXPR_ERROR_DATA_FLAGS_OFFSET, EXPR_ERROR_DATA_SIZE, EXPR_ERROR_DATA_STRING_INDEX_OFFSET,
     INSTRUCTION_HEADER_DATA_LENGTH_OFFSET, INSTRUCTION_HEADER_SIZE,
     PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_LEN_OFFSET, PRINT_COMPLEX_FORMAT_ARG_ACCESS_PATH_OFFSET,
     PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN, PRINT_COMPLEX_FORMAT_ARG_STATUS_OFFSET,

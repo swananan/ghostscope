@@ -151,12 +151,10 @@ pub mod consts {
     pub const MAX_TRACE_EVENT_SIZE: u16 = 8192;
 
     /// Trace event message size
-    pub const TRACE_EVENT_MESSAGE_SIZE: usize =
-        std::mem::size_of::<crate::trace_event::TraceEventMessage>();
+    pub const TRACE_EVENT_MESSAGE_SIZE: usize = crate::trace_event::TRACE_EVENT_MESSAGE_SIZE;
 
     /// Trace event header size
-    pub const TRACE_EVENT_HEADER_SIZE: usize =
-        std::mem::size_of::<crate::trace_event::TraceEventHeader>();
+    pub const TRACE_EVENT_HEADER_SIZE: usize = crate::trace_event::TRACE_EVENT_HEADER_SIZE;
 
     /// Instruction header size
     pub const INSTRUCTION_HEADER_SIZE: usize = crate::trace_event::INSTRUCTION_HEADER_SIZE;
@@ -166,10 +164,14 @@ pub mod consts {
         std::mem::size_of::<crate::trace_event::PrintVariableIndexData>();
 
     // TraceEventMessage field offsets
-    pub const TRACE_EVENT_MESSAGE_TRACE_ID_OFFSET: usize = 0;
-    pub const TRACE_EVENT_MESSAGE_TIMESTAMP_OFFSET: usize = 8;
-    pub const TRACE_EVENT_MESSAGE_PID_OFFSET: usize = 16;
-    pub const TRACE_EVENT_MESSAGE_TID_OFFSET: usize = 20;
+    pub const TRACE_EVENT_MESSAGE_TRACE_ID_OFFSET: usize =
+        crate::trace_event::TRACE_EVENT_MESSAGE_TRACE_ID_OFFSET;
+    pub const TRACE_EVENT_MESSAGE_TIMESTAMP_OFFSET: usize =
+        crate::trace_event::TRACE_EVENT_MESSAGE_TIMESTAMP_OFFSET;
+    pub const TRACE_EVENT_MESSAGE_PID_OFFSET: usize =
+        crate::trace_event::TRACE_EVENT_MESSAGE_PID_OFFSET;
+    pub const TRACE_EVENT_MESSAGE_TID_OFFSET: usize =
+        crate::trace_event::TRACE_EVENT_MESSAGE_TID_OFFSET;
 
     // InstructionHeader field offsets
     pub const INSTRUCTION_HEADER_INST_TYPE_OFFSET: usize =
