@@ -48,6 +48,7 @@ pub struct SysEvent {
 const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const PENDING_MAX_ATTEMPTS: u32 = 20;
 const MODULE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const SYSMON_EVENT_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingOffsetsEntry {
@@ -136,7 +137,7 @@ impl SysmonConfig {
 pub struct ProcessSysmon {
     cfg: SysmonConfig,
     mgr: Arc<Mutex<ProcessManager>>, // shared manager to compute/prefill offsets
-    tx: mpsc::Sender<SysEvent>,
+    tx: mpsc::SyncSender<SysEvent>,
     rx: mpsc::Receiver<SysEvent>,
     pending_offsets: Arc<Mutex<PendingOffsets>>,
     handle: Option<JoinHandle<()>>,
@@ -151,7 +152,7 @@ impl core::fmt::Debug for ProcessSysmon {
 impl ProcessSysmon {
     /// Create a new sysmon instance with shared ProcessManager and config.
     pub fn new(mgr: Arc<Mutex<ProcessManager>>, cfg: SysmonConfig) -> Self {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(SYSMON_EVENT_QUEUE_CAPACITY);
         Self {
             cfg,
             mgr,
@@ -332,13 +333,35 @@ impl ProcessSysmon {
     }
 }
 
+fn try_publish_sys_event(tx: &mpsc::SyncSender<SysEvent>, ev: SysEvent) -> bool {
+    match tx.try_send(ev) {
+        Ok(()) => true,
+        Err(mpsc::TrySendError::Full(ev)) => {
+            tracing::trace!(
+                "Sysmon event queue full; dropping lifecycle notification for pid {} kind {}",
+                ev.tgid,
+                ev.kind
+            );
+            false
+        }
+        Err(mpsc::TrySendError::Disconnected(ev)) => {
+            tracing::trace!(
+                "Sysmon event receiver disconnected; dropping lifecycle notification for pid {} kind {}",
+                ev.tgid,
+                ev.kind
+            );
+            false
+        }
+    }
+}
+
 #[cfg(feature = "sysmon-ebpf")]
 fn run_sysmon_loop(
     mgr: Arc<Mutex<ProcessManager>>,
     target: Option<PathBuf>,
     pending: Arc<Mutex<PendingOffsets>>,
     perf_pages: Option<usize>,
-    tx: mpsc::Sender<SysEvent>,
+    tx: mpsc::SyncSender<SysEvent>,
 ) -> anyhow::Result<()> {
     use aya::maps::{
         perf::{PerfEvent, PerfEventArray},
@@ -516,7 +539,7 @@ fn run_sysmon_loop(
                             e
                         );
                     }
-                    let _ = tx.send(ev);
+                    try_publish_sys_event(&tx, ev);
                 }
             }
             poll_pending_offsets(&mgr, &pending);
@@ -573,7 +596,7 @@ fn run_sysmon_loop(
                                     e
                                 );
                             }
-                            let _ = tx.send(ev);
+                            try_publish_sys_event(&tx, ev);
                         }
                     }
                     PerfEvent::Lost { count } => {
@@ -1088,4 +1111,22 @@ fn pid_maps_target_module(pid: u32, target: &Path) -> bool {
     }
 
     matched
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sysmon_event_publish_drops_when_queue_is_full() {
+        let (tx, rx) = mpsc::sync_channel(1);
+
+        assert!(try_publish_sys_event(&tx, SysEvent { tgid: 1, kind: 1 }));
+        assert!(!try_publish_sys_event(&tx, SysEvent { tgid: 2, kind: 2 }));
+
+        let queued = rx.try_recv().expect("first event should be queued");
+        assert_eq!(queued.tgid, 1);
+        assert_eq!(queued.kind, 1);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
 }
