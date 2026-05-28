@@ -234,6 +234,14 @@ pub struct Args {
     #[arg(long, value_name = "MODE", value_enum)]
     pub script_output: Option<ScriptOutputMode>,
 
+    /// Compile and resolve trace targets without attaching uprobes
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub dry_run: bool,
+
+    /// Include detailed target and variable diagnostics in dry-run output
+    #[arg(long = "dry-run-details", requires = "dry_run", action = clap::ArgAction::SetTrue)]
+    pub dry_run_details: bool,
+
     /// Enable interactive DWARF/script/attach status prompts on stderr
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub status: bool,
@@ -325,6 +333,8 @@ pub struct ParsedArgs {
     pub script_file: Option<PathBuf>,
     pub pid: Option<u32>,
     pub tui_mode: bool,
+    pub dry_run: bool,
+    pub dry_run_details: bool,
     pub script_output: Option<ScriptOutputMode>,
     pub status_enabled: bool,
     pub has_explicit_status_flag: bool,
@@ -475,6 +485,8 @@ impl Args {
         let should_save_ebpf = Self::should_save_ebpf(&parsed);
         let should_save_ast = Self::should_save_ast(&parsed);
         let tui_mode = Self::determine_tui_mode(&parsed);
+        let dry_run = parsed.dry_run;
+        let dry_run_details = parsed.dry_run_details;
         let target_path = Self::resolve_target_path(&parsed);
         let (status_enabled, has_explicit_status_flag) = Self::determine_status_config(&parsed);
         let (
@@ -502,6 +514,8 @@ impl Args {
             script_file: parsed.script_file,
             pid: parsed.pid,
             tui_mode,
+            dry_run,
+            dry_run_details,
             script_output: parsed.script_output,
             status_enabled,
             has_explicit_status_flag,
@@ -562,6 +576,10 @@ impl Args {
 
     /// Determine whether to start in TUI mode
     fn determine_tui_mode(parsed: &Args) -> bool {
+        if parsed.dry_run {
+            return false;
+        }
+
         // Explicit --tui flag takes precedence
         if parsed.tui {
             return true;
@@ -688,6 +706,8 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    use clap::Parser;
 
     use super::{
         Args, BpffsCommand, BpffsPruneArgs, ParsedCommand, ScriptOutputMode, ScriptTimestampFormat,
@@ -859,6 +879,44 @@ mod tests {
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_dry_run_details_flag() {
+        let parsed = Args::parse_args_from(vec![
+            "ghostscope".to_string(),
+            "--pid".to_string(),
+            "1234".to_string(),
+            "--script".to_string(),
+            "trace main { print 1; }".to_string(),
+            "--dry-run".to_string(),
+            "--dry-run-details".to_string(),
+        ]);
+
+        match parsed {
+            ParsedCommand::Trace(args) => {
+                assert!(args.dry_run);
+                assert!(args.dry_run_details);
+                assert!(!args.tui_mode);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dry_run_details_requires_dry_run() {
+        let err = Args::try_parse_from(vec![
+            "ghostscope",
+            "--pid",
+            "1234",
+            "--script",
+            "trace main { print 1; }",
+            "--dry-run-details",
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("--dry-run"));
     }
 
     #[test]

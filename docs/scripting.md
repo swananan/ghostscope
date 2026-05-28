@@ -43,6 +43,21 @@ GhostScope supports the following statements:
 
 The `trace` statement is the top‑level construct used only at the script file level (not nested inside other trace blocks).
 
+Before attaching uprobes, you can validate a script and inspect the resolved
+targets:
+
+```bash
+ghostscope -p 1234 --script-file trace.gs --dry-run
+ghostscope -p 1234 --script-file trace.gs --dry-run --dry-run-details
+```
+
+`--dry-run` parses DWARF, compiles the script, resolves PCs and uprobe file
+offsets, then exits without attaching. It still performs the same startup
+privilege and kernel capability checks as a real run, so use `sudo` or
+equivalent eBPF privileges when your system requires them. `--dry-run-details`
+adds source locations, inline classification, script-used variables, visible
+variables, and optimized-out/unavailable variable diagnostics.
+
 ### Syntax
 
 ```ghostscope

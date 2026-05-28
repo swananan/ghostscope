@@ -534,12 +534,12 @@ pub async fn compile_and_load_script_for_tui(
     })
 }
 
-/// Compile and load script for command line mode using session.command_loaders
-pub async fn compile_and_load_script_for_cli(
+/// Compile a script for command line mode without attaching uprobes.
+pub fn compile_script_for_cli(
     script: &str,
     session: &mut GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
-) -> Result<()> {
+) -> Result<ghostscope_compiler::CompilationResult> {
     let fallback_host_pid = session.host_pid();
 
     info!("Starting unified script compilation with DWARF integration...");
@@ -589,6 +589,17 @@ pub async fn compile_and_load_script_for_cli(
             );
         }
     }
+
+    Ok(compilation_result)
+}
+
+/// Compile and load script for command line mode using session.command_loaders
+pub async fn compile_and_load_script_for_cli(
+    script: &str,
+    session: &mut GhostSession,
+    compile_options: &ghostscope_compiler::CompileOptions,
+) -> Result<()> {
+    let compilation_result = compile_script_for_cli(script, session, compile_options)?;
 
     // Ensure -p offsets are cached once per session
     if let Some(proc_pid) = session.proc_pid() {

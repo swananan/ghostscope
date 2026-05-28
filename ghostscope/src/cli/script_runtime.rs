@@ -295,20 +295,60 @@ async fn run_cli_with_session(
     // Step 6: Build compile options from merged config
     let binary_path_hint = crate::util::derive_binary_path_hint(&session);
 
-    let compile_options = config.get_compile_options(
+    let mut compile_options = config.get_compile_options(
         config.should_save_llvm_ir,
         config.should_save_ebpf,
         config.should_save_ast,
         binary_path_hint,
     );
+    if config.dry_run {
+        compile_options.save_llvm_ir = false;
+        compile_options.save_ebpf = false;
+        compile_options.save_ast = false;
+    }
 
-    // Step 7: Compile and load script with graceful error handling
+    // Step 7: Compile the script and either report the plan or attach uprobes
     if show_cli_status {
         eprintln!(
             "{}",
-            stderr_colors.yellow(stderr_colors.bold("Compiling script..."))
+            stderr_colors.yellow(stderr_colors.bold(if config.dry_run {
+                "Compiling script for dry run..."
+            } else {
+                "Compiling script..."
+            }))
         );
     }
+
+    if config.dry_run {
+        let compilation_result = match crate::script::compile_script_for_cli(
+            &script_content,
+            &mut session,
+            &compile_options,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                error!("Failed to compile dry-run script: {:#}", e);
+                return Err(e);
+            }
+        };
+
+        if show_cli_status {
+            eprintln!(
+                "{}",
+                stderr_colors.green("Dry run complete; no uprobes attached.")
+            );
+        }
+        crate::cli::dry_run::print_dry_run_report(
+            &compilation_result,
+            session.process_analyzer.as_ref(),
+            &compile_options.runtime_capabilities,
+            crate::cli::dry_run::DryRunReportOptions {
+                details: config.dry_run_details,
+            },
+        );
+        return Ok(());
+    }
+
     if let Err(e) = crate::script::compile_and_load_script_for_cli(
         &script_content,
         &mut session,
@@ -574,6 +614,8 @@ mod tests {
                 script_color_mode: CliColorMode::Auto,
                 script_output_events_per_sec: 10_000,
                 tui_mode: false,
+                dry_run: false,
+                dry_run_details: false,
                 should_save_llvm_ir: false,
                 should_save_ebpf: false,
                 should_save_ast: false,

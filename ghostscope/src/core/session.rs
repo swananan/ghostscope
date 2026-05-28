@@ -114,7 +114,9 @@ impl GhostSession {
 
         // Start sysmon for standalone -t only. Combined -t -p uses the PID for
         // concrete process mappings and does not need system-wide lifecycle tracking.
-        if s.proc_pid().is_none() && s.target_binary.is_some() {
+        if config.dry_run {
+            info!("Sysmon not started (dry-run mode)");
+        } else if s.proc_pid().is_none() && s.target_binary.is_some() {
             let tpath = PathBuf::from(s.target_binary.as_ref().unwrap());
             if config.ebpf_config.enable_sysmon_for_target {
                 let cfg = SysmonConfig {
@@ -449,6 +451,8 @@ mod tests {
             script: None,
             script_file: None,
             tui_mode: false,
+            dry_run: false,
+            dry_run_details: false,
             script_output: None,
             status_enabled: true,
             has_explicit_status_flag: false,
