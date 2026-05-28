@@ -226,6 +226,8 @@ Behavior:
 | `--script-file <PATH>` | | Script file to execute | None |
 | `--script-help` | | Print the embedded script language reference and exit | Off |
 | `--script-output <MODE>` | | Script event stdout mode: pretty, plain | pretty |
+| `--dry-run` | | Compile the script, resolve trace targets, and exit without attaching uprobes. Requires the same eBPF privileges and kernel capabilities as a real run. | Off |
+| `--dry-run-details` | | Include source, inline, and variable diagnostics in dry-run output; requires `--dry-run` | Off |
 | `--status` | | Enable interactive DWARF/script/attach stderr status prompts | On |
 | `--no-status` | | Disable interactive DWARF/script/attach stderr status prompts | Off override |
 | `--script-timestamp <FORMAT>` | | Pretty output timestamp: local, boot, none | local |

@@ -31,6 +31,8 @@ pub struct UserConfig {
     pub script_color_mode: CliColorMode,
     pub script_output_events_per_sec: u64,
     pub tui_mode: bool,
+    pub dry_run: bool,
+    pub dry_run_details: bool,
 
     // File saving options
     pub should_save_llvm_ir: bool,
@@ -170,6 +172,8 @@ impl UserConfig {
                 .script_output_events_per_sec
                 .unwrap_or(config.script.output_events_per_sec),
             tui_mode,
+            dry_run: args.dry_run,
+            dry_run_details: args.dry_run_details,
             should_save_llvm_ir,
             should_save_ebpf,
             should_save_ast,
@@ -276,6 +280,12 @@ impl UserConfig {
                     script_file.display()
                 ));
             }
+        }
+
+        if self.dry_run && self.script.is_none() && self.script_file.is_none() {
+            return Err(anyhow::anyhow!(
+                "--dry-run requires --script or --script-file because there is no trace plan to resolve"
+            ));
         }
 
         if let Some(debug_file) = &self.debug_file {

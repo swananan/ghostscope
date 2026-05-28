@@ -43,6 +43,15 @@ GhostScope 支持以下语句类型：
 
 `trace` 语句是定义追踪点的顶层结构。它只在脚本文件中使用，不在追踪块内部使用。
 
+在真正 attach uprobe 之前，可以先验证脚本并查看解析结果：
+
+```bash
+ghostscope -p 1234 --script-file trace.gs --dry-run
+ghostscope -p 1234 --script-file trace.gs --dry-run --dry-run-details
+```
+
+`--dry-run` 会解析 DWARF、编译脚本、解析 PC 和 uprobe 文件偏移，然后直接退出，不 attach。它仍会执行与真实运行相同的启动权限和内核能力检查；如果当前系统要求，请使用 `sudo` 或等价 eBPF 权限。`--dry-run-details` 会追加源码位置、inline 分类、脚本用到的变量、当前 PC 可见变量，以及 optimized-out/不可用变量诊断。
+
 ### 语法
 
 ```ghostscope

@@ -227,6 +227,8 @@ ghostscope bpffs prune --dry-run --json
 | `--script-file <PATH>` | | 要执行的脚本文件 | 无 |
 | `--script-help` | | 输出内嵌的脚本语言参考并退出 | 关 |
 | `--script-output <MODE>` | | 脚本事件 stdout 模式：pretty, plain | pretty |
+| `--dry-run` | | 编译脚本、解析 trace 目标，然后退出，不 attach uprobe。需要与真实运行相同的 eBPF 权限和内核能力。 | 关 |
+| `--dry-run-details` | | 在 dry-run 输出中包含源码、inline 和变量诊断；需要同时使用 `--dry-run` | 关 |
 | `--status` | | 启用交互式 DWARF/脚本/attach stderr 状态提示 | 开 |
 | `--no-status` | | 禁用交互式 DWARF/脚本/attach stderr 状态提示 | 关闭覆盖 |
 | `--script-timestamp <FORMAT>` | | pretty 输出时间戳：local, boot, none | local |

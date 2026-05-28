@@ -3,4 +3,6 @@
 pub mod compiler;
 
 // Re-export main functions for convenience
-pub use compiler::{compile_and_load_script_for_cli, compile_and_load_script_for_tui};
+pub use compiler::{
+    compile_and_load_script_for_cli, compile_and_load_script_for_tui, compile_script_for_cli,
+};

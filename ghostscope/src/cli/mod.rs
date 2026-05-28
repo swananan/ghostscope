@@ -2,6 +2,7 @@
 
 mod color;
 mod docs;
+mod dry_run;
 mod loading_reporter;
 pub mod script_output;
 pub mod script_runtime;
