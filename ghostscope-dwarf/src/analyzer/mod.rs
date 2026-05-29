@@ -22,6 +22,7 @@ mod type_lookup;
 
 pub use module_resolution::ModuleDefaultPolicy;
 pub use source_resolution::{SourceLineAddressSearch, SourceLineQuerySearch};
+pub use type_lookup::TypeLookupAmbiguity;
 
 #[cfg(test)]
 use crate::{

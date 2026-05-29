@@ -136,7 +136,7 @@ fn detect_unknown_keyword(input: &str) -> Option<String> {
     // Valid statement starters that should not be flagged as unknown
     const SUPPORTED_HEADS: &[&str] = &["trace", "print", "if", "else", "let", "backtrace", "bt"];
     // Builtin call names allowed at expression head
-    const BUILTIN_CALLS: &[&str] = &["memcmp", "strncmp", "starts_with", "hex"];
+    const BUILTIN_CALLS: &[&str] = &["memcmp", "strncmp", "starts_with", "hex", "cast"];
 
     // Helper: simple Levenshtein distance (small strings, few keywords)
     fn levenshtein(a: &str, b: &str) -> usize {
@@ -826,6 +826,8 @@ fn parse_factor(pair: Pair<Rule>) -> Result<Expr> {
                 Rule::strncmp_call => parse_builtin_call(inner),
                 Rule::starts_with_call => parse_builtin_call(inner),
                 Rule::hex_call => parse_builtin_call(inner),
+                Rule::postfix_access => parse_postfix_access(inner),
+                Rule::cast_call => parse_cast_call(inner),
                 Rule::chain_access => parse_chain_access(inner),
                 Rule::pointer_deref => parse_pointer_deref(inner),
                 Rule::address_of => parse_address_of(inner),
@@ -1154,6 +1156,76 @@ fn parse_builtin_call(pair: Pair<Rule>) -> Result<Expr> {
     }
 }
 
+fn parse_cast_call(pair: Pair<Rule>) -> Result<Expr> {
+    let mut inner = pair.into_inner();
+    let expr_pair = inner.next().ok_or(ParseError::InvalidExpression)?;
+    let type_pair = inner.next().ok_or(ParseError::InvalidExpression)?;
+    let raw_type = type_pair.as_str();
+    let target_type = raw_type
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .ok_or_else(|| ParseError::SyntaxError("cast target type must be a string".to_string()))?
+        .to_string();
+
+    Ok(Expr::Cast {
+        expr: Box::new(parse_expr(expr_pair)?),
+        target_type,
+    })
+}
+
+fn parse_postfix_access(pair: Pair<Rule>) -> Result<Expr> {
+    let mut inner = pair.into_inner();
+    let base = inner.next().ok_or(ParseError::InvalidExpression)?;
+    let mut expr = match base.as_rule() {
+        Rule::postfix_base => {
+            let base_inner = base
+                .into_inner()
+                .next()
+                .ok_or(ParseError::InvalidExpression)?;
+            match base_inner.as_rule() {
+                Rule::cast_call => parse_cast_call(base_inner)?,
+                Rule::special_var => Expr::SpecialVar(base_inner.as_str().to_string()),
+                Rule::identifier => Expr::Variable(base_inner.as_str().to_string()),
+                Rule::expr => parse_expr(base_inner)?,
+                _ => return Err(ParseError::UnexpectedToken(base_inner.as_rule())),
+            }
+        }
+        _ => return Err(ParseError::UnexpectedToken(base.as_rule())),
+    };
+
+    for suffix in inner {
+        let suffix_inner = suffix
+            .into_inner()
+            .next()
+            .ok_or(ParseError::InvalidExpression)?;
+        match suffix_inner.as_rule() {
+            Rule::member_suffix => {
+                let field = suffix_inner
+                    .into_inner()
+                    .next()
+                    .ok_or(ParseError::InvalidExpression)?
+                    .as_str()
+                    .to_string();
+                expr = Expr::MemberAccess(Box::new(expr), field);
+            }
+            Rule::index_suffix => {
+                let index_pair = suffix_inner
+                    .into_inner()
+                    .next()
+                    .ok_or(ParseError::InvalidExpression)?;
+                let parsed_index = parse_expr(index_pair)?;
+                let parsed_index = integer_literal_value(&parsed_index)
+                    .map(Expr::Int)
+                    .unwrap_or(parsed_index);
+                expr = Expr::ArrayAccess(Box::new(expr), Box::new(parsed_index));
+            }
+            _ => return Err(ParseError::UnexpectedToken(suffix_inner.as_rule())),
+        }
+    }
+
+    Ok(expr)
+}
+
 fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
     let inner = pair
         .into_inner()
@@ -1451,7 +1523,10 @@ fn parse_pointer_deref(pair: Pair<Rule>) -> Result<Expr> {
     let target = inner.next().ok_or(ParseError::InvalidExpression)?;
     let parsed = match target.as_rule() {
         Rule::expr => parse_expr(target)?,
+        Rule::postfix_access => parse_postfix_access(target)?,
+        Rule::cast_call => parse_cast_call(target)?,
         Rule::complex_variable => parse_complex_variable(target)?,
+        Rule::special_var => Expr::SpecialVar(target.as_str().to_string()),
         Rule::identifier => Expr::Variable(target.as_str().to_string()),
         _ => return Err(ParseError::UnexpectedToken(target.as_rule())),
     };
@@ -1468,7 +1543,10 @@ fn parse_address_of(pair: Pair<Rule>) -> Result<Expr> {
     let target = inner.next().ok_or(ParseError::InvalidExpression)?;
     let parsed = match target.as_rule() {
         Rule::expr => parse_expr(target)?,
+        Rule::postfix_access => parse_postfix_access(target)?,
+        Rule::cast_call => parse_cast_call(target)?,
         Rule::complex_variable => parse_complex_variable(target)?,
+        Rule::special_var => Expr::SpecialVar(target.as_str().to_string()),
         Rule::identifier => Expr::Variable(target.as_str().to_string()),
         _ => return Err(ParseError::UnexpectedToken(target.as_rule())),
     };
@@ -1492,6 +1570,47 @@ trace foo {
 "#;
         let r = parse(script);
         assert!(r.is_ok(), "parse failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn parse_cast_member_and_index_access() {
+        let script = r#"
+trace foo {
+    print cast($arg0, "struct request *").id;
+    print cast($arg1, "u32 *")[2];
+    print *cast($arg1, "u32 *");
+    print &cast($arg0, "struct request *").id;
+}
+"#;
+        let program = parse(script).expect("parse should succeed");
+        let Statement::TracePoint { body, .. } = &program.statements[0] else {
+            panic!("expected trace point");
+        };
+        assert!(matches!(
+            &body[0],
+            Statement::Print(PrintStatement::ComplexVariable(Expr::MemberAccess(obj, field)))
+                if field == "id" && matches!(obj.as_ref(), Expr::Cast { .. })
+        ));
+        assert!(matches!(
+            &body[1],
+            Statement::Print(PrintStatement::ComplexVariable(Expr::ArrayAccess(base, index)))
+                if matches!(base.as_ref(), Expr::Cast { .. })
+                    && matches!(index.as_ref(), Expr::Int(2))
+        ));
+        assert!(matches!(
+            &body[2],
+            Statement::Print(PrintStatement::ComplexVariable(Expr::PointerDeref(inner)))
+                if matches!(inner.as_ref(), Expr::Cast { .. })
+        ));
+        assert!(matches!(
+            &body[3],
+            Statement::Print(PrintStatement::ComplexVariable(Expr::AddressOf(inner)))
+                if matches!(
+                    inner.as_ref(),
+                    Expr::MemberAccess(obj, field)
+                        if field == "id" && matches!(obj.as_ref(), Expr::Cast { .. })
+                )
+        ));
     }
 
     #[test]
