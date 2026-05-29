@@ -96,6 +96,103 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
+    fn complex_arg_from_dynamic_lvalue(
+        &mut self,
+        expr: &crate::script::ast::Expr,
+        lvalue: crate::ebpf::expression::DynamicLvalue<'ctx>,
+    ) -> Result<ComplexArg<'ctx>> {
+        let dwarf_type = lvalue.type_info.dwarf_type;
+        let data_len = Self::compute_read_size_for_type(&dwarf_type);
+        if data_len == 0 {
+            return Err(CodeGenError::TypeSizeNotAvailable(self.expr_to_name(expr)));
+        }
+
+        Ok(ComplexArg {
+            var_name_index: self
+                .trace_context
+                .add_variable_name(self.expr_to_name(expr)),
+            type_index: self.trace_context.add_type(dwarf_type),
+            access_path: Vec::new(),
+            data_len,
+            source: ComplexArgSource::MemDump {
+                address: lvalue.address,
+                len: data_len,
+            },
+        })
+    }
+
+    fn complex_arg_from_cast_expr(
+        &mut self,
+        source_expr: &crate::script::ast::Expr,
+        target_type: &str,
+    ) -> Result<ComplexArg<'ctx>> {
+        let dwarf_type = self.resolve_cast_target_type(target_type)?;
+        let display_name = format!(
+            "cast({}, \"{}\")",
+            self.expr_to_name(source_expr),
+            target_type
+        );
+        let var_name_index = self.trace_context.add_variable_name(display_name.clone());
+        let type_index = self.trace_context.add_type(dwarf_type.clone());
+
+        if matches!(
+            ghostscope_dwarf::strip_type_aliases(&dwarf_type),
+            ghostscope_dwarf::TypeInfo::PointerType { .. }
+        ) {
+            let value = self.cast_source_pointer_value(source_expr)?.value;
+            return Ok(ComplexArg {
+                var_name_index,
+                type_index,
+                access_path: Vec::new(),
+                data_len: 8,
+                source: ComplexArgSource::ComputedInt { value, byte_len: 8 },
+            });
+        }
+
+        if ghostscope_dwarf::c_integer_comparison_type(&dwarf_type).is_some() {
+            let cast_expr = crate::script::ast::Expr::Cast {
+                expr: Box::new(source_expr.clone()),
+                target_type: target_type.to_string(),
+            };
+            let value = match self.compile_expr(&cast_expr)? {
+                BasicValueEnum::IntValue(value) => value,
+                BasicValueEnum::PointerValue(value) => self
+                    .builder
+                    .build_ptr_to_int(value, self.context.i64_type(), "cast_arg_ptr_to_i64")
+                    .map_err(|err| CodeGenError::Builder(err.to_string()))?,
+                _ => {
+                    return Err(CodeGenError::TypeError(
+                        "cast expression did not produce an integer value".to_string(),
+                    ))
+                }
+            };
+            let byte_len = Self::cast_value_byte_len(&dwarf_type).unwrap_or(8);
+            return Ok(ComplexArg {
+                var_name_index,
+                type_index,
+                access_path: Vec::new(),
+                data_len: byte_len,
+                source: ComplexArgSource::ComputedInt { value, byte_len },
+            });
+        }
+
+        let address = self.cast_source_memory_address(source_expr)?;
+        let data_len = Self::compute_read_size_for_type(&dwarf_type);
+        if data_len == 0 {
+            return Err(CodeGenError::TypeSizeNotAvailable(display_name));
+        }
+        Ok(ComplexArg {
+            var_name_index,
+            type_index,
+            access_path: Vec::new(),
+            data_len,
+            source: ComplexArgSource::MemDump {
+                address,
+                len: data_len,
+            },
+        })
+    }
+
     /// Unified expression resolver: returns a ComplexArg carrying
     /// a consistent var_name_index/type_index/access_path/data_len/source
     /// with strict priority: script variables -> DWARF (locals/params/globals).
@@ -246,6 +343,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 })
             }
 
+            // 3b) Explicit forced cast/reinterpret view.
+            E::Cast { expr, target_type } => self.complex_arg_from_cast_expr(expr, target_type),
+
             // 4) AddressOf: return AddressValue (pointer payload will be produced)
             E::AddressOf(inner) => {
                 let var = self
@@ -299,6 +399,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             | E::ArrayAccess(_, _)
             | E::PointerDeref(_)
             | E::ChainAccess(_)) => {
+                if let Some(lvalue) = self.dynamic_lvalue_address_and_type(expr)? {
+                    return self.complex_arg_from_dynamic_lvalue(expr, lvalue);
+                }
+
                 if let E::ArrayAccess(array_expr, index_expr) = expr {
                     if let Some((BasicValueEnum::IntValue(value), _element_type)) =
                         self.compile_dynamic_array_access_value(array_expr, index_expr)?
@@ -376,6 +480,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
             // 7) Pointer arithmetic (ptr +/- K) → typed runtime read at computed address
             E::BinaryOp { .. } => {
+                if let Some(lvalue) = self.dynamic_lvalue_address_and_type(expr)? {
+                    return self.complex_arg_from_dynamic_lvalue(expr, lvalue);
+                }
+
                 // Support: ptr + int, int + ptr, ptr - int (int may be negative)
                 // Only allow when ptr side resolves to DWARF pointer/array; the offset must be an integer literal for now.
                 // We emit a RuntimeRead with computed location, preserving the pointed-to DWARF type.
@@ -668,6 +776,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 E::ArrayAccess(arr, idx) => format!("{}[{}]", inner(arr), inner(idx)),
                 E::PointerDeref(p) => format!("*{}", inner(p)),
                 E::AddressOf(p) => format!("&{}", inner(p)),
+                E::Cast { expr, target_type } => {
+                    format!("cast({}, \"{}\")", inner(expr), target_type)
+                }
                 E::ChainAccess(v) => v.join("."),
                 E::Int(v) => v.to_string(),
                 E::String(s) => format!("\"{s}\""),
@@ -726,6 +837,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             | E::PointerDeref(inner)
             | E::AddressOf(inner)
             | E::MemberAccess(inner, _) => Self::expr_contains_builtin(inner),
+            E::Cast { expr, .. } => Self::expr_contains_builtin(expr),
             E::ArrayAccess(base, index) => {
                 Self::expr_contains_builtin(base) || Self::expr_contains_builtin(index)
             }
@@ -867,6 +979,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             E::Variable(name) if self.alias_variable_exists(name) => true,
             // Explicit address-of is always an alias
             E::AddressOf(_) => true,
+            E::Cast { target_type, .. } => self
+                .resolve_cast_target_type(target_type)
+                .ok()
+                .is_some_and(|ty| {
+                    matches!(
+                        ghostscope_dwarf::strip_type_aliases(&ty),
+                        ghostscope_dwarf::TypeInfo::PointerType { .. }
+                            | ghostscope_dwarf::TypeInfo::ArrayType { .. }
+                            | ghostscope_dwarf::TypeInfo::StructType { .. }
+                            | ghostscope_dwarf::TypeInfo::UnionType { .. }
+                    )
+                }),
             // Constant offset on top of an alias-eligible expression
             E::BinaryOp {
                 left,

@@ -70,6 +70,9 @@ run_make_fixture c_multithread_program all
 run_make_fixture scalar_types_program clean
 run_make_fixture scalar_types_program all
 
+run_make_fixture cast_types_program clean
+run_make_fixture cast_types_program all
+
 run_cargo_fixture "$RUST_FIXTURE_DIR" clean
 run_cargo_fixture "$RUST_FIXTURE_DIR" build --locked
 

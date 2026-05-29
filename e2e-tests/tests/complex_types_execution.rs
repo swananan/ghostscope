@@ -75,6 +75,60 @@ trace update_complex {
 }
 
 #[tokio::test]
+async fn test_cast_pointer_members_array_and_scalar() -> anyhow::Result<()> {
+    init();
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::Debug)?;
+    let target = spawn_complex_types_binary(&binary_path).await?;
+
+    let script = r#"
+trace complex_types_program.c:15 {
+    let idx = i - (i / 8) * 8;
+    print cast(c, "struct Complex");
+    print *cast(c, "struct Complex *");
+    print "CAST_PTR I={} AGE={} DATA={} ARR={} U8={}",
+        i,
+        cast(c, "struct Complex *").age,
+        cast(c, "struct Complex *").data.i,
+        cast(c, "struct Complex *").arr[idx],
+        cast(i, "u8");
+    if (*cast(c, "struct Complex *")).data.i == i { print "CAST_DEREF_OK"; }
+    if cast(c, "struct Complex *").data.i == i { print "CAST_DATA_OK"; }
+    if cast(c, "struct Complex *").arr[idx] == i * 2 { print "CAST_ARR_OK"; }
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    assert!(
+        stdout.contains("arr: [") && stdout.contains("friend_ref:"),
+        "Expected aggregate cast to render struct fields. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("CAST_DATA_OK"),
+        "Expected pointer cast member access to match i. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("CAST_DEREF_OK"),
+        "Expected pointer deref cast member access to match i. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("CAST_ARR_OK"),
+        "Expected pointer cast array access to scale by element size. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("CAST_PTR I=") && stdout.contains(" U8="),
+        "Expected formatted scalar cast output. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_complex_o3_pointer_members_after_volatile_path() -> anyhow::Result<()> {
     init();
 

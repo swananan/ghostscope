@@ -1358,6 +1358,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     let in2 = expand_aliases(ctx, inner, visited, depth + 1)?;
                     E::AddressOf(Box::new(in2))
                 }
+                E::Cast { expr, target_type } => {
+                    let expr = expand_aliases(ctx, expr, visited, depth + 1)?;
+                    E::Cast {
+                        expr: Box::new(expr),
+                        target_type: target_type.clone(),
+                    }
+                }
                 E::ChainAccess(chain) => {
                     if chain.is_empty() {
                         return Ok(e.clone());
