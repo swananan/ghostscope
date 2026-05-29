@@ -233,6 +233,26 @@ Tips:
 - Auto‑dereference is supported for locals/params/globals. You don’t need to write `*ptr` or `->`; when safe, pointers are read and dereferenced automatically.
 - Array access: supported for top‑level `arr[<int literal>]` and chain‑tail `a.b.c[<int literal>]`. Not supported: chain‑middle indices (`a.b[2].c`), variable/expression indices (`arr[i]`, `arr[i + 1]`), and multi‑dim arrays.
 
+#### Explicit Casts
+
+Use `cast(expr, "TYPE")` to force GhostScope to interpret an expression as a different type. This is most useful when a value is an address, `void*`, or otherwise lacks the precise DWARF type you want to inspect.
+
+```ghostscope
+trace handle_request {
+    let req = cast(ctx, "struct request *");
+    print req.id;
+    print req.headers[0];
+}
+```
+
+Cast type names are resolved from DWARF type names. Treat the DWARF `DW_AT_name` value as the source of truth: C-style prefixes such as `struct`, `union`, `enum`, and `class` are accepted as convenience hints, but they are not usually part of the stored DWARF name. For example, a C `struct request` normally appears in DWARF as a structure DIE named `request`, while a typedef appears under the typedef name.
+
+Base types such as `int`, `unsigned int`, `bool`, `float`, and `double` also commonly exist in DWARF as base-type DIEs. GhostScope accepts common builtin spellings for convenience, and scalar casts can still be useful for width, signedness, and boolean normalization. The main value of `cast`, however, is user-defined and layout-bearing types: structs, classes, unions, enums, typedefs, pointers, and arrays. Those types let GhostScope use DWARF member offsets and element layout to read meaningful fields from memory.
+
+Type lookup is scoped by module. A module is the runtime-loaded ELF object that owns the trace point: the main executable or a shared library, not a source file, package, namespace, or Rust crate. Resolution first checks the current trace module, then falls back to other loaded modules that have DWARF information.
+
+Name collisions are possible when different modules define the same type name, for example a main executable and a shared library both defining `struct request`. In that case, the type in the current trace module wins. If the type exists in exactly one other loaded module, GhostScope may resolve that fallback match; if multiple fallback modules match, `cast` reports an ambiguity instead of picking one arbitrarily. There is no explicit `module=` or module-qualified cast syntax yet; future versions may add it for cross-module disambiguation.
+
 ## Special Variables
 
 Start with `$` and expose runtime info:
@@ -302,7 +322,7 @@ Extended specifiers and dynamic length:
 
 ```ghostscope
 // Hex / pointer / ASCII bytes
-print "A={:x} B={:08X}", a, b;
+print "A={:x} B={:X}", a, b;
 print "p={:p}", ptr;
 print "s={:s}", cstr;            // for char*/char[N], `{}` prints quoted C string
 
@@ -319,14 +339,28 @@ print "tail={:s.n$}", p;
 ```
 
 Notes:
-- `{}` default; `{:x}`/`{:X}` for integers; `{:p}` pointer; `{:s}` ASCII bytes.
+- `{}` default; `{:x}`/`{:X}` render the captured value payload as hex bytes; `{:p}` renders an address; `{:s}` renders ASCII bytes.
+- Length suffixes change `{:x}`/`{:s}` into memory-dump forms. `{:x}` formats the value already captured for the argument; `{:x.4}` treats the argument as an addressable memory source and reads 4 bytes from that address/source.
 - Length suffixes:
   - `.{N}`: static length (decimal/`0x..`/`0o..`/`0b..`).
   - `.*`: dynamic (consumes two args: len then value).
   - `.name$`: capture script variable `name` as length; does not consume an extra value arg.
-- Kernel performs bounded reads; user space renders hex/ASCII. For `{:s}` ASCII, rendering stops at first NUL; non‑printables show as `\xNN`.
+- Reads are type-sensitive. For `{:x}`, the DWARF/script type controls the captured value size and how the value is materialized. For `{:x.N}`/`{:s.N}`, pointers use the pointer value as the read address, arrays/aggregates use their base address, and addressable scalar DWARF variables use their storage address. A pure script integer is not addressable and will be rejected unless you explicitly cast it to a pointer type.
+- Kernel performs bounded reads for memory-dump forms; user space renders hex/ASCII. For `{:s}` ASCII, rendering stops at first NUL; non‑printables show as `\xNN`.
 - Per‑argument read cap is controlled by `ebpf.mem_dump_cap` (default 256 bytes). Requests beyond cap are truncated; if event payload is exceeded, output may also truncate with `…`.
 - On read failure (e.g., null deref, offsets unavailable, permission), extended specifiers print `<MISSING_ARG>`.
+
+Example:
+
+```ghostscope
+trace foo.c:42 {
+    // int a = 10;
+    print "value-hex={:x}", a;     // hex view of the captured int value, e.g. 0a 00 00 00
+    print "mem-hex={:x.4}", a;     // read 4 bytes from a's DWARF storage address
+    print "bad={:x.4}", 10;        // rejected: script integer literal is not an address
+    print "forced={:x.4}", cast(10, "u8 *"); // tries to read 4 bytes at address 0xa
+}
+```
 
 **Note**: Format strings use Rust‑style placeholders, not `%d`/`%s`.
 

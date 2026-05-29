@@ -74,6 +74,8 @@ factor = {
     strncmp_call |
     starts_with_call |
     hex_call |
+    postfix_access |
+    cast_call |
     bool |
     string |
     hex_int |
@@ -97,18 +99,25 @@ strncmp_call = { "strncmp" ~ "(" ~ expr ~ "," ~ expr ~ "," ~ expr ~ ")" }
 starts_with_call = { "starts_with" ~ "(" ~ expr ~ "," ~ expr ~ ")" }
 memcmp_call = { "memcmp" ~ "(" ~ expr ~ "," ~ expr ~ ("," ~ expr)? ~ ")" }
 hex_call = { "hex" ~ "(" ~ string ~ ")" }
+cast_call = { "cast" ~ "(" ~ expr ~ "," ~ string ~ ")" }
 
 special_var = @{ "$" ~ (ASCII_ALPHANUMERIC | "_")+ }
 
 // Complex variable access patterns
 complex_variable = { chain_access | array_access | member_access | pointer_deref | address_of }
+postfix_access = { postfix_base ~ postfix_suffix+ }
+postfix_base = { cast_call | special_var | identifier | "(" ~ expr ~ ")" }
+postfix_suffix = { member_suffix | index_suffix }
+member_suffix = { "." ~ identifier }
+index_suffix = { "[" ~ expr ~ "]" }
 
 chain_access = { identifier ~ ("." ~ identifier)* ~ ("[" ~ expr ~ "]")? }
 array_access = { identifier ~ "[" ~ expr ~ "]" ~ ("." ~ identifier)* }
 // Ensure member_access doesn't preempt cases followed by '[' (those should be parsed by chain_access)
 member_access = { identifier ~ ("." ~ identifier)+ ~ !("[") }
-pointer_deref = { "*" ~ ( "(" ~ expr ~ ")" | complex_variable | identifier ) }
-address_of = { "&" ~ ( "(" ~ expr ~ ")" | complex_variable | identifier ) }
+unary_target = _{ "(" ~ expr ~ ")" | postfix_access | cast_call | complex_variable | special_var | identifier }
+pointer_deref = { "*" ~ unary_target }
+address_of = { "&" ~ unary_target }
 
 add_op = { "+" | "-" }
 mul_op = { "*" | "/" }

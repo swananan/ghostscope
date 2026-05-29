@@ -24,6 +24,7 @@ pub use analyzer::{
     AddressQueryResult, AnalyzerStats, DwarfAnalyzer, ExecutableFileInfo, FunctionQueryResult,
     MainExecutableInfo, ModuleDefaultPolicy, ModuleLoadingEvent, ModuleLoadingStats, ModuleStats,
     SectionInfo, SharedLibraryInfo, SimpleFileInfo, SourceLineAddressSearch, SourceLineQuerySearch,
+    TypeLookupAmbiguity,
 };
 
 // Re-export essential core and semantic support types.

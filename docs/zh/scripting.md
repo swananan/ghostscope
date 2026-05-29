@@ -229,7 +229,25 @@ print arr[0].name;
 - 目前“局部变量、参数、全局变量”均已支持自动解引用（无需显式 `*ptr`，也不需要 `->`，统一使用 `.`，在安全范围内会自动加载并解引用指针值，类似于 Rust 的自动解引用）。
 - 数组访问：已支持顶层 `arr[整数字面量]` 与“链尾”`a.b.c[整数字面量]`。暂不支持：链中间索引（如 `a.b[2].c`）、变量/表达式下标（`arr[i]`、`arr[i + 1]`）和多维数组。
 
- 
+#### 显式类型转换
+
+使用 `cast(expr, "TYPE")` 可以强制 GhostScope 将表达式解释成另一种类型。这个能力最适合用于地址、`void*`，或者当前 DWARF 类型不够精确但用户明确知道内存真实布局的场景。
+
+```ghostscope
+trace handle_request {
+    let req = cast(ctx, "struct request *");
+    print req.id;
+    print req.headers[0];
+}
+```
+
+`cast` 的类型字符串会按 DWARF 类型名解析。应把 DWARF 的 `DW_AT_name` 当作最真实的类型名称来源：`struct`、`union`、`enum`、`class` 这类 C 风格前缀只是为了方便书写和表达 tag hint，通常不是 DWARF 里保存的名字。例如 C 里的 `struct request`，在 DWARF 的结构体 DIE 上通常叫 `request`；`typedef` 则通常以 typedef 自己的名字出现。
+
+`int`、`unsigned int`、`bool`、`float`、`double` 这类普通基础类型在 DWARF 里通常也会以 base type DIE 的形式存在。GhostScope 也接受常见 builtin 写法作为便利入口，标量 cast 在宽度、符号和布尔归一化这类场景仍然有用。不过 `cast` 的主要价值是用户自定义且带布局信息的类型：结构体、类、联合体、枚举、typedef、指针和数组。只有这些类型才能让 GhostScope 依据 DWARF 的成员偏移和元素布局，从内存中读出有意义的字段。
+
+类型解析按模块作用域进行。这里的“模块”指运行时加载的 ELF object：主可执行文件或共享库；不是源码文件、包名、namespace 或 Rust crate。解析会先查当前 trace 命中的模块，再回退到其他带 DWARF 信息的已加载模块。
+
+不同模块可能定义同名类型，例如主可执行文件和某个共享库都定义了 `struct request`。这种碰撞场景下，当前 trace 模块里的类型优先。如果该类型只存在于另一个已加载模块，GhostScope 可能解析到那个 fallback 结果；如果多个 fallback 模块同时命中，`cast` 会报告歧义，而不是随意选择一个。目前还没有显式 `module=` 或模块限定的 cast 语法；后续版本可能会加入，用于跨模块消歧。
 
 ### 特殊变量
 
@@ -306,7 +324,7 @@ print "姓名: {}, 年龄: {}", person.name, person.age;
 
 ```ghostscope
 // 十六进制 / 指针 / ASCII 字符串
-print "A={:x} B={:08X}", a, b;   // 十六进制（宽度/填充二阶段）
+print "A={:x} B={:X}", a, b;     // 十六进制字节视图
 print "p={:p}", ptr;             // 指针地址 0x...
 print "s={:s}", cstr;            // ASCII 字节视图；char*/char[N] 的 `{}` 仍打印带引号 C 字符串
 
@@ -323,14 +341,28 @@ print "tail={:s.n$}", p;          // 长度来自变量 n
 ```
 
 说明
-- `{}` 默认；`{:x}`/`{:X}` 用于整数；`{:p}` 指针；`{:s}` ASCII 字节。
+- `{}` 默认；`{:x}`/`{:X}` 将已经捕获到的参数 payload 按十六进制字节渲染；`{:p}` 渲染地址；`{:s}` 渲染 ASCII 字节。
+- 长度后缀会把 `{:x}`/`{:s}` 变成内存转储语义。`{:x}` 格式化参数已经捕获到的值；`{:x.4}` 会把参数当成可寻址的内存来源，并从该地址/来源读取 4 字节。
 - 长度后缀：
   - `.{N}`：静态长度（读取 N 字节）。`N` 支持十进制、十六进制（`0x..`）、八进制（`0o..`）和二进制（`0b..`）。
   - `.*`：动态长度，占位符会消费两个实参（先长度、后值）
   - `.name$`：捕获脚本变量 `name` 作为长度，不额外消费实参
-- 内核侧做有界读取；用户态十六进制/ASCII 渲染。`{:s}` 的 ASCII 渲染遇到首个 NUL 字节即停止；不可打印字节显示为 `\xNN`。
+- 读取方式会受类型影响。对于 `{:x}`，DWARF/脚本类型决定捕获值的大小，以及这个值如何被 materialize。对于 `{:x.N}`/`{:s.N}`，指针使用指针值作为读取地址，数组/聚合使用基地址，可取地址的 DWARF 标量变量使用自己的存储地址。纯脚本整数不是地址，除非显式 cast 成指针类型，否则会被拒绝。
+- 内核侧会为内存转储形式做有界读取；用户态负责十六进制/ASCII 渲染。`{:s}` 的 ASCII 渲染遇到首个 NUL 字节即停止；不可打印字节显示为 `\xNN`。
 - 内存转储的单参数上限由配置项 `ebpf.mem_dump_cap` 控制（默认 256 字节）。若请求长度超过该上限，将被截断；若超过事件负载上限，输出也可能被截断并以 `…` 表示。
 - 读取失败（如空指针、偏移不可用、权限等）时，扩展占位符会输出 `<MISSING_ARG>`。
+
+示例：
+
+```ghostscope
+trace foo.c:42 {
+    // int a = 10;
+    print "value-hex={:x}", a;     // a 这个 int 值的十六进制字节视图，如 0a 00 00 00
+    print "mem-hex={:x.4}", a;     // 从 a 的 DWARF 存储地址读取 4 字节
+    print "bad={:x.4}", 10;        // 会被拒绝：脚本整数字面量不是地址
+    print "forced={:x.4}", cast(10, "u8 *"); // 强制从地址 0xa 读 4 字节
+}
+```
 
 **注意**：格式字符串遵循 Rust 风格，不支持 `%d`/`%s`（C 风格）。
 
@@ -508,7 +540,7 @@ trace log_activity {
 - 支持：脚本变量（整数/布尔） 与上述 DWARF 整数类标量。
 - 有序比较 `< <= > >=` 的语义：
   - 脚本整数始终是有符号 `i64`；布尔按 `0`/`1` 参与比较。
-  - GhostScope 目前不支持显式类型转换，例如 `(uint32_t)x` 或 `x as u32`。
+  - 显式类型转换使用 `cast(expr, "TYPE")`，详见上文“显式类型转换”。不支持 C/Rust 原生写法，例如 `(uint32_t)x` 或 `x as u32`。
   - 对 DWARF 侧 C 整数类标量，有序比较会先按 C 的 integer promotions 与 usual arithmetic conversions 选择比较宽度和有符号/无符号语义。
   - `char`、`unsigned char`、`short`、`unsigned short` 等窄整数会先提升。按当前支持的 C 目标模型，`int8_t(-5) < uint8_t(250)` 会按有符号 `int` 比较，结果为真。
   - 对有符号/无符号混合比较，GhostScope 会选择转换后的比较宽度和符号。例如 `int32_t(-1) > uint32_t(4000000000)` 按 `uint32_t` 比较；`uint32_t(4000000000) > -10000000000` 则把脚本侧视为有符号 `i64` 参与比较。

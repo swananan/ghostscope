@@ -1,8 +1,74 @@
 use super::DwarfAnalyzer;
 use crate::semantics::VariableReadPlan;
-use std::path::Path;
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeLookupAmbiguity {
+    pub type_name: String,
+    pub module_paths: Vec<PathBuf>,
+}
+
+impl fmt::Display for TypeLookupAmbiguity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let modules = self
+            .module_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            f,
+            "type '{}' is ambiguous across loaded modules: {}",
+            self.type_name, modules
+        )
+    }
+}
+
+impl std::error::Error for TypeLookupAmbiguity {}
 
 impl DwarfAnalyzer {
+    pub fn resolve_builtin_type_spec(type_spec: &str) -> Option<crate::TypeInfo> {
+        resolve_type_spec_with(type_spec, |_| None)
+    }
+
+    pub fn resolve_type_spec_in_module<P: AsRef<Path>>(
+        &self,
+        module_path: P,
+        type_spec: &str,
+    ) -> Option<crate::TypeInfo> {
+        let module_path = module_path.as_ref().to_path_buf();
+        resolve_type_spec_with(type_spec, |name| {
+            self.resolve_named_type_in_module(&module_path, name)
+                .or_else(|| self.resolve_named_type(name))
+        })
+    }
+
+    pub fn try_resolve_type_spec_in_module<P: AsRef<Path>>(
+        &self,
+        module_path: P,
+        type_spec: &str,
+    ) -> std::result::Result<Option<crate::TypeInfo>, TypeLookupAmbiguity> {
+        let module_path = module_path.as_ref().to_path_buf();
+        try_resolve_type_spec_with(type_spec, |name| {
+            if let Some(ty) = self.resolve_named_type_in_module(&module_path, name) {
+                return Ok(Some(ty));
+            }
+            self.resolve_unique_named_type_outside_module(&module_path, name)
+        })
+    }
+
+    pub fn resolve_type_spec(&self, type_spec: &str) -> Option<crate::TypeInfo> {
+        resolve_type_spec_with(type_spec, |name| self.resolve_named_type(name))
+    }
+
+    pub fn try_resolve_type_spec(
+        &self,
+        type_spec: &str,
+    ) -> std::result::Result<Option<crate::TypeInfo>, TypeLookupAmbiguity> {
+        try_resolve_type_spec_with(type_spec, |name| self.resolve_unique_named_type(name))
+    }
+
     fn resolve_type_shallow_by_name_in_module_with_tags<P: AsRef<Path>>(
         &self,
         module_path: P,
@@ -23,6 +89,82 @@ impl DwarfAnalyzer {
         self.modules
             .values()
             .find_map(|module_data| module_data.resolve_type_shallow_by_name_with_tags(name, tags))
+    }
+
+    fn resolve_named_type_in_module(
+        &self,
+        module_path: &Path,
+        name: &str,
+    ) -> Option<crate::TypeInfo> {
+        let tags = [
+            gimli::constants::DW_TAG_structure_type,
+            gimli::constants::DW_TAG_class_type,
+            gimli::constants::DW_TAG_union_type,
+            gimli::constants::DW_TAG_enumeration_type,
+        ];
+        self.resolve_type_shallow_by_name_in_module_with_tags(module_path, name, &tags)
+    }
+
+    fn resolve_named_type(&self, name: &str) -> Option<crate::TypeInfo> {
+        let tags = [
+            gimli::constants::DW_TAG_structure_type,
+            gimli::constants::DW_TAG_class_type,
+            gimli::constants::DW_TAG_union_type,
+            gimli::constants::DW_TAG_enumeration_type,
+        ];
+        self.resolve_type_shallow_by_name_with_tags(name, &tags)
+    }
+
+    fn resolve_unique_named_type_outside_module(
+        &self,
+        module_path: &Path,
+        name: &str,
+    ) -> std::result::Result<Option<crate::TypeInfo>, TypeLookupAmbiguity> {
+        self.resolve_unique_named_type_with_filter(name, |candidate| candidate != module_path)
+    }
+
+    fn resolve_unique_named_type(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<crate::TypeInfo>, TypeLookupAmbiguity> {
+        self.resolve_unique_named_type_with_filter(name, |_| true)
+    }
+
+    fn resolve_unique_named_type_with_filter(
+        &self,
+        name: &str,
+        include_module: impl Fn(&Path) -> bool,
+    ) -> std::result::Result<Option<crate::TypeInfo>, TypeLookupAmbiguity> {
+        let tags = [
+            gimli::constants::DW_TAG_structure_type,
+            gimli::constants::DW_TAG_class_type,
+            gimli::constants::DW_TAG_union_type,
+            gimli::constants::DW_TAG_enumeration_type,
+        ];
+        let mut matches = self
+            .modules
+            .iter()
+            .filter(|(path, _)| include_module(path.as_path()))
+            .filter_map(|(path, module_data)| {
+                module_data
+                    .resolve_type_shallow_by_name_with_tags(name, &tags)
+                    .map(|ty| (path.clone(), ty))
+            })
+            .collect::<Vec<_>>();
+
+        if matches.len() > 1 {
+            let mut module_paths = matches
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            module_paths.sort();
+            return Err(TypeLookupAmbiguity {
+                type_name: name.to_string(),
+                module_paths,
+            });
+        }
+
+        Ok(matches.pop().map(|(_, ty)| ty))
     }
 
     pub(super) fn complete_unknown_pointer_target_type(
@@ -187,5 +329,231 @@ impl DwarfAnalyzer {
             name,
             &[gimli::constants::DW_TAG_enumeration_type],
         )
+    }
+}
+
+fn resolve_type_spec_with<F>(type_spec: &str, mut resolve_named: F) -> Option<crate::TypeInfo>
+where
+    F: FnMut(&str) -> Option<crate::TypeInfo>,
+{
+    try_resolve_type_spec_with(type_spec, |name| {
+        Ok::<_, std::convert::Infallible>(resolve_named(name))
+    })
+    .ok()
+    .flatten()
+}
+
+fn try_resolve_type_spec_with<F, E>(
+    type_spec: &str,
+    mut resolve_named: F,
+) -> std::result::Result<Option<crate::TypeInfo>, E>
+where
+    F: FnMut(&str) -> std::result::Result<Option<crate::TypeInfo>, E>,
+{
+    // TODO: This parser intentionally accepts only C/C++-style type specs for now.
+    // Add an explicit TypeSpec/parser layer before extending this to Rust or other languages.
+    let mut spec = type_spec.trim();
+    if spec.is_empty() {
+        return Ok(None);
+    }
+
+    let mut arrays = Vec::new();
+    while let Some((base, count)) = take_array_suffix(spec) {
+        arrays.push(count);
+        spec = base.trim_end();
+    }
+
+    let mut pointer_count = 0usize;
+    while let Some(base) = spec.strip_suffix('*') {
+        pointer_count += 1;
+        spec = base.trim_end();
+    }
+
+    let (qualifiers, base_spec) = strip_leading_qualifiers(spec);
+    let Some(mut ty) = try_resolve_base_type_spec(base_spec, &mut resolve_named)? else {
+        return Ok(None);
+    };
+
+    for qualifier in qualifiers.into_iter().rev() {
+        ty = crate::TypeInfo::QualifiedType {
+            qualifier,
+            underlying_type: Box::new(ty),
+        };
+    }
+
+    for _ in 0..pointer_count {
+        ty = crate::TypeInfo::PointerType {
+            target_type: Box::new(ty),
+            size: 8,
+        };
+    }
+
+    for count in arrays.into_iter().rev() {
+        let element_size = ty.size();
+        let total_size = count.and_then(|count| element_size.checked_mul(count));
+        ty = crate::TypeInfo::ArrayType {
+            element_type: Box::new(ty),
+            element_count: count,
+            total_size,
+        };
+    }
+
+    Ok(Some(ty))
+}
+
+fn take_array_suffix(spec: &str) -> Option<(&str, Option<u64>)> {
+    let spec = spec.trim_end();
+    if !spec.ends_with(']') {
+        return None;
+    }
+    let open = spec.rfind('[')?;
+    let inside = spec[open + 1..spec.len() - 1].trim();
+    let count = if inside.is_empty() {
+        None
+    } else {
+        Some(inside.parse::<u64>().ok()?)
+    };
+    Some((&spec[..open], count))
+}
+
+fn strip_leading_qualifiers(mut spec: &str) -> (Vec<crate::TypeQualifier>, &str) {
+    let mut qualifiers = Vec::new();
+    loop {
+        let trimmed = spec.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("const ") {
+            qualifiers.push(crate::TypeQualifier::Const);
+            spec = rest;
+        } else if let Some(rest) = trimmed.strip_prefix("volatile ") {
+            qualifiers.push(crate::TypeQualifier::Volatile);
+            spec = rest;
+        } else if let Some(rest) = trimmed.strip_prefix("restrict ") {
+            qualifiers.push(crate::TypeQualifier::Restrict);
+            spec = rest;
+        } else {
+            return (qualifiers, trimmed);
+        }
+    }
+}
+
+fn try_resolve_base_type_spec<F, E>(
+    spec: &str,
+    resolve_named: &mut F,
+) -> std::result::Result<Option<crate::TypeInfo>, E>
+where
+    F: FnMut(&str) -> std::result::Result<Option<crate::TypeInfo>, E>,
+{
+    let spec = spec.trim();
+    if let Some(ty) = builtin_type_spec(spec) {
+        return Ok(Some(ty));
+    }
+
+    for prefix in ["struct ", "class ", "union ", "enum "] {
+        if let Some(name) = spec.strip_prefix(prefix) {
+            return resolve_named(name.trim());
+        }
+    }
+
+    resolve_named(spec)
+}
+
+fn builtin_type_spec(spec: &str) -> Option<crate::TypeInfo> {
+    let normalized = spec
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let (name, size, encoding) = match normalized.as_str() {
+        "void" => {
+            return Some(crate::TypeInfo::UnknownType {
+                name: "void".to_string(),
+            })
+        }
+        "bool" | "_bool" => ("bool", 1, gimli::constants::DW_ATE_boolean.0 as u16),
+        "char" | "signed char" | "i8" | "int8_t" | "__s8" => {
+            ("i8", 1, gimli::constants::DW_ATE_signed_char.0 as u16)
+        }
+        "unsigned char" | "u8" | "uint8_t" | "__u8" | "byte" => {
+            ("u8", 1, gimli::constants::DW_ATE_unsigned_char.0 as u16)
+        }
+        "short" | "short int" | "signed short" | "signed short int" | "i16" | "int16_t"
+        | "__s16" => ("i16", 2, gimli::constants::DW_ATE_signed.0 as u16),
+        "unsigned short" | "unsigned short int" | "u16" | "uint16_t" | "__u16" => {
+            ("u16", 2, gimli::constants::DW_ATE_unsigned.0 as u16)
+        }
+        "int" | "signed" | "signed int" | "i32" | "int32_t" | "__s32" => {
+            ("i32", 4, gimli::constants::DW_ATE_signed.0 as u16)
+        }
+        "unsigned" | "unsigned int" | "u32" | "uint32_t" | "__u32" => {
+            ("u32", 4, gimli::constants::DW_ATE_unsigned.0 as u16)
+        }
+        "long"
+        | "long int"
+        | "signed long"
+        | "signed long int"
+        | "long long"
+        | "long long int"
+        | "signed long long"
+        | "signed long long int"
+        | "i64"
+        | "int64_t"
+        | "__s64"
+        | "ssize_t" => ("i64", 8, gimli::constants::DW_ATE_signed.0 as u16),
+        "unsigned long"
+        | "unsigned long int"
+        | "unsigned long long"
+        | "unsigned long long int"
+        | "u64"
+        | "uint64_t"
+        | "__u64"
+        | "size_t" => ("u64", 8, gimli::constants::DW_ATE_unsigned.0 as u16),
+        "float" | "f32" => ("f32", 4, gimli::constants::DW_ATE_float.0 as u16),
+        "double" | "f64" => ("f64", 8, gimli::constants::DW_ATE_float.0 as u16),
+        "long double" => ("long double", 16, gimli::constants::DW_ATE_float.0 as u16),
+        _ => return None,
+    };
+
+    Some(crate::TypeInfo::BaseType {
+        name: name.to_string(),
+        size,
+        encoding,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_builtin_pointer_and_array_specs() {
+        let ty = DwarfAnalyzer::resolve_builtin_type_spec("const unsigned int *[4]")
+            .expect("type should resolve");
+        let crate::TypeInfo::ArrayType {
+            element_type,
+            element_count,
+            total_size,
+        } = ty
+        else {
+            panic!("expected array type");
+        };
+        assert_eq!(element_count, Some(4));
+        assert_eq!(total_size, Some(32));
+        let crate::TypeInfo::PointerType { target_type, size } = *element_type else {
+            panic!("expected pointer element");
+        };
+        assert_eq!(size, 8);
+        assert!(matches!(
+            *target_type,
+            crate::TypeInfo::QualifiedType {
+                qualifier: crate::TypeQualifier::Const,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resolves_builtin_c_integer_aliases() {
+        let ty = DwarfAnalyzer::resolve_builtin_type_spec("uint64_t").expect("type should resolve");
+        assert_eq!(ty.size(), 8);
+        assert!(ty.is_unsigned_int());
     }
 }

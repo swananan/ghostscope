@@ -36,6 +36,7 @@ lazy_static! {
     static ref COMPILE_SCALAR_TYPES_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_SCALAR_TYPES_OPTIMIZED_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
+    static ref COMPILE_CAST_TYPES_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_RUST_GLOBAL_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_INLINE_CALLSITE_DEFAULT_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
@@ -76,6 +77,7 @@ enum RegisteredFixtureKind {
     ShortLivedLongComm,
     CMultithread,
     ScalarTypes,
+    CastTypes,
     RustGlobal,
     InlineCallsite,
     InlineCallValue,
@@ -149,6 +151,12 @@ const REGISTERED_FIXTURES: &[RegisteredFixture] = &[
         directory: "scalar_types_program",
         cleanup: CleanupCommand::Make,
         kind: RegisteredFixtureKind::ScalarTypes,
+    },
+    RegisteredFixture {
+        name: "cast_types_program",
+        directory: "cast_types_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::CastTypes,
     },
     RegisteredFixture {
         name: "rust_global_program",
@@ -478,6 +486,16 @@ impl RegisteredFixture {
                     }
                 };
                 Ok(dir.join(bin_name))
+            }
+            RegisteredFixtureKind::CastTypes => {
+                if !matches!(opt_level, OptimizationLevel::Debug) {
+                    anyhow::bail!(
+                        "{} optimization level not supported for cast_types_program",
+                        opt_level.description()
+                    );
+                }
+                ensure_cast_types_program_compiled()?;
+                Ok(dir.join("cast_types_program"))
             }
             RegisteredFixtureKind::RustGlobal => {
                 ensure_rust_global_program_compiled()?;
@@ -1238,6 +1256,7 @@ static COMPILE_SHORT_LIVED_LONG_COMM: Once = Once::new();
 static COMPILE_C_MULTITHREAD: Once = Once::new();
 static COMPILE_SCALAR_TYPES: Once = Once::new();
 static COMPILE_SCALAR_TYPES_OPTIMIZED: Once = Once::new();
+static COMPILE_CAST_TYPES: Once = Once::new();
 static COMPILE_RUST_GLOBAL: Once = Once::new();
 static COMPILE_INLINE_CALLSITE_DEFAULT: Once = Once::new();
 static COMPILE_INLINE_CALLSITE_CLANG_DWARF5: Once = Once::new();
@@ -1516,6 +1535,50 @@ fn ensure_scalar_types_program_optimized_variants_compiled() -> anyhow::Result<(
         .unwrap()
         .as_ref()
     {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
+fn ensure_cast_types_program_compiled() -> anyhow::Result<()> {
+    COMPILE_CAST_TYPES.call_once(|| {
+        let compile_result = (|| -> anyhow::Result<()> {
+            let base =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cast_types_program");
+            if let Some(result) = use_precompiled_outputs(
+                "cast_types_program",
+                &[
+                    base.join("cast_types_program"),
+                    base.join("libcast_types.so"),
+                    base.join("libcast_types_extra.so"),
+                ],
+            ) {
+                return result;
+            }
+
+            println!("Compiling cast_types_program (Debug) in {base:?}");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(base.clone())
+                .status()
+                .is_ok();
+            let out = Command::new("make").arg("all").current_dir(base).output()?;
+            if out.status.success() {
+                println!("✓ Successfully compiled cast_types_program and libcast_types.so");
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(anyhow::anyhow!(
+                    "Failed to compile cast_types_program: {}",
+                    stderr
+                ))
+            }
+        })();
+        *COMPILE_CAST_TYPES_RESULT.lock().unwrap() = Some(compile_result);
+    });
+
+    match COMPILE_CAST_TYPES_RESULT.lock().unwrap().as_ref() {
         Some(Ok(())) => Ok(()),
         Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
         None => panic!("Compilation result should be set after call_once"),
