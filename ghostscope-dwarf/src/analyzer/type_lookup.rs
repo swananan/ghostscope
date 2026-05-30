@@ -1,5 +1,5 @@
 use super::DwarfAnalyzer;
-use crate::semantics::VariableReadPlan;
+use crate::semantics::{strip_type_aliases, VariableReadPlan};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -233,6 +233,108 @@ impl DwarfAnalyzer {
             }
             return;
         }
+    }
+
+    pub fn complete_shallow_unknown_aggregate_type_in_module<P: AsRef<Path>>(
+        &self,
+        module_path: P,
+        ty: crate::TypeInfo,
+    ) -> crate::TypeInfo {
+        self.complete_shallow_unknown_aggregate_type_impl(Some(module_path.as_ref()), ty)
+    }
+
+    pub fn complete_shallow_unknown_aggregate_type(&self, ty: crate::TypeInfo) -> crate::TypeInfo {
+        self.complete_shallow_unknown_aggregate_type_impl(None, ty)
+    }
+
+    fn complete_shallow_unknown_aggregate_type_impl(
+        &self,
+        module_path: Option<&Path>,
+        ty: crate::TypeInfo,
+    ) -> crate::TypeInfo {
+        let candidate_name = match strip_type_aliases(&ty) {
+            crate::TypeInfo::UnknownType { name } => Some(name.clone()),
+            _ => None,
+        };
+        let Some(candidate_name) = candidate_name else {
+            return ty;
+        };
+        let Some(resolved) =
+            self.resolve_shallow_unknown_aggregate_name(module_path, &candidate_name)
+        else {
+            return ty;
+        };
+
+        match ty {
+            crate::TypeInfo::TypedefType { name, .. } => crate::TypeInfo::TypedefType {
+                name,
+                underlying_type: Box::new(resolved),
+            },
+            crate::TypeInfo::QualifiedType {
+                qualifier,
+                underlying_type,
+            } => {
+                crate::TypeInfo::QualifiedType {
+                    qualifier,
+                    underlying_type: Box::new(self.complete_shallow_unknown_aggregate_type_impl(
+                        module_path,
+                        *underlying_type,
+                    )),
+                }
+            }
+            _ => resolved,
+        }
+    }
+
+    fn resolve_shallow_unknown_aggregate_name(
+        &self,
+        module_path: Option<&Path>,
+        name: &str,
+    ) -> Option<crate::TypeInfo> {
+        let mut candidates = Vec::new();
+        let mut push_candidate = |candidate: &str| {
+            let candidate = candidate.trim();
+            if !candidate.is_empty() && candidate != "void" {
+                candidates.push(candidate.to_string());
+            }
+        };
+
+        push_candidate(name);
+        for prefix in [
+            "const ",
+            "volatile ",
+            "restrict ",
+            "struct ",
+            "class ",
+            "union ",
+        ] {
+            if let Some(stripped) = name.strip_prefix(prefix) {
+                push_candidate(stripped);
+            }
+        }
+
+        for candidate in candidates {
+            if let Some(module_path) = module_path {
+                let resolved = self
+                    .resolve_struct_type_shallow_by_name_in_module(module_path, &candidate)
+                    .or_else(|| {
+                        self.resolve_union_type_shallow_by_name_in_module(module_path, &candidate)
+                    });
+                if let Some(resolved) = resolved.filter(|ty| ty.size() > 0) {
+                    return Some(resolved);
+                }
+                continue;
+            }
+
+            let resolved = self
+                .resolve_struct_type_shallow_by_name(&candidate)
+                .or_else(|| self.resolve_union_type_shallow_by_name(&candidate));
+            if let Some(resolved) = resolved.filter(|ty| ty.size() > 0) {
+                return Some(resolved);
+            }
+        }
+
+        None
     }
 
     fn named_type(name: String, ty: crate::TypeInfo) -> crate::TypeInfo {

@@ -1176,6 +1176,8 @@ trace sample_program.c:73 {
     print "O3_ALIAS_ALIAS_CHAIN_HEX={:x.0b100}", q + 0b1;
     print "O3_DYNAMIC_INDEX_HEX={:x.0x4}", &numbers[dyn_arr_idx];
     print "O3_DYNAMIC_ALIAS_INDEX_HEX={:x.0b100}", &p[dyn_ptr_idx];
+    print "O3_DYNAMIC_INDEX_PTR={:p}", &numbers[dyn_arr_idx];
+    print "O3_DYNAMIC_INDEX_ADDR_DEFAULT:{}", &numbers[dyn_arr_idx];
     print "O3_DYNAMIC_PTRADD_HEX={:x.0x4}", numbers + dyn_arr_idx;
     print "O3_DYNAMIC_ALIAS_PTRADD_HEX={:x.0b100}", p + dyn_ptr_idx;
     print "O3_DYNAMIC_ALIAS_DIRECT_HEX={:x.0x4}", dyn_ptr;
@@ -1389,6 +1391,11 @@ trace sample_program.c:73 {
     assert!(
         stdout.contains("O3_DYNAMIC_ALIAS_DYN_INDEX_HEX=1e 00 00 00"),
         "Expected dynamic pointer alias dynamic index memdump to start at the third int. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_DYNAMIC_INDEX_PTR=0x")
+            && stdout.contains("O3_DYNAMIC_INDEX_ADDR_DEFAULT:0x"),
+        "Expected dynamic address-of array index to render as a pointer. STDOUT: {stdout}"
     );
     assert!(
         stdout.contains("O3_DYNAMIC_ALIAS_PLUS_HEX=1e 00 00 00"),

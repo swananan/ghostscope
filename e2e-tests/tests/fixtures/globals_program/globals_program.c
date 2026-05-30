@@ -12,7 +12,7 @@ const char g_message[] = "Hello, Global!";   // .rodata
 char g_bss_buffer[1024];                     // .bss
 
 // Complex global state
-GlobalState G_STATE = {"INIT", 0, {0, 0.0}, {1, 2, 3, 4}}; // .data
+GlobalState G_STATE = {"INIT", 0, {0, 0.0}, {1, 2, 3, 4}, {{41, 4.1}, {42, 4.2}}}; // .data
 
 // Top-level array of structs for arr[const].field tests
 Inner g_slots[2] = {{10, 1.0}, {20, 2.0}}; // .data

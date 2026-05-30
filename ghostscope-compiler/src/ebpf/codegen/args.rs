@@ -348,6 +348,24 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
             // 4) AddressOf: return AddressValue (pointer payload will be produced)
             E::AddressOf(inner) => {
+                if let Some(lvalue) = self.dynamic_lvalue_address_and_type(inner)? {
+                    let ptr_ty = ghostscope_dwarf::TypeInfo::PointerType {
+                        target_type: Box::new(lvalue.type_info.dwarf_type),
+                        size: 8,
+                    };
+                    return Ok(ComplexArg {
+                        var_name_index: self
+                            .trace_context
+                            .add_variable_name(self.expr_to_name(expr)),
+                        type_index: self.trace_context.add_type(ptr_ty),
+                        access_path: Vec::new(),
+                        data_len: 8,
+                        source: ComplexArgSource::ComputedAddress {
+                            address: lvalue.address,
+                        },
+                    });
+                }
+
                 let var = self
                     .query_dwarf_for_complex_expr(inner)?
                     .ok_or_else(|| CodeGenError::VariableNotFound(format!("{inner:?}")))?;
@@ -668,7 +686,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 )?;
                 Ok(1)
             }
-            ComplexArgSource::AddressValue { .. } | ComplexArgSource::ImmediateBytes { .. } => {
+            ComplexArgSource::AddressValue { .. }
+            | ComplexArgSource::ComputedAddress { .. }
+            | ComplexArgSource::ImmediateBytes { .. } => {
                 // Use ComplexFormat with "{}" to render address/immediate nicely
                 let fmt_idx = self.trace_context.add_string("{}".to_string());
                 self.generate_print_complex_format_instruction(fmt_idx, &[arg])?;

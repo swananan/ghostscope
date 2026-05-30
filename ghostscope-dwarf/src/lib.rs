@@ -39,12 +39,13 @@ pub use core::{
 
 // Re-export semantic contract types.
 pub use semantics::{
-    c_integer_comparison_type, is_c_aggregate_type, is_c_pointer_or_array_type,
-    is_c_signed_integer_type, strip_type_aliases, usual_c_arithmetic_comparison_plan,
-    AddressOrigin, AddressSpaceInfo, CIntegerComparisonPlan, CIntegerComparisonType, CfaRulePlan,
-    CompactUnwindRow, CompactUnwindStats, CompactUnwindTable, InlineFrame, LvalueAddressPlan,
-    PcContext, PcLineInfo, PcRange, PlannedAddress, PlannedAddressKind, PlannedValue,
-    RegisterRecoveryPlan, RuntimeComputedExpr, RuntimeComputedKind, UnwindDiagnostic,
+    c_integer_comparison_type, indexable_element_layout, is_c_aggregate_type,
+    is_c_pointer_or_array_type, is_c_signed_integer_type, member_layout, strip_type_aliases,
+    usual_c_arithmetic_comparison_plan, AddressOrigin, AddressSpaceInfo, CIntegerComparisonPlan,
+    CIntegerComparisonType, CfaRulePlan, CompactUnwindRow, CompactUnwindStats, CompactUnwindTable,
+    IndexableElementLayout, InlineFrame, LvalueAddressPlan, MemberLayout, PcContext, PcLineInfo,
+    PcRange, PlannedAddress, PlannedAddressKind, PlannedValue, RegisterRecoveryPlan,
+    RuntimeComputedExpr, RuntimeComputedKind, TypeLayoutError, UnwindDiagnostic,
     UnwindDiagnosticKind, VariableAccessPath, VariableAccessSegment, VariableLoweringKind,
     VariableLoweringPlan, VariableMaterialization, VariableMaterializationPlan, VariablePlan,
     VariableQueryDiagnostic, VariableReadPlan, VisibleVariable, VisibleVariablesResult,

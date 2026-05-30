@@ -5,7 +5,9 @@ use crate::core::{
     PieceLocation, PlanExprOp, Provenance, Result, RuntimeCapabilities, RuntimeRequirement, TypeId,
     UnsupportedReason, VariableId, VariableLocation, VerifierRisk,
 };
-use crate::semantics::{strip_type_aliases, PcRange};
+use crate::semantics::{
+    indexable_element_layout, member_layout, strip_type_aliases, PcRange, TypeLayoutError,
+};
 use crate::TypeInfo;
 use std::path::PathBuf;
 
@@ -506,25 +508,23 @@ impl VariableReadPlan {
             ty => (self.location.clone(), ty.clone()),
         };
 
-        let member = match strip_type_aliases(&aggregate_type) {
-            TypeInfo::StructType { name, members, .. } => members
-                .iter()
-                .find(|member| member.name == field)
-                .cloned()
-                .ok_or_else(|| unknown_member_error("struct", name, field, members))?,
-            TypeInfo::UnionType { name, members, .. } => members
-                .iter()
-                .find(|member| member.name == field)
-                .cloned()
-                .ok_or_else(|| unknown_member_error("union", name, field, members))?,
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "member '{}' not found on type '{}'",
-                    field,
-                    aggregate_type.type_name()
-                ));
+        let member = member_layout(&aggregate_type, field).map_err(|err| match err {
+            TypeLayoutError::UnknownMember {
+                kind,
+                type_name,
+                field,
+                members,
+            } => PlanError::UnknownMember {
+                kind,
+                type_name,
+                field,
+                members,
             }
-        };
+            .into(),
+            TypeLayoutError::InvalidMemberBase { type_name } => {
+                anyhow::anyhow!("member '{}' not found on type '{}'", field, type_name)
+            }
+        })?;
 
         let mut plan = self.clone();
         plan.location = add_location_offset(base_location, member.offset as i64)?;
@@ -544,19 +544,9 @@ impl VariableReadPlan {
         index: i64,
         context: ElementIndexContext,
     ) -> Result<Self> {
-        let (base_location, element_type, stride) = match strip_type_aliases(dwarf_type) {
-            TypeInfo::ArrayType { element_type, .. } => {
-                let stride = element_type.size().max(1);
-                (self.location.clone(), element_type.as_ref().clone(), stride)
-            }
-            TypeInfo::PointerType { target_type, .. } => {
-                let stride = target_type.size().max(1);
-                (
-                    dereference_location(&self.location)?,
-                    target_type.as_ref().clone(),
-                    stride,
-                )
-            }
+        let base_location = match strip_type_aliases(dwarf_type) {
+            TypeInfo::ArrayType { .. } => self.location.clone(),
+            TypeInfo::PointerType { .. } => dereference_location(&self.location)?,
             ty => {
                 let type_name = ty.type_name();
                 return Err(match context {
@@ -568,12 +558,14 @@ impl VariableReadPlan {
                 .into());
             }
         };
+        let layout = indexable_element_layout(dwarf_type)
+            .expect("array and pointer types must have element layout");
 
-        let byte_offset = index.saturating_mul(stride as i64);
+        let byte_offset = index.saturating_mul(layout.stride as i64);
         let mut plan = self.clone();
         plan.location = add_location_offset(base_location, byte_offset)?;
-        plan.type_name = element_type.type_name();
-        plan.dwarf_type = Some(element_type);
+        plan.type_name = layout.element_type.type_name();
+        plan.dwarf_type = Some(layout.element_type);
         plan.type_id = None;
         Ok(plan)
     }
@@ -1063,32 +1055,6 @@ fn requirement_rank(requirement: &RuntimeRequirement) -> u8 {
         RuntimeRequirement::UserMemoryRead => 2,
         RuntimeRequirement::DwarfCfiRecovery => 3,
     }
-}
-
-fn unknown_member_error(
-    kind: &'static str,
-    type_name: &str,
-    field: &str,
-    members: &[crate::StructMember],
-) -> anyhow::Error {
-    let mut member_names = members
-        .iter()
-        .map(|member| member.name.clone())
-        .collect::<Vec<_>>();
-    member_names.sort();
-    member_names.dedup();
-    let list = if member_names.is_empty() {
-        "<none>".to_string()
-    } else {
-        member_names.join(", ")
-    };
-    PlanError::UnknownMember {
-        kind,
-        type_name: type_name.to_string(),
-        field: field.to_string(),
-        members: list,
-    }
-    .into()
 }
 
 /// Apply a byte offset to an address-backed source variable location.

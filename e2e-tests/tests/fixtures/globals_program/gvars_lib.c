@@ -16,7 +16,7 @@ struct AmbiguousDynamic* LIB_AMBIGUOUS_DYNAMIC = lib_ambiguous_dynamic_items;
 int lib_counter = 100;                 // .data
 const char lib_message[] = "LIB_MESSAGE"; // .rodata
 char lib_bss[512];                      // .bss (zero-initialized)
-GlobalState LIB_STATE = {"LIB", 1, {123, 4.5}, {9,8,7,6}}; // .data
+GlobalState LIB_STATE = {"LIB", 1, {123, 4.5}, {9,8,7,6}, {{141, 14.1}, {142, 14.2}}}; // .data
 // 300-byte pattern buffer for tests (filled at library load)
 unsigned char lib_pattern[300]; // .bss -> becomes .data after constructor fills
 
