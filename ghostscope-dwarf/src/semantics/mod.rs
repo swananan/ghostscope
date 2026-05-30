@@ -8,9 +8,10 @@ pub(crate) mod pc;
 pub(crate) mod types;
 
 pub use c_types::{
-    c_integer_comparison_type, is_c_aggregate_type, is_c_pointer_or_array_type,
-    is_c_signed_integer_type, strip_type_aliases, usual_c_arithmetic_comparison_plan,
-    CIntegerComparisonPlan, CIntegerComparisonType,
+    c_integer_comparison_type, indexable_element_layout, is_c_aggregate_type,
+    is_c_pointer_or_array_type, is_c_signed_integer_type, member_layout, strip_type_aliases,
+    usual_c_arithmetic_comparison_plan, CIntegerComparisonPlan, CIntegerComparisonType,
+    IndexableElementLayout, MemberLayout, TypeLayoutError,
 };
 pub(crate) use origins::{
     resolve_attr_with_unit_origins, resolve_name_with_origins, resolve_origin_entry,

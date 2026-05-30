@@ -1849,6 +1849,41 @@ trace globals_program.c:32 {
 }
 
 #[tokio::test]
+async fn test_dynamic_chain_middle_array_member_access() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let target = spawn_globals_program(&binary_path).await?;
+
+    let script = r#"
+trace globals_program.c:32 {
+    let dyn_idx = $pid - $pid;
+    print "MID_MAIN:{}", G_STATE.slots[dyn_idx].x;
+    print "MID_LIB:{}", LIB_STATE.slots[dyn_idx].x;
+    print "MID_MAIN_PTR={:p}", &G_STATE.slots[dyn_idx].x;
+}
+"#;
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    assert!(
+        stdout.contains("MID_MAIN:41"),
+        "Expected dynamic G_STATE.slots[i].x access. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("MID_LIB:141"),
+        "Expected dynamic LIB_STATE.slots[i].x access. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains("MID_MAIN_PTR=0x")),
+        "Expected address-of dynamic G_STATE.slots[i].x access. STDOUT: {stdout}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_tick_once_entry_strings_and_structs() -> anyhow::Result<()> {
     init();
 

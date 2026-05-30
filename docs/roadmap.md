@@ -2,9 +2,9 @@
 
 GhostScope is still evolving quickly. The milestones below are ordered from “strengthen core capabilities” to “polish experience” and finally “expand language and deployment coverage”.
 
-## Chained array access & dynamic indices
-- First unlock constant-index access such as `a.b[idx].c`.
-- Once verifier limits are well understood, roll out expression-based/dynamic indices in staged fashion.
+## Chained array access
+- One-dimensional chained array access now supports constant and expression indices, including chain-tail `a.b.c[i]`, chain-middle `a.b[i].c`, and address-of forms such as `&arr[i]`.
+- Remaining work focuses on multi-dimensional arrays.
 
 ## Container tracing enhancements
 - Most PID-based container tracing scenarios for `-p` are now in place.

@@ -7,9 +7,10 @@ use crate::script::{BinaryOp, Expr};
 use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use ghostscope_dwarf::{
     AmbiguityReason, Availability, CIntegerComparisonPlan, CIntegerComparisonType,
-    RuntimeRequirement, TypeInfo as DwarfType, UnsupportedReason,
+    RuntimeRequirement, TypeInfo as DwarfType, TypeLayoutError, UnsupportedReason,
+    VariableReadPlan,
 };
-use inkwell::values::{BasicValueEnum, IntValue};
+use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use inkwell::AddressSpace;
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -442,32 +443,55 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map(|context| PathBuf::from(&context.module_path));
 
         match ghostscope_dwarf::strip_type_aliases(&target_type) {
-            DwarfType::PointerType {
-                target_type: element_type,
-                ..
-            } => {
+            DwarfType::PointerType { .. } => {
+                let Some(element_info) = Self::indexable_info_from_type(&target_type, module_path)
+                else {
+                    return Ok(None);
+                };
                 let base_address = self.cast_source_pointer_value(source_expr)?;
-                Ok(Some((
-                    IndexableElementInfo {
-                        element_type: element_type.as_ref().clone(),
-                        stride: element_type.size().max(1),
-                        module_path,
-                    },
-                    base_address,
-                )))
+                Ok(Some((element_info, base_address)))
             }
-            DwarfType::ArrayType { element_type, .. } => {
+            DwarfType::ArrayType { .. } => {
+                let Some(element_info) = Self::indexable_info_from_type(&target_type, module_path)
+                else {
+                    return Ok(None);
+                };
                 let base_address = self.cast_source_memory_address(source_expr)?;
-                Ok(Some((
-                    IndexableElementInfo {
-                        element_type: element_type.as_ref().clone(),
-                        stride: element_type.size().max(1),
-                        module_path,
-                    },
-                    base_address,
-                )))
+                Ok(Some((element_info, base_address)))
             }
             _ => Ok(None),
+        }
+    }
+
+    fn indexable_info_from_type(
+        dwarf_type: &DwarfType,
+        module_path: Option<PathBuf>,
+    ) -> Option<IndexableElementInfo> {
+        ghostscope_dwarf::indexable_element_layout(dwarf_type).map(|layout| IndexableElementInfo {
+            element_type: layout.element_type,
+            stride: layout.stride,
+            module_path,
+        })
+    }
+
+    fn compiled_pointer_value_to_runtime_address(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+        int_name: &str,
+        ptr_name: &str,
+        error_message: &'static str,
+    ) -> Result<RuntimeAddress<'ctx>> {
+        match value {
+            BasicValueEnum::IntValue(value) => Ok(RuntimeAddress::available(
+                self.normalize_int_to_i64(value, int_name)?,
+                self.context,
+            )),
+            BasicValueEnum::PointerValue(value) => self
+                .builder
+                .build_ptr_to_int(value, self.context.i64_type(), ptr_name)
+                .map(|value| RuntimeAddress::available(value, self.context))
+                .map_err(|err| CodeGenError::Builder(err.to_string())),
+            _ => Err(CodeGenError::TypeError(error_message.to_string())),
         }
     }
 
@@ -2749,6 +2773,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     inner.as_ref()
                 };
 
+                if let Some(lvalue) = self.dynamic_lvalue_address_and_type(target_inner)? {
+                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                    let as_ptr = self
+                        .builder
+                        .build_int_to_ptr(lvalue.address.value, ptr_ty, "addr_as_ptr")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    return Ok(as_ptr.into());
+                }
+
                 let var = self
                     .query_dwarf_for_complex_expr(target_inner)?
                     .ok_or_else(|| {
@@ -3688,20 +3721,54 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             aggregate.dwarf_type.clone(),
             aggregate.module_path.as_deref(),
         );
-        match ghostscope_dwarf::strip_type_aliases(&aggregate_type) {
-            DwarfType::StructType { members, .. } | DwarfType::UnionType { members, .. } => {
-                let Some(member) = members.iter().find(|member| member.name == field) else {
-                    return Err(CodeGenError::DwarfError(format!(
-                        "member '{field}' not found on dynamic array element type '{}'",
-                        aggregate_type.type_name()
-                    )));
-                };
-                Ok((member.offset, member.member_type.clone()))
+        match ghostscope_dwarf::member_layout(&aggregate_type, field) {
+            Ok(layout) => Ok((layout.offset, layout.member_type)),
+            Err(err @ TypeLayoutError::UnknownMember { .. }) => {
+                Err(CodeGenError::DwarfError(err.to_string()))
             }
-            other => Err(CodeGenError::TypeError(format!(
-                "dynamic member access requires struct or union element type, got '{}'",
-                other.type_name()
-            ))),
+            Err(err @ TypeLayoutError::InvalidMemberBase { .. }) => {
+                Err(CodeGenError::TypeError(err.to_string()))
+            }
+        }
+    }
+
+    fn dynamic_array_base_from_plan(
+        &mut self,
+        array_plan: &VariableReadPlan,
+        pc_address: u64,
+        status_ptr: Option<PointerValue<'ctx>>,
+        static_index: i64,
+    ) -> Result<(IndexableElementInfo, RuntimeAddress<'ctx>, i64)> {
+        let module_path = array_plan.module_path.clone();
+        let array_type = array_plan.dwarf_type.as_ref().ok_or_else(|| {
+            CodeGenError::DwarfError("Array expression has no DWARF type information".to_string())
+        })?;
+        let element_info =
+            Self::indexable_info_from_type(array_type, module_path).ok_or_else(|| {
+                CodeGenError::TypeError(format!(
+                    "dynamic array index requires array or pointer type, got '{}'",
+                    array_type.type_name()
+                ))
+            })?;
+
+        match ghostscope_dwarf::strip_type_aliases(array_type) {
+            DwarfType::ArrayType { .. } => {
+                let base_address =
+                    self.variable_read_plan_to_runtime_address(array_plan, pc_address, status_ptr)?;
+                Ok((element_info, base_address, static_index))
+            }
+            DwarfType::PointerType { .. } => {
+                let pointer_value =
+                    self.variable_read_plan_to_llvm_value(array_plan, pc_address, status_ptr)?;
+                let base_address = self.compiled_pointer_value_to_runtime_address(
+                    pointer_value,
+                    "dynamic_array_base_i64",
+                    "dynamic_array_base_ptr",
+                    "array base pointer did not compile to an address",
+                )?;
+                Ok((element_info, base_address, static_index))
+            }
+            _ => unreachable!("indexable_info_from_type accepts only array or pointer types"),
         }
     }
 
@@ -3733,75 +3800,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             (element_info, base_address, 0)
         } else {
             match self.query_dwarf_for_complex_expr(array_expr)? {
-                Some(array_plan) => {
-                    let module_path = array_plan.module_path.clone();
-                    let array_type = array_plan.dwarf_type.clone().ok_or_else(|| {
-                        CodeGenError::DwarfError(
-                            "Array expression has no DWARF type information".to_string(),
-                        )
-                    })?;
-                    match ghostscope_dwarf::strip_type_aliases(&array_type) {
-                        DwarfType::ArrayType { element_type, .. } => {
-                            let base_address = self.variable_read_plan_to_runtime_address(
-                                &array_plan,
-                                compile_context.pc_address,
-                                status_ptr,
-                            )?;
-                            (
-                                IndexableElementInfo {
-                                    element_type: element_type.as_ref().clone(),
-                                    stride: element_type.size().max(1),
-                                    module_path,
-                                },
-                                base_address,
-                                0,
-                            )
-                        }
-                        DwarfType::PointerType { target_type, .. } => {
-                            let pointer_value = self.variable_read_plan_to_llvm_value(
-                                &array_plan,
-                                compile_context.pc_address,
-                                status_ptr,
-                            )?;
-                            let base_address = match pointer_value {
-                                BasicValueEnum::IntValue(value) => RuntimeAddress::available(
-                                    self.normalize_int_to_i64(value, "dynamic_array_base_i64")?,
-                                    self.context,
-                                ),
-                                BasicValueEnum::PointerValue(value) => self
-                                    .builder
-                                    .build_ptr_to_int(
-                                        value,
-                                        self.context.i64_type(),
-                                        "dynamic_array_base_ptr",
-                                    )
-                                    .map(|value| RuntimeAddress::available(value, self.context))
-                                    .map_err(|err| CodeGenError::Builder(err.to_string()))?,
-                                _ => {
-                                    return Err(CodeGenError::TypeError(
-                                        "array base pointer did not compile to an address"
-                                            .to_string(),
-                                    ))
-                                }
-                            };
-                            (
-                                IndexableElementInfo {
-                                    element_type: target_type.as_ref().clone(),
-                                    stride: target_type.size().max(1),
-                                    module_path,
-                                },
-                                base_address,
-                                0,
-                            )
-                        }
-                        other => {
-                            return Err(CodeGenError::TypeError(format!(
-                                "dynamic array index requires array or pointer type, got '{}'",
-                                other.type_name()
-                            )))
-                        }
-                    }
-                }
+                Some(array_plan) => self.dynamic_array_base_from_plan(
+                    &array_plan,
+                    compile_context.pc_address,
+                    status_ptr,
+                    0,
+                )?,
                 None => {
                     if let Some((base_expr, static_index)) =
                         self.pointer_arithmetic_parts_expanding_aliases(&expanded_array_expr)?
@@ -3813,73 +3817,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     &base_expr,
                                 ))
                             })?;
-                        let module_path = array_plan.module_path.clone();
-                        let array_type = array_plan.dwarf_type.clone().ok_or_else(|| {
-                            CodeGenError::DwarfError(
-                                "Array expression has no DWARF type information".to_string(),
-                            )
-                        })?;
-                        match ghostscope_dwarf::strip_type_aliases(&array_type) {
-                            DwarfType::ArrayType { element_type, .. } => {
-                                let base_address = self.variable_read_plan_to_runtime_address(
-                                    &array_plan,
-                                    compile_context.pc_address,
-                                    status_ptr,
-                                )?;
-                                (
-                                    IndexableElementInfo {
-                                        element_type: element_type.as_ref().clone(),
-                                        stride: element_type.size().max(1),
-                                        module_path,
-                                    },
-                                    base_address,
-                                    static_index,
-                                )
-                            }
-                            DwarfType::PointerType { target_type, .. } => {
-                                let pointer_value = self.variable_read_plan_to_llvm_value(
-                                    &array_plan,
-                                    compile_context.pc_address,
-                                    status_ptr,
-                                )?;
-                                let base_address = match pointer_value {
-                                    BasicValueEnum::IntValue(value) => RuntimeAddress::available(
-                                        self.normalize_int_to_i64(value, "dynamic_array_base_i64")?,
-                                        self.context,
-                                    ),
-                                    BasicValueEnum::PointerValue(value) => self
-                                        .builder
-                                        .build_ptr_to_int(
-                                            value,
-                                            self.context.i64_type(),
-                                            "dynamic_array_base_ptr",
-                                        )
-                                        .map(|value| RuntimeAddress::available(value, self.context))
-                                        .map_err(|err| CodeGenError::Builder(err.to_string()))?,
-                                    _ => {
-                                        return Err(CodeGenError::TypeError(
-                                            "array base pointer did not compile to an address"
-                                                .to_string(),
-                                        ))
-                                    }
-                                };
-                                (
-                                    IndexableElementInfo {
-                                        element_type: target_type.as_ref().clone(),
-                                        stride: target_type.size().max(1),
-                                        module_path,
-                                    },
-                                    base_address,
-                                    static_index,
-                                )
-                            }
-                            other => {
-                                return Err(CodeGenError::TypeError(format!(
-                                    "dynamic array index requires array or pointer type, got '{}'",
-                                    other.type_name()
-                                )))
-                            }
-                        }
+                        self.dynamic_array_base_from_plan(
+                            &array_plan,
+                            compile_context.pc_address,
+                            status_ptr,
+                            static_index,
+                        )?
                     } else if has_dynamic_base {
                         let element_info = self
                             .indexable_element_type_and_stride(&expanded_array_expr)?
@@ -3895,63 +3838,36 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         self.dynamic_lvalue_address_and_type(&expanded_array_expr)?
                     {
                         let module_path = array_lvalue.type_info.module_path.clone();
+                        let element_info = Self::indexable_info_from_type(
+                            &array_lvalue.type_info.dwarf_type,
+                            module_path,
+                        )
+                        .ok_or_else(|| {
+                            CodeGenError::TypeError(format!(
+                                "dynamic array index requires array or pointer type, got '{}'",
+                                array_lvalue.type_info.dwarf_type.type_name()
+                            ))
+                        })?;
                         match ghostscope_dwarf::strip_type_aliases(
                             &array_lvalue.type_info.dwarf_type,
                         ) {
-                            DwarfType::ArrayType { element_type, .. } => (
-                                IndexableElementInfo {
-                                    element_type: element_type.as_ref().clone(),
-                                    stride: element_type.size().max(1),
-                                    module_path,
-                                },
-                                array_lvalue.address,
-                                0,
-                            ),
-                            DwarfType::PointerType { target_type, .. } => {
+                            DwarfType::ArrayType { .. } => (element_info, array_lvalue.address, 0),
+                            DwarfType::PointerType { .. } => {
                                 let pointer_value = self.read_dynamic_address_value(
                                     array_lvalue.address,
                                     &array_lvalue.type_info.dwarf_type,
                                 )?;
-                                let base_address = match pointer_value {
-                                    BasicValueEnum::IntValue(value) => RuntimeAddress::available(
-                                        self.normalize_int_to_i64(
-                                            value,
-                                            "dynamic_array_member_ptr_i64",
-                                        )?,
-                                        self.context,
-                                    ),
-                                    BasicValueEnum::PointerValue(value) => self
-                                        .builder
-                                        .build_ptr_to_int(
-                                            value,
-                                            self.context.i64_type(),
-                                            "dynamic_array_member_ptr",
-                                        )
-                                        .map(|value| RuntimeAddress::available(value, self.context))
-                                        .map_err(|err| CodeGenError::Builder(err.to_string()))?,
-                                    _ => {
-                                        return Err(CodeGenError::TypeError(
-                                            "array member pointer did not compile to an address"
-                                                .to_string(),
-                                        ))
-                                    }
-                                };
-                                (
-                                    IndexableElementInfo {
-                                        element_type: target_type.as_ref().clone(),
-                                        stride: target_type.size().max(1),
-                                        module_path,
-                                    },
-                                    base_address,
-                                    0,
-                                )
+                                let base_address = self.compiled_pointer_value_to_runtime_address(
+                                    pointer_value,
+                                    "dynamic_array_member_ptr_i64",
+                                    "dynamic_array_member_ptr",
+                                    "array member pointer did not compile to an address",
+                                )?;
+                                (element_info, base_address, 0)
                             }
-                            other => {
-                                return Err(CodeGenError::TypeError(format!(
-                                    "dynamic array index requires array or pointer type, got '{}'",
-                                    other.type_name()
-                                )))
-                            }
+                            _ => unreachable!(
+                                "indexable_info_from_type accepts only array or pointer types"
+                            ),
                         }
                     } else {
                         return Err(CodeGenError::VariableNotFound(Self::expr_to_debug_string(
@@ -4029,12 +3945,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         if let Some(plan) = self.query_dwarf_for_complex_expr(&expanded)? {
             if let Some(dwarf_type) = plan.dwarf_type.as_ref() {
-                if let Some(info) = Self::element_type_and_stride_from_type(dwarf_type) {
-                    return Ok(Some(IndexableElementInfo {
-                        element_type: info.0,
-                        stride: info.1,
-                        module_path: plan.module_path,
-                    }));
+                if let Some(info) =
+                    Self::indexable_info_from_type(dwarf_type, plan.module_path.clone())
+                {
+                    return Ok(Some(info));
                 }
             }
         }
@@ -4044,12 +3958,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         {
             if let Some(plan) = self.query_dwarf_for_complex_expr(&base_expr)? {
                 if let Some(dwarf_type) = plan.dwarf_type.as_ref() {
-                    if let Some(info) = Self::element_type_and_stride_from_type(dwarf_type) {
-                        return Ok(Some(IndexableElementInfo {
-                            element_type: info.0,
-                            stride: info.1,
-                            module_path: plan.module_path,
-                        }));
+                    if let Some(info) =
+                        Self::indexable_info_from_type(dwarf_type, plan.module_path.clone())
+                    {
+                        return Ok(Some(info));
                     }
                 }
             }
@@ -4075,111 +3987,25 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
-    fn element_type_and_stride_from_type(dwarf_type: &DwarfType) -> Option<(DwarfType, u64)> {
-        match ghostscope_dwarf::strip_type_aliases(dwarf_type) {
-            DwarfType::ArrayType { element_type, .. } => {
-                Some((element_type.as_ref().clone(), element_type.size().max(1)))
-            }
-            DwarfType::PointerType { target_type, .. } => {
-                Some((target_type.as_ref().clone(), target_type.size().max(1)))
-            }
-            _ => None,
-        }
-    }
-
     fn complete_dynamic_member_element_type(
         &self,
         element_type: DwarfType,
         module_path: Option<&Path>,
     ) -> DwarfType {
-        let candidate_name = match ghostscope_dwarf::strip_type_aliases(&element_type) {
-            DwarfType::UnknownType { name } => Some(name.clone()),
-            _ => None,
-        };
-        let Some(candidate_name) = candidate_name else {
+        let Some(analyzer) = self.process_analyzer else {
             return element_type;
         };
-        let Some(resolved) =
-            self.resolve_named_aggregate_type_for_dynamic_member(&candidate_name, module_path)
-        else {
-            return element_type;
-        };
-
-        match element_type {
-            DwarfType::TypedefType { name, .. } => DwarfType::TypedefType {
-                name,
-                underlying_type: Box::new(resolved),
-            },
-            DwarfType::QualifiedType {
-                qualifier,
-                underlying_type,
-            } => DwarfType::QualifiedType {
-                qualifier,
-                underlying_type: Box::new(
-                    self.complete_dynamic_member_element_type(*underlying_type, module_path),
-                ),
-            },
-            _ => resolved,
-        }
-    }
-
-    fn resolve_named_aggregate_type_for_dynamic_member(
-        &self,
-        name: &str,
-        module_path: Option<&Path>,
-    ) -> Option<DwarfType> {
-        let analyzer = self.process_analyzer?;
-        let mut candidates = Vec::new();
-        let mut push_candidate = |candidate: &str| {
-            let candidate = candidate.trim();
-            if !candidate.is_empty() && candidate != "void" {
-                candidates.push(candidate.to_string());
-            }
-        };
-
-        push_candidate(name);
-        for prefix in [
-            "const ",
-            "volatile ",
-            "restrict ",
-            "struct ",
-            "class ",
-            "union ",
-        ] {
-            if let Some(stripped) = name.strip_prefix(prefix) {
-                push_candidate(stripped);
-            }
-        }
-
         let fallback_module_path = self
             .current_compile_time_context
             .as_ref()
             .map(|ctx| PathBuf::from(&ctx.module_path));
         let lookup_module_path = module_path.or(fallback_module_path.as_deref());
 
-        for candidate in candidates {
-            if let Some(module_path) = lookup_module_path {
-                let resolved = analyzer
-                    .resolve_struct_type_shallow_by_name_in_module(module_path, &candidate)
-                    .or_else(|| {
-                        analyzer
-                            .resolve_union_type_shallow_by_name_in_module(module_path, &candidate)
-                    });
-                if let Some(resolved) = resolved.filter(|ty| ty.size() > 0) {
-                    return Some(resolved);
-                }
-                continue;
-            }
-
-            let resolved = analyzer
-                .resolve_struct_type_shallow_by_name(&candidate)
-                .or_else(|| analyzer.resolve_union_type_shallow_by_name(&candidate));
-            if let Some(resolved) = resolved.filter(|ty| ty.size() > 0) {
-                return Some(resolved);
-            }
+        if let Some(module_path) = lookup_module_path {
+            analyzer.complete_shallow_unknown_aggregate_type_in_module(module_path, element_type)
+        } else {
+            analyzer.complete_shallow_unknown_aggregate_type(element_type)
         }
-
-        None
     }
 
     fn read_dynamic_address_value(

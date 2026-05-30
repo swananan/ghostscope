@@ -59,6 +59,9 @@ enum ComplexArgSource<'ctx> {
         address: ghostscope_dwarf::PlannedAddress,
         module_for_offsets: Option<String>,
     },
+    ComputedAddress {
+        address: RuntimeAddress<'ctx>,
+    },
     // Newly added: a value computed in LLVM at runtime (e.g., expression result)
     ComputedInt {
         value: inkwell::values::IntValue<'ctx>,

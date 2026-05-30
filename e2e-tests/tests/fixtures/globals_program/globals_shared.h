@@ -11,6 +11,7 @@ typedef struct GlobalState {
     int counter;
     Inner inner;
     int array[4];
+    Inner slots[2];
     struct GlobalState* lib; // pointer to library GlobalState for deref-chain tests
 } GlobalState;
 

@@ -27,6 +27,7 @@ fn complex_format_static_payload_len(arg: &ComplexArg<'_>) -> Option<usize> {
     match &arg.source {
         ComplexArgSource::ImmediateBytes { bytes } => Some(bytes.len()),
         ComplexArgSource::AddressValue { .. } => Some(8),
+        ComplexArgSource::ComputedAddress { .. } => Some(8),
         ComplexArgSource::RuntimeRead { .. } => {
             Some(std::cmp::max(arg.data_len, VARIABLE_READ_ERROR_PAYLOAD_LEN))
         }
@@ -269,6 +270,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                     // Force pointer address payload (u64) regardless of DWARF shape
                     let expr = &args[ai];
+                    if let Ok(address) = self.resolve_runtime_address_from_expr(expr) {
+                        complex_args.push(ComplexArg {
+                            var_name_index: self
+                                .trace_context
+                                .add_variable_name(self.expr_to_name(expr)),
+                            type_index: self.add_synthesized_type_index_for_kind(TypeKind::Pointer),
+                            access_path: Vec::new(),
+                            data_len: 8,
+                            source: ComplexArgSource::ComputedAddress { address },
+                        });
+                        ai += 1;
+                        continue;
+                    }
+
                     // Try compile to IntValue or PointerValue
                     let val = self.compile_expr(expr)?;
                     let iv = match val {
@@ -963,6 +978,61 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
+    fn emit_complex_format_computed_address(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        var_data_ptr: PointerValue<'ctx>,
+        address: &RuntimeAddress<'ctx>,
+    ) -> Result<()> {
+        let cast_ptr = self
+            .builder
+            .build_pointer_cast(
+                var_data_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "computed_addr_store_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(cast_ptr, address.value)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let current_fn = self.current_function("compile computed address status")?;
+        let ok_block = self
+            .context
+            .append_basic_block(current_fn, "computed_addr_ok");
+        let miss_block = self
+            .context
+            .append_basic_block(current_fn, "computed_addr_offsets_miss");
+        let cont_block = self
+            .context
+            .append_basic_block(current_fn, "computed_addr_cont");
+        self.builder
+            .build_conditional_branch(address.offsets_found, ok_block, miss_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(ok_block);
+        self.builder
+            .build_unconditional_branch(cont_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(miss_block);
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::OffsetsUnavailable as u64, false),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(cont_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(cont_block);
+        Ok(())
+    }
+
     fn emit_complex_format_memdump(
         &mut self,
         status_ptr: PointerValue<'ctx>,
@@ -1604,6 +1674,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 address,
                 module_for_offsets.as_deref(),
             ),
+            ComplexArgSource::ComputedAddress { address } => {
+                self.emit_complex_format_computed_address(status_ptr, var_data_ptr, address)
+            }
         }
     }
 

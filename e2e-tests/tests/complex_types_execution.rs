@@ -148,8 +148,14 @@ trace complex_types_program.c:15 {
     let c_dyn = c + dyn_zero;
     print "O3_DYNAMIC_ARR IDX={} VAL={}", dyn_idx, c.arr[dyn_idx];
     print "O3_DYNAMIC_ARR_DIV:{}", c.arr[dyn_idx] / 0x2;
+    print "O3_DYNAMIC_ARR_PTR={:p}", &c.arr[dyn_idx];
+    print "O3_DYNAMIC_ARR_ADDR_DEFAULT:{}", &c.arr[dyn_idx];
     print "O3_C_DYN AGE={} DATA={} FLAGS={} ARR={}", c_dyn.age, c_dyn.data.i, c_dyn.flags, c_dyn.arr[dyn_idx];
+    print "O3_C_DYN_ARR_PTR={:p}", &c_dyn.arr[dyn_idx];
     print "O3_C_DYN_FRIEND DATA={} FLAGS={}", c_dyn.friend_ref.data.i, c_dyn.friend_ref.flags;
+    print "O3_FRIEND_DYNAMIC_ARR IDX={} VAL={}", dyn_idx, c.friend_ref.arr[dyn_idx];
+    print "O3_FRIEND_DYNAMIC_ARR_PTR={:p}", &c.friend_ref.arr[dyn_idx];
+    print "O3_FRIEND_DYNAMIC_ARR_HEX={:x.0x4}", &c.friend_ref.arr[dyn_idx];
     print "O3_NAME={:s.5}", &c.name[0];
     print "O3_FRIEND={:p}", c.friend_ref;
     if c.flags < 0 { print "O3_FLAGS_NEG"; }
@@ -162,6 +168,8 @@ trace complex_types_program.c:15 {
     if c_dyn.data.i == i { print "O3_C_DYN_DATA_EQ_I"; }
     if c_dyn.arr[dyn_idx] / 0x2 == i { print "O3_C_DYN_ARR_OK"; }
     if c_dyn.friend_ref.data.i == i { print "O3_C_DYN_FRIEND_DATA_EQ_I"; }
+    if c.friend_ref.arr[dyn_idx] / 0x2 == i { print "O3_FRIEND_DYNAMIC_ARR_OK"; }
+    if memcmp(&c.friend_ref.arr[dyn_idx], &c.arr[dyn_idx], 0x4) { print "O3_FRIEND_DYNAMIC_ARR_MEM_OK"; }
     if c.active == 1 { print "O3_ACTIVE_ONE"; }
 }
 "#;
@@ -376,6 +384,43 @@ trace complex_types_program.c:15 {
         saw_consistent_dynamic_arr,
         "Expected O3 dynamic array index to match loop state. Samples={samples:?} DynamicArr={dynamic_arr_samples:?} DynamicArrDiv={dynamic_arr_div_samples:?} STDOUT: {stdout}"
     );
+    assert!(
+        stdout.contains("O3_DYNAMIC_ARR_PTR=0x")
+            && stdout.contains("O3_DYNAMIC_ARR_ADDR_DEFAULT:0x")
+            && stdout.contains("O3_C_DYN_ARR_PTR=0x"),
+        "Expected O3 dynamic member-array address prints. STDOUT: {stdout}"
+    );
+    let friend_dynamic_arr_re =
+        Regex::new(r"O3_FRIEND_DYNAMIC_ARR IDX=([0-9]+)\s+VAL=(-?[0-9]+)").unwrap();
+    let friend_dynamic_arr_samples: Vec<(u64, i64)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let caps = friend_dynamic_arr_re.captures(line)?;
+            Some((
+                caps.get(1)?.as_str().parse::<u64>().ok()?,
+                caps.get(2)?.as_str().parse::<i64>().ok()?,
+            ))
+        })
+        .collect();
+    anyhow::ensure!(
+        !friend_dynamic_arr_samples.is_empty(),
+        "Missing O3 nested friend dynamic array-index samples. STDOUT: {stdout}"
+    );
+    let saw_consistent_friend_dynamic_arr =
+        samples.iter().zip(friend_dynamic_arr_samples.iter()).any(
+            |(&(i_val, _age_val, _data_val, _active_val, _flags_val), &(idx, arr_val))| {
+                idx == (i_val & 7) && arr_val == (i_val as i64) * 2
+            },
+        );
+    assert!(
+        saw_consistent_friend_dynamic_arr,
+        "Expected O3 nested friend dynamic array index to match loop state. Samples={samples:?} FriendDynamicArr={friend_dynamic_arr_samples:?} STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_FRIEND_DYNAMIC_ARR_PTR=0x")
+            && stdout.contains("O3_FRIEND_DYNAMIC_ARR_HEX="),
+        "Expected O3 nested friend dynamic member-array address formats. STDOUT: {stdout}"
+    );
     for marker in [
         "O3_FLAGS_NEG",
         "O3_FLAGS_EQ_NEG4",
@@ -387,6 +432,8 @@ trace complex_types_program.c:15 {
         "O3_C_DYN_DATA_EQ_I",
         "O3_C_DYN_ARR_OK",
         "O3_C_DYN_FRIEND_DATA_EQ_I",
+        "O3_FRIEND_DYNAMIC_ARR_OK",
+        "O3_FRIEND_DYNAMIC_ARR_MEM_OK",
         "O3_ACTIVE_ONE",
     ] {
         assert!(
