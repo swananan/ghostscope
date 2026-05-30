@@ -451,6 +451,53 @@ fn integer_literal_value(e: &Expr) -> Option<i64> {
             op: BO::Subtract,
             right,
         } => integer_literal_value(left)?.checked_sub(integer_literal_value(right)?),
+        E::BinaryOp {
+            left,
+            op: BO::Multiply,
+            right,
+        } => integer_literal_value(left)?.checked_mul(integer_literal_value(right)?),
+        E::BinaryOp {
+            left,
+            op: BO::Divide,
+            right,
+        } => integer_literal_value(left)?.checked_div(integer_literal_value(right)?),
+        E::BinaryOp {
+            left,
+            op: BO::Modulo,
+            right,
+        } => integer_literal_value(left)?.checked_rem(integer_literal_value(right)?),
+        E::BinaryOp {
+            left,
+            op: BO::BitAnd,
+            right,
+        } => Some(integer_literal_value(left)? & integer_literal_value(right)?),
+        E::BinaryOp {
+            left,
+            op: BO::BitXor,
+            right,
+        } => Some(integer_literal_value(left)? ^ integer_literal_value(right)?),
+        E::BinaryOp {
+            left,
+            op: BO::BitOr,
+            right,
+        } => Some(integer_literal_value(left)? | integer_literal_value(right)?),
+        E::BinaryOp {
+            left,
+            op: BO::ShiftLeft,
+            right,
+        } => {
+            let shift = u32::try_from(integer_literal_value(right)?).ok()?;
+            integer_literal_value(left)?.checked_shl(shift)
+        }
+        E::BinaryOp {
+            left,
+            op: BO::ShiftRight,
+            right,
+        } => {
+            let shift = u32::try_from(integer_literal_value(right)?).ok()?;
+            integer_literal_value(left)?.checked_shr(shift)
+        }
+        E::UnaryBitNot(inner) => Some(!integer_literal_value(inner)?),
         _ => None,
     }
 }
@@ -509,7 +556,7 @@ fn parse_logical_and(pair: Pair<Rule>) -> Result<Expr> {
         Rule::logical_and => {
             let mut pairs = pair.into_inner();
             let first = pairs.next().ok_or(ParseError::InvalidExpression)?;
-            let mut left = parse_equality(first)?;
+            let mut left = parse_bitwise_or(first)?;
 
             for chunk in chunks_of_two(pairs) {
                 if chunk.len() != 2 {
@@ -518,10 +565,103 @@ fn parse_logical_and(pair: Pair<Rule>) -> Result<Expr> {
                 if chunk[0].as_rule() != Rule::and_op {
                     return Err(ParseError::UnexpectedToken(chunk[0].as_rule()));
                 }
-                let right = parse_equality(chunk[1].clone())?;
+                let right = parse_bitwise_or(chunk[1].clone())?;
                 let expr = Expr::BinaryOp {
                     left: Box::new(left),
                     op: BinaryOp::LogicalAnd,
+                    right: Box::new(right),
+                };
+                if let Err(err) = infer_type(&expr) {
+                    return Err(ParseError::TypeError(err));
+                }
+                left = expr;
+            }
+            Ok(left)
+        }
+        _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_bitwise_or(pair: Pair<Rule>) -> Result<Expr> {
+    match pair.as_rule() {
+        Rule::bitwise_or => {
+            let mut pairs = pair.into_inner();
+            let first = pairs.next().ok_or(ParseError::InvalidExpression)?;
+            let mut left = parse_bitwise_xor(first)?;
+
+            for chunk in chunks_of_two(pairs) {
+                if chunk.len() != 2 {
+                    return Err(ParseError::InvalidExpression);
+                }
+                if chunk[0].as_rule() != Rule::bit_or_op {
+                    return Err(ParseError::UnexpectedToken(chunk[0].as_rule()));
+                }
+                let right = parse_bitwise_xor(chunk[1].clone())?;
+                let expr = Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOp::BitOr,
+                    right: Box::new(right),
+                };
+                if let Err(err) = infer_type(&expr) {
+                    return Err(ParseError::TypeError(err));
+                }
+                left = expr;
+            }
+            Ok(left)
+        }
+        _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_bitwise_xor(pair: Pair<Rule>) -> Result<Expr> {
+    match pair.as_rule() {
+        Rule::bitwise_xor => {
+            let mut pairs = pair.into_inner();
+            let first = pairs.next().ok_or(ParseError::InvalidExpression)?;
+            let mut left = parse_bitwise_and(first)?;
+
+            for chunk in chunks_of_two(pairs) {
+                if chunk.len() != 2 {
+                    return Err(ParseError::InvalidExpression);
+                }
+                if chunk[0].as_rule() != Rule::bit_xor_op {
+                    return Err(ParseError::UnexpectedToken(chunk[0].as_rule()));
+                }
+                let right = parse_bitwise_and(chunk[1].clone())?;
+                let expr = Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOp::BitXor,
+                    right: Box::new(right),
+                };
+                if let Err(err) = infer_type(&expr) {
+                    return Err(ParseError::TypeError(err));
+                }
+                left = expr;
+            }
+            Ok(left)
+        }
+        _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_bitwise_and(pair: Pair<Rule>) -> Result<Expr> {
+    match pair.as_rule() {
+        Rule::bitwise_and => {
+            let mut pairs = pair.into_inner();
+            let first = pairs.next().ok_or(ParseError::InvalidExpression)?;
+            let mut left = parse_equality(first)?;
+
+            for chunk in chunks_of_two(pairs) {
+                if chunk.len() != 2 {
+                    return Err(ParseError::InvalidExpression);
+                }
+                if chunk[0].as_rule() != Rule::bit_and_op {
+                    return Err(ParseError::UnexpectedToken(chunk[0].as_rule()));
+                }
+                let right = parse_equality(chunk[1].clone())?;
+                let expr = Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOp::BitAnd,
                     right: Box::new(right),
                 };
                 if let Err(err) = infer_type(&expr) {
@@ -577,7 +717,7 @@ fn parse_relational(pair: Pair<Rule>) -> Result<Expr> {
         Rule::relational => {
             let mut pairs = pair.into_inner();
             let first = pairs.next().ok_or(ParseError::InvalidExpression)?;
-            let mut left = parse_additive(first)?;
+            let mut left = parse_shift(first)?;
 
             for chunk in chunks_of_two(pairs) {
                 if chunk.len() != 2 {
@@ -591,6 +731,39 @@ fn parse_relational(pair: Pair<Rule>) -> Result<Expr> {
                     "<=" => BinaryOp::LessEqual,
                     ">" => BinaryOp::GreaterThan,
                     ">=" => BinaryOp::GreaterEqual,
+                    _ => return Err(ParseError::UnexpectedToken(chunk[0].as_rule())),
+                };
+                let right = parse_shift(chunk[1].clone())?;
+                let expr = Expr::BinaryOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                };
+                if let Err(err) = infer_type(&expr) {
+                    return Err(ParseError::TypeError(err));
+                }
+                left = expr;
+            }
+            Ok(left)
+        }
+        _ => Err(ParseError::UnexpectedToken(pair.as_rule())),
+    }
+}
+
+fn parse_shift(pair: Pair<Rule>) -> Result<Expr> {
+    match pair.as_rule() {
+        Rule::shift => {
+            let mut pairs = pair.into_inner();
+            let first = pairs.next().ok_or(ParseError::InvalidExpression)?;
+            let mut left = parse_additive(first)?;
+
+            for chunk in chunks_of_two(pairs) {
+                if chunk.len() != 2 {
+                    return Err(ParseError::InvalidExpression);
+                }
+                let op = match chunk[0].as_str() {
+                    "<<" => BinaryOp::ShiftLeft,
+                    ">>" => BinaryOp::ShiftRight,
                     _ => return Err(ParseError::UnexpectedToken(chunk[0].as_rule())),
                 };
                 let right = parse_additive(chunk[1].clone())?;
@@ -748,6 +921,7 @@ fn parse_term(pair: Pair<Rule>) -> Result<Expr> {
                 let op = match chunk[0].as_str() {
                     "*" => BinaryOp::Multiply,
                     "/" => BinaryOp::Divide,
+                    "%" => BinaryOp::Modulo,
                     _ => return Err(ParseError::UnexpectedToken(chunk[0].as_rule())),
                 };
 
@@ -806,6 +980,18 @@ fn parse_unary(pair: Pair<Rule>) -> Result<Expr> {
                         .ok_or(ParseError::InvalidExpression)?;
                     let right = parse_unary(u)?;
                     Ok(Expr::UnaryNot(Box::new(right)))
+                }
+                Rule::bit_not_unary => {
+                    let u = first
+                        .into_inner()
+                        .next()
+                        .ok_or(ParseError::InvalidExpression)?;
+                    let right = parse_unary(u)?;
+                    let expr = Expr::UnaryBitNot(Box::new(right));
+                    if let Err(err) = infer_type(&expr) {
+                        return Err(ParseError::TypeError(err));
+                    }
+                    Ok(expr)
                 }
                 _ => Err(ParseError::UnexpectedToken(first.as_rule())),
             }
@@ -2336,6 +2522,42 @@ trace foo {
             },
             other => panic!("expected TracePoint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_integer_modulo_and_bitwise_ops() {
+        let script = r#"
+trace foo {
+    let value = 0x1 | 0x2 ^ 0x3 & 0x4 << 0x1 + 0x2 % 0x3;
+    let inverse = ~value;
+}
+"#;
+        let prog = parse(script).expect("integer and bitwise ops should parse");
+        let Statement::TracePoint { body, .. } = prog.statements.first().expect("trace") else {
+            panic!("expected trace point");
+        };
+        let Statement::VarDeclaration { value, .. } = &body[0] else {
+            panic!("expected var declaration");
+        };
+        let Expr::BinaryOp { op, left, right } = value else {
+            panic!("expected bitwise-or root");
+        };
+        assert_eq!(*op, BinaryOp::BitOr);
+        assert!(matches!(left.as_ref(), Expr::Int(1)));
+        assert!(matches!(
+            right.as_ref(),
+            Expr::BinaryOp {
+                op: BinaryOp::BitXor,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &body[1],
+            Statement::VarDeclaration {
+                value: Expr::UnaryBitNot(_),
+                ..
+            }
+        ));
     }
 
     #[test]

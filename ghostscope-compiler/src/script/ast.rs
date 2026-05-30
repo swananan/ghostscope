@@ -5,6 +5,7 @@ pub enum Expr {
     String(String),
     Bool(bool),
     UnaryNot(Box<Expr>),
+    UnaryBitNot(Box<Expr>),
     Variable(String),
     MemberAccess(Box<Expr>, String),   // person.name
     PointerDeref(Box<Expr>),           // *ptr
@@ -34,6 +35,13 @@ pub enum BinaryOp {
     Subtract,
     Multiply,
     Divide,
+    Modulo,
+    // Bitwise operators
+    BitAnd,
+    BitXor,
+    BitOr,
+    ShiftLeft,
+    ShiftRight,
     // Comparison operators
     Equal,
     NotEqual,
@@ -183,6 +191,10 @@ pub fn infer_type(expr: &Expr) -> Result<VarType, String> {
         Expr::String(_) => Ok(VarType::String),
         Expr::Bool(_) => Ok(VarType::Bool),
         Expr::UnaryNot(_) => Ok(VarType::Bool),
+        Expr::UnaryBitNot(inner) => match infer_type(inner)? {
+            VarType::Int | VarType::Bool => Ok(VarType::Int),
+            _ => Err("Bitwise NOT requires an integer or boolean operand".to_string()),
+        },
         // During parsing phase, we cannot know variable types, only check literal expressions
         // For variable references, return a default type to allow compilation to continue, actual type checking will be done in code generation phase
         Expr::Variable(_) => Ok(VarType::Int), // Temporarily assume variables are integer type to let parsing pass

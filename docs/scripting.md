@@ -146,7 +146,7 @@ let result = a + b;
 
 | Type | Literal/Example | Description | Ops/Comparisons |
 | --- | --- | --- | --- |
-| Integer (i64) | `123`, `-42` | 64‑bit signed integer | +, -, *, /; mixes with DWARF integer‑like scalars |
+| Integer (i64) | `123`, `-42` | 64‑bit signed integer | `+`, `-`, `*`, `/`, `%`, bitwise `&`, `|`, `^`, `~`, `<<`, `>>`; mixes with DWARF integer‑like scalars |
 | Boolean (bool) | `true`, `false`, or from comparison `a < b` | From literals/comparisons/logical ops | logical AND/OR; when mixing with DWARF integers, treated as 0/1 |
 | String | `"hello"` | UTF‑8 string literal | Equality `==`, `!=` with DWARF C strings; no ordering |
 | Alias (DWARF expr alias) | `let a = global.arr;`, `let p = &buf[0];` | A named alias to any DWARF expression (variable, member, array, pointer deref, or address‑of). Lets you give short names to complex types/paths and reuse them. | Supports the same complex access as the underlying DWARF type: member access (`a.field`), literal or expression index (`a[0]`, `a[i + 1]`), address‑of (`&a`), and use in `memcmp/strncmp/starts_with` and `{:x.N}`/`{:s.N}`/`{:p}`. Pointer arithmetic is scaled by the pointed-to type when GhostScope knows the pointee layout. |
@@ -404,6 +404,7 @@ let sum = a + b;
 let diff = a - b;
 let product = a * b;
 let quotient = a / b;
+let remainder = a % 4;
 
 // Integer literals
 let x = 123;           // decimal
@@ -413,16 +414,35 @@ let b = 0b1010;        // binary (10)
 let neg = -0x10;       // unary minus is parsed as 0 - 16
 ```
 
+### Bitwise Operators
+
+```ghostscope
+let masked = flags & 0x4;
+let combined = flags | 0x10;
+let flipped = flags ^ 0xff;
+let inverse = ~flags;
+let high = value >> 8;
+let scaled = value << 2;
+```
+
+Bitwise operators require integer/boolean operands. Variable shift counts are
+masked to the operand width to avoid undefined runtime shifts.
+
 ### Precedence
 
 1. Parentheses `()`
 2. Member access `.`, Array access `[]`
-3. Pointer deref `*`, Address‑of `&`, Unary minus `-`, Logical NOT `!`
-4. Multiplication `*`, Division `/`
+3. Pointer deref `*`, Address‑of `&`, Unary minus `-`, Logical NOT `!`, Bitwise NOT `~`
+4. Multiplication `*`, Division `/`, Modulo `%`
 5. Addition `+`, Subtraction `-`
-6. Comparisons `==`, `!=`, `<`, `<=`, `>`, `>=`
-7. Logical AND `&&`
-8. Logical OR `||`
+6. Shifts `<<`, `>>`
+7. Comparisons `<`, `<=`, `>`, `>=`
+8. Equality `==`, `!=`
+9. Bitwise AND `&`
+10. Bitwise XOR `^`
+11. Bitwise OR `|`
+12. Logical AND `&&`
+13. Logical OR `||`
 
 ### Logical Operators
 
@@ -460,7 +480,8 @@ trace foo.c:42 {
 
 ### Cross‑type Operations with DWARF Values
 
-#### Arithmetic (+, -, *, /)
+#### Integer arithmetic and bitwise operations
+(`+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`, `~`, `<<`, `>>`)
 
 - Supported: script int/bool with DWARF integer‑like scalars
   - BaseType (signed/unsigned 1/2/4/8 bytes), Enum (as underlying), Bitfield (extracted integer), char/unsigned char (1 byte)
@@ -777,7 +798,7 @@ trace foo {
 2. No user‑defined functions
 3. Read‑only (no mutation of target program state)
 4. Limited string operations (CString equality and built‑ins only)
-5. Limited arithmetic (no bitwise operators yet)
+5. Integer-only arithmetic/bitwise operators; floating-point arithmetic is not supported
 6. No dynamic memory allocation in eBPF
 7. Uneven source-language coverage: C works best; C++ and Rust currently rely mostly on automatic demangling plus DWARF-layout-based access, with most language-specific features unsupported
 

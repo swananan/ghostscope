@@ -1120,6 +1120,50 @@ trace calculate_something {
 }
 
 #[tokio::test]
+async fn test_o3_integer_modulo_and_bitwise_ops() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let opt_level = OptimizationLevel::O3;
+    let _ = get_global_test_pid_with_opt(opt_level).await?;
+
+    let script_content = r#"
+trace sample_program.c:73 {
+    let mod_idx = numbers[0x3] % 0x3;
+    print "O3_EXPR_OPS:{}:{}:{}:{}:{}:{}", numbers[0x3] % numbers[0x1], numbers[0x0] & 0x6, numbers[0x0] | 0x1, numbers[0x1] ^ numbers[0x0], numbers[0x2] >> 0x1, numbers[0x1] << 0x1;
+    print "O3_EXPR_BITNOT:{}", ~0x0;
+    print "O3_EXPR_INDEX:{}", numbers[mod_idx];
+    if (numbers[0x3] % numbers[0x1] == 0x0) && ((numbers[0x0] & 0x2) == 0x2) && (((numbers[0x1] >> 0x2) | 0x8) == 0xd) && ((~0x0) == -0x1) {
+        print "O3_EXPR_OPS_OK";
+    }
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_opt(script_content, 4, opt_level).await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    assert!(
+        stdout.contains("O3_EXPR_OPS:0:2:11:30:15:40"),
+        "Expected modulo and bitwise expression results. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_EXPR_BITNOT:-1"),
+        "Expected bitwise NOT to produce -1. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_EXPR_INDEX:20"),
+        "Expected modulo-derived dynamic index to read numbers[1]. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("O3_EXPR_OPS_OK"),
+        "Expected modulo and bitwise condition marker. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_o3_local_int_array_decay_pointer_addition_and_memcmp() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();

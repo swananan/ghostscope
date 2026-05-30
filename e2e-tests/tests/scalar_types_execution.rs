@@ -191,6 +191,44 @@ trace scalar_anchor {
 }
 
 #[tokio::test]
+async fn test_c_scalar_unsigned_modulo_and_bitwise_normalize_widths() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("scalar_types_program")?;
+    let target = spawn_scalar_types_binary(&binary_path).await?;
+
+    let script = r#"
+trace scalar_anchor {
+    print "U32_I32_MOD={}", cast(0xffffffff, "uint32_t") % cast(-1, "int32_t");
+    print "U32_I32_BITOR={}", cast(0x0, "uint32_t") | cast(-1, "int32_t");
+    print "U32_BITNOT={}", ~cast(0x0, "uint32_t");
+    if cast(0xffffffff, "uint32_t") % cast(-1, "int32_t") == 0 {
+        print "U32_I32_MOD_OK";
+    }
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    for expected in [
+        "U32_I32_MOD=0",
+        "U32_I32_BITOR=4294967295",
+        "U32_BITNOT=4294967295",
+        "U32_I32_MOD_OK",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "Expected unsigned-width operator output {expected}. STDOUT: {stdout}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_c_scalar_bool_and_float_prints() -> anyhow::Result<()> {
     init();
 

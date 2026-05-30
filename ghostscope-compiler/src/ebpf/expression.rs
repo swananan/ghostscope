@@ -34,6 +34,14 @@ struct IndexableElementInfo {
     module_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct BinaryIntegerSemantics {
+    unsigned_ordering_width: Option<u32>,
+    unsigned_division_width: Option<u32>,
+    unsigned_bitwise_width: Option<u32>,
+    unsigned_right_shift_width: Option<u32>,
+}
+
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(crate) fn get_host_pid_tid_values(&mut self) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
         let i32_type = self.context.i32_type();
@@ -688,6 +696,59 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             } => {
                 Self::integer_literal_value(left)?.checked_sub(Self::integer_literal_value(right)?)
             }
+            E::BinaryOp {
+                left,
+                op: BO::Multiply,
+                right,
+            } => {
+                Self::integer_literal_value(left)?.checked_mul(Self::integer_literal_value(right)?)
+            }
+            E::BinaryOp {
+                left,
+                op: BO::Divide,
+                right,
+            } => {
+                Self::integer_literal_value(left)?.checked_div(Self::integer_literal_value(right)?)
+            }
+            E::BinaryOp {
+                left,
+                op: BO::Modulo,
+                right,
+            } => {
+                Self::integer_literal_value(left)?.checked_rem(Self::integer_literal_value(right)?)
+            }
+            E::BinaryOp {
+                left,
+                op: BO::BitAnd,
+                right,
+            } => Some(Self::integer_literal_value(left)? & Self::integer_literal_value(right)?),
+            E::BinaryOp {
+                left,
+                op: BO::BitXor,
+                right,
+            } => Some(Self::integer_literal_value(left)? ^ Self::integer_literal_value(right)?),
+            E::BinaryOp {
+                left,
+                op: BO::BitOr,
+                right,
+            } => Some(Self::integer_literal_value(left)? | Self::integer_literal_value(right)?),
+            E::BinaryOp {
+                left,
+                op: BO::ShiftLeft,
+                right,
+            } => {
+                let shift = u32::try_from(Self::integer_literal_value(right)?).ok()?;
+                Self::integer_literal_value(left)?.checked_shl(shift)
+            }
+            E::BinaryOp {
+                left,
+                op: BO::ShiftRight,
+                right,
+            } => {
+                let shift = u32::try_from(Self::integer_literal_value(right)?).ok()?;
+                Self::integer_literal_value(left)?.checked_shr(shift)
+            }
+            E::UnaryBitNot(inner) => Some(!Self::integer_literal_value(inner)?),
             _ => None,
         }
     }
@@ -844,6 +905,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let plan = self.integer_comparison_plan_for_exprs(left, right)?;
         if plan.is_unsigned {
             Some((plan.size * 8) as u32)
+        } else {
+            None
+        }
+    }
+
+    fn unsigned_shift_width_for_expr(&mut self, expr: &Expr) -> Option<u32> {
+        let c_type = self.dwarf_integer_comparison_expr(expr)?.promoted();
+        if c_type.is_unsigned {
+            Some((c_type.size * 8) as u32)
         } else {
             None
         }
@@ -2323,6 +2393,49 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                 Ok(res.into())
             }
+            Expr::UnaryBitNot(inner) => {
+                let unsigned_width = self
+                    .dwarf_integer_comparison_expr(inner)
+                    .map(CIntegerComparisonType::promoted)
+                    .and_then(|integer_type| {
+                        integer_type
+                            .is_unsigned
+                            .then_some((integer_type.size * 8) as u32)
+                    });
+                let v = self.compile_expr(inner)?;
+                let iv = match v {
+                    BasicValueEnum::IntValue(iv) => iv,
+                    _ => {
+                        return Err(CodeGenError::TypeError(
+                            "Bitwise NOT requires integer/boolean operand".to_string(),
+                        ))
+                    }
+                };
+                if let Some(bit_width) = unsigned_width {
+                    let iv =
+                        self.normalize_int_for_unsigned_compare(iv, bit_width, "bitnot_unsigned")?;
+                    let result = self
+                        .builder
+                        .build_xor(iv, iv.get_type().const_all_ones(), "bitnot")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                    return self
+                        .zero_extend_int_to_i64_if_needed(result, "bitnot_zext_i64")
+                        .map(|value| value.into());
+                }
+                let iv = if iv.get_type().get_bit_width() == 1 {
+                    self.builder
+                        .build_int_z_extend(iv, self.context.i64_type(), "bitnot_bool_i64")
+                        .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                } else {
+                    iv
+                };
+                let all_ones = iv.get_type().const_all_ones();
+                let result = self
+                    .builder
+                    .build_xor(iv, all_ones, "bitnot")
+                    .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                Ok(result.into())
+            }
             Expr::Variable(var_name) => {
                 debug!("compile_expr: Compiling variable expression: {}", var_name);
 
@@ -2489,9 +2602,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             },
             Expr::BinaryOp { left, op, right } => {
                 // Guard: disallow arithmetic/ordered comparisons that involve DWARF aggregates
-                let is_arith = matches!(
+                let is_integer_op = matches!(
                     op,
-                    BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
+                    BinaryOp::Add
+                        | BinaryOp::Subtract
+                        | BinaryOp::Multiply
+                        | BinaryOp::Divide
+                        | BinaryOp::Modulo
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitXor
+                        | BinaryOp::BitOr
+                        | BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
                 );
                 let is_ordered = matches!(
                     op,
@@ -2500,11 +2622,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         | BinaryOp::GreaterThan
                         | BinaryOp::GreaterEqual
                 );
-                if (is_arith || is_ordered)
+                if (is_integer_op || is_ordered)
                     && (self.is_dwarf_aggregate_expr(left) || self.is_dwarf_aggregate_expr(right))
                 {
                     return Err(CodeGenError::TypeError(
-                        "Unsupported arithmetic/ordered comparison involving struct/union/array. Select a scalar field (e.g., 'obj.field'), or use '&expr +/- <integer literal>' in an alias/address context if you need a raw address."
+                        "Unsupported arithmetic/ordered comparison involving struct/union/array, or unsupported bitwise operation involving struct/union/array. Select a scalar field (e.g., 'obj.field'), or use '&expr +/- <integer literal>' in an alias/address context if you need a raw address."
                             .to_string(),
                     ));
                 }
@@ -2709,10 +2831,27 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 } else {
                     None
                 };
-                let unsigned_division_width = if matches!(op, BinaryOp::Divide) {
+                let unsigned_division_width = if matches!(op, BinaryOp::Divide | BinaryOp::Modulo) {
                     self.unsigned_ordering_width_for_exprs(left, right)
                 } else {
                     None
+                };
+                let unsigned_bitwise_width =
+                    if matches!(op, BinaryOp::BitAnd | BinaryOp::BitXor | BinaryOp::BitOr) {
+                        self.unsigned_ordering_width_for_exprs(left, right)
+                    } else {
+                        None
+                    };
+                let unsigned_right_shift_width = if matches!(op, BinaryOp::ShiftRight) {
+                    self.unsigned_shift_width_for_expr(left)
+                } else {
+                    None
+                };
+                let integer_semantics = BinaryIntegerSemantics {
+                    unsigned_ordering_width,
+                    unsigned_division_width,
+                    unsigned_bitwise_width,
+                    unsigned_right_shift_width,
                 };
 
                 // Default eager evaluation for other binary ops
@@ -2722,8 +2861,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     left_val,
                     op.clone(),
                     right_val,
-                    unsigned_ordering_width,
-                    unsigned_division_width,
+                    integer_semantics,
                 )
             }
             Expr::MemberAccess(_, _) => {
@@ -2872,7 +3010,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         op: BinaryOp,
         right: BasicValueEnum<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>> {
-        self.compile_binary_op_with_ordering(left, op, right, None, None)
+        self.compile_binary_op_with_ordering(left, op, right, BinaryIntegerSemantics::default())
     }
 
     pub(crate) fn build_signed_int_div_via_udiv(
@@ -3058,13 +3196,55 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok((left, right))
     }
 
+    fn mask_shift_amount(&mut self, amount: IntValue<'ctx>, name: &str) -> Result<IntValue<'ctx>> {
+        let bit_width = amount.get_type().get_bit_width();
+        let mask = amount
+            .get_type()
+            .const_int(u64::from(bit_width.saturating_sub(1)), false);
+        self.builder
+            .build_and(amount, mask, name)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))
+    }
+
+    fn normalize_ints_for_unsigned_width(
+        &mut self,
+        left: IntValue<'ctx>,
+        right: IntValue<'ctx>,
+        bit_width: u32,
+        name: &str,
+    ) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
+        let left = self.normalize_int_for_unsigned_compare(
+            left,
+            bit_width,
+            &format!("{name}_lhs_unsigned"),
+        )?;
+        let right = self.normalize_int_for_unsigned_compare(
+            right,
+            bit_width,
+            &format!("{name}_rhs_unsigned"),
+        )?;
+        Ok((left, right))
+    }
+
+    fn zero_extend_int_to_i64_if_needed(
+        &mut self,
+        value: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>> {
+        if value.get_type().get_bit_width() >= 64 {
+            return Ok(value);
+        }
+        self.builder
+            .build_int_z_extend(value, self.context.i64_type(), name)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))
+    }
+
     fn compile_binary_op_with_ordering(
         &mut self,
         left: BasicValueEnum<'ctx>,
         op: BinaryOp,
         right: BasicValueEnum<'ctx>,
-        unsigned_ordering_width: Option<u32>,
-        unsigned_division_width: Option<u32>,
+        integer_semantics: BinaryIntegerSemantics,
     ) -> Result<BasicValueEnum<'ctx>> {
         use inkwell::values::BasicValueEnum::*;
 
@@ -3095,7 +3275,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             (IntValue(left_int), IntValue(right_int)) => {
                 let (left_int, right_int) =
                     self.align_int_widths_for_binary_op(left_int, right_int)?;
-                let unsigned_cmp_values = if let Some(bit_width) = unsigned_ordering_width {
+                let unsigned_cmp_values = if let Some(bit_width) =
+                    integer_semantics.unsigned_ordering_width
+                {
                     Some((
                         self.normalize_int_for_unsigned_compare(
                             left_int,
@@ -3125,13 +3307,121 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         .build_int_mul(left_int, right_int, "mul")
                         .map_err(|e| CodeGenError::Builder(e.to_string()))?,
                     BinaryOp::Divide => {
-                        if unsigned_division_width.is_some() {
-                            self.builder
+                        if let Some(bit_width) = integer_semantics.unsigned_division_width {
+                            let (left_int, right_int) = self.normalize_ints_for_unsigned_width(
+                                left_int,
+                                right_int,
+                                bit_width,
+                                "div",
+                            )?;
+                            let result = self
+                                .builder
                                 .build_int_unsigned_div(left_int, right_int, "div")
-                                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                            self.zero_extend_int_to_i64_if_needed(result, "div_zext_i64")?
                         } else {
                             self.build_signed_int_div_via_udiv(left_int, right_int, "div")?
                         }
+                    }
+                    BinaryOp::Modulo => {
+                        if let Some(bit_width) = integer_semantics.unsigned_division_width {
+                            let (left_int, right_int) = self.normalize_ints_for_unsigned_width(
+                                left_int,
+                                right_int,
+                                bit_width,
+                                "mod",
+                            )?;
+                            let result = self
+                                .builder
+                                .build_int_unsigned_rem(left_int, right_int, "mod")
+                                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                            self.zero_extend_int_to_i64_if_needed(result, "mod_zext_i64")?
+                        } else {
+                            self.build_signed_int_rem_via_urem(left_int, right_int, "mod")?
+                        }
+                    }
+                    BinaryOp::BitAnd => {
+                        let (left_int, right_int) =
+                            if let Some(bit_width) = integer_semantics.unsigned_bitwise_width {
+                                self.normalize_ints_for_unsigned_width(
+                                    left_int,
+                                    right_int,
+                                    bit_width,
+                                    "bitand",
+                                )?
+                            } else {
+                                (left_int, right_int)
+                            };
+                        let result = self
+                            .builder
+                            .build_and(left_int, right_int, "bitand")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        if integer_semantics.unsigned_bitwise_width.is_some() {
+                            self.zero_extend_int_to_i64_if_needed(result, "bitand_zext_i64")?
+                        } else {
+                            result
+                        }
+                    }
+                    BinaryOp::BitXor => {
+                        let (left_int, right_int) =
+                            if let Some(bit_width) = integer_semantics.unsigned_bitwise_width {
+                                self.normalize_ints_for_unsigned_width(
+                                    left_int,
+                                    right_int,
+                                    bit_width,
+                                    "bitxor",
+                                )?
+                            } else {
+                                (left_int, right_int)
+                            };
+                        let result = self
+                            .builder
+                            .build_xor(left_int, right_int, "bitxor")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        if integer_semantics.unsigned_bitwise_width.is_some() {
+                            self.zero_extend_int_to_i64_if_needed(result, "bitxor_zext_i64")?
+                        } else {
+                            result
+                        }
+                    }
+                    BinaryOp::BitOr => {
+                        let (left_int, right_int) =
+                            if let Some(bit_width) = integer_semantics.unsigned_bitwise_width {
+                                self.normalize_ints_for_unsigned_width(
+                                    left_int,
+                                    right_int,
+                                    bit_width,
+                                    "bitor",
+                                )?
+                            } else {
+                                (left_int, right_int)
+                            };
+                        let result = self
+                            .builder
+                            .build_or(left_int, right_int, "bitor")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+                        if integer_semantics.unsigned_bitwise_width.is_some() {
+                            self.zero_extend_int_to_i64_if_needed(result, "bitor_zext_i64")?
+                        } else {
+                            result
+                        }
+                    }
+                    BinaryOp::ShiftLeft => {
+                        let right_int = self.mask_shift_amount(right_int, "shl_rhs_mask")?;
+                        self.builder
+                            .build_left_shift(left_int, right_int, "shl")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                    }
+                    BinaryOp::ShiftRight => {
+                        let right_int = self.mask_shift_amount(right_int, "shr_rhs_mask")?;
+                        self.builder
+                            .build_right_shift(
+                                left_int,
+                                right_int,
+                                integer_semantics.unsigned_right_shift_width.is_none(),
+                                "shr",
+                            )
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?
                     }
                     // Comparison operators
                     BinaryOp::Equal => {
@@ -3149,7 +3439,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         return Ok(result.into());
                     }
                     BinaryOp::LessThan => {
-                        let predicate = if unsigned_ordering_width.is_some() {
+                        let predicate = if integer_semantics.unsigned_ordering_width.is_some() {
                             inkwell::IntPredicate::ULT
                         } else {
                             inkwell::IntPredicate::SLT
@@ -3163,7 +3453,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         return Ok(result.into());
                     }
                     BinaryOp::LessEqual => {
-                        let predicate = if unsigned_ordering_width.is_some() {
+                        let predicate = if integer_semantics.unsigned_ordering_width.is_some() {
                             inkwell::IntPredicate::ULE
                         } else {
                             inkwell::IntPredicate::SLE
@@ -3177,7 +3467,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         return Ok(result.into());
                     }
                     BinaryOp::GreaterThan => {
-                        let predicate = if unsigned_ordering_width.is_some() {
+                        let predicate = if integer_semantics.unsigned_ordering_width.is_some() {
                             inkwell::IntPredicate::UGT
                         } else {
                             inkwell::IntPredicate::SGT
@@ -3191,7 +3481,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         return Ok(result.into());
                     }
                     BinaryOp::GreaterEqual => {
-                        let predicate = if unsigned_ordering_width.is_some() {
+                        let predicate = if integer_semantics.unsigned_ordering_width.is_some() {
                             inkwell::IntPredicate::UGE
                         } else {
                             inkwell::IntPredicate::SGE
