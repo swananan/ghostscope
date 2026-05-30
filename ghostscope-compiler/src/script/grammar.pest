@@ -56,18 +56,27 @@ expr = { logical_or }
 or_op = { "||" }
 and_op = { "&&" }
 logical_or = { logical_and ~ (or_op ~ logical_and)* }
-logical_and = { equality ~ (and_op ~ equality)* }
+logical_and = { bitwise_or ~ (and_op ~ bitwise_or)* }
+bitwise_or = { bitwise_xor ~ (bit_or_op ~ bitwise_xor)* }
+bitwise_xor = { bitwise_and ~ (bit_xor_op ~ bitwise_and)* }
+bitwise_and = { equality ~ (bit_and_op ~ equality)* }
 eq_op = { "==" | "!=" }
 rel_op = { "<=" | ">=" | "<" | ">" }
+shift_op = { "<<" | ">>" }
+bit_and_op = { "&" ~ !"&" }
+bit_xor_op = { "^" }
+bit_or_op = { "|" ~ !"|" }
 equality = { relational ~ (eq_op ~ relational)* }
-relational = { additive ~ (rel_op ~ additive)* }
+relational = { shift ~ (rel_op ~ shift)* }
+shift = { additive ~ (shift_op ~ additive)* }
 additive = { term ~ (add_op ~ term)* }
 // Support unary minus by introducing a 'unary' level
 term = { unary ~ (mul_op ~ unary)* }
 // Note: use recursive definition so multiple '-' nest correctly and parser can detect '-' branch
 neg_unary = { "-" ~ unary }
 not_unary = { "!" ~ unary }
-unary = { neg_unary | not_unary | factor }
+bit_not_unary = { "~" ~ unary }
+unary = { neg_unary | not_unary | bit_not_unary | factor }
 factor = {
     // Builtin calls must be checked before identifier to avoid ambiguity
     memcmp_call |
@@ -120,7 +129,7 @@ pointer_deref = { "*" ~ unary_target }
 address_of = { "&" ~ unary_target }
 
 add_op = { "+" | "-" }
-mul_op = { "*" | "/" }
+mul_op = { "*" | "/" | "%" }
 
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 // Integer literals

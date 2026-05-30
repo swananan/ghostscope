@@ -1397,6 +1397,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         .map(|a| expand_aliases(ctx, a, visited, depth + 1))
                         .collect::<std::result::Result<Vec<_>, _>>()?,
                 },
+                E::UnaryNot(inner) => {
+                    E::UnaryNot(Box::new(expand_aliases(ctx, inner, visited, depth + 1)?))
+                }
+                E::UnaryBitNot(inner) => {
+                    E::UnaryBitNot(Box::new(expand_aliases(ctx, inner, visited, depth + 1)?))
+                }
                 E::BinaryOp { left, op, right } => E::BinaryOp {
                     left: Box::new(expand_aliases(ctx, left, visited, depth + 1)?),
                     op: op.clone(),

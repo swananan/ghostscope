@@ -804,6 +804,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 E::String(s) => format!("\"{s}\""),
                 E::Float(v) => format!("{v}"),
                 E::UnaryNot(e1) => format!("!{}", inner(e1)),
+                E::UnaryBitNot(e1) => format!("~{}", inner(e1)),
                 E::Bool(v) => v.to_string(),
                 E::SpecialVar(s) => format!("${s}"),
                 E::BuiltinCall { name, args } => {
@@ -816,6 +817,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         crate::script::ast::BinaryOp::Subtract => "-",
                         crate::script::ast::BinaryOp::Multiply => "*",
                         crate::script::ast::BinaryOp::Divide => "/",
+                        crate::script::ast::BinaryOp::Modulo => "%",
+                        crate::script::ast::BinaryOp::BitAnd => "&",
+                        crate::script::ast::BinaryOp::BitXor => "^",
+                        crate::script::ast::BinaryOp::BitOr => "|",
+                        crate::script::ast::BinaryOp::ShiftLeft => "<<",
+                        crate::script::ast::BinaryOp::ShiftRight => ">>",
                         crate::script::ast::BinaryOp::Equal => "==",
                         crate::script::ast::BinaryOp::NotEqual => "!=",
                         crate::script::ast::BinaryOp::LessThan => "<",
@@ -854,6 +861,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         match expr {
             E::BuiltinCall { .. } => true,
             E::UnaryNot(inner)
+            | E::UnaryBitNot(inner)
             | E::PointerDeref(inner)
             | E::AddressOf(inner)
             | E::MemberAccess(inner, _) => Self::expr_contains_builtin(inner),
