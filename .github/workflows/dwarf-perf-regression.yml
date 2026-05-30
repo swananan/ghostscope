@@ -255,6 +255,7 @@ jobs:
           compare_target() {
             local target="$1"
             local safe_target="$2"
+            local enforce_query_metrics="$3"
             local base_result="$DWARF_PERF_RESULTS_DIR/base-${target}.json"
             local head_result="$DWARF_PERF_RESULTS_DIR/head-${target}.json"
             local summary_result="$DWARF_PERF_RESULTS_DIR/summary-${safe_target}.md"
@@ -270,6 +271,13 @@ jobs:
               --summary-file "$summary_result"
               --result-file "$compare_result"
             )
+
+            if [[ "$enforce_query_metrics" != "true" ]]; then
+              args+=(
+                --skip-query-metrics
+                --skip-query-reason "Source-line query uses the same query-hotspot corpus for every parse target and is enforced only for parse-stress."
+              )
+            fi
 
             if [[ "$REPORT_ONLY" == "true" ]]; then
               args+=(
@@ -309,8 +317,12 @@ jobs:
 
           for target in "${parse_targets[@]}"; do
             safe_target=${target//-/_}
+            enforce_query_metrics=false
+            if [[ "$target" == "parse-stress" ]]; then
+              enforce_query_metrics=true
+            fi
             if [[ -f "$DWARF_PERF_RESULTS_DIR/base-${target}.json" ]]; then
-              compare_target "$target" "$safe_target"
+              compare_target "$target" "$safe_target" "$enforce_query_metrics"
               target_exit=$?
               if [[ "$target_exit" -ne 0 ]]; then
                 overall_exit="$target_exit"
