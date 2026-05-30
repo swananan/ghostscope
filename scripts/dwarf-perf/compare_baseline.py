@@ -53,7 +53,7 @@ class SupplementalMetricComparison:
     status: str
 
 
-RULES = [
+PARSE_RULES = [
     MetricRule(
         name="fast_parse_p50",
         json_path="parse_benchmark.metrics_ms.p50",
@@ -70,6 +70,9 @@ RULES = [
         severity="fail",
         description="Fast parse p95",
     ),
+]
+
+QUERY_RULES = [
     MetricRule(
         name="source_line_query_p50",
         json_path="query_benchmark.metrics_ms.p50",
@@ -154,6 +157,20 @@ def parse_args() -> argparse.Namespace:
         "--report-only-reason",
         default="",
         help="Optional note explaining why the comparison is report-only",
+    )
+    parser.add_argument(
+        "--skip-query-metrics",
+        action="store_true",
+        help=(
+            "Skip source-line query metrics for this comparison. The query "
+            "benchmark is independent of the parse target and should only be "
+            "enforced once per base/head comparison set."
+        ),
+    )
+    parser.add_argument(
+        "--skip-query-reason",
+        default="",
+        help="Optional note explaining why source-line query metrics were skipped.",
     )
     return parser.parse_args()
 
@@ -344,6 +361,7 @@ def build_console_report(
     head_label: str,
     report_only: bool,
     report_only_reason: str,
+    query_skip_reason: str,
     overall_status: str,
 ) -> str:
     mode = "report-only" if report_only else "enforced"
@@ -366,6 +384,8 @@ def build_console_report(
     )
     if report_only_reason:
         lines.append(f"  note: {report_only_reason}")
+    if query_skip_reason:
+        lines.append(f"  query metrics: skipped ({query_skip_reason})")
     return "\n".join(lines)
 
 
@@ -395,6 +415,7 @@ def build_summary(
     head_label: str,
     report_only: bool,
     report_only_reason: str,
+    query_skip_reason: str,
     overall_status: str,
 ) -> str:
     mode = "report-only" if report_only else "enforced"
@@ -410,6 +431,8 @@ def build_summary(
 
     if report_only_reason:
         lines.append(f"- Note: {report_only_reason}")
+    if query_skip_reason:
+        lines.append(f"- Query metrics: skipped. {query_skip_reason}")
 
     lines.extend(
         [
@@ -441,8 +464,10 @@ def main() -> int:
     base_data = load_json(args.base)
     head_data = load_json(args.head)
 
+    metric_rules = PARSE_RULES if args.skip_query_metrics else PARSE_RULES + QUERY_RULES
     metrics = [
-        compare_metric(base_data, head_data, rule, args.report_only) for rule in RULES
+        compare_metric(base_data, head_data, rule, args.report_only)
+        for rule in metric_rules
     ]
     index_phase_metrics = [
         compare_supplemental_metric(base_data, head_data, rule)
@@ -450,6 +475,7 @@ def main() -> int:
     ]
     overall_status = determine_overall_status(metrics, args.report_only)
     parse_target_name = resolve_parse_target_name(base_data, head_data)
+    query_skip_reason = args.skip_query_reason if args.skip_query_metrics else ""
 
     summary = build_summary(
         parse_target_name,
@@ -459,6 +485,7 @@ def main() -> int:
         args.head_label,
         args.report_only,
         args.report_only_reason,
+        query_skip_reason,
         overall_status,
     )
     Path(args.summary_file).write_text(summary)
@@ -467,6 +494,8 @@ def main() -> int:
         "schema_version": 2,
         "mode": "report-only" if args.report_only else "enforced",
         "report_only_reason": args.report_only_reason,
+        "query_metrics_skipped": args.skip_query_metrics,
+        "query_skip_reason": query_skip_reason,
         "parse_target": parse_target_name,
         "base": {"label": args.base_label, "path": args.base},
         "head": {"label": args.head_label, "path": args.head},
@@ -487,6 +516,7 @@ def main() -> int:
             args.head_label,
             args.report_only,
             args.report_only_reason,
+            query_skip_reason,
             overall_status,
         )
     )
