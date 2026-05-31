@@ -427,14 +427,13 @@ async fn run_runtime_coordinator(
     Ok(())
 }
 
-/// Handle script execution command
-async fn handle_execute_script(
+/// Compile and attach a script in TUI mode, returning display details without emitting UI status.
+async fn compile_script_for_tui_details(
     session: &mut Option<GhostSession>,
-    runtime_channels: &mut RuntimeChannels,
-    script: String,
+    script: &str,
     selected_index: Option<usize>,
     compile_options: &ghostscope_compiler::CompileOptions,
-) {
+) -> ghostscope_ui::events::ScriptCompilationDetails {
     info!("Executing script: {}", script);
 
     if let Some(ref mut session) = session {
@@ -442,49 +441,44 @@ async fn handle_execute_script(
         let mut options = compile_options.clone();
         options.selected_index = selected_index;
 
-        let details = match crate::script::compile_and_load_script_for_tui(
-            &script, session, &options,
-        )
-        .await
-        {
-            Ok(details) => {
-                info!(
-                    "✓ Script compilation completed: {} total, {} success, {} failed",
-                    details.total_count, details.success_count, details.failed_count
-                );
-                details
-            }
-            Err(e) => {
-                error!("❌ Script compilation failed: {}", e);
-                // Return details with all failures
-                ghostscope_ui::events::ScriptCompilationDetails {
-                    trace_ids: vec![],
-                    results: vec![ghostscope_ui::events::ScriptExecutionResult {
-                        pc_address: 0,
-                        target_name: script.clone(),
-                        binary_path: String::new(),
-                        status: ghostscope_ui::events::ExecutionStatus::Failed(e.to_string()),
-                        source_file: None,
-                        source_line: None,
-                        is_inline: None,
-                    }],
-                    total_count: 1,
-                    success_count: 0,
-                    failed_count: 1,
+        let details =
+            match crate::script::compile_and_load_script_for_tui(script, session, &options).await {
+                Ok(details) => {
+                    info!(
+                        "✓ Script compilation completed: {} total, {} success, {} failed",
+                        details.total_count, details.success_count, details.failed_count
+                    );
+                    details
                 }
-            }
-        };
+                Err(e) => {
+                    error!("❌ Script compilation failed: {}", e);
+                    // Return details with all failures
+                    ghostscope_ui::events::ScriptCompilationDetails {
+                        trace_ids: vec![],
+                        results: vec![ghostscope_ui::events::ScriptExecutionResult {
+                            pc_address: 0,
+                            target_name: script.to_string(),
+                            binary_path: String::new(),
+                            status: ghostscope_ui::events::ExecutionStatus::Failed(e.to_string()),
+                            source_file: None,
+                            source_line: None,
+                            is_inline: None,
+                        }],
+                        total_count: 1,
+                        success_count: 0,
+                        failed_count: 1,
+                    }
+                }
+            };
 
-        let _ = runtime_channels
-            .status_sender
-            .send(RuntimeStatus::ScriptCompilationCompleted { details });
+        details
     } else {
         // No session available - return details with failure
-        let details = ghostscope_ui::events::ScriptCompilationDetails {
+        ghostscope_ui::events::ScriptCompilationDetails {
             trace_ids: vec![],
             results: vec![ghostscope_ui::events::ScriptExecutionResult {
                 pc_address: 0,
-                target_name: script.clone(),
+                target_name: script.to_string(),
                 binary_path: String::new(),
                 status: ghostscope_ui::events::ExecutionStatus::Failed(
                     "No debug session available".to_string(),
@@ -496,11 +490,100 @@ async fn handle_execute_script(
             total_count: 1,
             success_count: 0,
             failed_count: 1,
+        }
+    }
+}
+
+/// Handle script execution command
+async fn handle_execute_script(
+    session: &mut Option<GhostSession>,
+    runtime_channels: &mut RuntimeChannels,
+    script: String,
+    selected_index: Option<usize>,
+    compile_options: &ghostscope_compiler::CompileOptions,
+) {
+    let details =
+        compile_script_for_tui_details(session, &script, selected_index, compile_options).await;
+
+    let _ = runtime_channels
+        .status_sender
+        .send(RuntimeStatus::ScriptCompilationCompleted { details });
+}
+
+fn recalculate_script_compilation_counts(
+    details: &mut ghostscope_ui::events::ScriptCompilationDetails,
+) {
+    let mut success_count = 0;
+    let mut failed_count = 0;
+
+    for result in &details.results {
+        match result.status {
+            ghostscope_ui::events::ExecutionStatus::Success => success_count += 1,
+            ghostscope_ui::events::ExecutionStatus::Failed(_) => failed_count += 1,
+            ghostscope_ui::events::ExecutionStatus::Skipped(_) => {}
+        }
+    }
+
+    details.success_count = success_count;
+    details.failed_count = failed_count;
+    details.total_count = success_count + failed_count;
+}
+
+fn restore_loaded_traces_as_disabled(
+    session: &mut GhostSession,
+    details: &mut ghostscope_ui::events::ScriptCompilationDetails,
+) {
+    let registered_trace_ids: Vec<u32> = details
+        .trace_ids
+        .iter()
+        .copied()
+        .filter(|trace_id| {
+            session
+                .trace_manager
+                .get_trace_snapshot(*trace_id)
+                .is_some()
+        })
+        .collect();
+    let mut registered_trace_ids = registered_trace_ids.into_iter();
+    let mut retained_trace_ids = Vec::new();
+    let mut changed = false;
+
+    for result_index in 0..details.results.len() {
+        if !matches!(
+            details.results[result_index].status,
+            ghostscope_ui::events::ExecutionStatus::Success
+        ) {
+            continue;
+        }
+
+        let Some(trace_id) = registered_trace_ids.next() else {
+            details.results[result_index].status = ghostscope_ui::events::ExecutionStatus::Failed(
+                "Loaded trace was not registered; cannot restore disabled state".to_string(),
+            );
+            changed = true;
+            continue;
         };
 
-        let _ = runtime_channels
-            .status_sender
-            .send(RuntimeStatus::ScriptCompilationCompleted { details });
+        match session.trace_manager.disable_trace(trace_id) {
+            Ok(()) => {
+                info!("Loaded trace {} as disabled", trace_id);
+                retained_trace_ids.push(trace_id);
+            }
+            Err(err) => {
+                let error = format!(
+                    "Failed to restore disabled trace #{trace_id}; trace remains active: {err:#}"
+                );
+                warn!("{}", error);
+                details.results[result_index].status =
+                    ghostscope_ui::events::ExecutionStatus::Failed(error);
+                changed = true;
+            }
+        }
+    }
+
+    details.trace_ids = retained_trace_ids;
+    if changed {
+        recalculate_script_compilation_counts(details);
     }
 }
 
@@ -593,25 +676,30 @@ async fn handle_load_traces(
         return;
     }
 
-    // Send all trace scripts for execution
-    // The UI will track individual ScriptCompilationCompleted responses
+    // Send all trace scripts for execution.
+    // The UI tracks individual ScriptCompilationCompleted responses and uses the
+    // original load request order to preserve enabled/disabled state in summaries.
     for trace in &traces {
         // Build the trace command
         let script_command = format!("trace {} {{\n{}\n}}", trace.target, trace.script);
 
-        // Execute the script (this sends the command but doesn't wait for result)
-        handle_execute_script(
+        let mut details = compile_script_for_tui_details(
             session,
-            runtime_channels,
-            script_command,
+            &script_command,
             trace.selected_index,
             compile_options,
         )
         .await;
 
-        // TODO: Handle disabled traces from //@disabled markers
-        // Currently ignoring disabled state - would need to track trace_id from
-        // ScriptCompilationCompleted response and then send disable command
+        if !trace.enabled {
+            if let Some(ref mut session) = session {
+                restore_loaded_traces_as_disabled(session, &mut details);
+            }
+        }
+
+        let _ = runtime_channels
+            .status_sender
+            .send(RuntimeStatus::ScriptCompilationCompleted { details });
     }
 
     // Don't send TracesLoaded here - let the UI track individual completions

@@ -1275,15 +1275,10 @@ impl CommandParser {
                 }
 
                 // Initialize batch loading state
-                state.batch_loading = Some(crate::model::panel_state::BatchLoadingState {
-                    filename: filename.to_string(),
-                    total_count: traces.len(),
-                    completed_count: 0,
-                    success_count: 0,
-                    failed_count: 0,
-                    disabled_count: 0,
-                    details: Vec::new(),
-                });
+                state.batch_loading = Some(crate::model::panel_state::BatchLoadingState::new(
+                    filename.to_string(),
+                    &traces,
+                ));
 
                 state.input_state = InputState::WaitingResponse {
                     command: command.to_string(),
