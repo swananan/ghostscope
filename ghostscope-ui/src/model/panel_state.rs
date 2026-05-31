@@ -457,8 +457,63 @@ pub struct BatchLoadingState {
     pub completed_count: usize,
     pub success_count: usize,
     pub failed_count: usize,
-    pub disabled_count: usize, // TODO: Currently not used - disabled traces are ignored during loading
+    pub disabled_count: usize,
     pub details: Vec<crate::events::TraceLoadDetail>,
+    requested_enabled: VecDeque<bool>,
+}
+
+impl BatchLoadingState {
+    pub fn new(filename: String, traces: &[crate::events::TraceDefinition]) -> Self {
+        Self {
+            filename,
+            total_count: traces.len(),
+            completed_count: 0,
+            success_count: 0,
+            failed_count: 0,
+            disabled_count: 0,
+            details: Vec::new(),
+            requested_enabled: traces.iter().map(|trace| trace.enabled).collect(),
+        }
+    }
+
+    pub fn record_script_compilation(&mut self, details: &crate::events::ScriptCompilationDetails) {
+        self.completed_count += 1;
+
+        let requested_enabled = self.requested_enabled.pop_front().unwrap_or(true);
+        self.success_count += details.success_count;
+        self.failed_count += details.failed_count;
+
+        let mut trace_ids = details.trace_ids.iter().copied();
+        for result in &details.results {
+            match &result.status {
+                crate::events::ExecutionStatus::Success => {
+                    let trace_id = trace_ids.next();
+                    let status = if requested_enabled {
+                        crate::events::LoadStatus::Created
+                    } else {
+                        self.disabled_count += 1;
+                        crate::events::LoadStatus::CreatedDisabled
+                    };
+
+                    self.details.push(crate::events::TraceLoadDetail {
+                        target: result.target_name.clone(),
+                        trace_id,
+                        status,
+                        error: None,
+                    });
+                }
+                crate::events::ExecutionStatus::Failed(error) => {
+                    self.details.push(crate::events::TraceLoadDetail {
+                        target: result.target_name.clone(),
+                        trace_id: None,
+                        status: crate::events::LoadStatus::Failed,
+                        error: Some(error.clone()),
+                    });
+                }
+                crate::events::ExecutionStatus::Skipped(_) => {}
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1319,6 +1374,10 @@ impl Default for CommandPanelState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{
+        ExecutionStatus, LoadStatus, ScriptCompilationDetails, ScriptExecutionResult,
+        TraceDefinition,
+    };
 
     #[test]
     fn runtime_warning_message_is_added_to_ebpf_panel() {
@@ -1338,5 +1397,94 @@ mod tests {
             cached.event.to_formatted_output(),
             vec!["Warning: TUI trace queue saturated; dropped 7 events before display".to_string()]
         );
+    }
+
+    fn trace_definition(target: &str, enabled: bool) -> TraceDefinition {
+        TraceDefinition {
+            target: target.to_string(),
+            script: "print value".to_string(),
+            enabled,
+            selected_index: None,
+        }
+    }
+
+    fn successful_compilation(trace_id: u32, target: &str) -> ScriptCompilationDetails {
+        ScriptCompilationDetails {
+            trace_ids: vec![trace_id],
+            results: vec![ScriptExecutionResult {
+                pc_address: 0x1234,
+                target_name: target.to_string(),
+                binary_path: "/tmp/app".to_string(),
+                status: ExecutionStatus::Success,
+                source_file: None,
+                source_line: None,
+                is_inline: None,
+            }],
+            total_count: 1,
+            success_count: 1,
+            failed_count: 0,
+        }
+    }
+
+    fn failed_compilation(target: &str, error: &str) -> ScriptCompilationDetails {
+        ScriptCompilationDetails {
+            trace_ids: vec![],
+            results: vec![ScriptExecutionResult {
+                pc_address: 0x1234,
+                target_name: target.to_string(),
+                binary_path: "/tmp/app".to_string(),
+                status: ExecutionStatus::Failed(error.to_string()),
+                source_file: None,
+                source_line: None,
+                is_inline: None,
+            }],
+            total_count: 1,
+            success_count: 0,
+            failed_count: 1,
+        }
+    }
+
+    #[test]
+    fn batch_loading_records_disabled_trace_requests() {
+        let traces = vec![
+            trace_definition("disabled_target", false),
+            trace_definition("enabled_target", true),
+        ];
+        let mut batch = BatchLoadingState::new("saved.gs".to_string(), &traces);
+
+        batch.record_script_compilation(&successful_compilation(42, "disabled_target"));
+        batch.record_script_compilation(&successful_compilation(43, "enabled_target"));
+
+        assert_eq!(batch.completed_count, 2);
+        assert_eq!(batch.success_count, 2);
+        assert_eq!(batch.failed_count, 0);
+        assert_eq!(batch.disabled_count, 1);
+        assert_eq!(batch.details.len(), 2);
+        assert!(matches!(
+            batch.details[0].status,
+            LoadStatus::CreatedDisabled
+        ));
+        assert_eq!(batch.details[0].trace_id, Some(42));
+        assert!(matches!(batch.details[1].status, LoadStatus::Created));
+        assert_eq!(batch.details[1].trace_id, Some(43));
+    }
+
+    #[test]
+    fn batch_loading_does_not_report_failed_disabled_restore_as_disabled() {
+        let traces = vec![trace_definition("disabled_target", false)];
+        let mut batch = BatchLoadingState::new("saved.gs".to_string(), &traces);
+
+        batch.record_script_compilation(&failed_compilation(
+            "disabled_target",
+            "Failed to restore disabled trace #42; trace remains active",
+        ));
+
+        assert_eq!(batch.completed_count, 1);
+        assert_eq!(batch.success_count, 0);
+        assert_eq!(batch.failed_count, 1);
+        assert_eq!(batch.disabled_count, 0);
+        assert_eq!(batch.details.len(), 1);
+        assert!(matches!(batch.details[0].status, LoadStatus::Failed));
+        assert_eq!(batch.details[0].trace_id, None);
     }
 }

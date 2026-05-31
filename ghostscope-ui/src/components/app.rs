@@ -3433,36 +3433,7 @@ impl App {
             RuntimeStatus::ScriptCompilationCompleted { details } => {
                 // Check if this is part of a batch load operation
                 if let Some(ref mut batch) = self.state.command_panel.batch_loading {
-                    // Update batch loading state
-                    batch.completed_count += 1;
-                    if details.success_count > 0 {
-                        batch.success_count += details.success_count;
-                        // Add successful trace details
-                        for result in &details.results {
-                            if matches!(result.status, crate::events::ExecutionStatus::Success) {
-                                let trace_id = details.trace_ids.first().copied();
-                                batch.details.push(crate::events::TraceLoadDetail {
-                                    target: result.target_name.clone(),
-                                    trace_id,
-                                    status: crate::events::LoadStatus::Created,
-                                    error: None,
-                                });
-                            }
-                        }
-                    } else {
-                        batch.failed_count += 1;
-                        // Add failed trace details
-                        for result in &details.results {
-                            if let crate::events::ExecutionStatus::Failed(error) = &result.status {
-                                batch.details.push(crate::events::TraceLoadDetail {
-                                    target: result.target_name.clone(),
-                                    trace_id: None,
-                                    status: crate::events::LoadStatus::Failed,
-                                    error: Some(error.clone()),
-                                });
-                            }
-                        }
-                    }
+                    batch.record_script_compilation(details);
 
                     // Check if all traces have been processed
                     if batch.completed_count >= batch.total_count {
