@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "debuginfod-client"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "dwarf-tool"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "ghostscope"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "ghostscope-compiler"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aya-ebpf-bindings",
  "ghostscope-dwarf",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "ghostscope-debuginfod"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "futures-util",
  "reqwest",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "ghostscope-dwarf"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "cpp_demangle",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "ghostscope-e2e-tests"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "ghostscope-compiler",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "ghostscope-loader"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aya",
  "aya-obj",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "ghostscope-platform"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aya-ebpf-bindings",
  "serde",
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "ghostscope-process"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "aya",
@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "ghostscope-protocol"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aya-ebpf-bindings",
  "chrono",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "ghostscope-ui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "chrono",
