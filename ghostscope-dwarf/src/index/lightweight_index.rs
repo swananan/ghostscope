@@ -124,8 +124,9 @@ pub struct LightweightIndex {
     func_addr_by_cu: HashMap<DebugInfoOffset, BTreeMap<u64, usize>>,
     /// All function-like entries in each CU for correctness fallback scans.
     func_indices_by_cu: HashMap<DebugInfoOffset, Vec<usize>>,
-    /// All function-like entry indices for global fallback scans.
-    function_indices: Vec<usize>,
+    /// True after CU lookup maps have been built. Address lookup intentionally
+    /// relies on this initialization instead of falling back to global scans.
+    cu_maps_built: bool,
 }
 
 impl LightweightIndex {
@@ -140,7 +141,7 @@ impl LightweightIndex {
             cu_range_map: BTreeMap::new(),
             func_addr_by_cu: HashMap::new(),
             func_indices_by_cu: HashMap::new(),
-            function_indices: Vec::new(),
+            cu_maps_built: false,
         }
     }
 
@@ -182,13 +183,11 @@ impl LightweightIndex {
         let mut total_functions = 0;
         let mut total_variables = 0;
         let mut func_indices_by_cu: HashMap<DebugInfoOffset, Vec<usize>> = HashMap::new();
-        let mut function_indices = Vec::new();
         for (idx, entry) in entries.iter().enumerate() {
             match entry.tag {
                 gimli::constants::DW_TAG_subprogram
                 | gimli::constants::DW_TAG_inlined_subroutine => {
                     total_functions += 1;
-                    function_indices.push(idx);
                     func_indices_by_cu
                         .entry(entry.unit_offset)
                         .or_default()
@@ -223,7 +222,7 @@ impl LightweightIndex {
             cu_range_map: BTreeMap::new(),
             func_addr_by_cu: HashMap::new(),
             func_indices_by_cu,
-            function_indices,
+            cu_maps_built: false,
         }
     }
 
@@ -513,6 +512,7 @@ impl LightweightIndex {
 
         self.cu_range_map = cu_map;
         self.func_addr_by_cu = per_cu;
+        self.cu_maps_built = true;
     }
 
     /// Build CU range map from .debug_aranges, if present. Returns true if any ranges were added.
@@ -554,6 +554,7 @@ impl LightweightIndex {
             }
         }
 
+        self.cu_maps_built = true;
         added_any
     }
 
@@ -567,7 +568,7 @@ impl LightweightIndex {
         None
     }
 
-    /// Find the subprogram DIE that contains the given address (unified: CU-fast path + fallback)
+    /// Find the subprogram DIE that contains the given address.
     pub fn find_function_by_address<F>(
         &self,
         address: u64,
@@ -576,6 +577,11 @@ impl LightweightIndex {
     where
         F: FnMut(&IndexEntry) -> Option<Vec<(u64, u64)>>,
     {
+        assert!(
+            self.cu_maps_built,
+            "LightweightIndex::find_function_by_address requires build_cu_maps before address lookup"
+        );
+
         if let Some(cu) = self.find_cu_by_address(address) {
             if let Some(map) = self.func_addr_by_cu.get(&cu) {
                 if let Some(entry) = self.find_matching_function_in_indices(
@@ -608,11 +614,7 @@ impl LightweightIndex {
             return Some(entry);
         }
 
-        self.find_matching_function_in_indices(
-            self.function_indices.iter().copied(),
-            address,
-            &mut resolve_ranges,
-        )
+        None
     }
 
     /// Find DIE entries by function name - returns all matching DIEs
