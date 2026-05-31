@@ -14,13 +14,13 @@ categories.workspace = true
 description = "Command-line entrypoint that drives GhostScope compiler, loader, and UI end-to-end."
 
 [dependencies]
-ghostscope-compiler = { version = "0.1.4", path = "../ghostscope-compiler" }
-ghostscope-loader = { version = "0.1.4", path = "../ghostscope-loader" }
-ghostscope-ui = { version = "0.1.4", path = "../ghostscope-ui" }
-ghostscope-dwarf = { version = "0.1.4", path = "../ghostscope-dwarf" }
-ghostscope-debuginfod = { version = "0.1.4", path = "../ghostscope-debuginfod" }
-ghostscope-protocol = { version = "0.1.4", path = "../ghostscope-protocol" }
-ghostscope-process = { version = "0.1.4", path = "../ghostscope-process" }
+ghostscope-compiler = { version = "0.1.5", path = "../ghostscope-compiler" }
+ghostscope-loader = { version = "0.1.5", path = "../ghostscope-loader" }
+ghostscope-ui = { version = "0.1.5", path = "../ghostscope-ui" }
+ghostscope-dwarf = { version = "0.1.5", path = "../ghostscope-dwarf" }
+ghostscope-debuginfod = { version = "0.1.5", path = "../ghostscope-debuginfod" }
+ghostscope-protocol = { version = "0.1.5", path = "../ghostscope-protocol" }
+ghostscope-process = { version = "0.1.5", path = "../ghostscope-process" }
 dirs = "5.0"
 libc = "0.2"
 clap = { version = "4.0", features = ["derive"] }

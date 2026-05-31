@@ -39,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/swananan/ghostscope/main/scripts/in
 
 2. 解压二进制文件：
 ```bash
-tar -xzf ghostscope-v0.1.4-x86_64-linux.tar.gz
+tar -xzf ghostscope-v0.1.5-x86_64-linux.tar.gz
 ```
 
 3. 移动到系统路径（可选）：
