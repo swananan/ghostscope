@@ -156,6 +156,14 @@ impl ModulePathSummaries {
             }
         }
     }
+
+    fn merged_summary(&self) -> Option<ModuleMapSummary> {
+        let mut merged = ModuleMapSummary::default();
+        for summary in self.by_identity.values() {
+            merged.merge(summary);
+        }
+        (!merged.candidates.is_empty()).then_some(merged)
+    }
 }
 
 impl ProcessManager {
@@ -291,11 +299,13 @@ impl ProcessManager {
                 .observe(entry);
         }
         let mut list: Vec<PidOffsetsEntry> = Vec::new();
-        for (module_path, summaries) in module_summaries {
-            let Some(summary) = summaries.summary_for_path(&module_path) else {
+        for (mapped_path, summaries) in module_summaries {
+            let Some((module_path, summary)) =
+                accessible_module_path_for_pid(pid, &mapped_path, &summaries)
+            else {
                 tracing::debug!(
-                    "ProcessManager: skip module {} for pid {}: no maps matched current file identity",
-                    module_path,
+                    "ProcessManager: skip module {} for pid {}: no accessible file matched current maps identity",
+                    mapped_path,
                     pid
                 );
                 continue;
@@ -525,6 +535,39 @@ impl ProcessManager {
             entries.retain(|entry| entry.pid != pid);
         }
     }
+}
+
+fn accessible_module_path_for_pid(
+    pid: u32,
+    mapped_path: &str,
+    summaries: &ModulePathSummaries,
+) -> Option<(String, ModuleMapSummary)> {
+    let mapped_path = normalize_mapped_module_path(mapped_path).replace("/./", "/");
+    if path_is_regular_file(&mapped_path) {
+        if let Some(summary) = summaries.summary_for_path(&mapped_path) {
+            return Some((mapped_path.clone(), summary));
+        }
+    }
+
+    let proc_root_path = proc_root_module_path(pid, &mapped_path)?;
+    if !path_is_regular_file(&proc_root_path) {
+        return None;
+    }
+
+    let summary = summaries
+        .summary_for_path(&proc_root_path)
+        .or_else(|| summaries.merged_summary())?;
+    Some((proc_root_path, summary))
+}
+
+fn proc_root_module_path(pid: u32, mapped_path: &str) -> Option<String> {
+    mapped_path
+        .starts_with('/')
+        .then(|| format!("/proc/{pid}/root{mapped_path}"))
+}
+
+fn path_is_regular_file(path: &str) -> bool {
+    matches!(fs::metadata(path), Ok(meta) if meta.file_type().is_file())
 }
 
 fn is_same_executable_as_current(pid: u32) -> bool {

@@ -38,7 +38,9 @@ print_content = {
     expr               // print expression (covers variable, member, array, pointer, etc.)
 }
 format_expr = { string ~ "," ~ expr ~ ("," ~ expr)* }
-backtrace_stmt = { ("backtrace" | "bt") ~ ";" }
+backtrace_stmt = { ("backtrace" | "bt") ~ backtrace_arg* ~ ";" }
+backtrace_arg = _{ backtrace_flag }
+backtrace_flag = { "raw" | "full" | "inline" | "noinline" }
 expr_stmt = { expr ~ ";" }
 var_decl_stmt = { "let" ~ identifier ~ "=" ~ expr ~ ";" }
 assign_stmt = { identifier ~ "=" ~ expr ~ ";" }

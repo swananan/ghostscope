@@ -227,6 +227,7 @@ ghostscope bpffs prune --dry-run --json
 | `--script-file <PATH>` | | 要执行的脚本文件 | 无 |
 | `--script-help` | | 输出内嵌的脚本语言参考并退出 | 关 |
 | `--script-output <MODE>` | | 脚本事件 stdout 模式：pretty, plain | pretty |
+| `--backtrace-depth <N>` | | 每条 `bt`/`backtrace` 指令最多采集的 DWARF unwind 栈帧数（`1..=128`） | 128 |
 | `--dry-run` | | 编译脚本、解析 trace 目标，然后退出，不 attach uprobe。需要与真实运行相同的 eBPF 权限和内核能力。 | 关 |
 | `--dry-run-details` | | 在 dry-run 输出中包含源码、inline 和变量诊断；需要同时使用 `--dry-run` | 关 |
 | `--status` | | 启用交互式 DWARF/脚本/attach stderr 状态提示 | 开 |
@@ -472,6 +473,11 @@ compare_cap = 64
 # 单条 trace 事件的最大大小（字节）。适用于 PerfEventArray 累计缓冲区。
 max_trace_event_size = 32768
 
+# 每条 bt/backtrace 指令最多采集的 DWARF unwind 栈帧数。
+# 可通过命令行 --backtrace-depth 临时覆盖。
+# 有效范围：1 到 128。
+backtrace_depth = 128
+
 # 推荐值：
 #   - 简单打印：16384
 #   - 通用场景：32768
@@ -552,6 +558,7 @@ ringbuf_size = 1048576  # 1MB 缓冲区用于高事件率
 mem_dump_cap = 4096     # 单参数转储上限更高
 compare_cap = 64        # 内置比较最大比较字节数（strncmp/memcmp）
 max_trace_event_size = 65536  # 大格式化输出需要更大的事件大小
+backtrace_depth = 128   # 默认完整 DWARF 回溯上限
 proc_module_offsets_max_entries = 8192  # 支持更多模块
 
 [general]
@@ -568,6 +575,7 @@ ringbuf_size = 131072  # 128KB 最小缓冲区
 mem_dump_cap = 512
 compare_cap = 32       # 降低内置比较上限以减小开销
 max_trace_event_size = 16384
+backtrace_depth = 32
 proc_module_offsets_max_entries = 1024  # 仅单进程
 enable_sysmon_for_target = false        # 关闭独立 -t 生命周期跟踪
 
@@ -667,6 +675,7 @@ GhostScope 在启动时验证配置：
    - **ringbuf_size**：必须是 2 的幂，范围 4096-16777216 字节
    - **perf_page_count**：必须是 2 的幂，范围 8-1024 页
    - **proc_module_offsets_max_entries**：必须在 64-65536 范围内
+   - **backtrace_depth**：必须在 1-128 栈帧范围内
    - **mem_dump_cap**、**compare_cap** 和 **max_trace_event_size** 是运行时上限；`max_trace_event_size` 可能会根据实际事件传输方式被 clamp。
 
 无效配置将产生清晰的错误消息和修复建议。

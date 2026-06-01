@@ -1024,7 +1024,7 @@ async fn test_compact_unwind_table_exposes_pc_row() -> anyhow::Result<()> {
         .compact_unwind_table_for_module(ctx.module)?
         .ok_or_else(|| anyhow::anyhow!("no compact unwind table returned for module"))?;
 
-    assert_eq!(table_by_context, table_by_module);
+    assert_eq!(table_by_context.as_ref(), table_by_module.as_ref());
 
     let stats = table_by_context.stats();
     assert!(stats.row_count > 0, "compact unwind table is empty");

@@ -2,8 +2,9 @@ use super::DwarfAnalyzer;
 use crate::{
     core::{ModuleAddress, Provenance, Result},
     semantics::{
-        AddressSpaceInfo, PcContext, PcLineInfo, PcRange, PlanError, VariableAccessPath,
-        VariableAccessSegment, VariableReadPlan, VisibleVariable, VisibleVariablesResult,
+        AddressSpaceInfo, FunctionParameter, PcContext, PcLineInfo, PcRange, PlanError,
+        VariableAccessPath, VariableAccessSegment, VariableReadPlan, VisibleVariable,
+        VisibleVariablesResult,
     },
 };
 use std::path::Path;
@@ -15,6 +16,28 @@ impl DwarfAnalyzer {
     /// query APIs, so `pc` and `normalized_pc` intentionally match. Runtime
     /// rebasing details are preserved in `address_space` for future lowering.
     pub fn resolve_pc(&self, module_address: &ModuleAddress) -> Result<PcContext> {
+        if let Some(context) = self
+            .pc_context_cache
+            .read()
+            .expect("PC context cache lock poisoned")
+            .get(&module_address.module_path, module_address.address)
+        {
+            return Ok(context);
+        }
+
+        let context = self.resolve_pc_uncached(module_address)?;
+        self.pc_context_cache
+            .write()
+            .expect("PC context cache lock poisoned")
+            .insert(
+                module_address.module_path.clone(),
+                module_address.address,
+                context.clone(),
+            );
+        Ok(context)
+    }
+
+    fn resolve_pc_uncached(&self, module_address: &ModuleAddress) -> Result<PcContext> {
         let module_data = self
             .modules
             .get(&module_address.module_path)
@@ -74,6 +97,25 @@ impl DwarfAnalyzer {
     /// Return variables visible at a previously resolved PC context.
     pub fn visible_variables(&self, ctx: &PcContext) -> Result<Vec<VisibleVariable>> {
         Ok(self.visible_variables_with_diagnostics(ctx)?.variables)
+    }
+
+    /// Return only function formal parameters for display.
+    ///
+    /// This does not evaluate locations, compute frame-base/CFA, or resolve
+    /// visible lexical variables. It is intended for inexpensive function
+    /// signature rendering in hot paths such as backtrace output.
+    pub fn function_parameters(&self, ctx: &PcContext) -> Result<Vec<FunctionParameter>> {
+        let Some(function) = ctx.function else {
+            return Ok(Vec::new());
+        };
+        let module_address = self.module_address_for_context(ctx)?;
+
+        self.modules
+            .get(&module_address.module_path)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Module {} not loaded", module_address.module_display())
+            })?
+            .function_parameters(function)
     }
 
     /// Return variables visible at a PC context plus non-fatal DWARF diagnostics.

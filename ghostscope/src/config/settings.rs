@@ -250,6 +250,10 @@ pub struct EbpfConfig {
     /// Default: 32768 bytes (32KB). Increase for larger formatted prints.
     #[serde(default = "default_max_trace_event_size")]
     pub max_trace_event_size: u32,
+    /// Max DWARF-unwound frames captured by each bt/backtrace instruction.
+    /// Default: 128 frames.
+    #[serde(default = "default_backtrace_depth")]
+    pub backtrace_depth: u8,
     /// Start sysmon eBPF for standalone -t targets.
     /// Maintains ASLR offsets for late-start processes loading the target.
     /// WARNING: This enables system-wide sched tracepoints and may impact
@@ -377,6 +381,10 @@ fn default_compare_cap() -> u32 {
     64
 }
 
+fn default_backtrace_depth() -> u8 {
+    ghostscope_compiler::DEFAULT_BACKTRACE_DEPTH
+}
+
 fn default_enable_sysmon_for_target() -> bool {
     true
 }
@@ -465,6 +473,7 @@ impl Default for EbpfConfig {
             mem_dump_cap: default_mem_dump_cap(),
             compare_cap: default_compare_cap(),
             max_trace_event_size: default_max_trace_event_size(),
+            backtrace_depth: default_backtrace_depth(),
             enable_sysmon_for_target: default_enable_sysmon_for_target(),
         }
     }
@@ -540,6 +549,19 @@ impl EbpfConfig {
                   - System-wide: 8192 or 16384",
                 file_path,
                 self.proc_module_offsets_max_entries
+            ));
+        }
+
+        if !(1..=ghostscope_compiler::MAX_BACKTRACE_DEPTH).contains(&self.backtrace_depth) {
+            return Err(anyhow::anyhow!(
+                "❌ Invalid eBPF configuration in '{}':\n\n\
+                backtrace_depth {} is out of range\n\n\
+                💡 Valid range: 1 to {} frames\n\
+                Recommended: {} frames",
+                file_path,
+                self.backtrace_depth,
+                ghostscope_compiler::MAX_BACKTRACE_DEPTH,
+                ghostscope_compiler::DEFAULT_BACKTRACE_DEPTH
             ));
         }
 
@@ -849,6 +871,30 @@ mod tests {
     #[test]
     fn ebpf_defaults_enable_sysmon_for_target() {
         assert!(Config::default().ebpf.enable_sysmon_for_target);
+    }
+
+    #[test]
+    fn ebpf_defaults_backtrace_depth_to_maximum() {
+        assert_eq!(
+            Config::default().ebpf.backtrace_depth,
+            ghostscope_compiler::DEFAULT_BACKTRACE_DEPTH
+        );
+    }
+
+    #[test]
+    fn ebpf_rejects_backtrace_depth_zero() {
+        let error = toml::from_str::<Config>(
+            r#"
+            [ebpf]
+            backtrace_depth = 0
+            "#,
+        )
+        .expect("toml parses")
+        .ebpf
+        .validate("test.toml")
+        .expect_err("backtrace_depth=0 should be rejected");
+
+        assert!(error.to_string().contains("backtrace_depth"));
     }
 
     #[test]

@@ -25,9 +25,12 @@ GhostScope 仍处在快速演进阶段，以下里程碑按照“优先修补基
 - 对暂时只能走普通 `uprobe` 的内核或 libbpf/Aya 路径保留兼容性回退。
 
 ## 栈回溯（Stack Unwinding）
-- 在每个追踪点捕获完整调用栈，基于 `.eh_frame`/`.eh_frame_hdr` 信息做好解析。
-- 结合符号/源信息，TUI 中提供直观的栈帧浏览。  
-  参考资料：[Unwinding the stack the hard way](https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way#h5.1-parsing-eh_frame-and-eh_frame_hdr-with-gimli)
+- 已支持 DWARF-only `bt` / `backtrace`，用于可安全降到 eBPF 执行的
+  compact CFI row；深栈通过 tail-call unwind step program 分段完成。
+- 后续继续增强 CFI 覆盖、跨模块准确性、停止状态诊断，以及大体量
+  debug info 场景下的性能。
+- 保持 TUI 和 CLI 的源码感知展示能力：TUI 使用结构化展示，脚本
+  `plain` 输出保持稳定文本。
 
 ## 稳定性与准确性
 - 作为调试工具，持续修复缺陷、改进错误处理，确保数据一致性。

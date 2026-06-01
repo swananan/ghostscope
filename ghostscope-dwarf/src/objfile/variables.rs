@@ -7,7 +7,8 @@ use crate::{
     parser::ExpressionEvaluator,
     semantics::{
         resolve_attr_with_unit_origins, resolve_name_with_origins, resolve_origin_entry,
-        resolve_type_ref_with_origins, InlineFrame, PcLineInfo, VariableQueryDiagnostic,
+        resolve_type_ref_with_origins, FunctionParameter, InlineFrame, PcLineInfo,
+        VariableQueryDiagnostic,
     },
 };
 use gimli::Reader;
@@ -390,7 +391,7 @@ impl LoadedObjfile {
 
         let fb_result = self.compute_frame_base_for_pc(&func, address);
         let cfa_result = if fb_result.is_none() {
-            if self.cfi_index.is_some() {
+            if self.unwind_info.has_cfi() {
                 match self.get_cfa_result(address) {
                     Ok(Some(cfa)) => Some(cfa),
                     _ => None,
@@ -412,7 +413,7 @@ impl LoadedObjfile {
         };
 
         let var_refs = func.variables_at_pc_with_scope_depth(address);
-        let cfi_index = self.cfi_index.clone();
+        let cfi_index = self.unwind_info.cfi_index().cloned();
         let dwarf_ref = self.dwarf();
         let mut variables = Vec::with_capacity(var_refs.len());
         let mut diagnostics = Vec::new();
@@ -481,6 +482,95 @@ impl LoadedObjfile {
                 || seen_param_names.insert((variable.name.clone(), variable.scope_depth))
         });
         Ok((variables, diagnostics))
+    }
+
+    pub(crate) fn function_parameters(
+        &self,
+        function: FunctionId,
+    ) -> Result<Vec<FunctionParameter>> {
+        let cu_off = gimli::DebugInfoOffset(function.declaration.cu.0 as usize);
+        let die_off = gimli::UnitOffset(function.declaration.offset as usize);
+        let dwarf = self.dwarf();
+        let header = dwarf.unit_header(cu_off)?;
+        let unit = dwarf.unit(header)?;
+        let entry = unit.entry(die_off)?;
+
+        let params = self.direct_function_parameters(dwarf, &unit, &entry)?;
+        if !params.is_empty() {
+            return Ok(params);
+        }
+
+        for origin_attr in [
+            gimli::constants::DW_AT_abstract_origin,
+            gimli::constants::DW_AT_specification,
+        ] {
+            if let Some(value) = entry.attr_value(origin_attr) {
+                if let Some((_, origin_unit, origin_entry)) =
+                    resolve_origin_entry(dwarf, &unit, value)?
+                {
+                    let params =
+                        self.direct_function_parameters(dwarf, &origin_unit, &origin_entry)?;
+                    if !params.is_empty() {
+                        return Ok(params);
+                    }
+                }
+            }
+        }
+
+        Ok(Vec::new())
+    }
+
+    fn direct_function_parameters(
+        &self,
+        dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+        unit: &gimli::Unit<crate::binary::DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<crate::binary::DwarfReader>,
+    ) -> Result<Vec<FunctionParameter>> {
+        let mut params = Vec::new();
+        let mut tree = unit.entries_tree(Some(entry.offset()))?;
+        let root = tree.root()?;
+        let mut children = root.children();
+
+        while let Some(child) = children.next()? {
+            let child_entry = child.entry();
+            if child_entry.tag() != gimli::constants::DW_TAG_formal_parameter {
+                continue;
+            }
+
+            params.push(self.function_parameter_from_entry(dwarf, unit, child_entry)?);
+        }
+
+        Ok(params)
+    }
+
+    fn function_parameter_from_entry(
+        &self,
+        dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+        unit: &gimli::Unit<crate::binary::DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<crate::binary::DwarfReader>,
+    ) -> Result<FunctionParameter> {
+        let name = resolve_name_with_origins(dwarf, unit, entry)?.unwrap_or_default();
+        let type_name = resolve_type_ref_with_origins(dwarf, entry, unit)?
+            .and_then(|loc| self.detailed_shallow_type(loc.cu_off, loc.die_off))
+            .map(|ty| ty.type_name())
+            .unwrap_or_else(|| "unknown".to_string());
+        let is_artificial =
+            resolve_attr_with_unit_origins(entry, unit, gimli::constants::DW_AT_artificial)?
+                .is_some_and(|value| match value {
+                    gimli::AttributeValue::Flag(v) => v,
+                    gimli::AttributeValue::Data1(v) => v != 0,
+                    gimli::AttributeValue::Data2(v) => v != 0,
+                    gimli::AttributeValue::Data4(v) => v != 0,
+                    gimli::AttributeValue::Data8(v) => v != 0,
+                    gimli::AttributeValue::Udata(v) => v != 0,
+                    _ => false,
+                });
+
+        Ok(FunctionParameter {
+            name,
+            type_name,
+            is_artificial,
+        })
     }
 
     fn variable_name_for_ref(&self, var_ref: &VarRef) -> Option<String> {

@@ -3341,7 +3341,7 @@ impl App {
     }
 
     /// Handle trace events
-    async fn handle_trace_event(&mut self, trace_event: ghostscope_protocol::ParsedTraceEvent) {
+    async fn handle_trace_event(&mut self, trace_event: crate::events::UiTraceEvent) {
         tracing::debug!("Trace event: {:?}", trace_event);
 
         // Realtime logging: write eBPF event to file if enabled
@@ -3807,7 +3807,7 @@ impl App {
     /// Write an eBPF event to the output log (realtime)
     fn write_ebpf_event_to_output_log(
         &mut self,
-        event: &ghostscope_protocol::ParsedTraceEvent,
+        event: &crate::events::UiTraceEvent,
     ) -> anyhow::Result<()> {
         if self.state.realtime_output_logger.enabled {
             // Format timestamp

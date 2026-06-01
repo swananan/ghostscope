@@ -260,6 +260,11 @@ mem_dump_cap = 256
 # Increase if you plan to print many/large variables in one event.
 max_trace_event_size = 32768
 
+# Max DWARF-unwound frames captured by each bt/backtrace instruction.
+# Valid range: 1 to 128.
+# Default: 128
+backtrace_depth = 128
+
 # Force use of PerfEventArray instead of RingBuf (for testing only)
 # WARNING: This is for testing purposes only. Normally the system auto-detects
 # kernel capabilities and uses RingBuf (kernel >= 5.8) or falls back to PerfEventArray.

@@ -226,6 +226,7 @@ Behavior:
 | `--script-file <PATH>` | | Script file to execute | None |
 | `--script-help` | | Print the embedded script language reference and exit | Off |
 | `--script-output <MODE>` | | Script event stdout mode: pretty, plain | pretty |
+| `--backtrace-depth <N>` | | Max DWARF-unwound frames captured by each `bt`/`backtrace` instruction (`1..=128`) | 128 |
 | `--dry-run` | | Compile the script, resolve trace targets, and exit without attaching uprobes. Requires the same eBPF privileges and kernel capabilities as a real run. | Off |
 | `--dry-run-details` | | Include source, inline, and variable diagnostics in dry-run output; requires `--dry-run` | Off |
 | `--status` | | Enable interactive DWARF/script/attach stderr status prompts | On |
@@ -477,6 +478,11 @@ compare_cap = 64
 # Maximum size of a single trace event (bytes). Applies to PerfEventArray accumulation buffer.
 max_trace_event_size = 32768
 
+# Max DWARF-unwound frames captured by each bt/backtrace instruction.
+# Can be overridden for one run with --backtrace-depth.
+# Valid range: 1 to 128.
+backtrace_depth = 128
+
 # Recommended values:
 #   - Simple prints: 16384
 #   - General use: 32768
@@ -559,6 +565,7 @@ ringbuf_size = 1048576  # 1MB buffer for high event rates
 mem_dump_cap = 4096     # Larger per-arg dump
 compare_cap = 64        # Max bytes for built-in compares (strncmp/memcmp)
 max_trace_event_size = 65536  # Larger event size for big formatted prints
+backtrace_depth = 128   # Default full DWARF backtrace cap
 proc_module_offsets_max_entries = 8192  # Support many modules
 
 [general]
@@ -575,6 +582,7 @@ ringbuf_size = 131072  # 128KB minimal buffer
 mem_dump_cap = 512
 compare_cap = 32       # Smaller compare cap for minimal overhead
 max_trace_event_size = 16384
+backtrace_depth = 32
 proc_module_offsets_max_entries = 1024  # Single process only
 enable_sysmon_for_target = false        # Disable standalone -t lifecycle tracking
 
@@ -674,6 +682,7 @@ GhostScope validates configuration at startup:
    - **ringbuf_size**: Must be power of 2, range 4096-16777216 bytes
    - **perf_page_count**: Must be power of 2, range 8-1024 pages
    - **proc_module_offsets_max_entries**: Must be in range 64-65536
+   - **backtrace_depth**: Must be in range 1-128 frames
    - **mem_dump_cap**, **compare_cap**, and **max_trace_event_size** are runtime caps; `max_trace_event_size` may be clamped by the selected event transport.
 
 Invalid configuration will produce clear error messages with suggestions for fixes.

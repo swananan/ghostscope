@@ -324,6 +324,14 @@ GhostScope uses an **instruction-based protocol** for flexible trace event repre
 | **Backtrace** | 0x10 | Stack backtrace with frame addresses |
 | **EndInstruction** | 0xFF | Marks end of instruction sequence |
 
+`Backtrace` is a compact frame stream, not pre-rendered text. The compiler asks
+`ghostscope-dwarf` for compact DWARF CFI rows, loads those rows into a BPF array
+map, and the uprobe program records module cookies plus module-normalized PCs.
+Userspace then resolves raw IPs through the process module map and asks
+`ghostscope-dwarf` for function, source line, and inline-chain information.
+`bt` always means DWARF unwinding; the script language intentionally does not
+expose helper/fp/backend selection.
+
 **Variable Status Tracking**:
 
 Each variable instruction includes a `status` field (u8) indicating data acquisition result:

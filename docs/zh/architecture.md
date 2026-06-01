@@ -323,6 +323,12 @@ GhostScope 使用**基于指令的协议**实现灵活的追踪事件表示：
 | **Backtrace** | 0x10 | 带栈帧地址的栈回溯 |
 | **EndInstruction** | 0xFF | 标记指令序列结束 |
 
+`Backtrace` 是紧凑的栈帧数据流，不是预先渲染好的文本。compiler 会从
+`ghostscope-dwarf` 获取 compact DWARF CFI row，并把这些 row 加载到 BPF
+array map；uprobe 程序只记录 module cookie 与模块内标准化 PC。用户态再根据
+进程模块映射解析 raw IP，并交给 `ghostscope-dwarf` 查询函数、源码行号和
+inline 调用链。`bt` 始终表示 DWARF unwind，脚本语言不会暴露 helper/fp/后端选择。
+
 **变量状态跟踪**：
 
 每个变量指令都包含一个 `status` 字段 (u8) 指示数据获取结果：

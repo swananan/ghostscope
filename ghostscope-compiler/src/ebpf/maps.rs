@@ -16,6 +16,7 @@ pub enum BpfMapType {
     PerCpuArray,
     Hash,
     PerfEventArray,
+    ProgramArray,
 }
 
 impl BpfMapType {
@@ -26,6 +27,7 @@ impl BpfMapType {
             BpfMapType::Array => bpf_map_type::BPF_MAP_TYPE_ARRAY,
             BpfMapType::Hash => bpf_map_type::BPF_MAP_TYPE_HASH,
             BpfMapType::PerfEventArray => bpf_map_type::BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+            BpfMapType::ProgramArray => bpf_map_type::BPF_MAP_TYPE_PROG_ARRAY,
         }
     }
 }
@@ -527,6 +529,49 @@ impl<'ctx> MapManager<'ctx> {
             SizedType::integer(value_size_bytes * 8),
         )
     }
+
+    /// Create a regular Array map (key=u32, value arbitrary size).
+    pub fn create_array_map(
+        &mut self,
+        module: &Module<'ctx>,
+        di_builder: &DebugInfoBuilder<'ctx>,
+        compile_unit: &inkwell::debug_info::DICompileUnit<'ctx>,
+        name: &str,
+        max_entries: u64,
+        value_size_bytes: u64,
+    ) -> Result<()> {
+        self.create_map_definition(
+            module,
+            di_builder,
+            compile_unit,
+            name,
+            BpfMapType::Array,
+            max_entries,
+            SizedType::integer(32),
+            SizedType::integer(value_size_bytes * 8),
+        )
+    }
+
+    /// Create a ProgramArray map for eBPF tail calls.
+    pub fn create_program_array_map(
+        &mut self,
+        module: &Module<'ctx>,
+        di_builder: &DebugInfoBuilder<'ctx>,
+        compile_unit: &inkwell::debug_info::DICompileUnit<'ctx>,
+        name: &str,
+        max_entries: u64,
+    ) -> Result<()> {
+        self.create_map_definition(
+            module,
+            di_builder,
+            compile_unit,
+            name,
+            BpfMapType::ProgramArray,
+            max_entries,
+            SizedType::integer(32),
+            SizedType::integer(32),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -554,6 +599,10 @@ mod tests {
         assert_eq!(
             MapManager::map_definition_field_count("ringbuf", BpfMapType::Ringbuf),
             2
+        );
+        assert_eq!(
+            MapManager::map_definition_field_count("bt_prog_array", BpfMapType::ProgramArray),
+            4
         );
     }
 }

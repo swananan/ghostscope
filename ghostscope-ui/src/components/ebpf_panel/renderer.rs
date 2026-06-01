@@ -1,5 +1,7 @@
+use crate::events::{BacktraceDisplay, BacktraceDisplayFrame, TraceDisplayItem};
 use crate::model::panel_state::{DisplayMode, EbpfPanelState, EbpfViewMode};
 use crate::ui::themes::UIThemes;
+use ghostscope_protocol::trace_event::BacktraceStatus;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -72,17 +74,7 @@ impl EbpfPanelRenderer {
         for (trace_index, cached_trace) in state.trace_events.iter().enumerate() {
             let trace = &cached_trace.event;
             let is_latest = trace_index == total_traces - 1;
-            let is_error = trace.instructions.last().is_some_and(|inst| {
-                if let ghostscope_protocol::ParsedInstruction::EndInstruction {
-                    execution_status,
-                    ..
-                } = inst
-                {
-                    *execution_status == 1 || *execution_status == 2
-                } else {
-                    false
-                }
-            });
+            let is_error = trace.is_error();
 
             let header_no_bold = String::from("[No:");
             let message_id = (trace_index + 1) as u64;
@@ -94,30 +86,12 @@ impl EbpfPanelRenderer {
             );
 
             let mut body_lines: Vec<Line> = Vec::new();
-            for output_line in trace.to_formatted_output() {
-                let color = if output_line.contains("ERROR") || output_line.contains("Error") {
-                    Color::Red
-                } else if output_line.contains("WARN") || output_line.contains("Warning") {
-                    Color::Yellow
-                } else {
-                    Color::Cyan
-                };
-                // Compute wrapping widths based on card inner width and indent per line
-                let inner_width = content_width.saturating_sub(2);
-                let first_width = inner_width.saturating_sub(2); // first line indent "  "
-                let cont_width = inner_width.saturating_sub(4); // continuation indent "    "
-                let wrapped_lines =
-                    Self::wrap_text_with_widths(&output_line, first_width, cont_width);
-                for (i, seg) in wrapped_lines.into_iter().enumerate() {
-                    let line_indent = if i == 0 { "  " } else { "    " };
-                    body_lines.push(Line::from(vec![
-                        Span::raw(line_indent),
-                        Span::styled(
-                            seg,
-                            Style::default().fg(color).add_modifier(Modifier::empty()),
-                        ),
-                    ]));
-                }
+            for item in &trace.items {
+                body_lines.extend(Self::render_trace_item(
+                    item,
+                    content_width,
+                    state.view_mode,
+                ));
             }
 
             // In list view: truncate to 3 body lines (with ellipsis) to keep card compact
@@ -453,10 +427,510 @@ impl EbpfPanelRenderer {
         }
         s[..end].to_string()
     }
+
+    fn render_trace_item(
+        item: &TraceDisplayItem,
+        content_width: usize,
+        view_mode: EbpfViewMode,
+    ) -> Vec<Line<'static>> {
+        match item {
+            TraceDisplayItem::Text { content } => Self::render_text_item(content, content_width),
+            TraceDisplayItem::Backtrace(backtrace) => Self::render_backtrace_item(
+                backtrace,
+                matches!(view_mode, EbpfViewMode::Expanded { .. }),
+                content_width,
+            ),
+        }
+    }
+
+    fn render_text_item(content: &str, content_width: usize) -> Vec<Line<'static>> {
+        let color = if content.contains("ERROR") || content.contains("Error") {
+            Color::Red
+        } else if content.contains("WARN") || content.contains("Warning") {
+            Color::Yellow
+        } else {
+            Color::Cyan
+        };
+        let inner_width = content_width.saturating_sub(2);
+        let first_width = inner_width.saturating_sub(2);
+        let cont_width = inner_width.saturating_sub(4);
+        Self::wrap_text_with_widths(content, first_width, cont_width)
+            .into_iter()
+            .enumerate()
+            .map(|(i, seg)| {
+                let line_indent = if i == 0 { "  " } else { "    " };
+                Line::from(vec![
+                    Span::raw(line_indent),
+                    Span::styled(seg, Style::default().fg(color)),
+                ])
+            })
+            .collect()
+    }
+
+    fn render_backtrace_item(
+        backtrace: &BacktraceDisplay,
+        expanded: bool,
+        content_width: usize,
+    ) -> Vec<Line<'static>> {
+        let line_width = content_width.saturating_sub(2).max(1);
+        let mut lines = Vec::new();
+        lines.push(Self::render_backtrace_header(backtrace));
+
+        if expanded {
+            lines.extend(backtrace.frames.iter().map(Self::render_backtrace_frame));
+            if let Some(stopped) = backtrace.stopped_text() {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(stopped, Self::status_style(backtrace.status)),
+                ]));
+            }
+            return lines
+                .into_iter()
+                .flat_map(|line| Self::wrap_styled_line(line, line_width, "    "))
+                .collect();
+        } else if backtrace.frames.len() > 2 {
+            if let Some(first) = backtrace.frames.first() {
+                let first_frame =
+                    Self::wrap_styled_line(Self::render_backtrace_frame(first), line_width, "    ");
+                if let Some(first_line) = first_frame.into_iter().next() {
+                    lines.push(first_line);
+                }
+            }
+            lines.push(Self::render_backtrace_more_line(
+                backtrace.frames.len().saturating_sub(1),
+            ));
+            return lines;
+        } else {
+            lines.extend(backtrace.frames.iter().map(Self::render_backtrace_frame));
+            if lines.len() < 3 {
+                if let Some(stopped) = backtrace.stopped_text() {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(stopped, Self::status_style(backtrace.status)),
+                    ]));
+                }
+            }
+        }
+
+        lines
+            .into_iter()
+            .flat_map(|line| Self::wrap_styled_line(line, line_width, "    "))
+            .collect()
+    }
+
+    fn wrap_styled_line(
+        line: Line<'static>,
+        width: usize,
+        continuation_indent: &'static str,
+    ) -> Vec<Line<'static>> {
+        let width = width.max(1);
+        let indent_width = continuation_indent.chars().count();
+        if width <= indent_width {
+            return vec![line];
+        }
+
+        let mut wrapped = Vec::new();
+        let mut current = Vec::new();
+        let mut current_len = 0usize;
+        let mut continuation = false;
+
+        for span in line.spans {
+            let style = span.style;
+            let mut remaining = span.content.into_owned();
+            while !remaining.is_empty() {
+                if current_len >= width {
+                    wrapped.push(Line::from(current));
+                    current = vec![Span::raw(continuation_indent)];
+                    current_len = indent_width;
+                    continuation = true;
+                }
+
+                let available = width.saturating_sub(current_len);
+                if available == 0 {
+                    wrapped.push(Line::from(current));
+                    current = vec![Span::raw(continuation_indent)];
+                    current_len = indent_width;
+                    continuation = true;
+                    continue;
+                }
+
+                let (segment, rest) = Self::split_prefix_chars(&remaining, available);
+                current_len += segment.chars().count();
+                current.push(Span::styled(segment, style));
+                remaining = rest;
+            }
+        }
+
+        if current.is_empty() {
+            if continuation {
+                wrapped.push(Line::from(vec![Span::raw(continuation_indent)]));
+            }
+        } else {
+            wrapped.push(Line::from(current));
+        }
+        wrapped
+    }
+
+    fn split_prefix_chars(text: &str, max_chars: usize) -> (String, String) {
+        if max_chars == 0 {
+            return (String::new(), text.to_string());
+        }
+
+        let mut split = text.len();
+        for (count, (idx, _)) in text.char_indices().enumerate() {
+            if count == max_chars {
+                split = idx;
+                break;
+            }
+        }
+        (text[..split].to_string(), text[split..].to_string())
+    }
+
+    fn render_backtrace_header(backtrace: &BacktraceDisplay) -> Line<'static> {
+        let frame_word = if backtrace.physical_frame_count == 1 {
+            "frame"
+        } else {
+            "frames"
+        };
+        let mut spans = vec![
+            Span::raw("  "),
+            Span::styled(
+                "backtrace",
+                Style::default()
+                    .fg(Color::LightBlue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                backtrace.status.label().to_string(),
+                Self::status_style(backtrace.status),
+            ),
+            Span::styled(", ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                backtrace.physical_frame_count.to_string(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {frame_word}"), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!(" (max {})", backtrace.requested_depth),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        if backtrace.raw {
+            spans.push(Span::styled(" raw", Style::default().fg(Color::Yellow)));
+        }
+        Line::from(spans)
+    }
+
+    fn render_backtrace_frame(frame: &BacktraceDisplayFrame) -> Line<'static> {
+        let mut spans = vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("#{}", frame.index),
+                Style::default()
+                    .fg(Color::LightBlue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if frame.inline {
+            spans.push(Span::styled(
+                ".inline",
+                Style::default().fg(Color::LightBlue),
+            ));
+        }
+        spans.push(Span::raw(" "));
+
+        if let Some(function) = &frame.function {
+            spans.push(Span::styled(
+                function.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if !frame.parameters.is_empty() {
+                spans.push(Span::styled("(", Style::default().fg(Color::Gray)));
+                for (idx, parameter) in frame.parameters.iter().enumerate() {
+                    if idx > 0 {
+                        spans.push(Span::styled(", ", Style::default().fg(Color::Gray)));
+                    }
+                    spans.extend(Self::render_parameter_spans(parameter));
+                }
+                spans.push(Span::styled(")", Style::default().fg(Color::Gray)));
+            }
+        } else {
+            spans.push(Span::styled(
+                frame
+                    .address
+                    .clone()
+                    .unwrap_or_else(|| "<unknown function>".to_string()),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+
+        if let Some(location) = &frame.location {
+            spans.push(Span::styled(" at ", Style::default().fg(Color::Gray)));
+            spans.push(Span::styled(
+                location.clone(),
+                Style::default().fg(Color::Cyan),
+            ));
+        } else if frame.function.is_some() {
+            spans.push(Span::styled(" at ??", Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(" [", Style::default().fg(Color::Gray)));
+        spans.push(Span::styled(
+            frame.module.clone(),
+            Style::default().fg(Color::LightYellow),
+        ));
+        spans.push(Span::styled("]", Style::default().fg(Color::Gray)));
+
+        if let Some(raw_ip) = frame.raw_ip {
+            spans.push(Span::styled(
+                format!(" raw=0x{raw_ip:x}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if let Some(cookie) = frame.cookie {
+            spans.push(Span::styled(
+                format!(" cookie=0x{cookie:016x}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if let Some(flags) = frame.flags {
+            spans.push(Span::styled(
+                format!(" flags=0x{flags:x}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        Line::from(spans)
+    }
+
+    fn render_backtrace_more_line(hidden_frames: usize) -> Line<'static> {
+        let frame_word = if hidden_frames == 1 {
+            "frame"
+        } else {
+            "frames"
+        };
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("... {hidden_frames} more {frame_word}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    }
+
+    fn render_parameter_spans(parameter: &str) -> Vec<Span<'static>> {
+        let parameter = parameter.trim();
+        if parameter.is_empty() {
+            return Vec::new();
+        }
+
+        if let Some((type_name, name)) = parameter.rsplit_once(' ') {
+            if !type_name.trim().is_empty() && !name.trim().is_empty() {
+                return vec![
+                    Span::styled(
+                        type_name.trim().to_string(),
+                        Style::default().fg(Color::LightMagenta),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        name.trim().to_string(),
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ];
+            }
+        }
+
+        vec![Span::styled(
+            parameter.to_string(),
+            Style::default().fg(Color::LightMagenta),
+        )]
+    }
+
+    fn status_style(status: BacktraceStatus) -> Style {
+        match status {
+            BacktraceStatus::Complete => Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+            BacktraceStatus::Truncated
+            | BacktraceStatus::DwarfUnavailable
+            | BacktraceStatus::UnsupportedCfi
+            | BacktraceStatus::OffsetsUnavailable => Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            BacktraceStatus::ReadError
+            | BacktraceStatus::InternalError
+            | BacktraceStatus::InvalidFrame => {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            }
+        }
+    }
 }
 
 impl Default for EbpfPanelRenderer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn sample_backtrace(frame_count: usize) -> BacktraceDisplay {
+        BacktraceDisplay {
+            requested_depth: 128,
+            physical_frame_count: frame_count,
+            status: BacktraceStatus::Complete,
+            error_code: 0,
+            raw: false,
+            frames: (0..frame_count)
+                .map(|index| BacktraceDisplayFrame {
+                    index,
+                    inline: false,
+                    function: Some(format!("function_{index}")),
+                    parameters: vec!["ngx_http_request_s* r".to_string()],
+                    address: None,
+                    location: Some(format!("request.c:{}", 100 + index)),
+                    module: format!("nginx+0x{:x}", 0x1000 + index),
+                    raw_ip: None,
+                    cookie: None,
+                    flags: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn list_mode_renders_backtrace_as_compact_structured_item() {
+        let item = TraceDisplayItem::Backtrace(sample_backtrace(4));
+        let lines = EbpfPanelRenderer::render_trace_item(&item, 120, EbpfViewMode::List);
+
+        assert_eq!(lines.len(), 3);
+        assert!(line_text(&lines[0]).contains("backtrace: complete, 4 frames"));
+        assert!(line_text(&lines[1]).contains("#0 function_0"));
+        assert!(line_text(&lines[2]).contains("... 3 more frames"));
+    }
+
+    #[test]
+    fn list_mode_keeps_backtrace_summary_when_first_frame_wraps() {
+        let mut backtrace = sample_backtrace(4);
+        backtrace.frames[0].function =
+            Some("ngx_http_process_request_headers_with_a_long_suffix".to_string());
+        backtrace.frames[0].parameters = vec!["ngx_http_request_s* request".to_string()];
+        backtrace.frames[0].location = Some(
+            "/mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx/src/http/ngx_http_request.c:1529:13"
+                .to_string(),
+        );
+
+        let item = TraceDisplayItem::Backtrace(backtrace);
+        let lines = EbpfPanelRenderer::render_trace_item(&item, 48, EbpfViewMode::List);
+
+        assert_eq!(lines.len(), 3);
+        assert!(line_text(&lines[0]).contains("backtrace: complete, 4 frames"));
+        assert!(line_text(&lines[1]).contains("#0 ngx_http_process"));
+        assert!(line_text(&lines[2]).contains("... 3 more frames"));
+    }
+
+    #[test]
+    fn expanded_mode_keeps_backtrace_status_and_parameters_structured() {
+        let item = TraceDisplayItem::Backtrace(sample_backtrace(1));
+        let lines = EbpfPanelRenderer::render_trace_item(
+            &item,
+            120,
+            EbpfViewMode::Expanded {
+                index: 0,
+                scroll: 0,
+            },
+        );
+
+        let frame = line_text(&lines[1]);
+        assert!(frame.contains("function_0("));
+        assert!(frame.contains("ngx_http_request_s* r"));
+        assert!(frame.contains("request.c:100"));
+        assert!(frame.contains("[nginx+0x1000]"));
+    }
+
+    #[test]
+    fn expanded_backtrace_lines_wrap_to_panel_width() {
+        let mut backtrace = sample_backtrace(1);
+        backtrace.frames[0].function =
+            Some("ngx_http_process_request_headers_with_a_long_suffix".to_string());
+        backtrace.frames[0].parameters = vec![
+            "ngx_http_request_s* request".to_string(),
+            "long unsigned int flags".to_string(),
+        ];
+        backtrace.frames[0].location = Some(
+            "/mnt/500g/code/openresty/openresty-1.27.1.1/build/nginx/src/http/ngx_http_request.c:1529:13"
+                .to_string(),
+        );
+
+        let item = TraceDisplayItem::Backtrace(backtrace);
+        let lines = EbpfPanelRenderer::render_trace_item(
+            &item,
+            48,
+            EbpfViewMode::Expanded {
+                index: 0,
+                scroll: 0,
+            },
+        );
+
+        assert!(
+            lines.len() > 2,
+            "narrow backtrace output should wrap long frame lines"
+        );
+        assert!(line_text(&lines[1]).contains("#0 ngx_http_process"));
+        assert!(
+            lines
+                .iter()
+                .skip(2)
+                .map(line_text)
+                .any(|line| line.starts_with("    ") && line.contains("request")),
+            "wrapped continuation should keep parameter text with indentation"
+        );
+        assert!(
+            lines
+                .iter()
+                .map(line_text)
+                .any(|line| line.contains("ngx_http_request.c:1529:13")),
+            "wrapped continuation should retain the source location"
+        );
+    }
+
+    #[test]
+    fn header_uses_physical_frame_count_for_inline_backtraces() {
+        let mut backtrace = sample_backtrace(1);
+        let mut inline_frame = backtrace.frames[0].clone();
+        inline_frame.inline = true;
+        inline_frame.function = Some("inlined_add".to_string());
+        backtrace.frames.insert(0, inline_frame);
+
+        let item = TraceDisplayItem::Backtrace(backtrace);
+        let lines = EbpfPanelRenderer::render_trace_item(
+            &item,
+            120,
+            EbpfViewMode::Expanded {
+                index: 0,
+                scroll: 0,
+            },
+        );
+
+        let header = line_text(&lines[0]);
+        assert!(header.contains("backtrace: complete, 1 frame (max 128)"));
+        assert!(!header.contains("2 frames"));
+        assert!(line_text(&lines[1]).contains("#0.inline inlined_add"));
+        assert!(line_text(&lines[2]).contains("#0 function_0"));
     }
 }

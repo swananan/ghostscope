@@ -52,6 +52,12 @@ pub struct UProbeConfig {
     /// Trace context containing all strings, types, and variable names used in this uprobe
     pub trace_context: ghostscope_protocol::TraceContext,
 
+    /// BPF-facing compact DWARF CFI rows used by the `bt` unwinder.
+    pub backtrace_unwind_rows: Vec<ghostscope_protocol::BacktraceUnwindRow>,
+
+    /// Optional eBPF tail-call step program used by the `bt` unwinder.
+    pub backtrace_tail_call_program: Option<crate::ebpf::context::BacktraceTailCallProgram>,
+
     /// Global 1-based index of this address within the resolved target list (if applicable)
     pub resolved_address_index: Option<usize>,
 }
@@ -273,7 +279,7 @@ impl<'a> AstCompiler<'a> {
     fn top_level_statement_error(statement: &Statement) -> String {
         let kind = match statement {
             Statement::Print(_) => "print",
-            Statement::Backtrace => "backtrace",
+            Statement::Backtrace(_) => "backtrace",
             Statement::Expr(_) => "expression",
             Statement::VarDeclaration { .. } | Statement::AliasDeclaration { .. } => "let",
             Statement::If { .. } => "if",
@@ -778,6 +784,8 @@ impl<'a> AstCompiler<'a> {
             ebpf_function_name,
             assigned_trace_id,
             trace_context,
+            backtrace_unwind_rows: codegen.backtrace_unwind_rows.clone(),
+            backtrace_tail_call_program: codegen.backtrace_tail_call_program(),
             resolved_address_index,
         })
     }
@@ -896,16 +904,6 @@ impl<'a> AstCompiler<'a> {
         use inkwell::targets::{FileType, Target, TargetTriple};
         use inkwell::OptimizationLevel;
 
-        // Get LLVM IR string for logging and saving
-        let llvm_ir = module.print_to_string().to_string();
-        let llvm_ir = llvm_ir.trim_end().to_string();
-        info!(
-            "Successfully generated LLVM IR for {}, length: {}",
-            function_name,
-            llvm_ir.len()
-        );
-
-        // Save LLVM IR file if requested
         if compile_options.save_llvm_ir {
             let filename = Self::generate_filename_with_hint(
                 target,
@@ -913,12 +911,13 @@ impl<'a> AstCompiler<'a> {
                 "ll",
                 binary_path_hint,
             );
-            if let Err(e) = std::fs::write(&filename, &llvm_ir) {
+            if let Err(e) = module.print_to_file(&filename) {
                 warn!("Failed to save LLVM IR to {}: {}", filename, e);
             } else {
                 info!("Saved LLVM IR to: {}", filename);
             }
         }
+        info!("Successfully generated LLVM module for {}", function_name);
 
         // Get target triple
         let triple = TargetTriple::create("bpf-pc-linux");
@@ -967,13 +966,6 @@ impl<'a> AstCompiler<'a> {
         info!("About to call LLVM write_to_memory_buffer...");
 
         let object_code = {
-            // Print module for debugging before compilation
-            let module_string = module.print_to_string();
-            debug!(
-                "Module IR before compilation:\n{}",
-                module_string.to_string()
-            );
-
             // Add a flush to ensure logs are written before potential crash
             use std::io::Write;
             let _ = std::io::stderr().flush();

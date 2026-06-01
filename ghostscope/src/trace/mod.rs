@@ -1,5 +1,6 @@
 //! Trace module - manages trace instances and their lifecycle
 
+pub mod backtrace;
 pub mod instance;
 pub mod manager;
 pub mod snapshot;

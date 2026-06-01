@@ -65,7 +65,7 @@ pub enum VarType {
 #[derive(Debug, Clone)]
 pub enum Statement {
     Print(PrintStatement), // Updated to use new PrintStatement
-    Backtrace,
+    Backtrace(BacktraceStatement),
     Expr(Expr),
     VarDeclaration {
         name: String,
@@ -87,6 +87,23 @@ pub enum Statement {
         else_body: Option<Box<Statement>>,
     },
     Block(Vec<Statement>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BacktraceStatement {
+    pub raw: bool,
+    pub full: bool,
+    pub inline: bool,
+}
+
+impl Default for BacktraceStatement {
+    fn default() -> Self {
+        Self {
+            raw: false,
+            full: false,
+            inline: true,
+        }
+    }
 }
 
 /// Print statement variants for new instruction system

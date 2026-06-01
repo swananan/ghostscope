@@ -26,6 +26,19 @@ pub struct CompileTimeContext {
     pub module_path: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct BacktraceTailCallProgram {
+    pub step_program_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingBacktraceTailCall {
+    pub step_program_name: String,
+    pub module_cookie: u64,
+    pub depth: u8,
+    pub instruction_size: usize,
+}
+
 #[derive(Error, Debug)]
 pub enum CodeGenError {
     #[error("LLVM compilation error: {0}")]
@@ -147,6 +160,15 @@ pub struct EbpfContext<'ctx, 'dw> {
     // we keep its bytes (including optional NUL) here for content printing via ImmediateBytes.
     pub string_vars: HashMap<String, Vec<u8>>,
 
+    // === DWARF compact unwind rows for bt ===
+    pub backtrace_unwind_rows: Vec<ghostscope_protocol::BacktraceUnwindRow>,
+    pub(crate) backtrace_unwind_rows_use_runtime_pcs: bool,
+    pub(crate) backtrace_tail_call_slots: u8,
+    pub(crate) next_backtrace_tail_call_slot: u8,
+    pub(crate) pending_backtrace_tail_call: Option<PendingBacktraceTailCall>,
+    pub(crate) backtrace_tail_enabled_alloca: Option<inkwell::values::PointerValue<'ctx>>,
+    pub(crate) backtrace_tail_last_slot_alloca: Option<inkwell::values::PointerValue<'ctx>>,
+
     // === Lexical scoping for immutable variables ===
     // Each scope frame records names declared in that scope.
     pub scope_stack: Vec<std::collections::HashSet<String>>,
@@ -249,6 +271,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             alias_vars: HashMap::new(),
             // String variables
             string_vars: HashMap::new(),
+            // Backtrace compact unwind rows
+            backtrace_unwind_rows: Vec::new(),
+            backtrace_unwind_rows_use_runtime_pcs: false,
+            backtrace_tail_call_slots: 1,
+            next_backtrace_tail_call_slot: 0,
+            pending_backtrace_tail_call: None,
+            backtrace_tail_enabled_alloca: None,
+            backtrace_tail_last_slot_alloca: None,
 
             // Scopes
             scope_stack: Vec::new(),
@@ -425,6 +455,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.trace_context.clone()
     }
 
+    pub fn backtrace_tail_call_program(&self) -> Option<BacktraceTailCallProgram> {
+        self.pending_backtrace_tail_call
+            .as_ref()
+            .map(|plan| BacktraceTailCallProgram {
+                step_program_name: plan.step_program_name.clone(),
+            })
+    }
+
     pub(crate) fn current_insert_block(&self, op: &str) -> Result<BasicBlock<'ctx>> {
         self.builder
             .get_insert_block()
@@ -474,6 +512,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             } else {
                 None
             };
+        self.prepare_backtrace_unwind_rows(trace_statements);
 
         // Create required maps - critical for eBPF loader
         // Create event output map based on compile options
@@ -560,6 +599,44 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 CodeGenError::LLVMError(format!("Failed to create pid_aliases map: {e}"))
             })?;
 
+        if !self.backtrace_unwind_rows.is_empty() {
+            self.map_manager
+                .create_array_map(
+                    &self.module,
+                    &self.di_builder,
+                    &self.compile_unit,
+                    "bt_unwind_rows",
+                    self.backtrace_unwind_rows.len() as u64,
+                    crate::BACKTRACE_UNWIND_ROW_SIZE as u64,
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to create bt_unwind_rows map: {e}"))
+                })?;
+            self.map_manager
+                .create_percpu_array_map(
+                    &self.module,
+                    &self.di_builder,
+                    &self.compile_unit,
+                    "bt_state",
+                    self.backtrace_tail_call_slots.max(1) as u64,
+                    crate::BACKTRACE_TAIL_STATE_SIZE as u64,
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to create bt_state map: {e}"))
+                })?;
+            self.map_manager
+                .create_program_array_map(
+                    &self.module,
+                    &self.di_builder,
+                    &self.compile_unit,
+                    "bt_prog_array",
+                    1,
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to create bt_prog_array map: {e}"))
+                })?;
+        }
+
         // Variables are now queried on-demand when accessed in expressions
         // No need to pre-populate DWARF variables
 
@@ -645,6 +722,30 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.event_offset_alloca = Some(event_off_alloca);
 
         info!("Created main function: {}", function_name);
+        Ok(function)
+    }
+
+    pub(crate) fn create_tail_call_function(
+        &mut self,
+        function_name: &str,
+    ) -> Result<FunctionValue<'ctx>> {
+        let i32_type = self.context.i32_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let fn_type = i32_type.fn_type(&[ptr_type.into()], false);
+        let function = self.module.add_function(function_name, fn_type, None);
+        function.set_section(Some("uprobe"));
+
+        let basic_block = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(basic_block);
+
+        let key_arr_ty = i32_type.array_type(4);
+        let key_alloca = self
+            .builder
+            .build_alloca(key_arr_ty, "pm_key")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.pm_key_alloca = Some(key_alloca);
+
+        info!("Created tail-call eBPF function: {}", function_name);
         Ok(function)
     }
 

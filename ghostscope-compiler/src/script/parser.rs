@@ -4,7 +4,8 @@ use pest::RuleType;
 use pest_derive::Parser;
 
 use crate::script::ast::{
-    infer_type, BinaryOp, Expr, PrintStatement, Program, Statement, TracePattern,
+    infer_type, BacktraceStatement, BinaryOp, Expr, PrintStatement, Program, Statement,
+    TracePattern,
 };
 use crate::script::format_validator::FormatValidator;
 use tracing::{debug, info};
@@ -67,6 +68,9 @@ pub fn parse(input: &str) -> Result<Program> {
             if let Some(msg) = detect_unclosed_print_string(input) {
                 return Err(ParseError::SyntaxError(msg));
             }
+            if let Some(msg) = detect_backtrace_depth_argument(input) {
+                return Err(ParseError::SyntaxError(msg));
+            }
             // Heuristic: detect likely misspelled or unknown keywords and suggest fixes
             if let Some(msg) = detect_unknown_keyword(input) {
                 return Err(ParseError::SyntaxError(msg));
@@ -123,6 +127,41 @@ fn detect_unclosed_print_string(input: &str) -> Option<String> {
                     "Unclosed string literal in print at line {}.",
                     i + 1
                 ));
+            }
+        }
+    }
+    None
+}
+
+fn detect_backtrace_depth_argument(input: &str) -> Option<String> {
+    fn boundary_before(line: &str, idx: usize) -> bool {
+        idx == 0
+            || line[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '{' | ';' | '}'))
+    }
+
+    for (line_idx, raw_line) in input.lines().enumerate() {
+        let line = raw_line.split("//").next().unwrap_or(raw_line);
+        for command in ["bt", "backtrace"] {
+            for (idx, _) in line.match_indices(command) {
+                if !boundary_before(line, idx) {
+                    continue;
+                }
+                let after = &line[idx + command.len()..];
+                if !after.starts_with(char::is_whitespace) {
+                    continue;
+                }
+                let arg = after.trim_start();
+                if arg.starts_with("depth")
+                    || arg.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+                {
+                    return Some(format!(
+                        "bt depth is no longer a script option at line {}. Set the global limit with --backtrace-depth <N> or [ebpf] backtrace_depth = N.",
+                        line_idx + 1
+                    ));
+                }
             }
         }
     }
@@ -276,6 +315,28 @@ fn detect_unknown_keyword(input: &str) -> Option<String> {
     None
 }
 
+fn parse_backtrace_stmt(pair: Pair<Rule>) -> Result<BacktraceStatement> {
+    let mut stmt = BacktraceStatement::default();
+
+    for arg in pair.into_inner() {
+        if arg.as_rule() == Rule::backtrace_flag {
+            match arg.as_str() {
+                "raw" => stmt.raw = true,
+                "full" => stmt.full = true,
+                "inline" => stmt.inline = true,
+                "noinline" => stmt.inline = false,
+                other => {
+                    return Err(ParseError::SyntaxError(format!(
+                        "Unknown bt option '{other}'"
+                    )))
+                }
+            }
+        }
+    }
+
+    Ok(stmt)
+}
+
 fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
     debug!(
         "parse_statement: {:?} = '{}'",
@@ -326,7 +387,7 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {
             let print_stmt = parse_print_content(print_content)?;
             Ok(Statement::Print(print_stmt))
         }
-        Rule::backtrace_stmt => Ok(Statement::Backtrace),
+        Rule::backtrace_stmt => Ok(Statement::Backtrace(parse_backtrace_stmt(inner)?)),
         Rule::assign_stmt => {
             // Friendly error for immutable variables (no assignment supported)
             let mut it = inner.into_inner();
@@ -2692,13 +2753,65 @@ trace foo {
     #[test]
     fn parse_backtrace_and_bt_statements() {
         let s = r#"
-trace foo {
-    backtrace;
-    bt;
-}
-"#;
+	trace foo {
+	    backtrace;
+	    bt;
+	    bt raw;
+	    bt full noinline;
+	}
+	"#;
+        let program = parse(s).expect("parse ok");
+        let Statement::TracePoint { body, .. } = &program.statements[0] else {
+            panic!("expected trace");
+        };
+        assert_eq!(body.len(), 4);
+        match &body[2] {
+            Statement::Backtrace(bt) => {
+                assert!(bt.raw);
+                assert!(bt.inline);
+            }
+            other => panic!("expected backtrace, got {other:?}"),
+        }
+        match &body[3] {
+            Statement::Backtrace(bt) => {
+                assert!(bt.full);
+                assert!(!bt.inline);
+            }
+            other => panic!("expected backtrace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_backtrace_rejects_named_depth_option() {
+        let s = r#"
+	trace foo {
+	    bt depth=8;
+	}
+	"#;
         let r = parse(s);
-        assert!(r.is_ok(), "parse failed: {:?}", r.err());
+        match r {
+            Err(ParseError::SyntaxError(msg)) => {
+                assert!(msg.contains("no longer a script option"), "{msg}");
+                assert!(msg.contains("--backtrace-depth"), "{msg}");
+            }
+            other => panic!("expected SyntaxError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_backtrace_rejects_positional_depth_option() {
+        let s = r#"
+	trace foo {
+	    bt 4 raw;
+	}
+	"#;
+        let r = parse(s);
+        match r {
+            Err(ParseError::SyntaxError(msg)) => {
+                assert!(msg.contains("no longer a script option"), "{msg}");
+            }
+            other => panic!("expected SyntaxError, got {other:?}"),
+        }
     }
 
     #[test]

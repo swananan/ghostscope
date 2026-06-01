@@ -200,6 +200,9 @@ impl UserConfig {
                 if args.enable_sysmon_for_target {
                     ebpf_config.enable_sysmon_for_target = true;
                 }
+                if let Some(backtrace_depth) = args.backtrace_depth {
+                    ebpf_config.backtrace_depth = backtrace_depth;
+                }
                 ebpf_config
             },
             source: config.source,

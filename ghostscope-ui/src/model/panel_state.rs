@@ -1,12 +1,12 @@
 use crate::action::ResponseType;
-use ghostscope_protocol::{ParsedInstruction, ParsedTraceEvent};
+use crate::events::UiTraceEvent;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 /// Cached trace event with pre-formatted timestamp
 #[derive(Debug, Clone)]
 pub struct CachedTraceEvent {
-    pub event: ParsedTraceEvent,
+    pub event: UiTraceEvent,
     pub formatted_timestamp: String,
 }
 
@@ -161,7 +161,7 @@ impl EbpfPanelState {
         }
     }
 
-    pub fn add_trace_event(&mut self, trace_event: ParsedTraceEvent) {
+    pub fn add_trace_event(&mut self, trace_event: UiTraceEvent) {
         // Format timestamp once when adding the event
         let formatted_timestamp = crate::utils::format_timestamp_ns(trace_event.timestamp);
         let cached_event = CachedTraceEvent {
@@ -180,20 +180,8 @@ impl EbpfPanelState {
         }
     }
 
-    pub fn runtime_warning_event(message: String, timestamp: u64) -> ParsedTraceEvent {
-        ParsedTraceEvent {
-            trace_id: 0,
-            timestamp,
-            pid: 0,
-            tid: 0,
-            instructions: vec![
-                ParsedInstruction::PrintString { content: message },
-                ParsedInstruction::EndInstruction {
-                    total_instructions: 1,
-                    execution_status: 1,
-                },
-            ],
-        }
+    pub fn runtime_warning_event(message: String, timestamp: u64) -> UiTraceEvent {
+        UiTraceEvent::text_event(0, timestamp, 0, 0, message, Some(1))
     }
 
     pub fn add_runtime_warning_message(&mut self, message: String, timestamp: u64) {

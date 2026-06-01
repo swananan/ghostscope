@@ -204,50 +204,7 @@ pub fn bpffs_mount_hint_for_pin_path(pin_path: &Path) -> Option<String> {
     )
 }
 
-/// Key for proc_module_offsets map: { pid:u32, pad:u32, cookie_lo:u32, cookie_hi:u32 }
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ProcModuleKey {
-    pub pid: u32,
-    pub pad: u32,
-    pub cookie_lo: u32,
-    pub cookie_hi: u32,
-}
-
-/// Value for proc_module_offsets map - section offsets for a module
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ProcModuleOffsetsValue {
-    pub text: u64,
-    pub rodata: u64,
-    pub data: u64,
-    pub bss: u64,
-}
-
-// SAFETY: ProcModuleKey is repr(C), Copy, and contains only plain integer fields.
-unsafe impl aya::Pod for ProcModuleKey {}
-// SAFETY: ProcModuleOffsetsValue is repr(C), Copy, and contains only plain integer fields.
-unsafe impl aya::Pod for ProcModuleOffsetsValue {}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct PidAliasValue {
-    pub proc_pid: u32,
-}
-
-// SAFETY: PidAliasValue is repr(C), Copy, and contains only a plain integer field.
-unsafe impl aya::Pod for PidAliasValue {}
-
-impl ProcModuleOffsetsValue {
-    pub fn new(text: u64, rodata: u64, data: u64, bss: u64) -> Self {
-        Self {
-            text,
-            rodata,
-            data,
-            bss,
-        }
-    }
-}
+pub use ghostscope_protocol::{PidAliasValue, ProcModuleKey, ProcModuleOffsetsValue};
 
 fn ensure_pin_dir(path: &Path) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
@@ -296,8 +253,8 @@ pub fn ensure_pinned_proc_offsets_exists(max_entries: u32) -> anyhow::Result<()>
         symbol_index: None,
         def: bpf_map_def {
             map_type: BPF_MAP_TYPE_HASH as u32,
-            key_size: 16,   // pid:u32, pad:u32, cookie:u64
-            value_size: 32, // text, rodata, data, bss
+            key_size: ghostscope_protocol::PROC_MODULE_KEY_SIZE as u32,
+            value_size: ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_SIZE as u32,
             max_entries,
             map_flags: 0,
             id: 0,
@@ -490,8 +447,8 @@ pub fn ensure_pinned_pid_aliases_exists(max_entries: u32) -> anyhow::Result<()> 
         symbol_index: None,
         def: bpf_map_def {
             map_type: BPF_MAP_TYPE_HASH as u32,
-            key_size: 4,
-            value_size: 4,
+            key_size: std::mem::size_of::<u32>() as u32,
+            value_size: ghostscope_protocol::PID_ALIAS_VALUE_SIZE as u32,
             max_entries,
             map_flags: 0,
             id: 0,

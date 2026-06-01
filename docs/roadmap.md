@@ -25,9 +25,13 @@ GhostScope is still evolving quickly. The milestones below are ordered from “s
 - Keep compatibility fallbacks for kernels or libbpf/Aya paths that still require regular `uprobe` attachments.
 
 ## Stack Unwinding
-- Capture full call stacks at each trace point by parsing `.eh_frame`/`.eh_frame_hdr`.
-- Surface the stack in the TUI with symbol/source awareness.  
-  Reference: <https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way#h5.1-parsing-eh_frame-and-eh_frame_hdr-with-gimli>
+- DWARF-only `bt` / `backtrace` is now supported for compact CFI rows that can
+  be executed safely in eBPF, including deep stacks through a tail-call unwind
+  step program.
+- Continue improving CFI coverage, cross-module accuracy, stop-status
+  diagnostics, and performance for large debug-info workloads.
+- Keep the TUI and CLI renderers source-aware, with structured TUI display and
+  stable plain output for scripts.
 
 ## Stability & accuracy
 - Keep fixing defects, hardening error handling, and ensuring data consistency.

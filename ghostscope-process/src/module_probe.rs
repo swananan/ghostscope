@@ -93,13 +93,15 @@ fn validate_module_path(path: &str) -> Result<ValidatedModulePath> {
     // `/proc/<pid>/maps` is not a trustworthy module list. Reject procfs/sysfs
     // paths up front, then resolve symlinks to the final target and insist that
     // the resolved object is a regular file before it reaches the ELF path.
-    if is_filtered_module_prefix(path) {
+    let input_is_proc_root = is_safe_proc_root_path(path);
+    if is_filtered_module_prefix(path) && !input_is_proc_root {
         anyhow::bail!("refusing to read pseudo-filesystem path {}", path);
     }
 
     let resolved_path = fs::canonicalize(path)?;
     let resolved_str = resolved_path.to_string_lossy();
-    if is_filtered_module_prefix(&resolved_str) {
+    let resolved_is_safe_proc_root = input_is_proc_root && is_safe_proc_root_path(&resolved_str);
+    if is_filtered_module_prefix(&resolved_str) && !resolved_is_safe_proc_root {
         anyhow::bail!("refusing to read pseudo-filesystem path {}", resolved_str);
     }
     let meta = fs::metadata(&resolved_path)?;
@@ -111,6 +113,23 @@ fn validate_module_path(path: &str) -> Result<ValidatedModulePath> {
         resolved_path,
         metadata: meta,
     })
+}
+
+fn is_safe_proc_root_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/proc/") else {
+        return false;
+    };
+    let Some((pid, path)) = rest.split_once('/') else {
+        return false;
+    };
+    let Some(inner_path) = path.strip_prefix("root/") else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !matches!(inner_path, "proc" | "sys")
+        && !inner_path.starts_with("proc/")
+        && !inner_path.starts_with("sys/")
 }
 
 fn normalize_cookie_path(module_path: &str) -> String {
@@ -144,6 +163,39 @@ mod tests {
         assert!(err
             .to_string()
             .contains("refusing to read non-regular file /dev/null"));
+
+        let err = match ModuleProbe::open("/proc/self/maps") {
+            Ok(_) => panic!("expected /proc/self/maps probe to be rejected"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("refusing to read pseudo-filesystem path /proc/self/maps"));
+
+        let err = match ModuleProbe::open("/proc/self/root/proc/self/maps") {
+            Ok(_) => panic!("expected /proc/self/root/proc/self/maps probe to be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("pseudo-filesystem path"));
+    }
+
+    #[test]
+    fn allows_proc_root_regular_files() {
+        let base = std::env::temp_dir().join(format!(
+            "ghostscope-module-probe-proc-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&base, b"not an elf but still a regular file").unwrap();
+        let pid = std::process::id();
+        let proc_root_path = format!("/proc/{pid}/root{}", base.display());
+
+        ModuleProbe::open(&proc_root_path).unwrap();
+
+        let _ = std::fs::remove_file(&base);
     }
 
     #[test]

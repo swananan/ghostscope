@@ -67,6 +67,13 @@ run_make_fixture short_lived_long_comm_program all
 run_make_fixture c_multithread_program clean
 run_make_fixture c_multithread_program all
 
+run_make_fixture backtrace_hot_program clean
+run_make_fixture backtrace_hot_program all
+run_make_fixture backtrace_hot_program backtrace_hot_program_nopie
+
+run_make_fixture backtrace_cross_module_program clean
+run_make_fixture backtrace_cross_module_program all
+
 run_make_fixture scalar_types_program clean
 run_make_fixture scalar_types_program all
 

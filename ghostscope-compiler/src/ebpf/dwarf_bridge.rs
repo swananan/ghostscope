@@ -40,7 +40,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     /// Compute cookie for module using coordinator policy.
-    fn cookie_for_module_or_fallback(&mut self, module_path: &str) -> u64 {
+    pub(crate) fn cookie_for_module_or_fallback(&mut self, module_path: &str) -> u64 {
         self.fallback_cookie_from_module_path(module_path)
     }
     fn planned_value_to_llvm_value(

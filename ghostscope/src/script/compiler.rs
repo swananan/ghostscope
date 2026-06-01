@@ -178,6 +178,17 @@ async fn create_and_attach_loader(
         config.trace_context.variable_name_count()
     );
     loader.set_trace_context(config.trace_context.clone());
+    loader
+        .populate_backtrace_unwind_rows(&config.backtrace_unwind_rows)
+        .context("Failed to populate DWARF backtrace unwind rows")?;
+    loader
+        .register_backtrace_tail_call_program(
+            config
+                .backtrace_tail_call_program
+                .as_ref()
+                .map(|program| program.step_program_name.as_str()),
+        )
+        .context("Failed to register bt tail-call program")?;
 
     // In -t mode (no attach PID), perform module prefill once per session and apply to this loader
     if attach_pid.is_none() {

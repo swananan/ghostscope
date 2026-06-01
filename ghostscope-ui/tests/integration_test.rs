@@ -1,7 +1,6 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ghostscope_protocol::ParsedTraceEvent;
-use ghostscope_ui::events::{EventRegistry, RuntimeCommand, RuntimeStatus};
+use ghostscope_ui::events::{EventRegistry, RuntimeCommand, RuntimeStatus, UiTraceEvent};
 use ratatui::{backend::TestBackend, Terminal};
 use tokio::sync::mpsc;
 
@@ -9,8 +8,8 @@ use tokio::sync::mpsc;
 pub struct TuiTestHarness {
     /// Mock channels for runtime communication
     pub command_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
-    pub trace_sender: mpsc::Sender<ParsedTraceEvent>,
-    pub trace_receiver: mpsc::Receiver<ParsedTraceEvent>,
+    pub trace_sender: mpsc::Sender<UiTraceEvent>,
+    pub trace_receiver: mpsc::Receiver<UiTraceEvent>,
     pub status_sender: mpsc::UnboundedSender<RuntimeStatus>,
     pub status_receiver: mpsc::UnboundedReceiver<RuntimeStatus>,
 
@@ -99,7 +98,7 @@ impl TuiTestHarness {
     }
 
     /// Send a mock trace event
-    pub fn send_trace_event(&mut self, event: ParsedTraceEvent) -> Result<()> {
+    pub fn send_trace_event(&mut self, event: UiTraceEvent) -> Result<()> {
         self.trace_sender
             .try_send(event)
             .map_err(|e| anyhow::anyhow!("Failed to enqueue trace event: {e}"))?;
@@ -118,7 +117,7 @@ impl TuiTestHarness {
     }
 
     /// Receive a trace event (for verification in tests)
-    pub async fn receive_trace_event(&mut self) -> Option<ParsedTraceEvent> {
+    pub async fn receive_trace_event(&mut self) -> Option<UiTraceEvent> {
         self.trace_receiver.recv().await
     }
 
@@ -177,12 +176,13 @@ mod tests {
         let mut harness = TuiTestHarness::new(120, 40);
 
         // Create a mock trace event
-        let trace_event = ParsedTraceEvent {
+        let trace_event = UiTraceEvent {
             timestamp: 1234567890,
             trace_id: 1,
             pid: 12345,
             tid: 67890,
-            instructions: vec![],
+            items: vec![],
+            execution_status: None,
         };
 
         // Clone for verification

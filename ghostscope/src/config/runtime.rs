@@ -261,6 +261,7 @@ impl ResolvedConfig {
             mem_dump_cap: self.ebpf_config.mem_dump_cap,
             compare_cap: self.ebpf_config.compare_cap,
             max_trace_event_size: effective_max_event,
+            backtrace_depth: self.ebpf_config.backtrace_depth,
             selected_index: None,
             pid_filter_spec: self.runtime.pid_filter_spec,
             special_pid_ns: self.runtime.special_pid_ns,
