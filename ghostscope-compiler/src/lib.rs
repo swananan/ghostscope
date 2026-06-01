@@ -15,6 +15,29 @@ pub fn hello() -> &'static str {
     "Hello from ghostscope-compiler!"
 }
 
+pub use ghostscope_protocol::bpf_abi::{
+    BacktraceTailCallState, BacktraceUnwindRow, BACKTRACE_RA_AT_CFA_OFFSET, BACKTRACE_RA_REGISTER,
+    BACKTRACE_RA_SAME_VALUE, BACKTRACE_RA_UNDEFINED, BACKTRACE_RA_VAL_CFA_OFFSET,
+    BACKTRACE_RECOVERY_AT_CFA_OFFSET, BACKTRACE_RECOVERY_REGISTER, BACKTRACE_RECOVERY_SAME_VALUE,
+    BACKTRACE_RECOVERY_UNDEFINED, BACKTRACE_RECOVERY_VAL_CFA_OFFSET, BACKTRACE_TAIL_NO_NEXT_SLOT,
+    BACKTRACE_TAIL_STATE_ACTIVE_SLOT_OFFSET, BACKTRACE_TAIL_STATE_CURRENT_IP_OFFSET,
+    BACKTRACE_TAIL_STATE_CURRENT_RBP_OFFSET, BACKTRACE_TAIL_STATE_CURRENT_RSP_OFFSET,
+    BACKTRACE_TAIL_STATE_ERROR_CODE_OFFSET, BACKTRACE_TAIL_STATE_EVENT_SIZE_OFFSET,
+    BACKTRACE_TAIL_STATE_FLAGS_OFFSET, BACKTRACE_TAIL_STATE_FRAME_COUNT_OFFSET,
+    BACKTRACE_TAIL_STATE_INST_OFFSET_OFFSET, BACKTRACE_TAIL_STATE_MODULE_BIAS_OFFSET,
+    BACKTRACE_TAIL_STATE_MODULE_COOKIE_OFFSET, BACKTRACE_TAIL_STATE_NEXT_SLOT_OFFSET,
+    BACKTRACE_TAIL_STATE_OFFSETS_FOUND_OFFSET, BACKTRACE_TAIL_STATE_REQUESTED_DEPTH_OFFSET,
+    BACKTRACE_TAIL_STATE_SIZE, BACKTRACE_TAIL_STATE_TAIL_CALLS_OFFSET,
+    BACKTRACE_UNWIND_ROW_CFA_OFFSET_OFFSET, BACKTRACE_UNWIND_ROW_CFA_REGISTER_OFFSET,
+    BACKTRACE_UNWIND_ROW_PC_END_OFFSET, BACKTRACE_UNWIND_ROW_PC_START_OFFSET,
+    BACKTRACE_UNWIND_ROW_RA_KIND_OFFSET, BACKTRACE_UNWIND_ROW_RA_OFFSET_OFFSET,
+    BACKTRACE_UNWIND_ROW_RA_REGISTER_OFFSET, BACKTRACE_UNWIND_ROW_RBP_KIND_OFFSET,
+    BACKTRACE_UNWIND_ROW_RBP_OFFSET_OFFSET, BACKTRACE_UNWIND_ROW_RBP_REGISTER_OFFSET,
+    BACKTRACE_UNWIND_ROW_SIZE, BACKTRACE_UNWIND_WORDS_PER_ROW, BACKTRACE_UNWIND_WORD_CFA_OFFSET,
+    BACKTRACE_UNWIND_WORD_PC_END, BACKTRACE_UNWIND_WORD_PC_START, BACKTRACE_UNWIND_WORD_RA_OFFSET,
+    BACKTRACE_UNWIND_WORD_RBP_OFFSET, BACKTRACE_UNWIND_WORD_REGISTERS,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
     #[error("Parse error: {0}")]
@@ -95,6 +118,8 @@ pub struct CompileOptions {
     pub compare_cap: u32,
     /// Max total bytes in a single trace event (used for PerfEventArray accumulation buffer size).
     pub max_trace_event_size: u32,
+    /// Max DWARF-unwound frames captured by each `bt`/`backtrace` instruction.
+    pub backtrace_depth: u8,
     /// Optional single-address filter: if set, only the Nth (1-based) address
     /// resolved for a target will be compiled. When None, compile all.
     pub selected_index: Option<usize>,
@@ -137,6 +162,7 @@ impl Default for CompileOptions {
             mem_dump_cap: 256,                     // Default per-arg dump cap (bytes)
             compare_cap: 64,                       // Default compare cap for strncmp/memcmp (bytes)
             max_trace_event_size: 32768,           // Default event size cap (32KB)
+            backtrace_depth: DEFAULT_BACKTRACE_DEPTH,
             selected_index: None,
             pid_filter_spec: None,
             special_pid_ns: None,
@@ -146,6 +172,9 @@ impl Default for CompileOptions {
         }
     }
 }
+
+pub const DEFAULT_BACKTRACE_DEPTH: u8 = 128;
+pub const MAX_BACKTRACE_DEPTH: u8 = 128;
 
 /// Main compilation interface with DwarfAnalyzer (multi-module support)
 ///
@@ -278,5 +307,40 @@ mod tests {
             err.user_message().as_ref(),
             "Use of variable 'x' outside of its scope"
         );
+    }
+
+    #[test]
+    fn backtrace_unwind_row_layout_matches_bpf_map_value() {
+        assert_eq!(BACKTRACE_UNWIND_ROW_SIZE, 56);
+        assert_eq!(BACKTRACE_UNWIND_ROW_PC_START_OFFSET, 0);
+        assert_eq!(BACKTRACE_UNWIND_ROW_PC_END_OFFSET, 8);
+        assert_eq!(BACKTRACE_UNWIND_ROW_CFA_OFFSET_OFFSET, 16);
+        assert_eq!(BACKTRACE_UNWIND_ROW_RA_OFFSET_OFFSET, 24);
+        assert_eq!(BACKTRACE_UNWIND_ROW_RBP_OFFSET_OFFSET, 32);
+        assert_eq!(BACKTRACE_UNWIND_ROW_CFA_REGISTER_OFFSET, 40);
+        assert_eq!(BACKTRACE_UNWIND_ROW_RA_REGISTER_OFFSET, 42);
+        assert_eq!(BACKTRACE_UNWIND_ROW_RBP_REGISTER_OFFSET, 44);
+        assert_eq!(BACKTRACE_UNWIND_ROW_RA_KIND_OFFSET, 46);
+        assert_eq!(BACKTRACE_UNWIND_ROW_RBP_KIND_OFFSET, 47);
+    }
+
+    #[test]
+    fn backtrace_tail_call_state_layout_matches_bpf_accessors() {
+        assert_eq!(BACKTRACE_TAIL_STATE_SIZE, 64);
+        assert_eq!(BACKTRACE_TAIL_STATE_CURRENT_IP_OFFSET, 0);
+        assert_eq!(BACKTRACE_TAIL_STATE_CURRENT_RSP_OFFSET, 8);
+        assert_eq!(BACKTRACE_TAIL_STATE_CURRENT_RBP_OFFSET, 16);
+        assert_eq!(BACKTRACE_TAIL_STATE_MODULE_BIAS_OFFSET, 24);
+        assert_eq!(BACKTRACE_TAIL_STATE_MODULE_COOKIE_OFFSET, 32);
+        assert_eq!(BACKTRACE_TAIL_STATE_INST_OFFSET_OFFSET, 40);
+        assert_eq!(BACKTRACE_TAIL_STATE_EVENT_SIZE_OFFSET, 44);
+        assert_eq!(BACKTRACE_TAIL_STATE_FRAME_COUNT_OFFSET, 48);
+        assert_eq!(BACKTRACE_TAIL_STATE_REQUESTED_DEPTH_OFFSET, 49);
+        assert_eq!(BACKTRACE_TAIL_STATE_OFFSETS_FOUND_OFFSET, 50);
+        assert_eq!(BACKTRACE_TAIL_STATE_TAIL_CALLS_OFFSET, 51);
+        assert_eq!(BACKTRACE_TAIL_STATE_FLAGS_OFFSET, 52);
+        assert_eq!(BACKTRACE_TAIL_STATE_ACTIVE_SLOT_OFFSET, 53);
+        assert_eq!(BACKTRACE_TAIL_STATE_ERROR_CODE_OFFSET, 54);
+        assert_eq!(BACKTRACE_TAIL_STATE_NEXT_SLOT_OFFSET, 56);
     }
 }

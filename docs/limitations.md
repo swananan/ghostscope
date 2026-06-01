@@ -45,13 +45,16 @@ Primarily tested and validated with DWARF 5 format. Theoretically supports DWARF
 
 GhostScope recognizes `DW_OP_form_tls_address`, but the runtime TLS address resolver currently handles only x86_64 executable static TLS. GhostScope resolves the current thread's TLS base at probe time, so a trace running on different pthreads reads each thread's own TLS instance for that supported executable case. The same DWARF operation is also used for dynamic/shared-library TLS; those cases require DTV/module TLS lookup and are not modeled yet, so GhostScope rejects shared-object TLS instead of guessing an address.
 
-### 7. Highly Optimized Code Support
+### 7. Stack Backtrace Coverage
+`bt` uses DWARF CFI only. GhostScope does not fall back to kernel stack helpers or frame-pointer walking, and it reports an explicit stop status when CFI is unavailable, not supported by the compact eBPF fast path, or a user-stack memory read fails. Cross-module frames can be symbolized from their raw IPs when the process module map is available, but unwinding continues only while GhostScope has compact DWARF rows it can execute safely in eBPF. Deep DWARF unwinding is split through an eBPF tail-call step program so the default `backtrace_depth = 128` avoids LLVM branch-distance and verifier-size limits; `status=truncated` means the configured depth or the tail-call unwind budget was reached before a natural stop.
+
+### 8. Highly Optimized Code Support
 Compiler optimizations (-O2, -O3) can cause variables to be optimized away or generate complex DWARF expressions. GhostScope will attempt to parse them, including inline function support, but some variables may be inaccessible (shown as OptimizedOut) because the compiler optimized them away.
 
-### 8. Dynamically Loaded Libraries (dlopen)
+### 9. Dynamically Loaded Libraries (dlopen)
 GhostScope scans `/proc/PID/maps` at startup to obtain loaded dynamic library information. As long as GhostScope is started after `dlopen`, tracing works normally. Future plans include dynamically monitoring process `dlopen` behavior for better user experience.
 
-### 9. Global Variables in `-t` Mode
+### 10. Global Variables in `-t` Mode
 
 - **Executable targets**: When `-t` points to an executable (`-t /path/to/app`), GhostScope treats that binary as the primary module and globals are supported by default.
 - **Shared-library targets (existing processes)**: If GhostScope starts after the library has already been mapped (e.g., tracing a running process that loaded `libfoo.so` earlier), globals work without extra steps.
@@ -60,7 +63,7 @@ GhostScope scans `/proc/PID/maps` at startup to obtain loaded dynamic library in
 
 > **Note**: The current sysmon pipeline still assumes the library is mapped when the exec event is handled; if a loader pulls it in much later, offsets are not retried yet.
 
-### 10. `-p <pid>` Mode inside Containers or WSL
+### 11. `-p <pid>` Mode inside Containers or WSL
 
 - See [Container Environments](container.md) for the full explanation of container / WSL scenarios, PID namespace terminology, the scenario matrix, and current implementation limits.
 - See [PID namespaces manual](https://www.man7.org/linux/man-pages/man7/pid_namespaces.7.html), [WSL issue #12408](https://github.com/microsoft/WSL/issues/12408), and [WSL issue #12115](https://github.com/microsoft/WSL/issues/12115) for background.

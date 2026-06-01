@@ -22,9 +22,9 @@ pub(crate) mod analyzer;
 // Re-export main public API only
 pub use analyzer::{
     AddressQueryResult, AnalyzerStats, DwarfAnalyzer, ExecutableFileInfo, FunctionQueryResult,
-    MainExecutableInfo, ModuleDefaultPolicy, ModuleLoadingEvent, ModuleLoadingStats, ModuleStats,
-    SectionInfo, SharedLibraryInfo, SimpleFileInfo, SourceLineAddressSearch, SourceLineQuerySearch,
-    TypeLookupAmbiguity,
+    LoadedModuleRuntimeInfo, MainExecutableInfo, ModuleDefaultPolicy, ModuleLoadingEvent,
+    ModuleLoadingStats, ModuleStats, SectionInfo, SharedLibraryInfo, SimpleFileInfo,
+    SourceLineAddressSearch, SourceLineQuerySearch, TypeLookupAmbiguity,
 };
 
 // Re-export essential core and semantic support types.
@@ -43,12 +43,13 @@ pub use semantics::{
     is_c_pointer_or_array_type, is_c_signed_integer_type, member_layout, strip_type_aliases,
     usual_c_arithmetic_comparison_plan, AddressOrigin, AddressSpaceInfo, CIntegerComparisonPlan,
     CIntegerComparisonType, CfaRulePlan, CompactUnwindRow, CompactUnwindStats, CompactUnwindTable,
-    IndexableElementLayout, InlineFrame, LvalueAddressPlan, MemberLayout, PcContext, PcLineInfo,
-    PcRange, PlannedAddress, PlannedAddressKind, PlannedValue, RegisterRecoveryPlan,
-    RuntimeComputedExpr, RuntimeComputedKind, TypeLayoutError, UnwindDiagnostic,
-    UnwindDiagnosticKind, VariableAccessPath, VariableAccessSegment, VariableLoweringKind,
-    VariableLoweringPlan, VariableMaterialization, VariableMaterializationPlan, VariablePlan,
-    VariableQueryDiagnostic, VariableReadPlan, VisibleVariable, VisibleVariablesResult,
+    FunctionParameter, IndexableElementLayout, InlineFrame, LvalueAddressPlan, MemberLayout,
+    PcContext, PcLineInfo, PcRange, PlannedAddress, PlannedAddressKind, PlannedValue,
+    RegisterRecoveryPlan, RuntimeComputedExpr, RuntimeComputedKind, TypeLayoutError,
+    UnwindDiagnostic, UnwindDiagnosticKind, VariableAccessPath, VariableAccessSegment,
+    VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
+    VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
+    VisibleVariable, VisibleVariablesResult,
 };
 
 // Re-export type definitions from protocol (avoiding circular dependencies)

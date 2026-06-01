@@ -12,9 +12,10 @@ GhostScope uses a domain‑specific language to define trace points and actions.
 7. [Expressions](#expressions)
 8. [Built-in Functions](#built-in-functions)
 9. [Special Variables](#special-variables)
-10. [Examples](#examples)
-11. [Limitations](#limitations)
-12. [Runtime Expression Failures (ExprError)](#runtime-expression-failures-exprerror)
+10. [Stack Backtrace](#stack-backtrace)
+11. [Examples](#examples)
+12. [Limitations](#limitations)
+13. [Runtime Expression Failures (ExprError)](#runtime-expression-failures-exprerror)
 
 ## Basic Syntax
 
@@ -34,7 +35,7 @@ GhostScope uses a domain‑specific language to define trace points and actions.
 GhostScope supports the following statements:
 - `trace` — define trace points and their actions
 - `print` — output formatted text
-- `backtrace` / `bt` — reserved syntax for future stack unwinding
+- `backtrace` / `bt` — print a DWARF-unwound stack backtrace
 - `if` / `else` — conditional execution
 - `let` — script variable declaration
 - Expression statements
@@ -676,9 +677,56 @@ trace foo {
 }
 ```
 
-## Stack Backtrace (not implemented)
+## Stack Backtrace
 
-Backtrace printing via `backtrace;` or `bt;` is planned but not implemented yet. The syntax is reserved, and a dedicated section will be added once available.
+`backtrace;` and `bt;` emit a source-aware stack backtrace at the probe point. The unwinder uses DWARF CFI directly; there is no `unwind=` option and no helper/fp fallback mode to select.
+
+```ghostscope
+trace test_function {
+    print "before";
+    bt;
+    print "after";
+}
+```
+
+Options:
+
+- `bt raw;` prints raw module cookie, module offset, and runtime IP without source symbolization.
+- `bt full;` prints symbolized source-aware frames. Raw IP/cookie debug metadata is kept out of `bt full` and is only shown by `bt raw`.
+- `bt inline;` enables inline call-chain rendering. This is the default.
+- `bt noinline;` suppresses inline call-chain rendering.
+
+Backtrace depth is configured globally, not in the script. Use `--backtrace-depth <N>` or `[ebpf] backtrace_depth = N` in the config file. Valid range is `1..=128`; the default is `128`.
+In `--script-output pretty`, backtrace payload lines are colorized when `[script] color` enables ANSI output. `--script-output plain` always emits the raw payload text without ANSI color.
+
+Examples:
+
+```ghostscope
+trace test_function {
+    bt full;
+    bt raw noinline;
+}
+```
+
+Typical output:
+
+```text
+backtrace: complete, 4 frames (max 128)
+  #0 test_function(int argc, char** argv) at sample_program.c:8:5 [sample_program+0x1189]
+  #1 caller(int value) at sample_program.c:42:9 [sample_program+0x1234]
+  #2 main(int argc, char** argv) at sample_program.c:88:12 [sample_program+0x13a0]
+  #3 <unknown function> at ?? [libc.so.6+0x2a1ca]
+```
+
+`bt raw;` keeps the same header but prints machine-facing fields for diagnosis:
+
+```text
+backtrace: truncated, 2 frames (max 2)
+  #0 0x1189 [sample_program+0x1189] raw=0x55... cookie=0x...
+  #1 0x1234 [sample_program+0x1234] raw=0x55... cookie=0x...
+```
+
+`status=complete` means DWARF unwinding reached a natural stop before the configured depth cap. `status=truncated` means GhostScope hit the configured depth cap or the eBPF tail-call unwind budget before a natural stop. Other statuses explain where unwinding stopped, for example unsupported CFI, unavailable module offsets, a failed user-memory read, or an invalid next frame. When available, `stopped:` includes a stable reason label and numeric code.
 
 ## Examples
 

@@ -5,7 +5,8 @@ use crate::{
         empty_dwarf_reader_with_endian, try_load_debug_file, DwarfData, MappedFile,
     },
     core::{mapping::ModuleMapping, Result},
-    index::{BlockIndex, CfiIndex, TypeNameIndex},
+    index::{BlockIndex, TypeNameIndex},
+    objfile::ModuleUnwindInfo,
     parser::DetailedParser,
 };
 use ghostscope_debuginfod::{build_id_to_hex, DebuginfodClient};
@@ -13,7 +14,7 @@ use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
 use std::{borrow::Cow, collections::HashMap, path::Path, sync::Arc, time::Instant};
 
 impl LoadedObjfile {
-    /// Parallel loading: debug_info || debug_line || CFI simultaneously
+    /// Parallel loading: debug_info || debug_line || CFI simultaneously.
     pub(crate) async fn load_parallel(
         module_mapping: ModuleMapping,
         debug_search_paths: &[String],
@@ -112,7 +113,7 @@ impl LoadedObjfile {
             "Starting parallel DWARF parsing with true debug_line || debug_info parallelism..."
         );
 
-        let (pair_result, cfi_index_result) = tokio::try_join!(
+        let (pair_result, unwind_info) = tokio::try_join!(
             tokio::task::spawn_blocking({
                 let dwarf = Arc::clone(&dwarf);
                 let module_path = module_mapping.path.to_string_lossy().to_string();
@@ -137,30 +138,11 @@ impl LoadedObjfile {
             tokio::task::spawn_blocking({
                 let binary_for_cfi = Arc::clone(&binary_mapped);
                 let module_path = module_mapping.path.clone();
-                move || -> Result<Option<CfiIndex>> {
-                    match CfiIndex::from_mapped_file(binary_for_cfi) {
-                        Ok(cfi) => {
-                            tracing::info!(
-                                "CFI index initialized successfully for {}",
-                                module_path.display()
-                            );
-                            Ok(Some(cfi))
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to initialize CFI index for {}: {}",
-                                module_path.display(),
-                                e
-                            );
-                            Ok(None)
-                        }
-                    }
-                }
+                move || ModuleUnwindInfo::from_mapped_file(binary_for_cfi, &module_path)
             })
         )?;
 
         let (line_result, info_result) = pair_result?;
-        let cfi_index = cfi_index_result?;
 
         let parse_result = crate::parser::DwarfParser::combine_parallel_results(
             line_result,
@@ -169,7 +151,7 @@ impl LoadedObjfile {
         );
         let parse_elapsed_ms = load_started_at.elapsed().as_millis();
 
-        if let Some(ref cfi) = cfi_index {
+        if let Some(cfi) = unwind_info.cfi_index() {
             let stats = cfi.get_stats();
             tracing::info!(
                 "CFI stats: has_eh_frame_hdr={}, fast_lookup={}",
@@ -199,10 +181,11 @@ impl LoadedObjfile {
             Arc::try_unwrap(dwarf).map_err(|_| anyhow::anyhow!("Failed to unwrap DWARF Arc"))?;
         let mut detailed_parser = DetailedParser::new();
         detailed_parser.set_type_name_index(Arc::clone(&type_name_index));
+        let entry_address = Self::read_entry_address(&binary_mapped);
         let text_symbol_starts_by_name = Self::collect_text_symbol_starts(&binary_mapped);
 
         let mut warnings = Vec::new();
-        if cfi_index.is_none() {
+        if !unwind_info.has_cfi() {
             warnings.push("CFI index failed to initialize".to_string());
         }
 
@@ -230,14 +213,16 @@ impl LoadedObjfile {
             line_mapping,
             scoped_file_manager,
             compilation_units,
-            cfi_index,
+            unwind_info,
             dwarf,
             detailed_parser,
             block_index: std::sync::RwLock::new(BlockIndex::new()),
             type_name_index,
             _dwarf_mapped_file: mapped_file,
             _binary_mapped_file: binary_mapped,
+            entry_address,
             text_symbol_starts_by_name,
+            function_ranges_cache: std::sync::RwLock::new(HashMap::new()),
             load_parse_ms: parse_elapsed_ms as u64,
             load_index_ms: index_elapsed_ms as u64,
             load_total_ms,
@@ -257,6 +242,11 @@ impl LoadedObjfile {
         );
 
         Ok(module)
+    }
+
+    fn read_entry_address(binary_mapped: &MappedFile) -> Option<u64> {
+        let address = binary_mapped.parse_object().ok()?.entry();
+        (address != 0).then_some(address)
     }
 
     fn has_debug_info(dwarf: &DwarfData) -> bool {

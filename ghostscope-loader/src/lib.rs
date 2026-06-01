@@ -18,7 +18,7 @@
 use aya::{
     maps::{
         perf::{PerfEvent, PerfEventArray},
-        MapData, PerCpuArray, RingBuf,
+        Array, MapData, PerCpuArray, ProgramArray, RingBuf,
     },
     programs::{
         uprobe::{UProbeLinkId, UProbeScope},
@@ -26,9 +26,13 @@ use aya::{
     },
     Ebpf, EbpfLoader, VerifierLogLevel,
 };
-use ghostscope_protocol::{ParsedTraceEvent, StreamingTraceParser, TraceContext};
+use ghostscope_protocol::{
+    BacktraceUnwindRow, ParsedTraceEvent, StreamingTraceParser, TraceContext,
+    BACKTRACE_UNWIND_ROW_SIZE,
+};
 use log::log_enabled;
 use log::Level as LogLevel;
+use std::borrow::Borrow;
 use std::convert::TryInto;
 use std::future::poll_fn;
 use std::num::NonZeroU32;
@@ -36,6 +40,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::task::Poll;
+use std::time::Instant;
 use std::{io, ops::ControlFlow};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
@@ -99,6 +104,40 @@ impl AsRawFd for PerfBufferFd {
     fn as_raw_fd(&self) -> RawFd {
         self.0
     }
+}
+
+fn log_backtrace_unwind_row_samples<T: Borrow<MapData>>(
+    array: &Array<T, BacktraceUnwindRow>,
+    rows: &[BacktraceUnwindRow],
+) -> Result<()> {
+    fn read_row<T: Borrow<MapData>>(
+        array: &Array<T, BacktraceUnwindRow>,
+        row_index: usize,
+    ) -> Result<BacktraceUnwindRow> {
+        let key = row_index as u32;
+        array.get(&key, 0).map_err(|e| {
+            LoaderError::Generic(format!("Failed to read back unwind row {row_index}: {e}"))
+        })
+    }
+
+    let mut sample_indices = vec![0usize, rows.len() / 2, rows.len().saturating_sub(1)];
+    sample_indices.sort_unstable();
+    sample_indices.dedup();
+
+    for index in sample_indices {
+        let stored = read_row(array, index)?;
+        if stored == rows[index] {
+            debug!(index, row = ?stored, "bt unwind row readback sample");
+        } else {
+            warn!(
+                index,
+                expected = ?rows[index],
+                stored = ?stored,
+                "bt unwind row readback mismatch"
+            );
+        }
+    }
+    Ok(())
 }
 
 struct PerfEventCpuBuffer {
@@ -240,6 +279,8 @@ pub struct GhostScopeLoader {
     event_map: Option<EventMap>,
     /// eBPF-side output helper failure counters.
     event_loss_counters: Option<PerCpuArray<MapData, u64>>,
+    /// ProgramArray holding bt tail-call targets.
+    bt_prog_array: Option<ProgramArray<MapData>>,
     /// Active uprobe link
     uprobe_link: Option<UProbeLinkId>,
     /// Stored parameters for re-attaching uprobe
@@ -258,6 +299,7 @@ impl std::fmt::Debug for GhostScopeLoader {
             .field("bpf", &"<eBPF object>")
             .field("event_map", &self.event_map.is_some())
             .field("event_loss_counters", &self.event_loss_counters.is_some())
+            .field("bt_prog_array", &self.bt_prog_array.is_some())
             .field("uprobe_attached", &self.uprobe_link.is_some())
             .field("attachment_params", &self.attachment_params.is_some())
             .finish()
@@ -335,6 +377,7 @@ impl GhostScopeLoader {
                     bpf,
                     event_map: None,
                     event_loss_counters: None,
+                    bt_prog_array: None,
                     uprobe_link: None,
                     attachment_params: None,
                     parser: StreamingTraceParser::new(),
@@ -379,6 +422,50 @@ impl GhostScopeLoader {
     /// Set PerfEventArray page count override (applies when using Perf backend)
     pub fn set_perf_page_count(&mut self, pages: u32) {
         self.perf_page_count = Some(pages as usize);
+    }
+
+    /// Load and register optional bt tail-call programs before the entry uprobe is attached.
+    pub fn register_backtrace_tail_call_program(
+        &mut self,
+        program_name: Option<&str>,
+    ) -> Result<()> {
+        let Some(program_name) = program_name else {
+            return Ok(());
+        };
+
+        info!("Registering bt tail-call step program: {}", program_name);
+        let program_ref = self.bpf.program_mut(program_name).ok_or_else(|| {
+            LoaderError::Generic(format!("bt tail-call program '{program_name}' not found"))
+        })?;
+        let program: &mut UProbe = program_ref.try_into().map_err(|e| {
+            LoaderError::Generic(format!(
+                "bt tail-call program '{program_name}' is not a UProbe: {e:?}"
+            ))
+        })?;
+        program.load().map_err(LoaderError::Program)?;
+        let step_fd = program
+            .fd()
+            .map_err(LoaderError::Program)?
+            .try_clone()
+            .map_err(|e| {
+                LoaderError::Generic(format!(
+                    "Failed to clone bt tail-call program fd for '{program_name}': {e}"
+                ))
+            })?;
+
+        let map = self
+            .bpf
+            .take_map("bt_prog_array")
+            .ok_or_else(|| LoaderError::MapNotFound("bt_prog_array".to_string()))?;
+        let mut prog_array: ProgramArray<_> = map.try_into().map_err(|e| {
+            LoaderError::Generic(format!("Failed to convert bt_prog_array map: {e}"))
+        })?;
+        prog_array.set(0, &step_fd, 0).map_err(|e| {
+            LoaderError::Generic(format!("Failed to set bt tail-call program fd: {e}"))
+        })?;
+        self.bt_prog_array = Some(prog_array);
+        info!("Registered bt tail-call step program at bt_prog_array[0]");
+        Ok(())
     }
 
     /// Attach to a uprobe with a specific eBPF program name
@@ -1018,6 +1105,35 @@ impl GhostScopeLoader {
     pub fn set_trace_context(&mut self, trace_context: TraceContext) {
         info!("Setting trace context for trace event parsing");
         self.trace_context = Some(trace_context);
+    }
+
+    pub fn populate_backtrace_unwind_rows(&mut self, rows: &[BacktraceUnwindRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let Some(map) = self.bpf.map_mut("bt_unwind_rows") else {
+            return Err(LoaderError::MapNotFound("bt_unwind_rows".to_string()));
+        };
+        let mut array: Array<_, BacktraceUnwindRow> = map.try_into().map_err(|e| {
+            LoaderError::Generic(format!("Failed to convert bt_unwind_rows map: {e}"))
+        })?;
+        let populate_started_at = Instant::now();
+        for (row_index, row) in rows.iter().copied().enumerate() {
+            array.set(row_index as u32, row, 0).map_err(|e| {
+                LoaderError::Generic(format!("Failed to set unwind row {row_index}: {e}"))
+            })?;
+        }
+        info!(
+            rows = rows.len(),
+            row_size = BACKTRACE_UNWIND_ROW_SIZE,
+            elapsed_ms = populate_started_at.elapsed().as_millis(),
+            "Loaded DWARF unwind rows for bt"
+        );
+        if log_enabled!(LogLevel::Debug) {
+            log_backtrace_unwind_row_samples(&array, rows)?;
+        }
+        Ok(())
     }
 
     // ============================================================================

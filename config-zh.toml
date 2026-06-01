@@ -34,10 +34,9 @@ log_level = "warn"
 
 [script]
 # 非 TUI 脚本模式的标准输出渲染方式
-# 可选值："pretty", "plain", "quiet"
+# 可选值："pretty", "plain"
 # - pretty: 类似 TUI 的头信息，包含时间戳/PID/TID，并保留缩进后的 payload
 # - plain: 只输出脚本 payload 行
-# - quiet: 完全不在 stdout 打印事件输出
 # 默认值："pretty"
 output = "pretty"
 
@@ -240,6 +239,11 @@ mem_dump_cap = 256
 # 适用于 PerfEventArray 模式的累计缓冲区，也作为内核端构造打印指令时的上界。
 # 如需在单个事件中打印较多/较大的变量，可适当增大。
 max_trace_event_size = 32768
+
+# 每条 bt/backtrace 指令最多采集的 DWARF unwind 栈帧数。
+# 有效范围：1 到 128。
+# 默认值：128
+backtrace_depth = 128
 
 # 强制使用 PerfEventArray 而不是 RingBuf（仅用于测试）
 # 警告：仅用于测试目的。正常情况下系统会自动检测内核能力，

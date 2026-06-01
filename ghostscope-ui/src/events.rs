@@ -1,7 +1,220 @@
 use crossterm::event::{KeyEvent, MouseEvent};
-use ghostscope_protocol::ParsedTraceEvent;
+use ghostscope_protocol::{
+    trace_event::{backtrace_error_label, BacktraceStatus},
+    ParsedTraceEvent,
+};
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
+
+/// Runtime trace event after conversion into TUI display items.
+///
+/// This keeps the UI transport structured without changing the eBPF/protocol
+/// wire format. Non-backtrace instructions are grouped into text lines, while
+/// backtraces keep frame/status fields for dedicated TUI rendering.
+#[derive(Debug, Clone)]
+pub struct UiTraceEvent {
+    pub trace_id: u64,
+    pub timestamp: u64,
+    pub pid: u32,
+    pub tid: u32,
+    pub items: Vec<TraceDisplayItem>,
+    pub execution_status: Option<u8>,
+}
+
+impl UiTraceEvent {
+    pub fn from_protocol_event(event: &ParsedTraceEvent) -> Self {
+        let execution_status = event.instructions.iter().rev().find_map(|instruction| {
+            if let ghostscope_protocol::ParsedInstruction::EndInstruction {
+                execution_status, ..
+            } = instruction
+            {
+                Some(*execution_status)
+            } else {
+                None
+            }
+        });
+
+        Self {
+            trace_id: event.trace_id,
+            timestamp: event.timestamp,
+            pid: event.pid,
+            tid: event.tid,
+            items: event
+                .to_formatted_output()
+                .into_iter()
+                .map(|content| TraceDisplayItem::Text { content })
+                .collect(),
+            execution_status,
+        }
+    }
+
+    pub fn text_event(
+        trace_id: u64,
+        timestamp: u64,
+        pid: u32,
+        tid: u32,
+        content: String,
+        execution_status: Option<u8>,
+    ) -> Self {
+        Self {
+            trace_id,
+            timestamp,
+            pid,
+            tid,
+            items: vec![TraceDisplayItem::Text { content }],
+            execution_status,
+        }
+    }
+
+    pub fn to_formatted_output(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .flat_map(TraceDisplayItem::to_formatted_output)
+            .collect()
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.execution_status
+            .is_some_and(|status| status == 1 || status == 2)
+            || self.items.iter().any(|item| {
+                matches!(
+                    item,
+                    TraceDisplayItem::Backtrace(backtrace)
+                        if backtrace.status != BacktraceStatus::Complete
+                            && backtrace.status != BacktraceStatus::Truncated
+                )
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TraceDisplayItem {
+    Text { content: String },
+    Backtrace(BacktraceDisplay),
+}
+
+impl TraceDisplayItem {
+    pub fn to_formatted_output(&self) -> Vec<String> {
+        match self {
+            Self::Text { content } => vec![content.clone()],
+            Self::Backtrace(backtrace) => backtrace.to_formatted_output(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BacktraceDisplay {
+    pub requested_depth: u8,
+    pub physical_frame_count: usize,
+    pub status: BacktraceStatus,
+    pub error_code: u16,
+    pub raw: bool,
+    pub frames: Vec<BacktraceDisplayFrame>,
+}
+
+impl BacktraceDisplay {
+    pub fn header_text(&self) -> String {
+        let frame_word = if self.physical_frame_count == 1 {
+            "frame"
+        } else {
+            "frames"
+        };
+        format!(
+            "backtrace: {}, {} {} (max {})",
+            self.status.label(),
+            self.physical_frame_count,
+            frame_word,
+            self.requested_depth
+        )
+    }
+
+    pub fn stopped_text(&self) -> Option<String> {
+        if self.status == BacktraceStatus::Complete {
+            return None;
+        }
+
+        let suffix = match backtrace_error_label(self.error_code) {
+            Some("unknown") => format!(" (code={})", self.error_code),
+            Some(label) => format!(" ({label}, code={})", self.error_code),
+            None => String::new(),
+        };
+        Some(format!("stopped: {}{}", self.status.label(), suffix))
+    }
+
+    pub fn to_formatted_output(&self) -> Vec<String> {
+        let mut output = Vec::with_capacity(self.frames.len() + 2);
+        output.push(self.header_text());
+        output.extend(
+            self.frames
+                .iter()
+                .map(BacktraceDisplayFrame::to_formatted_output),
+        );
+        if let Some(stopped) = self.stopped_text() {
+            output.push(stopped);
+        }
+        output
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BacktraceDisplayFrame {
+    pub index: usize,
+    pub inline: bool,
+    pub function: Option<String>,
+    pub parameters: Vec<String>,
+    pub address: Option<String>,
+    pub location: Option<String>,
+    pub module: String,
+    pub raw_ip: Option<u64>,
+    pub cookie: Option<u64>,
+    pub flags: Option<u16>,
+}
+
+impl BacktraceDisplayFrame {
+    pub fn to_formatted_output(&self) -> String {
+        let mut line = String::from("  #");
+        line.push_str(&self.index.to_string());
+        if self.inline {
+            line.push_str(".inline");
+        }
+        line.push(' ');
+
+        if let Some(function) = &self.function {
+            line.push_str(function);
+            if !self.parameters.is_empty() {
+                line.push('(');
+                line.push_str(&self.parameters.join(", "));
+                line.push(')');
+            }
+        } else if let Some(address) = &self.address {
+            line.push_str(address);
+        } else {
+            line.push_str("<unknown function>");
+        }
+
+        if let Some(location) = &self.location {
+            line.push_str(" at ");
+            line.push_str(location);
+        } else if self.function.is_some() {
+            line.push_str(" at ??");
+        }
+        line.push_str(" [");
+        line.push_str(&self.module);
+        line.push(']');
+
+        if let Some(raw_ip) = self.raw_ip {
+            line.push_str(&format!(" raw=0x{raw_ip:x}"));
+        }
+        if let Some(cookie) = self.cookie {
+            line.push_str(&format!(" cookie=0x{cookie:016x}"));
+        }
+        if let Some(flags) = self.flags {
+            line.push_str(&format!(" flags=0x{flags:x}"));
+        }
+
+        line
+    }
+}
 
 /// Trace status enumeration for shared use between UI and runtime
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +271,7 @@ pub struct EventRegistry {
     pub command_sender: mpsc::UnboundedSender<RuntimeCommand>,
 
     // Runtime -> TUI communication
-    pub trace_receiver: mpsc::Receiver<ParsedTraceEvent>,
+    pub trace_receiver: mpsc::Receiver<UiTraceEvent>,
     pub status_receiver: mpsc::UnboundedReceiver<RuntimeStatus>,
 }
 
@@ -1018,7 +1231,7 @@ impl EventRegistry {
     pub fn new_with_trace_capacity(trace_capacity: usize) -> (Self, RuntimeChannels) {
         let trace_capacity = trace_capacity.max(1);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (trace_tx, trace_rx) = mpsc::channel::<ParsedTraceEvent>(trace_capacity);
+        let (trace_tx, trace_rx) = mpsc::channel::<UiTraceEvent>(trace_capacity);
         let (status_tx, status_rx) = mpsc::unbounded_channel();
 
         let registry = EventRegistry {
@@ -1045,7 +1258,7 @@ pub const DEFAULT_TRACE_CHANNEL_CAPACITY: usize = 4096;
 #[derive(Debug)]
 pub struct RuntimeChannels {
     pub command_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
-    pub trace_sender: mpsc::Sender<ParsedTraceEvent>,
+    pub trace_sender: mpsc::Sender<UiTraceEvent>,
     pub status_sender: mpsc::UnboundedSender<RuntimeStatus>,
     pub trace_channel_capacity: usize,
 }
@@ -1057,7 +1270,7 @@ impl RuntimeChannels {
     }
 
     /// Create a trace sender that can be shared with other tasks
-    pub fn create_trace_sender(&self) -> mpsc::Sender<ParsedTraceEvent> {
+    pub fn create_trace_sender(&self) -> mpsc::Sender<UiTraceEvent> {
         self.trace_sender.clone()
     }
 }
@@ -1277,13 +1490,14 @@ impl RuntimeStatus {
 mod tests {
     use super::*;
 
-    fn sample_event(trace_id: u64) -> ParsedTraceEvent {
-        ParsedTraceEvent {
+    fn sample_event(trace_id: u64) -> UiTraceEvent {
+        UiTraceEvent {
             timestamp: 0,
             trace_id,
             pid: 42,
             tid: 42,
-            instructions: vec![],
+            items: vec![],
+            execution_status: None,
         }
     }
 

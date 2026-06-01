@@ -454,16 +454,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let key_alloca = self.pm_key_alloca.ok_or_else(|| {
             CodeGenError::LLVMError("pm_key not allocated in entry block".to_string())
         })?;
-        // Get i32* to the first element (&key[0])
-        let zero = i32_type.const_zero();
-        // SAFETY: key_alloca is the [4 x i32] pm_key stack slot and [0, 0]
-        // addresses the first element.
-        let base_i32_ptr = unsafe {
-            self.builder
-                .build_gep(key_arr_ty, key_alloca, &[zero, zero], "pm_key_i32_ptr")
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-        };
-
         // Resolve the pid key used for proc_module_offsets lookup.
         // Host mode uses host TGID, while NamespaceTgid mode uses namespace TGID
         // from bpf_get_ns_current_pid_tgid().
@@ -569,60 +559,52 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         };
         let pid = self.lookup_proc_pid_alias(runtime_pid, "offset_pid")?;
 
-        // Store pid at key[0]
-        self.builder
-            .build_store(base_i32_ptr, pid)
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
-        // Zero padding at key[1] for deterministic key bytes
-        let idx1 = i32_type.const_int(1, false);
-        // SAFETY: base_i32_ptr points to key[0] of a four-element i32 array; index
-        // 1 is the padding field.
-        let pad_ptr = unsafe {
-            self.builder
-                .build_gep(self.context.i32_type(), base_i32_ptr, &[idx1], "pad_ptr")
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        let store_key_u32 = |offset: usize,
+                             value: IntValue<'ctx>,
+                             name: &str,
+                             ctx: &mut EbpfContext<'ctx, 'dw>|
+         -> Result<()> {
+            let offset_i32 = ctx.context.i32_type().const_int(offset as u64, false);
+            // SAFETY: key_alloca is the ProcModuleKey stack slot. `offset`
+            // comes from ghostscope_protocol::bpf_abi field offsets.
+            let ptr = unsafe {
+                ctx.builder
+                    .build_gep(ctx.context.i8_type(), key_alloca, &[offset_i32], name)
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            };
+            ctx.builder
+                .build_store(ptr, value)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            Ok(())
         };
-        self.builder
-            .build_store(pad_ptr, self.context.i32_type().const_zero())
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-        // Store cookie_lo at key[2] and cookie_hi at key[3] (key[1] is padding for 8-byte alignment)
+        store_key_u32(
+            ghostscope_protocol::PROC_MODULE_KEY_PID_OFFSET,
+            pid,
+            "pm_key_pid_ptr",
+            self,
+        )?;
+        store_key_u32(
+            ghostscope_protocol::PROC_MODULE_KEY_PAD_OFFSET,
+            self.context.i32_type().const_zero(),
+            "pm_key_pad_ptr",
+            self,
+        )?;
+
         let cookie_lo = i32_type.const_int(module_cookie & 0xffff_ffff, false);
         let cookie_hi = i32_type.const_int(module_cookie >> 32, false);
-        let idx2 = i32_type.const_int(2, false);
-        let idx3 = i32_type.const_int(3, false);
-        // key[1] left as padding = 0 by default
-        // SAFETY: base_i32_ptr points to key[0] of a four-element i32 array; index
-        // 2 is the low cookie word.
-        let cookie_lo_ptr = unsafe {
-            self.builder
-                .build_gep(
-                    self.context.i32_type(),
-                    base_i32_ptr,
-                    &[idx2],
-                    "cookie_lo_ptr",
-                )
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-        };
-        // SAFETY: base_i32_ptr points to key[0] of a four-element i32 array; index
-        // 3 is the high cookie word.
-        let cookie_hi_ptr = unsafe {
-            self.builder
-                .build_gep(
-                    self.context.i32_type(),
-                    base_i32_ptr,
-                    &[idx3],
-                    "cookie_hi_ptr",
-                )
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-        };
-        self.builder
-            .build_store(cookie_lo_ptr, cookie_lo)
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        self.builder
-            .build_store(cookie_hi_ptr, cookie_hi)
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        store_key_u32(
+            ghostscope_protocol::PROC_MODULE_KEY_COOKIE_LO_OFFSET,
+            cookie_lo,
+            "pm_key_cookie_lo_ptr",
+            self,
+        )?;
+        store_key_u32(
+            ghostscope_protocol::PROC_MODULE_KEY_COOKIE_HI_OFFSET,
+            cookie_hi,
+            "pm_key_cookie_hi_ptr",
+            self,
+        )?;
 
         // Call bpf_map_lookup_elem(map, &key)
         let lookup_id = i64_type.const_int(BPF_FUNC_map_lookup_elem as u64, false);
@@ -672,26 +654,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_conditional_branch(is_null, miss_block, found_block)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-        // Found: load appropriate offset based on section_type
+        // Found: load the requested field from ProcModuleOffsetsValue. The
+        // byte offsets are shared through ghostscope_protocol::bpf_abi because
+        // this map is an ABI between generated eBPF and userspace.
         self.builder.position_at_end(found_block);
-        // Cast value pointer (void*) to i64* for loading 64-bit offsets
-        // Use opaque pointer type (LLVM15+): model as generic pointer
-        let i64_ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let val_u64_ptr = self
-            .builder
-            .build_pointer_cast(val_ptr, i64_ptr_ty, "val_u64_ptr")
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let load_field = |idx: u64,
+        let load_field = |offset: usize,
                           ctx: &mut EbpfContext<'ctx, 'dw>,
                           base: PointerValue<'ctx>|
          -> Result<IntValue<'ctx>> {
-            // GEP in i64 element space
-            let idx_i32 = ctx.context.i32_type().const_int(idx, false);
-            // SAFETY: val_u64_ptr points at ProcModuleOffsetsValue, represented as
-            // four contiguous u64 fields; idx is one of 0..=3.
+            let offset_i32 = ctx.context.i32_type().const_int(offset as u64, false);
+            // SAFETY: `base` points at ProcModuleOffsetsValue returned by
+            // bpf_map_lookup_elem. `offset` is one of its u64 field offsets.
             let field_ptr = unsafe {
                 ctx.builder
-                    .build_gep(ctx.context.i64_type(), base, &[idx_i32], "field_ptr_i64")
+                    .build_gep(ctx.context.i8_type(), base, &[offset_i32], "field_ptr")
                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             };
             let loaded = ctx
@@ -705,10 +681,26 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         };
         let st = section_type;
-        let off_text = load_field(0, self, val_u64_ptr)?;
-        let off_rodata = load_field(1, self, val_u64_ptr)?;
-        let off_data = load_field(2, self, val_u64_ptr)?;
-        let off_bss = load_field(3, self, val_u64_ptr)?;
+        let off_text = load_field(
+            ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_TEXT_OFFSET,
+            self,
+            val_ptr,
+        )?;
+        let off_rodata = load_field(
+            ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_RODATA_OFFSET,
+            self,
+            val_ptr,
+        )?;
+        let off_data = load_field(
+            ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_DATA_OFFSET,
+            self,
+            val_ptr,
+        )?;
+        let off_bss = load_field(
+            ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_BSS_OFFSET,
+            self,
+            val_ptr,
+        )?;
         // Build a bottom-up cascade to preserve earlier choices:
         // tmp  = (section==data)   ? off_data   : off_bss
         // tmp2 = (section==rodata) ? off_rodata : tmp
@@ -1084,6 +1076,36 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "value_or_zero",
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))
+    }
+
+    /// Generate a user memory read and return both the zero-on-failure value and failure flag.
+    pub(crate) fn generate_memory_read_with_fail_flag(
+        &mut self,
+        address: RuntimeAddress<'ctx>,
+        size: MemoryAccessSize,
+        name_suffix: &str,
+    ) -> Result<(BasicValueEnum<'ctx>, IntValue<'ctx>)> {
+        let zero_const = self.context.i64_type().const_zero();
+        let ProbeReadResult {
+            loaded_i64,
+            combined_fail,
+            ..
+        } = self.probe_read_user_core(address, size, name_suffix)?;
+
+        self.update_any_fail_flag(combined_fail, name_suffix)?;
+
+        let zero_bv: BasicValueEnum = zero_const.into();
+        let val_bv: BasicValueEnum = loaded_i64.into();
+        let value = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                combined_fail,
+                zero_bv,
+                val_bv,
+                &format!("{name_suffix}_value_or_zero"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok((value, combined_fail))
     }
 
     /// Generate memory read with runtime status capture (for control-flow conditions).

@@ -107,7 +107,7 @@ Background: one motivation for GhostScope was that newer bpftrace versions no lo
 | Source line and statement probes | Supported; line-level attachment is a core path | Supported; statement probes can be resolved and attached |
 | Variable access (params, locals, globals) | Supported. Build PC-context read plans with gimli-backed DWARF data; render by real types; naturally ASLR and PIE friendly | Supported. DWARF location expressions are lowered through SystemTap's pipeline into eBPF-compatible logic, with verifier and stack constraints |
 | DWARF expression handling | Convert DWARF locations into semantic read plans and lower supported plans into eBPF runtime reads | Translate DWARF operations into internal representations and lower them into eBPF instruction sequences |
-| Stack unwinding (CFI) | Not supported yet; planned via `.eh_frame` unwinding | Not supported in the eBPF backend |
+| Stack unwinding (CFI) | Supported through DWARF-only `bt`/`backtrace` for compact CFI rows that can be executed safely in eBPF | Not supported in the eBPF backend |
 | Event transport and formatting | RingBuf (on newer kernels) or PerfEventArray; configurable pages and event size; built-in dump helpers such as `{:x.N}`, `{:s.N}`, and `{:p}` | PERF_EVENT_ARRAY plus userspace formatting/interpreter flow; formatting and string handling are more constrained |
 | BTF, CO-RE, linkage | Aya ecosystem, prefer RingBuf; not centered on BTF or CO-RE | No BTF or CO-RE focus; minimal libbpf-style backend |
 | eBPF generation pipeline | Rust and Aya loader; focused on reading userspace DWARF variables and presentation | Custom IR and assembler pipeline that emits eBPF bytecode and ELF artifacts |

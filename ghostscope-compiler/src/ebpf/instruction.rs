@@ -457,10 +457,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
-    /// Send EndInstruction as final segment
-    pub fn send_end_instruction(&mut self, total_instructions: u16) -> Result<()> {
+    /// Write EndInstruction as final segment into the accumulation buffer.
+    pub(crate) fn write_end_instruction(&mut self, total_instructions: u16) -> Result<()> {
         info!(
-            "Sending EndInstruction segment with {} total instructions",
+            "Writing EndInstruction segment with {} total instructions",
             total_instructions
         );
 
@@ -634,70 +634,78 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // Already accumulated in per-CPU buffer; no extra copy needed
 
-        // End: send the entire accumulated buffer once (RingBuf or PerfEventArray)
-        {
-            let accum_buffer = self
-                .get_or_create_perf_accumulation_buffer_or_return_zero()?
-                .into_value_after_runtime_returns();
-            let offset_ptr = self.get_or_create_perf_buffer_offset()?;
+        Ok(())
+    }
 
-            // Load total accumulated size (u32)
-            let total_accumulated_size = self
-                .builder
-                .build_load(self.context.i32_type(), offset_ptr, "total_size")
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to load total size: {e}")))?
-                .into_int_value();
+    /// Send EndInstruction and immediately output the accumulated event.
+    pub fn send_end_instruction(&mut self, total_instructions: u16) -> Result<()> {
+        self.write_end_instruction(total_instructions)?;
+        self.emit_accumulated_event_output_from_stack_offset()
+    }
 
-            // Clamp size to [0, max_trace_event_size] to satisfy verifier bounded access
-            let max_size_i32 = self
-                .context
-                .i32_type()
-                .const_int(self.compile_options.max_trace_event_size as u64, false);
-            let size_le_max = self
-                .builder
-                .build_int_compare(
-                    inkwell::IntPredicate::ULE,
-                    total_accumulated_size,
-                    max_size_i32,
-                    "size_le_max",
-                )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to compare end size: {e}")))?;
-            let clamped_size_i32 = self
-                .builder
-                .build_select(
-                    size_le_max,
-                    total_accumulated_size,
-                    max_size_i32,
-                    "clamped_size_i32",
-                )
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to select clamp size: {e}")))?
-                .into_int_value();
+    pub(crate) fn emit_accumulated_event_output_from_stack_offset(&mut self) -> Result<()> {
+        let accum_buffer = self
+            .get_or_create_perf_accumulation_buffer_or_return_zero()?
+            .into_value_after_runtime_returns();
+        let offset_ptr = self.get_or_create_perf_buffer_offset()?;
 
-            // Convert i32 to i64 for size parameter
-            let total_size_i64 = self
-                .builder
-                .build_int_z_extend(clamped_size_i32, self.context.i64_type(), "total_size_i64")
-                .map_err(|e| CodeGenError::LLVMError(format!("Failed to extend size: {e}")))?;
+        let total_accumulated_size = self
+            .builder
+            .build_load(self.context.i32_type(), offset_ptr, "total_size")
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to load total size: {e}")))?
+            .into_int_value();
+        self.emit_accumulated_event_output(accum_buffer, total_accumulated_size)?;
 
-            match self.compile_options.event_map_type {
-                crate::EventMapType::PerfEventArray => {
-                    // Single-shot perf send
-                    self.create_perf_event_output_dynamic(accum_buffer, total_size_i64)?;
-                }
-                crate::EventMapType::RingBuf => {
-                    // Single-shot ringbuf send
-                    self.create_ringbuf_output_dynamic(accum_buffer, total_size_i64)?;
-                }
+        self.builder
+            .build_store(offset_ptr, self.context.i32_type().const_zero())
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to reset offset after send: {e}"))
+            })?;
+        Ok(())
+    }
+
+    pub(crate) fn emit_accumulated_event_output(
+        &mut self,
+        accum_buffer: PointerValue<'ctx>,
+        total_accumulated_size: inkwell::values::IntValue<'ctx>,
+    ) -> Result<()> {
+        let max_size_i32 = self
+            .context
+            .i32_type()
+            .const_int(self.compile_options.max_trace_event_size as u64, false);
+        let size_le_max = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::ULE,
+                total_accumulated_size,
+                max_size_i32,
+                "size_le_max",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to compare end size: {e}")))?;
+        let clamped_size_i32 = self
+            .builder
+            .build_select(
+                size_le_max,
+                total_accumulated_size,
+                max_size_i32,
+                "clamped_size_i32",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to select clamp size: {e}")))?
+            .into_int_value();
+
+        let total_size_i64 = self
+            .builder
+            .build_int_z_extend(clamped_size_i32, self.context.i64_type(), "total_size_i64")
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to extend size: {e}")))?;
+
+        match self.compile_options.event_map_type {
+            crate::EventMapType::PerfEventArray => {
+                self.create_perf_event_output_dynamic(accum_buffer, total_size_i64)?;
             }
-
-            // Reset offset to 0 after sending to ensure clean state for next trace event
-            self.builder
-                .build_store(offset_ptr, self.context.i32_type().const_zero())
-                .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to reset offset after send: {e}"))
-                })?;
+            crate::EventMapType::RingBuf => {
+                self.create_ringbuf_output_dynamic(accum_buffer, total_size_i64)?;
+            }
         }
-
         Ok(())
     }
 }

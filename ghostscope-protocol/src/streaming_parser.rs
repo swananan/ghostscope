@@ -47,12 +47,24 @@ pub enum ParsedInstruction {
         raw_data: Vec<u8>,
     },
     Backtrace {
-        depth: u8,
+        requested_depth: u8,
+        flags: u8,
+        status: BacktraceStatus,
+        error_code: u16,
+        frames: Vec<ParsedBacktraceFrame>,
     },
     EndInstruction {
         total_instructions: u16,
         execution_status: u8,
     },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ParsedBacktraceFrame {
+    pub module_cookie: u64,
+    pub pc: u64,
+    pub raw_ip: u64,
+    pub flags: u16,
 }
 
 /// Parsed trace event containing header, message, and instructions
@@ -567,12 +579,43 @@ impl StreamingTraceParser {
             }
 
             t if t == InstructionType::Backtrace as u8 => {
-                if inst_data.is_empty() {
+                let (data_struct, _) = BacktraceData::read_from_prefix(inst_data)
+                    .map_err(|_| "Invalid Backtrace data".to_string())?;
+
+                let requested_depth = data_struct.requested_depth;
+                let frame_count = data_struct.frame_count;
+                let flags = data_struct.flags;
+                let status = BacktraceStatus::from_u8(data_struct.status);
+                let error_code = data_struct.error_code;
+                let frame_offset = BACKTRACE_DATA_SIZE;
+                let available_frames =
+                    inst_data.len().saturating_sub(frame_offset) / BACKTRACE_FRAME_DATA_SIZE;
+                let parsed_frames = frame_count as usize;
+                if frame_count > requested_depth || parsed_frames > available_frames {
                     return Err("Invalid Backtrace data".to_string());
                 }
 
-                let depth = inst_data[0];
-                ParsedInstruction::Backtrace { depth }
+                let mut frames = Vec::with_capacity(parsed_frames);
+                for index in 0..parsed_frames {
+                    let start = frame_offset + index * BACKTRACE_FRAME_DATA_SIZE;
+                    let end = start + BACKTRACE_FRAME_DATA_SIZE;
+                    let (frame, _) = BacktraceFrameData::read_from_prefix(&inst_data[start..end])
+                        .map_err(|_| "Invalid Backtrace frame data".to_string())?;
+                    frames.push(ParsedBacktraceFrame {
+                        module_cookie: frame.module_cookie,
+                        pc: frame.pc,
+                        raw_ip: frame.raw_ip,
+                        flags: frame.flags,
+                    });
+                }
+
+                ParsedInstruction::Backtrace {
+                    requested_depth,
+                    flags,
+                    status,
+                    error_code,
+                    frames,
+                }
             }
 
             t if t == InstructionType::PrintComplexVariable as u8 => {
@@ -756,8 +799,33 @@ impl ParsedInstruction {
                 // formatted_value already contains "name = ..." or "name.access = ..."
                 formatted_value.clone()
             }
-            ParsedInstruction::Backtrace { depth } => {
-                format!("backtrace({depth})")
+            ParsedInstruction::Backtrace {
+                requested_depth,
+                status,
+                error_code,
+                frames,
+                ..
+            } => {
+                let mut lines = vec![format!(
+                    "backtrace(max_depth={requested_depth}, frames={}, status={})",
+                    frames.len(),
+                    status.label()
+                )];
+                for (index, frame) in frames.iter().enumerate() {
+                    lines.push(format!(
+                        "  #{index} cookie=0x{:016x} pc=0x{:x} raw=0x{:x}",
+                        frame.module_cookie, frame.pc, frame.raw_ip
+                    ));
+                }
+                if *status != BacktraceStatus::Complete {
+                    let suffix = match backtrace_error_label(*error_code) {
+                        Some("unknown") => format!(" (code={error_code})"),
+                        Some(label) => format!(" ({label}, code={error_code})"),
+                        None => String::new(),
+                    };
+                    lines.push(format!("  stopped: {}{}", status.label(), suffix));
+                }
+                lines.join("\n")
             }
             ParsedInstruction::EndInstruction {
                 total_instructions,
@@ -916,6 +984,78 @@ mod tests {
                 assert_eq!(*execution_status, 1); // partial_failure
             }
             other => panic!("unexpected last instruction: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_backtrace_instruction_with_frames() {
+        let trace_context = TraceContext::new();
+        let mut parser = StreamingTraceParser::new();
+
+        let header = TraceEventHeader {
+            magic: crate::consts::MAGIC,
+        };
+        parser
+            .process_segment(zerocopy::IntoBytes::as_bytes(&header), &trace_context)
+            .unwrap();
+
+        let message = TraceEventMessage {
+            trace_id: 7,
+            timestamp: 0,
+            pid: 100,
+            tid: 101,
+        };
+        parser
+            .process_segment(zerocopy::IntoBytes::as_bytes(&message), &trace_context)
+            .unwrap();
+
+        let mut inst = Vec::new();
+        inst.push(InstructionType::Backtrace as u8);
+        inst.extend_from_slice(
+            &((BACKTRACE_DATA_SIZE + BACKTRACE_FRAME_DATA_SIZE) as u16).to_le_bytes(),
+        );
+        inst.push(0);
+        inst.push(8); // requested_depth
+        inst.push(1); // frame_count
+        inst.push(BACKTRACE_FLAG_INLINE);
+        inst.push(BacktraceStatus::UnsupportedCfi as u8);
+        inst.extend_from_slice(&0u16.to_le_bytes());
+        inst.extend_from_slice(&0u16.to_le_bytes());
+        inst.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        inst.extend_from_slice(&0x1234u64.to_le_bytes());
+        inst.extend_from_slice(&0x7fff_0000_1234u64.to_le_bytes());
+        inst.extend_from_slice(&0u16.to_le_bytes());
+        inst.extend_from_slice(&0u16.to_le_bytes());
+        inst.extend_from_slice(&0u32.to_le_bytes());
+
+        inst.push(InstructionType::EndInstruction as u8);
+        inst.extend_from_slice(&(std::mem::size_of::<EndInstructionData>() as u16).to_le_bytes());
+        inst.push(0);
+        inst.extend_from_slice(&1u16.to_le_bytes());
+        inst.push(1);
+        inst.push(0);
+
+        let event = parser
+            .process_segment(&inst, &trace_context)
+            .unwrap()
+            .expect("complete event");
+        match &event.instructions[0] {
+            ParsedInstruction::Backtrace {
+                requested_depth,
+                flags,
+                status,
+                frames,
+                ..
+            } => {
+                assert_eq!(*requested_depth, 8);
+                assert_eq!(*flags, BACKTRACE_FLAG_INLINE);
+                assert_eq!(*status, BacktraceStatus::UnsupportedCfi);
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].module_cookie, 0x1122_3344_5566_7788);
+                assert_eq!(frames[0].pc, 0x1234);
+                assert_eq!(frames[0].raw_ip, 0x7fff_0000_1234);
+            }
+            other => panic!("unexpected instruction: {other:?}"),
         }
     }
 

@@ -174,11 +174,112 @@ pub const PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN: usize =
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
 pub struct BacktraceData {
-    pub depth: u8, // Maximum backtrace depth to capture
-    pub flags: u8, // Backtrace options (0 = default)
-    pub reserved: u16, // Padding for alignment
-                   // Followed by backtrace frame data in the instruction payload
+    pub requested_depth: u8,
+    pub frame_count: u8,
+    pub flags: u8,
+    pub status: u8,
+    pub error_code: u16,
+    pub reserved: u16,
+    // Followed by BacktraceFrameData[requested_depth].
 }
+
+pub const BACKTRACE_DATA_SIZE: usize = std::mem::size_of::<BacktraceData>();
+pub const BACKTRACE_DATA_REQUESTED_DEPTH_OFFSET: usize =
+    std::mem::offset_of!(BacktraceData, requested_depth);
+pub const BACKTRACE_DATA_FRAME_COUNT_OFFSET: usize =
+    std::mem::offset_of!(BacktraceData, frame_count);
+pub const BACKTRACE_DATA_FLAGS_OFFSET: usize = std::mem::offset_of!(BacktraceData, flags);
+pub const BACKTRACE_DATA_STATUS_OFFSET: usize = std::mem::offset_of!(BacktraceData, status);
+pub const BACKTRACE_DATA_ERROR_CODE_OFFSET: usize = std::mem::offset_of!(BacktraceData, error_code);
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned, Serialize, Deserialize,
+)]
+pub struct BacktraceFrameData {
+    pub module_cookie: u64,
+    /// Module-normalized DWARF PC / ELF virtual address.
+    pub pc: u64,
+    /// Runtime instruction pointer as observed in the target process.
+    pub raw_ip: u64,
+    pub flags: u16,
+    pub reserved: u16,
+    pub reserved2: u32,
+}
+
+pub const BACKTRACE_FRAME_DATA_SIZE: usize = std::mem::size_of::<BacktraceFrameData>();
+pub const BACKTRACE_FRAME_MODULE_COOKIE_OFFSET: usize =
+    std::mem::offset_of!(BacktraceFrameData, module_cookie);
+pub const BACKTRACE_FRAME_PC_OFFSET: usize = std::mem::offset_of!(BacktraceFrameData, pc);
+pub const BACKTRACE_FRAME_RAW_IP_OFFSET: usize = std::mem::offset_of!(BacktraceFrameData, raw_ip);
+pub const BACKTRACE_FRAME_FLAGS_OFFSET: usize = std::mem::offset_of!(BacktraceFrameData, flags);
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BacktraceStatus {
+    Complete = 0,
+    Truncated = 1,
+    DwarfUnavailable = 2,
+    UnsupportedCfi = 3,
+    OffsetsUnavailable = 4,
+    ReadError = 5,
+    InternalError = 6,
+    InvalidFrame = 7,
+}
+
+impl BacktraceStatus {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Complete,
+            1 => Self::Truncated,
+            2 => Self::DwarfUnavailable,
+            3 => Self::UnsupportedCfi,
+            4 => Self::OffsetsUnavailable,
+            5 => Self::ReadError,
+            6 => Self::InternalError,
+            7 => Self::InvalidFrame,
+            _ => Self::InternalError,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Truncated => "truncated",
+            Self::DwarfUnavailable => "dwarf unavailable",
+            Self::UnsupportedCfi => "unsupported CFI",
+            Self::OffsetsUnavailable => "offsets unavailable",
+            Self::ReadError => "read error",
+            Self::InternalError => "internal error",
+            Self::InvalidFrame => "invalid frame",
+        }
+    }
+}
+
+pub const BACKTRACE_ERROR_NONE: u16 = 0;
+pub const BACKTRACE_ERROR_RETURN_ADDRESS_READ: u16 = 1;
+pub const BACKTRACE_ERROR_FRAME_POINTER_READ: u16 = 2;
+pub const BACKTRACE_ERROR_NEXT_IP_BELOW_USER: u16 = 3;
+pub const BACKTRACE_ERROR_NEXT_IP_KERNEL_LIKE: u16 = 4;
+pub const BACKTRACE_ERROR_NEXT_CFA_ZERO: u16 = 5;
+pub const BACKTRACE_ERROR_NEXT_CFA_NOT_ADVANCING: u16 = 6;
+
+pub fn backtrace_error_label(error_code: u16) -> Option<&'static str> {
+    match error_code {
+        BACKTRACE_ERROR_NONE => None,
+        BACKTRACE_ERROR_RETURN_ADDRESS_READ => Some("return-address-read-failed"),
+        BACKTRACE_ERROR_FRAME_POINTER_READ => Some("frame-pointer-read-failed"),
+        BACKTRACE_ERROR_NEXT_IP_BELOW_USER => Some("next-ip-below-user-range"),
+        BACKTRACE_ERROR_NEXT_IP_KERNEL_LIKE => Some("next-ip-kernel-like"),
+        BACKTRACE_ERROR_NEXT_CFA_ZERO => Some("next-cfa-zero"),
+        BACKTRACE_ERROR_NEXT_CFA_NOT_ADVANCING => Some("next-cfa-not-advancing"),
+        _ => Some("unknown"),
+    }
+}
+
+pub const BACKTRACE_FLAG_RAW: u8 = 0x01;
+pub const BACKTRACE_FLAG_FULL: u8 = 0x02;
+pub const BACKTRACE_FLAG_INLINE: u8 = 0x04;
 /// ExprError instruction data - structured warning for runtime expression failure
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
@@ -233,9 +334,12 @@ pub enum Instruction {
         failing_addr: u64,
     },
     Backtrace {
-        depth: u8,
+        requested_depth: u8,
+        frame_count: u8,
         flags: u8,
-        frames: Vec<u64>, // Stack frame addresses
+        status: BacktraceStatus,
+        error_code: u16,
+        frames: Vec<BacktraceFrameData>,
     },
     EndInstruction {
         total_instructions: u16,
@@ -299,6 +403,17 @@ mod tests {
         assert_eq!(EXPR_ERROR_DATA_ERROR_CODE_OFFSET, 2);
         assert_eq!(EXPR_ERROR_DATA_FLAGS_OFFSET, 3);
         assert_eq!(EXPR_ERROR_DATA_FAILING_ADDR_OFFSET, 4);
+        assert_eq!(BACKTRACE_DATA_SIZE, 8);
+        assert_eq!(BACKTRACE_DATA_REQUESTED_DEPTH_OFFSET, 0);
+        assert_eq!(BACKTRACE_DATA_FRAME_COUNT_OFFSET, 1);
+        assert_eq!(BACKTRACE_DATA_FLAGS_OFFSET, 2);
+        assert_eq!(BACKTRACE_DATA_STATUS_OFFSET, 3);
+        assert_eq!(BACKTRACE_DATA_ERROR_CODE_OFFSET, 4);
+        assert_eq!(BACKTRACE_FRAME_DATA_SIZE, 32);
+        assert_eq!(BACKTRACE_FRAME_MODULE_COOKIE_OFFSET, 0);
+        assert_eq!(BACKTRACE_FRAME_PC_OFFSET, 8);
+        assert_eq!(BACKTRACE_FRAME_RAW_IP_OFFSET, 16);
+        assert_eq!(BACKTRACE_FRAME_FLAGS_OFFSET, 24);
         assert_eq!(PRINT_COMPLEX_FORMAT_DATA_ARG_COUNT_OFFSET, 2);
         assert_eq!(PRINT_COMPLEX_FORMAT_ARG_VAR_NAME_INDEX_OFFSET, 0);
         assert_eq!(PRINT_COMPLEX_FORMAT_ARG_TYPE_INDEX_OFFSET, 2);

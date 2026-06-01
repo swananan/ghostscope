@@ -258,6 +258,10 @@ pub struct Args {
     #[arg(long = "script-output-events-per-sec", value_name = "N")]
     pub script_output_events_per_sec: Option<u64>,
 
+    /// Max DWARF-unwound frames captured by each bt/backtrace instruction.
+    #[arg(long = "backtrace-depth", value_name = "N", value_parser = clap::value_parser!(u8).range(1..=128))]
+    pub backtrace_depth: Option<u8>,
+
     /// Save LLVM IR files for each trace pattern (debug: true, release: false)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub save_llvm_ir: bool,
@@ -340,6 +344,7 @@ pub struct ParsedArgs {
     pub has_explicit_status_flag: bool,
     pub script_timestamp: Option<ScriptTimestampFormat>,
     pub script_output_events_per_sec: Option<u64>,
+    pub backtrace_depth: Option<u8>,
     pub should_save_llvm_ir: bool,
     pub should_save_ebpf: bool,
     pub should_save_ast: bool,
@@ -521,6 +526,7 @@ impl Args {
             has_explicit_status_flag,
             script_timestamp: parsed.script_timestamp,
             script_output_events_per_sec: parsed.script_output_events_per_sec,
+            backtrace_depth: parsed.backtrace_depth,
             should_save_llvm_ir,
             should_save_ebpf,
             should_save_ast,
@@ -879,6 +885,43 @@ mod tests {
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_backtrace_depth_flag() {
+        let parsed = Args::parse_args_from(vec![
+            "ghostscope".to_string(),
+            "--pid".to_string(),
+            "1234".to_string(),
+            "--script-file".to_string(),
+            "trace.gs".to_string(),
+            "--backtrace-depth".to_string(),
+            "64".to_string(),
+        ]);
+
+        match parsed {
+            ParsedCommand::Trace(args) => {
+                assert_eq!(args.backtrace_depth, Some(64));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_backtrace_depth_out_of_range() {
+        let err = Args::try_parse_from(vec![
+            "ghostscope",
+            "--pid",
+            "1234",
+            "--script-file",
+            "trace.gs",
+            "--backtrace-depth",
+            "129",
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("--backtrace-depth"));
     }
 
     #[test]

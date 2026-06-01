@@ -2993,14 +2993,29 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 let ts = self.get_current_timestamp()?;
                 Ok(ts.into())
             }
+            "pc" => self.load_special_register_value(16),
+            "sp" => self.load_special_register_value(7),
             _ => {
-                let supported =
-                    ["$pid", "$tid", "$host_pid", "$input_pid", "$timestamp"].join(", ");
+                let supported = [
+                    "$pid",
+                    "$tid",
+                    "$host_pid",
+                    "$input_pid",
+                    "$timestamp",
+                    "$pc",
+                    "$sp",
+                ]
+                .join(", ");
                 Err(CodeGenError::NotImplemented(format!(
                     "Unknown special variable '${name}'. Supported: {supported}"
                 )))
             }
         }
+    }
+
+    fn load_special_register_value(&mut self, dwarf_reg: u16) -> Result<BasicValueEnum<'ctx>> {
+        let pt_regs = self.get_pt_regs_parameter()?;
+        self.load_register_value(dwarf_reg, pt_regs)
     }
 
     /// Compile binary operations

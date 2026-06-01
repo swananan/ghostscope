@@ -303,6 +303,79 @@ trace print_record {
 }
 
 #[tokio::test]
+async fn test_backtrace_outputs_dwarf_frames_between_prints() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let opt_level = OptimizationLevel::Debug;
+    let target = get_global_test_target_with_opt(opt_level).await?;
+
+    let script_content = r#"
+trace test_function {
+    print "before-bt";
+    bt full;
+    print "after-bt";
+}
+"#;
+
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script_content)
+        .attach_to(&target)
+        .timeout_secs(5)
+        .enable_sysmon_for_target(false)
+        .with_cli_args(["--backtrace-depth", "3"])
+        .run()
+        .await?;
+
+    if exit_code != 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    assert_eq!(
+        exit_code, 0,
+        "unexpected error: stderr={stderr}\nstdout={stdout}"
+    );
+
+    let before = stdout
+        .find("before-bt")
+        .ok_or_else(|| anyhow::anyhow!("missing before print:\n{stdout}"))?;
+    let backtrace = stdout
+        .find("backtrace:")
+        .ok_or_else(|| anyhow::anyhow!("missing backtrace header:\n{stdout}"))?;
+    assert!(
+        stdout[backtrace..].contains("(max 3)"),
+        "backtrace header should show configured max depth:\n{stdout}"
+    );
+    let frame = stdout
+        .find("#0")
+        .ok_or_else(|| anyhow::anyhow!("missing backtrace frame:\n{stdout}"))?;
+    let function = stdout
+        .find("test_function")
+        .ok_or_else(|| anyhow::anyhow!("missing DWARF function name:\n{stdout}"))?;
+    let after = stdout
+        .find("after-bt")
+        .ok_or_else(|| anyhow::anyhow!("missing after print:\n{stdout}"))?;
+
+    assert!(
+        before < backtrace,
+        "backtrace should follow first print:\n{stdout}"
+    );
+    assert!(
+        backtrace < frame,
+        "frame should follow backtrace header:\n{stdout}"
+    );
+    assert!(
+        frame <= function,
+        "function should be rendered in frame:\n{stdout}"
+    );
+    assert!(
+        function < after,
+        "second print should follow frames:\n{stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_special_pid_in_if_condition() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();

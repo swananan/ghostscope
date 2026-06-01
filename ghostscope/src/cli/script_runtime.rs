@@ -7,7 +7,7 @@ use ghostscope_dwarf::ModuleLoadingEvent;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, trace, warn};
 
 const SCRIPT_OUTPUT_BACKPRESSURE_SLEEP: Duration = Duration::from_millis(10);
 
@@ -387,6 +387,7 @@ async fn run_cli_with_session(
     );
     let stdout = io::stdout();
     let mut stdout = io::BufWriter::new(stdout.lock());
+    let mut backtrace_renderer = crate::trace::backtrace::BacktraceRenderer::default();
     let mut output_rate_limiter = ScriptOutputRateLimiter::new(config.script_output_events_per_sec);
     let mut ebpf_loss_report_ticker = tokio::time::interval(Duration::from_secs(1));
     ebpf_loss_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -408,7 +409,19 @@ async fn run_cli_with_session(
                             ) {
                                 ScriptOutputRateDecision::Silent => {}
                                 ScriptOutputRateDecision::Render => {
-                                    match output_renderer.write_event(&event, &mut stdout) {
+                                    let rendered_event = {
+                                        let coordinator = session
+                                            .coordinator
+                                            .lock()
+                                            .expect("coordinator mutex poisoned");
+                                        backtrace_renderer.render_event_backtraces(
+                                            &event,
+                                            session.process_analyzer.as_ref(),
+                                            &coordinator,
+                                            session.proc_pid(),
+                                        )
+                                    };
+                                    match output_renderer.write_event(&rendered_event, &mut stdout) {
                                         Ok(wrote) => wrote_output |= wrote,
                                         Err(e) => warn!("Failed to write event output: {e}"),
                                     }
@@ -418,7 +431,7 @@ async fn run_cli_with_session(
                                 }
                             }
 
-                            debug!("Raw trace event: {:?}", event);
+                            trace!("Raw trace event: {:?}", event);
                         }
                         output_rate_limiter.maybe_report(Instant::now());
                         // When stdout is piped (as in tests), Rust switches to block buffering.

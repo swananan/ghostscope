@@ -54,6 +54,7 @@ pub struct GhostscopeRunner {
     enable_file_logging: bool,
     enable_console_logging: bool,
     sandbox: Option<SandboxHandle>,
+    config_content: Option<String>,
     extra_args: Vec<OsString>,
 }
 
@@ -72,6 +73,7 @@ impl Default for GhostscopeRunner {
             enable_file_logging: false,
             enable_console_logging: false,
             sandbox: None,
+            config_content: None,
             extra_args: Vec::new(),
         }
     }
@@ -157,6 +159,12 @@ impl GhostscopeRunner {
         self
     }
 
+    #[allow(dead_code)]
+    pub fn with_config_content(mut self, content: impl Into<String>) -> Self {
+        self.config_content = Some(content.into());
+        self
+    }
+
     pub async fn run(self) -> Result<(i32, String, String)> {
         let (exit_code, stdout, stderr, ()) = self
             .run_internal(
@@ -234,13 +242,18 @@ impl GhostscopeRunner {
         use std::io::Write as _;
         script_file.write_all(self.script_content.as_bytes())?;
         let script_path = sandbox.path_in_sandbox(script_file.path())?;
-        let sysmon_config_file = if self.disable_sysmon_for_target {
-            let mut file = create_config_file()?;
-            file.write_all(b"[ebpf]\nenable_sysmon_for_target = false\n")?;
-            Some(file)
-        } else {
-            None
-        };
+        let config_file =
+            if self.disable_sysmon_for_target || self.config_content.as_deref().is_some() {
+                let mut file = create_config_file()?;
+                let content = build_config_content(
+                    self.config_content.as_deref(),
+                    self.disable_sysmon_for_target,
+                );
+                file.write_all(content.as_bytes())?;
+                Some(file)
+            } else {
+                None
+            };
 
         let mut args: Vec<OsString> = Vec::new();
         if let Some(ref target) = self.target {
@@ -258,7 +271,7 @@ impl GhostscopeRunner {
 
         args.push(OsString::from("--script-file"));
         args.push(script_path.into_os_string());
-        if let Some(config_file) = sysmon_config_file.as_ref() {
+        if let Some(config_file) = config_file.as_ref() {
             args.push(OsString::from("--config"));
             args.push(
                 sandbox
@@ -753,6 +766,37 @@ fn create_config_file() -> Result<NamedTempFile> {
         .suffix(".toml")
         .tempfile_in(repo_root)
         .map_err(Into::into)
+}
+
+fn build_config_content(config_content: Option<&str>, disable_sysmon_for_target: bool) -> String {
+    let mut lines = config_content
+        .unwrap_or_default()
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    if disable_sysmon_for_target && !contains_config_key(&lines, "enable_sysmon_for_target") {
+        let setting = "enable_sysmon_for_target = false".to_string();
+        if let Some(ebpf_table_index) = lines.iter().position(|line| line.trim() == "[ebpf]") {
+            lines.insert(ebpf_table_index + 1, setting);
+        } else {
+            lines.push("[ebpf]".to_string());
+            lines.push(setting);
+        }
+    }
+
+    let mut content = lines.join("\n");
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content
+}
+
+fn contains_config_key(lines: &[String], key: &str) -> bool {
+    lines.iter().any(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with('#') && trimmed.starts_with(key)
+    })
 }
 
 fn env_bool(name: &str) -> Option<bool> {

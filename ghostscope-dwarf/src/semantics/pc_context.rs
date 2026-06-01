@@ -23,6 +23,13 @@ pub struct PcContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionParameter {
+    pub name: String,
+    pub type_name: String,
+    pub is_artificial: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineFrame {
     pub context: Option<InlineContextId>,
     pub call_site: Option<PcLineInfo>,

@@ -10,9 +10,9 @@ use crate::{
 };
 use ghostscope_debuginfod::DebuginfodClient;
 use object::{Object, ObjectSection};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 mod module_resolution;
 mod plan_global;
@@ -87,6 +87,15 @@ pub struct AddressQueryResult {
     pub parameters: Vec<VisibleVariable>,
 }
 
+/// Runtime mapping metadata for a loaded module.
+#[derive(Debug, Clone)]
+pub struct LoadedModuleRuntimeInfo {
+    pub module_path: PathBuf,
+    pub loaded_address: Option<u64>,
+    pub load_bias: Option<u64>,
+    pub size: u64,
+}
+
 /// Rich query result for a function lookup across modules.
 #[derive(Debug, Clone)]
 pub struct FunctionQueryResult {
@@ -101,6 +110,74 @@ pub struct DwarfAnalyzer {
     pid: u32,
     /// Module path -> module data mapping
     modules: HashMap<PathBuf, LoadedObjfile>,
+    /// Cached PC semantic contexts for repeated symbol/source lookups.
+    pc_context_cache: RwLock<PcContextCache>,
+}
+
+const PC_CONTEXT_CACHE_MAX_ENTRIES: usize = 8192;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PcContextCacheKey {
+    module_path: PathBuf,
+    address: u64,
+}
+
+#[derive(Debug)]
+struct PcContextCache {
+    entries: HashMap<PathBuf, HashMap<u64, PcContext>>,
+    insertion_order: VecDeque<PcContextCacheKey>,
+    len: usize,
+    max_entries: usize,
+}
+
+impl Default for PcContextCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            len: 0,
+            max_entries: PC_CONTEXT_CACHE_MAX_ENTRIES,
+        }
+    }
+}
+
+impl PcContextCache {
+    fn get(&self, module_path: &Path, address: u64) -> Option<PcContext> {
+        self.entries
+            .get(module_path)
+            .and_then(|entries| entries.get(&address))
+            .cloned()
+    }
+
+    fn insert(&mut self, module_path: PathBuf, address: u64, context: PcContext) {
+        if self.max_entries == 0 {
+            return;
+        }
+
+        let key = PcContextCacheKey {
+            module_path,
+            address,
+        };
+        let module_entries = self.entries.entry(key.module_path.clone()).or_default();
+        if module_entries.insert(address, context).is_none() {
+            self.insertion_order.push_back(key.clone());
+            self.len += 1;
+        }
+
+        while self.len > self.max_entries {
+            let Some(expired) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if let Some(module_entries) = self.entries.get_mut(&expired.module_path) {
+                if module_entries.remove(&expired.address).is_some() {
+                    self.len -= 1;
+                }
+                if module_entries.is_empty() {
+                    self.entries.remove(&expired.module_path);
+                }
+            }
+        }
+    }
 }
 
 impl DwarfAnalyzer {
@@ -382,6 +459,7 @@ impl DwarfAnalyzer {
                         std::path::PathBuf::from(&e.module_path),
                     );
                     mm.loaded_address = Some(e.base);
+                    mm.load_bias = Some(e.offsets.text);
                     mm.size = e.size;
                     module_mappings.push(mm);
                 }
@@ -506,6 +584,7 @@ impl DwarfAnalyzer {
         let mut analyzer = Self {
             pid: 0, // No specific PID in exec mode
             modules: HashMap::new(),
+            pc_context_cache: RwLock::new(PcContextCache::default()),
         };
 
         // Create a single module mapping for the executable
@@ -513,7 +592,8 @@ impl DwarfAnalyzer {
         let module_mapping = ModuleMapping {
             path: exec_path.clone(),
             loaded_address: None, // No process mapping in exec path mode
-            size: 0,              // Will be determined from file size if needed
+            load_bias: None,
+            size: 0, // Will be determined from file size if needed
         };
         let module_path = exec_path.to_string_lossy().to_string();
 
@@ -586,6 +666,7 @@ impl DwarfAnalyzer {
         let mut analyzer = Self {
             pid,
             modules: HashMap::new(),
+            pc_context_cache: RwLock::new(PcContextCache::default()),
         };
 
         for module in modules {
@@ -698,7 +779,7 @@ impl DwarfAnalyzer {
     pub fn compact_unwind_table_for_context(
         &self,
         ctx: &PcContext,
-    ) -> Result<Option<CompactUnwindTable>> {
+    ) -> Result<Option<Arc<CompactUnwindTable>>> {
         let module_path = self
             .module_path_for_id(ctx.module)
             .ok_or_else(|| anyhow::anyhow!("Semantic module id {:?} is not loaded", ctx.module))?;
@@ -726,7 +807,7 @@ impl DwarfAnalyzer {
     pub fn compact_unwind_table_for_module(
         &self,
         module: crate::ModuleId,
-    ) -> Result<Option<CompactUnwindTable>> {
+    ) -> Result<Option<Arc<CompactUnwindTable>>> {
         let module_path = self
             .module_path_for_id(module)
             .ok_or_else(|| anyhow::anyhow!("Semantic module id {:?} is not loaded", module))?;
@@ -739,6 +820,32 @@ impl DwarfAnalyzer {
     /// Get all loaded module paths
     pub fn get_loaded_modules(&self) -> Vec<&PathBuf> {
         self.modules.keys().collect()
+    }
+
+    /// Get loaded module paths with process mapping metadata, when available.
+    pub fn loaded_module_runtime_info(&self) -> Vec<LoadedModuleRuntimeInfo> {
+        let mut modules: Vec<_> = self
+            .modules
+            .values()
+            .map(|module| {
+                let mapping = module.module_mapping();
+                LoadedModuleRuntimeInfo {
+                    module_path: mapping.path.clone(),
+                    loaded_address: mapping.loaded_address,
+                    load_bias: mapping.load_bias,
+                    size: mapping.size,
+                }
+            })
+            .collect();
+        modules.sort_by(|left, right| left.module_path.cmp(&right.module_path));
+        modules
+    }
+
+    /// Get the ELF entry address for a loaded module, when present.
+    pub fn module_entry_address<P: AsRef<Path>>(&self, module_path: P) -> Option<u64> {
+        self.modules
+            .get(module_path.as_ref())
+            .and_then(|module| module.entry_address())
     }
 
     /// Classify the section type for a link-time virtual address in a specific module

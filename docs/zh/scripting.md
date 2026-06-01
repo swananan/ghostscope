@@ -12,9 +12,10 @@ GhostScope 使用专门的领域特定语言来定义追踪点和操作。脚本
 7. [表达式](#表达式)
 8. [内置函数](#内置函数)
 9. [特殊变量](#特殊变量)
-10. [示例](#示例)
-11. [限制](#限制)
-12. [运行时表达式失败（ExprError）](#运行时表达式失败exprerror)
+10. [栈回溯语句](#栈回溯语句)
+11. [示例](#示例)
+12. [限制](#限制)
+13. [运行时表达式失败（ExprError）](#运行时表达式失败exprerror)
 
 ## 基础语法
 
@@ -34,7 +35,7 @@ GhostScope 使用专门的领域特定语言来定义追踪点和操作。脚本
 GhostScope 支持以下语句类型：
 - `trace` - 定义追踪点及其操作
 - `print` - 输出格式化文本
-- `backtrace` / `bt` - 为后续栈回溯预留的语法
+- `backtrace` / `bt` - 输出基于 DWARF unwind 的栈回溯
 - `if`/`else` - 条件执行
 - `let` - 变量声明
 - 表达式语句
@@ -705,17 +706,56 @@ trace foo {
 }
 ```
 
-## 栈回溯语句（还没有实现）
+## 栈回溯语句
 
-`backtrace;` 和 `bt;` 是为后续栈回溯功能预留的语法，目前不会输出真实调用栈。
+`backtrace;` 和 `bt;` 会在探针触发点输出源码感知的调用栈。unwinder 直接使用 DWARF CFI；没有 `unwind=` 参数，也不暴露 helper/fp 之类的后端选择。
 
 ```ghostscope
-// 完整形式
-backtrace;
-
-// 简写形式
-bt;
+trace test_function {
+    print "before";
+    bt;
+    print "after";
+}
 ```
+
+参数：
+
+- `bt raw;` 输出原始 module cookie、模块内偏移和运行时 IP，不做源码符号化。
+- `bt full;` 输出符号化的源码感知栈帧。raw IP/cookie 调试元数据不会出现在 `bt full` 中，只由 `bt raw` 显示。
+- `bt inline;` 输出 inline 调用链；这是默认行为。
+- `bt noinline;` 关闭 inline 调用链输出。
+
+Backtrace 深度是全局配置，不再写在脚本里。使用命令行 `--backtrace-depth <N>`，或在配置文件 `[ebpf]` 中设置 `backtrace_depth = N`。合法范围是 `1..=128`，默认值是 `128`。
+在 `--script-output pretty` 下，如果 `[script] color` 启用了 ANSI 输出，backtrace payload 会带颜色。`--script-output plain` 始终输出不带 ANSI 的原始 payload 文本。
+
+示例：
+
+```ghostscope
+trace test_function {
+    bt full;
+    bt raw noinline;
+}
+```
+
+典型输出：
+
+```text
+backtrace: complete, 4 frames (max 128)
+  #0 test_function(int argc, char** argv) at sample_program.c:8:5 [sample_program+0x1189]
+  #1 caller(int value) at sample_program.c:42:9 [sample_program+0x1234]
+  #2 main(int argc, char** argv) at sample_program.c:88:12 [sample_program+0x13a0]
+  #3 <unknown function> at ?? [libc.so.6+0x2a1ca]
+```
+
+`bt raw;` 使用相同的 header，但会输出面向排障的机器字段：
+
+```text
+backtrace: truncated, 2 frames (max 2)
+  #0 0x1189 [sample_program+0x1189] raw=0x55... cookie=0x...
+  #1 0x1234 [sample_program+0x1234] raw=0x55... cookie=0x...
+```
+
+`status=complete` 表示 DWARF unwind 在达到配置的深度上限前自然结束。`status=truncated` 表示 GhostScope 达到了配置的深度上限，或先达到了 eBPF tail-call unwind 预算。其他状态会说明 unwind 停止的原因，例如 CFI 不支持、模块偏移不可用、读取用户栈内存失败，或下一帧地址/CFA 不合法。可用时，`stopped:` 会附带稳定的原因标签和数字 code。
 
 ## 示例
 

@@ -10,7 +10,10 @@ pub mod utils;
 // Public exports
 pub use action::{Action, PanelType};
 pub use components::App;
-pub use events::{EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus, TuiEvent};
+pub use events::{
+    BacktraceDisplay, BacktraceDisplayFrame, EventRegistry, RuntimeChannels, RuntimeCommand,
+    RuntimeStatus, TraceDisplayItem, TuiEvent, UiTraceEvent,
+};
 pub use model::ui_state::{HistoryConfig, LayoutMode, UiConfig};
 
 use anyhow::Result;

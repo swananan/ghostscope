@@ -163,6 +163,16 @@ impl LoadedObjfile {
             return Ok(Vec::new());
         }
 
+        let cache_key = (entry.unit_offset.0 as u64, entry.die_offset.0 as u64);
+        if let Some(ranges) = self
+            .function_ranges_cache
+            .read()
+            .expect("function range cache lock poisoned")
+            .get(&cache_key)
+        {
+            return Ok(ranges.clone());
+        }
+
         let dwarf = self.dwarf();
         let header = dwarf
             .unit_header(entry.unit_offset)
@@ -174,8 +184,13 @@ impl LoadedObjfile {
             .entry(entry.die_offset)
             .map_err(|e| anyhow::anyhow!("entry load error: {}", e))?;
 
-        RangeExtractor::extract_all_ranges(&die, &unit, dwarf)
-            .map_err(|e| anyhow::anyhow!("range extraction error: {}", e))
+        let ranges = RangeExtractor::extract_all_ranges(&die, &unit, dwarf)
+            .map_err(|e| anyhow::anyhow!("range extraction error: {}", e))?;
+        self.function_ranges_cache
+            .write()
+            .expect("function range cache lock poisoned")
+            .insert(cache_key, ranges.clone());
+        Ok(ranges)
     }
 
     pub(super) fn find_function_index_entry_by_address(

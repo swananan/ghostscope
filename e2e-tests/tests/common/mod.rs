@@ -33,6 +33,9 @@ lazy_static! {
     static ref COMPILE_SHORT_LIVED_LONG_COMM_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
     static ref COMPILE_C_MULTITHREAD_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_BACKTRACE_HOT_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_BACKTRACE_CROSS_MODULE_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
     static ref COMPILE_SCALAR_TYPES_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
     static ref COMPILE_SCALAR_TYPES_OPTIMIZED_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
@@ -76,6 +79,8 @@ enum RegisteredFixtureKind {
     LateGlobals,
     ShortLivedLongComm,
     CMultithread,
+    BacktraceHot,
+    BacktraceCrossModule,
     ScalarTypes,
     CastTypes,
     RustGlobal,
@@ -145,6 +150,18 @@ const REGISTERED_FIXTURES: &[RegisteredFixture] = &[
         directory: "c_multithread_program",
         cleanup: CleanupCommand::Make,
         kind: RegisteredFixtureKind::CMultithread,
+    },
+    RegisteredFixture {
+        name: "backtrace_hot_program",
+        directory: "backtrace_hot_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::BacktraceHot,
+    },
+    RegisteredFixture {
+        name: "backtrace_cross_module_program",
+        directory: "backtrace_cross_module_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::BacktraceCrossModule,
     },
     RegisteredFixture {
         name: "scalar_types_program",
@@ -460,6 +477,14 @@ impl RegisteredFixture {
             RegisteredFixtureKind::CMultithread => {
                 ensure_c_multithread_program_compiled()?;
                 Ok(dir.join("c_multithread_program"))
+            }
+            RegisteredFixtureKind::BacktraceHot => {
+                ensure_backtrace_hot_program_compiled()?;
+                Ok(dir.join("backtrace_hot_program"))
+            }
+            RegisteredFixtureKind::BacktraceCrossModule => {
+                ensure_backtrace_cross_module_program_compiled()?;
+                Ok(dir.join("backtrace_cross_module_program"))
             }
             RegisteredFixtureKind::ScalarTypes => {
                 let bin_name = match opt_level {
@@ -1254,6 +1279,8 @@ static COMPILE_GLOBALS_OPTIMIZED: Once = Once::new();
 static COMPILE_LATE_GLOBALS: Once = Once::new();
 static COMPILE_SHORT_LIVED_LONG_COMM: Once = Once::new();
 static COMPILE_C_MULTITHREAD: Once = Once::new();
+static COMPILE_BACKTRACE_HOT: Once = Once::new();
+static COMPILE_BACKTRACE_CROSS_MODULE: Once = Once::new();
 static COMPILE_SCALAR_TYPES: Once = Once::new();
 static COMPILE_SCALAR_TYPES_OPTIMIZED: Once = Once::new();
 static COMPILE_CAST_TYPES: Once = Once::new();
@@ -1447,6 +1474,70 @@ fn ensure_c_multithread_program_compiled() -> anyhow::Result<()> {
     });
 
     match COMPILE_C_MULTITHREAD_RESULT.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
+fn ensure_backtrace_hot_program_compiled() -> anyhow::Result<()> {
+    COMPILE_BACKTRACE_HOT.call_once(|| {
+        let compile_result = compile_c_make_fixture(
+            "backtrace_hot_program",
+            FixtureCompiler::Default,
+            "-Wall -Wextra -g -O0",
+        );
+        *COMPILE_BACKTRACE_HOT_RESULT.lock().unwrap() = Some(compile_result);
+    });
+
+    match COMPILE_BACKTRACE_HOT_RESULT.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
+fn ensure_backtrace_cross_module_program_compiled() -> anyhow::Result<()> {
+    COMPILE_BACKTRACE_CROSS_MODULE.call_once(|| {
+        let compile_result = (|| -> anyhow::Result<()> {
+            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/backtrace_cross_module_program");
+            if let Some(result) = use_precompiled_outputs(
+                "backtrace_cross_module_program",
+                &[
+                    base.join("backtrace_cross_module_program"),
+                    base.join("libbacktrace_cross_module.so"),
+                ],
+            ) {
+                return result;
+            }
+
+            println!("Compiling backtrace_cross_module_program (Debug) in {base:?}");
+            let _ = Command::new("make")
+                .arg("clean")
+                .current_dir(base.clone())
+                .status()
+                .is_ok();
+            let out = Command::new("make").arg("all").current_dir(base).output()?;
+            if out.status.success() {
+                println!("✓ Successfully compiled backtrace_cross_module_program");
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(anyhow::anyhow!(
+                    "Failed to compile backtrace_cross_module_program: {}",
+                    stderr
+                ))
+            }
+        })();
+        *COMPILE_BACKTRACE_CROSS_MODULE_RESULT.lock().unwrap() = Some(compile_result);
+    });
+
+    match COMPILE_BACKTRACE_CROSS_MODULE_RESULT
+        .lock()
+        .unwrap()
+        .as_ref()
+    {
         Some(Ok(())) => Ok(()),
         Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
         None => panic!("Compilation result should be set after call_once"),

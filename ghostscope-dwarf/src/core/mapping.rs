@@ -4,6 +4,7 @@ use std::path::PathBuf;
 pub struct ModuleMapping {
     pub path: PathBuf,
     pub loaded_address: Option<u64>,
+    pub load_bias: Option<u64>,
     pub size: u64,
 }
 
@@ -12,6 +13,7 @@ impl ModuleMapping {
         Self {
             path,
             loaded_address: None,
+            load_bias: None,
             size: 0,
         }
     }

@@ -28,8 +28,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             instruction_count += self.compile_statement(statement)?;
         }
 
-        // Step 4: Send EndInstruction to mark completion
-        self.send_end_instruction(instruction_count)?;
+        // Step 4: Write EndInstruction and either emit immediately or hand off
+        // emission to the bt tail-call finalizer.
+        self.write_end_instruction(instruction_count)?;
+        self.finish_event_after_instructions()?;
         info!(
             "Sent EndInstruction with {} total instructions",
             instruction_count
@@ -103,6 +105,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 }
             }
             Statement::Print(print_stmt) => self.compile_print_statement(print_stmt),
+            Statement::Backtrace(backtrace_stmt) => {
+                self.generate_backtrace_instruction(backtrace_stmt)?;
+                Ok(1)
+            }
             Statement::If {
                 condition,
                 then_body,

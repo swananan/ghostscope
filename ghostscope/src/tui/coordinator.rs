@@ -2,8 +2,7 @@ use crate::config::ResolvedConfig;
 use crate::core::GhostSession;
 use crate::tui::{dwarf_loader, info_handlers, source_handlers, trace_handlers};
 use anyhow::Result;
-use ghostscope_protocol::ParsedTraceEvent;
-use ghostscope_ui::{EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus};
+use ghostscope_ui::{EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus, UiTraceEvent};
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::{error, info, warn};
 
@@ -37,8 +36,8 @@ enum TraceForwardResult {
 }
 
 fn forward_trace_event(
-    trace_sender: &tokio::sync::mpsc::Sender<ParsedTraceEvent>,
-    event_data: ParsedTraceEvent,
+    trace_sender: &tokio::sync::mpsc::Sender<UiTraceEvent>,
+    event_data: UiTraceEvent,
     backpressure_state: &mut TraceBackpressureState,
 ) -> TraceForwardResult {
     match trace_sender.try_send(event_data) {
@@ -144,6 +143,7 @@ async fn run_runtime_coordinator(
     // Create trace sender for event polling task
     let trace_sender = runtime_channels.create_trace_sender();
     let trace_channel_capacity = runtime_channels.trace_channel_capacity;
+    let mut backtrace_renderer = crate::trace::backtrace::BacktraceRenderer::default();
     let mut backpressure_state = TraceBackpressureState::default();
     let mut backpressure_report_ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
     backpressure_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -162,11 +162,23 @@ async fn run_runtime_coordinator(
             }, if session.is_some() => {
                 match result {
                     Ok(events) => {
-                        if let Some(ref _session) = session {
+                        if let Some(ref session) = session {
                             if !events.is_empty() {
                                 tracing::debug!("Forwarding {} trace events to UI", events.len());
                             }
                             for event_data in events {
+                                let event_data = {
+                                    let coordinator = session
+                                        .coordinator
+                                        .lock()
+                                        .expect("coordinator mutex poisoned");
+                                    backtrace_renderer.render_event_for_tui(
+                                        &event_data,
+                                        session.process_analyzer.as_ref(),
+                                        &coordinator,
+                                        session.proc_pid(),
+                                    )
+                                };
                                 match forward_trace_event(
                                     &trace_sender,
                                     event_data,
@@ -710,13 +722,14 @@ async fn handle_load_traces(
 mod tests {
     use super::*;
 
-    fn sample_event(trace_id: u64) -> ParsedTraceEvent {
-        ParsedTraceEvent {
+    fn sample_event(trace_id: u64) -> UiTraceEvent {
+        UiTraceEvent {
             timestamp: 0,
             trace_id,
             pid: 1000,
             tid: 1000,
-            instructions: vec![],
+            items: vec![],
+            execution_status: None,
         }
     }
 

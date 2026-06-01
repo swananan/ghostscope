@@ -15,7 +15,7 @@ description = "Loads compiled GhostScope programs, manages sessions, and orchest
 
 [dependencies]
 ghostscope-compiler = { version = "0.1.5", path = "../ghostscope-compiler" }
-ghostscope-protocol = { version = "0.1.5", path = "../ghostscope-protocol" }
+ghostscope-protocol = { version = "0.1.5", path = "../ghostscope-protocol", features = ["aya-pod"] }
 ghostscope-process = { version = "0.1.5", path = "../ghostscope-process" }
 aya = { workspace = true }
 aya-obj = { workspace = true }

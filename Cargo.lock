@@ -1049,6 +1049,7 @@ dependencies = [
  "aya-build",
  "aya-obj",
  "bytes",
+ "ghostscope-protocol",
  "libc",
  "log",
  "memmap2",
@@ -1061,6 +1062,7 @@ dependencies = [
 name = "ghostscope-protocol"
 version = "0.1.5"
 dependencies = [
+ "aya",
  "aya-ebpf-bindings",
  "chrono",
  "ghostscope-platform",

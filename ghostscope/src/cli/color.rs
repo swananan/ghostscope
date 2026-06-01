@@ -48,6 +48,10 @@ impl CliColors {
         self.wrap("33", value)
     }
 
+    pub fn magenta<T: Display>(&self, value: T) -> String {
+        self.wrap("35", value)
+    }
+
     pub fn red<T: Display>(&self, value: T) -> String {
         self.wrap("31", value)
     }

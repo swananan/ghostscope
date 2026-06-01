@@ -17,7 +17,7 @@ use gimli::{
     Register, RegisterRule, UnwindContext, UnwindSection,
 };
 use object::{Object, ObjectSection};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use tracing::{debug, info, warn};
 
 /// CFI index for fast CFA rule lookup
@@ -218,13 +218,16 @@ impl CfiIndex {
 
     /// Compile all FDE rows into a compact unwind table for userspace/BPF planning.
     pub fn compact_unwind_table(&self, module: ModuleId) -> Result<CompactUnwindTable> {
+        let started_at = Instant::now();
         let mut rows = Vec::new();
         let mut diagnostics = Vec::new();
         let mut entries = self.eh_frame.entries(&self.bases);
+        let mut fde_count = 0usize;
 
         while let Some(entry) = entries.next().context("Failed to iterate FDE entries")? {
             match entry {
                 CieOrFde::Fde(partial_fde) => {
+                    fde_count += 1;
                     let fde = partial_fde
                         .parse(|_, bases, offset| self.eh_frame.cie_from_offset(bases, offset))
                         .context("Failed to parse FDE")?;
@@ -235,6 +238,14 @@ impl CfiIndex {
         }
 
         rows.sort_by_key(|row| (row.pc_start, row.pc_end));
+        info!(
+            ?module,
+            fdes = fde_count,
+            rows = rows.len(),
+            diagnostics = diagnostics.len(),
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "Built compact DWARF unwind table for bt"
+        );
         Ok(CompactUnwindTable {
             module,
             rows,

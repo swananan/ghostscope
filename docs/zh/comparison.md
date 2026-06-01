@@ -107,7 +107,7 @@ GhostScope 的目标很明确：**针对带有 DWARF 调试信息的活跃进程
 | 源码行/语句级设点 | 支持，行级附着是核心路径 | 支持，statement probe 可以解析后附着 |
 | 变量访问（参/局/全） | 支持。基于 gimli 读取 DWARF，并生成 PC 上下文读取计划；按真实类型渲染，天然适配 ASLR 和 PIE | 支持。DWARF 位置表达式会经过 SystemTap 的处理链路降为 eBPF 可执行逻辑，但要受验证器和栈限制 |
 | DWARF 表达式处理 | 将 DWARF 位置转换成语义读取计划，并把支持的计划 lower 成 eBPF 运行时读取 | 把 DWARF 操作翻译成内部表示，再继续降成 eBPF 指令序列 |
-| 栈回溯（CFI） | 还不支持，计划通过 `.eh_frame` 支持 | eBPF 后端暂不支持 |
+| 栈回溯（CFI） | 通过 DWARF-only `bt`/`backtrace` 支持可安全降到 eBPF 的 compact CFI row | eBPF 后端暂不支持 |
 | 事件传输/格式化 | 新内核优先 RingBuf，也支持 PerfEventArray；页数和事件大小可配；内置 `{:x.N}`、`{:s.N}`、`{:p}` 等 dump helper | 更偏 PERF_EVENT_ARRAY + 用户态解释/格式化流程，格式和字符串能力更受约束 |
 | BTF/CO-RE/链接 | Aya 生态，优先 RingBuf；不以 BTF/CO-RE 为核心 | 不以 BTF/CO-RE 为核心，更接近最小 libbpf 风格后端 |
 | eBPF 生成链 | Rust + Aya 装载，重点是用户态 DWARF 变量读取和展示 | 自研 IR / assembler 流水线，产出 eBPF 字节码和 ELF 产物 |

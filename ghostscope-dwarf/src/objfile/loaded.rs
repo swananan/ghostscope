@@ -4,9 +4,9 @@ use crate::{
     binary::{DwarfReader, MappedFile},
     core::{mapping::ModuleMapping, Result},
     index::{
-        BlockIndex, CfiIndex, LightweightIndex, LineMappingTable, ScopedFileIndexManager,
-        TypeNameIndex,
+        BlockIndex, LightweightIndex, LineMappingTable, ScopedFileIndexManager, TypeNameIndex,
     },
+    objfile::ModuleUnwindInfo,
     parser::{CompilationUnit, DetailedParser},
 };
 use object::{Object, ObjectSegment};
@@ -16,6 +16,8 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+type FunctionRangeCacheKey = (u64, u64);
+
 /// Complete DWARF data for a single loaded object file.
 #[derive(Debug)]
 pub(crate) struct LoadedObjfile {
@@ -24,12 +26,14 @@ pub(crate) struct LoadedObjfile {
     pub(super) line_mapping: LineMappingTable,
     pub(super) scoped_file_manager: ScopedFileIndexManager,
     pub(super) compilation_units: HashMap<String, CompilationUnit>,
-    pub(super) cfi_index: Option<CfiIndex>,
+    pub(super) unwind_info: ModuleUnwindInfo,
     pub(super) dwarf: gimli::Dwarf<DwarfReader>,
     pub(super) detailed_parser: DetailedParser,
     pub(super) _dwarf_mapped_file: Arc<MappedFile>,
     pub(super) _binary_mapped_file: Arc<MappedFile>,
+    pub(super) entry_address: Option<u64>,
     pub(super) text_symbol_starts_by_name: HashMap<String, Vec<u64>>,
+    pub(super) function_ranges_cache: RwLock<HashMap<FunctionRangeCacheKey, Vec<(u64, u64)>>>,
     pub(super) block_index: RwLock<BlockIndex>,
     pub(super) type_name_index: Arc<TypeNameIndex>,
     pub(super) load_parse_ms: u64,
@@ -44,6 +48,10 @@ impl LoadedObjfile {
 
     pub(crate) fn module_mapping(&self) -> &ModuleMapping {
         &self.module_mapping
+    }
+
+    pub(crate) fn entry_address(&self) -> Option<u64> {
+        self.entry_address
     }
 
     pub(crate) fn get_function_names(&self) -> Vec<&String> {
@@ -86,10 +94,7 @@ impl LoadedObjfile {
     }
 
     pub(crate) fn get_cfa_result(&self, pc: u64) -> Result<Option<crate::core::CfaResult>> {
-        match &self.cfi_index {
-            Some(cfi) => Ok(Some(cfi.get_cfa_result(pc)?)),
-            None => Ok(None),
-        }
+        self.unwind_info.get_cfa_result(pc)
     }
 
     pub(crate) fn recover_caller_frame(
@@ -97,20 +102,14 @@ impl LoadedObjfile {
         pc: u64,
         registers: &[u16],
     ) -> Result<Option<crate::core::CallerFrameRecovery>> {
-        match &self.cfi_index {
-            Some(cfi) => Ok(Some(cfi.recover_caller_frame(pc, registers)?)),
-            None => Ok(None),
-        }
+        self.unwind_info.recover_caller_frame(pc, registers)
     }
 
     pub(crate) fn compact_unwind_table(
         &self,
         module: crate::ModuleId,
-    ) -> Result<Option<crate::CompactUnwindTable>> {
-        match &self.cfi_index {
-            Some(cfi) => Ok(Some(cfi.compact_unwind_table(module)?)),
-            None => Ok(None),
-        }
+    ) -> Result<Option<Arc<crate::CompactUnwindTable>>> {
+        self.unwind_info.compact_unwind_table(module)
     }
 
     pub(crate) fn compact_unwind_row(
@@ -118,9 +117,7 @@ impl LoadedObjfile {
         module: crate::ModuleId,
         pc: u64,
     ) -> Result<Option<crate::CompactUnwindRow>> {
-        Ok(self
-            .compact_unwind_table(module)?
-            .and_then(|table| table.row_for_pc(pc).cloned()))
+        self.unwind_info.compact_unwind_row(module, pc)
     }
 
     pub(crate) fn vaddr_to_file_offset(&self, vaddr: u64) -> Option<u64> {
