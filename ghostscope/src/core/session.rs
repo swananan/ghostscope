@@ -251,6 +251,20 @@ impl GhostSession {
         Ok(Some(Arc::new(DebuginfodClient::new(client_config)?)))
     }
 
+    fn ensure_pid_runtime_modules(
+        &self,
+        proc_pid: u32,
+    ) -> Result<Vec<ghostscope_dwarf::LoadedModuleRuntimeInfo>> {
+        let mut coordinator = self.coordinator.lock().expect("coordinator mutex poisoned");
+        coordinator.ensure_prefill_pid(proc_pid)?;
+
+        let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(proc_pid) else {
+            return Ok(Vec::new());
+        };
+
+        Ok(DwarfAnalyzer::runtime_modules_from_pid_offsets(entries))
+    }
+
     /// Load binary and perform DWARF analysis using parallel loading (TUI mode)
     pub async fn load_binary_parallel(&mut self) -> Result<()> {
         info!("Loading binary and performing DWARF analysis (parallel mode)");
@@ -261,9 +275,11 @@ impl GhostSession {
 
         let process_analyzer = if let Some(proc_pid) = self.proc_pid() {
             info!("Loading binary from PID: {} (parallel)", proc_pid);
+            let runtime_modules = self.ensure_pid_runtime_modules(proc_pid)?;
             Some(
-                DwarfAnalyzer::from_pid_parallel_with_config_and_debuginfod(
+                DwarfAnalyzer::from_pid_runtime_modules_with_config_and_debuginfod(
                     proc_pid,
+                    runtime_modules,
                     &debug_search_paths,
                     allow_loose,
                     debuginfod_client.clone(),
@@ -310,9 +326,11 @@ impl GhostSession {
                 "Loading binary from PID: {} (parallel with progress)",
                 proc_pid
             );
+            let runtime_modules = self.ensure_pid_runtime_modules(proc_pid)?;
             Some(
-                DwarfAnalyzer::from_pid_parallel_with_config_and_debuginfod(
+                DwarfAnalyzer::from_pid_runtime_modules_with_config_and_debuginfod(
                     proc_pid,
+                    runtime_modules,
                     &debug_search_paths,
                     allow_loose,
                     debuginfod_client.clone(),

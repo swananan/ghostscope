@@ -446,25 +446,74 @@ impl DwarfAnalyzer {
     {
         tracing::info!("Creating DWARF analyzer for PID {} (parallel)", pid);
 
-        // Discover all modules for this process using coordinator
+        let module_runtime_info = Self::discover_pid_runtime_modules(pid)?;
+
+        Self::from_pid_runtime_modules_with_config_and_debuginfod(
+            pid,
+            module_runtime_info,
+            debug_search_paths,
+            allow_loose_debug_match,
+            debuginfod_client,
+            progress_callback,
+        )
+        .await
+    }
+
+    /// Discover runtime module mappings for a PID.
+    pub fn discover_pid_runtime_modules(pid: u32) -> Result<Vec<LoadedModuleRuntimeInfo>> {
         let mut coord = ghostscope_process::ProcessManager::new();
         coord.ensure_prefill_pid(pid)?;
-        let mut module_mappings: Vec<crate::core::mapping::ModuleMapping> = Vec::new();
-        if let Some(entries) = coord.cached_offsets_with_paths_for_pid(pid) {
-            use std::collections::HashSet;
-            let mut seen = HashSet::new();
-            for e in entries {
-                if seen.insert(e.module_path.clone()) {
-                    let mut mm = crate::core::mapping::ModuleMapping::from_path(
-                        std::path::PathBuf::from(&e.module_path),
-                    );
-                    mm.loaded_address = Some(e.base);
-                    mm.load_bias = Some(e.offsets.text);
-                    mm.size = e.size;
-                    module_mappings.push(mm);
-                }
-            }
-        }
+        Ok(coord
+            .cached_offsets_with_paths_for_pid(pid)
+            .map(Self::runtime_modules_from_pid_offsets)
+            .unwrap_or_default())
+    }
+
+    /// Convert cached process offsets into one runtime mapping per module path.
+    pub fn runtime_modules_from_pid_offsets(
+        entries: &[ghostscope_process::PidOffsetsEntry],
+    ) -> Vec<LoadedModuleRuntimeInfo> {
+        let mut seen = std::collections::HashSet::new();
+        entries
+            .iter()
+            .filter(|entry| seen.insert(entry.module_path.clone()))
+            .map(|entry| LoadedModuleRuntimeInfo {
+                module_path: PathBuf::from(&entry.module_path),
+                loaded_address: Some(entry.base),
+                load_bias: Some(entry.offsets.text),
+                size: entry.size,
+            })
+            .collect()
+    }
+
+    /// Create DWARF analyzer from an already discovered PID runtime module snapshot.
+    pub async fn from_pid_runtime_modules_with_config_and_debuginfod<F>(
+        pid: u32,
+        runtime_modules: Vec<LoadedModuleRuntimeInfo>,
+        debug_search_paths: &[String],
+        allow_loose_debug_match: bool,
+        debuginfod_client: Option<Arc<DebuginfodClient>>,
+        progress_callback: F,
+    ) -> Result<Self>
+    where
+        F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
+    {
+        tracing::info!(
+            "Creating DWARF analyzer for PID {} from {} runtime module mappings",
+            pid,
+            runtime_modules.len()
+        );
+
+        let module_mappings: Vec<crate::core::mapping::ModuleMapping> = runtime_modules
+            .into_iter()
+            .map(|module| {
+                let mut mapping = ModuleMapping::from_path(module.module_path);
+                mapping.loaded_address = module.loaded_address;
+                mapping.load_bias = module.load_bias;
+                mapping.size = module.size;
+                mapping
+            })
+            .collect();
 
         tracing::info!(
             "Discovered {} modules for PID {}",
