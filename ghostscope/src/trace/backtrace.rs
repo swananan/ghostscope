@@ -1,7 +1,9 @@
 use ghostscope_dwarf::{DwarfAnalyzer, FunctionParameter, ModuleAddress, PcContext};
 use ghostscope_process::{PidOffsetsEntry, ProcessManager};
+#[cfg(test)]
+use ghostscope_protocol::trace_event::backtrace_error_label;
 use ghostscope_protocol::trace_event::{
-    backtrace_error_label, BacktraceStatus, BACKTRACE_FLAG_INLINE, BACKTRACE_FLAG_RAW,
+    BacktraceStatus, BACKTRACE_FLAG_INLINE, BACKTRACE_FLAG_RAW,
 };
 use ghostscope_protocol::{ParsedBacktraceFrame, ParsedInstruction, ParsedTraceEvent};
 use ghostscope_ui::{BacktraceDisplay, BacktraceDisplayFrame, TraceDisplayItem, UiTraceEvent};
@@ -20,6 +22,7 @@ struct ResolvedFrameModule<'a> {
 
 #[derive(Debug)]
 pub struct BacktraceRenderer {
+    #[cfg(test)]
     frame_cache: SimpleCache<FrameRenderCacheKey, Vec<String>>,
     frame_display_cache: SimpleCache<FrameRenderCacheKey, Vec<BacktraceDisplayFrame>>,
     status_cache: SimpleCache<StatusCacheKey, BacktraceStatus>,
@@ -28,6 +31,7 @@ pub struct BacktraceRenderer {
 impl Default for BacktraceRenderer {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
             frame_cache: SimpleCache::new(FRAME_RENDER_CACHE_MAX_ENTRIES),
             frame_display_cache: SimpleCache::new(FRAME_RENDER_CACHE_MAX_ENTRIES),
             status_cache: SimpleCache::new(STATUS_CACHE_MAX_ENTRIES),
@@ -168,6 +172,7 @@ impl BacktraceRenderer {
         }
     }
 
+    #[cfg(test)]
     pub fn render_event_backtraces(
         &mut self,
         event: &ParsedTraceEvent,
@@ -209,6 +214,7 @@ impl BacktraceRenderer {
         }
     }
 
+    #[cfg(test)]
     fn format_backtrace_instruction(
         &mut self,
         instruction: &ParsedInstruction,
@@ -366,6 +372,7 @@ impl BacktraceRenderer {
         display_status
     }
 
+    #[cfg(test)]
     fn format_frame(
         &mut self,
         index: usize,
@@ -570,12 +577,7 @@ fn flush_text_chunk(
         tid: event.tid,
         instructions: std::mem::take(text_chunk),
     };
-    items.extend(
-        chunk_event
-            .to_formatted_output()
-            .into_iter()
-            .map(|content| TraceDisplayItem::Text { content }),
-    );
+    items.extend(UiTraceEvent::from_protocol_event(&chunk_event).items);
 }
 
 fn is_process_entry_frame(analyzer: &DwarfAnalyzer, module_path: &str, pc: u64) -> bool {
@@ -605,6 +607,7 @@ fn candidate_pids(event_pid: u32, proc_pid_hint: Option<u32>) -> Vec<u32> {
     seen.into_iter().collect()
 }
 
+#[cfg(test)]
 fn format_backtrace_header(status: BacktraceStatus, frames: usize, requested_depth: u8) -> String {
     let frame_word = if frames == 1 { "frame" } else { "frames" };
     format!(
@@ -645,6 +648,7 @@ fn resolve_frame_module<'a>(
     None
 }
 
+#[cfg(test)]
 fn format_raw_frame(
     index: usize,
     frame: &ParsedBacktraceFrame,
@@ -708,6 +712,7 @@ fn format_line_info(line: &ghostscope_dwarf::PcLineInfo) -> String {
     }
 }
 
+#[cfg(test)]
 fn format_function_signature(function: &str, analyzer: &DwarfAnalyzer, ctx: &PcContext) -> String {
     let parameters = format_function_parameters(analyzer, ctx);
     if parameters.is_empty() {

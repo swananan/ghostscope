@@ -435,6 +435,18 @@ impl EbpfPanelRenderer {
     ) -> Vec<Line<'static>> {
         match item {
             TraceDisplayItem::Text { content } => Self::render_text_item(content, content_width),
+            TraceDisplayItem::FormattedText { content } => {
+                Self::render_text_item(content, content_width)
+            }
+            TraceDisplayItem::Variable(variable) => {
+                Self::render_text_item(&variable.to_formatted_output(), content_width)
+            }
+            TraceDisplayItem::ComplexVariable(variable) => {
+                Self::render_text_item(&variable.to_formatted_output(), content_width)
+            }
+            TraceDisplayItem::ExprError(error) => {
+                Self::render_text_item(&error.to_formatted_output(), content_width)
+            }
             TraceDisplayItem::Backtrace(backtrace) => Self::render_backtrace_item(
                 backtrace,
                 matches!(view_mode, EbpfViewMode::Expanded { .. }),
