@@ -409,19 +409,19 @@ async fn run_cli_with_session(
                             ) {
                                 ScriptOutputRateDecision::Silent => {}
                                 ScriptOutputRateDecision::Render => {
-                                    let rendered_event = {
+                                    let display_event = {
                                         let coordinator = session
                                             .coordinator
                                             .lock()
                                             .expect("coordinator mutex poisoned");
-                                        backtrace_renderer.render_event_backtraces(
+                                        backtrace_renderer.render_event_for_tui(
                                             &event,
                                             session.process_analyzer.as_ref(),
                                             &coordinator,
                                             session.proc_pid(),
                                         )
                                     };
-                                    match output_renderer.write_event(&rendered_event, &mut stdout) {
+                                    match output_renderer.write_display_event(&display_event, &mut stdout) {
                                         Ok(wrote) => wrote_output |= wrote,
                                         Err(e) => warn!("Failed to write event output: {e}"),
                                     }

@@ -1,16 +1,16 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 use ghostscope_protocol::{
     trace_event::{backtrace_error_label, BacktraceStatus},
-    ParsedTraceEvent,
+    ParsedInstruction, ParsedTraceEvent,
 };
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
-/// Runtime trace event after conversion into TUI display items.
+/// Runtime trace event after conversion into display items.
 ///
 /// This keeps the UI transport structured without changing the eBPF/protocol
-/// wire format. Non-backtrace instructions are grouped into text lines, while
-/// backtraces keep frame/status fields for dedicated TUI rendering.
+/// wire format. Backtraces, variables, and runtime expression errors keep their
+/// fields for dedicated CLI/TUI rendering.
 #[derive(Debug, Clone)]
 pub struct UiTraceEvent {
     pub trace_id: u64,
@@ -39,11 +39,7 @@ impl UiTraceEvent {
             timestamp: event.timestamp,
             pid: event.pid,
             tid: event.tid,
-            items: event
-                .to_formatted_output()
-                .into_iter()
-                .map(|content| TraceDisplayItem::Text { content })
-                .collect(),
+            items: protocol_instructions_to_display_items(&event.instructions),
             execution_status,
         }
     }
@@ -76,13 +72,13 @@ impl UiTraceEvent {
     pub fn is_error(&self) -> bool {
         self.execution_status
             .is_some_and(|status| status == 1 || status == 2)
-            || self.items.iter().any(|item| {
-                matches!(
-                    item,
-                    TraceDisplayItem::Backtrace(backtrace)
-                        if backtrace.status != BacktraceStatus::Complete
-                            && backtrace.status != BacktraceStatus::Truncated
-                )
+            || self.items.iter().any(|item| match item {
+                TraceDisplayItem::ExprError(_) => true,
+                TraceDisplayItem::Backtrace(backtrace) => {
+                    backtrace.status != BacktraceStatus::Complete
+                        && backtrace.status != BacktraceStatus::Truncated
+                }
+                _ => false,
             })
     }
 }
@@ -90,6 +86,10 @@ impl UiTraceEvent {
 #[derive(Debug, Clone)]
 pub enum TraceDisplayItem {
     Text { content: String },
+    FormattedText { content: String },
+    Variable(VariableDisplay),
+    ComplexVariable(ComplexVariableDisplay),
+    ExprError(ExprErrorDisplay),
     Backtrace(BacktraceDisplay),
 }
 
@@ -97,9 +97,245 @@ impl TraceDisplayItem {
     pub fn to_formatted_output(&self) -> Vec<String> {
         match self {
             Self::Text { content } => vec![content.clone()],
+            Self::FormattedText { content } => vec![content.clone()],
+            Self::Variable(variable) => vec![variable.to_formatted_output()],
+            Self::ComplexVariable(variable) => vec![variable.to_formatted_output()],
+            Self::ExprError(error) => vec![error.to_formatted_output()],
             Self::Backtrace(backtrace) => backtrace.to_formatted_output(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct VariableDisplay {
+    pub name: String,
+    pub type_name: String,
+    pub formatted_value: String,
+}
+
+impl VariableDisplay {
+    pub fn to_formatted_output(&self) -> String {
+        format!(
+            "{} ({}): {}",
+            self.name, self.type_name, self.formatted_value
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ComplexVariableDisplay {
+    pub name: String,
+    pub access_path: String,
+    pub type_index: u16,
+    pub formatted_value: String,
+}
+
+impl ComplexVariableDisplay {
+    pub fn display_name(&self) -> &str {
+        if self.access_path.is_empty() {
+            &self.name
+        } else {
+            &self.access_path
+        }
+    }
+
+    pub fn to_formatted_output(&self) -> String {
+        self.formatted_value.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExprErrorDisplay {
+    pub expr: String,
+    pub error_code: u8,
+    pub flags: u8,
+    pub failing_addr: u64,
+}
+
+impl ExprErrorDisplay {
+    pub fn reason(&self) -> &'static str {
+        match self.error_code {
+            1 => "null deref",
+            2 => "read error",
+            3 => "access error",
+            4 => "truncated",
+            5 => "offsets unavailable",
+            6 => "zero length",
+            _ => "error",
+        }
+    }
+
+    pub fn readable_flags(&self) -> Option<String> {
+        if self.flags == 0 {
+            return None;
+        }
+        let mut tags: Vec<&'static str> = Vec::new();
+        let is_memcmp = self.expr.contains("memcmp(");
+        let is_strncmp = self.expr.contains("strncmp(") || self.expr.contains("starts_with(");
+        if is_memcmp {
+            if (self.flags & 0x01) != 0 {
+                tags.push("first-arg read-fail");
+            }
+            if (self.flags & 0x02) != 0 {
+                tags.push("second-arg read-fail");
+            }
+            if (self.flags & 0x04) != 0 {
+                tags.push("len-clamped");
+            }
+            if (self.flags & 0x08) != 0 {
+                tags.push("len=0");
+            }
+        } else if is_strncmp {
+            if (self.flags & 0x01) != 0 {
+                tags.push("read-fail");
+            }
+            if (self.flags & 0x04) != 0 {
+                tags.push("len-clamped");
+            }
+            if (self.flags & 0x08) != 0 {
+                tags.push("len=0");
+            }
+        } else {
+            return Some(format!("0x{:02x}", self.flags));
+        }
+
+        (!tags.is_empty()).then(|| tags.join(","))
+    }
+
+    pub fn addr_text(&self) -> String {
+        if self.failing_addr != 0 {
+            format!("at 0x{:016x}", self.failing_addr)
+        } else {
+            "at NULL".to_string()
+        }
+    }
+
+    pub fn to_formatted_output(&self) -> String {
+        let base = format!(
+            "ExprError: {} ({} {}",
+            self.expr,
+            self.reason(),
+            self.addr_text()
+        );
+        match self.readable_flags() {
+            Some(flags) => format!("{base}, flags: {flags})"),
+            None => format!("{base})"),
+        }
+    }
+}
+
+fn protocol_instructions_to_display_items(
+    instructions: &[ParsedInstruction],
+) -> Vec<TraceDisplayItem> {
+    let mut items = Vec::new();
+    let mut index = 0usize;
+
+    while index < instructions.len() {
+        match &instructions[index] {
+            ParsedInstruction::PrintString { content } => {
+                if content.contains("{}") {
+                    let (formatted, consumed) =
+                        format_string_with_variable_items(content, instructions, index + 1);
+                    items.push(TraceDisplayItem::FormattedText { content: formatted });
+                    index += consumed;
+                } else {
+                    items.push(TraceDisplayItem::Text {
+                        content: content.clone(),
+                    });
+                    index += 1;
+                }
+            }
+            ParsedInstruction::PrintVariable {
+                name,
+                type_encoding,
+                formatted_value,
+                ..
+            } => {
+                items.push(TraceDisplayItem::Variable(VariableDisplay {
+                    name: name.clone(),
+                    type_name: format!("{type_encoding:?}"),
+                    formatted_value: formatted_value.clone(),
+                }));
+                index += 1;
+            }
+            ParsedInstruction::ExprError {
+                expr,
+                error_code,
+                flags,
+                failing_addr,
+            } => {
+                items.push(TraceDisplayItem::ExprError(ExprErrorDisplay {
+                    expr: expr.clone(),
+                    error_code: *error_code,
+                    flags: *flags,
+                    failing_addr: *failing_addr,
+                }));
+                index += 1;
+            }
+            ParsedInstruction::PrintComplexFormat { formatted_output } => {
+                items.push(TraceDisplayItem::FormattedText {
+                    content: formatted_output.clone(),
+                });
+                index += 1;
+            }
+            ParsedInstruction::PrintComplexVariable {
+                name,
+                access_path,
+                type_index,
+                formatted_value,
+                ..
+            } => {
+                items.push(TraceDisplayItem::ComplexVariable(ComplexVariableDisplay {
+                    name: name.clone(),
+                    access_path: access_path.clone(),
+                    type_index: *type_index,
+                    formatted_value: formatted_value.clone(),
+                }));
+                index += 1;
+            }
+            ParsedInstruction::Backtrace { .. } => {
+                index += 1;
+            }
+            ParsedInstruction::EndInstruction { .. } => {
+                index += 1;
+            }
+        }
+    }
+
+    items
+}
+
+fn format_string_with_variable_items(
+    format_string: &str,
+    instructions: &[ParsedInstruction],
+    start_index: usize,
+) -> (String, usize) {
+    let placeholder_count = format_string.matches("{}").count();
+    let mut consumed = 1;
+    let mut result = String::with_capacity(format_string.len());
+    let mut remaining = format_string;
+
+    for instruction_index in start_index..(start_index + placeholder_count).min(instructions.len())
+    {
+        let Some(pos) = remaining.find("{}") else {
+            break;
+        };
+
+        if let Some(ParsedInstruction::PrintVariable {
+            formatted_value, ..
+        }) = instructions.get(instruction_index)
+        {
+            result.push_str(&remaining[..pos]);
+            result.push_str(formatted_value);
+            consumed += 1;
+            remaining = &remaining[pos + 2..];
+        } else {
+            break;
+        }
+    }
+    result.push_str(remaining);
+
+    (result, consumed)
 }
 
 #[derive(Debug, Clone)]
@@ -1489,6 +1725,7 @@ impl RuntimeStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghostscope_protocol::{ParsedInstruction, ParsedTraceEvent, TypeKind};
 
     fn sample_event(trace_id: u64) -> UiTraceEvent {
         UiTraceEvent {
@@ -1508,6 +1745,86 @@ mod tests {
 
         channels.trace_sender.try_send(sample_event(1)).unwrap();
         assert!(channels.trace_sender.try_send(sample_event(2)).is_err());
+    }
+
+    #[test]
+    fn protocol_event_preserves_structured_print_items() {
+        let event = ParsedTraceEvent {
+            trace_id: 7,
+            timestamp: 11,
+            pid: 42,
+            tid: 43,
+            instructions: vec![
+                ParsedInstruction::PrintString {
+                    content: "value={}".to_string(),
+                },
+                ParsedInstruction::PrintVariable {
+                    name: "counter".to_string(),
+                    type_encoding: TypeKind::U64,
+                    formatted_value: "99".to_string(),
+                    raw_data: Vec::new(),
+                },
+                ParsedInstruction::PrintVariable {
+                    name: "standalone".to_string(),
+                    type_encoding: TypeKind::I32,
+                    formatted_value: "-1".to_string(),
+                    raw_data: Vec::new(),
+                },
+                ParsedInstruction::PrintComplexVariable {
+                    name: "req".to_string(),
+                    access_path: "req.method".to_string(),
+                    type_index: 12,
+                    formatted_value: "req.method = GET".to_string(),
+                    raw_data: Vec::new(),
+                },
+                ParsedInstruction::ExprError {
+                    expr: "memcmp(buf, hex(\"41\"), 1)".to_string(),
+                    error_code: 2,
+                    flags: 0x01,
+                    failing_addr: 0x1234,
+                },
+                ParsedInstruction::EndInstruction {
+                    total_instructions: 5,
+                    execution_status: 1,
+                },
+            ],
+        };
+
+        let display = UiTraceEvent::from_protocol_event(&event);
+        assert_eq!(display.items.len(), 4);
+        assert!(matches!(
+            &display.items[0],
+            TraceDisplayItem::FormattedText { content } if content == "value=99"
+        ));
+        assert!(matches!(
+            &display.items[1],
+            TraceDisplayItem::Variable(variable)
+                if variable.name == "standalone"
+                    && variable.type_name == "I32"
+                    && variable.formatted_value == "-1"
+        ));
+        assert!(matches!(
+            &display.items[2],
+            TraceDisplayItem::ComplexVariable(variable)
+                if variable.display_name() == "req.method"
+                    && variable.to_formatted_output() == "req.method = GET"
+        ));
+        assert!(matches!(
+            &display.items[3],
+            TraceDisplayItem::ExprError(error)
+                if error.reason() == "read error"
+                    && error.readable_flags().as_deref() == Some("first-arg read-fail")
+        ));
+        assert!(display.is_error());
+        assert_eq!(
+            display.to_formatted_output(),
+            vec![
+                "value=99".to_string(),
+                "standalone (I32): -1".to_string(),
+                "req.method = GET".to_string(),
+                "ExprError: memcmp(buf, hex(\"41\"), 1) (read error at 0x0000000000001234, flags: first-arg read-fail)".to_string(),
+            ]
+        );
     }
 }
 

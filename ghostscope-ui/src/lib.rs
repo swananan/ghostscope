@@ -11,8 +11,9 @@ pub mod utils;
 pub use action::{Action, PanelType};
 pub use components::App;
 pub use events::{
-    BacktraceDisplay, BacktraceDisplayFrame, EventRegistry, RuntimeChannels, RuntimeCommand,
-    RuntimeStatus, TraceDisplayItem, TuiEvent, UiTraceEvent,
+    BacktraceDisplay, BacktraceDisplayFrame, ComplexVariableDisplay, EventRegistry,
+    ExprErrorDisplay, RuntimeChannels, RuntimeCommand, RuntimeStatus, TraceDisplayItem, TuiEvent,
+    UiTraceEvent, VariableDisplay,
 };
 pub use model::ui_state::{HistoryConfig, LayoutMode, UiConfig};
 
