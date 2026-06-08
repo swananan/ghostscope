@@ -420,7 +420,8 @@ trace dummy_touch {
     assert!(
         !block.contains("stopped: invalid frame")
             && !block.contains("stopped: read error")
-            && !block.contains("stopped: unsupported CFI"),
+            && !block.contains("stopped: unsupported CFI")
+            && !block.contains("stopped: no unwind rows for PC"),
         "full user stack should not stop on an unwind error\nBLOCK:\n{block}\nSTDERR:\n{stderr}"
     );
     assert_no_adjacent_duplicate_frame_locations(block)?;
@@ -606,7 +607,8 @@ trace dummy_touch {
         assert!(
             !block.contains("stopped: invalid frame")
                 && !block.contains("stopped: read error")
-                && !block.contains("stopped: unsupported CFI"),
+                && !block.contains("stopped: unsupported CFI")
+                && !block.contains("stopped: no unwind rows for PC"),
             "deep multi-bt stack should not stop on an unwind error\nBLOCK:\n{block}\nSTDERR:\n{stderr}"
         );
     }
@@ -662,7 +664,8 @@ trace dummy_touch {
         assert!(
             !event.contains("stopped: invalid frame")
                 && !event.contains("stopped: read error")
-                && !event.contains("stopped: unsupported CFI"),
+                && !event.contains("stopped: unsupported CFI")
+                && !event.contains("stopped: no unwind rows for PC"),
             "conditional bt should not consume stale slot state\nEVENT:\n{event}"
         );
     }
@@ -805,7 +808,8 @@ trace dummy_touch {
         "non-PIE PID-mode CFI rows should match raw ET_EXEC PCs and unwind callers\nBLOCK:\n{block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
     assert!(
-        !block.contains("stopped: unsupported CFI"),
+        !block.contains("stopped: unsupported CFI")
+            && !block.contains("stopped: no unwind rows for PC"),
         "non-PIE PID-mode rows should not be shifted by mapping base\nBLOCK:\n{block}\nSTDERR:\n{stderr}"
     );
 
@@ -861,7 +865,8 @@ trace cross_module_lib_leaf {
     assert!(
         !block.contains("stopped: invalid frame")
             && !block.contains("stopped: read error")
-            && !block.contains("stopped: unsupported CFI"),
+            && !block.contains("stopped: unsupported CFI")
+            && !block.contains("stopped: no unwind rows for PC"),
         "cross-module stack should not stop on an unwind error\nBLOCK:\n{block}\nSTDERR:\n{stderr}"
     );
     assert_no_adjacent_duplicate_frame_locations(block)?;
@@ -1033,7 +1038,8 @@ trace hot_bt_probe {
     assert!(
         !stdout.contains("stopped: invalid frame")
             && !stdout.contains("stopped: read error")
-            && !stdout.contains("stopped: unsupported CFI"),
+            && !stdout.contains("stopped: unsupported CFI")
+            && !stdout.contains("stopped: no unwind rows for PC"),
         "depth=128 full backtrace should not stop on an unwind error\nSTDOUT: {stdout}\nSTDERR: {stderr}"
     );
 
@@ -1064,7 +1070,8 @@ trace hot_bt_probe {
     assert!(
         !stdout.contains("stopped: invalid frame")
             && !stdout.contains("stopped: read error")
-            && !stdout.contains("stopped: unsupported CFI"),
+            && !stdout.contains("stopped: unsupported CFI")
+            && !stdout.contains("stopped: no unwind rows for PC"),
         "deep full backtrace should not regress into unwind errors under event load\nSTDOUT: {stdout}\nSTDERR: {stderr}"
     );
     assert!(

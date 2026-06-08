@@ -726,7 +726,7 @@ backtrace: truncated, 2 frames (max 2)
   #1 0x1234 [sample_program+0x1234] raw=0x55... cookie=0x...
 ```
 
-`status=complete` means DWARF unwinding reached a natural stop before the configured depth cap. `status=truncated` means GhostScope hit the configured depth cap or the eBPF tail-call unwind budget before a natural stop. Other statuses explain where unwinding stopped, for example unsupported CFI, unavailable module offsets, a failed user-memory read, or an invalid next frame. When available, `stopped:` includes a stable reason label and numeric code.
+`status=complete` means DWARF unwinding reached a natural stop before the configured depth cap. `status=truncated` means GhostScope hit the configured depth cap or the eBPF tail-call unwind budget before a natural stop. Other statuses explain where unwinding stopped, for example no unwind rows for the current PC, unsupported CFI, unavailable module offsets, a failed user-memory read, or an invalid next frame. When available, `stopped:` includes a stable reason label and numeric code.
 
 ## Examples
 

@@ -772,6 +772,7 @@ impl EbpfPanelRenderer {
             BacktraceStatus::Truncated
             | BacktraceStatus::DwarfUnavailable
             | BacktraceStatus::UnsupportedCfi
+            | BacktraceStatus::NoUnwindRowsForPc
             | BacktraceStatus::OffsetsUnavailable => Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),

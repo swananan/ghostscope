@@ -332,7 +332,10 @@ impl BacktraceRenderer {
         coordinator: &ProcessManager,
         pids: &[u32],
     ) -> BacktraceStatus {
-        if status != BacktraceStatus::UnsupportedCfi {
+        if !matches!(
+            status,
+            BacktraceStatus::UnsupportedCfi | BacktraceStatus::NoUnwindRowsForPc
+        ) {
             return status;
         }
 
@@ -800,6 +803,14 @@ mod tests {
             .iter()
             .any(|line| line.contains("stopped: unsupported CFI")));
         assert_eq!(output.last().map(String::as_str), Some("after"));
+    }
+
+    #[test]
+    fn formats_no_unwind_rows_for_pc_status() {
+        assert_eq!(
+            format_backtrace_header(BacktraceStatus::NoUnwindRowsForPc, 1, 3),
+            "backtrace: no unwind rows for PC, 1 frame (max 3)"
+        );
     }
 
     #[test]

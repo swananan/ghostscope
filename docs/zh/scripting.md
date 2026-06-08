@@ -755,7 +755,7 @@ backtrace: truncated, 2 frames (max 2)
   #1 0x1234 [sample_program+0x1234] raw=0x55... cookie=0x...
 ```
 
-`status=complete` 表示 DWARF unwind 在达到配置的深度上限前自然结束。`status=truncated` 表示 GhostScope 达到了配置的深度上限，或先达到了 eBPF tail-call unwind 预算。其他状态会说明 unwind 停止的原因，例如 CFI 不支持、模块偏移不可用、读取用户栈内存失败，或下一帧地址/CFA 不合法。可用时，`stopped:` 会附带稳定的原因标签和数字 code。
+`status=complete` 表示 DWARF unwind 在达到配置的深度上限前自然结束。`status=truncated` 表示 GhostScope 达到了配置的深度上限，或先达到了 eBPF tail-call unwind 预算。其他状态会说明 unwind 停止的原因，例如当前 PC 没有可用的 unwind row、CFI 不支持、模块偏移不可用、读取用户栈内存失败，或下一帧地址/CFA 不合法。可用时，`stopped:` 会附带稳定的原因标签和数字 code。
 
 ## 示例
 
