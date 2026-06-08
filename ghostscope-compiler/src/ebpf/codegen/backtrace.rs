@@ -68,6 +68,12 @@ struct BtFrameValidation<'ctx> {
     error_code: IntValue<'ctx>,
 }
 
+enum BacktraceUnwindRowForPc {
+    Usable(ghostscope_protocol::BacktraceUnwindRow),
+    Missing,
+    Unsupported,
+}
+
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(crate) fn prepare_backtrace_unwind_rows(&mut self, statements: &[Statement]) {
         self.backtrace_unwind_rows.clear();
@@ -287,15 +293,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         let row = self
-            .compact_unwind_row_for_backtrace(&compile_ctx.module_path, compile_ctx.pc_address)
-            .and_then(|row| backtrace_unwind_row_from_compact(&row));
-        let initial_status = if row.is_some() {
-            BacktraceStatus::ReadError
-        } else if self.process_analyzer.is_some() {
-            BacktraceStatus::UnsupportedCfi
-        } else {
-            BacktraceStatus::DwarfUnavailable
-        };
+            .usable_backtrace_unwind_row_for_pc(&compile_ctx.module_path, compile_ctx.pc_address);
+        let initial_status = self.status_for_backtrace_unwind_row_for_pc(&row);
         let status = self.status_or_offsets_unavailable(initial_status, offsets_found)?;
         self.store_u8_value(
             inst_buffer,
@@ -304,7 +303,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             "bt_initial_status",
         )?;
 
-        let Some(row) = row else {
+        let BacktraceUnwindRowForPc::Usable(row) = row else {
             return Ok(());
         };
 
@@ -404,8 +403,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .build_unconditional_branch(done)
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         } else if self.backtrace_unwind_rows.is_empty() {
-            let status =
-                self.status_or_offsets_unavailable(BacktraceStatus::UnsupportedCfi, offsets_found)?;
+            let status = self
+                .status_or_offsets_unavailable(BacktraceStatus::NoUnwindRowsForPc, offsets_found)?;
             self.store_u8_value(
                 inst_buffer,
                 data_base + BACKTRACE_DATA_STATUS_OFFSET,
@@ -433,7 +432,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
                 self.builder.position_at_end(missing_block);
                 let status = self.status_or_offsets_unavailable(
-                    BacktraceStatus::UnsupportedCfi,
+                    BacktraceStatus::NoUnwindRowsForPc,
                     offsets_found,
                 )?;
                 self.store_u8_value(
@@ -646,8 +645,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         if self.backtrace_unwind_rows.is_empty() {
-            let status =
-                self.status_or_offsets_unavailable(BacktraceStatus::UnsupportedCfi, offsets_found)?;
+            let status = self
+                .status_or_offsets_unavailable(BacktraceStatus::NoUnwindRowsForPc, offsets_found)?;
             self.store_u8_value(
                 inst_buffer,
                 data_base + BACKTRACE_DATA_STATUS_OFFSET,
@@ -657,19 +656,21 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             return Ok(());
         }
 
-        let row = self
-            .compact_unwind_row_for_backtrace(&compile_ctx.module_path, compile_ctx.pc_address)
-            .and_then(|row| backtrace_unwind_row_from_compact(&row));
-        let Some(row) = row else {
-            let status =
-                self.status_or_offsets_unavailable(BacktraceStatus::UnsupportedCfi, offsets_found)?;
-            self.store_u8_value(
-                inst_buffer,
-                data_base + BACKTRACE_DATA_STATUS_OFFSET,
-                status,
-                "bt_status_no_initial_row",
-            )?;
-            return Ok(());
+        let row = match self
+            .usable_backtrace_unwind_row_for_pc(&compile_ctx.module_path, compile_ctx.pc_address)
+        {
+            BacktraceUnwindRowForPc::Usable(row) => row,
+            row_status => {
+                let initial_status = self.status_for_backtrace_unwind_row_for_pc(&row_status);
+                let status = self.status_or_offsets_unavailable(initial_status, offsets_found)?;
+                self.store_u8_value(
+                    inst_buffer,
+                    data_base + BACKTRACE_DATA_STATUS_OFFSET,
+                    status,
+                    "bt_status_no_initial_row",
+                )?;
+                return Ok(());
+            }
         };
 
         let status =
@@ -788,8 +789,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
             self.builder.position_at_end(missing_block);
-            let status =
-                self.status_or_offsets_unavailable(BacktraceStatus::UnsupportedCfi, offsets_found)?;
+            let status = self
+                .status_or_offsets_unavailable(BacktraceStatus::NoUnwindRowsForPc, offsets_found)?;
             self.store_u8_value(
                 inst_buffer,
                 data_base + BACKTRACE_DATA_STATUS_OFFSET,
@@ -1563,7 +1564,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder.position_at_end(row_missing_block);
         self.store_tail_backtrace_status(
             inst_buffer,
-            BacktraceStatus::UnsupportedCfi,
+            BacktraceStatus::NoUnwindRowsForPc,
             BACKTRACE_ERROR_NONE,
         )?;
         self.builder
@@ -1759,6 +1760,38 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let module_address = ModuleAddress::new(PathBuf::from(module_path), pc);
         let ctx = analyzer.resolve_pc(&module_address).ok()?;
         analyzer.compact_unwind_row_for_context(&ctx).ok().flatten()
+    }
+
+    fn usable_backtrace_unwind_row_for_pc(
+        &self,
+        module_path: &str,
+        pc: u64,
+    ) -> BacktraceUnwindRowForPc {
+        let Some(row) = self.compact_unwind_row_for_backtrace(module_path, pc) else {
+            return BacktraceUnwindRowForPc::Missing;
+        };
+        match backtrace_unwind_row_from_compact(&row) {
+            Some(row) => BacktraceUnwindRowForPc::Usable(row),
+            None => BacktraceUnwindRowForPc::Unsupported,
+        }
+    }
+
+    fn status_for_backtrace_unwind_row_for_pc(
+        &self,
+        row: &BacktraceUnwindRowForPc,
+    ) -> BacktraceStatus {
+        match row {
+            BacktraceUnwindRowForPc::Usable(_) => BacktraceStatus::ReadError,
+            BacktraceUnwindRowForPc::Missing if self.process_analyzer.is_some() => {
+                BacktraceStatus::NoUnwindRowsForPc
+            }
+            BacktraceUnwindRowForPc::Unsupported if self.process_analyzer.is_some() => {
+                BacktraceStatus::UnsupportedCfi
+            }
+            BacktraceUnwindRowForPc::Missing | BacktraceUnwindRowForPc::Unsupported => {
+                BacktraceStatus::DwarfUnavailable
+            }
+        }
     }
 
     fn runtime_row_from_static(

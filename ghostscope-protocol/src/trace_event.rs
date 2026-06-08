@@ -225,6 +225,7 @@ pub enum BacktraceStatus {
     ReadError = 5,
     InternalError = 6,
     InvalidFrame = 7,
+    NoUnwindRowsForPc = 8,
 }
 
 impl BacktraceStatus {
@@ -238,6 +239,7 @@ impl BacktraceStatus {
             5 => Self::ReadError,
             6 => Self::InternalError,
             7 => Self::InvalidFrame,
+            8 => Self::NoUnwindRowsForPc,
             _ => Self::InternalError,
         }
     }
@@ -252,6 +254,7 @@ impl BacktraceStatus {
             Self::ReadError => "read error",
             Self::InternalError => "internal error",
             Self::InvalidFrame => "invalid frame",
+            Self::NoUnwindRowsForPc => "no unwind rows for PC",
         }
     }
 }
@@ -377,6 +380,24 @@ mod tests {
             execution_status: 0,
         };
         assert_eq!(inst.instruction_type(), InstructionType::EndInstruction);
+    }
+
+    #[test]
+    fn backtrace_status_wire_values_and_labels_are_stable() {
+        assert_eq!(BacktraceStatus::UnsupportedCfi as u8, 3);
+        assert_eq!(BacktraceStatus::NoUnwindRowsForPc as u8, 8);
+        assert_eq!(
+            BacktraceStatus::from_u8(8),
+            BacktraceStatus::NoUnwindRowsForPc
+        );
+        assert_eq!(
+            BacktraceStatus::NoUnwindRowsForPc.label(),
+            "no unwind rows for PC"
+        );
+        assert_eq!(
+            BacktraceStatus::from_u8(255),
+            BacktraceStatus::InternalError
+        );
     }
 
     #[test]
