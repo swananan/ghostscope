@@ -356,6 +356,235 @@ fn try_publish_sys_event(tx: &mpsc::SyncSender<SysEvent>, ev: SysEvent) -> bool 
 }
 
 #[cfg(feature = "sysmon-ebpf")]
+#[derive(Debug, Clone, Copy)]
+enum SysmonAttachBackend {
+    Raw,
+    Btf,
+    Classic,
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+impl SysmonAttachBackend {
+    fn label(self) -> &'static str {
+        match self {
+            SysmonAttachBackend::Raw => "raw tracepoint",
+            SysmonAttachBackend::Btf => "BTF tracepoint",
+            SysmonAttachBackend::Classic => "classic tracepoint",
+        }
+    }
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+struct SysmonTracepoint {
+    event: &'static str,
+    category: &'static str,
+    classic_program: &'static str,
+    raw_program: &'static str,
+    btf_program: &'static str,
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+const SYSMON_TRACEPOINTS: &[SysmonTracepoint] = &[
+    SysmonTracepoint {
+        event: "sched_process_exec",
+        category: "sched",
+        classic_program: "sched_process_exec",
+        raw_program: "raw_sched_process_exec",
+        btf_program: "btf_sched_process_exec",
+    },
+    SysmonTracepoint {
+        event: "sched_process_exit",
+        category: "sched",
+        classic_program: "sched_process_exit",
+        raw_program: "raw_sched_process_exit",
+        btf_program: "btf_sched_process_exit",
+    },
+    SysmonTracepoint {
+        event: "sched_process_fork",
+        category: "sched",
+        classic_program: "sched_process_fork",
+        raw_program: "raw_sched_process_fork",
+        btf_program: "btf_sched_process_fork",
+    },
+];
+
+#[cfg(feature = "sysmon-ebpf")]
+fn load_sysmon_bpf(obj: &[u8], use_verbose: bool) -> anyhow::Result<aya::Ebpf> {
+    use aya::{EbpfLoader, VerifierLogLevel};
+
+    let mut loader = EbpfLoader::new();
+    if use_verbose {
+        loader.verifier_log_level(VerifierLogLevel::VERBOSE | VerifierLogLevel::STATS);
+        tracing::info!("Sysmon verifier logs: VERBOSE (debug build/log)");
+    } else {
+        loader.verifier_log_level(VerifierLogLevel::DEBUG | VerifierLogLevel::STATS);
+        tracing::info!("Sysmon verifier logs: DEBUG (release/info)");
+    }
+
+    let pin_dir = crate::pinned_bpf_maps::proc_offsets_pin_dir()?;
+    loader.map_pin_path(
+        crate::pinned_bpf_maps::ALLOWED_PIDS_MAP_NAME,
+        pin_dir.join(crate::pinned_bpf_maps::ALLOWED_PIDS_MAP_NAME),
+    );
+    loader.map_pin_path(
+        crate::pinned_bpf_maps::TARGET_EXEC_COMM_MAP_NAME,
+        pin_dir.join(crate::pinned_bpf_maps::TARGET_EXEC_COMM_MAP_NAME),
+    );
+
+    Ok(loader.load(obj)?)
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+fn configure_sysmon_exec_comm_filter(
+    bpf: &mut aya::Ebpf,
+    target: Option<&Path>,
+) -> anyhow::Result<()> {
+    use aya::maps::Array;
+
+    let mut filter_bytes = [0u8; 16];
+    let mut filter_len = 0usize;
+    if let Some(tpath) = target {
+        if !crate::util::is_shared_object(tpath) {
+            if let Some(name) = tpath.file_name().and_then(|s| s.to_str()) {
+                let bytes = name.as_bytes();
+                // task->comm stores at most TASK_COMM_LEN - 1 visible bytes plus NUL.
+                // Keep the filter null-terminated so long executable basenames compare
+                // against the same truncation that bpf_get_current_comm() returns.
+                let len = bytes.len().min(filter_bytes.len() - 1);
+                filter_bytes[..len].copy_from_slice(&bytes[..len]);
+                filter_len = len;
+            } else {
+                tracing::warn!(
+                    "Sysmon: target basename contains non-UTF8 bytes; exec comm filter disabled"
+                );
+            }
+        }
+    }
+
+    if let Some(map) = bpf.map_mut("target_exec_comm") {
+        let mut array: Array<_, [u8; 16]> = map.try_into()?;
+        array.set(0, filter_bytes, 0)?;
+        if filter_len > 0 {
+            match std::str::from_utf8(&filter_bytes[..filter_len]) {
+                Ok(name_str) => {
+                    tracing::info!("Sysmon: exec comm filter configured for '{}'", name_str)
+                }
+                Err(_) => tracing::info!(
+                    "Sysmon: exec comm filter configured (non-UTF8 basename, len={})",
+                    filter_len
+                ),
+            }
+        } else {
+            tracing::info!("Sysmon: exec comm filter disabled");
+        }
+    } else if filter_len > 0 {
+        tracing::warn!("Sysmon: target_exec_comm map missing; exec filtering unavailable");
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+fn attach_sysmon_backend(bpf: &mut aya::Ebpf, backend: SysmonAttachBackend) -> anyhow::Result<()> {
+    match backend {
+        SysmonAttachBackend::Raw => attach_raw_sysmon_tracepoints(bpf),
+        SysmonAttachBackend::Btf => attach_btf_sysmon_tracepoints(bpf),
+        SysmonAttachBackend::Classic => attach_classic_sysmon_tracepoints(bpf),
+    }
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+fn attach_raw_sysmon_tracepoints(bpf: &mut aya::Ebpf) -> anyhow::Result<()> {
+    use aya::programs::RawTracePoint;
+
+    for spec in SYSMON_TRACEPOINTS {
+        let prog = bpf.program_mut(spec.raw_program).ok_or_else(|| {
+            anyhow::anyhow!("missing program '{}' in sysmon-bpf", spec.raw_program)
+        })?;
+        let tp: &mut RawTracePoint = prog.try_into()?;
+        tp.load()?;
+        tp.attach(spec.event)?;
+        info!("Attached raw tracepoint: {}", spec.event);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+fn attach_btf_sysmon_tracepoints(bpf: &mut aya::Ebpf) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use aya::{programs::BtfTracePoint, Btf};
+
+    let btf = Btf::from_sys_fs().context("kernel BTF is unavailable")?;
+    for spec in SYSMON_TRACEPOINTS {
+        let prog = bpf.program_mut(spec.btf_program).ok_or_else(|| {
+            anyhow::anyhow!("missing program '{}' in sysmon-bpf", spec.btf_program)
+        })?;
+        let tp: &mut BtfTracePoint = prog.try_into()?;
+        tp.load(spec.event, &btf)?;
+        tp.attach()?;
+        info!("Attached BTF tracepoint: {}", spec.event);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+fn attach_classic_sysmon_tracepoints(bpf: &mut aya::Ebpf) -> anyhow::Result<()> {
+    use aya::programs::TracePoint;
+
+    for spec in SYSMON_TRACEPOINTS {
+        let prog = bpf.program_mut(spec.classic_program).ok_or_else(|| {
+            anyhow::anyhow!("missing program '{}' in sysmon-bpf", spec.classic_program)
+        })?;
+        let tp: &mut TracePoint = prog.try_into()?;
+        tp.load()?;
+        tp.attach(spec.category, spec.event)?;
+        info!(
+            "Attached classic tracepoint: {}:{}",
+            spec.category, spec.event
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+fn load_and_attach_sysmon_bpf(
+    obj: &[u8],
+    target: Option<&Path>,
+    use_verbose: bool,
+) -> anyhow::Result<aya::Ebpf> {
+    let mut failures = Vec::new();
+    for backend in [
+        SysmonAttachBackend::Raw,
+        SysmonAttachBackend::Btf,
+        SysmonAttachBackend::Classic,
+    ] {
+        tracing::info!("Sysmon: trying {} backend", backend.label());
+        let result = (|| {
+            let mut bpf = load_sysmon_bpf(obj, use_verbose)?;
+            configure_sysmon_exec_comm_filter(&mut bpf, target)?;
+            attach_sysmon_backend(&mut bpf, backend)?;
+            Ok::<_, anyhow::Error>(bpf)
+        })();
+
+        match result {
+            Ok(bpf) => {
+                tracing::info!("Sysmon: using {} backend", backend.label());
+                return Ok(bpf);
+            }
+            Err(err) => {
+                tracing::warn!("Sysmon: {} backend unavailable: {:#}", backend.label(), err);
+                failures.push(format!("{}: {err:#}", backend.label()));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "no sysmon tracepoint backend available ({})",
+        failures.join("; ")
+    ))
+}
+
+#[cfg(feature = "sysmon-ebpf")]
 fn run_sysmon_loop(
     mgr: Arc<Mutex<ProcessManager>>,
     target: Option<PathBuf>,
@@ -363,13 +592,12 @@ fn run_sysmon_loop(
     perf_pages: Option<usize>,
     tx: mpsc::SyncSender<SysEvent>,
 ) -> anyhow::Result<()> {
+    use aya::include_bytes_aligned;
     use aya::maps::{
         perf::{PerfEvent, PerfEventArray},
         ring_buf::RingBuf,
-        Array, MapData,
+        MapData,
     };
-    use aya::programs::TracePoint;
-    use aya::{include_bytes_aligned, EbpfLoader, VerifierLogLevel};
     use log::{log_enabled, Level as LogLevel};
     // Load eBPF object (copied to OUT_DIR at build time)
     #[allow(unused_variables)]
@@ -385,90 +613,11 @@ fn run_sysmon_loop(
         warn!("sysmon-bpf object missing; running in stub mode (no realtime process events)");
         return Ok(());
     }
-    let mut loader = EbpfLoader::new();
     let use_verbose =
         cfg!(debug_assertions) || log_enabled!(LogLevel::Trace) || log_enabled!(LogLevel::Debug);
-    if use_verbose {
-        loader.verifier_log_level(VerifierLogLevel::VERBOSE | VerifierLogLevel::STATS);
-        tracing::info!("Sysmon verifier logs: VERBOSE (debug build/log)");
-    } else {
-        loader.verifier_log_level(VerifierLogLevel::DEBUG | VerifierLogLevel::STATS);
-        tracing::info!("Sysmon verifier logs: DEBUG (release/info)");
-    }
-    // Reuse pinned maps by name under our per-process dir.
-    let pin_dir = crate::pinned_bpf_maps::proc_offsets_pin_dir()?;
-    loader.map_pin_path(
-        crate::pinned_bpf_maps::ALLOWED_PIDS_MAP_NAME,
-        pin_dir.join(crate::pinned_bpf_maps::ALLOWED_PIDS_MAP_NAME),
-    );
-    loader.map_pin_path(
-        crate::pinned_bpf_maps::TARGET_EXEC_COMM_MAP_NAME,
-        pin_dir.join(crate::pinned_bpf_maps::TARGET_EXEC_COMM_MAP_NAME),
-    );
-    let mut bpf = loader.load(obj)?;
-
-    // Configure optional exec comm filter when targeting executables (-t binary).
-    // This is only a first-pass narrowing filter in BPF; userspace still validates
-    // the proc comm and target module/path before inserting offsets or allowed PIDs.
-    {
-        let mut filter_bytes = [0u8; 16];
-        let mut filter_len = 0usize;
-        if let Some(tpath) = target.as_ref() {
-            if !crate::util::is_shared_object(tpath) {
-                if let Some(name) = tpath.file_name().and_then(|s| s.to_str()) {
-                    let bytes = name.as_bytes();
-                    // task->comm stores at most TASK_COMM_LEN - 1 visible bytes plus NUL.
-                    // Keep the filter null-terminated so long executable basenames compare
-                    // against the same truncation that bpf_get_current_comm() returns.
-                    let len = bytes.len().min(filter_bytes.len() - 1);
-                    filter_bytes[..len].copy_from_slice(&bytes[..len]);
-                    filter_len = len;
-                } else {
-                    tracing::warn!(
-                        "Sysmon: target basename contains non-UTF8 bytes; exec comm filter disabled"
-                    );
-                }
-            }
-        }
-        if let Some(map) = bpf.map_mut("target_exec_comm") {
-            let mut array: Array<_, [u8; 16]> = map.try_into()?;
-            array.set(0, filter_bytes, 0)?;
-            if filter_len > 0 {
-                match std::str::from_utf8(&filter_bytes[..filter_len]) {
-                    Ok(name_str) => {
-                        tracing::info!("Sysmon: exec comm filter configured for '{}'", name_str)
-                    }
-                    Err(_) => tracing::info!(
-                        "Sysmon: exec comm filter configured (non-UTF8 basename, len={})",
-                        filter_len
-                    ),
-                }
-            } else {
-                tracing::info!("Sysmon: exec comm filter disabled");
-            }
-        } else if filter_len > 0 {
-            tracing::warn!("Sysmon: target_exec_comm map missing; exec filtering unavailable");
-        }
-    }
+    let mut bpf = load_and_attach_sysmon_bpf(obj, target.as_deref(), use_verbose)?;
 
     // Using allowlist-based gating in kernel; userspace decides allow on exec.
-
-    // Attach tracepoints
-    for (name, cat, evt) in [
-        ("sched_process_exec", "sched", "sched_process_exec"),
-        ("sched_process_exit", "sched", "sched_process_exit"),
-        ("sched_process_fork", "sched", "sched_process_fork"),
-    ] {
-        if let Some(prog) = bpf.program_mut(name) {
-            let tp: &mut TracePoint = prog.try_into()?;
-            tp.load()?;
-            tp.attach(cat, evt)?;
-            info!("Attached tracepoint: {}:{}", cat, evt);
-        } else {
-            warn!("Missing program '{}' in sysmon-bpf", name);
-        }
-    }
-    tracing::info!("Sysmon: attached all tracepoints");
 
     // Initial prefill for late-start cases: compute and insert offsets for already-running PIDs.
     if let Some(tpath) = &target {
