@@ -639,6 +639,18 @@ export LLVM_SYS_170_PREFIX=/usr/lib/llvm-17
 - **日志级别**：未指定时为 `warn`
 - **日志文件**：当前目录中的 `./ghostscope.log`
 
+### 启动加载报告
+
+启动阶段，GhostScope 可以在 trace attach 前报告 DWARF 的加载情况。在交互式
+终端中，如果启用了 CLI status 输出且没有启用 console stderr 日志，CLI 脚本
+模式会输出最终加载报告，包括目标摘要、调试信息来源计数（`embedded`、
+`explicit`、`debuglink`、`debuginfod`、`missing`），以及每个模块的函数、变量、
+类型数量。TUI 加载界面的进度和完成视图也会展示相同的来源分类。
+
+`missing` 表示该模块已被映射并加载，但 GhostScope 没有找到可用的 DWARF。
+如果需要查看完整路径和更细的解析步骤，使用
+`--log --log-level debug --log-file <path>` 或 `RUST_LOG=debug` 查看日志。
+
 ### 调试输出默认值
 
 - **Debug 构建**：保存 LLVM IR、eBPF 字节码和 AST 文件

@@ -1890,6 +1890,8 @@ impl App {
             functions,
             variables,
             types,
+            debug_source: "unknown".to_string(),
+            debug_source_path: None,
         };
         self.state
             .loading_ui
@@ -2267,6 +2269,8 @@ impl App {
                     functions: stats.functions,
                     variables: stats.variables,
                     types: stats.types,
+                    debug_source: stats.debug_source.clone(),
+                    debug_source_path: stats.debug_source_path.clone(),
                 };
                 self.state
                     .loading_ui

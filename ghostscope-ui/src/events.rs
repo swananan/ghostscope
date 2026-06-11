@@ -1387,6 +1387,8 @@ pub struct ModuleLoadingStats {
     pub functions: usize,
     pub variables: usize,
     pub types: usize,
+    pub debug_source: String,
+    pub debug_source_path: Option<String>,
     pub load_time_ms: u64,
 }
 

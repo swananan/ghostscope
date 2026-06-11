@@ -57,6 +57,45 @@ pub enum Provenance {
     Synthesized { detail: String },
 }
 
+/// Where DWARF debug information for a loaded module came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DebugInfoSource {
+    Embedded { path: String },
+    Explicit { path: String },
+    Debuglink { path: String },
+    Debuginfod { path: String },
+    Missing,
+}
+
+impl DebugInfoSource {
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Embedded { .. } => "embedded",
+            Self::Explicit { .. } => "explicit",
+            Self::Debuglink { .. } => "debuglink",
+            Self::Debuginfod { .. } => "debuginfod",
+            Self::Missing => "missing",
+        }
+    }
+
+    pub fn display_path(&self) -> Option<&str> {
+        match self {
+            Self::Embedded { path }
+            | Self::Explicit { path }
+            | Self::Debuglink { path }
+            | Self::Debuginfod { path } => Some(path),
+            Self::Missing => None,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        match self.display_path() {
+            Some(path) => format!("{} ({path})", self.kind_label()),
+            None => self.kind_label().to_string(),
+        }
+    }
+}
+
 /// Capabilities available to a future BPF lowering pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeCapabilities {

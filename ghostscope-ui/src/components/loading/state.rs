@@ -73,6 +73,53 @@ pub struct ModuleStats {
     pub functions: usize,
     pub variables: usize,
     pub types: usize,
+    pub debug_source: String,
+    pub debug_source_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DebugSourceCounts {
+    pub embedded: usize,
+    pub explicit: usize,
+    pub debuglink: usize,
+    pub debuginfod: usize,
+    pub missing: usize,
+    pub other: usize,
+}
+
+impl DebugSourceCounts {
+    fn record(&mut self, source: &str) {
+        match source {
+            "embedded" => self.embedded += 1,
+            "explicit" => self.explicit += 1,
+            "debuglink" => self.debuglink += 1,
+            "debuginfod" => self.debuginfod += 1,
+            "missing" => self.missing += 1,
+            _ => self.other += 1,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        push_nonzero(&mut parts, "embedded", self.embedded);
+        push_nonzero(&mut parts, "explicit", self.explicit);
+        push_nonzero(&mut parts, "debuglink", self.debuglink);
+        push_nonzero(&mut parts, "debuginfod", self.debuginfod);
+        push_nonzero(&mut parts, "missing", self.missing);
+        push_nonzero(&mut parts, "other", self.other);
+        parts.join("  ")
+    }
+
+    pub fn has_counts(&self) -> bool {
+        self.embedded + self.explicit + self.debuglink + self.debuginfod + self.missing + self.other
+            > 0
+    }
+}
+
+fn push_nonzero(parts: &mut Vec<String>, label: &str, count: usize) {
+    if count > 0 {
+        parts.push(format!("{label} {count}"));
+    }
 }
 
 impl ModuleLoadStatus {
@@ -115,6 +162,7 @@ pub struct LoadingProgress {
     pub completed_count: usize,
     pub failed_count: usize,
     pub current_loading: Option<String>,
+    pub debug_sources: DebugSourceCounts,
 }
 
 impl LoadingProgress {
@@ -125,6 +173,7 @@ impl LoadingProgress {
             completed_count: 0,
             failed_count: 0,
             current_loading: None,
+            debug_sources: DebugSourceCounts::default(),
         }
     }
 
@@ -141,6 +190,7 @@ impl LoadingProgress {
 
     pub fn complete_module(&mut self, path: &str, stats: ModuleStats) {
         if let Some(module) = self.modules.iter_mut().find(|m| m.path == path) {
+            self.debug_sources.record(&stats.debug_source);
             module.complete(stats);
             self.completed_count += 1;
             if self.current_loading.as_deref() == Some(path) {
@@ -207,6 +257,8 @@ impl LoadingProgress {
             functions: 0,
             variables: 0,
             types: 0,
+            debug_source: "summary".to_string(),
+            debug_source_path: None,
         };
 
         for module in &self.modules {

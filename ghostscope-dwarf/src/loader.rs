@@ -197,6 +197,7 @@ impl ModuleLoader {
                                 functions,
                                 variables,
                                 types,
+                                debug_info_source: module.get_debug_info_source().clone(),
                                 load_time_ms,
                                 parse_time_ms,
                                 index_time_ms,

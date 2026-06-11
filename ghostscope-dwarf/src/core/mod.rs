@@ -14,8 +14,8 @@ pub mod types;
 
 pub use demangle::is_likely_mangled;
 pub use diagnostic::{
-    AmbiguityReason, Availability, HelperMode, Provenance, RuntimeCapabilities, RuntimeRequirement,
-    TargetArch, UnsupportedReason, VerifierRisk,
+    AmbiguityReason, Availability, DebugInfoSource, HelperMode, Provenance, RuntimeCapabilities,
+    RuntimeRequirement, TargetArch, UnsupportedReason, VerifierRisk,
 };
 pub use errors::{DwarfError, Result};
 pub(crate) use evaluation::{

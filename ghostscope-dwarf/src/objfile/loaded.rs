@@ -2,7 +2,7 @@
 
 use crate::{
     binary::{DwarfReader, MappedFile},
-    core::{mapping::ModuleMapping, Result},
+    core::{mapping::ModuleMapping, DebugInfoSource, Result},
     index::{
         BlockIndex, LightweightIndex, LineMappingTable, ScopedFileIndexManager, TypeNameIndex,
     },
@@ -31,6 +31,7 @@ pub(crate) struct LoadedObjfile {
     pub(super) detailed_parser: DetailedParser,
     pub(super) _dwarf_mapped_file: Arc<MappedFile>,
     pub(super) _binary_mapped_file: Arc<MappedFile>,
+    pub(super) debug_info_source: DebugInfoSource,
     pub(super) entry_address: Option<u64>,
     pub(super) text_symbol_starts_by_name: HashMap<String, Vec<u64>>,
     pub(super) function_ranges_cache: RwLock<HashMap<FunctionRangeCacheKey, Vec<(u64, u64)>>>,
@@ -83,6 +84,10 @@ impl LoadedObjfile {
         } else {
             None
         }
+    }
+
+    pub(crate) fn get_debug_info_source(&self) -> &DebugInfoSource {
+        &self.debug_info_source
     }
 
     pub(super) fn dwarf(&self) -> &gimli::Dwarf<DwarfReader> {

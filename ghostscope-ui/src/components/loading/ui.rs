@@ -7,7 +7,13 @@ use ratatui::{
 };
 use std::time::Instant;
 
-use super::{LoadingProgress, LoadingState, ProgressRenderer};
+use super::{
+    debug_source_style, push_debug_source_count_spans, LoadingProgress, LoadingState,
+    ModuleLoadStatus, ModuleState, ProgressRenderer,
+};
+
+const MAX_WELCOME_DEBUG_SOURCE_DETAILS: usize = 8;
+const MAX_WELCOME_MISSING_EXAMPLES: usize = 3;
 
 /// Enhanced Loading UI component with detailed progress tracking
 #[derive(Clone, Debug)]
@@ -245,6 +251,16 @@ impl LoadingUI {
             Style::default().fg(Color::Yellow),
         )));
 
+        if self.progress.debug_sources.has_counts() {
+            let mut source_spans = vec![Span::styled(
+                "• Debug sources: ",
+                Style::default().fg(Color::White),
+            )];
+            push_debug_source_count_spans(&mut source_spans, &self.progress.debug_sources);
+            lines.push(Line::from(source_spans));
+            append_debug_source_details(&mut lines, &self.progress);
+        }
+
         // Empty line
         lines.push(Line::from(""));
 
@@ -402,8 +418,208 @@ impl LoadingUI {
     }
 }
 
+fn append_debug_source_details(lines: &mut Vec<Line<'static>>, progress: &LoadingProgress) {
+    let debug_source_modules: Vec<&ModuleLoadStatus> = progress
+        .modules
+        .iter()
+        .filter(|module| matches!(module.state, ModuleState::Completed))
+        .filter(|module| {
+            module.stats.as_ref().is_some_and(|stats| {
+                stats.debug_source != "missing" && stats.debug_source_path.is_some()
+            })
+        })
+        .collect();
+
+    if !debug_source_modules.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "• Debug source files:",
+            Style::default().fg(Color::White),
+        )));
+
+        for module in debug_source_modules
+            .iter()
+            .take(MAX_WELCOME_DEBUG_SOURCE_DETAILS)
+        {
+            if let Some(stats) = &module.stats {
+                if let Some(path) = stats.debug_source_path.as_deref() {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("{:<10}", stats.debug_source),
+                            debug_source_style(&stats.debug_source),
+                        ),
+                        Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            shorten_middle(&module_file_name(&module.path), 34),
+                            Style::default().fg(Color::White),
+                        ),
+                        Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(shorten_path(path, 80), Style::default().fg(Color::Gray)),
+                    ]));
+                }
+            }
+        }
+
+        if debug_source_modules.len() > MAX_WELCOME_DEBUG_SOURCE_DETAILS {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  ... {} more module(s) omitted",
+                    debug_source_modules.len() - MAX_WELCOME_DEBUG_SOURCE_DETAILS
+                ),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    if progress.debug_sources.missing > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("• Missing DWARF: ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                missing_module_hint(progress),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+}
+
+fn missing_module_hint(progress: &LoadingProgress) -> String {
+    let missing_modules: Vec<&ModuleLoadStatus> = progress
+        .modules
+        .iter()
+        .filter(|module| matches!(module.state, ModuleState::Completed))
+        .filter(|module| {
+            module
+                .stats
+                .as_ref()
+                .is_some_and(|stats| stats.debug_source == "missing")
+        })
+        .collect();
+
+    let count = missing_modules.len();
+    if count == 0 {
+        return "0 modules".to_string();
+    }
+
+    let examples: Vec<String> = missing_modules
+        .iter()
+        .take(MAX_WELCOME_MISSING_EXAMPLES)
+        .map(|module| module_file_name(&module.path))
+        .collect();
+
+    let mut message = format!("{count} module{}", if count == 1 { "" } else { "s" });
+    if !examples.is_empty() {
+        message.push_str(&format!(" ({})", examples.join(", ")));
+        if count > examples.len() {
+            message.push_str(&format!(" +{} more", count - examples.len()));
+        }
+    }
+    message
+}
+
+fn module_file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn shorten_path(path: &str, max_width: usize) -> String {
+    let width = path.chars().count();
+    if width <= max_width {
+        return path.to_string();
+    }
+
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let suffix: String = path.chars().skip(width - (max_width - 3)).collect();
+    format!("...{suffix}")
+}
+
+fn shorten_middle(value: &str, max_width: usize) -> String {
+    let width = value.chars().count();
+    if width <= max_width {
+        return value.to_string();
+    }
+
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let prefix_width = (max_width - 3) / 2;
+    let suffix_width = max_width - 3 - prefix_width;
+    let prefix: String = value.chars().take(prefix_width).collect();
+    let suffix: String = value.chars().skip(width - suffix_width).collect();
+    format!("{prefix}...{suffix}")
+}
+
 impl Default for LoadingUI {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::loading::ModuleStats;
+
+    #[test]
+    fn welcome_message_includes_debug_sources_and_paths() {
+        let mut loading_ui = LoadingUI::new();
+
+        loading_ui
+            .progress
+            .add_module("/usr/local/openresty/luajit/lib/libluajit-5.1.so.2.1.ROLLING".to_string());
+        loading_ui.progress.complete_module(
+            "/usr/local/openresty/luajit/lib/libluajit-5.1.so.2.1.ROLLING",
+            ModuleStats {
+                functions: 42,
+                variables: 7,
+                types: 11,
+                debug_source: "embedded".to_string(),
+                debug_source_path: Some(
+                    "/usr/local/openresty/luajit/lib/libluajit-5.1.so.2.1.ROLLING".to_string(),
+                ),
+            },
+        );
+
+        loading_ui
+            .progress
+            .add_module("/usr/lib/x86_64-linux-gnu/libcrypt.so.1.1.0".to_string());
+        loading_ui.progress.complete_module(
+            "/usr/lib/x86_64-linux-gnu/libcrypt.so.1.1.0",
+            ModuleStats {
+                functions: 0,
+                variables: 0,
+                types: 0,
+                debug_source: "missing".to_string(),
+                debug_source_path: None,
+            },
+        );
+
+        let text = plain_text(&loading_ui.create_welcome_message(1.25));
+
+        assert!(text.contains("Debug sources: embedded:1"));
+        assert!(text.contains("missing:1"));
+        assert!(text.contains("Debug source files:"));
+        assert!(text.contains("embedded"));
+        assert!(text.contains("libluajit-5.1.so.2.1.ROLLING  /usr/local/openresty/luajit/lib/"));
+        assert!(text.contains("Missing DWARF: 1 module (libcrypt.so.1.1.0)"));
+    }
+
+    fn plain_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

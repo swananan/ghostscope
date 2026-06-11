@@ -139,6 +139,9 @@ pub async fn run_command_line_runtime_with_config(config: ResolvedConfig) -> Res
             config.script_status,
         ),
     ));
+    if let Ok(mut reporter) = reporter.lock() {
+        reporter.set_target_summary(format_startup_target_summary(&config));
+    }
     let reporter_task = spawn_loading_reporter(Arc::clone(&reporter));
     let progress_callback = {
         let reporter = Arc::clone(&reporter);
@@ -502,6 +505,31 @@ fn is_console_stderr_logging_active(enable_logging: bool, enable_console_logging
     enable_logging && enable_console_logging
 }
 
+fn format_startup_target_summary(config: &ResolvedConfig) -> String {
+    let mut parts = Vec::new();
+
+    match (config.runtime.proc_pid, config.runtime.host_pid) {
+        (Some(proc_pid), Some(host_pid)) if proc_pid != host_pid => {
+            parts.push(format!("pid={proc_pid} host_pid={host_pid}"));
+        }
+        (Some(proc_pid), _) => parts.push(format!("pid={proc_pid}")),
+        (None, Some(host_pid)) => parts.push(format!("host_pid={host_pid}")),
+        (None, None) => {}
+    }
+
+    if let Some(target_path) = config.target_path.as_deref() {
+        parts.push(format!("target={target_path}"));
+    } else if let Some(binary_path) = config.binary_path.as_deref() {
+        parts.push(format!("binary={binary_path}"));
+    }
+
+    if let Some(debug_file) = config.debug_file.as_ref() {
+        parts.push(format!("debug_file={}", debug_file.display()));
+    }
+
+    parts.join(" ")
+}
+
 fn should_use_script_stdout_color(config: &ResolvedConfig) -> bool {
     crate::cli::color::CliColors::for_stdout(config.script_color_mode).enabled()
 }
@@ -540,7 +568,7 @@ fn get_script_content_from_config(config: &ResolvedConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_script_output_rate, is_console_stderr_logging_active,
+        decide_script_output_rate, format_startup_target_summary, is_console_stderr_logging_active,
         should_print_cli_status_with_terminal, ScriptOutputRateDecision, ScriptOutputRateLimiter,
     };
     use crate::config::{
@@ -670,5 +698,20 @@ mod tests {
             &sample_config(ScriptOutputMode::Pretty, true),
             true,
         ));
+    }
+
+    #[test]
+    fn startup_target_summary_includes_pid_target_and_debug_file() {
+        let mut config = sample_config(ScriptOutputMode::Plain, true);
+        config.runtime.proc_pid = Some(42);
+        config.runtime.host_pid = Some(4242);
+        config.user.target_path = Some("/tmp/app".to_string());
+        config.user.debug_file = Some(PathBuf::from("/tmp/app.debug"));
+
+        let summary = format_startup_target_summary(&config);
+
+        assert!(summary.contains("pid=42 host_pid=4242"));
+        assert!(summary.contains("target=/tmp/app"));
+        assert!(summary.contains("debug_file=/tmp/app.debug"));
     }
 }
