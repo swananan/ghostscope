@@ -30,12 +30,12 @@ pub use loader::ExplicitDebugFile;
 
 // Re-export essential core and semantic support types.
 pub use core::{
-    AddressExpr, AmbiguityReason, Availability, CallerFrameRecovery, CfaResult, CuId, DieRef,
-    DwarfError, EntryValueCase, FunctionId, FunctionInfo, GlobalVariableInfo, HelperMode,
-    InlineContextId, MemoryAccessSize, ModuleAddress, ModuleId, PieceLocation, PlanExprOp,
-    Provenance, Result, RuntimeCapabilities, RuntimeRequirement, ScopeId, SectionType,
-    SourceLocation, TargetArch, TypeId, UnsupportedReason, VariableId, VariableLocation,
-    VerifierRisk,
+    AddressExpr, AmbiguityReason, Availability, CallerFrameRecovery, CfaResult, CuId,
+    DebugInfoSource, DieRef, DwarfError, EntryValueCase, FunctionId, FunctionInfo,
+    GlobalVariableInfo, HelperMode, InlineContextId, MemoryAccessSize, ModuleAddress, ModuleId,
+    PieceLocation, PlanExprOp, Provenance, Result, RuntimeCapabilities, RuntimeRequirement,
+    ScopeId, SectionType, SourceLocation, TargetArch, TypeId, UnsupportedReason, VariableId,
+    VariableLocation, VerifierRisk,
 };
 
 // Re-export semantic contract types.

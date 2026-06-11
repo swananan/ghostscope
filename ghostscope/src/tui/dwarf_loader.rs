@@ -35,6 +35,8 @@ fn convert_loading_event_to_runtime_status(event: ModuleLoadingEvent) -> Runtime
                 functions: stats.functions,
                 variables: stats.variables,
                 types: stats.types,
+                debug_source: stats.debug_info_source.kind_label().to_string(),
+                debug_source_path: stats.debug_info_source.display_path().map(str::to_string),
                 load_time_ms: stats.load_time_ms,
             };
             RuntimeStatus::DwarfModuleLoadingCompleted {
@@ -104,11 +106,12 @@ pub async fn initialize_dwarf_processing_with_progress(
                     let functions = session.list_functions();
                     let symbols_count = functions.len();
 
-                    // Send success status
-                    // If no debug information was found, treat it as a loading failure
-                    if stats.modules_with_debug_info == 0 {
+                    // Send success status. Symbol-only modules can still support
+                    // function-level tracing; only fail when there is neither
+                    // DWARF nor symbol metadata to trace.
+                    if stats.modules_with_debug_info == 0 && stats.total_symbols == 0 {
                         let _ = status_sender.send(RuntimeStatus::DwarfLoadingFailed(
-                            "No debug information available. Compile with -g for full functionality"
+                            "No debug information or symbols available. Compile with -g for full functionality"
                                 .to_string(),
                         ));
                     } else {

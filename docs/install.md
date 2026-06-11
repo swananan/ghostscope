@@ -183,7 +183,23 @@ sudo dnf debuginfo-install glibc
 
 **Verification:**
 
-GhostScope will automatically detect and use separate debug files. You can verify this in the logs:
+GhostScope will automatically detect and use separate debug files. In script
+mode, when CLI status output is enabled on an interactive terminal, the
+startup report shows the DWARF source mix and per-module load details:
+```text
+DWARF ready: 11 modules, 49425 functions, 3393 variables, 152543 types, debug: embedded:2 missing:9, 3.0s | pid=2762799
+Startup load report:
+  target: pid=2762799
+  debug sources: embedded:2 missing:9
+  modules loaded: 11 completed, 0 failed
+  module details:
+    embedded /usr/sbin/nginx      49000 funcs   3300 vars 150000 types  1200ms  /usr/sbin/nginx
+  missing DWARF: 9 modules (libc.so.6, libssl.so.3, libcrypto.so.3 +6 more; use --log --log-level debug --log-file <path> for full paths)
+```
+
+The startup report is status output, not tracing log output. It is hidden when
+stderr is not a terminal or console stderr logging is active. Use logs when you
+need the lower-level debuglink resolution steps:
 ```bash
 # Run with debug logging to see debuglink resolution
 RUST_LOG=debug sudo ghostscope -p $(pidof your_program)

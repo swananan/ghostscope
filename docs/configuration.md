@@ -647,6 +647,20 @@ export LLVM_SYS_170_PREFIX=/usr/lib/llvm-17
 - **Log Level**: `warn` if not specified
 - **Log File**: `./ghostscope.log` in current directory
 
+### Startup Load Report
+
+During startup, GhostScope can report how DWARF was loaded before traces
+attach. On an interactive terminal, when CLI status output is enabled and
+console stderr logging is inactive, the CLI script runner prints a final load
+report with the target summary, debug source counts (`embedded`, `explicit`,
+`debuglink`, `debuginfod`, `missing`), and per-module
+function/variable/type counts. The TUI loading screen shows the same source
+categories in its progress and completion views.
+
+`missing` means the module was mapped and loaded, but GhostScope did not find
+usable DWARF for that module. Use `--log --log-level debug --log-file <path>`
+or `RUST_LOG=debug` for the full paths and lower-level resolution details.
+
 ### Debug Output Defaults
 
 - **Debug Builds**: Save LLVM IR, eBPF bytecode, and AST files

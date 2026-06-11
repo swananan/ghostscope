@@ -2,8 +2,8 @@
 
 use crate::{
     core::{
-        mapping::ModuleMapping, CallerFrameRecovery, ModuleAddress, Result, SectionType,
-        SourceLocation,
+        mapping::ModuleMapping, CallerFrameRecovery, DebugInfoSource, ModuleAddress, Result,
+        SectionType, SourceLocation,
     },
     loader::ExplicitDebugFile,
     objfile::LoadedObjfile,
@@ -68,6 +68,7 @@ pub struct ModuleLoadingStats {
     pub functions: usize,
     pub variables: usize,
     pub types: usize,
+    pub debug_info_source: DebugInfoSource,
     pub load_time_ms: u64,
     pub parse_time_ms: u64,
     pub index_time_ms: u64,
@@ -731,6 +732,7 @@ impl DwarfAnalyzer {
                         functions,
                         variables,
                         types,
+                        debug_info_source: module_data.get_debug_info_source().clone(),
                         load_time_ms: start_time.elapsed().as_millis() as u64,
                         parse_time_ms,
                         index_time_ms,
@@ -1109,10 +1111,17 @@ impl DwarfAnalyzer {
         let mut total_symbols = 0;
         let mut executable_modules = 0;
         let mut library_modules = 0;
+        let mut modules_with_debug_info = 0;
 
         for (module_path, module_data) in &self.modules {
             let function_names = module_data.get_function_names();
             total_symbols += function_names.len();
+            if !matches!(
+                module_data.get_debug_info_source(),
+                DebugInfoSource::Missing
+            ) {
+                modules_with_debug_info += 1;
+            }
 
             // Check if module is executable (main binary) or library
             if self.is_main_executable_module(module_path) {
@@ -1127,7 +1136,7 @@ impl DwarfAnalyzer {
             executable_modules,
             library_modules,
             total_symbols,
-            modules_with_debug_info: self.modules.len(), // All DWARF modules have debug info
+            modules_with_debug_info,
         }
     }
 

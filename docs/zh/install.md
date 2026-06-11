@@ -182,7 +182,22 @@ sudo dnf debuginfo-install glibc
 
 **验证：**
 
-GhostScope 会自动检测并使用独立调试文件。你可以通过日志验证：
+GhostScope 会自动检测并使用独立调试文件。脚本模式中，如果交互式终端启用
+CLI status 输出，启动报告会展示 DWARF 来源汇总和模块加载明细：
+```text
+DWARF ready: 11 modules, 49425 functions, 3393 variables, 152543 types, debug: embedded:2 missing:9, 3.0s | pid=2762799
+Startup load report:
+  target: pid=2762799
+  debug sources: embedded:2 missing:9
+  modules loaded: 11 completed, 0 failed
+  module details:
+    embedded /usr/sbin/nginx      49000 funcs   3300 vars 150000 types  1200ms  /usr/sbin/nginx
+  missing DWARF: 9 modules (libc.so.6, libssl.so.3, libcrypto.so.3 +6 more；使用 --log --log-level debug --log-file <path> 查看完整路径)
+```
+
+启动报告是 status 输出，不是 tracing 日志。stderr 不是终端，或者启用了
+console stderr 日志时，它不会显示。需要查看更底层的 debuglink 解析过程时，
+可以继续使用日志：
 ```bash
 # 启用调试日志以查看 debuglink 解析过程
 RUST_LOG=debug sudo ghostscope -p $(pidof your_program)

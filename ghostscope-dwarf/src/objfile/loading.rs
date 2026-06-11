@@ -5,7 +5,7 @@ use crate::{
         empty_dwarf_reader_with_endian, load_explicit_debug_file, try_load_debug_file, DwarfData,
         MappedFile,
     },
-    core::{mapping::ModuleMapping, Result},
+    core::{mapping::ModuleMapping, DebugInfoSource, Result},
     index::{BlockIndex, TypeNameIndex},
     objfile::ModuleUnwindInfo,
     parser::DetailedParser,
@@ -49,7 +49,9 @@ impl LoadedObjfile {
         );
 
         let binary_mapped = Arc::new(MappedFile::open(&module_mapping.path)?);
-        let (dwarf, mapped_file_for_dwarf) = if let Some(debug_file_path) = explicit_debug_file {
+        let (dwarf, mapped_file_for_dwarf, debug_info_source) = if let Some(debug_file_path) =
+            explicit_debug_file
+        {
             tracing::info!(
                 "Loading DWARF from explicit debug file {} for {}",
                 debug_file_path.display(),
@@ -68,7 +70,13 @@ impl LoadedObjfile {
                     module_mapping.path.display()
                 ));
             }
-            (Arc::new(debug_dwarf), debug_mapped)
+            (
+                Arc::new(debug_dwarf),
+                debug_mapped,
+                DebugInfoSource::Explicit {
+                    path: debug_file_path.display().to_string(),
+                },
+            )
         } else {
             let dwarf_result = Self::load_dwarf_sections(&binary_mapped);
             match dwarf_result {
@@ -78,7 +86,13 @@ impl LoadedObjfile {
                             "Found debug info in binary: {}",
                             module_mapping.path.display()
                         );
-                        (Arc::new(dwarf_data), Arc::clone(&binary_mapped))
+                        (
+                            Arc::new(dwarf_data),
+                            Arc::clone(&binary_mapped),
+                            DebugInfoSource::Embedded {
+                                path: module_mapping.path.display().to_string(),
+                            },
+                        )
                     } else {
                         tracing::info!(
                             "No debug info in binary, searching for .gnu_debuglink: {}",
@@ -95,8 +109,13 @@ impl LoadedObjfile {
                                     debug_mapped.path.display()
                                 );
                                 let debug_mapped = Arc::new(debug_mapped);
+                                let debug_path = debug_mapped.path.display().to_string();
                                 let debug_dwarf = Self::load_dwarf_sections(&debug_mapped)?;
-                                (Arc::new(debug_dwarf), debug_mapped)
+                                (
+                                    Arc::new(debug_dwarf),
+                                    debug_mapped,
+                                    DebugInfoSource::Debuglink { path: debug_path },
+                                )
                             }
                             None => {
                                 match Self::try_load_debuginfod_debug_file(
@@ -107,14 +126,23 @@ impl LoadedObjfile {
                                 .await
                                 {
                                     Some((debug_dwarf, debug_mapped)) => {
-                                        (Arc::new(debug_dwarf), debug_mapped)
+                                        let debug_path = debug_mapped.path.display().to_string();
+                                        (
+                                            Arc::new(debug_dwarf),
+                                            debug_mapped,
+                                            DebugInfoSource::Debuginfod { path: debug_path },
+                                        )
                                     }
                                     None => {
                                         tracing::warn!(
                                             "No separate debug file found for: {}",
                                             module_mapping.path.display()
                                         );
-                                        (Arc::new(dwarf_data), Arc::clone(&binary_mapped))
+                                        (
+                                            Arc::new(dwarf_data),
+                                            Arc::clone(&binary_mapped),
+                                            DebugInfoSource::Missing,
+                                        )
                                     }
                                 }
                             }
@@ -245,6 +273,7 @@ impl LoadedObjfile {
             type_name_index,
             _dwarf_mapped_file: mapped_file,
             _binary_mapped_file: binary_mapped,
+            debug_info_source,
             entry_address,
             text_symbol_starts_by_name,
             function_ranges_cache: std::sync::RwLock::new(HashMap::new()),
