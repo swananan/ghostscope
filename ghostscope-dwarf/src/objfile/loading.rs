@@ -111,40 +111,35 @@ impl LoadedObjfile {
                                 let debug_mapped = Arc::new(debug_mapped);
                                 let debug_path = debug_mapped.path.display().to_string();
                                 let debug_dwarf = Self::load_dwarf_sections(&debug_mapped)?;
-                                (
-                                    Arc::new(debug_dwarf),
-                                    debug_mapped,
-                                    DebugInfoSource::Debuglink { path: debug_path },
-                                )
+                                if Self::has_debug_info(&debug_dwarf) {
+                                    (
+                                        Arc::new(debug_dwarf),
+                                        debug_mapped,
+                                        DebugInfoSource::Debuglink { path: debug_path },
+                                    )
+                                } else {
+                                    tracing::warn!(
+                                        "Ignoring separate debug file {} for {} because it contains no .debug_info",
+                                        debug_mapped.path.display(),
+                                        module_mapping.path.display()
+                                    );
+                                    Self::load_debuginfod_debug_file_or_missing(
+                                        debuginfod_client.as_ref(),
+                                        &binary_mapped,
+                                        &module_mapping.path,
+                                        dwarf_data,
+                                    )
+                                    .await
+                                }
                             }
                             None => {
-                                match Self::try_load_debuginfod_debug_file(
+                                Self::load_debuginfod_debug_file_or_missing(
                                     debuginfod_client.as_ref(),
                                     &binary_mapped,
                                     &module_mapping.path,
+                                    dwarf_data,
                                 )
                                 .await
-                                {
-                                    Some((debug_dwarf, debug_mapped)) => {
-                                        let debug_path = debug_mapped.path.display().to_string();
-                                        (
-                                            Arc::new(debug_dwarf),
-                                            debug_mapped,
-                                            DebugInfoSource::Debuginfod { path: debug_path },
-                                        )
-                                    }
-                                    None => {
-                                        tracing::warn!(
-                                            "No separate debug file found for: {}",
-                                            module_mapping.path.display()
-                                        );
-                                        (
-                                            Arc::new(dwarf_data),
-                                            Arc::clone(&binary_mapped),
-                                            DebugInfoSource::Missing,
-                                        )
-                                    }
-                                }
                             }
                         }
                     }
@@ -305,6 +300,37 @@ impl LoadedObjfile {
 
     fn has_debug_info(dwarf: &DwarfData) -> bool {
         matches!(dwarf.units().next(), Ok(Some(_)))
+    }
+
+    async fn load_debuginfod_debug_file_or_missing(
+        debuginfod_client: Option<&Arc<DebuginfodClient>>,
+        binary_mapped: &Arc<MappedFile>,
+        module_path: &Path,
+        fallback_dwarf: DwarfData,
+    ) -> (Arc<DwarfData>, Arc<MappedFile>, DebugInfoSource) {
+        match Self::try_load_debuginfod_debug_file(debuginfod_client, binary_mapped, module_path)
+            .await
+        {
+            Some((debug_dwarf, debug_mapped)) => {
+                let debug_path = debug_mapped.path.display().to_string();
+                (
+                    Arc::new(debug_dwarf),
+                    debug_mapped,
+                    DebugInfoSource::Debuginfod { path: debug_path },
+                )
+            }
+            None => {
+                tracing::warn!(
+                    "No usable separate debug file found for: {}",
+                    module_path.display()
+                );
+                (
+                    Arc::new(fallback_dwarf),
+                    Arc::clone(binary_mapped),
+                    DebugInfoSource::Missing,
+                )
+            }
+        }
     }
 
     async fn try_load_debuginfod_debug_file(

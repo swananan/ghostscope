@@ -2732,6 +2732,7 @@ trace add_numbers {
 
     let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
         .with_script(script_content)
+        .with_target(&binary_path)
         .attach_to(&target)
         .timeout_secs(3)
         .enable_sysmon_for_target(false)

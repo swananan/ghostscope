@@ -161,6 +161,11 @@ When `--debug-file`/`-d` is used, GhostScope validates available CRC and
 Build-ID metadata before loading the file. Mismatches are rejected unless
 `--allow-loose-debug-match` is explicitly set.
 
+Automatic `.gnu_debuglink` discovery is reported as `debuglink` only when the
+separate file contains usable `.debug_info`. A file that passes CRC or Build-ID
+checks but contains no DWARF is ignored, debuginfod fallback is tried when
+enabled, and the module is otherwise reported as `missing`.
+
 **Debug file search paths (following GDB conventions):**
 
 GhostScope automatically searches for debug files in the following locations:

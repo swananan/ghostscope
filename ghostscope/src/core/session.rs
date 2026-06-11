@@ -219,10 +219,7 @@ impl GhostSession {
                 .map(|pid| PathBuf::from(format!("/proc/{pid}/exe")))
         })?;
 
-        Some(ExplicitDebugFile {
-            target_module,
-            debug_file,
-        })
+        Some(ExplicitDebugFile::new(target_module, debug_file))
     }
 
     fn build_debuginfod_client(&self) -> Result<Option<Arc<DebuginfodClient>>> {

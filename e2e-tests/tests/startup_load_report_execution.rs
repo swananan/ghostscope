@@ -17,6 +17,7 @@ const FIXTURE_BINARY: &str = "debug_source_report";
 const FIXTURE_DEBUG_FILE: &str = "debug_source_report.debug";
 const EMBEDDED_BINARY: &str = "debug_source_report_embedded";
 const NO_DEBUGLINK_BINARY: &str = "debug_source_report_no_debuglink";
+const NO_DWARF_DEBUGLINK_BINARY: &str = "debug_source_report_no_dwarf_debuglink";
 const MISSING_BINARY: &str = "debug_source_report_missing";
 const BAD_DEBUG_FILE: &str = "bad.debug";
 const TEST_CONFIG: &str = r#"
@@ -134,6 +135,47 @@ async fn test_startup_report_shows_missing_source_without_module_details() -> Re
 
 #[tokio::test]
 #[serial_test::serial]
+async fn test_startup_report_treats_debuglink_without_dwarf_as_missing() -> Result<()> {
+    init();
+
+    if !is_host_topology() {
+        println!("skipping startup load report e2e outside host->host topology");
+        return Ok(());
+    }
+
+    let fixture = ensure_startup_report_fixture()?;
+    let run =
+        run_startup_report_command_for_binary(&fixture, &fixture.no_dwarf_debuglink_binary, &[])?;
+
+    assert!(
+        run.status.success(),
+        "no-DWARF debuglink startup report run failed with status {}\n{}",
+        run.status,
+        run.output
+    );
+    assert_output_contains(&run.output, "\x1b[32mDWARF ready:\x1b[0m");
+    assert_output_contains(&run.output, "Startup load report:");
+    assert_output_contains(&run.output, "\x1b[33mmissing:1\x1b[0m");
+    assert_output_contains(&run.output, "modules loaded: 1 completed, 0 failed");
+    assert_output_contains(&run.output, "\x1b[33mmissing DWARF:\x1b[0m");
+    assert_output_contains(&run.output, NO_DWARF_DEBUGLINK_BINARY);
+    assert!(
+        !run.output.contains("\x1b[34mdebuglink:1\x1b[0m"),
+        "debuglink file without .debug_info should not be reported as debuglink\n{}",
+        run.output
+    );
+    assert!(
+        !run.output.contains("module details:"),
+        "missing-DWARF modules should stay out of module details\n{}",
+        run.output
+    );
+    assert_output_contains(&run.output, "Dry run complete; no uprobes attached.");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn test_startup_report_shows_explicit_debug_file_source() -> Result<()> {
     init();
 
@@ -212,6 +254,7 @@ struct StartupReportFixture {
     binary: PathBuf,
     embedded_binary: PathBuf,
     no_debuglink_binary: PathBuf,
+    no_dwarf_debuglink_binary: PathBuf,
     missing_binary: PathBuf,
     debug_file: PathBuf,
     bad_debug_file: PathBuf,
@@ -232,6 +275,7 @@ fn ensure_startup_report_fixture() -> Result<StartupReportFixture> {
                 binary: dir.join(FIXTURE_BINARY),
                 embedded_binary: dir.join(EMBEDDED_BINARY),
                 no_debuglink_binary: dir.join(NO_DEBUGLINK_BINARY),
+                no_dwarf_debuglink_binary: dir.join(NO_DWARF_DEBUGLINK_BINARY),
                 missing_binary: dir.join(MISSING_BINARY),
                 debug_file: dir.join(FIXTURE_DEBUG_FILE),
                 bad_debug_file: dir.join(BAD_DEBUG_FILE),
