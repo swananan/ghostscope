@@ -4,6 +4,7 @@
 //! debug information in separate files, following GDB's search strategy.
 
 use crate::{binary::MappedFile, core::Result};
+use anyhow::Context;
 use object::Object;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -314,6 +315,156 @@ pub fn try_load_debug_file<P: AsRef<Path>>(
         }
         None => Ok(None),
     }
+}
+
+/// Load a user-provided debug file after verifying it belongs to `binary_path`.
+///
+/// Unlike `.gnu_debuglink` auto-discovery, an explicit debug file may be used
+/// even when the target binary has no debuglink section. When a debuglink CRC or
+/// Build ID comparison is available, strict mode rejects mismatches.
+pub fn load_explicit_debug_file<P: AsRef<Path>, Q: AsRef<Path>>(
+    binary_path: P,
+    debug_file_path: Q,
+    allow_loose_debug_match: bool,
+) -> Result<MappedFile> {
+    let binary_path = binary_path.as_ref();
+    let debug_file_path = debug_file_path.as_ref();
+
+    let binary_data = MappedFile::open(binary_path)
+        .with_context(|| format!("failed to open target binary {}", binary_path.display()))?;
+    let binary_obj = binary_data
+        .parse_object()
+        .with_context(|| format!("failed to parse target binary {}", binary_path.display()))?;
+    let binary_build_id = binary_obj.build_id().ok().flatten();
+    let expected_crc = match binary_obj.gnu_debuglink() {
+        Ok(Some((_filename, crc))) => Some(crc),
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                "Failed to read .gnu_debuglink from {} while validating explicit debug file {}: {}",
+                binary_path.display(),
+                debug_file_path.display(),
+                err
+            );
+            None
+        }
+    };
+
+    let debug_data = MappedFile::open(debug_file_path)
+        .with_context(|| format!("failed to open debug file {}", debug_file_path.display()))?;
+    verify_explicit_debug_file(
+        binary_path,
+        debug_file_path,
+        &debug_data,
+        expected_crc,
+        binary_build_id,
+        allow_loose_debug_match,
+    )?;
+
+    Ok(debug_data)
+}
+
+fn verify_explicit_debug_file(
+    binary_path: &Path,
+    debug_file_path: &Path,
+    debug_data: &MappedFile,
+    expected_crc: Option<u32>,
+    binary_build_id: Option<&[u8]>,
+    allow_loose_debug_match: bool,
+) -> Result<()> {
+    if let Some(expected_crc) = expected_crc {
+        let actual_crc = calculate_gnu_debuglink_crc(debug_data.as_bytes());
+        if actual_crc != expected_crc {
+            let message = format!(
+                "Explicit debug file {} failed CRC verification for {}: expected=0x{:08x}, actual=0x{:08x}",
+                debug_file_path.display(),
+                binary_path.display(),
+                expected_crc,
+                actual_crc
+            );
+            if allow_loose_debug_match {
+                tracing::warn!("{}; loose match enabled -> using it", message);
+            } else {
+                return Err(anyhow::anyhow!(message));
+            }
+        } else {
+            tracing::info!(
+                "Explicit debug file CRC verification passed for {}: 0x{:08x}",
+                debug_file_path.display(),
+                actual_crc
+            );
+        }
+    } else {
+        tracing::info!(
+            "No .gnu_debuglink CRC available in {}; validating explicit debug file {} by Build ID when possible",
+            binary_path.display(),
+            debug_file_path.display()
+        );
+    }
+
+    let debug_obj = debug_data
+        .parse_object()
+        .with_context(|| format!("failed to parse debug file {}", debug_file_path.display()))?;
+    let debug_build_id = debug_obj.build_id().ok().flatten();
+
+    match (binary_build_id, debug_build_id) {
+        (Some(binary_id), Some(debug_id)) if binary_id != debug_id => {
+            let message = format!(
+                "Explicit debug file {} Build ID mismatch for {}: binary={}, debug={}",
+                debug_file_path.display(),
+                binary_path.display(),
+                format_build_id(binary_id),
+                format_build_id(debug_id)
+            );
+            if allow_loose_debug_match {
+                tracing::warn!("{}; loose match enabled -> using it", message);
+            } else {
+                return Err(anyhow::anyhow!(message));
+            }
+        }
+        (Some(binary_id), Some(debug_id)) => {
+            tracing::info!(
+                "Explicit debug file Build ID verification passed for {}: binary={}, debug={}",
+                debug_file_path.display(),
+                format_build_id(binary_id),
+                format_build_id(debug_id)
+            );
+        }
+        (Some(binary_id), None) => {
+            tracing::warn!(
+                "Target binary {} has Build ID {} but explicit debug file {} has none",
+                binary_path.display(),
+                format_build_id(binary_id),
+                debug_file_path.display()
+            );
+        }
+        (None, Some(debug_id)) => {
+            tracing::warn!(
+                "Explicit debug file {} has Build ID {} but target binary {} has none",
+                debug_file_path.display(),
+                format_build_id(debug_id),
+                binary_path.display()
+            );
+        }
+        (None, None) => {
+            tracing::warn!(
+                "Neither target binary {} nor explicit debug file {} has Build ID",
+                binary_path.display(),
+                debug_file_path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn format_build_id(build_id: &[u8]) -> String {
+    let mut hex = String::with_capacity(build_id.len() * 2);
+    for byte in build_id {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 #[cfg(test)]

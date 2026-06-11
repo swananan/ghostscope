@@ -3,7 +3,7 @@ use crate::source_path::SourcePathResolver;
 use crate::trace::TraceManager;
 use anyhow::Result;
 use ghostscope_debuginfod::{DebuginfodClient, DebuginfodConfig};
-use ghostscope_dwarf::{DwarfAnalyzer, ModuleStats};
+use ghostscope_dwarf::{DwarfAnalyzer, ExplicitDebugFile, ModuleStats};
 use ghostscope_process::{ProcessManager, ProcessSysmon, SysmonConfig};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -212,6 +212,19 @@ impl GhostSession {
             .unwrap_or(false)
     }
 
+    fn explicit_debug_file_for_target(&self) -> Option<ExplicitDebugFile> {
+        let debug_file = self.debug_file.as_ref().map(PathBuf::from)?;
+        let target_module = self.target_binary.as_ref().map(PathBuf::from).or_else(|| {
+            self.proc_pid()
+                .map(|pid| PathBuf::from(format!("/proc/{pid}/exe")))
+        })?;
+
+        Some(ExplicitDebugFile {
+            target_module,
+            debug_file,
+        })
+    }
+
     fn build_debuginfod_client(&self) -> Result<Option<Arc<DebuginfodClient>>> {
         let Some(config) = self.config.as_ref() else {
             return Ok(None);
@@ -271,18 +284,20 @@ impl GhostSession {
 
         let debug_search_paths = self.get_debug_search_paths();
         let allow_loose = self.get_allow_loose_debug_match();
+        let explicit_debug_file = self.explicit_debug_file_for_target();
         let debuginfod_client = self.build_debuginfod_client()?;
 
         let process_analyzer = if let Some(proc_pid) = self.proc_pid() {
             info!("Loading binary from PID: {} (parallel)", proc_pid);
             let runtime_modules = self.ensure_pid_runtime_modules(proc_pid)?;
             Some(
-                DwarfAnalyzer::from_pid_runtime_modules_with_config_and_debuginfod(
+                DwarfAnalyzer::from_pid_runtime_modules_with_config_debuginfod_and_explicit_debug_file(
                     proc_pid,
                     runtime_modules,
                     &debug_search_paths,
                     allow_loose,
                     debuginfod_client.clone(),
+                    explicit_debug_file.clone(),
                     |_| {},
                 )
                 .await?,
@@ -290,11 +305,13 @@ impl GhostSession {
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
             Some(
-                DwarfAnalyzer::from_exec_path_with_config_and_debuginfod(
+                DwarfAnalyzer::from_exec_path_with_config_debuginfod_explicit_debug_file_and_progress(
                     binary_path,
                     &debug_search_paths,
                     allow_loose,
                     debuginfod_client.clone(),
+                    explicit_debug_file.map(|explicit| explicit.debug_file),
+                    |_| {},
                 )
                 .await?,
             )
@@ -319,6 +336,7 @@ impl GhostSession {
 
         let debug_search_paths = self.get_debug_search_paths();
         let allow_loose = self.get_allow_loose_debug_match();
+        let explicit_debug_file = self.explicit_debug_file_for_target();
         let debuginfod_client = self.build_debuginfod_client()?;
 
         let process_analyzer = if let Some(proc_pid) = self.proc_pid() {
@@ -328,12 +346,13 @@ impl GhostSession {
             );
             let runtime_modules = self.ensure_pid_runtime_modules(proc_pid)?;
             Some(
-                DwarfAnalyzer::from_pid_runtime_modules_with_config_and_debuginfod(
+                DwarfAnalyzer::from_pid_runtime_modules_with_config_debuginfod_and_explicit_debug_file(
                     proc_pid,
                     runtime_modules,
                     &debug_search_paths,
                     allow_loose,
                     debuginfod_client.clone(),
+                    explicit_debug_file.clone(),
                     progress_callback,
                 )
                 .await?,
@@ -341,11 +360,12 @@ impl GhostSession {
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
             Some(
-                DwarfAnalyzer::from_exec_path_with_config_and_debuginfod_and_progress(
+                DwarfAnalyzer::from_exec_path_with_config_debuginfod_explicit_debug_file_and_progress(
                     binary_path,
                     &debug_search_paths,
                     allow_loose,
                     debuginfod_client.clone(),
+                    explicit_debug_file.map(|explicit| explicit.debug_file),
                     progress_callback,
                 )
                 .await?,

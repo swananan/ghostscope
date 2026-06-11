@@ -148,6 +148,18 @@ objcopy --add-gnu-debuglink=your_program.debug your_program
 readelf -x .gnu_debuglink your_program
 ```
 
+**不依赖 debuglink，直接指定显式调试文件：**
+```bash
+# 目标模式：将调试文件绑定到该二进制或共享库
+sudo ghostscope -t /path/to/your_program --debug-file /path/to/your_program.debug
+
+# PID 模式：将调试文件绑定到 /proc/<pid>/exe（主可执行文件）
+sudo ghostscope -p $(pidof your_program) --debug-file /path/to/your_program.debug
+```
+
+使用 `--debug-file`/`-d` 时，GhostScope 会在加载前校验可用的 CRC 和
+Build-ID 元数据。不匹配会被拒绝，除非显式设置 `--allow-loose-debug-match`。
+
 **调试文件搜索路径（遵循 GDB 约定）：**
 
 GhostScope 会自动在以下位置搜索调试文件：

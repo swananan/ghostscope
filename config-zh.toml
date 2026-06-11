@@ -62,6 +62,9 @@ color = "auto"
 # 当二进制文件使用 .gnu_debuglink 引用独立的调试文件时，
 # GhostScope 会在这些路径中搜索调试文件。
 #
+# 这些路径只影响自动 .gnu_debuglink 发现。命令行 --debug-file/-d
+# 会直接指定一个调试文件，并绕过该搜索列表用于选中的目标模块。
+#
 # 搜索顺序（优先级从高到低）：
 # 1. 绝对路径（如果 .gnu_debuglink 包含绝对路径 - 罕见）
 # 2. 用户配置的 search_paths + basename（此处配置）

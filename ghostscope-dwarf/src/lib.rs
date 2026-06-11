@@ -26,6 +26,7 @@ pub use analyzer::{
     ModuleLoadingStats, ModuleStats, SectionInfo, SharedLibraryInfo, SimpleFileInfo,
     SourceLineAddressSearch, SourceLineQuerySearch, TypeLookupAmbiguity,
 };
+pub use loader::ExplicitDebugFile;
 
 // Re-export essential core and semantic support types.
 pub use core::{

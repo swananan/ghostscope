@@ -174,8 +174,13 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// Debug information file path (overrides auto-detection)
-    /// Auto-detection searches:
+    /// Explicit debug information file path for the target module (overrides auto-detection)
+    /// Binding rules:
+    /// 1. With -t, applies to that target binary or shared library
+    /// 2. With -p only, applies to /proc/<pid>/exe (the main executable)
+    /// 3. With -p and -t, applies to the -t target module
+    ///
+    /// Auto-detection otherwise searches:
     /// 1. Binary itself (.debug_info sections)
     /// 2. .gnu_debuglink section
     /// 3. .gnu_debugdata section (Android/compressed)
