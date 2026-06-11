@@ -648,6 +648,7 @@ export LLVM_SYS_170_PREFIX=/usr/lib/llvm-17
 类型数量。TUI 加载界面的进度和完成视图也会展示相同的来源分类。
 
 `missing` 表示该模块已被映射并加载，但 GhostScope 没有找到可用的 DWARF。
+这也包括 `.gnu_debuglink` 文件与二进制匹配、但不包含 `.debug_info` 的情况。
 如果需要查看完整路径和更细的解析步骤，使用
 `--log --log-level debug --log-file <path>` 或 `RUST_LOG=debug` 查看日志。
 

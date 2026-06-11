@@ -658,8 +658,10 @@ function/variable/type counts. The TUI loading screen shows the same source
 categories in its progress and completion views.
 
 `missing` means the module was mapped and loaded, but GhostScope did not find
-usable DWARF for that module. Use `--log --log-level debug --log-file <path>`
-or `RUST_LOG=debug` for the full paths and lower-level resolution details.
+usable DWARF for that module. This includes `.gnu_debuglink` files that match
+the binary but contain no `.debug_info`. Use
+`--log --log-level debug --log-file <path>` or `RUST_LOG=debug` for the full
+paths and lower-level resolution details.
 
 ### Debug Output Defaults
 

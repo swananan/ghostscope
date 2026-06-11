@@ -6,8 +6,9 @@ use crate::{
     objfile::LoadedObjfile,
 };
 use ghostscope_debuginfod::DebuginfodClient;
+use std::ffi::OsStr;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::task;
 
@@ -16,6 +17,19 @@ use tokio::task;
 pub struct ExplicitDebugFile {
     pub target_module: PathBuf,
     pub debug_file: PathBuf,
+}
+
+impl ExplicitDebugFile {
+    pub fn new(target_module: PathBuf, debug_file: PathBuf) -> Self {
+        Self {
+            target_module,
+            debug_file,
+        }
+    }
+
+    fn matches_module(&self, module_path: &Path) -> bool {
+        paths_equivalent(module_path, &self.target_module)
+    }
 }
 
 /// Configuration for module loading (parallel only)
@@ -157,7 +171,8 @@ impl ModuleLoader {
                 let debuginfod_client = debuginfod_client.clone();
                 let explicit_debug_file_for_module =
                     explicit_debug_file.as_ref().and_then(|explicit| {
-                        paths_equivalent(&mapping.path, &explicit.target_module)
+                        explicit
+                            .matches_module(&mapping.path)
                             .then(|| explicit.debug_file.clone())
                     });
 
@@ -239,7 +254,7 @@ fn validate_explicit_debug_file_target(
 ) -> Result<()> {
     let matches: Vec<&ModuleMapping> = mappings
         .iter()
-        .filter(|mapping| paths_equivalent(&mapping.path, &explicit.target_module))
+        .filter(|mapping| explicit.matches_module(&mapping.path))
         .collect();
 
     match matches.len() {
@@ -280,6 +295,10 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
         return true;
     }
 
+    if proc_root_paths_equivalent(left, right) {
+        return true;
+    }
+
     if let (Ok(left), Ok(right)) = (left.canonicalize(), right.canonicalize()) {
         if left == right {
             return true;
@@ -290,6 +309,47 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
         _ => false,
     }
+}
+
+fn proc_root_paths_equivalent(left: &Path, right: &Path) -> bool {
+    match (strip_proc_root_prefix(left), strip_proc_root_prefix(right)) {
+        (Some(left), Some(right)) => left == right,
+        (Some(left), None) => left.as_path() == right,
+        (None, Some(right)) => left == right.as_path(),
+        (None, None) => false,
+    }
+}
+
+fn strip_proc_root_prefix(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return None;
+    }
+    if !matches!(
+        components.next(),
+        Some(Component::Normal(component)) if component == OsStr::new("proc")
+    ) {
+        return None;
+    }
+    if !matches!(
+        components.next(),
+        Some(Component::Normal(pid)) if pid.to_string_lossy().parse::<u32>().is_ok()
+    ) {
+        return None;
+    }
+    if !matches!(
+        components.next(),
+        Some(Component::Normal(component)) if component == OsStr::new("root")
+    ) {
+        return None;
+    }
+
+    let remaining = components.as_path();
+    let mut stripped = PathBuf::from("/");
+    if !remaining.as_os_str().is_empty() {
+        stripped.push(remaining);
+    }
+    Some(stripped)
 }
 
 /// ModuleLoader with attached progress callback (for method chaining)
@@ -308,5 +368,53 @@ where
     /// Load modules with attached progress callback
     pub async fn load(self) -> Result<Vec<LoadedObjfile>> {
         self.loader.load_with_progress(self.callback).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_debug_file_matches_proc_root_rewritten_target_path() {
+        let mapping = ModuleMapping::from_path(PathBuf::from("/proc/123/root/usr/bin/app"));
+        let explicit = ExplicitDebugFile::new(
+            PathBuf::from("/usr/bin/app"),
+            PathBuf::from("/tmp/app.debug"),
+        );
+
+        assert!(explicit.matches_module(&mapping.path));
+        assert!(validate_explicit_debug_file_target(&[mapping], &explicit).is_ok());
+    }
+
+    #[test]
+    fn explicit_debug_file_rejects_unmatched_proc_root_target_path() {
+        let mapping = ModuleMapping::from_path(PathBuf::from("/proc/123/root/usr/bin/other"));
+        let explicit = ExplicitDebugFile::new(
+            PathBuf::from("/usr/bin/app"),
+            PathBuf::from("/tmp/app.debug"),
+        );
+
+        let error = validate_explicit_debug_file_target(&[mapping], &explicit)
+            .expect_err("unmatched explicit debug file should be rejected")
+            .to_string();
+
+        assert!(error.contains("/usr/bin/app"));
+    }
+
+    #[test]
+    fn proc_root_paths_equivalent_normalizes_either_side() {
+        assert!(proc_root_paths_equivalent(
+            Path::new("/proc/123/root/usr/bin/app"),
+            Path::new("/usr/bin/app")
+        ));
+        assert!(proc_root_paths_equivalent(
+            Path::new("/usr/lib/libfoo.so"),
+            Path::new("/proc/456/root/usr/lib/libfoo.so")
+        ));
+        assert!(!proc_root_paths_equivalent(
+            Path::new("/proc/123/root/usr/bin/app"),
+            Path::new("/usr/bin/other")
+        ));
     }
 }

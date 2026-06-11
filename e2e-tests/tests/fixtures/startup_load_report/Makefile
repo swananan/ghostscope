@@ -10,12 +10,14 @@ UNSTRIPPED ?= $(BINARY).unstripped
 EMBEDDED_BINARY ?= debug_source_report_embedded
 NO_DEBUGLINK_BINARY ?= debug_source_report_no_debuglink
 NO_DEBUGLINK_UNSTRIPPED ?= $(NO_DEBUGLINK_BINARY).unstripped
+NO_DWARF_DEBUGLINK_BINARY ?= debug_source_report_no_dwarf_debuglink
+NO_DWARF_DEBUG_FILE ?= debug_source_report_no_dwarf.debug
 MISSING_BINARY ?= debug_source_report_missing
 MISSING_UNSTRIPPED ?= $(MISSING_BINARY).unstripped
 BAD_DEBUG ?= bad.debug
 SCRIPT_FILE ?= trace.gs
 
-all: $(BINARY) $(EMBEDDED_BINARY) $(NO_DEBUGLINK_BINARY) $(MISSING_BINARY) $(BAD_DEBUG) $(SCRIPT_FILE)
+all: $(BINARY) $(EMBEDDED_BINARY) $(NO_DEBUGLINK_BINARY) $(NO_DWARF_DEBUGLINK_BINARY) $(MISSING_BINARY) $(BAD_DEBUG) $(SCRIPT_FILE)
 
 $(UNSTRIPPED): debug_source_report.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
@@ -38,6 +40,15 @@ $(NO_DEBUGLINK_BINARY): $(NO_DEBUGLINK_UNSTRIPPED)
 	cp $(NO_DEBUGLINK_UNSTRIPPED) $@
 	$(OBJCOPY) --strip-debug $@
 
+$(NO_DWARF_DEBUG_FILE): $(UNSTRIPPED)
+	cp $(UNSTRIPPED) $@
+	$(OBJCOPY) --strip-debug $@
+
+$(NO_DWARF_DEBUGLINK_BINARY): $(UNSTRIPPED) $(NO_DWARF_DEBUG_FILE)
+	cp $(UNSTRIPPED) $@
+	$(OBJCOPY) --strip-debug $@
+	$(OBJCOPY) --add-gnu-debuglink=$(notdir $(NO_DWARF_DEBUG_FILE)) $@
+
 $(MISSING_UNSTRIPPED): debug_source_report.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
@@ -52,6 +63,6 @@ $(SCRIPT_FILE):
 	printf '%s\n' 'trace debug_source_probe {' '    print "startup-load-report";' '}' > $@
 
 clean:
-	rm -f $(BINARY) $(DEBUG_FILE) $(UNSTRIPPED) $(EMBEDDED_BINARY) $(NO_DEBUGLINK_BINARY) $(NO_DEBUGLINK_UNSTRIPPED) $(MISSING_BINARY) $(MISSING_UNSTRIPPED) $(BAD_DEBUG) $(SCRIPT_FILE)
+	rm -f $(BINARY) $(DEBUG_FILE) $(UNSTRIPPED) $(EMBEDDED_BINARY) $(NO_DEBUGLINK_BINARY) $(NO_DEBUGLINK_UNSTRIPPED) $(NO_DWARF_DEBUGLINK_BINARY) $(NO_DWARF_DEBUG_FILE) $(MISSING_BINARY) $(MISSING_UNSTRIPPED) $(BAD_DEBUG) $(SCRIPT_FILE)
 
 .PHONY: all clean

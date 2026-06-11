@@ -160,6 +160,10 @@ sudo ghostscope -p $(pidof your_program) --debug-file /path/to/your_program.debu
 使用 `--debug-file`/`-d` 时，GhostScope 会在加载前校验可用的 CRC 和
 Build-ID 元数据。不匹配会被拒绝，除非显式设置 `--allow-loose-debug-match`。
 
+自动 `.gnu_debuglink` 发现只有在独立文件包含可用 `.debug_info` 时才会报告为
+`debuglink`。如果文件通过了 CRC 或 Build-ID 校验但不包含 DWARF，GhostScope
+会忽略它，启用 debuginfod 时会继续 fallback，否则该模块会报告为 `missing`。
+
 **调试文件搜索路径（遵循 GDB 约定）：**
 
 GhostScope 会自动在以下位置搜索调试文件：
