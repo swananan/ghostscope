@@ -2,6 +2,7 @@ use anyhow::Context;
 use std::time::{Duration, Instant};
 
 pub(crate) const GRACEFUL_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const FORCEFUL_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
 const TERMINATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[cfg(unix)]
@@ -26,15 +27,18 @@ pub(crate) fn send_sigterm(pid: u32, label: &str) -> anyhow::Result<()> {
     anyhow::bail!("SIGTERM helpers are only supported on Unix test platforms");
 }
 
-pub(crate) fn terminate_pid_gracefully<Send, Running>(
+pub(crate) fn terminate_pid_with_escalation<SendTerm, SendKill, Running>(
     pid: u32,
     label: &str,
-    wait_timeout: Duration,
-    mut send_term: Send,
+    graceful_timeout: Duration,
+    forceful_timeout: Duration,
+    mut send_term: SendTerm,
+    mut send_kill: SendKill,
     mut is_running: Running,
 ) -> anyhow::Result<()>
 where
-    Send: FnMut(u32) -> anyhow::Result<()>,
+    SendTerm: FnMut(u32) -> anyhow::Result<()>,
+    SendKill: FnMut(u32) -> anyhow::Result<()>,
     Running: FnMut(u32) -> anyhow::Result<bool>,
 {
     if !is_running(pid)? {
@@ -42,16 +46,34 @@ where
     }
 
     send_term(pid)?;
+    if wait_for_pid_exit(pid, graceful_timeout, &mut is_running)? {
+        return Ok(());
+    }
 
+    send_kill(pid)?;
+    if wait_for_pid_exit(pid, forceful_timeout, &mut is_running)? {
+        return Ok(());
+    }
+
+    anyhow::bail!("timed out waiting for {label} pid {pid} to exit after SIGTERM and SIGKILL");
+}
+
+fn wait_for_pid_exit<Running>(
+    pid: u32,
+    wait_timeout: Duration,
+    is_running: &mut Running,
+) -> anyhow::Result<bool>
+where
+    Running: FnMut(u32) -> anyhow::Result<bool>,
+{
     let deadline = Instant::now() + wait_timeout;
     while Instant::now() < deadline {
         if !is_running(pid)? {
-            return Ok(());
+            return Ok(true);
         }
         std::thread::sleep(TERMINATION_POLL_INTERVAL);
     }
-
-    anyhow::bail!("timed out waiting for {label} pid {pid} to exit after SIGTERM");
+    Ok(false)
 }
 
 pub(crate) fn terminate_std_child_gracefully(

@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use super::termination::{terminate_pid_gracefully, GRACEFUL_TERMINATION_TIMEOUT};
+use super::termination::{
+    terminate_pid_with_escalation, FORCEFUL_TERMINATION_TIMEOUT, GRACEFUL_TERMINATION_TIMEOUT,
+};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -1431,22 +1433,31 @@ impl SandboxHandle {
 
     pub fn terminate_pid(&self, pid: u32) -> Result<()> {
         let label = self.label().to_owned();
-        terminate_pid_gracefully(
+        terminate_pid_with_escalation(
             pid,
             &label,
             GRACEFUL_TERMINATION_TIMEOUT,
-            |pid| match &*self.inner {
-                SandboxInner::Host => {
-                    terminate_pid_with_shell("host", pid, &format!("kill -TERM {pid}"))
-                }
-                SandboxInner::Docker(inner) => terminate_pid_with_shell(
-                    &inner.container_name,
-                    pid,
-                    &format!("docker exec {} kill -TERM {}", inner.container_name, pid),
-                ),
-            },
+            FORCEFUL_TERMINATION_TIMEOUT,
+            |pid| self.send_signal_to_pid(pid, "TERM"),
+            |pid| self.send_signal_to_pid(pid, "KILL"),
             |pid| self.pid_is_running(pid),
         )
+    }
+
+    fn send_signal_to_pid(&self, pid: u32, signal: &str) -> Result<()> {
+        match &*self.inner {
+            SandboxInner::Host => {
+                send_pid_signal_with_shell("host", pid, &format!("kill -{signal} {pid}"))
+            }
+            SandboxInner::Docker(inner) => send_pid_signal_with_shell(
+                &inner.container_name,
+                pid,
+                &format!(
+                    "docker exec {} kill -{} {}",
+                    inner.container_name, signal, pid
+                ),
+            ),
+        }
     }
 
     fn pid_is_running(&self, pid: u32) -> Result<bool> {
@@ -2104,11 +2115,11 @@ fn stage_host_binary_under_repo(host_bin: &Path, name: &str) -> Result<PathBuf> 
     Ok(staged)
 }
 
-fn terminate_pid_with_shell(label: &str, pid: u32, command: &str) -> Result<()> {
+fn send_pid_signal_with_shell(label: &str, pid: u32, command: &str) -> Result<()> {
     let _ = Command::new("bash")
         .args(["-lc", command])
         .status()
-        .with_context(|| format!("failed to terminate pid {pid} in {label}"))?;
+        .with_context(|| format!("failed to signal pid {pid} in {label}"))?;
     Ok(())
 }
 
