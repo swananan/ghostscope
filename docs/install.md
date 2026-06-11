@@ -148,6 +148,19 @@ objcopy --add-gnu-debuglink=your_program.debug your_program
 readelf -x .gnu_debuglink your_program
 ```
 
+**Use an explicit debug file without relying on debuglink:**
+```bash
+# Target mode: bind the debug file to this binary or shared library
+sudo ghostscope -t /path/to/your_program --debug-file /path/to/your_program.debug
+
+# PID mode: bind the debug file to /proc/<pid>/exe (the main executable)
+sudo ghostscope -p $(pidof your_program) --debug-file /path/to/your_program.debug
+```
+
+When `--debug-file`/`-d` is used, GhostScope validates available CRC and
+Build-ID metadata before loading the file. Mismatches are rejected unless
+`--allow-loose-debug-match` is explicitly set.
+
 **Debug file search paths (following GDB conventions):**
 
 GhostScope automatically searches for debug files in the following locations:

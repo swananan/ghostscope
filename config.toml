@@ -66,6 +66,10 @@ color = "auto"
 # When a binary uses .gnu_debuglink to reference separate debug files,
 # GhostScope searches these paths to locate the debug file.
 #
+# These paths only affect automatic .gnu_debuglink discovery. The
+# --debug-file/-d CLI option points directly at one debug file and bypasses
+# this search list for the selected target module.
+#
 # Search order (highest priority first):
 # 1. Absolute path (if .gnu_debuglink contains an absolute path - rare)
 # 2. User-configured search_paths + basename (configured here)

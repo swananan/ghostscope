@@ -96,9 +96,15 @@ ghostscope --tui
 ### Debug Information
 
 ```bash
-# Specify custom debug file (overrides auto-detection)
+# Specify an explicit debug file for the target module (overrides auto-detection)
 ghostscope -d /path/to/binary.debug
 ghostscope --debug-file /path/to/binary.debug
+#
+# Binding rules:
+# - With -t, the debug file is used for that target binary or shared library
+# - With -p only, the debug file is used for /proc/<pid>/exe (the main executable)
+# - With -p and -t, the debug file is used for the -t target module
+# - CRC/Build-ID mismatches are rejected unless --allow-loose-debug-match is set
 
 # Auto-detection searches in order:
 # 1. Binary itself (.debug_info sections)
@@ -232,7 +238,7 @@ Behavior:
 | `--status` | | Enable interactive DWARF/script/attach stderr status prompts | On |
 | `--no-status` | | Disable interactive DWARF/script/attach stderr status prompts | Off override |
 | `--script-timestamp <FORMAT>` | | Pretty output timestamp: local, boot, none | local |
-| `--debug-file <PATH>` | `-d` | Debug info file path | Auto-detect |
+| `--debug-file <PATH>` | `-d` | Explicit debug info file for the target module | Auto-detect |
 | `--debuginfod <MODE>` | | debuginfod mode: off, on, ask | off |
 | `--debuginfod-url <URL>` | | debuginfod server URL; may be repeated | None |
 | `--debuginfod-cache-dir <DIR>` | | debuginfod cache directory | debuginfod-compatible default |
@@ -317,6 +323,10 @@ color = "auto"
 # Debug information search paths for .gnu_debuglink files
 # When a binary uses .gnu_debuglink to reference separate debug files,
 # GhostScope searches these paths to locate the debug file.
+#
+# These paths only affect automatic .gnu_debuglink discovery. The
+# --debug-file/-d CLI option points directly at one debug file and bypasses
+# this search list for the selected target module.
 #
 # Search order (highest priority first):
 # 1. Absolute path (if .gnu_debuglink contains an absolute path - rare)

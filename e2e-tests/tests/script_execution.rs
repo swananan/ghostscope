@@ -2702,3 +2702,113 @@ trace add_numbers {
 
     Ok(())
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_stripped_binary_with_explicit_debug_file() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    common::ensure_test_program_compiled_with_opt(OptimizationLevel::Stripped)?;
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("sample_program", OptimizationLevel::Stripped)?;
+    let debug_file = binary_path.with_file_name("sample_program_stripped.debug");
+    assert!(
+        debug_file.exists(),
+        "Debug file should exist: {}",
+        debug_file.display()
+    );
+
+    let script_content = r#"
+trace add_numbers {
+    print "EXPLICIT_DEBUG_FILE: add_numbers called with a={} b={}", a, b;
+}
+"#;
+
+    let target = common::targets::TargetLauncher::binary(&binary_path)
+        .spawn()
+        .await?;
+
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script_content)
+        .attach_to(&target)
+        .timeout_secs(3)
+        .enable_sysmon_for_target(false)
+        .enable_file_logging(true)
+        .enable_console_logging(true)
+        .with_log_level("info")
+        .with_cli_args([
+            std::ffi::OsString::from("--debug-file"),
+            debug_file.as_os_str().to_os_string(),
+        ])
+        .run()
+        .await?;
+
+    target.terminate().await?;
+
+    if exit_code != 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+
+    assert_eq!(
+        exit_code, 0,
+        "explicit debug file run failed\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Loading DWARF from explicit debug file"),
+        "expected explicit debug-file loading log\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_explicit_debug_file_rejects_mismatch() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    common::ensure_test_program_compiled_with_opt(OptimizationLevel::Stripped)?;
+
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("sample_program", OptimizationLevel::Stripped)?;
+
+    let script_content = r#"
+trace add_numbers {
+    print "SHOULD_NOT_ATTACH";
+}
+"#;
+
+    let target = common::targets::TargetLauncher::binary(&binary_path)
+        .spawn()
+        .await?;
+
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script_content)
+        .attach_to(&target)
+        .timeout_secs(3)
+        .enable_sysmon_for_target(false)
+        .with_cli_args([
+            std::ffi::OsString::from("--debug-file"),
+            binary_path.as_os_str().to_os_string(),
+        ])
+        .run()
+        .await?;
+
+    target.terminate().await?;
+
+    assert_ne!(
+        exit_code, 0,
+        "mismatched explicit debug file should fail\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Explicit debug file")
+            && (stderr.contains("failed CRC verification")
+                || stderr.contains("Build ID mismatch")
+                || stderr.contains("contains no .debug_info section")),
+        "expected explicit debug-file rejection reason\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    Ok(())
+}

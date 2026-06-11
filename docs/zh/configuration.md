@@ -97,9 +97,15 @@ ghostscope --tui
 ### 调试信息
 
 ```bash
-# 指定自定义调试文件（覆盖自动检测）
+# 为目标模块指定显式调试文件（覆盖自动检测）
 ghostscope -d /path/to/binary.debug
 ghostscope --debug-file /path/to/binary.debug
+#
+# 绑定规则：
+# - 搭配 -t 时，调试文件用于该目标二进制或共享库
+# - 仅搭配 -p 时，调试文件用于 /proc/<pid>/exe（主可执行文件）
+# - 同时搭配 -p 和 -t 时，调试文件用于 -t 指定的目标模块
+# - CRC/Build-ID 不匹配会被拒绝，除非设置 --allow-loose-debug-match
 
 # 自动检测按以下顺序搜索：
 # 1. 二进制文件本身（.debug_info 节）
@@ -233,7 +239,7 @@ ghostscope bpffs prune --dry-run --json
 | `--status` | | 启用交互式 DWARF/脚本/attach stderr 状态提示 | 开 |
 | `--no-status` | | 禁用交互式 DWARF/脚本/attach stderr 状态提示 | 关闭覆盖 |
 | `--script-timestamp <FORMAT>` | | pretty 输出时间戳：local, boot, none | local |
-| `--debug-file <PATH>` | `-d` | 调试信息文件路径 | 自动检测 |
+| `--debug-file <PATH>` | `-d` | 目标模块的显式调试信息文件 | 自动检测 |
 | `--debuginfod <MODE>` | | debuginfod 模式：off, on, ask | off |
 | `--debuginfod-url <URL>` | | debuginfod 服务 URL，可重复传递 | 无 |
 | `--debuginfod-cache-dir <DIR>` | | debuginfod 缓存目录 | debuginfod 兼容默认值 |
@@ -318,6 +324,9 @@ color = "auto"
 # DWARF 调试信息搜索路径（用于 .gnu_debuglink 文件）
 # 当二进制文件使用 .gnu_debuglink 引用独立的调试文件时，
 # GhostScope 会在这些路径中搜索调试文件。
+#
+# 这些路径只影响自动 .gnu_debuglink 发现。命令行 --debug-file/-d
+# 会直接指定一个调试文件，并绕过该搜索列表用于选中的目标模块。
 #
 # 搜索顺序（优先级从高到低）：
 # 1. 绝对路径（如果 .gnu_debuglink 包含绝对路径 - 罕见）

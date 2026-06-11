@@ -2,7 +2,8 @@ use super::LoadedObjfile;
 use crate::{
     binary::{
         dwarf_endian_from_object, dwarf_reader_from_arc_with_endian,
-        empty_dwarf_reader_with_endian, try_load_debug_file, DwarfData, MappedFile,
+        empty_dwarf_reader_with_endian, load_explicit_debug_file, try_load_debug_file, DwarfData,
+        MappedFile,
     },
     core::{mapping::ModuleMapping, Result},
     index::{BlockIndex, TypeNameIndex},
@@ -11,7 +12,7 @@ use crate::{
 };
 use ghostscope_debuginfod::{build_id_to_hex, DebuginfodClient};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
-use std::{borrow::Cow, collections::HashMap, path::Path, sync::Arc, time::Instant};
+use std::{borrow::Cow, collections::HashMap, path::Path, path::PathBuf, sync::Arc, time::Instant};
 
 impl LoadedObjfile {
     /// Parallel loading: debug_info || debug_line || CFI simultaneously.
@@ -19,6 +20,7 @@ impl LoadedObjfile {
         module_mapping: ModuleMapping,
         debug_search_paths: &[String],
         allow_loose_debug_match: bool,
+        explicit_debug_file: Option<PathBuf>,
         debuginfod_client: Option<Arc<DebuginfodClient>>,
     ) -> Result<Self> {
         tracing::info!("Parallel loading for: {}", module_mapping.path.display());
@@ -26,6 +28,7 @@ impl LoadedObjfile {
             module_mapping,
             debug_search_paths,
             allow_loose_debug_match,
+            explicit_debug_file,
             debuginfod_client,
         )
         .await
@@ -36,6 +39,7 @@ impl LoadedObjfile {
         module_mapping: ModuleMapping,
         debug_search_paths: &[String],
         allow_loose_debug_match: bool,
+        explicit_debug_file: Option<PathBuf>,
         debuginfod_client: Option<Arc<DebuginfodClient>>,
     ) -> Result<Self> {
         let load_started_at = Instant::now();
@@ -45,65 +49,86 @@ impl LoadedObjfile {
         );
 
         let binary_mapped = Arc::new(MappedFile::open(&module_mapping.path)?);
-        let dwarf_result = Self::load_dwarf_sections(&binary_mapped);
-
-        let (dwarf, mapped_file_for_dwarf) = match dwarf_result {
-            Ok(dwarf_data) => {
-                if Self::has_debug_info(&dwarf_data) {
-                    tracing::debug!(
-                        "Found debug info in binary: {}",
-                        module_mapping.path.display()
-                    );
-                    (Arc::new(dwarf_data), Arc::clone(&binary_mapped))
-                } else {
-                    tracing::info!(
-                        "No debug info in binary, searching for .gnu_debuglink: {}",
-                        module_mapping.path.display()
-                    );
-                    match try_load_debug_file(
-                        &module_mapping.path,
-                        debug_search_paths,
-                        allow_loose_debug_match,
-                    )? {
-                        Some(debug_mapped) => {
-                            tracing::info!(
-                                "Loading DWARF from separate debug file: {}",
-                                debug_mapped.path.display()
-                            );
-                            let debug_mapped = Arc::new(debug_mapped);
-                            let debug_dwarf = Self::load_dwarf_sections(&debug_mapped)?;
-                            (Arc::new(debug_dwarf), debug_mapped)
-                        }
-                        None => {
-                            match Self::try_load_debuginfod_debug_file(
-                                debuginfod_client.as_ref(),
-                                &binary_mapped,
-                                &module_mapping.path,
-                            )
-                            .await
-                            {
-                                Some((debug_dwarf, debug_mapped)) => {
-                                    (Arc::new(debug_dwarf), debug_mapped)
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        "No separate debug file found for: {}",
-                                        module_mapping.path.display()
-                                    );
-                                    (Arc::new(dwarf_data), Arc::clone(&binary_mapped))
+        let (dwarf, mapped_file_for_dwarf) = if let Some(debug_file_path) = explicit_debug_file {
+            tracing::info!(
+                "Loading DWARF from explicit debug file {} for {}",
+                debug_file_path.display(),
+                module_mapping.path.display()
+            );
+            let debug_mapped = Arc::new(load_explicit_debug_file(
+                &module_mapping.path,
+                &debug_file_path,
+                allow_loose_debug_match,
+            )?);
+            let debug_dwarf = Self::load_dwarf_sections(&debug_mapped)?;
+            if !Self::has_debug_info(&debug_dwarf) {
+                return Err(anyhow::anyhow!(
+                    "Explicit debug file {} for {} contains no .debug_info section",
+                    debug_mapped.path.display(),
+                    module_mapping.path.display()
+                ));
+            }
+            (Arc::new(debug_dwarf), debug_mapped)
+        } else {
+            let dwarf_result = Self::load_dwarf_sections(&binary_mapped);
+            match dwarf_result {
+                Ok(dwarf_data) => {
+                    if Self::has_debug_info(&dwarf_data) {
+                        tracing::debug!(
+                            "Found debug info in binary: {}",
+                            module_mapping.path.display()
+                        );
+                        (Arc::new(dwarf_data), Arc::clone(&binary_mapped))
+                    } else {
+                        tracing::info!(
+                            "No debug info in binary, searching for .gnu_debuglink: {}",
+                            module_mapping.path.display()
+                        );
+                        match try_load_debug_file(
+                            &module_mapping.path,
+                            debug_search_paths,
+                            allow_loose_debug_match,
+                        )? {
+                            Some(debug_mapped) => {
+                                tracing::info!(
+                                    "Loading DWARF from separate debug file: {}",
+                                    debug_mapped.path.display()
+                                );
+                                let debug_mapped = Arc::new(debug_mapped);
+                                let debug_dwarf = Self::load_dwarf_sections(&debug_mapped)?;
+                                (Arc::new(debug_dwarf), debug_mapped)
+                            }
+                            None => {
+                                match Self::try_load_debuginfod_debug_file(
+                                    debuginfod_client.as_ref(),
+                                    &binary_mapped,
+                                    &module_mapping.path,
+                                )
+                                .await
+                                {
+                                    Some((debug_dwarf, debug_mapped)) => {
+                                        (Arc::new(debug_dwarf), debug_mapped)
+                                    }
+                                    None => {
+                                        tracing::warn!(
+                                            "No separate debug file found for: {}",
+                                            module_mapping.path.display()
+                                        );
+                                        (Arc::new(dwarf_data), Arc::clone(&binary_mapped))
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Failed to parse DWARF from {}: {}",
-                    module_mapping.path.display(),
-                    e
-                );
-                return Err(e);
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to parse DWARF from {}: {}",
+                        module_mapping.path.display(),
+                        e
+                    );
+                    return Err(e);
+                }
             }
         };
 

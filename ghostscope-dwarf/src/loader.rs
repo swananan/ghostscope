@@ -6,8 +6,17 @@ use crate::{
     objfile::LoadedObjfile,
 };
 use ghostscope_debuginfod::DebuginfodClient;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::task;
+
+/// A user-provided debug file bound to one loaded module.
+#[derive(Debug, Clone)]
+pub struct ExplicitDebugFile {
+    pub target_module: PathBuf,
+    pub debug_file: PathBuf,
+}
 
 /// Configuration for module loading (parallel only)
 #[derive(Debug, Clone)]
@@ -18,6 +27,8 @@ pub struct LoadConfig {
     pub debug_search_paths: Vec<String>,
     /// Allow non-strict debug file matching (CRC/Build-ID)
     pub allow_loose_debug_match: bool,
+    /// Optional user-provided debug file for one target module.
+    pub explicit_debug_file: Option<ExplicitDebugFile>,
     /// Optional debuginfod client for build-id based debug file lookup.
     pub debuginfod_client: Option<Arc<DebuginfodClient>>,
 }
@@ -28,6 +39,7 @@ impl Default for LoadConfig {
             max_module_concurrency: num_cpus::get(),
             debug_search_paths: Vec::new(),
             allow_loose_debug_match: false,
+            explicit_debug_file: None,
             debuginfod_client: None,
         }
     }
@@ -40,6 +52,7 @@ impl LoadConfig {
             max_module_concurrency: num_cpus::get(),
             debug_search_paths: Vec::new(),
             allow_loose_debug_match: false,
+            explicit_debug_file: None,
             debuginfod_client: None,
         }
     }
@@ -75,6 +88,12 @@ impl ModuleLoader {
     /// Set loose debug match policy (CRC/Build-ID mismatches allowed)
     pub fn with_loose_debug_match(mut self, allow: bool) -> Self {
         self.config.allow_loose_debug_match = allow;
+        self
+    }
+
+    /// Set a user-provided debug file for one target module.
+    pub fn with_explicit_debug_file(mut self, debug_file: Option<ExplicitDebugFile>) -> Self {
+        self.config.explicit_debug_file = debug_file;
         self
     }
 
@@ -118,9 +137,13 @@ impl ModuleLoader {
         ));
 
         let total_modules = self.mappings.len();
+        if let Some(explicit) = self.config.explicit_debug_file.as_ref() {
+            validate_explicit_debug_file_target(&self.mappings, explicit)?;
+        }
         let progress_callback = Arc::new(progress_callback);
         let debug_search_paths = Arc::new(self.config.debug_search_paths.clone());
         let allow_loose = self.config.allow_loose_debug_match;
+        let explicit_debug_file = self.config.explicit_debug_file.clone();
         let debuginfod_client = self.config.debuginfod_client.clone();
 
         let tasks: Vec<_> = self
@@ -132,6 +155,11 @@ impl ModuleLoader {
                 let progress_callback = progress_callback.clone();
                 let debug_search_paths = debug_search_paths.clone();
                 let debuginfod_client = debuginfod_client.clone();
+                let explicit_debug_file_for_module =
+                    explicit_debug_file.as_ref().and_then(|explicit| {
+                        paths_equivalent(&mapping.path, &explicit.target_module)
+                            .then(|| explicit.debug_file.clone())
+                    });
 
                 task::spawn(async move {
                     let _permit = semaphore.acquire().await.unwrap();
@@ -151,6 +179,7 @@ impl ModuleLoader {
                         mapping,
                         &debug_search_paths,
                         allow_loose,
+                        explicit_debug_file_for_module,
                         debuginfod_client,
                     )
                     .await;
@@ -200,6 +229,65 @@ impl ModuleLoader {
         let results = futures::future::try_join_all(tasks).await?;
         let modules: Result<Vec<_>> = results.into_iter().collect();
         modules
+    }
+}
+
+fn validate_explicit_debug_file_target(
+    mappings: &[ModuleMapping],
+    explicit: &ExplicitDebugFile,
+) -> Result<()> {
+    let matches: Vec<&ModuleMapping> = mappings
+        .iter()
+        .filter(|mapping| paths_equivalent(&mapping.path, &explicit.target_module))
+        .collect();
+
+    match matches.len() {
+        1 => Ok(()),
+        0 => {
+            let sample = mappings
+                .iter()
+                .take(8)
+                .map(|mapping| mapping.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n  - ");
+            Err(anyhow::anyhow!(
+                "Explicit debug file {} was provided for target module {}, but that module was not loaded. Loaded modules include:\n  - {}",
+                explicit.debug_file.display(),
+                explicit.target_module.display(),
+                sample
+            ))
+        }
+        _ => {
+            let sample = matches
+                .iter()
+                .take(8)
+                .map(|mapping| mapping.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n  - ");
+            Err(anyhow::anyhow!(
+                "Explicit debug file {} target {} matched multiple loaded modules:\n  - {}",
+                explicit.debug_file.display(),
+                explicit.target_module.display(),
+                sample
+            ))
+        }
+    }
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    if let (Ok(left), Ok(right)) = (left.canonicalize(), right.canonicalize()) {
+        if left == right {
+            return true;
+        }
+    }
+
+    match (std::fs::metadata(left), std::fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
     }
 }
 
