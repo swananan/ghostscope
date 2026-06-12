@@ -11,6 +11,11 @@ Use this flow when GhostScope crashes, cannot capture as expected, shows obvious
 - Config file used, especially when `--config` is involved
 - Source checkout path or the fact that it is unknown
 - Debug-enabled binary path or separate debug-file path for the affected modules
+- Debug source status from startup output, including `embedded`, `explicit`,
+  `debuglink`, `debuginfod`, `missing`, and any module failures
+- DWARF configuration that affects separate debug files, especially
+  `[dwarf].search_paths`, `--debug-file`, `--allow-loose-debug-match`, and
+  debuginfod settings
 - Relevant logs or captured output
 - Expected behavior
 - Actual behavior or crash text
@@ -40,6 +45,7 @@ python3 "$SKILL_DIR/scripts/prepare_issue_report.py" \
   --log-file /tmp/ghostscope.log \
   --inline-text 'source_root=/home/user/myapp' \
   --inline-text 'debug_file=/usr/lib/debug/usr/bin/myapp.debug' \
+  --inline-text 'debug_sources=embedded:1 missing:3' \
   --extra-command 'debug_sections=readelf -S /usr/bin/myapp | grep debug' \
   --extra-command 'ghostscope_version=ghostscope --version'
 ```
@@ -53,6 +59,8 @@ When issue prep is needed:
 1. Rule out obvious non-bug causes first.
 - Missing privileges
 - Missing debug symbols
+- Separate debug files that are present but not reachable because
+  `[dwarf].search_paths` omits their directory
 - Unknown source tree path for a source-oriented workflow
 - Wrong PID namespace assumption for `-p`
 - Shared-library `-t` case that actually needs `--enable-sysmon-shared-lib`

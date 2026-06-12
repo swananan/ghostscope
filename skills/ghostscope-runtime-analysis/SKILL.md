@@ -8,11 +8,23 @@ description: Explain GhostScope and turn the project docs into concrete tracing 
 ## Overview
 
 Translate GhostScope documentation into runnable commands and minimal trace scripts.
-Prefer repository docs as the source of truth. When the user is writing in Chinese, prefer the `docs/zh/` counterparts first.
+Prefer live GhostScope output and repository docs as the source of truth. Treat
+this skill and its references as routing and workflow guidance, not as a frozen
+copy of GhostScope behavior. When the user is writing in Chinese, prefer the
+`docs/zh/` counterparts first.
 
 ## Workflow
 
 1. Classify the request before answering.
+- For any answer involving CLI flags, debug-info loading, logging behavior,
+  startup reports, or script syntax, derive the current behavior dynamically:
+  run `ghostscope --help` or the relevant subcommand help for flags, run
+  `ghostscope --script-help` for DSL syntax, and read the current docs under
+  `docs/` or `docs/zh/` for configuration semantics. Use
+  `references/cli-cookbook.md` only as a command-template fallback.
+- If live CLI output, docs, and source comments disagree, do not silently choose
+  one. Say what disagrees, inspect the implementation when available, and base
+  the answer on the implementation plus current docs.
 - Capabilities, positioning, tool comparisons, or "should I use GhostScope here?": read `references/doc-map.md`, then use `README.md`, `docs/comparison.md`, and `docs/faq.md` or `README-zh.md`, `docs/zh/comparison.md`, and `docs/zh/faq.md`.
 - Installation, permissions, or debug symbols: read `references/cli-cookbook.md`, then `docs/install.md` or `docs/zh/install.md`.
 - Exact CLI flags or launch syntax: run `ghostscope --help` first, and use subcommand help such as `ghostscope bpffs prune --help` when relevant. If `ghostscope` is unavailable but the shared workspace is the GhostScope repo, fall back to `references/cli-cookbook.md`, then `docs/configuration.md` or `docs/zh/configuration.md`.
@@ -29,6 +41,9 @@ Prefer repository docs as the source of truth. When the user is writing in Chine
 - If the current privilege model is unclear, tell the user explicitly. Recommend either granting GhostScope eBPF-related capabilities with `setcap` or running a prepared wrapper script with `sudo`.
 - If the source tree location is not already known, first try to discover it from the shared workspace, local filesystem, build paths, or command context before asking the user. GhostScope is most effective when it can be used together with the relevant source tree.
 - DWARF debug information is required in the target binary or a separate debug file.
+- When separate debug information is involved, check the current install and
+  configuration docs before naming supported sources, validation rules, or
+  search paths.
 - If the relevant module's DWARF debug info or debug-file status is unknown, first inspect the target locally when possible. If it is still missing or unclear, tell the user and ask them to provide it. At minimum, the modules they care about must have debug info.
 - For `ghostscope -p <PID>`, use the PID visible in the same environment where GhostScope runs.
 - Do not suggest running GhostScope and GDB against the same target at the same time.
@@ -53,6 +68,8 @@ Prefer repository docs as the source of truth. When the user is writing in Chine
 - If the source path is unknown or the relevant source cannot be inspected after local discovery attempts, say that explicitly before giving the script and ask the user for the checkout path.
 - If DWARF or debug info is missing, say that source-backed variable tracing and explanation will be partial or unreliable.
 - If the command needs privileges and the user is likely to rerun it, prefer offering either a `setcap` command or a ready-to-run `sudo` wrapper script.
+- When asking the user for logs, check the current logging docs/help first and
+  include the flags or config required to actually enable log output.
 
 5. Avoid common mistakes.
 - Do not invent GhostScope DSL syntax. Validate it against `ghostscope --script-help`, or fall back to `docs/scripting.md` or `docs/zh/scripting.md` only when GhostScope is unavailable.
@@ -60,6 +77,9 @@ Prefer repository docs as the source of truth. When the user is writing in Chine
 - Do not overpromise unsupported behavior. Check `docs/limitations.md` for caveats first.
 - Do not pretend source-line workflows are fully ready when the source tree path cannot be discovered. Ask the user for the source checkout path instead.
 - Do not pretend DWARF-backed variable tracing is ready when the relevant module lacks debug info. Ask the user for the debug-enabled binary or debug file instead.
+- Do not suggest `--debug-file`, debug search paths, debuginfod, or logging
+  flags from memory. Re-check current CLI help and docs, then explain the
+  target binding and enabled output path in the command you provide.
 - For `-t` shared-library targets where new processes must expose globals, mention `--enable-sysmon-shared-lib`.
 - When source paths do not resolve, prefer `srcpath map` over telling the user to move files manually.
 - When docs and generated examples seem inconsistent, prefer the installed CLI help output from `ghostscope --help` and relevant subcommand help.
