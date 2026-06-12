@@ -33,10 +33,10 @@ See [Tool Comparison - Quick Recommendation](comparison.md#quick-recommendation)
 - Can I use it with Release builds?
   - Yes. “Release” typically just enables higher compiler optimizations and does not imply the absence of debug info. As long as debug info is available for the target executables/libraries. Common options:
     - Keep `-g` in Release: e.g., `-O2/-O3 + -g`. Binaries are larger, but GhostScope can use the embedded debug sections directly.
-    - Use separate debug files: ship a stripped production binary and put debug info in `your_program.debug` linked via `.gnu_debuglink`. Deploy the debug file in the same directory, a `.debug` subdirectory, or under `/usr/lib/debug`; GhostScope will discover it automatically.
+    - Use separate debug files: ship a stripped production binary and put debug info in `your_program.debug` linked via `.gnu_debuglink`. Deploy the debug file in the same directory, a `.debug` subdirectory, or a configured debug search path. The default search paths include `/usr/lib/debug` and `/usr/local/lib/debug`; if you override `[dwarf].search_paths`, keep the directories you rely on.
 
 - System libraries
-  - Install distro debuginfo packages (e.g., Ubuntu/Debian `libc6-dbg`, Fedora/RHEL `debuginfo-install glibc`). These typically place files under `/usr/lib/debug/`, where GhostScope looks by default.
+  - Install distro debuginfo packages (e.g., Ubuntu/Debian `libc6-dbg`, Fedora/RHEL `debuginfo-install glibc`). These typically place files under `/usr/lib/debug/`, which is included in the default debug search paths.
 
 - Effects of optimization
   - In highly optimized builds, some variables may be “optimized out” or only have locations at certain instruction points (location lists). GhostScope evaluates DWARF at runtime, but if the compiler didn’t emit a location (no `DW_AT_location`), that variable cannot be read.

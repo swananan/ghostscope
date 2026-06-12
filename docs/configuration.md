@@ -97,20 +97,25 @@ ghostscope --tui
 
 ```bash
 # Specify an explicit debug file for the target module (overrides auto-detection)
-ghostscope -d /path/to/binary.debug
-ghostscope --debug-file /path/to/binary.debug
+ghostscope -t /path/to/binary --debug-file /path/to/binary.debug
+ghostscope -p 1234 --debug-file /path/to/binary.debug
 #
 # Binding rules:
 # - With -t, the debug file is used for that target binary or shared library
 # - With -p only, the debug file is used for /proc/<pid>/exe (the main executable)
 # - With -p and -t, the debug file is used for the -t target module
-# - CRC/Build-ID mismatches are rejected unless --allow-loose-debug-match is set
+# - CRC mismatches and available Build-ID mismatches are rejected unless
+#   --allow-loose-debug-match is set
 
 # Auto-detection searches in order:
 # 1. Binary itself (.debug_info sections)
 # 2. .gnu_debuglink section (see search paths below)
-# 3. .gnu_debugdata section (Android/compressed)
-# 4. Build-ID based paths
+# 3. debuginfod by Build-ID, when [dwarf.debuginfod] is enabled
+#
+# Local Build-ID directory layouts are not searched directly. .gnu_debugdata
+# is not loaded currently. Use .gnu_debuglink search_paths or debuginfod for
+# separate debug information. The default search_paths include /usr/lib/debug
+# and /usr/local/lib/debug.
 
 # .gnu_debuglink search paths (configurable in config.toml):
 # 1. Absolute path (if .gnu_debuglink contains absolute path - rare)
@@ -118,8 +123,8 @@ ghostscope --debug-file /path/to/binary.debug
 # 3. Same directory as the binary + basename
 # 4. .debug subdirectory next to the binary + basename
 #
-# Note: To use system-wide debug directories like /usr/lib/debug,
-# add them to search_paths in config.toml
+# Note: If you override search_paths in config.toml, keep any system-wide debug
+# directories that you still rely on.
 ```
 
 ### Logging Configuration
@@ -343,9 +348,10 @@ color = "auto"
 # - Duplicate paths are automatically removed to avoid redundant checks
 # - Paths are tried in order until a matching debug file is found
 #
-# Note: .gnu_debuglink typically uses basename (relative path), but absolute paths
-# are also supported. If you need system-wide debug directories like /usr/lib/debug,
-# add them to search_paths.
+# Note: .gnu_debuglink typically uses basename (relative path), but absolute
+# paths are also supported. The default config includes /usr/lib/debug and
+# /usr/local/lib/debug; if you replace search_paths, keep any system-wide debug
+# directories that you still rely on.
 #
 # Examples:
 search_paths = [
@@ -357,9 +363,11 @@ search_paths = [
 
 # Allow non-strict debug file matching (CRC/Build-ID)
 # Default: false (strict). When true, GhostScope will allow using a separate
-# debug file even if CRC or Build-ID does not match exactly. This is useful for
-# ad-hoc environments or partially repackaged symbols, but may cause inaccurate
-# symbol/line information. Prefer leaving this off unless you know what you are doing.
+# debug file even if CRC or Build-ID does not match exactly. Loose debuglink
+# candidates are still reported as debuglink when they contain usable
+# .debug_info. This is useful for ad-hoc environments or partially repackaged
+# symbols, but may cause inaccurate symbol/line information. Prefer leaving
+# this off unless you know what you are doing.
 allow_loose_debug_match = false
 
 [dwarf.debuginfod]
@@ -613,18 +621,26 @@ release = false
 
 ### RUST_LOG
 
-Controls log level when `--log-level` is not specified:
+Controls the final tracing filter whenever it is set. If `RUST_LOG` is unset,
+GhostScope uses the effective `--log-level`/config `log_level` value instead.
+`RUST_LOG` does not enable logging by itself. In script mode, pass `--log` or
+set `[general].enable_logging = true`; TUI mode enables file logging by
+default.
 
 ```bash
-# Set log level via environment
+# Script mode: enable logging and set the filter via environment
 export RUST_LOG=debug
-ghostscope -p 1234
+ghostscope -p 1234 --script-file trace.gs --log
 
 # Module-specific logging
 export RUST_LOG=ghostscope=debug,ghostscope_compiler=trace
+ghostscope -p 1234 --script-file trace.gs --log
 ```
 
-Priority: Command line > RUST_LOG > Config file
+Filter selection: `RUST_LOG` when set; otherwise the effective `log_level`.
+For non-default CLI levels, `--log-level` overrides the config file. `warn` is
+also the built-in fallback level, so use the config file when you need to make
+`warn` explicit over a different configured value.
 
 ### LLVM_SYS_*_PREFIX
 
@@ -660,8 +676,9 @@ categories in its progress and completion views.
 `missing` means the module was mapped and loaded, but GhostScope did not find
 usable DWARF for that module. This includes `.gnu_debuglink` files that match
 the binary but contain no `.debug_info`. Use
-`--log --log-level debug --log-file <path>` or `RUST_LOG=debug` for the full
-paths and lower-level resolution details.
+`--log --log-level debug --log-file <path>` for the full paths and lower-level
+resolution details. `RUST_LOG=debug` can be used instead of `--log-level debug`
+when logging is enabled.
 
 ### Debug Output Defaults
 

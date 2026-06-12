@@ -26,7 +26,8 @@ use std::path::{Path, PathBuf};
 /// - Absolute paths are honored if they exist
 /// - But custom search_paths can still provide alternatives via basename
 ///
-/// For system-wide debug directories (like /usr/lib/debug), configure them in search_paths.
+/// System-wide debug directories are searched when the caller includes them in
+/// search_paths; the default GhostScope config includes common system paths.
 ///
 /// Returns the path to the debug file if found and CRC matches
 /// Also verifies build ID if present in both files
@@ -154,7 +155,8 @@ fn expand_home_dir(path: &str) -> PathBuf {
 /// Note:
 /// - If debug_filename is an absolute path, it will be tried first, then basename extracted
 /// - Paths are deduplicated to avoid redundant filesystem checks
-/// - Global debug directories (like /usr/lib/debug) should be configured via search_paths
+/// - Global debug directories are searched when the caller includes them in
+///   search_paths
 fn build_search_paths(
     binary_path: &Path,
     debug_filename: &Path,
@@ -206,9 +208,9 @@ fn build_search_paths(
         add_path(dir.join(".debug").join(basename));
     }
 
-    // Note: Global debug directories (like /usr/lib/debug) should be configured
-    // in user_search_paths if needed. This avoids generating nonsensical paths
-    // like /usr/lib/debug/mnt/500g/... for non-system binaries.
+    // Note: callers provide any global debug directories through
+    // user_search_paths. This avoids generating nonsensical paths like
+    // /usr/lib/debug/mnt/500g/... for non-system binaries.
 
     paths
 }
