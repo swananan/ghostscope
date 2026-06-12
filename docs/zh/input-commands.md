@@ -352,7 +352,8 @@ i f                 # 最短形式（无参数）
 **输出说明：**
 - **模块虚拟地址**：函数、源码行和 `info address` 展示的地址是 DWARF/符号表 PC，可用于 `trace 0xADDR` 或 `trace 模块:0xADDR`。
 - **运行时加载信息**：`-p` 模式可能同时展示进程映射/加载信息，但地址 trace 的输入仍然使用模块虚拟地址，而不是 ASLR 后的运行时地址。
-- **调试链接**：使用 .gnu_debuglink 时显示独立调试文件路径
+- **独立调试文件**：当 DWARF 来自 `--debug-file`、`.gnu_debuglink` 或
+  debuginfod 时显示调试文件路径
 
 **示例：**
 ```
@@ -377,7 +378,7 @@ i sh all             # 等同于 `info share all`
 - 符号表状态
 - 调试信息状态
 - 库文件路径
-- 独立调试文件（使用 .gnu_debuglink 时）
+- 独立调试文件（来自 `--debug-file`、`.gnu_debuglink` 或 debuginfod）
 
 默认情况下，`info share` 只列出“存在调试信息”的动态库。
 如需查看所有动态库，请使用 `info share all`。
@@ -390,7 +391,7 @@ From               To                 Syms  Debug      Shared Object
 ──────────────────────────────────────────────────────────────────────
 0x00007f...        0x00007f...        ✓     ✓          /lib/libc.so.6
 
-Debug files (.gnu_debuglink):
+Debug files:
   /lib/libc.so.6 → /usr/lib/debug/.build-id/ab/cdef.debug
 ```
 

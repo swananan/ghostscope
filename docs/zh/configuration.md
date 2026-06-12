@@ -98,20 +98,24 @@ ghostscope --tui
 
 ```bash
 # 为目标模块指定显式调试文件（覆盖自动检测）
-ghostscope -d /path/to/binary.debug
-ghostscope --debug-file /path/to/binary.debug
+ghostscope -t /path/to/binary --debug-file /path/to/binary.debug
+ghostscope -p 1234 --debug-file /path/to/binary.debug
 #
 # 绑定规则：
 # - 搭配 -t 时，调试文件用于该目标二进制或共享库
 # - 仅搭配 -p 时，调试文件用于 /proc/<pid>/exe（主可执行文件）
 # - 同时搭配 -p 和 -t 时，调试文件用于 -t 指定的目标模块
-# - CRC/Build-ID 不匹配会被拒绝，除非设置 --allow-loose-debug-match
+# - CRC 不匹配和可用 Build-ID 不匹配会被拒绝，除非设置
+#   --allow-loose-debug-match
 
 # 自动检测按以下顺序搜索：
 # 1. 二进制文件本身（.debug_info 节）
 # 2. .gnu_debuglink 节（参见下方搜索路径）
-# 3. .gnu_debugdata 节（Android/压缩格式）
-# 4. 基于 Build-ID 的路径
+# 3. 启用 [dwarf.debuginfod] 时，通过 Build-ID 使用 debuginfod
+#
+# GhostScope 不会直接搜索本地 Build-ID 目录布局；当前也不会加载
+# .gnu_debugdata。如需使用独立调试信息，请使用 .gnu_debuglink search_paths
+# 或 debuginfod。默认 search_paths 包含 /usr/lib/debug 和 /usr/local/lib/debug。
 
 # .gnu_debuglink 搜索路径（可在 config.toml 中配置）：
 # 1. 绝对路径（如果 .gnu_debuglink 包含绝对路径 - 罕见）
@@ -119,8 +123,7 @@ ghostscope --debug-file /path/to/binary.debug
 # 3. 二进制文件同目录 + basename
 # 4. 二进制文件同目录的 .debug 子目录 + basename
 #
-# 注意：如需使用系统范围的调试目录（如 /usr/lib/debug），
-# 请在 config.toml 的 search_paths 中添加
+# 注意：如果在 config.toml 中覆盖 search_paths，请保留仍然依赖的系统调试目录。
 ```
 
 ### 日志配置
@@ -344,7 +347,8 @@ color = "auto"
 # - 按顺序尝试路径，直到找到匹配的调试文件
 #
 # 注意：.gnu_debuglink 通常使用 basename（相对路径），但也支持绝对路径。
-# 如需使用系统范围的调试目录（如 /usr/lib/debug），请添加到 search_paths。
+# 默认配置包含 /usr/lib/debug 和 /usr/local/lib/debug；如果替换 search_paths，
+# 请保留仍然依赖的系统调试目录。
 #
 # 示例：
 search_paths = [
@@ -356,7 +360,8 @@ search_paths = [
 
 # 允许非严格的调试文件匹配（CRC/Build-ID）
 # 默认：false（严格）。当设置为 true 时，即使 CRC 或 Build‑ID 不完全匹配，
-# 也会继续使用该独立调试文件（会记录警告日志）。仅建议在排障或环境不规范时短期启用。
+# 也会继续使用该独立调试文件（会记录警告日志）。loose 模式接受的 debuglink
+# 候选只要包含可用 .debug_info，仍会报告为 debuglink。仅建议在排障或环境不规范时短期启用。
 allow_loose_debug_match = false
 
 [dwarf.debuginfod]
@@ -605,18 +610,25 @@ release = false
 
 ### RUST_LOG
 
-未指定 `--log-level` 时控制日志级别：
+设置 `RUST_LOG` 后，它会控制最终 tracing 过滤器。如果未设置 `RUST_LOG`，
+GhostScope 会使用生效后的 `--log-level`/配置文件 `log_level`。`RUST_LOG`
+不会自己启用 logging。脚本模式需要传入 `--log` 或设置
+`[general].enable_logging = true`；TUI 模式默认启用文件日志。
 
 ```bash
-# 通过环境变量设置日志级别
+# 脚本模式：启用 logging，并通过环境变量设置过滤器
 export RUST_LOG=debug
-ghostscope -p 1234
+ghostscope -p 1234 --script-file trace.gs --log
 
 # 模块特定的日志
 export RUST_LOG=ghostscope=debug,ghostscope_compiler=trace
+ghostscope -p 1234 --script-file trace.gs --log
 ```
 
-优先级：命令行 > RUST_LOG > 配置文件
+过滤器选择规则：设置了 `RUST_LOG` 时使用 `RUST_LOG`；否则使用生效后的
+`log_level`。对于非默认命令行级别，`--log-level` 会覆盖配置文件。`warn`
+同时也是内置 fallback 级别；如果需要明确用 `warn` 覆盖其他配置值，请在
+配置文件中设置。
 
 ### LLVM_SYS_*_PREFIX
 
@@ -650,7 +662,8 @@ export LLVM_SYS_170_PREFIX=/usr/lib/llvm-17
 `missing` 表示该模块已被映射并加载，但 GhostScope 没有找到可用的 DWARF。
 这也包括 `.gnu_debuglink` 文件与二进制匹配、但不包含 `.debug_info` 的情况。
 如果需要查看完整路径和更细的解析步骤，使用
-`--log --log-level debug --log-file <path>` 或 `RUST_LOG=debug` 查看日志。
+`--log --log-level debug --log-file <path>` 查看日志。启用 logging 后，也可以用
+`RUST_LOG=debug` 代替 `--log-level debug`。
 
 ### 调试输出默认值
 

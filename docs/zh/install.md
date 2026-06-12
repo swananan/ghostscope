@@ -157,21 +157,32 @@ sudo ghostscope -t /path/to/your_program --debug-file /path/to/your_program.debu
 sudo ghostscope -p $(pidof your_program) --debug-file /path/to/your_program.debug
 ```
 
-使用 `--debug-file`/`-d` 时，GhostScope 会在加载前校验可用的 CRC 和
-Build-ID 元数据。不匹配会被拒绝，除非显式设置 `--allow-loose-debug-match`。
+使用 `--debug-file`/`-d` 时，如果目标文件有 `.gnu_debuglink`，GhostScope
+会校验 debuglink CRC；如果目标文件和调试文件都提供 Build-ID，也会比较
+Build-ID 元数据。CRC 不匹配和 Build-ID 不匹配都会被拒绝，除非显式设置
+`--allow-loose-debug-match`。如果任意一侧缺少 Build-ID，GhostScope 会记录
+warning，但不会仅因此拒绝该文件。显式调试文件必须包含可用的 `.debug_info`。
 
-自动 `.gnu_debuglink` 发现只有在独立文件包含可用 `.debug_info` 时才会报告为
-`debuglink`。如果文件通过了 CRC 或 Build-ID 校验但不包含 DWARF，GhostScope
-会忽略它，启用 debuginfod 时会继续 fallback，否则该模块会报告为 `missing`。
+默认情况下，自动 `.gnu_debuglink` 发现只有在独立文件通过 debuglink CRC 校验、
+双方都提供 Build-ID 时通过 Build-ID 校验，并且包含可用 `.debug_info` 时才会
+报告为 `debuglink`。设置 `--allow-loose-debug-match` 后，CRC/Build-ID 不匹配会
+以 warning 形式接受；只要该文件包含可用 `.debug_info`，仍会报告为 `debuglink`。
+如果文件不包含 DWARF，GhostScope 会忽略它，启用 debuginfod 时会继续 fallback，
+否则该模块会报告为 `missing`。
 
-**调试文件搜索路径（遵循 GDB 约定）：**
+**调试文件搜索路径：**
 
-GhostScope 会自动在以下位置搜索调试文件：
-1. 二进制文件同目录：`/path/to/your_program.debug`
-2. `.debug` 子目录：`/path/to/.debug/your_program.debug`
-3. 全局调试目录：`/usr/lib/debug/path/to/your_program.debug`
+对于自动 `.gnu_debuglink` 发现，GhostScope 会搜索：
+1. `.gnu_debuglink` 中的绝对路径（如果存在）
+2. `[dwarf].search_paths` 中的目录（默认包含 `/usr/lib/debug`、
+   `/usr/local/lib/debug`）
+3. 二进制文件同目录：`/path/to/your_program.debug`
+4. `.debug` 子目录：`/path/to/.debug/your_program.debug`
 
-> **📝 自定义搜索路径**：你可以在配置文件中配置额外的搜索路径（包括用户特定目录如 `~/.local/lib/debug`）。详细信息请参阅 [配置参考 - DWARF 调试搜索路径](configuration.md#dwarf)。
+> **自定义搜索路径**：默认配置已经包含常见系统调试目录。如果你覆盖
+> `[dwarf].search_paths`，需要把仍然希望 GhostScope 搜索的系统或自定义目录保留
+> 在列表中。详细信息请参阅
+> [配置参考 - DWARF 调试搜索路径](configuration.md#dwarf)。
 
 **安装系统调试包：**
 ```bash
@@ -181,13 +192,14 @@ sudo apt install libc6-dbg
 # Fedora/RHEL - 安装调试符号
 sudo dnf debuginfo-install glibc
 
-# 调试文件通常安装在 /usr/lib/debug/ 目录下
+# 调试文件通常安装在 /usr/lib/debug/ 目录下，
+# 该目录已包含在默认 [dwarf].search_paths 中。
 ```
 
 **验证：**
 
-GhostScope 会自动检测并使用独立调试文件。脚本模式中，如果交互式终端启用
-CLI status 输出，启动报告会展示 DWARF 来源汇总和模块加载明细：
+当独立调试文件位于搜索路径中时，GhostScope 会检测并使用它们。脚本模式中，
+如果交互式终端启用 CLI status 输出，启动报告会展示 DWARF 来源汇总和模块加载明细：
 ```text
 DWARF ready: 11 modules, 49425 functions, 3393 variables, 152543 types, debug: embedded:2 missing:9, 3.0s | pid=2762799
 Startup load report:
@@ -203,8 +215,15 @@ Startup load report:
 console stderr 日志时，它不会显示。需要查看更底层的 debuglink 解析过程时，
 可以继续使用日志：
 ```bash
-# 启用调试日志以查看 debuglink 解析过程
-RUST_LOG=debug sudo ghostscope -p $(pidof your_program)
+# 在脚本模式中启用调试日志以查看 debuglink 解析过程
+sudo ghostscope -p $(pidof your_program) \
+  --script-file /path/to/script.gs \
+  --log --log-level debug
+
+# RUST_LOG 也可以设置过滤器，但仍需启用 logging
+sudo env RUST_LOG=debug ghostscope -p $(pidof your_program) \
+  --script-file /path/to/script.gs \
+  --log
 
 # 查找类似以下的消息：
 # "Looking for debug file 'your_program.debug' for binary '/path/to/your_program'"

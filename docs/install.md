@@ -157,23 +157,37 @@ sudo ghostscope -t /path/to/your_program --debug-file /path/to/your_program.debu
 sudo ghostscope -p $(pidof your_program) --debug-file /path/to/your_program.debug
 ```
 
-When `--debug-file`/`-d` is used, GhostScope validates available CRC and
-Build-ID metadata before loading the file. Mismatches are rejected unless
-`--allow-loose-debug-match` is explicitly set.
+When `--debug-file`/`-d` is used, GhostScope validates the `.gnu_debuglink`
+CRC when the target has one, and compares Build-ID metadata when both the
+target and debug file provide Build-IDs. CRC mismatches and Build-ID
+mismatches are rejected unless `--allow-loose-debug-match` is explicitly set.
+If Build-ID metadata is missing on either side, GhostScope logs a warning but
+does not reject the file on that basis. The explicit debug file must contain
+usable `.debug_info`.
 
-Automatic `.gnu_debuglink` discovery is reported as `debuglink` only when the
-separate file contains usable `.debug_info`. A file that passes CRC or Build-ID
-checks but contains no DWARF is ignored, debuginfod fallback is tried when
-enabled, and the module is otherwise reported as `missing`.
+By default, automatic `.gnu_debuglink` discovery is reported as `debuglink`
+only when the separate file passes the debuglink CRC check, passes the Build-ID
+check when both files provide Build-IDs, and contains usable `.debug_info`.
+When `--allow-loose-debug-match` is set, CRC/Build-ID mismatches are accepted
+with warnings; the file is still reported as `debuglink` if it contains usable
+`.debug_info`. A file that does not contain DWARF is ignored, debuginfod
+fallback is tried when enabled, and the module is otherwise reported as
+`missing`.
 
-**Debug file search paths (following GDB conventions):**
+**Debug file search paths:**
 
-GhostScope automatically searches for debug files in the following locations:
-1. Same directory as the binary: `/path/to/your_program.debug`
-2. `.debug` subdirectory: `/path/to/.debug/your_program.debug`
-3. Global debug directory: `/usr/lib/debug/path/to/your_program.debug`
+For automatic `.gnu_debuglink` discovery, GhostScope searches:
+1. An absolute path from `.gnu_debuglink`, when present
+2. Directories from `[dwarf].search_paths` (defaults: `/usr/lib/debug`,
+   `/usr/local/lib/debug`)
+3. Same directory as the binary: `/path/to/your_program.debug`
+4. `.debug` subdirectory: `/path/to/.debug/your_program.debug`
 
-> **📝 Custom Search Paths**: You can configure additional search paths (including user-specific directories like `~/.local/lib/debug`) in the configuration file. See the [Configuration Reference - DWARF Debug Search Paths](configuration.md#dwarf) for detailed information.
+> **Custom Search Paths**: The default configuration includes common system
+> debug directories. If you override `[dwarf].search_paths`, include any system
+> or custom directories that you still want GhostScope to search. See the
+> [Configuration Reference - DWARF Debug Search Paths](configuration.md#dwarf)
+> for details.
 
 **Installing system debug packages:**
 ```bash
@@ -183,14 +197,16 @@ sudo apt install libc6-dbg
 # Fedora/RHEL - install debug symbols
 sudo dnf debuginfo-install glibc
 
-# The debug files are typically installed in /usr/lib/debug/
+# The debug files are typically installed in /usr/lib/debug/,
+# which is included in the default [dwarf].search_paths.
 ```
 
 **Verification:**
 
-GhostScope will automatically detect and use separate debug files. In script
-mode, when CLI status output is enabled on an interactive terminal, the
-startup report shows the DWARF source mix and per-module load details:
+GhostScope will detect and use separate debug files when they are in the
+searched locations. In script mode, when CLI status output is enabled on an
+interactive terminal, the startup report shows the DWARF source mix and
+per-module load details:
 ```text
 DWARF ready: 11 modules, 49425 functions, 3393 variables, 152543 types, debug: embedded:2 missing:9, 3.0s | pid=2762799
 Startup load report:
@@ -206,8 +222,15 @@ The startup report is status output, not tracing log output. It is hidden when
 stderr is not a terminal or console stderr logging is active. Use logs when you
 need the lower-level debuglink resolution steps:
 ```bash
-# Run with debug logging to see debuglink resolution
-RUST_LOG=debug sudo ghostscope -p $(pidof your_program)
+# Run with debug logging to see debuglink resolution in script mode
+sudo ghostscope -p $(pidof your_program) \
+  --script-file /path/to/script.gs \
+  --log --log-level debug
+
+# RUST_LOG can set the filter too, but logging must still be enabled
+sudo env RUST_LOG=debug ghostscope -p $(pidof your_program) \
+  --script-file /path/to/script.gs \
+  --log
 
 # Look for messages like:
 # "Looking for debug file 'your_program.debug' for binary '/path/to/your_program'"

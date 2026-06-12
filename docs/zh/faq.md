@@ -31,10 +31,10 @@ GhostScope 是一个基于 eBPF 的运行时追踪器，允许你在不修改源
 - Release 能用吗
   - 可以。Release 版本只是可能使用了更高级别的编译器优化选项，并不代表不存在调试信息。换句话说，只要目标可执行文件/动态库“有可用的调试信息”。常见做法：
     - 保留 `-g` 的 Release：例如 `-O2/-O3 + -g`，体积更大，但 GhostScope 可直接使用嵌入在二进制内部的的调试信息段。
-    - 使用独立调试文件：生产二进制做 `strip`，把调试信息写到 `your_program.debug` 并通过 `.gnu_debuglink` 关联；把调试文件部署到“同目录/.debug 子目录/`/usr/lib/debug` 路径”，GhostScope 会按约定自动搜索并加载。
+    - 使用独立调试文件：生产二进制做 `strip`，把调试信息写到 `your_program.debug` 并通过 `.gnu_debuglink` 关联；把调试文件部署到同目录、`.debug` 子目录或已配置的调试搜索路径。默认搜索路径包含 `/usr/lib/debug` 和 `/usr/local/lib/debug`；如果覆盖 `[dwarf].search_paths`，需要保留你依赖的目录。
 
 - 系统库调试包
-  - 可以安装发行版提供的 debuginfo 包（如 Ubuntu/Debian `libc6-dbg`，Fedora/RHEL `debuginfo-install glibc`），调试文件通常位于 `/usr/lib/debug/`，GhostScope 会自动查找。
+  - 可以安装发行版提供的 debuginfo 包（如 Ubuntu/Debian `libc6-dbg`，Fedora/RHEL `debuginfo-install glibc`），调试文件通常位于 `/usr/lib/debug/`，该目录已包含在默认调试搜索路径中。
 
 - 优化的影响
   - 高优化构建中，部分变量可能“优化掉”或仅在某些指令点有位置（位置列表）。GhostScope 会按 DWARF 表达式实时求值；但若编译器未生成位置信息（无 `DW_AT_location`），则无法读取该变量。

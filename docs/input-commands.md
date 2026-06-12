@@ -356,7 +356,8 @@ Display executable file information including:
 **Output:**
 - **Module virtual addresses**: The addresses shown for functions, lines, and `info address` are DWARF/symbol PCs that can be used in `trace 0xADDR` or `trace module:0xADDR`.
 - **Runtime mapping information**: `-p` mode may also show process mapping/load information, but address trace inputs still use module virtual addresses, not ASLR-adjusted runtime addresses.
-- **Debug link**: Shows separate debug file path if using .gnu_debuglink
+- **Separate debug file**: Shows the debug file path when DWARF comes from
+  `--debug-file`, `.gnu_debuglink`, or debuginfod
 
 **Examples:**
 ```
@@ -381,7 +382,7 @@ Display loaded shared libraries (dynamic libraries) with:
 - Symbol table status
 - Debug information status
 - Library file paths
-- Separate debug files (if using .gnu_debuglink)
+- Separate debug files (from `--debug-file`, `.gnu_debuglink`, or debuginfod)
 
 By default, `info share` only lists libraries that have debug information available.
 Use `info share all` to list every loaded library regardless of debug info.
@@ -394,7 +395,7 @@ From               To                 Syms  Debug      Shared Object
 ──────────────────────────────────────────────────────────────────────
 0x00007f...        0x00007f...        ✓     ✓          /lib/libc.so.6
 
-Debug files (.gnu_debuglink):
+Debug files:
   /lib/libc.so.6 → /usr/lib/debug/.build-id/ab/cdef.debug
 ```
 
