@@ -117,6 +117,13 @@ struct ModulePathSummaries {
     by_identity: BTreeMap<ModuleMapIdentityKey, ModuleMapSummary>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModulePathLookupError {
+    MetadataUnavailable,
+    NotRegularFile,
+    IdentityMismatch,
+}
+
 impl ModulePathSummaries {
     fn observe(&mut self, entry: &OwnedProcMapEntry) {
         self.by_identity
@@ -138,22 +145,25 @@ impl ModulePathSummaries {
         Some(merged)
     }
 
-    fn summary_for_path(&self, module_path: &str) -> Option<ModuleMapSummary> {
+    fn summary_for_regular_path(
+        &self,
+        module_path: &str,
+    ) -> Result<ModuleMapSummary, ModulePathLookupError> {
         match fs::metadata(module_path) {
-            Ok(meta) => self
-                .by_identity
-                .get(&ModuleMapIdentityKey::from_metadata(&meta))
-                .cloned()
-                // overlayfs compatibility: within the same normalized path bucket, the mapped
-                // file can keep the same inode while reporting a different device number.
-                .or_else(|| self.summary_for_inode(meta.ino())),
-            Err(_) => {
-                let mut merged = ModuleMapSummary::default();
-                for summary in self.by_identity.values() {
-                    merged.merge(summary);
+            Ok(meta) => {
+                if !meta.file_type().is_file() {
+                    return Err(ModulePathLookupError::NotRegularFile);
                 }
-                (!merged.candidates.is_empty()).then_some(merged)
+
+                self.by_identity
+                    .get(&ModuleMapIdentityKey::from_metadata(&meta))
+                    .cloned()
+                    // overlayfs compatibility: within the same normalized path bucket, the mapped
+                    // file can keep the same inode while reporting a different device number.
+                    .or_else(|| self.summary_for_inode(meta.ino()))
+                    .ok_or(ModulePathLookupError::IdentityMismatch)
             }
+            Err(_) => Err(ModulePathLookupError::MetadataUnavailable),
         }
     }
 
@@ -543,31 +553,26 @@ fn accessible_module_path_for_pid(
     summaries: &ModulePathSummaries,
 ) -> Option<(String, ModuleMapSummary)> {
     let mapped_path = normalize_mapped_module_path(mapped_path).replace("/./", "/");
-    if path_is_regular_file(&mapped_path) {
-        if let Some(summary) = summaries.summary_for_path(&mapped_path) {
-            return Some((mapped_path.clone(), summary));
-        }
+    if let Ok(summary) = summaries.summary_for_regular_path(&mapped_path) {
+        return Some((mapped_path.clone(), summary));
     }
 
     let proc_root_path = proc_root_module_path(pid, &mapped_path)?;
-    if !path_is_regular_file(&proc_root_path) {
-        return None;
+    match summaries.summary_for_regular_path(&proc_root_path) {
+        Ok(summary) => Some((proc_root_path, summary)),
+        Err(ModulePathLookupError::MetadataUnavailable) => summaries
+            .merged_summary()
+            .map(|summary| (proc_root_path, summary)),
+        Err(ModulePathLookupError::NotRegularFile | ModulePathLookupError::IdentityMismatch) => {
+            None
+        }
     }
-
-    let summary = summaries
-        .summary_for_path(&proc_root_path)
-        .or_else(|| summaries.merged_summary())?;
-    Some((proc_root_path, summary))
 }
 
 fn proc_root_module_path(pid: u32, mapped_path: &str) -> Option<String> {
     mapped_path
         .starts_with('/')
         .then(|| format!("/proc/{pid}/root{mapped_path}"))
-}
-
-fn path_is_regular_file(path: &str) -> bool {
-    matches!(fs::metadata(path), Ok(meta) if meta.file_type().is_file())
 }
 
 fn is_same_executable_as_current(pid: u32) -> bool {
@@ -694,7 +699,7 @@ mod tests {
         summaries.observe(&stale_entry);
         summaries.observe(&current_entry);
 
-        let summary = summaries.summary_for_path(&path_str).unwrap();
+        let summary = summaries.summary_for_regular_path(&path_str).unwrap();
         assert_eq!(summary.candidates, vec![(0x1000, 0x2000)]);
         assert_eq!(summary.base(), 0x2000);
         assert_eq!(summary.size(), 0x1000);
@@ -703,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn path_summaries_merge_groups_when_metadata_is_unavailable() {
+    fn path_summaries_keep_unavailable_metadata_separate_from_identity_mismatch() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -723,7 +728,12 @@ mod tests {
         summaries.observe(&first);
         summaries.observe(&second);
 
-        let summary = summaries.summary_for_path(&path).unwrap();
+        assert!(matches!(
+            summaries.summary_for_regular_path(&path),
+            Err(ModulePathLookupError::MetadataUnavailable)
+        ));
+
+        let summary = summaries.merged_summary().unwrap();
         assert_eq!(summary.candidates, vec![(0, 0x1000), (0x2000, 0x3000)]);
         assert_eq!(summary.base(), 0x1000);
         assert_eq!(summary.size(), 0x4000);
@@ -752,7 +762,7 @@ mod tests {
         let mut summaries = ModulePathSummaries::default();
         summaries.observe(&overlay_entry);
 
-        let summary = summaries.summary_for_path(&path_str).unwrap();
+        let summary = summaries.summary_for_regular_path(&path_str).unwrap();
         assert_eq!(summary.candidates, vec![(0x1000, 0x2000)]);
         assert_eq!(summary.base(), 0x2000);
         assert_eq!(summary.size(), 0x1000);
@@ -790,12 +800,52 @@ mod tests {
         summaries.observe(&lower_entry);
         summaries.observe(&upper_entry);
 
-        let summary = summaries.summary_for_path(&path_str).unwrap();
+        let summary = summaries.summary_for_regular_path(&path_str).unwrap();
         let mut candidates = summary.candidates.clone();
         candidates.sort();
         assert_eq!(candidates, vec![(0, 0x1000), (0x2000, 0x3000)]);
         assert_eq!(summary.base(), 0x1000);
         assert_eq!(summary.size(), 0x4000);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn accessible_proc_root_path_rejects_replaced_file_identity_mismatch() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ghostscope-offsets-replaced-{suffix}.so"));
+        std::fs::write(&path, b"new current file").unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let dev = meta.dev() as libc::dev_t;
+        let dev_major = libc::major(dev) as u64;
+        let dev_minor = libc::minor(dev) as u64;
+        let stale_inode = if meta.ino() == u64::MAX {
+            meta.ino() - 1
+        } else {
+            meta.ino() + 1
+        };
+        let path_str = path.to_string_lossy().to_string();
+
+        let stale_entry: OwnedProcMapEntry = parse_maps_line(&format!(
+            "1000-2000 r-xp 00000000 {dev_major:02x}:{dev_minor:02x} {stale_inode} {path_str} (deleted)"
+        ))
+        .unwrap()
+        .into();
+
+        let mut summaries = ModulePathSummaries::default();
+        summaries.observe(&stale_entry);
+        assert!(summaries.merged_summary().is_some());
+
+        let resolved = accessible_module_path_for_pid(
+            std::process::id(),
+            &format!("{path_str} (deleted)"),
+            &summaries,
+        );
+        assert!(resolved.is_none());
 
         let _ = std::fs::remove_file(path);
     }
