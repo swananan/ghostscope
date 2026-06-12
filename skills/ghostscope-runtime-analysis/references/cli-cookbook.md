@@ -1,5 +1,11 @@
 # GhostScope CLI Cookbook
 
+Use this file as a set of command templates and diagnostic prompts. Before
+answering with exact flags, logging behavior, debug-info search behavior, or DSL
+syntax, refresh the facts from the current `ghostscope --help`,
+`ghostscope --script-help`, and repository docs. Do not treat this cookbook as a
+frozen source of truth.
+
 ## Capability Snapshot
 
 Use GhostScope when the user wants low-overhead userspace tracing with DWARF-aware access to locals, parameters, globals, source lines, and function entries without stopping the target process.
@@ -9,7 +15,8 @@ Use GhostScope when the user wants low-overhead userspace tracing with DWARF-awa
 - GhostScope works best when used together with the relevant source tree. If the source checkout path is unknown, first try to discover it from the shared workspace or local filesystem before asking the user.
 - Linux and x86_64 only.
 - Elevated privileges are usually required. If privileges are not available yet, either grant GhostScope capabilities or prepare a `sudo` wrapper script.
-- Target binaries need DWARF debug info or a resolvable separate debug file. If the user cannot provide debug info for the modules they care about, tell them variable and source-level tracing will not work reliably.
+- Target binaries need DWARF debug info or a resolvable separate debug file. Re-check the current install/configuration docs before naming supported separate-debug sources or validation rules. If the user cannot provide debug info for the modules they care about, tell them variable and source-level tracing will not work reliably.
+- Verify the current `[dwarf]` search-path behavior before relying on distro debuginfo packages. Current GhostScope docs/config normally include common system debug directories by default, but users can override that list.
 - `-p <PID>` means the PID visible where GhostScope is being run.
 
 ## Common Workflows
@@ -52,15 +59,42 @@ Before giving file:line tracing or variable-inspection workflows, confirm:
 - target executable or shared-library path
 - whether the relevant modules have DWARF debug info
 - path to a separate debug file when the main binary is stripped
+- whether separate debug info should be supplied explicitly with `--debug-file`, discovered from `.gnu_debuglink`, or fetched with debuginfod
 
 Useful checks:
 
 ```bash
 readelf -S /path/to/your_program | grep debug
 readelf -x .gnu_debuglink /path/to/your_program
+readelf -n /path/to/your_program | grep 'Build ID'
+readelf -S /path/to/your_program.debug | grep .debug_info
 ```
 
 If the source tree path is still unknown after local discovery, ask the user to provide it. If debug info is missing after local inspection, ask the user to provide a debug-enabled binary or separate debug file for the modules they actually want to trace.
+
+If the current config overrides default search paths or omits a needed
+directory, include the relevant directory explicitly:
+
+```toml
+[dwarf]
+search_paths = ["/usr/lib/debug", "/usr/local/lib/debug"]
+```
+
+### Use An Explicit Debug File
+
+```bash
+# Bind the debug file to this binary or shared library
+sudo ghostscope -t /path/to/your_program \
+  --debug-file /path/to/your_program.debug
+
+# Bind the debug file to /proc/<pid>/exe, the main executable
+sudo ghostscope -p "$(pidof your_app)" \
+  --debug-file /path/to/your_program.debug
+```
+
+Before giving these commands, verify the current `--debug-file` binding rules
+from `ghostscope --help` and the configuration docs. Do not show
+`--debug-file` without also showing which target it binds to.
 
 ### Grant GhostScope Privileges
 
@@ -208,6 +242,25 @@ sudo ghostscope -p $(pidof your_app) --script-file trace.gs --script-output plai
 
 Use `plain` when the user wants payload-only stdout and less formatting noise.
 
+### Debug Logs For DWARF Or Startup Loading
+
+Verify current logging behavior from `ghostscope --help` and
+`docs/configuration.md` first. If script-mode logging is disabled by default,
+use forms like:
+
+```bash
+sudo ghostscope -p "$(pidof your_app)" \
+  --script-file trace.gs \
+  --log --log-level debug
+
+sudo env RUST_LOG=debug ghostscope -p "$(pidof your_app)" \
+  --script-file trace.gs \
+  --log
+```
+
+Use the current equivalent of these forms when the user needs full debuglink,
+debuginfod, startup load, or module-resolution details.
+
 ## High-Value TUI Commands
 
 - `trace <target> [index]`: open Script Mode for a function, line, or address.
@@ -225,6 +278,9 @@ Use `plain` when the user wants payload-only stdout and less formatting noise.
 - Optimized builds may show variables as optimized out.
 - Source-oriented workflows depend on knowing the relevant source tree location, whether discovered locally or provided by the user.
 - Variable and source-level tracing depend on debug info for the modules the user cares about.
+- Re-check logging behavior before telling the user how to collect debug logs.
+- Re-check debug-search behavior before telling the user where GhostScope looks
+  for separate debug files.
 - For exact script syntax on the installed version, run `ghostscope --script-help`.
 - If the user needs exact supported flags, run `ghostscope --help` and relevant subcommand help such as `ghostscope bpffs prune --help`.
 

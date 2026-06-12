@@ -33,6 +33,7 @@ rg -n "When To Use GhostScope|GhostScope vs|Tool Comparison|When Not To Use Ghos
 Use these when the user needs setup help before tracing:
 - `docs/install.md`
 - `docs/configuration.md`
+- `ghostscope/src/config/args.rs` for CLI help text and flag definitions
 
 Chinese:
 - `docs/zh/install.md`
@@ -41,7 +42,7 @@ Chinese:
 Useful search patterns:
 
 ```bash
-rg -n "Quick Install|Configure Permissions|Debug Symbols|script-file|enable-sysmon" docs/install.md docs/configuration.md ghostscope/src/config/args.rs
+rg -n "Quick Install|Configure Permissions|Debug Symbols|debug-file|debuginfod|search_paths|RUST_LOG|script-file|enable-sysmon" docs/install.md docs/configuration.md ghostscope/src/config/args.rs
 ```
 
 ### Launch GhostScope and pick `-p` vs `-t`

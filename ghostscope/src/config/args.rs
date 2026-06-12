@@ -166,7 +166,8 @@ pub struct Args {
     pub no_log_console: bool,
 
     /// Set log level (error, warn, info, debug, trace)
-    /// Priority: 1. Command line args, 2. RUST_LOG env var, 3. Config file (default: warn)
+    /// RUST_LOG, when set, controls the final tracing filter. Otherwise
+    /// GhostScope uses the effective --log-level/config log_level value.
     #[arg(long, value_name = "LEVEL")]
     pub log_level: Option<String>,
 
@@ -183,15 +184,17 @@ pub struct Args {
     /// Auto-detection otherwise searches:
     /// 1. Binary itself (.debug_info sections)
     /// 2. .gnu_debuglink section
-    /// 3. .gnu_debugdata section (Android/compressed)
-    /// 4. Standard paths: /usr/lib/debug, /usr/local/lib/debug
-    /// 5. Build-ID based paths
-    /// 6. Common patterns: binary.debug, binary.dbg
+    /// 3. debuginfod by Build-ID when enabled
+    ///
+    /// Local Build-ID directory layouts are not searched directly.
+    /// .gnu_debugdata is not loaded currently. Default .gnu_debuglink search_paths
+    /// include /usr/lib/debug and /usr/local/lib/debug unless overridden in config.
     #[arg(long, short = 'd', value_name = "PATH")]
     pub debug_file: Option<PathBuf>,
 
     /// Allow non-strict debug file matching (CRC/Build-ID mismatches)
     /// Default is strict (disabled). When set, CRC/Build-ID mismatches are allowed with WARN logs.
+    /// Accepted files must still contain usable .debug_info.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub allow_loose_debug_match: bool,
 
@@ -683,7 +686,9 @@ impl Args {
             false // Default: console logging is disabled for cleaner output
         };
 
-        // Determine log_level - Priority: 1. Command line, 2. RUST_LOG env, 3. Config file (default: warn)
+        // Determine the preliminary log level. The tracing subscriber still
+        // lets RUST_LOG control the final filter when the environment variable
+        // is set.
         let log_level = if let Some(ref level_str) = parsed.log_level {
             // --log-level takes highest precedence
             crate::config::settings::LogLevel::from_str(level_str).unwrap_or_else(|_| {
