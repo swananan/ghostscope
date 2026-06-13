@@ -259,7 +259,7 @@ impl<'ctx> MapManager<'ctx> {
         max_entries: u64,
     ) -> Result<()> {
         // Key: {pid:u32, pad:u32, cookie:u64} => 16 bytes => 128 bits
-        // Value: {text, rodata, data, bss: u64} => 32 bytes => 256 bits
+        // Value: {text, rodata, data, bss, base, size: u64} => 48 bytes => 384 bits
         self.create_map_definition(
             module,
             di_builder,
@@ -268,7 +268,7 @@ impl<'ctx> MapManager<'ctx> {
             BpfMapType::Hash,
             max_entries,
             SizedType::integer(128),
-            SizedType::integer(256),
+            SizedType::integer(384),
         )
     }
 

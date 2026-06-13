@@ -16,6 +16,7 @@ const BPF_INLINE_BACKTRACE_FRAME_LIMIT: u8 = 5;
 const BPF_BACKTRACE_FRAMES_PER_TAIL_CALL: u8 = 4;
 const BPF_BACKTRACE_MAX_STEP_INVOCATIONS: u8 = 32;
 const BPF_BACKTRACE_STEP_PROG_INDEX: u32 = 0;
+const BPF_BACKTRACE_MODULE_CANDIDATE_LIMIT: usize = 16;
 
 struct RuntimeBtUnwindRow<'ctx> {
     found: IntValue<'ctx>,
@@ -27,6 +28,12 @@ struct RuntimeBtUnwindRow<'ctx> {
     rbp_kind: IntValue<'ctx>,
     rbp_register: IntValue<'ctx>,
     rbp_offset: IntValue<'ctx>,
+}
+
+struct BtFrameModule<'ctx> {
+    cookie: IntValue<'ctx>,
+    bias: IntValue<'ctx>,
+    found: IntValue<'ctx>,
 }
 
 struct RuntimeBtRowScratch<'ctx> {
@@ -77,6 +84,7 @@ enum BacktraceUnwindRowForPc {
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(crate) fn prepare_backtrace_unwind_rows(&mut self, statements: &[Statement]) {
         self.backtrace_unwind_rows.clear();
+        self.backtrace_module_cookies.clear();
         self.backtrace_unwind_rows_use_runtime_pcs = false;
         self.backtrace_tail_call_slots = 1;
         self.next_backtrace_tail_call_slot = 0;
@@ -132,7 +140,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     fn runtime_backtrace_unwind_rows(
-        &self,
+        &mut self,
         analyzer: &ghostscope_dwarf::DwarfAnalyzer,
     ) -> Vec<ghostscope_protocol::BacktraceUnwindRow> {
         let started_at = Instant::now();
@@ -156,16 +164,31 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 wire.pc_end = wire.pc_end.checked_add(module_bias)?;
                 Some(wire)
             }));
+            let bpf_rows = rows.len().saturating_sub(row_start);
+            if bpf_rows > 0 {
+                let module_path = module.module_path.to_string_lossy();
+                let cookie = self.cookie_for_module_or_fallback(&module_path);
+                if !self.backtrace_module_cookies.contains(&cookie) {
+                    self.backtrace_module_cookies.push(cookie);
+                }
+            }
             modules += 1;
             tracing::info!(
                 module = %module.module_path.display(),
                 compact_rows = table.rows.len(),
-                bpf_rows = rows.len().saturating_sub(row_start),
+                bpf_rows,
                 elapsed_ms = module_started_at.elapsed().as_millis(),
                 "Prepared bt unwind rows for module"
             );
         }
         rows.sort_by_key(|row| (row.pc_start, row.pc_end));
+        if self.backtrace_module_cookies.len() > BPF_BACKTRACE_MODULE_CANDIDATE_LIMIT {
+            tracing::warn!(
+                candidates = self.backtrace_module_cookies.len(),
+                limit = BPF_BACKTRACE_MODULE_CANDIDATE_LIMIT,
+                "Limiting bt frame module range lookup candidates"
+            );
+        }
         tracing::info!(
             modules,
             rows = rows.len(),
@@ -269,6 +292,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         };
 
         let module_cookie = self.cookie_for_module_or_fallback(&compile_ctx.module_path);
+        let module_cookie_value = self.context.i64_type().const_int(module_cookie, false);
         let pt_regs = self.get_pt_regs_parameter()?;
         let raw_ip = self.load_dwarf_register_i64(X86_64_DWARF_RIP, pt_regs)?;
         let (module_bias, offsets_found) = self.generate_runtime_address_from_offsets(
@@ -277,8 +301,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             module_cookie,
         )?;
         let normalized_pc = self.normalized_pc_from_raw(raw_ip, module_bias, offsets_found)?;
+        let caller_fallback_found = if self.backtrace_unwind_rows_use_runtime_pcs {
+            self.context.bool_type().const_zero()
+        } else {
+            offsets_found
+        };
 
-        self.store_backtrace_frame(inst_buffer, 0, module_cookie, normalized_pc, raw_ip, 0)?;
+        self.store_backtrace_frame(
+            inst_buffer,
+            0,
+            module_cookie_value,
+            normalized_pc,
+            raw_ip,
+            0,
+        )?;
 
         if depth == 1 {
             let status =
@@ -368,8 +404,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         self.builder.position_at_end(initial_store_block);
-        let next_pc = self.normalized_pc_from_raw(next.ip, module_bias, offsets_found)?;
-        self.store_backtrace_frame(inst_buffer, 1, module_cookie, next_pc, next.ip, 0)?;
+        let frame_module = self.resolve_backtrace_frame_module(
+            next.ip,
+            module_cookie_value,
+            module_bias,
+            caller_fallback_found,
+            "bt_initial_frame_module",
+        )?;
+        let next_pc =
+            self.normalized_pc_from_raw(next.ip, frame_module.bias, frame_module.found)?;
+        self.store_backtrace_frame(inst_buffer, 1, frame_module.cookie, next_pc, next.ip, 0)?;
         self.store_u8_const(
             inst_buffer,
             data_base + BACKTRACE_DATA_FRAME_COUNT_OFFSET,
@@ -485,11 +529,19 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
                 self.builder.position_at_end(store_block);
-                let next_pc = self.normalized_pc_from_raw(next.ip, module_bias, offsets_found)?;
+                let frame_module = self.resolve_backtrace_frame_module(
+                    next.ip,
+                    module_cookie_value,
+                    module_bias,
+                    caller_fallback_found,
+                    &format!("bt_frame_{frame_index}_module"),
+                )?;
+                let next_pc =
+                    self.normalized_pc_from_raw(next.ip, frame_module.bias, frame_module.found)?;
                 self.store_backtrace_frame(
                     inst_buffer,
                     frame_index as usize,
-                    module_cookie,
+                    frame_module.cookie,
                     next_pc,
                     next.ip,
                     0,
@@ -619,6 +671,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         };
 
         let module_cookie = self.cookie_for_module_or_fallback(&compile_ctx.module_path);
+        let module_cookie_value = self.context.i64_type().const_int(module_cookie, false);
         let pt_regs = self.get_pt_regs_parameter()?;
         let raw_ip = self.load_dwarf_register_i64(X86_64_DWARF_RIP, pt_regs)?;
         let initial_rsp = self.load_dwarf_register_i64(X86_64_DWARF_RSP, pt_regs)?;
@@ -629,8 +682,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             module_cookie,
         )?;
         let normalized_pc = self.normalized_pc_from_raw(raw_ip, module_bias, offsets_found)?;
+        let caller_fallback_found = if self.backtrace_unwind_rows_use_runtime_pcs {
+            self.context.bool_type().const_zero()
+        } else {
+            offsets_found
+        };
 
-        self.store_backtrace_frame(inst_buffer, 0, module_cookie, normalized_pc, raw_ip, 0)?;
+        self.store_backtrace_frame(
+            inst_buffer,
+            0,
+            module_cookie_value,
+            normalized_pc,
+            raw_ip,
+            0,
+        )?;
 
         if depth == 1 {
             let status =
@@ -691,6 +756,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let ip_ptr = self.build_entry_alloca(i64_type, "bt_tail_prefix_ip")?;
         let rsp_ptr = self.build_entry_alloca(i64_type, "bt_tail_prefix_rsp")?;
         let rbp_ptr = self.build_entry_alloca(i64_type, "bt_tail_prefix_rbp")?;
+        let module_bias_ptr = self.build_entry_alloca(i64_type, "bt_tail_prefix_module_bias")?;
+        let module_cookie_ptr =
+            self.build_entry_alloca(i64_type, "bt_tail_prefix_module_cookie")?;
+        self.builder
+            .build_store(module_bias_ptr, module_bias)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(module_cookie_ptr, module_cookie_value)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         let runtime_row = self.runtime_row_from_static(row);
         let state = BtRegisterState {
@@ -733,8 +807,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         self.builder.position_at_end(initial_store_block);
-        let next_pc = self.normalized_pc_from_raw(next.ip, module_bias, offsets_found)?;
-        self.store_backtrace_frame(inst_buffer, 1, module_cookie, next_pc, next.ip, 0)?;
+        let frame_module = self.resolve_backtrace_frame_module(
+            next.ip,
+            module_cookie_value,
+            module_bias,
+            caller_fallback_found,
+            "bt_tail_initial_frame_module",
+        )?;
+        let next_pc =
+            self.normalized_pc_from_raw(next.ip, frame_module.bias, frame_module.found)?;
+        self.store_backtrace_frame(inst_buffer, 1, frame_module.cookie, next_pc, next.ip, 0)?;
         self.store_u8_const(
             inst_buffer,
             data_base + BACKTRACE_DATA_FRAME_COUNT_OFFSET,
@@ -762,6 +844,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_store(rbp_ptr, next.rbp)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(module_bias_ptr, frame_module.bias)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(module_cookie_ptr, frame_module.cookie)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         if depth == 2 {
             self.builder
@@ -774,9 +862,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let prefix_depth = depth.min(BPF_INLINE_BACKTRACE_FRAME_LIMIT);
         for frame_index in 2..prefix_depth {
             let current_ip = self.load_i64(ip_ptr, "bt_tail_prefix_lookup_ip")?;
+            let current_module_bias =
+                self.load_i64(module_bias_ptr, "bt_tail_prefix_lookup_module_bias")?;
             let lookup_raw = self.add_signed_offset(current_ip, -1, "bt_tail_prefix_lookup_raw")?;
             let lookup_pc =
-                self.backtrace_lookup_pc_from_raw(lookup_raw, module_bias, offsets_found)?;
+                self.backtrace_lookup_pc_from_raw(lookup_raw, current_module_bias, offsets_found)?;
             let runtime_row = self.lookup_backtrace_unwind_row(lookup_pc, &scratch.row)?;
             let found_block = self
                 .context
@@ -842,11 +932,22 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
             self.builder.position_at_end(store_block);
-            let next_pc = self.normalized_pc_from_raw(next.ip, module_bias, offsets_found)?;
+            let fallback_cookie =
+                self.load_i64(module_cookie_ptr, "bt_tail_prefix_module_cookie")?;
+            let fallback_bias = self.load_i64(module_bias_ptr, "bt_tail_prefix_module_bias")?;
+            let frame_module = self.resolve_backtrace_frame_module(
+                next.ip,
+                fallback_cookie,
+                fallback_bias,
+                caller_fallback_found,
+                &format!("bt_tail_prefix_frame_{frame_index}_module"),
+            )?;
+            let next_pc =
+                self.normalized_pc_from_raw(next.ip, frame_module.bias, frame_module.found)?;
             self.store_backtrace_frame(
                 inst_buffer,
                 frame_index as usize,
-                module_cookie,
+                frame_module.cookie,
                 next_pc,
                 next.ip,
                 0,
@@ -878,6 +979,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.builder
                 .build_store(rbp_ptr, next.rbp)
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            self.builder
+                .build_store(module_bias_ptr, frame_module.bias)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            self.builder
+                .build_store(module_cookie_ptr, frame_module.cookie)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
             if frame_index + 1 == depth {
                 self.builder
@@ -903,7 +1010,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.pending_backtrace_tail_call =
                 Some(crate::ebpf::context::PendingBacktraceTailCall {
                     step_program_name,
-                    module_cookie,
                     depth,
                     instruction_size,
                 });
@@ -944,6 +1050,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let tail_ip = self.load_i64(ip_ptr, "bt_tail_state_prefix_ip")?;
         let tail_rsp = self.load_i64(rsp_ptr, "bt_tail_state_prefix_rsp")?;
         let tail_rbp = self.load_i64(rbp_ptr, "bt_tail_state_prefix_rbp")?;
+        let tail_module_bias = self.load_i64(module_bias_ptr, "bt_tail_state_module_bias")?;
+        let tail_module_cookie = self.load_i64(module_cookie_ptr, "bt_tail_state_module_cookie")?;
         self.store_state_i64(
             state_ptr,
             crate::BACKTRACE_TAIL_STATE_CURRENT_IP_OFFSET,
@@ -965,13 +1073,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.store_state_i64(
             state_ptr,
             crate::BACKTRACE_TAIL_STATE_MODULE_BIAS_OFFSET,
-            module_bias,
+            tail_module_bias,
             "bt_state_module_bias",
         )?;
-        self.store_u64_const(
+        self.store_u64_value(
             state_ptr,
             crate::BACKTRACE_TAIL_STATE_MODULE_COOKIE_OFFSET,
-            module_cookie,
+            tail_module_cookie,
             "bt_state_module_cookie",
         )?;
         self.store_state_i32(
@@ -1274,7 +1382,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         for _ in 0..BPF_BACKTRACE_FRAMES_PER_TAIL_CALL {
             self.generate_backtrace_tail_call_step_iteration(
                 plan.depth,
-                plan.module_cookie,
                 state_ptr,
                 inst_buffer,
                 &scratch,
@@ -1450,7 +1557,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     fn generate_backtrace_tail_call_step_iteration(
         &mut self,
         depth: u8,
-        module_cookie: u64,
         state_ptr: PointerValue<'ctx>,
         inst_buffer: PointerValue<'ctx>,
         scratch: &BtScratch<'ctx>,
@@ -1513,6 +1619,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             crate::BACKTRACE_TAIL_STATE_MODULE_BIAS_OFFSET,
             "bt_step_module_bias",
         )?;
+        let module_cookie = self.load_row_i64(
+            state_ptr,
+            crate::BACKTRACE_TAIL_STATE_MODULE_COOKIE_OFFSET,
+            "bt_step_module_cookie",
+        )?;
         let offsets_found_u8 = self.load_row_i8(
             state_ptr,
             crate::BACKTRACE_TAIL_STATE_OFFSETS_FOUND_OFFSET,
@@ -1527,6 +1638,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "bt_step_offsets_found",
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let caller_fallback_found = if self.backtrace_unwind_rows_use_runtime_pcs {
+            self.context.bool_type().const_zero()
+        } else {
+            offsets_found
+        };
         let is_first_unwind = self
             .builder
             .build_int_compare(
@@ -1610,12 +1726,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         self.builder.position_at_end(store_block);
-        let next_pc = self.normalized_pc_from_raw(next.ip, module_bias, offsets_found)?;
+        let frame_module = self.resolve_backtrace_frame_module(
+            next.ip,
+            module_cookie,
+            module_bias,
+            caller_fallback_found,
+            "bt_step_frame_module",
+        )?;
+        let next_pc =
+            self.normalized_pc_from_raw(next.ip, frame_module.bias, frame_module.found)?;
         self.store_backtrace_frame_dynamic(
             inst_buffer,
             frame_count,
             depth.saturating_sub(1),
-            module_cookie,
+            frame_module.cookie,
             next_pc,
             next.ip,
         )?;
@@ -1656,6 +1780,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             crate::BACKTRACE_TAIL_STATE_CURRENT_RBP_OFFSET,
             next.rbp,
             "bt_step_state_next_rbp",
+        )?;
+        self.store_state_i64(
+            state_ptr,
+            crate::BACKTRACE_TAIL_STATE_MODULE_BIAS_OFFSET,
+            frame_module.bias,
+            "bt_step_state_next_module_bias",
+        )?;
+        self.store_state_i64(
+            state_ptr,
+            crate::BACKTRACE_TAIL_STATE_MODULE_COOKIE_OFFSET,
+            frame_module.cookie,
+            "bt_step_state_next_module_cookie",
         )?;
 
         let reached_depth = self
@@ -3243,6 +3379,129 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))
     }
 
+    fn resolve_backtrace_frame_module(
+        &mut self,
+        raw_ip: IntValue<'ctx>,
+        fallback_cookie: IntValue<'ctx>,
+        fallback_bias: IntValue<'ctx>,
+        fallback_found: IntValue<'ctx>,
+        name_prefix: &str,
+    ) -> Result<BtFrameModule<'ctx>> {
+        if !self.backtrace_unwind_rows_use_runtime_pcs || self.backtrace_module_cookies.is_empty() {
+            return Ok(BtFrameModule {
+                cookie: fallback_cookie,
+                bias: fallback_bias,
+                found: fallback_found,
+            });
+        }
+
+        let i64_type = self.context.i64_type();
+        let mut cookie = fallback_cookie;
+        let mut bias = fallback_bias;
+        let mut found = fallback_found;
+        let candidates = self.backtrace_module_cookies.clone();
+        for (idx, candidate_cookie) in candidates
+            .into_iter()
+            .take(BPF_BACKTRACE_MODULE_CANDIDATE_LIMIT)
+            .enumerate()
+        {
+            let lookup = self.lookup_proc_module_offsets_value(
+                candidate_cookie,
+                &format!("{name_prefix}_{idx}"),
+            )?;
+            let end = self
+                .builder
+                .build_int_add(
+                    lookup.base,
+                    lookup.size,
+                    &format!("{name_prefix}_{idx}_end"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let non_empty = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::NE,
+                    lookup.size,
+                    i64_type.const_zero(),
+                    &format!("{name_prefix}_{idx}_non_empty"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let at_or_after_base = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::UGE,
+                    raw_ip,
+                    lookup.base,
+                    &format!("{name_prefix}_{idx}_after_base"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let before_end = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::ULT,
+                    raw_ip,
+                    end,
+                    &format!("{name_prefix}_{idx}_before_end"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let in_bounds = self
+                .builder
+                .build_and(
+                    at_or_after_base,
+                    before_end,
+                    &format!("{name_prefix}_{idx}_in_bounds"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let valid_range = self
+                .builder
+                .build_and(
+                    lookup.found,
+                    non_empty,
+                    &format!("{name_prefix}_{idx}_range_has_offsets"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let in_range = self
+                .builder
+                .build_and(
+                    valid_range,
+                    in_bounds,
+                    &format!("{name_prefix}_{idx}_in_range"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+            cookie = self
+                .builder
+                .build_select::<BasicValueEnum<'ctx>, _>(
+                    in_range,
+                    i64_type.const_int(candidate_cookie, false).into(),
+                    cookie.into(),
+                    &format!("{name_prefix}_{idx}_cookie"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                .into_int_value();
+            bias = self
+                .builder
+                .build_select::<BasicValueEnum<'ctx>, _>(
+                    in_range,
+                    lookup.text.into(),
+                    bias.into(),
+                    &format!("{name_prefix}_{idx}_bias"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                .into_int_value();
+            found = self
+                .builder
+                .build_or(found, in_range, &format!("{name_prefix}_{idx}_found"))
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        }
+
+        Ok(BtFrameModule {
+            cookie,
+            bias,
+            found,
+        })
+    }
+
     fn backtrace_lookup_pc_from_raw(
         &self,
         raw_ip: IntValue<'ctx>,
@@ -3349,14 +3608,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         &self,
         inst_buffer: PointerValue<'ctx>,
         frame_index: usize,
-        module_cookie: u64,
+        module_cookie: IntValue<'ctx>,
         pc: IntValue<'ctx>,
         raw_ip: IntValue<'ctx>,
         flags: u16,
     ) -> Result<()> {
         let frame_base =
             INSTRUCTION_HEADER_SIZE + BACKTRACE_DATA_SIZE + frame_index * BACKTRACE_FRAME_DATA_SIZE;
-        self.store_u64_const(
+        self.store_u64_value(
             inst_buffer,
             frame_base + BACKTRACE_FRAME_MODULE_COOKIE_OFFSET,
             module_cookie,
@@ -3387,7 +3646,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         inst_buffer: PointerValue<'ctx>,
         frame_index: IntValue<'ctx>,
         max_frame_index: u8,
-        module_cookie: u64,
+        module_cookie: IntValue<'ctx>,
         pc: IntValue<'ctx>,
         raw_ip: IntValue<'ctx>,
     ) -> Result<()> {
@@ -3436,7 +3695,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let frame_base =
             self.dynamic_byte_gep(inst_buffer, frame_base_offset, "bt_dynamic_frame")?;
 
-        self.store_u64_const(
+        self.store_u64_value(
             frame_base,
             BACKTRACE_FRAME_MODULE_COOKIE_OFFSET,
             module_cookie,
@@ -3521,21 +3780,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_store(ptr, value)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         Ok(())
-    }
-
-    fn store_u64_const(
-        &self,
-        base: PointerValue<'ctx>,
-        offset: usize,
-        value: u64,
-        name: &str,
-    ) -> Result<()> {
-        self.store_u64_value(
-            base,
-            offset,
-            self.context.i64_type().const_int(value, false),
-            name,
-        )
     }
 
     fn store_u64_value(
@@ -3755,7 +3999,9 @@ fn backtrace_flags(stmt: &BacktraceStatement) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::backtrace_row_binary_search_steps;
+    use super::*;
+    use crate::CompileOptions;
+    use inkwell::AddressSpace;
 
     #[test]
     fn binary_search_steps_cover_power_of_two_row_counts() {
@@ -3771,5 +4017,64 @@ mod tests {
         assert_eq!(backtrace_row_binary_search_steps(3), 3);
         assert_eq!(backtrace_row_binary_search_steps(5), 4);
         assert_eq!(backtrace_row_binary_search_steps(9), 5);
+    }
+
+    #[test]
+    fn runtime_backtrace_frame_module_resolution_generates_range_lookups() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx =
+            EbpfContext::new(&context, "bt_frame_module_test", Some(0), &opts).expect("ctx");
+        let i64_type = context.i64_type();
+        let map_global = ctx.module.add_global(
+            i64_type,
+            Some(AddressSpace::default()),
+            "proc_module_offsets",
+        );
+        map_global.set_initializer(&i64_type.const_zero());
+
+        let fn_type = context.i32_type().fn_type(&[], false);
+        let function = ctx.module.add_function("bt_frame_module", fn_type, None);
+        let entry = context.append_basic_block(function, "entry");
+        ctx.builder.position_at_end(entry);
+        let key_type = context.i32_type().array_type(4);
+        ctx.pm_key_alloca = Some(
+            ctx.builder
+                .build_alloca(key_type, "pm_key")
+                .expect("pm_key alloca"),
+        );
+        ctx.backtrace_unwind_rows_use_runtime_pcs = true;
+        ctx.backtrace_module_cookies = vec![0x1111, 0x2222];
+
+        let frame_module = ctx
+            .resolve_backtrace_frame_module(
+                i64_type.const_int(0x7f00_1234, false),
+                i64_type.const_int(0x1111, false),
+                i64_type.const_zero(),
+                context.bool_type().const_zero(),
+                "test_bt_frame_module",
+            )
+            .expect("resolve frame module");
+        ctx.store_u64_value(
+            ctx.pm_key_alloca.expect("pm key"),
+            0,
+            frame_module.cookie,
+            "selected_cookie",
+        )
+        .expect("store selected cookie");
+
+        let ir = ctx.module.print_to_string().to_string();
+        assert!(
+            ir.contains("test_bt_frame_module_0_base")
+                && ir.contains("test_bt_frame_module_0_size")
+                && ir.contains("test_bt_frame_module_1_base")
+                && ir.contains("test_bt_frame_module_1_size"),
+            "resolver should load base/size for every module candidate\nIR:\n{ir}"
+        );
+        assert!(
+            ir.contains("test_bt_frame_module_0_cookie")
+                && ir.contains("test_bt_frame_module_1_cookie"),
+            "resolver should select a per-frame module cookie\nIR:\n{ir}"
+        );
     }
 }

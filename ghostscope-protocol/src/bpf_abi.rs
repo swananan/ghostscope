@@ -38,15 +38,19 @@ pub struct ProcModuleOffsetsValue {
     pub rodata: u64,
     pub data: u64,
     pub bss: u64,
+    pub base: u64,
+    pub size: u64,
 }
 
 impl ProcModuleOffsetsValue {
-    pub fn new(text: u64, rodata: u64, data: u64, bss: u64) -> Self {
+    pub fn new(text: u64, rodata: u64, data: u64, bss: u64, base: u64, size: u64) -> Self {
         Self {
             text,
             rodata,
             data,
             bss,
+            base,
+            size,
         }
     }
 }
@@ -59,6 +63,10 @@ pub const PROC_MODULE_OFFSETS_VALUE_DATA_OFFSET: usize =
     std::mem::offset_of!(ProcModuleOffsetsValue, data);
 pub const PROC_MODULE_OFFSETS_VALUE_BSS_OFFSET: usize =
     std::mem::offset_of!(ProcModuleOffsetsValue, bss);
+pub const PROC_MODULE_OFFSETS_VALUE_BASE_OFFSET: usize =
+    std::mem::offset_of!(ProcModuleOffsetsValue, base);
+pub const PROC_MODULE_OFFSETS_VALUE_SIZE_OFFSET: usize =
+    std::mem::offset_of!(ProcModuleOffsetsValue, size);
 pub const PROC_MODULE_OFFSETS_VALUE_SIZE: usize = std::mem::size_of::<ProcModuleOffsetsValue>();
 
 /// Value for the pinned `pid_aliases` map.
@@ -263,11 +271,13 @@ mod tests {
         assert_eq!(PROC_MODULE_KEY_COOKIE_LO_OFFSET, 8);
         assert_eq!(PROC_MODULE_KEY_COOKIE_HI_OFFSET, 12);
 
-        assert_eq!(PROC_MODULE_OFFSETS_VALUE_SIZE, 32);
+        assert_eq!(PROC_MODULE_OFFSETS_VALUE_SIZE, 48);
         assert_eq!(PROC_MODULE_OFFSETS_VALUE_TEXT_OFFSET, 0);
         assert_eq!(PROC_MODULE_OFFSETS_VALUE_RODATA_OFFSET, 8);
         assert_eq!(PROC_MODULE_OFFSETS_VALUE_DATA_OFFSET, 16);
         assert_eq!(PROC_MODULE_OFFSETS_VALUE_BSS_OFFSET, 24);
+        assert_eq!(PROC_MODULE_OFFSETS_VALUE_BASE_OFFSET, 32);
+        assert_eq!(PROC_MODULE_OFFSETS_VALUE_SIZE_OFFSET, 40);
 
         assert_eq!(PID_ALIAS_VALUE_SIZE, 4);
         assert_eq!(PID_ALIAS_VALUE_PROC_PID_OFFSET, 0);

@@ -206,6 +206,19 @@ pub fn bpffs_mount_hint_for_pin_path(pin_path: &Path) -> Option<String> {
 
 pub use ghostscope_protocol::{PidAliasValue, ProcModuleKey, ProcModuleOffsetsValue};
 
+fn proc_offsets_pin_layout_matches(map: &MapData) -> bool {
+    match map.info() {
+        Ok(info) => {
+            info.key_size() == ghostscope_protocol::PROC_MODULE_KEY_SIZE as u32
+                && info.value_size() == ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_SIZE as u32
+        }
+        Err(e) => {
+            warn!("Unable to inspect pinned proc_module_offsets map layout: {e}");
+            false
+        }
+    }
+}
+
 fn ensure_pin_dir(path: &Path) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
@@ -232,17 +245,28 @@ pub fn ensure_pinned_proc_offsets_exists(max_entries: u32) -> anyhow::Result<()>
         )
     })?;
 
-    // If pinned file already exists, try to reuse it directly (idempotent)
+    // If pinned file already exists, reuse it only when the ABI layout matches.
     if pin_path.exists() {
-        if MapData::from_pin(&pin_path).is_ok() {
-            info!(
-                "Reusing existing pinned map at {} (no recreate)",
-                pin_path.display()
-            );
-            return Ok(());
-        } else {
-            // Stale/corrupted pin path, remove and recreate
-            let _ = std::fs::remove_file(&pin_path);
+        match MapData::from_pin(&pin_path) {
+            Ok(map) if proc_offsets_pin_layout_matches(&map) => {
+                info!(
+                    "Reusing existing pinned map at {} (layout ok)",
+                    pin_path.display()
+                );
+                return Ok(());
+            }
+            Ok(_) => {
+                warn!(
+                    "Pinned {} at {} has stale ABI layout; recreating",
+                    PROC_OFFSETS_MAP_NAME,
+                    pin_path.display()
+                );
+                let _ = std::fs::remove_file(&pin_path);
+            }
+            Err(_) => {
+                // Stale/corrupted pin path, remove and recreate
+                let _ = std::fs::remove_file(&pin_path);
+            }
         }
     }
 
@@ -280,7 +304,7 @@ pub fn ensure_pinned_proc_offsets_exists(max_entries: u32) -> anyhow::Result<()>
         Err(e) => {
             // If another thread/process pinned concurrently, reuse the existing pin
             match MapData::from_pin(&pin_path) {
-                Ok(_) => {
+                Ok(map) if proc_offsets_pin_layout_matches(&map) => {
                     info!(
                         "Pin path {} already exists; reusing existing map ({}).",
                         pin_path.display(),
@@ -288,7 +312,7 @@ pub fn ensure_pinned_proc_offsets_exists(max_entries: u32) -> anyhow::Result<()>
                     );
                     Ok(())
                 }
-                Err(_) => {
+                Ok(_) | Err(_) => {
                     // Best-effort cleanup and propagate error
                     let _ = std::fs::remove_file(&pin_path);
                     let hint = bpffs_mount_hint_for_pin_path(&pin_path)
@@ -580,8 +604,8 @@ pub fn insert_offsets_for_pid(
         match map.insert(key, *off, 0) {
             Ok(()) => {
                 tracing::debug!(
-                    "proc_module_offsets insert ok: pid={} cookie=0x{:08x}{:08x} text=0x{:x} rodata=0x{:x} data=0x{:x} bss=0x{:x}",
-                    pid, key.cookie_hi, key.cookie_lo, off.text, off.rodata, off.data, off.bss
+                    "proc_module_offsets insert ok: pid={} cookie=0x{:08x}{:08x} text=0x{:x} rodata=0x{:x} data=0x{:x} bss=0x{:x} base=0x{:x} size=0x{:x}",
+                    pid, key.cookie_hi, key.cookie_lo, off.text, off.rodata, off.data, off.bss, off.base, off.size
                 );
                 inserted += 1
             }
