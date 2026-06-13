@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 /// System-wide debug directories are searched when the caller includes them in
 /// search_paths; the default GhostScope config includes common system paths.
 ///
-/// Returns the path to the debug file if found and CRC matches
-/// Also verifies build ID if present in both files
+/// Returns the path to the debug file if a strict CRC/Build-ID match is found,
+/// or if loose mode falls back to the first mismatched candidate.
 pub fn find_debug_file<P: AsRef<Path>>(
     binary_path: P,
     user_search_paths: &[String],
@@ -77,7 +77,10 @@ pub fn find_debug_file<P: AsRef<Path>>(
     // Build search paths following GDB's strategy
     let search_paths = build_search_paths(binary_path, debug_filename, user_search_paths);
 
-    // Try each path and verify CRC + build ID
+    // Try each path and verify CRC + build ID. Strict matches always win, even
+    // in loose mode; only fall back to the first mismatched candidate after the
+    // full search list has been checked.
+    let mut first_loose_candidate = None;
     for candidate_path in search_paths {
         tracing::debug!("Checking debug file path: {}", candidate_path.display());
 
@@ -94,10 +97,12 @@ pub fn find_debug_file<P: AsRef<Path>>(
                 Ok(false) => {
                     if allow_loose_debug_match {
                         tracing::warn!(
-                            "Debug file {} exists but verification failed; loose match enabled -> using it",
+                            "Debug file {} exists but verification failed; loose match enabled -> retaining as fallback",
                             candidate_path.display()
                         );
-                        return Ok(Some(candidate_path));
+                        if first_loose_candidate.is_none() {
+                            first_loose_candidate = Some(candidate_path);
+                        }
                     } else {
                         tracing::error!(
                             "Debug file {} exists but verification failed (CRC or Build-ID mismatch)",
@@ -114,6 +119,14 @@ pub fn find_debug_file<P: AsRef<Path>>(
                 }
             }
         }
+    }
+
+    if let Some(candidate_path) = first_loose_candidate {
+        tracing::warn!(
+            "No strict matching debug file found; loose match enabled -> using {}",
+            candidate_path.display()
+        );
+        return Ok(Some(candidate_path));
     }
 
     tracing::warn!(
