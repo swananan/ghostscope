@@ -34,7 +34,6 @@ pub struct BacktraceTailCallProgram {
 #[derive(Debug, Clone)]
 pub(crate) struct PendingBacktraceTailCall {
     pub step_program_name: String,
-    pub module_cookie: u64,
     pub depth: u8,
     pub instruction_size: usize,
 }
@@ -162,6 +161,7 @@ pub struct EbpfContext<'ctx, 'dw> {
 
     // === DWARF compact unwind rows for bt ===
     pub backtrace_unwind_rows: Vec<ghostscope_protocol::BacktraceUnwindRow>,
+    pub(crate) backtrace_module_cookies: Vec<u64>,
     pub(crate) backtrace_unwind_rows_use_runtime_pcs: bool,
     pub(crate) backtrace_tail_call_slots: u8,
     pub(crate) next_backtrace_tail_call_slot: u8,
@@ -273,6 +273,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             string_vars: HashMap::new(),
             // Backtrace compact unwind rows
             backtrace_unwind_rows: Vec::new(),
+            backtrace_module_cookies: Vec::new(),
             backtrace_unwind_rows_use_runtime_pcs: false,
             backtrace_tail_call_slots: 1,
             next_backtrace_tail_call_slot: 0,

@@ -634,10 +634,12 @@ fn run_sysmon_loop(
                     use std::collections::HashMap;
                     let mut by_pid: HashMap<u32, Vec<(u64, ProcModuleOffsetsValue)>> =
                         HashMap::new();
-                    for (pid, cookie, off) in entries {
+                    for (pid, cookie, off, base, size) in entries {
                         by_pid.entry(pid).or_default().push((
                             cookie,
-                            ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss),
+                            ProcModuleOffsetsValue::new(
+                                off.text, off.rodata, off.data, off.bss, base, size,
+                            ),
                         ));
                     }
                     let mut total = 0usize;
@@ -954,10 +956,14 @@ fn prefill_offsets_for_pid(
                     }
                     let mut by_pid: HashMap<u32, Vec<(u64, ProcModuleOffsetsValue)>> =
                         HashMap::new();
-                    for (pid, cookie, off) in guard.cached_offsets_for_module(&module_path) {
+                    for (pid, cookie, off, base, size) in
+                        guard.cached_offsets_for_module(&module_path)
+                    {
                         by_pid.entry(pid).or_default().push((
                             cookie,
-                            ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss),
+                            ProcModuleOffsetsValue::new(
+                                off.text, off.rodata, off.data, off.bss, base, size,
+                            ),
                         ));
                     }
                     for (pid, items) in by_pid {
@@ -1023,6 +1029,8 @@ fn prefill_offsets_for_pid(
                             e.offsets.rodata,
                             e.offsets.data,
                             e.offsets.bss,
+                            e.base,
+                            e.size,
                         ),
                     )
                 })
@@ -1094,10 +1102,10 @@ fn refresh_target_module_offsets(
             );
             return;
         }
-        for (pid, cookie, off) in guard.cached_offsets_for_module(&module_path) {
+        for (pid, cookie, off, base, size) in guard.cached_offsets_for_module(&module_path) {
             by_pid.entry(pid).or_default().push((
                 cookie,
-                ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss),
+                ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss, base, size),
             ));
         }
     }

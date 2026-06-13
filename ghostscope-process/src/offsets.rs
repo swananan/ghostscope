@@ -50,6 +50,8 @@ struct CachedEntry {
     pid: u32,
     cookie: u64,
     offsets: SectionOffsets,
+    base: u64,
+    size: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -255,11 +257,13 @@ impl ProcessManager {
                 3,
                 std::time::Duration::from_millis(75),
             ) {
-                Ok((cookie, offsets, _base, _size)) => {
+                Ok((cookie, offsets, base, size)) => {
                     cached.push(CachedEntry {
                         pid,
                         cookie,
                         offsets,
+                        base,
+                        size,
                     });
                     new_count += 1;
                 }
@@ -276,10 +280,17 @@ impl ProcessManager {
         Ok(new_count)
     }
 
-    pub fn cached_offsets_for_module(&self, module_path: &str) -> Vec<(u32, u64, SectionOffsets)> {
+    pub fn cached_offsets_for_module(
+        &self,
+        module_path: &str,
+    ) -> Vec<(u32, u64, SectionOffsets, u64, u64)> {
         self.module_cache
             .get(module_path)
-            .map(|v| v.iter().map(|e| (e.pid, e.cookie, e.offsets)).collect())
+            .map(|v| {
+                v.iter()
+                    .map(|e| (e.pid, e.cookie, e.offsets, e.base, e.size))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -649,11 +660,15 @@ mod tests {
                     pid: 42,
                     cookie: 1,
                     offsets: SectionOffsets::default(),
+                    base: 0,
+                    size: 0,
                 },
                 CachedEntry {
                     pid: 7,
                     cookie: 2,
                     offsets: SectionOffsets::default(),
+                    base: 0,
+                    size: 0,
                 },
             ],
         );

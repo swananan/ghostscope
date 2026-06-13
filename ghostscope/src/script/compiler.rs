@@ -74,16 +74,25 @@ fn apply_cached_offsets_for_session_pid(
                 .coordinator
                 .lock()
                 .expect("coordinator mutex poisoned");
-            coordinator.cached_offsets_pairs_for_pid(proc_pid)
+            coordinator
+                .cached_offsets_with_paths_for_pid(proc_pid)
+                .map(|entries| entries.to_vec())
         };
         if let Some(items) = items {
             use ghostscope_process::pinned_bpf_maps::ProcModuleOffsetsValue;
             let adapted: Vec<(u64, ProcModuleOffsetsValue)> = items
                 .iter()
-                .map(|(cookie, off)| {
+                .map(|entry| {
                     (
-                        *cookie,
-                        ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss),
+                        entry.cookie,
+                        ProcModuleOffsetsValue::new(
+                            entry.offsets.text,
+                            entry.offsets.rodata,
+                            entry.offsets.data,
+                            entry.offsets.bss,
+                            entry.base,
+                            entry.size,
+                        ),
                     )
                 })
                 .collect();
@@ -214,10 +223,12 @@ async fn create_and_attach_loader(
             // Group by pid for efficient batch insert
             use std::collections::HashMap;
             let mut by_pid: HashMap<u32, Vec<(u64, ProcModuleOffsetsValue)>> = HashMap::new();
-            for (pid, cookie, off) in entries {
+            for (pid, cookie, off, base, size) in entries {
                 by_pid.entry(pid).or_default().push((
                     cookie,
-                    ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss),
+                    ProcModuleOffsetsValue::new(
+                        off.text, off.rodata, off.data, off.bss, base, size,
+                    ),
                 ));
             }
             let mut total = 0usize;

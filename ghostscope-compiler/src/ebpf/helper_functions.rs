@@ -22,6 +22,16 @@ struct ProbeReadResult<'ctx> {
     not_found: IntValue<'ctx>,
 }
 
+pub(crate) struct ProcModuleOffsetsLookup<'ctx> {
+    pub(crate) found: IntValue<'ctx>,
+    pub(crate) text: IntValue<'ctx>,
+    pub(crate) rodata: IntValue<'ctx>,
+    pub(crate) data: IntValue<'ctx>,
+    pub(crate) bss: IntValue<'ctx>,
+    pub(crate) base: IntValue<'ctx>,
+    pub(crate) size: IntValue<'ctx>,
+}
+
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     fn get_or_create_tls_scratch_buffer(&mut self) -> Result<PointerValue<'ctx>> {
         if let Some(alloca) = self.tls_scratch_alloca {
@@ -420,14 +430,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .into_int_value();
         Ok((buf_global, status, arr_ty))
     }
-    /// Compute runtime address from link-time address using proc_module_offsets map
-    /// section_type: 0=text, 1=rodata, 2=data, 3=bss; other values fallback to data
-    pub fn generate_runtime_address_from_offsets(
+    pub(crate) fn lookup_proc_module_offsets_value(
         &mut self,
-        link_addr: IntValue<'ctx>,
-        section_type: u8,
         module_cookie: u64,
-    ) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
+        name_prefix: &str,
+    ) -> Result<ProcModuleOffsetsLookup<'ctx>> {
         const BPF_FUNC_GET_NS_CURRENT_PID_TGID: u64 = 120;
         const BPF_PIDNS_INFO_SIZE: u64 = 8; // struct { u32 pid; u32 tgid; }
 
@@ -444,7 +451,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let map_ptr = map_global.as_pointer_value();
         let map_ptr_cast = self
             .builder
-            .build_bit_cast(map_ptr, ptr_type, "map_ptr")
+            .build_bit_cast(map_ptr, ptr_type, &format!("{name_prefix}_map_ptr"))
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         // Use per-invocation key buffer [4 x u32] pre-allocated in entry block
@@ -461,11 +468,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let helper_fn_type = i64_type.fn_type(&[], false);
         let helper_fn_ptr = self
             .builder
-            .build_int_to_ptr(helper_id, ptr_type, "get_pid_fn")
+            .build_int_to_ptr(helper_id, ptr_type, &format!("{name_prefix}_get_pid_fn"))
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let pid_tgid = self
             .builder
-            .build_indirect_call(helper_fn_type, helper_fn_ptr, &[], "pid_tgid")
+            .build_indirect_call(
+                helper_fn_type,
+                helper_fn_ptr,
+                &[],
+                &format!("{name_prefix}_pid_tgid"),
+            )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .try_as_basic_value()
             .left()
@@ -476,10 +488,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             // pid = upper 32 bits
             let shifted = self
                 .builder
-                .build_right_shift(v, i64_type.const_int(32, false), false, "pid_shift")
+                .build_right_shift(
+                    v,
+                    i64_type.const_int(32, false),
+                    false,
+                    &format!("{name_prefix}_pid_shift"),
+                )
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
             self.builder
-                .build_int_truncate(shifted, i32_type, "pid32")
+                .build_int_truncate(shifted, i32_type, &format!("{name_prefix}_pid32"))
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
         } else {
             return Err(CodeGenError::LLVMError(
@@ -499,7 +516,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
             let pidns_info_ptr = self
                 .builder
-                .build_bit_cast(key_alloca, ptr_type, "offset_pidns_info_ptr")
+                .build_bit_cast(
+                    key_alloca,
+                    ptr_type,
+                    &format!("{name_prefix}_pidns_info_ptr"),
+                )
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
             let helper_args = [
                 i64_type.const_int(pid_ns_dev, false).into(),
@@ -511,7 +532,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 BPF_FUNC_GET_NS_CURRENT_PID_TGID,
                 &helper_args,
                 i64_type.into(),
-                "offset_ns_pid_tgid_ret",
+                &format!("{name_prefix}_ns_pid_tgid_ret"),
             )?;
             let helper_ret = match helper_ret {
                 BasicValueEnum::IntValue(v) => v,
@@ -527,7 +548,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     inkwell::IntPredicate::EQ,
                     helper_ret,
                     i64_type.const_zero(),
-                    "offset_ns_helper_ok",
+                    &format!("{name_prefix}_ns_helper_ok"),
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
             // SAFETY: key_alloca temporarily holds the two-field pid namespace
@@ -537,13 +558,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     key_arr_ty,
                     key_alloca,
                     &[i32_type.const_zero(), i32_type.const_int(1, false)],
-                    "offset_ns_tgid_ptr",
+                    &format!("{name_prefix}_ns_tgid_ptr"),
                 )
             }
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
             let ns_tgid = self
                 .builder
-                .build_load(i32_type, ns_tgid_ptr, "offset_ns_tgid")
+                .build_load(i32_type, ns_tgid_ptr, &format!("{name_prefix}_ns_tgid"))
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
                 .into_int_value();
             // The proc_module_offsets map is populated from `/proc/<proc_pid>/maps`,
@@ -551,13 +572,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             // those `/proc` reads. This is *not* necessarily the same namespace
             // used for `$pid`/`$tid` or NamespaceTgid filtering.
             self.builder
-                .build_select(helper_ok, ns_tgid, host_tgid, "offset_pid_key")
+                .build_select(
+                    helper_ok,
+                    ns_tgid,
+                    host_tgid,
+                    &format!("{name_prefix}_pid_key"),
+                )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
                 .into_int_value()
         } else {
             host_tgid
         };
-        let pid = self.lookup_proc_pid_alias(runtime_pid, "offset_pid")?;
+        let pid = self.lookup_proc_pid_alias(runtime_pid, name_prefix)?;
 
         let store_key_u32 = |offset: usize,
                              value: IntValue<'ctx>,
@@ -581,13 +607,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         store_key_u32(
             ghostscope_protocol::PROC_MODULE_KEY_PID_OFFSET,
             pid,
-            "pm_key_pid_ptr",
+            &format!("{name_prefix}_pm_key_pid_ptr"),
             self,
         )?;
         store_key_u32(
             ghostscope_protocol::PROC_MODULE_KEY_PAD_OFFSET,
             self.context.i32_type().const_zero(),
-            "pm_key_pad_ptr",
+            &format!("{name_prefix}_pm_key_pad_ptr"),
             self,
         )?;
 
@@ -596,13 +622,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         store_key_u32(
             ghostscope_protocol::PROC_MODULE_KEY_COOKIE_LO_OFFSET,
             cookie_lo,
-            "pm_key_cookie_lo_ptr",
+            &format!("{name_prefix}_pm_key_cookie_lo_ptr"),
             self,
         )?;
         store_key_u32(
             ghostscope_protocol::PROC_MODULE_KEY_COOKIE_HI_OFFSET,
             cookie_hi,
-            "pm_key_cookie_hi_ptr",
+            &format!("{name_prefix}_pm_key_cookie_hi_ptr"),
             self,
         )?;
 
@@ -611,17 +637,22 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let lookup_fn_type = ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
         let lookup_fn_ptr = self
             .builder
-            .build_int_to_ptr(lookup_id, ptr_type, "lookup_fn")
+            .build_int_to_ptr(lookup_id, ptr_type, &format!("{name_prefix}_lookup_fn"))
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         // Pass pointer to the beginning of the key buffer (void*)
         let key_arg = self
             .builder
-            .build_bit_cast(key_alloca, ptr_type, "key_arg")
+            .build_bit_cast(key_alloca, ptr_type, &format!("{name_prefix}_key_arg"))
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let args: Vec<BasicMetadataValueEnum> = vec![map_ptr_cast.into(), key_arg.into()];
         let val_ptr_any = self
             .builder
-            .build_indirect_call(lookup_fn_type, lookup_fn_ptr, &args, "val_ptr_any")
+            .build_indirect_call(
+                lookup_fn_type,
+                lookup_fn_ptr,
+                &args,
+                &format!("{name_prefix}_val_ptr_any"),
+            )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .try_as_basic_value()
             .left()
@@ -629,9 +660,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let null_ptr = ptr_type.const_null();
         let current_fn = self.current_function("generate module offset lookup")?;
-        let found_block = self.context.append_basic_block(current_fn, "found_offsets");
-        let miss_block = self.context.append_basic_block(current_fn, "miss_offsets");
-        let cont_block = self.context.append_basic_block(current_fn, "cont_offsets");
+        let found_block = self
+            .context
+            .append_basic_block(current_fn, &format!("{name_prefix}_found_offsets"));
+        let miss_block = self
+            .context
+            .append_basic_block(current_fn, &format!("{name_prefix}_miss_offsets"));
+        let cont_block = self
+            .context
+            .append_basic_block(current_fn, &format!("{name_prefix}_cont_offsets"));
 
         // Compare against NULL
         let val_ptr = if let BasicValueEnum::PointerValue(p) = val_ptr_any {
@@ -644,21 +681,22 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_int_compare(
                 inkwell::IntPredicate::EQ,
                 self.builder
-                    .build_ptr_to_int(val_ptr, i64_type, "val_ptr_i64")
+                    .build_ptr_to_int(val_ptr, i64_type, &format!("{name_prefix}_val_ptr_i64"))
                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?,
                 i64_type.const_zero(),
-                "is_null_offsets",
+                &format!("{name_prefix}_is_null_offsets"),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder
             .build_conditional_branch(is_null, miss_block, found_block)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-        // Found: load the requested field from ProcModuleOffsetsValue. The
+        // Found: load fields from ProcModuleOffsetsValue. The
         // byte offsets are shared through ghostscope_protocol::bpf_abi because
         // this map is an ABI between generated eBPF and userspace.
         self.builder.position_at_end(found_block);
         let load_field = |offset: usize,
+                          field_name: &str,
                           ctx: &mut EbpfContext<'ctx, 'dw>,
                           base: PointerValue<'ctx>|
          -> Result<IntValue<'ctx>> {
@@ -672,7 +710,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             };
             let loaded = ctx
                 .builder
-                .build_load(ctx.context.i64_type(), field_ptr, "loaded_offset")
+                .build_load(ctx.context.i64_type(), field_ptr, field_name)
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
             if let BasicValueEnum::IntValue(iv) = loaded {
                 Ok(iv)
@@ -680,32 +718,103 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 Err(CodeGenError::LLVMError("offset load failed".to_string()))
             }
         };
-        let st = section_type;
         let off_text = load_field(
             ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_TEXT_OFFSET,
+            &format!("{name_prefix}_text"),
             self,
             val_ptr,
         )?;
         let off_rodata = load_field(
             ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_RODATA_OFFSET,
+            &format!("{name_prefix}_rodata"),
             self,
             val_ptr,
         )?;
         let off_data = load_field(
             ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_DATA_OFFSET,
+            &format!("{name_prefix}_data"),
             self,
             val_ptr,
         )?;
         let off_bss = load_field(
             ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_BSS_OFFSET,
+            &format!("{name_prefix}_bss"),
             self,
             val_ptr,
         )?;
+        let base = load_field(
+            ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_BASE_OFFSET,
+            &format!("{name_prefix}_base"),
+            self,
+            val_ptr,
+        )?;
+        let size = load_field(
+            ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_SIZE_OFFSET,
+            &format!("{name_prefix}_size"),
+            self,
+            val_ptr,
+        )?;
+        self.builder
+            .build_unconditional_branch(cont_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let found_end = self.current_insert_block("finish proc offsets found block")?;
+
+        self.builder.position_at_end(miss_block);
+        self.builder
+            .build_unconditional_branch(cont_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let miss_end = self.current_insert_block("finish proc offsets miss block")?;
+
+        self.builder.position_at_end(cont_block);
+        let zero_i64 = i64_type.const_zero();
+        let phi_i64 = |ctx: &mut EbpfContext<'ctx, 'dw>,
+                       name: &str,
+                       hit_value: IntValue<'ctx>|
+         -> Result<IntValue<'ctx>> {
+            let phi = ctx
+                .builder
+                .build_phi(i64_type, name)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            phi.add_incoming(&[(&hit_value, found_end), (&zero_i64, miss_end)]);
+            Ok(phi.as_basic_value().into_int_value())
+        };
+        let found_type = self.context.bool_type();
+        let found_phi = self
+            .builder
+            .build_phi(found_type, &format!("{name_prefix}_found_phi"))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        found_phi.add_incoming(&[
+            (&found_type.const_int(1, false), found_end),
+            (&found_type.const_zero(), miss_end),
+        ]);
+
+        Ok(ProcModuleOffsetsLookup {
+            found: found_phi.as_basic_value().into_int_value(),
+            text: phi_i64(self, &format!("{name_prefix}_text_phi"), off_text)?,
+            rodata: phi_i64(self, &format!("{name_prefix}_rodata_phi"), off_rodata)?,
+            data: phi_i64(self, &format!("{name_prefix}_data_phi"), off_data)?,
+            bss: phi_i64(self, &format!("{name_prefix}_bss_phi"), off_bss)?,
+            base: phi_i64(self, &format!("{name_prefix}_base_phi"), base)?,
+            size: phi_i64(self, &format!("{name_prefix}_size_phi"), size)?,
+        })
+    }
+
+    /// Compute runtime address from link-time address using proc_module_offsets map
+    /// section_type: 0=text, 1=rodata, 2=data, 3=bss; other values fallback to data
+    pub fn generate_runtime_address_from_offsets(
+        &mut self,
+        link_addr: IntValue<'ctx>,
+        section_type: u8,
+        module_cookie: u64,
+    ) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
+        let i32_type = self.context.i32_type();
+        let offsets = self.lookup_proc_module_offsets_value(module_cookie, "offset")?;
+
         // Build a bottom-up cascade to preserve earlier choices:
         // tmp  = (section==data)   ? off_data   : off_bss
         // tmp2 = (section==rodata) ? off_rodata : tmp
         // off  = (section==text)   ? off_text  : tmp2
-        let st_val = i32_type.const_int(st as u64, false);
+        let st_val = i32_type.const_int(section_type as u64, false);
         let eq_text = self
             .builder
             .build_int_compare(
@@ -736,56 +845,37 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let tmp_any = self
             .builder
-            .build_select(eq_da, off_data, off_bss, "sel_data_bss")
+            .build_select(eq_da, offsets.data, offsets.bss, "sel_data_bss")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let tmp = tmp_any.into_int_value();
 
         let tmp2_any = self
             .builder
-            .build_select(eq_ro, off_rodata, tmp, "sel_rodata_else")
+            .build_select(eq_ro, offsets.rodata, tmp, "sel_rodata_else")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let tmp2 = tmp2_any.into_int_value();
 
         let off_final_any = self
             .builder
-            .build_select(eq_text, off_text, tmp2, "sel_text_else")
+            .build_select(eq_text, offsets.text, tmp2, "sel_text_else")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let off_final = off_final_any.into_int_value();
         let rt_addr = self
             .builder
             .build_int_add(link_addr, off_final, "runtime_addr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        self.builder
-            .build_unconditional_branch(cont_block)
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
-        // Miss: return link_addr as-is (will likely fault and set ReadError)
-        self.builder.position_at_end(miss_block);
-        self.builder
-            .build_unconditional_branch(cont_block)
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
-        // Phi to merge address
-        self.builder.position_at_end(cont_block);
-        let phi = self
+        let final_addr = self
             .builder
-            .build_phi(i64_type, "addr_phi")
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        phi.add_incoming(&[(&rt_addr, found_block), (&link_addr, miss_block)]);
-        let final_addr = phi.as_basic_value().into_int_value();
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                offsets.found,
+                rt_addr.into(),
+                link_addr.into(),
+                "addr_or_link",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
 
-        // Phi to merge found-flag (i1): 1 on found, 0 on miss
-        let i1_type = self.context.bool_type();
-        let one = i1_type.const_int(1, false);
-        let zero = i1_type.const_int(0, false);
-        let flag_phi = self
-            .builder
-            .build_phi(i1_type, "off_found_phi")
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        flag_phi.add_incoming(&[(&one, found_block), (&zero, miss_block)]);
-        let found_flag = flag_phi.as_basic_value().into_int_value();
-
-        Ok((final_addr, found_flag))
+        Ok((final_addr, offsets.found))
     }
     /// Load a register value from pt_regs
     pub fn load_register_value(
