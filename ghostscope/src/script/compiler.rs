@@ -303,6 +303,13 @@ pub async fn compile_and_load_script_for_tui(
     session: &mut GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<ScriptCompilationDetails> {
+    if let Err(e) = session.refresh_pid_runtime_modules_if_needed().await {
+        warn!(
+            "Failed to refresh PID runtime modules after sysmon map-change event: {:#}",
+            e
+        );
+    }
+
     let fallback_host_pid = session.host_pid();
 
     // Step 1: Validate process analyzer availability
@@ -621,6 +628,13 @@ pub async fn compile_and_load_script_for_cli(
     session: &mut GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<()> {
+    if let Err(e) = session.refresh_pid_runtime_modules_if_needed().await {
+        warn!(
+            "Failed to refresh PID runtime modules after sysmon map-change event: {:#}",
+            e
+        );
+    }
+
     let compilation_result = compile_script_for_cli(script, session, compile_options)?;
 
     // Ensure -p offsets are cached once per session

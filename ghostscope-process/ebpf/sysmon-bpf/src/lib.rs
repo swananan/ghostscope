@@ -17,8 +17,18 @@ use aya_ebpf::{
 #[repr(C)]
 pub struct SysEvent {
     pub tgid: u32,
-    pub kind: u32, // 1=Exec,2=Fork,3=Exit
+    pub kind: u32, // 1=Exec,2=Fork,3=Exit,4=MapChange
 }
+
+const SYS_EVENT_EXEC: u32 = 1;
+const SYS_EVENT_FORK: u32 = 2;
+const SYS_EVENT_EXIT: u32 = 3;
+const SYS_EVENT_MAP_CHANGE: u32 = 4;
+
+const SYS_EVENT_MASK_EXEC: u32 = 1 << 0;
+const SYS_EVENT_MASK_FORK: u32 = 1 << 1;
+const SYS_EVENT_MASK_EXIT: u32 = 1 << 2;
+const SYS_EVENT_MASK_MAP_CHANGE: u32 = 1 << 3;
 
 #[map(name = "sysmon_events")]
 static SYS_EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0); // 1MB
@@ -34,6 +44,12 @@ static ALLOWED_PIDS: HashMap<u32, u8> = HashMap::pinned(16384, 0);
 #[map(name = "target_exec_comm")]
 static TARGET_EXEC_COMM: Array<[u8; 16]> = Array::pinned(1, 0);
 
+#[map(name = "sysmon_event_mask")]
+static SYSMON_EVENT_MASK: Array<u32> = Array::with_max_entries(1, 0);
+
+#[map(name = "sysmon_watched_pid")]
+static SYSMON_WATCHED_PID: Array<u32> = Array::with_max_entries(1, 0);
+
 fn write_event<C: EbpfContext>(ctx: &C, ev: SysEvent) {
     if SYS_EVENTS.output::<SysEvent>(&ev, 0).is_err() {
         SYS_EVENTS_PERF.output(ctx, &ev, 0);
@@ -42,13 +58,17 @@ fn write_event<C: EbpfContext>(ctx: &C, ev: SysEvent) {
 
 #[inline(always)]
 fn emit_exec<C: EbpfContext>(ctx: &C) -> u32 {
+    let pid = current_tgid();
+    if !event_enabled(SYS_EVENT_MASK_EXEC) || !watched_pid_allows(pid) {
+        return 0;
+    }
     if !exec_comm_matches() {
         return 0;
     }
     // Emit exec only when filter (if present) passes; userspace handles mapping and allowlist.
     let ev = SysEvent {
-        tgid: current_tgid(),
-        kind: 1,
+        tgid: pid,
+        kind: SYS_EVENT_EXEC,
     };
     write_event(ctx, ev);
     0
@@ -57,10 +77,16 @@ fn emit_exec<C: EbpfContext>(ctx: &C) -> u32 {
 #[inline(always)]
 fn emit_fork<C: EbpfContext>(ctx: &C) -> u32 {
     let pid = current_tgid();
+    if !event_enabled(SYS_EVENT_MASK_FORK) || !watched_pid_allows(pid) {
+        return 0;
+    }
     if ALLOWED_PIDS.get_ptr(&pid).is_none() {
         return 0;
     }
-    let ev = SysEvent { tgid: pid, kind: 2 };
+    let ev = SysEvent {
+        tgid: pid,
+        kind: SYS_EVENT_FORK,
+    };
     write_event(ctx, ev);
     0
 }
@@ -68,10 +94,30 @@ fn emit_fork<C: EbpfContext>(ctx: &C) -> u32 {
 #[inline(always)]
 fn emit_exit<C: EbpfContext>(ctx: &C) -> u32 {
     let pid = current_tgid();
+    if !event_enabled(SYS_EVENT_MASK_EXIT) || !watched_pid_allows(pid) {
+        return 0;
+    }
     if ALLOWED_PIDS.get_ptr(&pid).is_none() {
         return 0;
     }
-    let ev = SysEvent { tgid: pid, kind: 3 };
+    let ev = SysEvent {
+        tgid: pid,
+        kind: SYS_EVENT_EXIT,
+    };
+    write_event(ctx, ev);
+    0
+}
+
+#[inline(always)]
+fn emit_map_change<C: EbpfContext>(ctx: &C) -> u32 {
+    let pid = current_tgid();
+    if !event_enabled(SYS_EVENT_MASK_MAP_CHANGE) || !watched_pid_allows(pid) {
+        return 0;
+    }
+    let ev = SysEvent {
+        tgid: pid,
+        kind: SYS_EVENT_MAP_CHANGE,
+    };
     write_event(ctx, ev);
     0
 }
@@ -81,6 +127,22 @@ fn current_tgid() -> u32 {
     // BPF helper: get_current_pid_tgid >> 32
     let v = aya_ebpf::helpers::bpf_get_current_pid_tgid();
     (v >> 32) as u32
+}
+
+#[inline(always)]
+fn event_enabled(bit: u32) -> bool {
+    match SYSMON_EVENT_MASK.get(0) {
+        Some(mask) => (*mask & bit) != 0,
+        None => false,
+    }
+}
+
+#[inline(always)]
+fn watched_pid_allows(pid: u32) -> bool {
+    match SYSMON_WATCHED_PID.get(0) {
+        Some(watched) => *watched == 0 || *watched == pid,
+        None => true,
+    }
 }
 
 #[inline(always)]
@@ -133,6 +195,26 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
 #[tracepoint(name = "sched_process_exit", category = "sched")]
 pub fn sched_process_exit(ctx: TracePointContext) -> u32 {
     emit_exit(&ctx)
+}
+
+#[tracepoint(name = "sys_exit_mmap", category = "syscalls")]
+pub fn sys_exit_mmap(ctx: TracePointContext) -> u32 {
+    emit_map_change(&ctx)
+}
+
+#[tracepoint(name = "sys_exit_mprotect", category = "syscalls")]
+pub fn sys_exit_mprotect(ctx: TracePointContext) -> u32 {
+    emit_map_change(&ctx)
+}
+
+#[tracepoint(name = "sys_exit_munmap", category = "syscalls")]
+pub fn sys_exit_munmap(ctx: TracePointContext) -> u32 {
+    emit_map_change(&ctx)
+}
+
+#[tracepoint(name = "sys_exit_mremap", category = "syscalls")]
+pub fn sys_exit_mremap(ctx: TracePointContext) -> u32 {
+    emit_map_change(&ctx)
 }
 
 #[raw_tracepoint(tracepoint = "sched_process_exec")]
