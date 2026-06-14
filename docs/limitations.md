@@ -48,6 +48,8 @@ GhostScope recognizes `DW_OP_form_tls_address`, but the runtime TLS address reso
 ### 7. Stack Backtrace Coverage
 `bt` uses DWARF CFI only. GhostScope does not fall back to kernel stack helpers or frame-pointer walking, and it reports an explicit stop status when CFI is unavailable, not supported by the compact eBPF fast path, or a user-stack memory read fails. Cross-module frames can be symbolized from their raw IPs when the process module map is available, but unwinding continues only while GhostScope has compact DWARF rows it can execute safely in eBPF. Deep DWARF unwinding is split through an eBPF tail-call step program so the default `backtrace_depth = 128` avoids LLVM branch-distance and verifier-size limits; `status=truncated` means the configured depth or the tail-call unwind budget was reached before a natural stop.
 
+Runtime mode also affects `bt` coverage. `-p <pid>` is a process-level view, so GhostScope loads the modules already mapped in that PID's `/proc/<pid>/maps`; cross-module unwinding and symbolization are usually best in this mode. Standalone `-t <path>` is a target-file, multi-process trace view that primarily guarantees probes and variables in the target module. Once the call stack leaves that module, backtrace quality is best-effort and depends on runtime module mappings, maintained `proc_module_offsets`, and compact DWARF CFI being available for the other modules. If you need both target-module scoping and a fuller single-process backtrace, prefer `-t <path> -p <pid>`.
+
 ### 8. Highly Optimized Code Support
 Compiler optimizations (-O2, -O3) can cause variables to be optimized away or generate complex DWARF expressions. GhostScope will attempt to parse them, including inline function support, but some variables may be inaccessible (shown as OptimizedOut) because the compiler optimized them away.
 
@@ -60,6 +62,8 @@ GhostScope scans `/proc/PID/maps` at startup to obtain loaded dynamic library in
 - **Shared-library targets (existing processes)**: If GhostScope starts after the library has already been mapped (e.g., tracing a running process that loaded `libfoo.so` earlier), globals work without extra steps.
 - **Shared-library targets (new processes)**: Standalone `-t` starts sysmon by default so globals can be resolved for later-started processes. This incurs extra system-wide work, so expect higher overhead on hosts with frequent process churn; set `enable_sysmon_for_target = false` in config to disable it.
 - **Target-scoped PID runs (`-t ... -p ...`)**: sysmon is not needed or started. `-t` chooses the module used for function/source/address target resolution, while `-p` supplies the concrete process mappings and PID filter.
+
+In `-t` mode, globals depend on `proc_module_offsets`, which tracks runtime address offsets by `(pid, module)`. Standalone `-t` maintains target-module offsets for multiple PIDs, so it is suitable for observing globals in that module; it is not a complete process view, and `bt` after leaving the target module is not equivalent to `-p`. Use `-p <pid>` when you need the full module context for one process. Use `-t <path> -p <pid>` when you need target-module trace resolution while keeping that process context.
 
 > **Note**: The current sysmon pipeline still assumes the library is mapped when the exec event is handled; if a loader pulls it in much later, offsets are not retried yet.
 
