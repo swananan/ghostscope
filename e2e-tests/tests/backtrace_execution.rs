@@ -2,10 +2,11 @@
 
 mod common;
 
-use common::{init, FIXTURES};
+use common::{init, targets::TargetHandle, FIXTURES};
 use ghostscope_dwarf::{CfaRulePlan, ModuleAddress, RegisterRecoveryPlan};
 use std::ffi::OsString;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -146,6 +147,41 @@ fn get_backtrace_hot_nopie_binary() -> anyhow::Result<std::path::PathBuf> {
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(binary_path)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r#"'"'"'"#))
+}
+
+async fn spawn_backtrace_dlopen_program() -> anyhow::Result<(TargetHandle, PathBuf)> {
+    let binary_path = FIXTURES.get_test_binary("backtrace_dlopen_program")?;
+    let bin_dir = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("backtrace_dlopen_program has no parent directory"))?;
+    let trigger_path = bin_dir.join("dlopen.trigger");
+    let _ = fs::remove_file(&trigger_path);
+    let target = common::targets::TargetLauncher::binary(&binary_path)
+        .current_dir(bin_dir)
+        .spawn()
+        .await?;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    Ok((target, trigger_path))
+}
+
+fn touch_dlopen_trigger_in_target_sandbox(
+    target: &TargetHandle,
+    trigger_path: &Path,
+) -> anyhow::Result<()> {
+    let sandbox_path = target.sandbox().path_in_sandbox(trigger_path)?;
+    let command = format!(": > {}", shell_quote(&sandbox_path.display().to_string()));
+    let output = target.sandbox().run_shell(&command)?;
+    anyhow::ensure!(
+        output.status.success(),
+        "failed to create dlopen trigger in target sandbox\nSTDOUT: {}\nSTDERR: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
 }
 
 async fn run_hot_backtrace(script: &str) -> anyhow::Result<(usize, String, String)> {
@@ -870,6 +906,64 @@ trace cross_module_lib_leaf {
         "cross-module stack should not stop on an unwind error\nBLOCK:\n{block}\nSTDERR:\n{stderr}"
     );
     assert_no_adjacent_duplicate_frame_locations(block)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_pid_backtrace_reports_frame_from_library_loaded_by_dlopen() -> anyhow::Result<()> {
+    init();
+
+    let (target, trigger_path) = spawn_backtrace_dlopen_program().await?;
+    let script = r#"
+trace dlopen_main_callback {
+    print "DLOPEN_CALLBACK_STACK";
+    bt full;
+}
+"#;
+
+    let trigger_target = target.clone();
+    let trigger_for_callback = trigger_path.clone();
+    let result = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .attach_to(&target)
+        .timeout_secs(5)
+        .enable_sysmon_for_target(false)
+        .with_cli_args([
+            OsString::from("--script-output-events-per-sec"),
+            OsString::from("200"),
+            OsString::from("--backtrace-depth"),
+            OsString::from("6"),
+        ])
+        .run_after_ready(move || async move {
+            touch_dlopen_trigger_in_target_sandbox(&trigger_target, &trigger_for_callback)
+        })
+        .await;
+
+    target.terminate().await?;
+    let _ = fs::remove_file(trigger_path);
+    let (exit_code, stdout, stderr, ()) = result?;
+    if exit_code != 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    anyhow::ensure!(exit_code == 0, "stderr={stderr} stdout={stdout}");
+
+    let blocks = backtrace_blocks_after(&stdout, "DLOPEN_CALLBACK_STACK", 6)?;
+    let dlopen_block = blocks
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("expected a dlopen callback backtrace block"))?;
+    assert!(
+        dlopen_block.contains("[libbacktrace_dlopen_target.so+"),
+        "expected first backtrace block to include a frame from dlopen-loaded library\nBLOCK:\n{dlopen_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        dlopen_block.contains("dlopen_main_callback"),
+        "expected traced callback frame from main executable\nBLOCK:\n{dlopen_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !dlopen_block.contains("<proc offsets unavailable>"),
+        "dlopen backtrace should refresh proc maps before rendering the library frame\nBLOCK:\n{dlopen_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
 
     Ok(())
 }

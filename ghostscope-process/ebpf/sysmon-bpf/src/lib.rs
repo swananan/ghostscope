@@ -2,6 +2,7 @@
 #![no_main]
 
 use aya_ebpf::{
+    bindings::bpf_pidns_info,
     macros::{btf_tracepoint, map, raw_tracepoint, tracepoint},
     maps::{Array, HashMap, PerfEventArray, RingBuf},
     programs::{BtfTracePointContext, RawTracePointContext, TracePointContext},
@@ -50,6 +51,12 @@ static SYSMON_EVENT_MASK: Array<u32> = Array::with_max_entries(1, 0);
 #[map(name = "sysmon_watched_pid")]
 static SYSMON_WATCHED_PID: Array<u32> = Array::with_max_entries(1, 0);
 
+#[map(name = "sysmon_watched_pid_ns_dev")]
+static SYSMON_WATCHED_PID_NS_DEV: Array<u64> = Array::with_max_entries(1, 0);
+
+#[map(name = "sysmon_watched_pid_ns_ino")]
+static SYSMON_WATCHED_PID_NS_INO: Array<u64> = Array::with_max_entries(1, 0);
+
 fn write_event<C: EbpfContext>(ctx: &C, ev: SysEvent) {
     if SYS_EVENTS.output::<SysEvent>(&ev, 0).is_err() {
         SYS_EVENTS_PERF.output(ctx, &ev, 0);
@@ -58,8 +65,11 @@ fn write_event<C: EbpfContext>(ctx: &C, ev: SysEvent) {
 
 #[inline(always)]
 fn emit_exec<C: EbpfContext>(ctx: &C) -> u32 {
-    let pid = current_tgid();
-    if !event_enabled(SYS_EVENT_MASK_EXEC) || !watched_pid_allows(pid) {
+    if !event_enabled(SYS_EVENT_MASK_EXEC) {
+        return 0;
+    }
+    let pid = current_filtered_tgid();
+    if pid == 0 {
         return 0;
     }
     if !exec_comm_matches() {
@@ -76,8 +86,11 @@ fn emit_exec<C: EbpfContext>(ctx: &C) -> u32 {
 
 #[inline(always)]
 fn emit_fork<C: EbpfContext>(ctx: &C) -> u32 {
-    let pid = current_tgid();
-    if !event_enabled(SYS_EVENT_MASK_FORK) || !watched_pid_allows(pid) {
+    if !event_enabled(SYS_EVENT_MASK_FORK) {
+        return 0;
+    }
+    let pid = current_filtered_tgid();
+    if pid == 0 {
         return 0;
     }
     if ALLOWED_PIDS.get_ptr(&pid).is_none() {
@@ -93,8 +106,11 @@ fn emit_fork<C: EbpfContext>(ctx: &C) -> u32 {
 
 #[inline(always)]
 fn emit_exit<C: EbpfContext>(ctx: &C) -> u32 {
-    let pid = current_tgid();
-    if !event_enabled(SYS_EVENT_MASK_EXIT) || !watched_pid_allows(pid) {
+    if !event_enabled(SYS_EVENT_MASK_EXIT) {
+        return 0;
+    }
+    let pid = current_filtered_tgid();
+    if pid == 0 {
         return 0;
     }
     if ALLOWED_PIDS.get_ptr(&pid).is_none() {
@@ -110,8 +126,11 @@ fn emit_exit<C: EbpfContext>(ctx: &C) -> u32 {
 
 #[inline(always)]
 fn emit_map_change<C: EbpfContext>(ctx: &C) -> u32 {
-    let pid = current_tgid();
-    if !event_enabled(SYS_EVENT_MASK_MAP_CHANGE) || !watched_pid_allows(pid) {
+    if !event_enabled(SYS_EVENT_MASK_MAP_CHANGE) {
+        return 0;
+    }
+    let pid = current_filtered_tgid();
+    if pid == 0 {
         return 0;
     }
     let ev = SysEvent {
@@ -123,7 +142,7 @@ fn emit_map_change<C: EbpfContext>(ctx: &C) -> u32 {
 }
 
 #[inline(always)]
-fn current_tgid() -> u32 {
+fn current_host_tgid() -> u32 {
     // BPF helper: get_current_pid_tgid >> 32
     let v = aya_ebpf::helpers::bpf_get_current_pid_tgid();
     (v >> 32) as u32
@@ -138,10 +157,45 @@ fn event_enabled(bit: u32) -> bool {
 }
 
 #[inline(always)]
-fn watched_pid_allows(pid: u32) -> bool {
-    match SYSMON_WATCHED_PID.get(0) {
-        Some(watched) => *watched == 0 || *watched == pid,
-        None => true,
+fn current_filtered_tgid() -> u32 {
+    let host_pid = current_host_tgid();
+    let watched = match SYSMON_WATCHED_PID.get(0) {
+        Some(watched) => *watched,
+        None => 0,
+    };
+    if watched == 0 {
+        return host_pid;
+    }
+
+    let ns_dev = match SYSMON_WATCHED_PID_NS_DEV.get(0) {
+        Some(dev) => *dev,
+        None => 0,
+    };
+    let ns_ino = match SYSMON_WATCHED_PID_NS_INO.get(0) {
+        Some(ino) => *ino,
+        None => 0,
+    };
+
+    if ns_dev != 0 && ns_ino != 0 {
+        let mut nsdata = bpf_pidns_info { pid: 0, tgid: 0 };
+        let ret = unsafe {
+            aya_ebpf::helpers::generated::bpf_get_ns_current_pid_tgid(
+                ns_dev,
+                ns_ino,
+                &mut nsdata,
+                core::mem::size_of::<bpf_pidns_info>() as u32,
+            )
+        };
+        if ret == 0 && nsdata.tgid == watched {
+            return nsdata.tgid;
+        }
+        return 0;
+    }
+
+    if host_pid == watched {
+        host_pid
+    } else {
+        0
     }
 }
 

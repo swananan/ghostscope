@@ -120,6 +120,17 @@ fn decide_script_output_rate(
     }
 }
 
+fn events_include_backtrace(events: &[ghostscope_protocol::ParsedTraceEvent]) -> bool {
+    events.iter().any(|event| {
+        event.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                ghostscope_protocol::ParsedInstruction::Backtrace { .. }
+            )
+        })
+    })
+}
+
 /// Run GhostScope in command line mode with merged configuration
 pub async fn run_command_line_runtime_with_config(config: ResolvedConfig) -> Result<()> {
     info!("Starting GhostScope in command line mode");
@@ -402,6 +413,24 @@ async fn run_cli_with_session(
             result = session.trace_manager.wait_for_all_events_async() => {
                 match result {
                     Ok(events) => {
+                        if !events.is_empty() {
+                            let refresh_result = if events_include_backtrace(&events) {
+                                session.refresh_pid_runtime_modules_before_rendering().await
+                            } else {
+                                session.refresh_pid_runtime_modules_if_needed().await
+                            };
+                            match refresh_result {
+                                Ok(loaded) if loaded > 0 => {
+                                    backtrace_renderer =
+                                        crate::trace::backtrace::BacktraceRenderer::default();
+                                }
+                                Ok(_) => {}
+                                Err(e) => warn!(
+                                    "Failed to refresh PID runtime modules after sysmon map-change event: {e:#}"
+                                ),
+                            }
+                        }
+
                         let mut wrote_output = false;
                         let mut suppressed_output = false;
                         for event in events {
