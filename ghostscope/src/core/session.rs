@@ -166,7 +166,7 @@ impl GhostSession {
                     proc_offsets_max_entries: config.ebpf_config.proc_module_offsets_max_entries
                         as u32,
                     perf_page_count: Some(config.ebpf_config.perf_page_count as usize),
-                    event_mask: SysmonEventMask::target_mode_with_map_changes(),
+                    event_mask: SysmonEventMask::target_mode(),
                     watched_pid: None,
                     watched_pid_ns: None,
                     watched_proc_pid: None,
@@ -238,7 +238,7 @@ impl GhostSession {
                 target_module,
                 proc_offsets_max_entries: 4096,
                 perf_page_count: None,
-                event_mask: SysmonEventMask::target_mode_with_map_changes(),
+                event_mask: SysmonEventMask::target_mode(),
                 watched_pid: None,
                 watched_pid_ns: None,
                 watched_proc_pid: None,
