@@ -38,6 +38,13 @@ pub(crate) struct PendingBacktraceTailCall {
     pub instruction_size: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BacktraceModuleRowRange {
+    pub cookie: u64,
+    pub row_start: usize,
+    pub row_end: usize,
+}
+
 #[derive(Error, Debug)]
 pub enum CodeGenError {
     #[error("LLVM compilation error: {0}")]
@@ -161,8 +168,7 @@ pub struct EbpfContext<'ctx, 'dw> {
 
     // === DWARF compact unwind rows for bt ===
     pub backtrace_unwind_rows: Vec<ghostscope_protocol::BacktraceUnwindRow>,
-    pub(crate) backtrace_module_cookies: Vec<u64>,
-    pub(crate) backtrace_unwind_rows_use_runtime_pcs: bool,
+    pub(crate) backtrace_module_row_ranges: Vec<BacktraceModuleRowRange>,
     pub(crate) backtrace_tail_call_slots: u8,
     pub(crate) next_backtrace_tail_call_slot: u8,
     pub(crate) pending_backtrace_tail_call: Option<PendingBacktraceTailCall>,
@@ -273,8 +279,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             string_vars: HashMap::new(),
             // Backtrace compact unwind rows
             backtrace_unwind_rows: Vec::new(),
-            backtrace_module_cookies: Vec::new(),
-            backtrace_unwind_rows_use_runtime_pcs: false,
+            backtrace_module_row_ranges: Vec::new(),
             backtrace_tail_call_slots: 1,
             next_backtrace_tail_call_slot: 0,
             pending_backtrace_tail_call: None,

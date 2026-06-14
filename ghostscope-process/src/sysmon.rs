@@ -1939,6 +1939,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sysmon_target_mode_does_not_enable_map_change_events() {
+        let mask = SysmonEventMask::target_mode();
+        assert!(mask.exec);
+        assert!(mask.fork);
+        assert!(mask.exit);
+        assert!(!mask.map_change);
+    }
+
+    #[test]
+    fn sysmon_pid_module_changes_only_enable_map_change_events() {
+        let mask = SysmonEventMask::pid_module_changes();
+        assert!(!mask.exec);
+        assert!(!mask.fork);
+        assert!(!mask.exit);
+        assert!(mask.map_change);
+    }
+
+    #[test]
     fn sysmon_event_publish_drops_when_queue_is_full() {
         let (tx, rx) = mpsc::sync_channel(1);
 
