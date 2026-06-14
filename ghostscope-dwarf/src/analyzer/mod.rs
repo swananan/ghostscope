@@ -488,6 +488,117 @@ impl DwarfAnalyzer {
             .collect()
     }
 
+    fn runtime_modules_to_module_mappings(
+        runtime_modules: Vec<LoadedModuleRuntimeInfo>,
+    ) -> Vec<ModuleMapping> {
+        runtime_modules
+            .into_iter()
+            .map(|module| {
+                let mut mapping = ModuleMapping::from_path(module.module_path);
+                mapping.loaded_address = module.loaded_address;
+                mapping.load_bias = module.load_bias;
+                mapping.size = module.size;
+                mapping
+            })
+            .collect()
+    }
+
+    /// Load newly discovered modules into an existing PID analyzer.
+    pub async fn refresh_pid_runtime_modules_with_config_and_debuginfod<F>(
+        &mut self,
+        runtime_modules: Vec<LoadedModuleRuntimeInfo>,
+        debug_search_paths: &[String],
+        allow_loose_debug_match: bool,
+        debuginfod_client: Option<Arc<DebuginfodClient>>,
+        progress_callback: F,
+    ) -> Result<usize>
+    where
+        F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
+    {
+        let mut new_runtime_modules = Vec::new();
+        let mut updated_existing = 0usize;
+
+        for runtime_module in runtime_modules {
+            let existing = self.modules.iter_mut().find(|(path, _)| {
+                Self::module_paths_equivalent(path.as_path(), &runtime_module.module_path)
+            });
+
+            if let Some((_path, loaded)) = existing {
+                let mapping = loaded.module_mapping();
+                if mapping.loaded_address != runtime_module.loaded_address
+                    || mapping.load_bias != runtime_module.load_bias
+                    || mapping.size != runtime_module.size
+                {
+                    loaded.update_runtime_mapping(
+                        runtime_module.loaded_address,
+                        runtime_module.load_bias,
+                        runtime_module.size,
+                    );
+                    updated_existing += 1;
+                }
+            } else {
+                new_runtime_modules.push(runtime_module);
+            }
+        }
+
+        if updated_existing > 0 {
+            self.clear_pc_context_cache();
+            tracing::debug!(
+                "Updated runtime mapping metadata for {} loaded module(s)",
+                updated_existing
+            );
+        }
+
+        if new_runtime_modules.is_empty() {
+            return Ok(0);
+        }
+
+        tracing::info!(
+            "Refreshing DWARF analyzer for PID {} with {} newly mapped module(s)",
+            self.pid,
+            new_runtime_modules.len()
+        );
+
+        let module_mappings = Self::runtime_modules_to_module_mappings(new_runtime_modules);
+
+        for (index, mapping) in module_mappings.iter().enumerate() {
+            progress_callback(ModuleLoadingEvent::Discovered {
+                module_path: mapping.path.to_string_lossy().to_string(),
+                current: index + 1,
+                total: module_mappings.len(),
+            });
+        }
+
+        let mut loader = crate::loader::ModuleLoader::new(module_mappings).parallel();
+        if !debug_search_paths.is_empty() {
+            loader = loader.with_debug_search_paths(debug_search_paths.to_vec());
+        }
+        loader = loader.with_loose_debug_match(allow_loose_debug_match);
+        loader = loader.with_debuginfod_client(debuginfod_client);
+
+        let modules = loader
+            .with_progress_callback(progress_callback)
+            .load()
+            .await?;
+        let loaded_count = modules.len();
+
+        for module in modules {
+            let module_path = module.module_path().clone();
+            self.modules.insert(module_path, module);
+        }
+
+        if loaded_count > 0 {
+            self.clear_pc_context_cache();
+            tracing::info!(
+                "DWARF analyzer for PID {} loaded {} new module(s)",
+                self.pid,
+                loaded_count
+            );
+        }
+
+        Ok(loaded_count)
+    }
+
     /// Create DWARF analyzer from an already discovered PID runtime module snapshot.
     pub async fn from_pid_runtime_modules_with_config_and_debuginfod<F>(
         pid: u32,
@@ -532,16 +643,7 @@ impl DwarfAnalyzer {
             runtime_modules.len()
         );
 
-        let module_mappings: Vec<crate::core::mapping::ModuleMapping> = runtime_modules
-            .into_iter()
-            .map(|module| {
-                let mut mapping = ModuleMapping::from_path(module.module_path);
-                mapping.loaded_address = module.loaded_address;
-                mapping.load_bias = module.load_bias;
-                mapping.size = module.size;
-                mapping
-            })
-            .collect();
+        let module_mappings = Self::runtime_modules_to_module_mappings(runtime_modules);
 
         tracing::info!(
             "Discovered {} modules for PID {}",
@@ -786,6 +888,12 @@ impl DwarfAnalyzer {
         );
 
         analyzer
+    }
+
+    fn clear_pc_context_cache(&self) {
+        if let Ok(mut cache) = self.pc_context_cache.write() {
+            *cache = PcContextCache::default();
+        }
     }
 
     /// Lookup function addresses across all modules

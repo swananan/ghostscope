@@ -51,6 +51,17 @@ impl LoadedObjfile {
         &self.module_mapping
     }
 
+    pub(crate) fn update_runtime_mapping(
+        &mut self,
+        loaded_address: Option<u64>,
+        load_bias: Option<u64>,
+        size: u64,
+    ) {
+        self.module_mapping.loaded_address = loaded_address;
+        self.module_mapping.load_bias = load_bias;
+        self.module_mapping.size = size;
+    }
+
     pub(crate) fn entry_address(&self) -> Option<u64> {
         self.entry_address
     }

@@ -12,6 +12,6 @@ pub use pid::{
     RuntimeEnvironmentInfo, RuntimePidPlan, RuntimePidPlanInput, INITIAL_PID_NAMESPACE_INO,
 };
 pub mod sysmon;
-pub use sysmon::{ProcessSysmon, SysEvent, SysEventKind, SysmonConfig};
+pub use sysmon::{ProcessSysmon, SysEvent, SysEventKind, SysmonConfig, SysmonEventMask};
 pub mod util;
 pub use util::is_shared_object;

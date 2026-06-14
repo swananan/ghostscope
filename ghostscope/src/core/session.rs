@@ -4,7 +4,9 @@ use crate::trace::TraceManager;
 use anyhow::Result;
 use ghostscope_debuginfod::{DebuginfodClient, DebuginfodConfig};
 use ghostscope_dwarf::{DwarfAnalyzer, ExplicitDebugFile, ModuleStats};
-use ghostscope_process::{ProcessManager, ProcessSysmon, SysmonConfig};
+use ghostscope_process::{
+    ProcessManager, ProcessSysmon, SysEventKind, SysmonConfig, SysmonEventMask,
+};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -112,11 +114,31 @@ impl GhostSession {
             }
         }
 
-        // Start sysmon for standalone -t only. Combined -t -p uses the PID for
-        // concrete process mappings and does not need system-wide lifecycle tracking.
+        // Start sysmon for standalone -t lifecycle tracking, or for -p module
+        // map-change tracking.
         if config.dry_run {
             info!("Sysmon not started (dry-run mode)");
-        } else if s.proc_pid().is_none() && s.target_binary.is_some() {
+        } else if s.proc_pid().is_some() {
+            let cfg = SysmonConfig {
+                target_module: None,
+                proc_offsets_max_entries: config.ebpf_config.proc_module_offsets_max_entries as u32,
+                perf_page_count: Some(config.ebpf_config.perf_page_count as usize),
+                event_mask: SysmonEventMask::pid_module_changes(),
+                watched_pid: s.host_pid(),
+            };
+            let mgr = Arc::clone(&s.coordinator);
+            let mut sysmon = ProcessSysmon::new(mgr, cfg);
+            sysmon.start();
+            s.sysmon = Some(Arc::new(Mutex::new(sysmon)));
+            if let Some(host_pid) = s.host_pid() {
+                info!(
+                    "Sysmon started (-p map-change mode, watched event pid={})",
+                    host_pid
+                );
+            } else {
+                info!("Sysmon started (-p map-change mode)");
+            }
+        } else if s.target_binary.is_some() {
             let tpath = PathBuf::from(s.target_binary.as_ref().unwrap());
             if config.ebpf_config.enable_sysmon_for_target {
                 let cfg = SysmonConfig {
@@ -124,6 +146,8 @@ impl GhostSession {
                     proc_offsets_max_entries: config.ebpf_config.proc_module_offsets_max_entries
                         as u32,
                     perf_page_count: Some(config.ebpf_config.perf_page_count as usize),
+                    event_mask: SysmonEventMask::target_mode(),
+                    watched_pid: None,
                 };
                 let mgr = Arc::clone(&s.coordinator);
                 let mut sysmon = ProcessSysmon::new(mgr, cfg);
@@ -138,10 +162,6 @@ impl GhostSession {
             } else {
                 info!("Sysmon not started (-t disabled by config)");
             }
-        } else if s.proc_pid().is_some() && s.target_binary.is_some() {
-            info!("Sysmon not started (-t target scoped by -p)");
-        } else if s.proc_pid().is_some() {
-            info!("Sysmon not started (-p mode)");
         } else {
             info!("Sysmon not started (no -t target)");
         }
@@ -175,22 +195,33 @@ impl GhostSession {
                 pid_context.proc_pid, pid_context.host_pid
             );
         }
-        if s.proc_pid().is_none() && s.target_binary.is_some() {
+        if s.proc_pid().is_some() {
+            let cfg = SysmonConfig {
+                target_module: None,
+                proc_offsets_max_entries: 4096,
+                perf_page_count: None,
+                event_mask: SysmonEventMask::pid_module_changes(),
+                watched_pid: s.host_pid(),
+            };
+            let mgr = Arc::clone(&s.coordinator);
+            let mut sysmon = ProcessSysmon::new(mgr, cfg);
+            sysmon.start();
+            s.sysmon = Some(Arc::new(Mutex::new(sysmon)));
+            info!("Sysmon started (-p map-change mode)");
+        } else if s.target_binary.is_some() {
             let target_module = s.target_binary.as_ref().map(PathBuf::from);
             let cfg = SysmonConfig {
                 target_module,
                 proc_offsets_max_entries: 4096,
                 perf_page_count: None,
+                event_mask: SysmonEventMask::target_mode(),
+                watched_pid: None,
             };
             let mgr = Arc::clone(&s.coordinator);
             let mut sysmon = ProcessSysmon::new(mgr, cfg);
             sysmon.start();
             s.sysmon = Some(Arc::new(Mutex::new(sysmon)));
             info!("Sysmon started (-t mode)");
-        } else if s.proc_pid().is_some() && s.target_binary.is_some() {
-            info!("Sysmon not started (-t target scoped by -p)");
-        } else if s.proc_pid().is_some() {
-            info!("Sysmon not started (-p mode)");
         } else {
             info!("Sysmon not started (no -t target)");
         }
@@ -273,6 +304,77 @@ impl GhostSession {
         };
 
         Ok(DwarfAnalyzer::runtime_modules_from_pid_offsets(entries))
+    }
+
+    fn drain_sysmon_map_change_events(&self) -> bool {
+        let Some(sysmon) = self.sysmon.as_ref() else {
+            return false;
+        };
+
+        let Ok(sysmon) = sysmon.lock() else {
+            return false;
+        };
+
+        let mut saw_map_change = false;
+        while let Some(event) = sysmon.recv_timeout(Duration::from_millis(0)) {
+            if matches!(event.event_kind(), Some(SysEventKind::MapChange)) {
+                saw_map_change = true;
+            }
+        }
+
+        saw_map_change
+    }
+
+    pub async fn refresh_pid_runtime_modules_if_needed(&mut self) -> Result<usize> {
+        if self.proc_pid().is_none() || !self.drain_sysmon_map_change_events() {
+            return Ok(0);
+        }
+
+        self.refresh_pid_runtime_modules().await
+    }
+
+    pub async fn refresh_pid_runtime_modules(&mut self) -> Result<usize> {
+        let Some(proc_pid) = self.proc_pid() else {
+            return Ok(0);
+        };
+
+        let runtime_modules = {
+            let mut coordinator = self.coordinator.lock().expect("coordinator mutex poisoned");
+            coordinator.refresh_prefill_pid(proc_pid)?;
+
+            let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(proc_pid) else {
+                return Ok(0);
+            };
+
+            DwarfAnalyzer::runtime_modules_from_pid_offsets(entries)
+        };
+
+        let debug_search_paths = self.get_debug_search_paths();
+        let allow_loose = self.get_allow_loose_debug_match();
+        let debuginfod_client = self.build_debuginfod_client()?;
+
+        let Some(analyzer) = self.process_analyzer.as_mut() else {
+            return Ok(0);
+        };
+
+        let loaded = analyzer
+            .refresh_pid_runtime_modules_with_config_and_debuginfod(
+                runtime_modules,
+                &debug_search_paths,
+                allow_loose,
+                debuginfod_client,
+                |_| {},
+            )
+            .await?;
+
+        if loaded > 0 {
+            info!(
+                "Refreshed PID {} runtime module analysis with {} new module(s)",
+                proc_pid, loaded
+            );
+        }
+
+        Ok(loaded)
     }
 
     /// Load binary and perform DWARF analysis using parallel loading (TUI mode)

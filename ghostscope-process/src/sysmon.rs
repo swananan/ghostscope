@@ -19,6 +19,7 @@ pub enum SysEventKind {
     Exec,
     Fork,
     Exit,
+    MapChange,
 }
 
 impl SysEventKind {
@@ -27,8 +28,71 @@ impl SysEventKind {
             1 => Some(SysEventKind::Exec),
             2 => Some(SysEventKind::Fork),
             3 => Some(SysEventKind::Exit),
+            4 => Some(SysEventKind::MapChange),
             _ => None,
         }
+    }
+}
+
+/// Internal sysmon event selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SysmonEventMask {
+    pub exec: bool,
+    pub fork: bool,
+    pub exit: bool,
+    pub map_change: bool,
+}
+
+impl SysmonEventMask {
+    pub fn target_mode() -> Self {
+        Self {
+            exec: true,
+            fork: true,
+            exit: true,
+            map_change: false,
+        }
+    }
+
+    pub fn target_mode_with_map_changes() -> Self {
+        Self {
+            exec: true,
+            fork: true,
+            exit: true,
+            map_change: true,
+        }
+    }
+
+    pub fn pid_module_changes() -> Self {
+        Self {
+            exec: false,
+            fork: false,
+            exit: false,
+            map_change: true,
+        }
+    }
+
+    #[cfg(feature = "sysmon-ebpf")]
+    fn bits(self) -> u32 {
+        let mut bits = 0u32;
+        if self.exec {
+            bits |= SYSMON_EVENT_MASK_EXEC;
+        }
+        if self.fork {
+            bits |= SYSMON_EVENT_MASK_FORK;
+        }
+        if self.exit {
+            bits |= SYSMON_EVENT_MASK_EXIT;
+        }
+        if self.map_change {
+            bits |= SYSMON_EVENT_MASK_MAP_CHANGE;
+        }
+        bits
+    }
+}
+
+impl Default for SysmonEventMask {
+    fn default() -> Self {
+        Self::target_mode()
     }
 }
 
@@ -42,13 +106,29 @@ impl SysEventKind {
 #[derive(Clone, Copy)]
 pub struct SysEvent {
     pub tgid: u32,
-    pub kind: u32, // 1=exec,2=fork,3=exit
+    pub kind: u32, // 1=exec,2=fork,3=exit,4=map-change
+}
+
+impl SysEvent {
+    pub fn event_kind(self) -> Option<SysEventKind> {
+        SysEventKind::from_u32(self.kind)
+    }
 }
 
 const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const PENDING_MAX_ATTEMPTS: u32 = 20;
+const MAP_CHANGE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(75);
 const MODULE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const SYSMON_EVENT_QUEUE_CAPACITY: usize = 1024;
+
+#[cfg(feature = "sysmon-ebpf")]
+const SYSMON_EVENT_MASK_EXEC: u32 = 1 << 0;
+#[cfg(feature = "sysmon-ebpf")]
+const SYSMON_EVENT_MASK_FORK: u32 = 1 << 1;
+#[cfg(feature = "sysmon-ebpf")]
+const SYSMON_EVENT_MASK_EXIT: u32 = 1 << 2;
+#[cfg(feature = "sysmon-ebpf")]
+const SYSMON_EVENT_MASK_MAP_CHANGE: u32 = 1 << 3;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingOffsetsEntry {
@@ -107,8 +187,50 @@ impl PendingOffsets {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PendingMapRefreshEntry {
+    last_seen: Instant,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PendingMapRefreshes {
+    entries: HashMap<u32, PendingMapRefreshEntry>,
+}
+
+impl PendingMapRefreshes {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn register(&mut self, pid: u32) {
+        self.entries.insert(
+            pid,
+            PendingMapRefreshEntry {
+                last_seen: Instant::now(),
+            },
+        );
+    }
+
+    fn take_due(&mut self) -> Vec<u32> {
+        let now = Instant::now();
+        let due: Vec<u32> = self
+            .entries
+            .iter()
+            .filter_map(|(&pid, entry)| {
+                (now.duration_since(entry.last_seen) >= MAP_CHANGE_DEBOUNCE_INTERVAL).then_some(pid)
+            })
+            .collect();
+        for pid in &due {
+            self.entries.remove(pid);
+        }
+        due
+    }
+}
+
 /// Configuration for sysmon
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SysmonConfig {
     /// If set, only attempt offsets prefill for events whose binary/module path matches this target.
     pub target_module: Option<PathBuf>,
@@ -116,6 +238,10 @@ pub struct SysmonConfig {
     pub proc_offsets_max_entries: u32,
     /// PerfEventArray per-CPU buffer pages (used when ringbuf is unavailable).
     pub perf_page_count: Option<usize>,
+    /// Internal event selector for the sysmon eBPF side.
+    pub event_mask: SysmonEventMask,
+    /// Optional host/event PID to watch. `None` means system-wide.
+    pub watched_pid: Option<u32>,
 }
 
 impl SysmonConfig {
@@ -124,7 +250,15 @@ impl SysmonConfig {
             target_module: None,
             proc_offsets_max_entries: 4096,
             perf_page_count: None,
+            event_mask: SysmonEventMask::target_mode(),
+            watched_pid: None,
         }
+    }
+}
+
+impl Default for SysmonConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -140,6 +274,7 @@ pub struct ProcessSysmon {
     tx: mpsc::SyncSender<SysEvent>,
     rx: mpsc::Receiver<SysEvent>,
     pending_offsets: Arc<Mutex<PendingOffsets>>,
+    pending_map_refreshes: Arc<Mutex<PendingMapRefreshes>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -159,6 +294,7 @@ impl ProcessSysmon {
             tx,
             rx,
             pending_offsets: Arc::new(Mutex::new(PendingOffsets::new())),
+            pending_map_refreshes: Arc::new(Mutex::new(PendingMapRefreshes::new())),
             handle: None,
         }
     }
@@ -178,8 +314,8 @@ impl ProcessSysmon {
         let tx = self.tx.clone();
         let mgr = Arc::clone(&self.mgr);
         let pending = Arc::clone(&self.pending_offsets);
-        let target = self.cfg.target_module.clone();
-        let perf_pages = self.cfg.perf_page_count;
+        let pending_map_refreshes = Arc::clone(&self.pending_map_refreshes);
+        let cfg = self.cfg.clone();
 
         let handle = thread::Builder::new()
             .name("gs-sysmon".to_string())
@@ -187,13 +323,15 @@ impl ProcessSysmon {
                 info!("ProcessSysmon thread started");
                 #[cfg(feature = "sysmon-ebpf")]
                 {
-                    if let Err(e) = run_sysmon_loop(mgr, target, pending, perf_pages, tx) {
+                    if let Err(e) = run_sysmon_loop(mgr, cfg, pending, pending_map_refreshes, tx) {
                         error!("Sysmon loop error: {}", e);
                     }
                 }
                 #[cfg(not(feature = "sysmon-ebpf"))]
                 {
                     let _ = pending;
+                    let _ = pending_map_refreshes;
+                    let _ = cfg;
                     warn!("sysmon-ebpf feature is disabled; sysmon is in stub mode");
                     loop {
                         std::thread::sleep(std::time::Duration::from_millis(5000));
@@ -328,6 +466,12 @@ impl ProcessSysmon {
                 let _ = crate::pinned_bpf_maps::remove_allowed_pid(ev.tgid);
                 let _ = crate::pinned_bpf_maps::remove_pid_alias(ev.tgid);
             }
+            SysEventKind::MapChange => {
+                tracing::trace!(
+                    "Sysmon: map-change event for pid {} is handled by the debounce queue",
+                    ev.tgid
+                );
+            }
         }
         Ok(())
     }
@@ -351,6 +495,42 @@ fn try_publish_sys_event(tx: &mpsc::SyncSender<SysEvent>, ev: SysEvent) -> bool 
                 ev.kind
             );
             false
+        }
+    }
+}
+
+fn dispatch_sysmon_event(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    target: &Option<PathBuf>,
+    pending: &Arc<Mutex<PendingOffsets>>,
+    pending_map_refreshes: &Arc<Mutex<PendingMapRefreshes>>,
+    ev: &SysEvent,
+) {
+    match SysEventKind::from_u32(ev.kind) {
+        Some(SysEventKind::MapChange) => {
+            if let Ok(mut guard) = pending_map_refreshes.lock() {
+                guard.register(ev.tgid);
+            }
+        }
+        Some(_) => {
+            if let Err(e) = ProcessSysmon::handle_event(mgr, target, pending, ev) {
+                tracing::debug!(
+                    "Sysmon: handle_event failed for pid {} kind {}: {}",
+                    ev.tgid,
+                    ev.kind,
+                    e
+                );
+            }
+        }
+        None => {
+            if let Err(e) = ProcessSysmon::handle_event(mgr, target, pending, ev) {
+                tracing::debug!(
+                    "Sysmon: handle_event rejected invalid event for pid {} kind {}: {}",
+                    ev.tgid,
+                    ev.kind,
+                    e
+                );
+            }
         }
     }
 }
@@ -405,6 +585,37 @@ const SYSMON_TRACEPOINTS: &[SysmonTracepoint] = &[
         classic_program: "sched_process_fork",
         raw_program: "raw_sched_process_fork",
         btf_program: "btf_sched_process_fork",
+    },
+];
+
+#[cfg(feature = "sysmon-ebpf")]
+struct SysmonMapChangeTracepoint {
+    event: &'static str,
+    category: &'static str,
+    program: &'static str,
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+const SYSMON_MAP_CHANGE_TRACEPOINTS: &[SysmonMapChangeTracepoint] = &[
+    SysmonMapChangeTracepoint {
+        event: "sys_exit_mmap",
+        category: "syscalls",
+        program: "sys_exit_mmap",
+    },
+    SysmonMapChangeTracepoint {
+        event: "sys_exit_mprotect",
+        category: "syscalls",
+        program: "sys_exit_mprotect",
+    },
+    SysmonMapChangeTracepoint {
+        event: "sys_exit_munmap",
+        category: "syscalls",
+        program: "sys_exit_munmap",
+    },
+    SysmonMapChangeTracepoint {
+        event: "sys_exit_mremap",
+        category: "syscalls",
+        program: "sys_exit_mremap",
     },
 ];
 
@@ -485,6 +696,43 @@ fn configure_sysmon_exec_comm_filter(
 }
 
 #[cfg(feature = "sysmon-ebpf")]
+fn configure_sysmon_event_filter(
+    bpf: &mut aya::Ebpf,
+    event_mask: SysmonEventMask,
+    watched_pid: Option<u32>,
+) -> anyhow::Result<()> {
+    use aya::maps::Array;
+
+    if let Some(map) = bpf.map_mut("sysmon_event_mask") {
+        let mut array: Array<_, u32> = map.try_into()?;
+        array.set(0, event_mask.bits(), 0)?;
+        tracing::info!(
+            "Sysmon: event mask configured (exec={}, fork={}, exit={}, map_change={})",
+            event_mask.exec,
+            event_mask.fork,
+            event_mask.exit,
+            event_mask.map_change
+        );
+    } else {
+        tracing::warn!("Sysmon: sysmon_event_mask map missing; event filtering unavailable");
+    }
+
+    if let Some(map) = bpf.map_mut("sysmon_watched_pid") {
+        let mut array: Array<_, u32> = map.try_into()?;
+        array.set(0, watched_pid.unwrap_or(0), 0)?;
+        if let Some(pid) = watched_pid {
+            tracing::info!("Sysmon: watched event pid configured: {}", pid);
+        } else {
+            tracing::info!("Sysmon: watched event pid disabled");
+        }
+    } else if watched_pid.is_some() {
+        tracing::warn!("Sysmon: sysmon_watched_pid map missing; PID filtering unavailable");
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "sysmon-ebpf")]
 fn attach_sysmon_backend(bpf: &mut aya::Ebpf, backend: SysmonAttachBackend) -> anyhow::Result<()> {
     match backend {
         SysmonAttachBackend::Raw => attach_raw_sysmon_tracepoints(bpf),
@@ -547,9 +795,52 @@ fn attach_classic_sysmon_tracepoints(bpf: &mut aya::Ebpf) -> anyhow::Result<()> 
 }
 
 #[cfg(feature = "sysmon-ebpf")]
+fn attach_classic_map_change_tracepoints(bpf: &mut aya::Ebpf) -> anyhow::Result<usize> {
+    use aya::programs::TracePoint;
+
+    let mut attached = 0usize;
+    for spec in SYSMON_MAP_CHANGE_TRACEPOINTS {
+        let Some(prog) = bpf.program_mut(spec.program) else {
+            tracing::warn!(
+                "Sysmon: missing map-change program '{}' in sysmon-bpf",
+                spec.program
+            );
+            continue;
+        };
+        let attach_result = (|| {
+            let tp: &mut TracePoint = prog.try_into()?;
+            tp.load()?;
+            tp.attach(spec.category, spec.event)?;
+            Ok::<_, anyhow::Error>(())
+        })();
+        match attach_result {
+            Ok(()) => {
+                attached += 1;
+                info!(
+                    "Attached map-change tracepoint: {}:{}",
+                    spec.category, spec.event
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Sysmon: map-change tracepoint {}:{} unavailable: {:#}",
+                    spec.category,
+                    spec.event,
+                    err
+                );
+            }
+        }
+    }
+
+    Ok(attached)
+}
+
+#[cfg(feature = "sysmon-ebpf")]
 fn load_and_attach_sysmon_bpf(
     obj: &[u8],
     target: Option<&Path>,
+    event_mask: SysmonEventMask,
+    watched_pid: Option<u32>,
     use_verbose: bool,
 ) -> anyhow::Result<aya::Ebpf> {
     let mut failures = Vec::new();
@@ -562,7 +853,16 @@ fn load_and_attach_sysmon_bpf(
         let result = (|| {
             let mut bpf = load_sysmon_bpf(obj, use_verbose)?;
             configure_sysmon_exec_comm_filter(&mut bpf, target)?;
+            configure_sysmon_event_filter(&mut bpf, event_mask, watched_pid)?;
             attach_sysmon_backend(&mut bpf, backend)?;
+            if event_mask.map_change {
+                let map_attached = attach_classic_map_change_tracepoints(&mut bpf)?;
+                if map_attached == 0 {
+                    return Err(anyhow::anyhow!(
+                        "map-change events requested but no syscall tracepoints attached"
+                    ));
+                }
+            }
             Ok::<_, anyhow::Error>(bpf)
         })();
 
@@ -587,9 +887,9 @@ fn load_and_attach_sysmon_bpf(
 #[cfg(feature = "sysmon-ebpf")]
 fn run_sysmon_loop(
     mgr: Arc<Mutex<ProcessManager>>,
-    target: Option<PathBuf>,
+    cfg: SysmonConfig,
     pending: Arc<Mutex<PendingOffsets>>,
-    perf_pages: Option<usize>,
+    pending_map_refreshes: Arc<Mutex<PendingMapRefreshes>>,
     tx: mpsc::SyncSender<SysEvent>,
 ) -> anyhow::Result<()> {
     use aya::include_bytes_aligned;
@@ -613,9 +913,16 @@ fn run_sysmon_loop(
         warn!("sysmon-bpf object missing; running in stub mode (no realtime process events)");
         return Ok(());
     }
+    let target = cfg.target_module.clone();
     let use_verbose =
         cfg!(debug_assertions) || log_enabled!(LogLevel::Trace) || log_enabled!(LogLevel::Debug);
-    let mut bpf = load_and_attach_sysmon_bpf(obj, target.as_deref(), use_verbose)?;
+    let mut bpf = load_and_attach_sysmon_bpf(
+        obj,
+        target.as_deref(),
+        cfg.event_mask,
+        cfg.watched_pid,
+        use_verbose,
+    )?;
 
     // Using allowlist-based gating in kernel; userspace decides allow on exec.
 
@@ -682,18 +989,12 @@ fn run_sysmon_loop(
                     // SAFETY: The ring buffer sample length was checked to match SysEvent;
                     // read_unaligned handles any alignment from the byte slice.
                     let ev = unsafe { core::ptr::read_unaligned(item.as_ptr() as *const SysEvent) };
-                    if let Err(e) = ProcessSysmon::handle_event(&mgr, &target, &pending, &ev) {
-                        tracing::debug!(
-                            "Sysmon: handle_event failed (ringbuf) for pid {} kind {}: {}",
-                            ev.tgid,
-                            ev.kind,
-                            e
-                        );
-                    }
+                    dispatch_sysmon_event(&mgr, &target, &pending, &pending_map_refreshes, &ev);
                     try_publish_sys_event(&tx, ev);
                 }
             }
             poll_pending_offsets(&mgr, &pending);
+            poll_pending_map_refreshes(&mgr, target.as_deref(), &pending_map_refreshes);
             refresh_target_module_offsets(&mgr, target.as_deref(), &mut last_module_refresh);
             if !had_event {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -704,7 +1005,7 @@ fn run_sysmon_loop(
         let online = aya::util::online_cpus().map_err(|(_, e)| anyhow::anyhow!(e))?;
         let mut bufs = Vec::new();
         for cpu in online {
-            match perf.open(cpu, perf_pages) {
+            match perf.open(cpu, cfg.perf_page_count) {
                 Ok(buf) => bufs.push(buf),
                 Err(e) => warn!("Perf open failed for CPU {}: {}", cpu, e),
             }
@@ -737,16 +1038,13 @@ fn run_sysmon_loop(
                             let ev = unsafe {
                                 core::ptr::read_unaligned(raw.as_ptr() as *const SysEvent)
                             };
-                            if let Err(e) =
-                                ProcessSysmon::handle_event(&mgr, &target, &pending, &ev)
-                            {
-                                tracing::debug!(
-                                    "Sysmon: handle_event failed (perf) for pid {} kind {}: {}",
-                                    ev.tgid,
-                                    ev.kind,
-                                    e
-                                );
-                            }
+                            dispatch_sysmon_event(
+                                &mgr,
+                                &target,
+                                &pending,
+                                &pending_map_refreshes,
+                                &ev,
+                            );
                             try_publish_sys_event(&tx, ev);
                         }
                     }
@@ -756,6 +1054,7 @@ fn run_sysmon_loop(
                 });
             }
             poll_pending_offsets(&mgr, &pending);
+            poll_pending_map_refreshes(&mgr, target.as_deref(), &pending_map_refreshes);
             refresh_target_module_offsets(&mgr, target.as_deref(), &mut last_module_refresh);
         }
     } else {
@@ -917,6 +1216,23 @@ fn prefill_offsets_for_pid(
     event_pid: u32,
     target: Option<&Path>,
 ) -> anyhow::Result<bool> {
+    write_offsets_for_pid(mgr, event_pid, target, false)
+}
+
+fn refresh_offsets_for_pid(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    event_pid: u32,
+    target: Option<&Path>,
+) -> anyhow::Result<bool> {
+    write_offsets_for_pid(mgr, event_pid, target, true)
+}
+
+fn write_offsets_for_pid(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    event_pid: u32,
+    target: Option<&Path>,
+    force_refresh: bool,
+) -> anyhow::Result<bool> {
     use crate::pinned_bpf_maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
 
     let proc_pid = resolve_proc_pid_for_event(event_pid);
@@ -932,7 +1248,11 @@ fn prefill_offsets_for_pid(
     }
     let mut inserted_any = false;
     if let Ok(mut guard) = mgr.lock() {
-        let prefilled = match guard.ensure_prefill_pid(proc_pid) {
+        let prefilled = match if force_refresh {
+            guard.refresh_prefill_pid(proc_pid)
+        } else {
+            guard.ensure_prefill_pid(proc_pid)
+        } {
             Ok(v) => v,
             Err(e) => {
                 // In private PID namespaces, sysmon event PID may be in the initial namespace
@@ -993,8 +1313,15 @@ fn prefill_offsets_for_pid(
         };
         if prefilled > 0 {
             info!(
-                "Sysmon: prefilled {} entries for event pid {} (proc pid {})",
-                prefilled, event_pid, proc_pid
+                "Sysmon: {} {} entries for event pid {} (proc pid {})",
+                if force_refresh {
+                    "refreshed"
+                } else {
+                    "prefilled"
+                },
+                prefilled,
+                event_pid,
+                proc_pid
             );
         }
         let mut filtered = guard
@@ -1220,6 +1547,65 @@ fn poll_pending_offsets(mgr: &Arc<Mutex<ProcessManager>>, pending: &Arc<Mutex<Pe
             for pid in to_remove {
                 guard.remove(pid);
             }
+        }
+    }
+}
+
+fn poll_pending_map_refreshes(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    target: Option<&Path>,
+    pending_map_refreshes: &Arc<Mutex<PendingMapRefreshes>>,
+) {
+    let due = if let Ok(mut guard) = pending_map_refreshes.lock() {
+        guard.take_due()
+    } else {
+        Vec::new()
+    };
+
+    if due.is_empty() {
+        return;
+    }
+
+    for event_pid in due {
+        let proc_pid = resolve_proc_pid_for_event(event_pid);
+        if !pid_alive(proc_pid) {
+            tracing::trace!(
+                "Sysmon: event pid {} (proc pid {}) exited before map refresh",
+                event_pid,
+                proc_pid
+            );
+            continue;
+        }
+
+        if let Some(target_path) = target {
+            if !pid_maps_target_module(proc_pid, target_path) {
+                tracing::trace!(
+                    "Sysmon: event pid {} (proc pid {}) map-change does not include target {}; skip",
+                    event_pid,
+                    proc_pid,
+                    target_path.display()
+                );
+                continue;
+            }
+        }
+
+        match refresh_offsets_for_pid(mgr, event_pid, target) {
+            Ok(true) => tracing::debug!(
+                "Sysmon: refreshed offsets after map-change for event pid {} (proc pid {})",
+                event_pid,
+                proc_pid
+            ),
+            Ok(false) => tracing::trace!(
+                "Sysmon: map-change refresh inserted no offsets for event pid {} (proc pid {})",
+                event_pid,
+                proc_pid
+            ),
+            Err(e) => tracing::debug!(
+                "Sysmon: map-change refresh failed for event pid {} (proc pid {}): {}",
+                event_pid,
+                proc_pid,
+                e
+            ),
         }
     }
 }
