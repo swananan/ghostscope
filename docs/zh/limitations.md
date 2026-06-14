@@ -48,6 +48,8 @@ GhostScope 能识别 `DW_OP_form_tls_address`，但运行时 TLS 地址解析目
 ### 7. 栈回溯覆盖范围
 `bt` 只使用 DWARF CFI。GhostScope 不会回退到内核 stack helper 或 frame pointer walking；当 CFI 不可用、无法转换为 compact eBPF fast path，或读取用户栈内存失败时，会输出明确的停止状态。只要进程模块映射可用，跨模块栈帧可以通过 raw IP 做正确符号化；但 unwind 只有在 GhostScope 拥有能安全在 eBPF 中执行的 compact DWARF row 时才会继续。深栈 DWARF unwind 已经通过 eBPF tail-call step program 分段执行，因此默认 `backtrace_depth = 128` 不会触发 LLVM 分支距离和 verifier 程序大小限制；`status=truncated` 表示达到配置深度或 tail-call unwind 预算后仍未自然停止。
 
+运行模式也会影响 `bt` 的覆盖面。`-p <pid>` 是进程级视图，GhostScope 会从该 PID 的 `/proc/<pid>/maps` 加载已映射模块，因此跨模块 unwind 和符号化通常最完整。独立 `-t <path>` 是目标文件级、多进程 trace 视图，主要保证目标模块内的探针和变量；调用栈跨出目标模块后属于 best-effort，依赖运行时模块映射、`proc_module_offsets` 维护结果以及相关模块是否有可用 compact DWARF CFI。若既需要限定 trace 目标模块，又需要更完整的单进程 backtrace，优先使用 `-t <path> -p <pid>`。
+
 ### 8. 高度优化代码的支持
 编译器优化（-O2、-O3）会导致变量被优化掉或生成复杂的 DWARF 表达式。GhostScope 会尽力解析，包括内联函数的支持，但部分变量可能无法访问（显示为 OptimizedOut），这是因为编译器优化掉了。
 
@@ -62,6 +64,8 @@ GhostScope 启动时会扫描进程的 `/proc/PID/maps` 获取已加载的动态
 - **限定 PID 的目标模式（`-t ... -p ...`）**：不需要也不会启动 sysmon。`-t` 决定函数/源码行/地址目标解析使用哪个模块，`-p` 提供具体进程映射和 PID 过滤。
 
 提示：`-p <pid>` 模式下仍会自动计算并下发模块偏移，全局变量始终可用。
+
+`-t` 下的全局变量依赖 `proc_module_offsets`，也就是按 `(pid, module)` 维护的运行时地址偏移。独立 `-t` 会面向多个 PID 维护目标模块偏移，因此适合观察目标模块里的全局变量；但它不是完整进程视图，`bt` 跨出目标模块后的 unwind/符号化能力不等同于 `-p`。需要单个进程的完整模块上下文时，使用 `-p <pid>`；需要把 trace 目标限定到某个模块并保留该进程上下文时，使用 `-t <path> -p <pid>`。
 
 > **说明**：目前 sysmon 假设共享库在 exec 事件处理时已经映射；若动态加载发生得更晚，目前不会自动重试。
 
