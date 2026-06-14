@@ -74,6 +74,9 @@ run_make_fixture backtrace_hot_program backtrace_hot_program_nopie
 run_make_fixture backtrace_cross_module_program clean
 run_make_fixture backtrace_cross_module_program all
 
+run_make_fixture backtrace_dlopen_program clean
+run_make_fixture backtrace_dlopen_program all
+
 run_make_fixture scalar_types_program clean
 run_make_fixture scalar_types_program all
 

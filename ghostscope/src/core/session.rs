@@ -5,12 +5,29 @@ use anyhow::Result;
 use ghostscope_debuginfod::{DebuginfodClient, DebuginfodConfig};
 use ghostscope_dwarf::{DwarfAnalyzer, ExplicitDebugFile, ModuleStats};
 use ghostscope_process::{
-    ProcessManager, ProcessSysmon, SysEventKind, SysmonConfig, SysmonEventMask,
+    PidFilterSpec, PidNamespaceId, ProcessManager, ProcessSysmon, SysEventKind, SysmonConfig,
+    SysmonEventMask,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+const SYSMON_MAP_CHANGE_RENDER_GRACE: Duration = Duration::from_millis(20);
+const SYSMON_MAP_CHANGE_DRAIN_POLL: Duration = Duration::from_millis(2);
+
+fn sysmon_watch_from_config(
+    config: &ResolvedConfig,
+    fallback_host_pid: Option<u32>,
+) -> (Option<u32>, Option<PidNamespaceId>) {
+    match config.runtime.pid_filter_spec {
+        Some(PidFilterSpec::NamespaceTgid { filter_pid, pid_ns }) => {
+            (Some(filter_pid), Some(pid_ns))
+        }
+        Some(PidFilterSpec::HostTgid { filter_pid }) => (Some(filter_pid), None),
+        None => (fallback_host_pid, None),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RuntimePidContext {
@@ -119,21 +136,24 @@ impl GhostSession {
         if config.dry_run {
             info!("Sysmon not started (dry-run mode)");
         } else if s.proc_pid().is_some() {
+            let (watched_pid, watched_pid_ns) = sysmon_watch_from_config(config, s.host_pid());
             let cfg = SysmonConfig {
                 target_module: None,
                 proc_offsets_max_entries: config.ebpf_config.proc_module_offsets_max_entries as u32,
                 perf_page_count: Some(config.ebpf_config.perf_page_count as usize),
                 event_mask: SysmonEventMask::pid_module_changes(),
-                watched_pid: s.host_pid(),
+                watched_pid,
+                watched_pid_ns,
+                watched_proc_pid: s.proc_pid(),
             };
             let mgr = Arc::clone(&s.coordinator);
             let mut sysmon = ProcessSysmon::new(mgr, cfg);
             sysmon.start();
             s.sysmon = Some(Arc::new(Mutex::new(sysmon)));
-            if let Some(host_pid) = s.host_pid() {
+            if let Some(watched_pid) = watched_pid {
                 info!(
                     "Sysmon started (-p map-change mode, watched event pid={})",
-                    host_pid
+                    watched_pid
                 );
             } else {
                 info!("Sysmon started (-p map-change mode)");
@@ -148,6 +168,8 @@ impl GhostSession {
                     perf_page_count: Some(config.ebpf_config.perf_page_count as usize),
                     event_mask: SysmonEventMask::target_mode(),
                     watched_pid: None,
+                    watched_pid_ns: None,
+                    watched_proc_pid: None,
                 };
                 let mgr = Arc::clone(&s.coordinator);
                 let mut sysmon = ProcessSysmon::new(mgr, cfg);
@@ -202,6 +224,8 @@ impl GhostSession {
                 perf_page_count: None,
                 event_mask: SysmonEventMask::pid_module_changes(),
                 watched_pid: s.host_pid(),
+                watched_pid_ns: None,
+                watched_proc_pid: s.proc_pid(),
             };
             let mgr = Arc::clone(&s.coordinator);
             let mut sysmon = ProcessSysmon::new(mgr, cfg);
@@ -216,6 +240,8 @@ impl GhostSession {
                 perf_page_count: None,
                 event_mask: SysmonEventMask::target_mode(),
                 watched_pid: None,
+                watched_pid_ns: None,
+                watched_proc_pid: None,
             };
             let mgr = Arc::clone(&s.coordinator);
             let mut sysmon = ProcessSysmon::new(mgr, cfg);
@@ -306,7 +332,7 @@ impl GhostSession {
         Ok(DwarfAnalyzer::runtime_modules_from_pid_offsets(entries))
     }
 
-    fn drain_sysmon_map_change_events(&self) -> bool {
+    fn drain_sysmon_map_change_events(&self, grace: Duration) -> bool {
         let Some(sysmon) = self.sysmon.as_ref() else {
             return false;
         };
@@ -316,9 +342,30 @@ impl GhostSession {
         };
 
         let mut saw_map_change = false;
-        while let Some(event) = sysmon.recv_timeout(Duration::from_millis(0)) {
-            if matches!(event.event_kind(), Some(SysEventKind::MapChange)) {
-                saw_map_change = true;
+        let deadline = Instant::now() + grace;
+        let mut timeout = Duration::ZERO;
+
+        loop {
+            match sysmon.recv_timeout(timeout) {
+                Some(event) => {
+                    if matches!(event.event_kind(), Some(SysEventKind::MapChange)) {
+                        saw_map_change = true;
+                    }
+                    timeout = Duration::ZERO;
+                }
+                None => {
+                    if saw_map_change || grace == Duration::ZERO {
+                        break;
+                    }
+
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    timeout = deadline
+                        .saturating_duration_since(now)
+                        .min(SYSMON_MAP_CHANGE_DRAIN_POLL);
+                }
             }
         }
 
@@ -326,7 +373,17 @@ impl GhostSession {
     }
 
     pub async fn refresh_pid_runtime_modules_if_needed(&mut self) -> Result<usize> {
-        if self.proc_pid().is_none() || !self.drain_sysmon_map_change_events() {
+        if self.proc_pid().is_none() || !self.drain_sysmon_map_change_events(Duration::ZERO) {
+            return Ok(0);
+        }
+
+        self.refresh_pid_runtime_modules().await
+    }
+
+    pub async fn refresh_pid_runtime_modules_before_rendering(&mut self) -> Result<usize> {
+        if self.proc_pid().is_none()
+            || !self.drain_sysmon_map_change_events(SYSMON_MAP_CHANGE_RENDER_GRACE)
+        {
             return Ok(0);
         }
 
