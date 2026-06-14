@@ -5,7 +5,7 @@ use crate::{
     pinned_bpf_maps,
     proc_maps::{visit_proc_maps, ModuleIdentity},
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -999,6 +999,7 @@ fn run_sysmon_loop(
 
     // Initial prefill for late-start cases: compute and insert offsets for already-running PIDs.
     if let Some(tpath) = &target {
+        let mut initial_target_pids: BTreeSet<u32> = BTreeSet::new();
         if let Ok(mut guard) = mgr.lock() {
             if let Ok(prefilled) = guard.ensure_prefill_module(tpath.to_string_lossy().as_ref()) {
                 tracing::info!(
@@ -1022,6 +1023,7 @@ fn run_sysmon_loop(
                     }
                     let mut total = 0usize;
                     for (pid, items) in by_pid {
+                        initial_target_pids.insert(pid);
                         if let Ok(n) = insert_offsets_for_pid(pid, &items) {
                             total += n;
                         }
@@ -1036,6 +1038,19 @@ fn run_sysmon_loop(
                         tpath.display()
                     );
                 }
+            }
+        }
+        for pid in initial_target_pids {
+            let event_pid = resolve_event_pid_for_proc(pid);
+            if let Err(e) =
+                prefill_full_offsets_for_pid_if_new(&mgr, event_pid, &proc_pid_for_event)
+            {
+                tracing::debug!(
+                    "Sysmon: initial full offset prefill failed for proc pid {} (event pid {}): {}",
+                    pid,
+                    event_pid,
+                    e
+                );
             }
         }
     }
@@ -1078,7 +1093,12 @@ fn run_sysmon_loop(
                 &pending_map_refreshes,
                 &proc_pid_for_event,
             );
-            refresh_target_module_offsets(&mgr, target.as_deref(), &mut last_module_refresh);
+            refresh_target_module_offsets(
+                &mgr,
+                target.as_deref(),
+                &mut last_module_refresh,
+                &proc_pid_for_event,
+            );
             if !had_event {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
@@ -1144,7 +1164,12 @@ fn run_sysmon_loop(
                 &pending_map_refreshes,
                 &proc_pid_for_event,
             );
-            refresh_target_module_offsets(&mgr, target.as_deref(), &mut last_module_refresh);
+            refresh_target_module_offsets(
+                &mgr,
+                target.as_deref(),
+                &mut last_module_refresh,
+                &proc_pid_for_event,
+            );
         }
     } else {
         return Err(anyhow::anyhow!("No sysmon events map found (ringbuf/perf)"));
@@ -1312,10 +1337,9 @@ fn prefill_offsets_for_pid(
 fn refresh_offsets_for_pid(
     mgr: &Arc<Mutex<ProcessManager>>,
     event_pid: u32,
-    target: Option<&Path>,
     proc_pid_for_event: &impl Fn(u32) -> u32,
 ) -> anyhow::Result<bool> {
-    write_offsets_for_pid(mgr, event_pid, target, true, proc_pid_for_event)
+    write_offsets_for_pid(mgr, event_pid, None, true, proc_pid_for_event)
 }
 
 fn write_offsets_for_pid(
@@ -1418,12 +1442,13 @@ fn write_offsets_for_pid(
                 proc_pid
             );
         }
-        let mut filtered = guard
+        let mut entries = guard
             .cached_offsets_with_paths_for_pid(proc_pid)
-            .map(|entries| filter_entries_for_target(entries, target))
+            .map(|entries| entries.to_vec())
             .unwrap_or_default();
+        let mut target_match_count = filter_entries_for_target(&entries, target).len();
 
-        if filtered.is_empty() && target.is_some() {
+        if target_match_count == 0 && target.is_some() {
             let refreshed = guard.refresh_prefill_pid(proc_pid)?;
             if refreshed > 0 {
                 tracing::debug!(
@@ -1433,10 +1458,11 @@ fn write_offsets_for_pid(
                     proc_pid
                 );
             }
-            filtered = guard
+            entries = guard
                 .cached_offsets_with_paths_for_pid(proc_pid)
-                .map(|entries| filter_entries_for_target(entries, target))
+                .map(|entries| entries.to_vec())
                 .unwrap_or_default();
+            target_match_count = filter_entries_for_target(&entries, target).len();
         }
 
         if force_refresh && target.is_none() {
@@ -1451,28 +1477,13 @@ fn write_offsets_for_pid(
             }
         }
 
-        if !filtered.is_empty() {
-            let items: Vec<(u64, ProcModuleOffsetsValue)> = filtered
-                .iter()
-                .map(|e| {
-                    (
-                        e.cookie,
-                        ProcModuleOffsetsValue::new(
-                            e.offsets.text,
-                            e.offsets.rodata,
-                            e.offsets.data,
-                            e.offsets.bss,
-                            e.base,
-                            e.size,
-                        ),
-                    )
-                })
-                .collect();
+        if !entries.is_empty() && (target.is_none() || target_match_count > 0) {
+            let items = offset_items_from_entries(entries.iter());
             match insert_offsets_for_pid(proc_pid, &items) {
                 Ok(inserted) => {
                     if inserted == 0 {
                         tracing::warn!(
-                            "Sysmon: no offsets inserted for event pid {} (proc pid {}) (filtered count={})",
+                            "Sysmon: no offsets inserted for event pid {} (proc pid {}) (entry count={})",
                             event_pid,
                             proc_pid,
                             items.len()
@@ -1508,10 +1519,93 @@ fn write_offsets_for_pid(
     Ok(inserted_any)
 }
 
+fn prefill_full_offsets_for_pid_if_new(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    event_pid: u32,
+    proc_pid_for_event: &impl Fn(u32) -> u32,
+) -> anyhow::Result<bool> {
+    use crate::pinned_bpf_maps::insert_offsets_for_pid;
+
+    let proc_pid = proc_pid_for_event(event_pid);
+    if proc_pid != event_pid {
+        if let Err(e) = crate::pinned_bpf_maps::insert_pid_alias(event_pid, proc_pid) {
+            tracing::debug!(
+                "Sysmon: failed to insert PID alias event pid {} -> proc pid {}: {}",
+                event_pid,
+                proc_pid,
+                e
+            );
+        }
+    }
+
+    let items = {
+        let Ok(mut guard) = mgr.lock() else {
+            return Ok(false);
+        };
+        let prefilled = guard.ensure_prefill_pid(proc_pid)?;
+        if prefilled == 0 {
+            return Ok(false);
+        }
+        let Some(entries) = guard.cached_offsets_with_paths_for_pid(proc_pid) else {
+            return Ok(false);
+        };
+        offset_items_from_entries(entries.iter())
+    };
+
+    if items.is_empty() {
+        return Ok(false);
+    }
+
+    match insert_offsets_for_pid(proc_pid, &items) {
+        Ok(inserted) if inserted > 0 => {
+            tracing::info!(
+                "Sysmon: inserted {} full offset entries for event pid {} (proc pid {})",
+                inserted,
+                event_pid,
+                proc_pid
+            );
+            let _ = crate::pinned_bpf_maps::insert_allowed_pid(event_pid);
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(e) => {
+            tracing::warn!(
+                "Sysmon: failed to insert full offsets for event pid {} (proc pid {}): {}",
+                event_pid,
+                proc_pid,
+                e
+            );
+            Ok(false)
+        }
+    }
+}
+
+fn offset_items_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a PidOffsetsEntry>,
+) -> Vec<(u64, crate::pinned_bpf_maps::ProcModuleOffsetsValue)> {
+    entries
+        .into_iter()
+        .map(|e| {
+            (
+                e.cookie,
+                crate::pinned_bpf_maps::ProcModuleOffsetsValue::new(
+                    e.offsets.text,
+                    e.offsets.rodata,
+                    e.offsets.data,
+                    e.offsets.bss,
+                    e.base,
+                    e.size,
+                ),
+            )
+        })
+        .collect()
+}
+
 fn refresh_target_module_offsets(
     mgr: &Arc<Mutex<ProcessManager>>,
     target: Option<&Path>,
     last_refresh: &mut Instant,
+    proc_pid_for_event: &impl Fn(u32) -> u32,
 ) {
     use crate::pinned_bpf_maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
 
@@ -1526,6 +1620,7 @@ fn refresh_target_module_offsets(
 
     let module_path = target_path.to_string_lossy().to_string();
     let mut by_pid: HashMap<u32, Vec<(u64, ProcModuleOffsetsValue)>> = HashMap::new();
+    let mut target_pids: BTreeSet<u32> = BTreeSet::new();
     if let Ok(mut guard) = mgr.lock() {
         if let Err(e) = guard.refresh_prefill_module(&module_path) {
             tracing::debug!(
@@ -1536,6 +1631,7 @@ fn refresh_target_module_offsets(
             return;
         }
         for (pid, cookie, off, base, size) in guard.cached_offsets_for_module(&module_path) {
+            target_pids.insert(pid);
             by_pid.entry(pid).or_default().push((
                 cookie,
                 ProcModuleOffsetsValue::new(off.text, off.rodata, off.data, off.bss, base, size),
@@ -1562,6 +1658,17 @@ fn refresh_target_module_offsets(
                 module_path,
                 e
             ),
+        }
+    }
+    for pid in target_pids {
+        let event_pid = resolve_event_pid_for_proc(pid);
+        if let Err(e) = prefill_full_offsets_for_pid_if_new(mgr, event_pid, proc_pid_for_event) {
+            tracing::debug!(
+                "Sysmon: periodic full offset prefill failed for proc pid {} (event pid {}): {}",
+                pid,
+                event_pid,
+                e
+            );
         }
     }
     if total > 0 {
@@ -1666,6 +1773,58 @@ fn poll_pending_offsets(
     }
 }
 
+fn cached_offsets_exist_for_target_pid(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    target_path: &Path,
+    proc_pid: u32,
+) -> bool {
+    let module_path = target_path.to_string_lossy().to_string();
+    mgr.lock()
+        .ok()
+        .map(|guard| {
+            guard.cached_offsets_with_paths_for_pid(proc_pid).is_some()
+                || guard
+                    .cached_offsets_for_module(&module_path)
+                    .iter()
+                    .any(|(pid, _, _, _, _)| *pid == proc_pid)
+        })
+        .unwrap_or(false)
+}
+
+fn forget_pid_offsets_after_target_unmap(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    event_pid: u32,
+    proc_pid: u32,
+) {
+    if let Ok(mut guard) = mgr.lock() {
+        guard.forget_pid(proc_pid);
+        if proc_pid != event_pid {
+            guard.forget_pid(event_pid);
+        }
+    }
+
+    match crate::pinned_bpf_maps::purge_offsets_for_pid(proc_pid) {
+        Ok(n) if n > 0 => tracing::info!(
+            "Sysmon: target unmapped for event pid {} (proc pid {}); purged {} offset entries",
+            event_pid,
+            proc_pid,
+            n
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            "Sysmon: purge after target unmap failed for event pid {} (proc pid {}): {}",
+            event_pid,
+            proc_pid,
+            e
+        ),
+    }
+    if proc_pid != event_pid {
+        let _ = crate::pinned_bpf_maps::purge_offsets_for_pid(event_pid);
+    }
+    let _ = crate::pinned_bpf_maps::remove_allowed_pid(event_pid);
+    let _ = crate::pinned_bpf_maps::remove_pid_alias(event_pid);
+}
+
 fn poll_pending_map_refreshes(
     mgr: &Arc<Mutex<ProcessManager>>,
     target: Option<&Path>,
@@ -1695,6 +1854,9 @@ fn poll_pending_map_refreshes(
 
         if let Some(target_path) = target {
             if !pid_maps_target_module(proc_pid, target_path) {
+                if cached_offsets_exist_for_target_pid(mgr, target_path, proc_pid) {
+                    forget_pid_offsets_after_target_unmap(mgr, event_pid, proc_pid);
+                }
                 tracing::trace!(
                     "Sysmon: event pid {} (proc pid {}) map-change does not include target {}; skip",
                     event_pid,
@@ -1705,7 +1867,7 @@ fn poll_pending_map_refreshes(
             }
         }
 
-        match refresh_offsets_for_pid(mgr, event_pid, target, proc_pid_for_event) {
+        match refresh_offsets_for_pid(mgr, event_pid, proc_pid_for_event) {
             Ok(true) => tracing::debug!(
                 "Sysmon: refreshed offsets after map-change for event pid {} (proc pid {})",
                 event_pid,

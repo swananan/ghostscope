@@ -166,7 +166,7 @@ impl GhostSession {
                     proc_offsets_max_entries: config.ebpf_config.proc_module_offsets_max_entries
                         as u32,
                     perf_page_count: Some(config.ebpf_config.perf_page_count as usize),
-                    event_mask: SysmonEventMask::target_mode(),
+                    event_mask: SysmonEventMask::target_mode_with_map_changes(),
                     watched_pid: None,
                     watched_pid_ns: None,
                     watched_proc_pid: None,
@@ -238,7 +238,7 @@ impl GhostSession {
                 target_module,
                 proc_offsets_max_entries: 4096,
                 perf_page_count: None,
-                event_mask: SysmonEventMask::target_mode(),
+                event_mask: SysmonEventMask::target_mode_with_map_changes(),
                 watched_pid: None,
                 watched_pid_ns: None,
                 watched_proc_pid: None,
@@ -373,7 +373,12 @@ impl GhostSession {
     }
 
     pub async fn refresh_pid_runtime_modules_if_needed(&mut self) -> Result<usize> {
-        if self.proc_pid().is_none() || !self.drain_sysmon_map_change_events(Duration::ZERO) {
+        if self.proc_pid().is_none() {
+            let _ = self.drain_sysmon_map_change_events(Duration::ZERO);
+            return Ok(0);
+        }
+
+        if !self.drain_sysmon_map_change_events(Duration::ZERO) {
             return Ok(0);
         }
 
@@ -381,9 +386,12 @@ impl GhostSession {
     }
 
     pub async fn refresh_pid_runtime_modules_before_rendering(&mut self) -> Result<usize> {
-        if self.proc_pid().is_none()
-            || !self.drain_sysmon_map_change_events(SYSMON_MAP_CHANGE_RENDER_GRACE)
-        {
+        if self.proc_pid().is_none() {
+            let _ = self.drain_sysmon_map_change_events(Duration::ZERO);
+            return Ok(0);
+        }
+
+        if !self.drain_sysmon_map_change_events(SYSMON_MAP_CHANGE_RENDER_GRACE) {
             return Ok(0);
         }
 
