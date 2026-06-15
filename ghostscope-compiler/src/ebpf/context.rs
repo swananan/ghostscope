@@ -640,6 +640,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             })?;
 
         if !self.backtrace_unwind_rows.is_empty() {
+            let share_backtrace_maps = !self.backtrace_module_row_ranges.is_empty();
+            if share_backtrace_maps {
+                self.map_manager.mark_pinned_map("bt_unwind_rows");
+                self.map_manager.mark_pinned_map("bt_module_row_ranges");
+            }
             self.map_manager
                 .create_array_map(
                     &self.module,
@@ -652,7 +657,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .map_err(|e| {
                     CodeGenError::LLVMError(format!("Failed to create bt_unwind_rows map: {e}"))
                 })?;
-            if !self.backtrace_module_row_ranges.is_empty() {
+            if share_backtrace_maps {
                 self.map_manager
                     .create_proc_module_range_meta_map(
                         &self.module,

@@ -1030,6 +1030,79 @@ trace cross_module_lib_leaf {
 }
 
 #[tokio::test]
+async fn test_t_mode_multiple_backtrace_traces_share_cross_module_cfi() -> anyhow::Result<()> {
+    init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
+
+    let binary_path = FIXTURES.get_test_binary("backtrace_cross_module_program")?;
+    let lib_path = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cross-module fixture has no parent directory"))?
+        .join("libbacktrace_cross_module.so");
+    let script = r#"
+trace cross_module_lib_probe {
+    print "T_MODE_SHARED_CFI_PROBE";
+    bt full;
+}
+
+trace cross_module_lib_leaf {
+    print "T_MODE_SHARED_CFI_LEAF";
+    bt full;
+}
+"#;
+
+    let (count, stdout, stderr) =
+        run_backtrace_target_mode_library_with_depth(&binary_path, &lib_path, script, 5, 250, 3)
+            .await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    assert!(
+        count >= 2,
+        "expected both target-mode backtrace traces to emit events\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    let probe_block = first_backtrace_block_after(&stdout, "T_MODE_SHARED_CFI_PROBE", 5)?;
+    assert_ordered_patterns(
+        probe_block,
+        &[
+            "#0 cross_module_lib_probe",
+            "#1 cross_module_main_caller",
+            "#2 cross_module_main_loop",
+            "#3 main",
+        ],
+    )?;
+    assert!(
+        probe_block.contains("[libbacktrace_cross_module.so+")
+            && probe_block.contains("[backtrace_cross_module_program+"),
+        "probe trace should unwind across the shared library and executable\nBLOCK:\n{probe_block}"
+    );
+
+    let leaf_block = first_backtrace_block_after(&stdout, "T_MODE_SHARED_CFI_LEAF", 5)?;
+    assert_ordered_patterns(
+        leaf_block,
+        &[
+            "#0 cross_module_lib_leaf",
+            "#1 cross_module_lib_probe",
+            "#2 cross_module_main_caller",
+            "#3 cross_module_main_loop",
+            "#4 main",
+        ],
+    )?;
+    assert!(
+        leaf_block.contains("[libbacktrace_cross_module.so+")
+            && leaf_block.contains("[backtrace_cross_module_program+"),
+        "leaf trace should unwind across the shared library and executable\nBLOCK:\n{leaf_block}"
+    );
+    assert_no_adjacent_duplicate_frame_locations(probe_block)?;
+    assert_no_adjacent_duplicate_frame_locations(leaf_block)?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_pid_backtrace_reports_frame_from_library_loaded_by_dlopen() -> anyhow::Result<()> {
     init();
 
@@ -1100,6 +1173,7 @@ trace dlopen_main_callback {
             "#1 dlopen_lib_leaf",
             "#2 dlopen_lib_middle",
             "#3 dlopen_lib_driver",
+            "#4 main",
         ],
     )?;
     assert!(
@@ -1248,6 +1322,7 @@ trace dlopen_lib_leaf {
             "#0 dlopen_lib_leaf",
             "#1 dlopen_lib_middle",
             "#2 dlopen_lib_driver",
+            "#3 main",
         ],
     )?;
     assert!(
