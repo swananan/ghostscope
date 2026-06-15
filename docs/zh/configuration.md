@@ -44,7 +44,7 @@ ghostscope --target <PATH>
 
 # 两者可以一起使用：在一个运行中 PID 内追踪 -t 指定的模块。
 # 这种形式下，函数/源码行/地址目标解析一律以 -t 为准，
-# -p 只负责把运行时事件限制到该进程；sysmon 不会启动。
+# -p 负责把运行时事件和模块刷新限制到该进程。
 ghostscope -t /usr/bin/myapp -p 1234
 
 # 启动新进程
@@ -183,11 +183,13 @@ ghostscope --source-panel       # 显示源码面板
 # 警告：仅用于测试目的。即使在内核 >= 5.8 上也强制使用 PerfEventArray
 ghostscope --force-perf-event-array
 
-# 独立 -t 默认启动 sysmon。-t 与 -p 同时使用时不会使用 sysmon，
-# 因为 PID 已经提供了具体进程映射。
-# 警告：该选项会全局附加 sched 的 exec/fork/exit tracepoint，在进程频繁
-# 启动/退出的主机上可能带来一定性能开销。可在配置中设置
-# enable_sysmon_for_target=false 关闭；该选项可为单次运行重新开启。
+# 独立 -t 默认启动 target-mode sysmon。-t 与 -p 同时使用时，
+# GhostScope 会改用 -p 的 watched-PID 模块刷新路径。
+# 警告：该选项会全局附加生命周期 tracepoint（exec/fork/exit），也可能
+# 为运行时模块刷新附加 map-change tracepoint（mmap/mprotect/munmap/mremap）。
+# 在进程频繁启动/退出或内存映射频繁变化的主机上可能带来一定性能开销。
+# 可在配置中设置 enable_sysmon_for_target=false 关闭；该选项可为单次运行
+# 重新开启。
 ghostscope --enable-sysmon-for-target
 ```
 
@@ -266,7 +268,7 @@ ghostscope bpffs prune --dry-run --json
 | `--source-panel` | | 显示源码面板 | 开 |
 | `--config <PATH>` | | 自定义配置文件 | 自动检测 |
 | `--force-perf-event-array` | | 强制 PerfEventArray（测试） | 关 |
-| `--enable-sysmon-for-target` | | 当配置关闭 sysmon 时，重新为独立 `-t` 开启 sysmon。独立 `-t` 默认开启；`-t -p` 不使用 sysmon。 | 关 |
+| `--enable-sysmon-for-target` | | 当配置关闭 sysmon 时，重新为独立 `-t` 开启 target-mode sysmon。独立 `-t` 默认开启；`-t -p` 改用 `-p` 的 watched-PID 模块刷新路径。 | 关 |
 | `[BINARY] [ARGS...]` | | 启动目标程序并传递位置参数 | 无 |
 | `--args <PROGRAM> [ARGS...]` | | 分隔 GhostScope 选项和目标程序参数 | 无 |
 
@@ -509,9 +511,12 @@ backtrace_unwind_rows_max_entries = 65536
 force_perf_event_array = false  # 默认（根据内核版本自动检测）
 
 # 为独立 -t 目标启动 sysmon eBPF，
-# 用于维护后续启动进程里目标模块的 ASLR 偏移。
-# -t 与 -p 同时使用时不会使用 sysmon，因为 PID 已经提供具体进程映射。
-# 启用后会注册系统范围的 sched tracepoint，进程频繁创建/退出的环境下可能带来性能开销。
+# 用于维护后续启动进程里的 ASLR 偏移，以及后续映射目标模块或其他
+# backtrace 模块时的运行时模块刷新。
+# -t 与 -p 同时使用时会改用 -p 的 watched-PID 模块刷新路径，
+# 而不是 target-mode sysmon。
+# 启用后会注册系统范围的生命周期 tracepoint，也可能注册 map-change
+# tracepoint；进程频繁创建/退出或内存映射变化频繁的环境下可能带来性能开销。
 enable_sysmon_for_target = true  # 默认开启
 ```
 

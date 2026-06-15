@@ -380,7 +380,8 @@ sudo ghostscope -p 12345
 ❌ **限制**：
 - 无法捕获进程启动阶段（GhostScope 附加时进程已在运行）
 - 如果程序文件被替换，旧进程仍然可以被追踪（因为映射的是旧 inode）
-- 动态加载的库（`dlopen`）目前不支持自动追踪
+- 运行时模块刷新可以为后续通过 `dlopen` 加载的库更新偏移和 backtrace
+  CFI，但 GhostScope 不会自动为 setup 阶段尚未知的 trace 目标新增 uprobe
 
 #### 使用场景
 

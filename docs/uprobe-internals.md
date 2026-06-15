@@ -381,7 +381,9 @@ sudo ghostscope -p 12345
 ❌ **Limitations**:
 - Cannot capture process startup phase (GhostScope attaches when process is already running)
 - If program file is replaced, old process can still be traced (because it maps the old inode)
-- Dynamically loaded libraries (`dlopen`) are not currently supported for automatic tracing
+- Runtime module refresh can update offsets and backtrace CFI for libraries
+  loaded later through `dlopen`, but GhostScope does not automatically add new
+  uprobes for trace targets that were unknown during setup
 
 #### Use Cases
 

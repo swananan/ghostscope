@@ -48,12 +48,12 @@ sudo ghostscope -t /usr/lib/libexample.so
 - **When to use**: You want to catch process startup events or trace multiple instances
 - **Advantage**: Can capture events from process initialization, perfect for debugging startup issues
 - **Note**: Standalone `-t` starts sysmon by default and will trace ALL processes using this binary/library, which may generate more events. Set `enable_sysmon_for_target = false` in config to disable sysmon for standalone `-t`.
-- **Target-scoped PID variant**: Use `-t /path/to/module -p <PID>` when you want `-t` target resolution for one module but only one running process's events. In this variant, `-t` takes precedence and `sysmon` is not started.
+- **Target-scoped PID variant**: Use `-t /path/to/module -p <PID>` when you want `-t` target resolution for one module but only one running process's events. In this variant, `-t` takes precedence for target resolution, while `-p` supplies the PID filter and watched-PID module refresh.
 
 #### Important Notes
 
 > ⚠️ **Things to know**:
-> 1. The `-p` option traces the main program and all currently loaded dynamic libraries (libraries loaded later via dlopen are not yet supported)
+> 1. The `-p` option traces the selected process. `bt` can refresh module metadata for libraries loaded later via `dlopen`, but new trace probes still depend on the target module being known during setup.
 > 2. The executables and libraries you want to trace **must contain debug information**, otherwise GhostScope will be helpless. How to check? See the [Debug Symbols section in the Installation Guide](install.md#3-debug-symbols-required)
 
 

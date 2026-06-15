@@ -54,18 +54,18 @@ Runtime mode also affects `bt` coverage. `-p <pid>` is a process-level view, so 
 Compiler optimizations (-O2, -O3) can cause variables to be optimized away or generate complex DWARF expressions. GhostScope will attempt to parse them, including inline function support, but some variables may be inaccessible (shown as OptimizedOut) because the compiler optimized them away.
 
 ### 9. Dynamically Loaded Libraries (dlopen)
-GhostScope scans `/proc/PID/maps` at startup to obtain loaded dynamic library information. As long as GhostScope is started after `dlopen`, tracing works normally. Future plans include dynamically monitoring process `dlopen` behavior for better user experience.
+GhostScope scans `/proc/PID/maps` at startup, and runtime map-change monitoring now refreshes module mappings for `-p <pid>` and standalone `-t <path>` runs while sysmon is enabled. For `bt`/`backtrace`, this can add compact DWARF CFI rows and module offsets for libraries loaded later through `dlopen`, subject to `backtrace_unwind_rows_max_entries` and the map-change race noted above.
+
+This runtime refresh does not automatically create new trace probes or make print/global-variable targets available for a library that was unknown when the script was compiled and attached. Those targets still depend on the target module and debug information being available during trace setup.
 
 ### 10. Global Variables in `-t` Mode
 
 - **Executable targets**: When `-t` points to an executable (`-t /path/to/app`), GhostScope treats that binary as the primary module and globals are supported by default.
 - **Shared-library targets (existing processes)**: If GhostScope starts after the library has already been mapped (e.g., tracing a running process that loaded `libfoo.so` earlier), globals work without extra steps.
-- **Shared-library targets (new processes)**: Standalone `-t` starts sysmon by default so globals can be resolved for later-started processes. This incurs extra system-wide work, so expect higher overhead on hosts with frequent process churn; set `enable_sysmon_for_target = false` in config to disable it.
-- **Target-scoped PID runs (`-t ... -p ...`)**: sysmon is not needed or started. `-t` chooses the module used for function/source/address target resolution, while `-p` supplies the concrete process mappings and PID filter.
+- **Shared-library targets (new or later-mapped processes)**: Standalone `-t` starts sysmon by default so globals can be resolved for later-started processes and for processes that map the target library later through `dlopen`. This incurs extra system-wide work, so expect higher overhead on hosts with frequent process churn or frequent memory-map changes; set `enable_sysmon_for_target = false` in config to disable it.
+- **Target-scoped PID runs (`-t ... -p ...`)**: `-t` chooses the module used for function/source/address target resolution, while `-p` supplies the concrete process mappings, PID filter, and watched-PID module refresh. Target-mode lifecycle sysmon is not used.
 
 In `-t` mode, globals depend on `proc_module_offsets`, which tracks runtime address offsets by `(pid, module)`. Standalone `-t` maintains target-module offsets for multiple PIDs, so it is suitable for observing globals in that module; it is not a complete process view, and `bt` after leaving the target module is not equivalent to `-p`. Use `-p <pid>` when you need the full module context for one process. Use `-t <path> -p <pid>` when you need target-module trace resolution while keeping that process context.
-
-> **Note**: The current sysmon pipeline still assumes the library is mapped when the exec event is handled; if a loader pulls it in much later, offsets are not retried yet.
 
 ### 11. `-p <pid>` Mode inside Containers or WSL
 

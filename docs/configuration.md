@@ -43,7 +43,7 @@ ghostscope --target <PATH>
 
 # Both can be used together to trace the -t module inside one running PID.
 # In this form, -t wins for function/source/address target resolution and
-# -p only scopes runtime events to that process. sysmon is not started.
+# -p scopes runtime events and module refresh to that process.
 ghostscope -t /usr/bin/myapp -p 1234
 
 # Launch a new process
@@ -184,11 +184,13 @@ ghostscope --source-panel       # Show source panel
 # WARNING: Testing purposes only. Forces PerfEventArray even on kernels >= 5.8
 ghostscope --force-perf-event-array
 
-# Standalone -t starts sysmon by default. It is not used when -t is
-# combined with -p because the PID already provides concrete process mappings.
-# WARNING: Attaches system-wide sched tracepoints (exec/fork/exit) and may add
-# overhead on hosts with high process churn. Set enable_sysmon_for_target=false
-# in config to disable it; this flag can re-enable it for one run.
+# Standalone -t starts target-mode sysmon by default. When -t is combined with
+# -p, GhostScope uses the -p watched-PID module-refresh path instead.
+# WARNING: Attaches system-wide lifecycle tracepoints (exec/fork/exit) and may
+# also attach map-change tracepoints (mmap/mprotect/munmap/mremap) for runtime
+# module refresh. This can add overhead on hosts with high process churn or
+# frequent memory-map changes. Set enable_sysmon_for_target=false in config to
+# disable it; this flag can re-enable it for one run.
 ghostscope --enable-sysmon-for-target
 ```
 
@@ -267,7 +269,7 @@ Behavior:
 | `--source-panel` | | Show source panel | On |
 | `--config <PATH>` | | Custom config file | Auto-detect |
 | `--force-perf-event-array` | | Force PerfEventArray (testing) | Off |
-| `--enable-sysmon-for-target` | | Re-enable sysmon for standalone `-t` when config disables it. Standalone `-t` enables sysmon by default; `-t -p` does not use it. | Off |
+| `--enable-sysmon-for-target` | | Re-enable target-mode sysmon for standalone `-t` when config disables it. Standalone `-t` enables target-mode sysmon by default; `-t -p` uses the `-p` watched-PID module-refresh path instead. | Off |
 | `[BINARY] [ARGS...]` | | Launch target program with positional arguments | None |
 | `--args <PROGRAM> [ARGS...]` | | Separate GhostScope options from target program arguments | None |
 
@@ -518,11 +520,13 @@ backtrace_unwind_rows_max_entries = 65536
 force_perf_event_array = false  # Default (auto-detect based on kernel version)
 
 # Start sysmon eBPF for standalone -t targets.
-# Maintains ASLR offsets for late-start processes loading the target.
-# Not used when -t is combined with -p, because the PID already provides the
-# concrete process mappings.
-# This enables system-wide sched tracepoints and may impact performance
-# when process churn is high.
+# Maintains ASLR offsets for late-start processes and runtime module refresh for
+# processes that map the target or other backtrace modules later.
+# When -t is combined with -p, GhostScope uses the -p watched-PID module-refresh
+# path instead of target-mode sysmon.
+# This enables system-wide lifecycle tracepoints and may also enable map-change
+# tracepoints, so it may impact performance when process churn or memory-map
+# churn is high.
 enable_sysmon_for_target = true  # Default
 ```
 
