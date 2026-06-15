@@ -133,6 +133,9 @@ fn emit_map_change<C: EbpfContext>(ctx: &C) -> u32 {
     if pid == 0 {
         return 0;
     }
+    if !watched_pid_configured() && ALLOWED_PIDS.get_ptr(&pid).is_none() {
+        return 0;
+    }
     let ev = SysEvent {
         tgid: pid,
         kind: SYS_EVENT_MAP_CHANGE,
@@ -152,6 +155,14 @@ fn current_host_tgid() -> u32 {
 fn event_enabled(bit: u32) -> bool {
     match SYSMON_EVENT_MASK.get(0) {
         Some(mask) => (*mask & bit) != 0,
+        None => false,
+    }
+}
+
+#[inline(always)]
+fn watched_pid_configured() -> bool {
+    match SYSMON_WATCHED_PID.get(0) {
+        Some(watched) => *watched != 0,
         None => false,
     }
 }

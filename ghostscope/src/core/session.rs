@@ -8,6 +8,7 @@ use ghostscope_process::{
     PidFilterSpec, PidNamespaceId, ProcessManager, ProcessSysmon, SysEventKind, SysmonConfig,
     SysmonEventMask,
 };
+use ghostscope_protocol::BacktraceUnwindRow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -169,7 +170,7 @@ impl GhostSession {
                     proc_offsets_max_entries: config.ebpf_config.proc_module_offsets_max_entries
                         as u32,
                     perf_page_count: Some(config.ebpf_config.perf_page_count as usize),
-                    event_mask: SysmonEventMask::target_mode(),
+                    event_mask: SysmonEventMask::target_mode_with_map_changes(),
                     watched_pid: None,
                     watched_pid_ns: None,
                     watched_proc_pid: None,
@@ -242,7 +243,7 @@ impl GhostSession {
                 target_module,
                 proc_offsets_max_entries: 4096,
                 perf_page_count: None,
-                event_mask: SysmonEventMask::target_mode(),
+                event_mask: SysmonEventMask::target_mode_with_map_changes(),
                 watched_pid: None,
                 watched_pid_ns: None,
                 watched_proc_pid: None,
@@ -492,6 +493,7 @@ impl GhostSession {
             .await?;
 
         if loaded > 0 {
+            self.append_runtime_backtrace_unwind_rows();
             info!(
                 "Refreshed PID {} runtime module analysis with {} new module(s)",
                 proc_pid, loaded
@@ -580,6 +582,51 @@ impl GhostSession {
         Ok(modules_by_cookie.into_values().collect())
     }
 
+    fn collect_runtime_backtrace_unwind_rows(&self) -> Vec<(u64, Vec<BacktraceUnwindRow>)> {
+        let Some(analyzer) = self.process_analyzer.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut modules_by_cookie = BTreeMap::<u64, Vec<BacktraceUnwindRow>>::new();
+        for module in analyzer.loaded_module_runtime_info() {
+            let Some(module_id) = analyzer.module_id_for_path(&module.module_path) else {
+                continue;
+            };
+            let Ok(Some(table)) = analyzer.compact_unwind_table_for_module(module_id) else {
+                continue;
+            };
+            let mut rows = table
+                .rows
+                .iter()
+                .filter_map(ghostscope_compiler::backtrace_unwind_row_from_compact)
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                continue;
+            }
+            rows.sort_by_key(|row| (row.pc_start, row.pc_end));
+            let module_path = module.module_path.to_string_lossy();
+            let cookie = ghostscope_compiler::module_cookie_for_path(&module_path);
+            modules_by_cookie.entry(cookie).or_insert(rows);
+        }
+
+        modules_by_cookie.into_iter().collect()
+    }
+
+    fn append_runtime_backtrace_unwind_rows(&mut self) -> usize {
+        let modules = self.collect_runtime_backtrace_unwind_rows();
+        let stats = self
+            .trace_manager
+            .append_backtrace_unwind_rows_for_modules(&modules);
+        if stats.modules > 0 {
+            info!(
+                modules = stats.modules,
+                rows = stats.rows,
+                "Appended runtime DWARF bt unwind rows to active traces"
+            );
+        }
+        stats.modules
+    }
+
     pub async fn refresh_target_runtime_modules(&mut self) -> Result<usize> {
         if self.proc_pid().is_some() {
             return Ok(0);
@@ -609,6 +656,7 @@ impl GhostSession {
             .await?;
 
         if loaded > 0 {
+            self.append_runtime_backtrace_unwind_rows();
             info!(
                 "Refreshed target-mode runtime module analysis with {} new module(s)",
                 loaded

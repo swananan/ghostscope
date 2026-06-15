@@ -496,15 +496,20 @@ compare_cap = 64
 # Maximum size of a single trace event (bytes). Applies to PerfEventArray accumulation buffer.
 max_trace_event_size = 32768
 
+# Recommended values:
+#   - Simple prints: 16384
+#   - General use: 32768
+#   - Large formatted prints: 65536
+
 # Max DWARF-unwound frames captured by each bt/backtrace instruction.
 # Can be overridden for one run with --backtrace-depth.
 # Valid range: 1 to 128.
 backtrace_depth = 128
 
-# Recommended values:
-#   - Simple prints: 16384
-#   - General use: 32768
-#   - Large formatted prints: 65536
+# Fixed capacity for compact DWARF unwind rows used by bt/backtrace.
+# Runtime module refresh can append rows for newly loaded modules until this
+# capacity is reached. Valid range: 1024 to 1048576 rows.
+backtrace_unwind_rows_max_entries = 65536
 
 # Force use of PerfEventArray instead of RingBuf (TESTING ONLY)
 # WARNING: This is for testing purposes only. Set to true to force PerfEventArray
@@ -726,6 +731,7 @@ GhostScope validates configuration at startup:
    - **perf_page_count**: Must be power of 2, range 8-1024 pages
    - **proc_module_offsets_max_entries**: Must be in range 64-65536
    - **backtrace_depth**: Must be in range 1-128 frames
+   - **backtrace_unwind_rows_max_entries**: Must be in range 1024-1048576 rows
    - **mem_dump_cap**, **compare_cap**, and **max_trace_event_size** are runtime caps; `max_trace_event_size` may be clamped by the selected event transport.
 
 Invalid configuration will produce clear error messages with suggestions for fixes.

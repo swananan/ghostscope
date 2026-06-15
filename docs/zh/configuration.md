@@ -487,15 +487,20 @@ compare_cap = 64
 # 单条 trace 事件的最大大小（字节）。适用于 PerfEventArray 累计缓冲区。
 max_trace_event_size = 32768
 
+# 推荐值：
+#   - 简单打印：16384
+#   - 通用场景：32768
+#   - 大格式化输出：65536
+
 # 每条 bt/backtrace 指令最多采集的 DWARF unwind 栈帧数。
 # 可通过命令行 --backtrace-depth 临时覆盖。
 # 有效范围：1 到 128。
 backtrace_depth = 128
 
-# 推荐值：
-#   - 简单打印：16384
-#   - 通用场景：32768
-#   - 大格式化输出：65536
+# bt/backtrace 使用的 compact DWARF unwind row 固定容量。
+# 运行时模块刷新可以为新加载模块追加 rows，直到达到该容量。
+# 有效范围：1024 到 1048576 rows。
+backtrace_unwind_rows_max_entries = 65536
 
 # 强制使用 PerfEventArray 而非 RingBuf（仅用于测试）
 # 警告：这仅用于测试目的。设为 true 会强制使用 PerfEventArray
@@ -711,6 +716,7 @@ GhostScope 在启动时验证配置：
    - **perf_page_count**：必须是 2 的幂，范围 8-1024 页
    - **proc_module_offsets_max_entries**：必须在 64-65536 范围内
    - **backtrace_depth**：必须在 1-128 栈帧范围内
+   - **backtrace_unwind_rows_max_entries**：必须在 1024-1048576 rows 范围内
    - **mem_dump_cap**、**compare_cap** 和 **max_trace_event_size** 是运行时上限；`max_trace_event_size` 可能会根据实际事件传输方式被 clamp。
 
 无效配置将产生清晰的错误消息和修复建议。

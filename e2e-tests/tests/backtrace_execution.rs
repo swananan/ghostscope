@@ -1084,6 +1084,100 @@ trace dlopen_main_callback {
         "dlopen backtrace should refresh proc maps before rendering the library frame\nBLOCK:\n{dlopen_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
 
+    let refreshed_block = blocks
+        .iter()
+        .find(|block| block.contains("dlopen_lib_middle") && block.contains("dlopen_lib_driver"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "expected a refreshed dlopen backtrace block to unwind inside the library\n\
+                 STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            )
+        })?;
+    assert_ordered_patterns(
+        refreshed_block,
+        &[
+            "#0 dlopen_main_callback",
+            "#1 dlopen_lib_leaf",
+            "#2 dlopen_lib_middle",
+            "#3 dlopen_lib_driver",
+        ],
+    )?;
+    assert!(
+        !refreshed_block.contains("stopped: no unwind rows for PC"),
+        "dlopen backtrace should append CFI rows for the loaded library\n\
+         BLOCK:\n{refreshed_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_t_mode_backtrace_unwinds_library_loaded_by_dlopen() -> anyhow::Result<()> {
+    init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
+
+    let binary_path = FIXTURES.get_test_binary("backtrace_dlopen_program")?;
+    let (target, trigger_path) = spawn_backtrace_dlopen_program().await?;
+    let script = r#"
+trace dlopen_main_callback {
+    print "T_MODE_DLOPEN_CALLBACK_STACK";
+    bt full;
+}
+"#;
+
+    let trigger_target = target.clone();
+    let trigger_for_callback = trigger_path.clone();
+    let result = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_target(&binary_path)
+        .timeout_secs(5)
+        .with_cli_args([
+            OsString::from("--script-output-events-per-sec"),
+            OsString::from("200"),
+            OsString::from("--backtrace-depth"),
+            OsString::from("6"),
+        ])
+        .run_after_ready(move || async move {
+            touch_dlopen_trigger_in_target_sandbox(&trigger_target, &trigger_for_callback)
+        })
+        .await;
+
+    target.terminate().await?;
+    let _ = fs::remove_file(trigger_path);
+    let (exit_code, stdout, stderr, ()) = result?;
+    if exit_code != 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    anyhow::ensure!(exit_code == 0, "stderr={stderr} stdout={stdout}");
+
+    let blocks = backtrace_blocks_after(&stdout, "T_MODE_DLOPEN_CALLBACK_STACK", 6)?;
+    let refreshed_block = blocks
+        .iter()
+        .find(|block| block.contains("dlopen_lib_middle") && block.contains("dlopen_lib_driver"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "expected a target-mode dlopen backtrace block to unwind inside the library\n\
+                 STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            )
+        })?;
+    assert_ordered_patterns(
+        refreshed_block,
+        &[
+            "#0 dlopen_main_callback",
+            "#1 dlopen_lib_leaf",
+            "#2 dlopen_lib_middle",
+            "#3 dlopen_lib_driver",
+        ],
+    )?;
+    assert!(
+        !refreshed_block.contains("<proc offsets unavailable>")
+            && !refreshed_block.contains("stopped: no unwind rows for PC"),
+        "target-mode dlopen backtrace should refresh module offsets and append CFI rows\n\
+         BLOCK:\n{refreshed_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
     Ok(())
 }
 
