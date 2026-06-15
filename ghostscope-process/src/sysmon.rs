@@ -315,6 +315,9 @@ impl ProcessSysmon {
             pinned_bpf_maps::ensure_pinned_proc_offsets_exists(self.cfg.proc_offsets_max_entries);
         let _ =
             pinned_bpf_maps::ensure_pinned_pid_aliases_exists(self.cfg.proc_offsets_max_entries);
+        let _ = pinned_bpf_maps::ensure_pinned_proc_module_ranges_exist(
+            self.cfg.proc_offsets_max_entries,
+        );
         let _ = pinned_bpf_maps::ensure_pinned_allowed_pids_exists(16_384);
 
         let tx = self.tx.clone();
@@ -468,8 +471,10 @@ impl ProcessSysmon {
                         e
                     ),
                 }
+                let _ = crate::pinned_bpf_maps::purge_ranges_for_pid(proc_pid);
                 if proc_pid != ev.tgid {
                     let _ = crate::pinned_bpf_maps::purge_offsets_for_pid(ev.tgid);
+                    let _ = crate::pinned_bpf_maps::purge_ranges_for_pid(ev.tgid);
                 }
                 let _ = crate::pinned_bpf_maps::remove_allowed_pid(ev.tgid);
                 let _ = crate::pinned_bpf_maps::remove_pid_alias(ev.tgid);
@@ -1350,7 +1355,8 @@ fn write_offsets_for_pid(
     proc_pid_for_event: &impl Fn(u32) -> u32,
 ) -> anyhow::Result<bool> {
     use crate::pinned_bpf_maps::{
-        insert_offsets_for_pid, purge_offsets_for_pid, ProcModuleOffsetsValue,
+        insert_offsets_for_pid, purge_offsets_for_pid, replace_ranges_for_pid,
+        ProcModuleOffsetsValue,
     };
 
     let proc_pid = proc_pid_for_event(event_pid);
@@ -1489,6 +1495,14 @@ fn write_offsets_for_pid(
                             items.len()
                         );
                     } else {
+                        if let Err(e) = replace_ranges_for_pid(proc_pid, &items) {
+                            tracing::warn!(
+                                "Sysmon: failed to replace module ranges for event pid {} (proc pid {}): {}",
+                                event_pid,
+                                proc_pid,
+                                e
+                            );
+                        }
                         tracing::info!(
                             "Sysmon: inserted {} offset entries for event pid {} (proc pid {})",
                             inserted,
@@ -1524,7 +1538,7 @@ fn prefill_full_offsets_for_pid_if_new(
     event_pid: u32,
     proc_pid_for_event: &impl Fn(u32) -> u32,
 ) -> anyhow::Result<bool> {
-    use crate::pinned_bpf_maps::insert_offsets_for_pid;
+    use crate::pinned_bpf_maps::{insert_offsets_for_pid, replace_ranges_for_pid};
 
     let proc_pid = proc_pid_for_event(event_pid);
     if proc_pid != event_pid {
@@ -1558,6 +1572,14 @@ fn prefill_full_offsets_for_pid_if_new(
 
     match insert_offsets_for_pid(proc_pid, &items) {
         Ok(inserted) if inserted > 0 => {
+            if let Err(e) = replace_ranges_for_pid(proc_pid, &items) {
+                tracing::warn!(
+                    "Sysmon: failed to replace module ranges for event pid {} (proc pid {}): {}",
+                    event_pid,
+                    proc_pid,
+                    e
+                );
+            }
             tracing::info!(
                 "Sysmon: inserted {} full offset entries for event pid {} (proc pid {})",
                 inserted,
@@ -1818,8 +1840,10 @@ fn forget_pid_offsets_after_target_unmap(
             e
         ),
     }
+    let _ = crate::pinned_bpf_maps::purge_ranges_for_pid(proc_pid);
     if proc_pid != event_pid {
         let _ = crate::pinned_bpf_maps::purge_offsets_for_pid(event_pid);
+        let _ = crate::pinned_bpf_maps::purge_ranges_for_pid(event_pid);
     }
     let _ = crate::pinned_bpf_maps::remove_allowed_pid(event_pid);
     let _ = crate::pinned_bpf_maps::remove_pid_alias(event_pid);

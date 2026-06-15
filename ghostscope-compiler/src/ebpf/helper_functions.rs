@@ -28,8 +28,6 @@ pub(crate) struct ProcModuleOffsetsLookup<'ctx> {
     pub(crate) rodata: IntValue<'ctx>,
     pub(crate) data: IntValue<'ctx>,
     pub(crate) bss: IntValue<'ctx>,
-    pub(crate) base: IntValue<'ctx>,
-    pub(crate) size: IntValue<'ctx>,
 }
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
@@ -250,6 +248,138 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(alias_phi.as_basic_value().into_int_value())
     }
 
+    pub(crate) fn proc_module_pid_key(&mut self, name_prefix: &str) -> Result<IntValue<'ctx>> {
+        const BPF_FUNC_GET_NS_CURRENT_PID_TGID: u64 = 120;
+        const BPF_PIDNS_INFO_SIZE: u64 = 8; // struct { u32 pid; u32 tgid; }
+
+        let i32_type = self.context.i32_type();
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let key_arr_ty = i32_type.array_type(4);
+        let key_alloca = self.pm_key_alloca.ok_or_else(|| {
+            CodeGenError::LLVMError("pm_key not allocated in entry block".to_string())
+        })?;
+
+        let helper_id = i64_type.const_int(BPF_FUNC_get_current_pid_tgid as u64, false);
+        let helper_fn_type = i64_type.fn_type(&[], false);
+        let helper_fn_ptr = self
+            .builder
+            .build_int_to_ptr(helper_id, ptr_type, &format!("{name_prefix}_get_pid_fn"))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let pid_tgid = self
+            .builder
+            .build_indirect_call(
+                helper_fn_type,
+                helper_fn_ptr,
+                &[],
+                &format!("{name_prefix}_pid_tgid"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .ok_or_else(|| {
+                CodeGenError::LLVMError("get_current_pid_tgid returned void".to_string())
+            })?;
+        let host_tgid = if let BasicValueEnum::IntValue(v) = pid_tgid {
+            let shifted = self
+                .builder
+                .build_right_shift(
+                    v,
+                    i64_type.const_int(32, false),
+                    false,
+                    &format!("{name_prefix}_pid_shift"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            self.builder
+                .build_int_truncate(shifted, i32_type, &format!("{name_prefix}_pid32"))
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+        } else {
+            return Err(CodeGenError::LLVMError(
+                "pid_tgid is not IntValue".to_string(),
+            ));
+        };
+
+        let ns_spec = self
+            .compile_options
+            .proc_offsets_pid_ns
+            .and_then(|pid_ns| pid_ns.helper_dev_inode());
+
+        let runtime_pid = if let Some((pid_ns_dev, pid_ns_inode)) = ns_spec {
+            self.builder
+                .build_store(key_alloca, key_arr_ty.const_zero())
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let pidns_info_ptr = self
+                .builder
+                .build_bit_cast(
+                    key_alloca,
+                    ptr_type,
+                    &format!("{name_prefix}_pidns_info_ptr"),
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let helper_args = [
+                i64_type.const_int(pid_ns_dev, false).into(),
+                i64_type.const_int(pid_ns_inode, false).into(),
+                pidns_info_ptr,
+                i64_type.const_int(BPF_PIDNS_INFO_SIZE, false).into(),
+            ];
+            let helper_ret = self.create_bpf_helper_call(
+                BPF_FUNC_GET_NS_CURRENT_PID_TGID,
+                &helper_args,
+                i64_type.into(),
+                &format!("{name_prefix}_ns_pid_tgid_ret"),
+            )?;
+            let helper_ret = match helper_ret {
+                BasicValueEnum::IntValue(v) => v,
+                _ => {
+                    return Err(CodeGenError::LLVMError(
+                        "bpf_get_ns_current_pid_tgid did not return integer".to_string(),
+                    ));
+                }
+            };
+            let helper_ok = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    helper_ret,
+                    i64_type.const_zero(),
+                    &format!("{name_prefix}_ns_helper_ok"),
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            // SAFETY: key_alloca temporarily holds the two-field pid namespace
+            // helper result, so [0, 1] addresses the tgid field.
+            let ns_tgid_ptr = unsafe {
+                self.builder.build_gep(
+                    key_arr_ty,
+                    key_alloca,
+                    &[i32_type.const_zero(), i32_type.const_int(1, false)],
+                    &format!("{name_prefix}_ns_tgid_ptr"),
+                )
+            }
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let ns_tgid = self
+                .builder
+                .build_load(i32_type, ns_tgid_ptr, &format!("{name_prefix}_ns_tgid"))
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                .into_int_value();
+            // The proc module maps are populated from `/proc/<proc_pid>/maps`,
+            // so their keys must use the same PID namespace view GhostScope used
+            // for those `/proc` reads.
+            self.builder
+                .build_select(
+                    helper_ok,
+                    ns_tgid,
+                    host_tgid,
+                    &format!("{name_prefix}_pid_key"),
+                )
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?
+                .into_int_value()
+        } else {
+            host_tgid
+        };
+
+        self.lookup_proc_pid_alias(runtime_pid, name_prefix)
+    }
+
     /// Get or create a static i8 buffer global of a given size, returning its ArrayType and pointer
     pub fn get_or_create_i8_buffer(
         &mut self,
@@ -435,9 +565,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         module_cookie: u64,
         name_prefix: &str,
     ) -> Result<ProcModuleOffsetsLookup<'ctx>> {
-        const BPF_FUNC_GET_NS_CURRENT_PID_TGID: u64 = 120;
-        const BPF_PIDNS_INFO_SIZE: u64 = 8; // struct { u32 pid; u32 tgid; }
-
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
@@ -457,133 +584,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Use per-invocation key buffer [4 x u32] pre-allocated in entry block
         // struct { u32 pid; u32 pad; u32 cookie_lo; u32 cookie_hi; }
         let i32_type = self.context.i32_type();
-        let key_arr_ty = i32_type.array_type(4);
         let key_alloca = self.pm_key_alloca.ok_or_else(|| {
             CodeGenError::LLVMError("pm_key not allocated in entry block".to_string())
         })?;
-        // Resolve the pid key used for proc_module_offsets lookup.
-        // Host mode uses host TGID, while NamespaceTgid mode uses namespace TGID
-        // from bpf_get_ns_current_pid_tgid().
-        let helper_id = i64_type.const_int(BPF_FUNC_get_current_pid_tgid as u64, false);
-        let helper_fn_type = i64_type.fn_type(&[], false);
-        let helper_fn_ptr = self
-            .builder
-            .build_int_to_ptr(helper_id, ptr_type, &format!("{name_prefix}_get_pid_fn"))
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let pid_tgid = self
-            .builder
-            .build_indirect_call(
-                helper_fn_type,
-                helper_fn_ptr,
-                &[],
-                &format!("{name_prefix}_pid_tgid"),
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-            .try_as_basic_value()
-            .left()
-            .ok_or_else(|| {
-                CodeGenError::LLVMError("get_current_pid_tgid returned void".to_string())
-            })?;
-        let host_tgid = if let BasicValueEnum::IntValue(v) = pid_tgid {
-            // pid = upper 32 bits
-            let shifted = self
-                .builder
-                .build_right_shift(
-                    v,
-                    i64_type.const_int(32, false),
-                    false,
-                    &format!("{name_prefix}_pid_shift"),
-                )
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-            self.builder
-                .build_int_truncate(shifted, i32_type, &format!("{name_prefix}_pid32"))
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-        } else {
-            return Err(CodeGenError::LLVMError(
-                "pid_tgid is not IntValue".to_string(),
-            ));
-        };
-
-        let ns_spec = self
-            .compile_options
-            .proc_offsets_pid_ns
-            .and_then(|pid_ns| pid_ns.helper_dev_inode());
-
-        let runtime_pid = if let Some((pid_ns_dev, pid_ns_inode)) = ns_spec {
-            // Reuse key_alloca as temporary helper output buffer: [pid:u32, tgid:u32].
-            self.builder
-                .build_store(key_alloca, key_arr_ty.const_zero())
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-            let pidns_info_ptr = self
-                .builder
-                .build_bit_cast(
-                    key_alloca,
-                    ptr_type,
-                    &format!("{name_prefix}_pidns_info_ptr"),
-                )
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-            let helper_args = [
-                i64_type.const_int(pid_ns_dev, false).into(),
-                i64_type.const_int(pid_ns_inode, false).into(),
-                pidns_info_ptr,
-                i64_type.const_int(BPF_PIDNS_INFO_SIZE, false).into(),
-            ];
-            let helper_ret = self.create_bpf_helper_call(
-                BPF_FUNC_GET_NS_CURRENT_PID_TGID,
-                &helper_args,
-                i64_type.into(),
-                &format!("{name_prefix}_ns_pid_tgid_ret"),
-            )?;
-            let helper_ret = match helper_ret {
-                BasicValueEnum::IntValue(v) => v,
-                _ => {
-                    return Err(CodeGenError::LLVMError(
-                        "bpf_get_ns_current_pid_tgid did not return integer".to_string(),
-                    ));
-                }
-            };
-            let helper_ok = self
-                .builder
-                .build_int_compare(
-                    inkwell::IntPredicate::EQ,
-                    helper_ret,
-                    i64_type.const_zero(),
-                    &format!("{name_prefix}_ns_helper_ok"),
-                )
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-            // SAFETY: key_alloca temporarily holds the two-field pid namespace
-            // helper result, so [0, 1] addresses the tgid field.
-            let ns_tgid_ptr = unsafe {
-                self.builder.build_gep(
-                    key_arr_ty,
-                    key_alloca,
-                    &[i32_type.const_zero(), i32_type.const_int(1, false)],
-                    &format!("{name_prefix}_ns_tgid_ptr"),
-                )
-            }
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-            let ns_tgid = self
-                .builder
-                .build_load(i32_type, ns_tgid_ptr, &format!("{name_prefix}_ns_tgid"))
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                .into_int_value();
-            // The proc_module_offsets map is populated from `/proc/<proc_pid>/maps`,
-            // so its key must use the same PID namespace view GhostScope used for
-            // those `/proc` reads. This is *not* necessarily the same namespace
-            // used for `$pid`/`$tid` or NamespaceTgid filtering.
-            self.builder
-                .build_select(
-                    helper_ok,
-                    ns_tgid,
-                    host_tgid,
-                    &format!("{name_prefix}_pid_key"),
-                )
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                .into_int_value()
-        } else {
-            host_tgid
-        };
-        let pid = self.lookup_proc_pid_alias(runtime_pid, name_prefix)?;
+        let pid = self.proc_module_pid_key(name_prefix)?;
 
         let store_key_u32 = |offset: usize,
                              value: IntValue<'ctx>,
@@ -742,18 +746,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self,
             val_ptr,
         )?;
-        let base = load_field(
-            ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_BASE_OFFSET,
-            &format!("{name_prefix}_base"),
-            self,
-            val_ptr,
-        )?;
-        let size = load_field(
-            ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_SIZE_OFFSET,
-            &format!("{name_prefix}_size"),
-            self,
-            val_ptr,
-        )?;
         self.builder
             .build_unconditional_branch(cont_block)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
@@ -794,8 +786,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             rodata: phi_i64(self, &format!("{name_prefix}_rodata_phi"), off_rodata)?,
             data: phi_i64(self, &format!("{name_prefix}_data_phi"), off_data)?,
             bss: phi_i64(self, &format!("{name_prefix}_bss_phi"), off_bss)?,
-            base: phi_i64(self, &format!("{name_prefix}_base_phi"), base)?,
-            size: phi_i64(self, &format!("{name_prefix}_size_phi"), size)?,
         })
     }
 

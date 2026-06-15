@@ -69,6 +69,93 @@ pub const PROC_MODULE_OFFSETS_VALUE_SIZE_OFFSET: usize =
     std::mem::offset_of!(ProcModuleOffsetsValue, size);
 pub const PROC_MODULE_OFFSETS_VALUE_SIZE: usize = std::mem::size_of::<ProcModuleOffsetsValue>();
 
+/// Value for the pinned `proc_module_range_meta` map.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcModuleRangeMeta {
+    pub active_slot: u32,
+    pub count: u32,
+}
+
+impl ProcModuleRangeMeta {
+    pub fn new(active_slot: u32, count: u32) -> Self {
+        Self { active_slot, count }
+    }
+}
+
+pub const PROC_MODULE_RANGE_META_ACTIVE_SLOT_OFFSET: usize =
+    std::mem::offset_of!(ProcModuleRangeMeta, active_slot);
+pub const PROC_MODULE_RANGE_META_COUNT_OFFSET: usize =
+    std::mem::offset_of!(ProcModuleRangeMeta, count);
+pub const PROC_MODULE_RANGE_META_SIZE: usize = std::mem::size_of::<ProcModuleRangeMeta>();
+
+/// Key for the pinned `proc_module_ranges` map.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ProcModuleRangeKey {
+    pub pid: u32,
+    pub slot: u32,
+    pub index: u32,
+    pub pad: u32,
+}
+
+impl ProcModuleRangeKey {
+    pub fn new(pid: u32, slot: u32, index: u32) -> Self {
+        Self {
+            pid,
+            slot,
+            index,
+            pad: 0,
+        }
+    }
+}
+
+pub const PROC_MODULE_RANGE_KEY_PID_OFFSET: usize = std::mem::offset_of!(ProcModuleRangeKey, pid);
+pub const PROC_MODULE_RANGE_KEY_SLOT_OFFSET: usize = std::mem::offset_of!(ProcModuleRangeKey, slot);
+pub const PROC_MODULE_RANGE_KEY_INDEX_OFFSET: usize =
+    std::mem::offset_of!(ProcModuleRangeKey, index);
+pub const PROC_MODULE_RANGE_KEY_PAD_OFFSET: usize = std::mem::offset_of!(ProcModuleRangeKey, pad);
+pub const PROC_MODULE_RANGE_KEY_SIZE: usize = std::mem::size_of::<ProcModuleRangeKey>();
+
+/// Value for the pinned `proc_module_ranges` map.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcModuleRangeValue {
+    pub base: u64,
+    pub end: u64,
+    pub text: u64,
+    pub cookie_lo: u32,
+    pub cookie_hi: u32,
+}
+
+impl ProcModuleRangeValue {
+    pub fn new(base: u64, end: u64, text: u64, module_cookie: u64) -> Self {
+        Self {
+            base,
+            end,
+            text,
+            cookie_lo: module_cookie as u32,
+            cookie_hi: (module_cookie >> 32) as u32,
+        }
+    }
+
+    pub fn module_cookie(self) -> u64 {
+        u64::from(self.cookie_lo) | (u64::from(self.cookie_hi) << 32)
+    }
+}
+
+pub const PROC_MODULE_RANGE_VALUE_BASE_OFFSET: usize =
+    std::mem::offset_of!(ProcModuleRangeValue, base);
+pub const PROC_MODULE_RANGE_VALUE_END_OFFSET: usize =
+    std::mem::offset_of!(ProcModuleRangeValue, end);
+pub const PROC_MODULE_RANGE_VALUE_TEXT_OFFSET: usize =
+    std::mem::offset_of!(ProcModuleRangeValue, text);
+pub const PROC_MODULE_RANGE_VALUE_COOKIE_LO_OFFSET: usize =
+    std::mem::offset_of!(ProcModuleRangeValue, cookie_lo);
+pub const PROC_MODULE_RANGE_VALUE_COOKIE_HI_OFFSET: usize =
+    std::mem::offset_of!(ProcModuleRangeValue, cookie_hi);
+pub const PROC_MODULE_RANGE_VALUE_SIZE: usize = std::mem::size_of::<ProcModuleRangeValue>();
+
 /// Value for the pinned `pid_aliases` map.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -257,7 +344,8 @@ pub const BACKTRACE_RA_SAME_VALUE: u8 = BACKTRACE_RECOVERY_SAME_VALUE;
 mod aya_pod {
     use super::{
         BacktraceModuleRowRange, BacktraceTailCallState, BacktraceUnwindRow, PidAliasValue,
-        ProcModuleKey, ProcModuleOffsetsValue,
+        ProcModuleKey, ProcModuleOffsetsValue, ProcModuleRangeKey, ProcModuleRangeMeta,
+        ProcModuleRangeValue,
     };
 
     // SAFETY: ProcModuleKey is repr(C), Copy, 'static, and contains only
@@ -269,6 +357,15 @@ mod aya_pod {
     // SAFETY: PidAliasValue is repr(C), Copy, 'static, and contains only an
     // integer field with no invalid bit patterns.
     unsafe impl aya::Pod for PidAliasValue {}
+    // SAFETY: ProcModuleRangeMeta is repr(C), Copy, 'static, and contains only
+    // integer fields with no invalid bit patterns.
+    unsafe impl aya::Pod for ProcModuleRangeMeta {}
+    // SAFETY: ProcModuleRangeKey is repr(C), Copy, 'static, and contains only
+    // integer fields with no invalid bit patterns.
+    unsafe impl aya::Pod for ProcModuleRangeKey {}
+    // SAFETY: ProcModuleRangeValue is repr(C), Copy, 'static, and contains
+    // only integer fields with no invalid bit patterns.
+    unsafe impl aya::Pod for ProcModuleRangeValue {}
     // SAFETY: BacktraceUnwindRow is repr(C), Copy, 'static, and contains only
     // integer fields with no invalid bit patterns.
     unsafe impl aya::Pod for BacktraceUnwindRow {}
@@ -302,6 +399,23 @@ mod tests {
 
         assert_eq!(PID_ALIAS_VALUE_SIZE, 4);
         assert_eq!(PID_ALIAS_VALUE_PROC_PID_OFFSET, 0);
+
+        assert_eq!(PROC_MODULE_RANGE_META_SIZE, 8);
+        assert_eq!(PROC_MODULE_RANGE_META_ACTIVE_SLOT_OFFSET, 0);
+        assert_eq!(PROC_MODULE_RANGE_META_COUNT_OFFSET, 4);
+
+        assert_eq!(PROC_MODULE_RANGE_KEY_SIZE, 16);
+        assert_eq!(PROC_MODULE_RANGE_KEY_PID_OFFSET, 0);
+        assert_eq!(PROC_MODULE_RANGE_KEY_SLOT_OFFSET, 4);
+        assert_eq!(PROC_MODULE_RANGE_KEY_INDEX_OFFSET, 8);
+        assert_eq!(PROC_MODULE_RANGE_KEY_PAD_OFFSET, 12);
+
+        assert_eq!(PROC_MODULE_RANGE_VALUE_SIZE, 32);
+        assert_eq!(PROC_MODULE_RANGE_VALUE_BASE_OFFSET, 0);
+        assert_eq!(PROC_MODULE_RANGE_VALUE_END_OFFSET, 8);
+        assert_eq!(PROC_MODULE_RANGE_VALUE_TEXT_OFFSET, 16);
+        assert_eq!(PROC_MODULE_RANGE_VALUE_COOKIE_LO_OFFSET, 24);
+        assert_eq!(PROC_MODULE_RANGE_VALUE_COOKIE_HI_OFFSET, 28);
     }
 
     #[test]

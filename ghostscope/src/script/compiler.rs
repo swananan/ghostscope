@@ -166,6 +166,14 @@ fn apply_cached_offsets_for_session_pid(
                     proc_pid
                 );
             }
+            if let Err(e) =
+                ghostscope_process::pinned_bpf_maps::replace_ranges_for_pid(proc_pid, &adapted)
+            {
+                warn!(
+                    "Failed to write cached module ranges to pinned map for PID {}: {}",
+                    proc_pid, e
+                );
+            }
         }
     }
 }
@@ -220,6 +228,23 @@ async fn create_and_attach_loader(
         return Err(e.context(format!(
             "Unable to prepare pinned pid_aliases map at {}",
             alias_pin_path.display()
+        )));
+    }
+    let range_meta_pin_path =
+        ghostscope_process::pinned_bpf_maps::proc_module_range_meta_pin_path()
+            .context("Failed to resolve pinned proc_module_range_meta map path")?;
+    if let Err(e) =
+        ghostscope_process::pinned_bpf_maps::ensure_pinned_proc_module_ranges_exist(max_entries)
+    {
+        error!(
+            "Failed to ensure pinned module range maps at {} ({} entries): {:#}",
+            range_meta_pin_path.display(),
+            max_entries,
+            e
+        );
+        return Err(e.context(format!(
+            "Unable to prepare pinned module range maps at {}",
+            range_meta_pin_path.display()
         )));
     }
 
