@@ -3,7 +3,8 @@ use crate::trace::snapshot::{TraceSnapshot, TraceSummary};
 use anyhow::Result;
 use futures::future::{select_all, BoxFuture};
 use futures::FutureExt;
-use ghostscope_loader::{EventLossStats, GhostScopeLoader};
+use ghostscope_loader::{BacktraceUnwindRowsAppendStats, EventLossStats, GhostScopeLoader};
+use ghostscope_protocol::BacktraceUnwindRow;
 use ghostscope_protocol::ParsedTraceEvent;
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -266,6 +267,45 @@ impl TraceManager {
         }
 
         reports
+    }
+
+    pub fn append_backtrace_unwind_rows_for_modules(
+        &mut self,
+        modules: &[(u64, Vec<BacktraceUnwindRow>)],
+    ) -> BacktraceUnwindRowsAppendStats {
+        let mut total = BacktraceUnwindRowsAppendStats::default();
+        if modules.is_empty() {
+            return total;
+        }
+
+        for (&trace_id, trace) in self.traces.iter_mut() {
+            let Some(loader) = trace.loader.as_mut() else {
+                continue;
+            };
+
+            match loader.append_backtrace_unwind_rows_for_modules(modules) {
+                Ok(stats) => {
+                    if stats.modules > 0 {
+                        debug!(
+                            trace_id,
+                            modules = stats.modules,
+                            rows = stats.rows,
+                            "Appended runtime DWARF bt unwind rows to trace"
+                        );
+                        total.modules += stats.modules;
+                        total.rows += stats.rows;
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        trace_id,
+                        "Failed to append runtime DWARF bt unwind rows: {}", err
+                    );
+                }
+            }
+        }
+
+        total
     }
 
     /// Wait for the first trace to be enabled (for TUI mode to avoid busy waiting)

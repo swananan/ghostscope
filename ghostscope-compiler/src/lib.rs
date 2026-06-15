@@ -6,10 +6,16 @@ pub mod script;
 use crate::script::compiler::AstCompiler;
 use ebpf::context::CodeGenError;
 pub use ghostscope_dwarf::RuntimeCapabilities;
+use ghostscope_dwarf::{CfaRulePlan, CompactUnwindRow, RegisterRecoveryPlan};
+use ghostscope_process::module_probe;
 pub use ghostscope_process::{PidFilterSpec, PidNamespaceId};
 use script::parser::ParseError;
 use std::borrow::Cow;
 use tracing::info;
+
+const X86_64_DWARF_RIP: u16 = 16;
+const X86_64_DWARF_RBP: u16 = 6;
+const X86_64_DWARF_RSP: u16 = 7;
 
 pub fn hello() -> &'static str {
     "Hello from ghostscope-compiler!"
@@ -110,6 +116,8 @@ pub struct CompileOptions {
     pub target_binary_path: Option<String>,
     pub ringbuf_size: u64,
     pub proc_module_offsets_max_entries: u64,
+    /// Fixed capacity for DWARF compact CFI rows used by `bt`.
+    pub backtrace_unwind_rows_max_entries: u32,
     pub perf_page_count: u32,
     pub event_map_type: EventMapType,
     /// Max bytes to read per memory-dump argument (format {:x}/{:s}).
@@ -157,6 +165,7 @@ impl Default for CompileOptions {
             target_binary_path: None,
             ringbuf_size: 262144,                  // 256KB
             proc_module_offsets_max_entries: 4096, // Default
+            backtrace_unwind_rows_max_entries: DEFAULT_BACKTRACE_UNWIND_ROWS_MAX_ENTRIES,
             perf_page_count: 64,                   // 64 pages = 256KB per CPU
             event_map_type: EventMapType::RingBuf, // Default to RingBuf
             mem_dump_cap: 256,                     // Default per-arg dump cap (bytes)
@@ -175,6 +184,89 @@ impl Default for CompileOptions {
 
 pub const DEFAULT_BACKTRACE_DEPTH: u8 = 128;
 pub const MAX_BACKTRACE_DEPTH: u8 = 128;
+pub const DEFAULT_BACKTRACE_UNWIND_ROWS_MAX_ENTRIES: u32 = 65_536;
+pub const MIN_BACKTRACE_UNWIND_ROWS_MAX_ENTRIES: u32 = 1_024;
+pub const MAX_BACKTRACE_UNWIND_ROWS_MAX_ENTRIES: u32 = 1_048_576;
+
+pub fn module_cookie_for_path(module_path: &str) -> u64 {
+    module_probe::cookie_for_path(module_path)
+}
+
+pub fn backtrace_unwind_row_from_compact(
+    row: &CompactUnwindRow,
+) -> Option<ghostscope_protocol::BacktraceUnwindRow> {
+    if !row.bpf_supported {
+        return None;
+    }
+    let CfaRulePlan::RegPlusOffset {
+        register,
+        offset: cfa_offset,
+    } = &row.cfa
+    else {
+        return None;
+    };
+    if !backtrace_supported_state_register(*register) {
+        return None;
+    }
+
+    let mut wire = ghostscope_protocol::BacktraceUnwindRow {
+        pc_start: row.pc_start,
+        pc_end: row.pc_end,
+        cfa_offset: *cfa_offset,
+        cfa_register: *register,
+        ..Default::default()
+    };
+
+    match &row.return_address {
+        RegisterRecoveryPlan::AtCfaOffset { offset } => {
+            wire.ra_kind = BACKTRACE_RECOVERY_AT_CFA_OFFSET;
+            wire.ra_offset = *offset;
+            wire.ra_register = row.return_address_register;
+        }
+        _ => return None,
+    }
+
+    match row.rbp.as_ref() {
+        Some(RegisterRecoveryPlan::AtCfaOffset { offset }) => {
+            wire.rbp_kind = BACKTRACE_RECOVERY_AT_CFA_OFFSET;
+            wire.rbp_offset = *offset;
+            wire.rbp_register = X86_64_DWARF_RBP;
+        }
+        Some(RegisterRecoveryPlan::ValCfaOffset { offset }) => {
+            wire.rbp_kind = BACKTRACE_RECOVERY_VAL_CFA_OFFSET;
+            wire.rbp_offset = *offset;
+            wire.rbp_register = X86_64_DWARF_RBP;
+        }
+        Some(RegisterRecoveryPlan::Register { register }) => {
+            if !backtrace_supported_state_register(*register) {
+                return None;
+            }
+            wire.rbp_kind = BACKTRACE_RECOVERY_REGISTER;
+            wire.rbp_register = *register;
+        }
+        Some(RegisterRecoveryPlan::SameValue { register }) => {
+            if !backtrace_supported_state_register(*register) {
+                return None;
+            }
+            wire.rbp_kind = BACKTRACE_RECOVERY_SAME_VALUE;
+            wire.rbp_register = *register;
+        }
+        Some(RegisterRecoveryPlan::Undefined) | None => {
+            wire.rbp_kind = BACKTRACE_RECOVERY_SAME_VALUE;
+            wire.rbp_register = X86_64_DWARF_RBP;
+        }
+        _ => return None,
+    }
+
+    Some(wire)
+}
+
+fn backtrace_supported_state_register(register: u16) -> bool {
+    matches!(
+        register,
+        X86_64_DWARF_RIP | X86_64_DWARF_RBP | X86_64_DWARF_RSP
+    )
+}
 
 /// Main compilation interface with DwarfAnalyzer (multi-module support)
 ///

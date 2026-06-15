@@ -2,9 +2,7 @@ use super::*;
 use crate::ebpf::context::BacktraceModuleRowRangeEntry;
 use crate::script::{BacktraceStatement, Statement};
 use aya_ebpf_bindings::bindings::bpf_func_id::{BPF_FUNC_map_lookup_elem, BPF_FUNC_tail_call};
-use ghostscope_dwarf::{
-    CfaRulePlan, CompactUnwindRow, MemoryAccessSize, ModuleAddress, RegisterRecoveryPlan,
-};
+use ghostscope_dwarf::{CompactUnwindRow, MemoryAccessSize, ModuleAddress};
 use inkwell::basic_block::BasicBlock;
 use inkwell::values::BasicMetadataValueEnum;
 use std::{path::PathBuf, time::Instant};
@@ -139,7 +137,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.backtrace_unwind_rows = table
             .rows
             .iter()
-            .filter_map(backtrace_unwind_row_from_compact)
+            .filter_map(crate::backtrace_unwind_row_from_compact)
             .collect();
         self.backtrace_unwind_rows
             .sort_by_key(|row| (row.pc_start, row.pc_end));
@@ -182,7 +180,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             let mut bpf_rows = table
                 .rows
                 .iter()
-                .filter_map(backtrace_unwind_row_from_compact)
+                .filter_map(crate::backtrace_unwind_row_from_compact)
                 .collect::<Vec<_>>();
             bpf_rows.sort_by_key(|row| (row.pc_start, row.pc_end));
             if bpf_rows.is_empty() {
@@ -2004,7 +2002,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let Some(row) = self.compact_unwind_row_for_backtrace(module_path, pc) else {
             return BacktraceUnwindRowForPc::Missing;
         };
-        match backtrace_unwind_row_from_compact(&row) {
+        match crate::backtrace_unwind_row_from_compact(&row) {
             Some(row) => BacktraceUnwindRowForPc::Usable(row),
             None => BacktraceUnwindRowForPc::Unsupported,
         }
@@ -2293,7 +2291,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         row_end: IntValue<'ctx>,
         scratch: &RuntimeBtRowScratch<'ctx>,
     ) -> Result<RuntimeBtUnwindRow<'ctx>> {
-        let row_count = self.backtrace_unwind_rows.len();
+        let row_count = self.backtrace_unwind_row_map_entries() as usize;
         let i16_type = self.context.i16_type();
         let i32_type = self.context.i32_type();
         let i64_type = self.context.i64_type();
@@ -4845,82 +4843,6 @@ fn count_statement_backtraces(statement: &Statement) -> usize {
         }
         _ => 0,
     }
-}
-
-fn backtrace_unwind_row_from_compact(
-    row: &CompactUnwindRow,
-) -> Option<ghostscope_protocol::BacktraceUnwindRow> {
-    if !row.bpf_supported {
-        return None;
-    }
-    let CfaRulePlan::RegPlusOffset {
-        register,
-        offset: cfa_offset,
-    } = &row.cfa
-    else {
-        return None;
-    };
-    if !backtrace_supported_state_register(*register) {
-        return None;
-    }
-
-    let mut wire = ghostscope_protocol::BacktraceUnwindRow {
-        pc_start: row.pc_start,
-        pc_end: row.pc_end,
-        cfa_offset: *cfa_offset,
-        cfa_register: *register,
-        ..Default::default()
-    };
-
-    match &row.return_address {
-        RegisterRecoveryPlan::AtCfaOffset { offset } => {
-            wire.ra_kind = crate::BACKTRACE_RECOVERY_AT_CFA_OFFSET;
-            wire.ra_offset = *offset;
-            wire.ra_register = row.return_address_register;
-        }
-        _ => return None,
-    }
-
-    match row.rbp.as_ref() {
-        Some(RegisterRecoveryPlan::AtCfaOffset { offset }) => {
-            wire.rbp_kind = crate::BACKTRACE_RECOVERY_AT_CFA_OFFSET;
-            wire.rbp_offset = *offset;
-            wire.rbp_register = X86_64_DWARF_RBP;
-        }
-        Some(RegisterRecoveryPlan::ValCfaOffset { offset }) => {
-            wire.rbp_kind = crate::BACKTRACE_RECOVERY_VAL_CFA_OFFSET;
-            wire.rbp_offset = *offset;
-            wire.rbp_register = X86_64_DWARF_RBP;
-        }
-        Some(RegisterRecoveryPlan::Register { register }) => {
-            if !backtrace_supported_state_register(*register) {
-                return None;
-            }
-            wire.rbp_kind = crate::BACKTRACE_RECOVERY_REGISTER;
-            wire.rbp_register = *register;
-        }
-        Some(RegisterRecoveryPlan::SameValue { register }) => {
-            if !backtrace_supported_state_register(*register) {
-                return None;
-            }
-            wire.rbp_kind = crate::BACKTRACE_RECOVERY_SAME_VALUE;
-            wire.rbp_register = *register;
-        }
-        Some(RegisterRecoveryPlan::Undefined) | None => {
-            wire.rbp_kind = crate::BACKTRACE_RECOVERY_SAME_VALUE;
-            wire.rbp_register = X86_64_DWARF_RBP;
-        }
-        _ => return None,
-    }
-
-    Some(wire)
-}
-
-fn backtrace_supported_state_register(register: u16) -> bool {
-    matches!(
-        register,
-        X86_64_DWARF_RIP | X86_64_DWARF_RBP | X86_64_DWARF_RSP
-    )
 }
 
 fn backtrace_flags(stmt: &BacktraceStatement) -> u8 {

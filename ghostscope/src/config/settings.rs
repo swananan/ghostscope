@@ -233,6 +233,10 @@ pub struct EbpfConfig {
     ///   - System-wide tracing: 8192 or 16384
     #[serde(default = "default_proc_module_offsets_max_entries")]
     pub proc_module_offsets_max_entries: u64,
+    /// Fixed capacity for compact DWARF unwind rows used by bt/backtrace.
+    /// Default: 65536 rows.
+    #[serde(default = "default_backtrace_unwind_rows_max_entries")]
+    pub backtrace_unwind_rows_max_entries: u32,
     /// Force use of PerfEventArray instead of RingBuf (for testing only)
     /// WARNING: This is for testing purposes only. Set to true to force PerfEventArray
     /// even on kernels that support RingBuf.
@@ -365,6 +369,10 @@ fn default_proc_module_offsets_max_entries() -> u64 {
     4096
 }
 
+fn default_backtrace_unwind_rows_max_entries() -> u32 {
+    ghostscope_compiler::DEFAULT_BACKTRACE_UNWIND_ROWS_MAX_ENTRIES
+}
+
 fn default_force_perf_event_array() -> bool {
     false
 }
@@ -469,6 +477,7 @@ impl Default for EbpfConfig {
             ringbuf_size: default_ringbuf_size(),
             perf_page_count: default_perf_page_count(),
             proc_module_offsets_max_entries: default_proc_module_offsets_max_entries(),
+            backtrace_unwind_rows_max_entries: default_backtrace_unwind_rows_max_entries(),
             force_perf_event_array: default_force_perf_event_array(),
             mem_dump_cap: default_mem_dump_cap(),
             compare_cap: default_compare_cap(),
@@ -562,6 +571,23 @@ impl EbpfConfig {
                 self.backtrace_depth,
                 ghostscope_compiler::MAX_BACKTRACE_DEPTH,
                 ghostscope_compiler::DEFAULT_BACKTRACE_DEPTH
+            ));
+        }
+
+        if !(ghostscope_compiler::MIN_BACKTRACE_UNWIND_ROWS_MAX_ENTRIES
+            ..=ghostscope_compiler::MAX_BACKTRACE_UNWIND_ROWS_MAX_ENTRIES)
+            .contains(&self.backtrace_unwind_rows_max_entries)
+        {
+            return Err(anyhow::anyhow!(
+                "❌ Invalid eBPF configuration in '{}':\n\n\
+                backtrace_unwind_rows_max_entries {} is out of range\n\n\
+                💡 Valid range: {} to {} rows\n\
+                Recommended: {} rows",
+                file_path,
+                self.backtrace_unwind_rows_max_entries,
+                ghostscope_compiler::MIN_BACKTRACE_UNWIND_ROWS_MAX_ENTRIES,
+                ghostscope_compiler::MAX_BACKTRACE_UNWIND_ROWS_MAX_ENTRIES,
+                ghostscope_compiler::DEFAULT_BACKTRACE_UNWIND_ROWS_MAX_ENTRIES
             ));
         }
 

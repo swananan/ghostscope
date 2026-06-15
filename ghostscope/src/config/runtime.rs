@@ -256,6 +256,7 @@ impl ResolvedConfig {
             target_binary_path: self.target_path.clone(),
             ringbuf_size: self.ebpf_config.ringbuf_size,
             proc_module_offsets_max_entries: self.ebpf_config.proc_module_offsets_max_entries,
+            backtrace_unwind_rows_max_entries: self.ebpf_config.backtrace_unwind_rows_max_entries,
             perf_page_count: self.ebpf_config.perf_page_count,
             event_map_type,
             mem_dump_cap: self.ebpf_config.mem_dump_cap,

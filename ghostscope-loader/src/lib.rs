@@ -33,6 +33,7 @@ use ghostscope_protocol::{
 use log::log_enabled;
 use log::Level as LogLevel;
 use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::convert::TryInto;
 use std::future::poll_fn;
 use std::num::NonZeroU32;
@@ -68,6 +69,12 @@ impl EventLossStats {
                 .saturating_sub(previous.output_failures),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BacktraceUnwindRowsAppendStats {
+    pub modules: usize,
+    pub rows: usize,
 }
 
 // Export kernel capabilities detection
@@ -292,6 +299,10 @@ pub struct GhostScopeLoader {
     trace_context: Option<TraceContext>,
     /// Optional override for PerfEventArray page count (per CPU buffer size in pages)
     perf_page_count: Option<usize>,
+    /// Number of compact unwind rows currently written to bt_unwind_rows.
+    backtrace_unwind_row_count: u32,
+    /// Module cookies already published in bt_module_row_ranges.
+    backtrace_module_row_cookies: HashSet<u64>,
 }
 
 impl std::fmt::Debug for GhostScopeLoader {
@@ -303,6 +314,14 @@ impl std::fmt::Debug for GhostScopeLoader {
             .field("bt_prog_array", &self.bt_prog_array.is_some())
             .field("uprobe_attached", &self.uprobe_link.is_some())
             .field("attachment_params", &self.attachment_params.is_some())
+            .field(
+                "backtrace_unwind_row_count",
+                &self.backtrace_unwind_row_count,
+            )
+            .field(
+                "backtrace_module_row_cookies",
+                &self.backtrace_module_row_cookies.len(),
+            )
             .finish()
     }
 }
@@ -412,6 +431,8 @@ impl GhostScopeLoader {
                     parser: StreamingTraceParser::new(),
                     trace_context: None,
                     perf_page_count: None,
+                    backtrace_unwind_row_count: 0,
+                    backtrace_module_row_cookies: HashSet::new(),
                 })
             }
             Err(e) => {
@@ -1153,8 +1174,10 @@ impl GhostScopeLoader {
                 LoaderError::Generic(format!("Failed to set unwind row {row_index}: {e}"))
             })?;
         }
+        self.backtrace_unwind_row_count = self.backtrace_unwind_row_count.max(rows.len() as u32);
         info!(
             rows = rows.len(),
+            capacity = array.len(),
             row_size = BACKTRACE_UNWIND_ROW_SIZE,
             elapsed_ms = populate_started_at.elapsed().as_millis(),
             "Loaded DWARF unwind rows for bt"
@@ -1187,6 +1210,8 @@ impl GhostScopeLoader {
                     "Failed to set bt module row range for cookie 0x{cookie:016x}: {e}"
                 ))
             })?;
+            self.backtrace_module_row_cookies.insert(cookie);
+            self.backtrace_unwind_row_count = self.backtrace_unwind_row_count.max(range.row_end);
         }
         info!(
             modules = ranges.len(),
@@ -1194,6 +1219,103 @@ impl GhostScopeLoader {
             "Loaded DWARF unwind row ranges for bt"
         );
         Ok(())
+    }
+
+    pub fn append_backtrace_unwind_rows_for_module(
+        &mut self,
+        cookie: u64,
+        rows: &[BacktraceUnwindRow],
+    ) -> Result<Option<BacktraceModuleRowRange>> {
+        if rows.is_empty() || self.backtrace_module_row_cookies.contains(&cookie) {
+            return Ok(None);
+        }
+
+        if self.bpf.map("bt_unwind_rows").is_none()
+            || self.bpf.map("bt_module_row_ranges").is_none()
+        {
+            return Ok(None);
+        }
+
+        let start = self.backtrace_unwind_row_count;
+        let row_count = u32::try_from(rows.len()).map_err(|_| {
+            LoaderError::Generic(format!(
+                "Too many unwind rows for module cookie 0x{cookie:016x}: {}",
+                rows.len()
+            ))
+        })?;
+        let end = start.checked_add(row_count).ok_or_else(|| {
+            LoaderError::Generic(format!(
+                "Unwind row index overflow for module cookie 0x{cookie:016x}"
+            ))
+        })?;
+
+        let Some(map) = self.bpf.map_mut("bt_unwind_rows") else {
+            return Ok(None);
+        };
+        let mut array: Array<_, BacktraceUnwindRow> = map.try_into().map_err(|e| {
+            LoaderError::Generic(format!("Failed to convert bt_unwind_rows map: {e}"))
+        })?;
+        if end > array.len() {
+            return Err(LoaderError::Generic(format!(
+                "bt_unwind_rows capacity exceeded while appending module \
+                 0x{cookie:016x}: need end row {}, capacity {}",
+                end,
+                array.len()
+            )));
+        }
+
+        for (offset, row) in rows.iter().copied().enumerate() {
+            let row_index = start + offset as u32;
+            array.set(row_index, row, 0).map_err(|e| {
+                LoaderError::Generic(format!("Failed to append unwind row {row_index}: {e}"))
+            })?;
+        }
+
+        let range = BacktraceModuleRowRange {
+            row_start: start,
+            row_end: end,
+        };
+        let Some(map) = self.bpf.map_mut("bt_module_row_ranges") else {
+            return Ok(None);
+        };
+        let mut hash: AyaHashMap<_, u64, BacktraceModuleRowRange> =
+            map.try_into().map_err(|e| {
+                LoaderError::Generic(format!("Failed to convert bt_module_row_ranges map: {e}"))
+            })?;
+        hash.insert(cookie, range, 0).map_err(|e| {
+            LoaderError::Generic(format!(
+                "Failed to append bt module row range for cookie 0x{cookie:016x}: {e}"
+            ))
+        })?;
+
+        self.backtrace_unwind_row_count = end;
+        self.backtrace_module_row_cookies.insert(cookie);
+        debug!(
+            cookie = format_args!("0x{cookie:016x}"),
+            rows = rows.len(),
+            row_start = range.row_start,
+            row_end = range.row_end,
+            "Appended DWARF unwind rows for bt module"
+        );
+
+        Ok(Some(range))
+    }
+
+    pub fn append_backtrace_unwind_rows_for_modules(
+        &mut self,
+        modules: &[(u64, Vec<BacktraceUnwindRow>)],
+    ) -> Result<BacktraceUnwindRowsAppendStats> {
+        let mut stats = BacktraceUnwindRowsAppendStats::default();
+        for (cookie, rows) in modules {
+            if self
+                .append_backtrace_unwind_rows_for_module(*cookie, rows)?
+                .is_some()
+            {
+                stats.modules += 1;
+                stats.rows += rows.len();
+            }
+        }
+        Ok(stats)
     }
 
     // ============================================================================

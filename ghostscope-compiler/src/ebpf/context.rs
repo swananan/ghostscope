@@ -180,6 +180,12 @@ pub struct EbpfContext<'ctx, 'dw> {
 }
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
+    pub(crate) fn backtrace_unwind_row_map_entries(&self) -> u64 {
+        (self.compile_options.backtrace_unwind_rows_max_entries as u64)
+            .max(self.backtrace_unwind_rows.len() as u64)
+            .max(1)
+    }
+
     /// Create a new eBPF code generation context
     pub fn new(
         context: &'ctx Context,
@@ -640,7 +646,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     &self.di_builder,
                     &self.compile_unit,
                     "bt_unwind_rows",
-                    self.backtrace_unwind_rows.len() as u64,
+                    self.backtrace_unwind_row_map_entries(),
                     crate::BACKTRACE_UNWIND_ROW_SIZE as u64,
                 )
                 .map_err(|e| {
@@ -682,7 +688,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         &self.di_builder,
                         &self.compile_unit,
                         "bt_module_row_ranges",
-                        self.backtrace_module_row_ranges.len() as u64,
+                        self.compile_options.proc_module_offsets_max_entries.max(1),
                         (
                             std::mem::size_of::<u64>() as u64,
                             ghostscope_protocol::BACKTRACE_MODULE_ROW_RANGE_SIZE as u64,
