@@ -27,16 +27,17 @@ impl DwarfAnalyzer {
             return true;
         }
 
-        if proc_root_paths_equivalent(left, right) {
+        if files_have_same_identity(left, right) {
             return true;
+        }
+
+        if has_proc_root_prefix(left) || has_proc_root_prefix(right) {
+            return false;
         }
 
         match (left.canonicalize(), right.canonicalize()) {
             (Ok(left), Ok(right)) => left == right,
-            _ => match (std::fs::metadata(left), std::fs::metadata(right)) {
-                (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
-                _ => false,
-            },
+            _ => false,
         }
     }
 
@@ -232,13 +233,15 @@ impl DwarfAnalyzer {
     }
 }
 
-fn proc_root_paths_equivalent(left: &Path, right: &Path) -> bool {
-    match (strip_proc_root_prefix(left), strip_proc_root_prefix(right)) {
-        (Some(left), Some(right)) => left == right,
-        (Some(left), None) => left.as_path() == right,
-        (None, Some(right)) => left == right.as_path(),
-        (None, None) => false,
+fn files_have_same_identity(left: &Path, right: &Path) -> bool {
+    match (std::fs::metadata(left), std::fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
     }
+}
+
+fn has_proc_root_prefix(path: &Path) -> bool {
+    strip_proc_root_prefix(path).is_some()
 }
 
 fn strip_proc_root_prefix(path: &Path) -> Option<PathBuf> {
@@ -302,27 +305,40 @@ mod tests {
     }
 
     #[test]
-    fn proc_root_paths_match_same_inner_path() {
-        assert!(proc_root_paths_equivalent(
-            Path::new("/proc/123/root/usr/lib/libfoo.so"),
-            Path::new("/proc/456/root/usr/lib/libfoo.so")
+    fn proc_root_paths_do_not_match_by_stripped_text() {
+        assert!(!DwarfAnalyzer::module_paths_equivalent(
+            "/proc/123/root/usr/lib/libfoo.so",
+            "/proc/456/root/usr/lib/libfoo.so"
         ));
-        assert!(proc_root_paths_equivalent(
-            Path::new("/proc/123/root/usr/lib/libfoo.so"),
-            Path::new("/usr/lib/libfoo.so")
+        assert!(!DwarfAnalyzer::module_paths_equivalent(
+            "/proc/123/root/usr/lib/libfoo.so",
+            "/usr/lib/libfoo.so"
         ));
     }
 
     #[test]
     fn proc_root_paths_reject_non_pid_prefixes() {
-        assert!(!proc_root_paths_equivalent(
-            Path::new("/proc/self/root/usr/lib/libfoo.so"),
-            Path::new("/usr/lib/libfoo.so")
+        assert!(!has_proc_root_prefix(Path::new(
+            "/proc/self/root/usr/lib/libfoo.so"
+        )));
+        assert!(!has_proc_root_prefix(Path::new("/proc/123/maps")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_root_paths_match_by_file_identity() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let real_path = temp_dir.path().join("libfoo.so");
+        std::fs::write(&real_path, b"test")?;
+        let proc_root_path = PathBuf::from(format!("/proc/{}/root", std::process::id()))
+            .join(real_path.strip_prefix("/")?);
+
+        assert!(DwarfAnalyzer::module_paths_equivalent(
+            &real_path,
+            &proc_root_path
         ));
-        assert!(!proc_root_paths_equivalent(
-            Path::new("/proc/123/maps"),
-            Path::new("/maps")
-        ));
+
+        Ok(())
     }
 
     #[cfg(unix)]

@@ -1182,6 +1182,85 @@ trace dlopen_main_callback {
 }
 
 #[tokio::test]
+async fn test_t_mode_backtrace_unwinds_shared_library_loaded_by_dlopen() -> anyhow::Result<()> {
+    init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
+
+    let binary_path = FIXTURES.get_test_binary("backtrace_dlopen_program")?;
+    let lib_path = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("backtrace_dlopen_program has no parent directory"))?
+        .join("libbacktrace_dlopen_target.so");
+    let (target, trigger_path) = spawn_backtrace_dlopen_program().await?;
+    let script = r#"
+trace dlopen_lib_leaf {
+    print "T_MODE_DLOPEN_SHARED_LIBRARY_STACK";
+    bt full;
+}
+"#;
+
+    let trigger_target = target.clone();
+    let trigger_for_callback = trigger_path.clone();
+    let result = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_target(&lib_path)
+        .timeout_secs(5)
+        .with_cli_args([
+            OsString::from("--script-output-events-per-sec"),
+            OsString::from("200"),
+            OsString::from("--backtrace-depth"),
+            OsString::from("6"),
+        ])
+        .run_after_ready(move || async move {
+            touch_dlopen_trigger_in_target_sandbox(&trigger_target, &trigger_for_callback)
+        })
+        .await;
+
+    target.terminate().await?;
+    let _ = fs::remove_file(trigger_path);
+    let (exit_code, stdout, stderr, ()) = result?;
+    if exit_code != 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    anyhow::ensure!(exit_code == 0, "stderr={stderr} stdout={stdout}");
+
+    let blocks = backtrace_blocks_after(&stdout, "T_MODE_DLOPEN_SHARED_LIBRARY_STACK", 6)?;
+    let refreshed_block = blocks
+        .iter()
+        .find(|block| {
+            block.contains("dlopen_lib_driver")
+                && block.contains("[backtrace_dlopen_program+")
+                && !block.contains("<proc offsets unavailable>")
+                && !block.contains("stopped: offsets unavailable")
+                && !block.contains("stopped: no unwind rows for PC")
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "expected a shared-library target dlopen backtrace block to unwind into the main executable\n\
+                 STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            )
+        })?;
+    assert_ordered_patterns(
+        refreshed_block,
+        &[
+            "#0 dlopen_lib_leaf",
+            "#1 dlopen_lib_middle",
+            "#2 dlopen_lib_driver",
+        ],
+    )?;
+    assert!(
+        !refreshed_block.contains("<proc offsets unavailable>")
+            && !refreshed_block.contains("stopped: no unwind rows for PC"),
+        "shared-library target dlopen backtrace should publish the first target mapping refresh\n\
+         BLOCK:\n{refreshed_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_hot_backtrace_full_renders_function_parameters() -> anyhow::Result<()> {
     init();
 
