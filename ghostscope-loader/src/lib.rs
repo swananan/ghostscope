@@ -18,7 +18,7 @@
 use aya::{
     maps::{
         perf::{PerfEvent, PerfEventArray},
-        Array, MapData, PerCpuArray, ProgramArray, RingBuf,
+        Array, HashMap as AyaHashMap, MapData, PerCpuArray, ProgramArray, RingBuf,
     },
     programs::{
         uprobe::{UProbeLinkId, UProbeScope},
@@ -27,8 +27,8 @@ use aya::{
     Ebpf, EbpfLoader, VerifierLogLevel,
 };
 use ghostscope_protocol::{
-    BacktraceUnwindRow, ParsedTraceEvent, StreamingTraceParser, TraceContext,
-    BACKTRACE_UNWIND_ROW_SIZE,
+    BacktraceModuleRowRange, BacktraceUnwindRow, ParsedTraceEvent, StreamingTraceParser,
+    TraceContext, BACKTRACE_UNWIND_ROW_SIZE,
 };
 use log::log_enabled;
 use log::Level as LogLevel;
@@ -1133,6 +1133,37 @@ impl GhostScopeLoader {
         if log_enabled!(LogLevel::Debug) {
             log_backtrace_unwind_row_samples(&array, rows)?;
         }
+        Ok(())
+    }
+
+    pub fn populate_backtrace_module_row_ranges(
+        &mut self,
+        ranges: &[(u64, BacktraceModuleRowRange)],
+    ) -> Result<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+
+        let Some(map) = self.bpf.map_mut("bt_module_row_ranges") else {
+            return Err(LoaderError::MapNotFound("bt_module_row_ranges".to_string()));
+        };
+        let mut hash: AyaHashMap<_, u64, BacktraceModuleRowRange> =
+            map.try_into().map_err(|e| {
+                LoaderError::Generic(format!("Failed to convert bt_module_row_ranges map: {e}"))
+            })?;
+        let populate_started_at = Instant::now();
+        for (cookie, range) in ranges.iter().copied() {
+            hash.insert(cookie, range, 0).map_err(|e| {
+                LoaderError::Generic(format!(
+                    "Failed to set bt module row range for cookie 0x{cookie:016x}: {e}"
+                ))
+            })?;
+        }
+        info!(
+            modules = ranges.len(),
+            elapsed_ms = populate_started_at.elapsed().as_millis(),
+            "Loaded DWARF unwind row ranges for bt"
+        );
         Ok(())
     }
 

@@ -130,6 +130,24 @@ pub const BACKTRACE_UNWIND_WORD_RA_OFFSET: usize = 3;
 pub const BACKTRACE_UNWIND_WORD_RBP_OFFSET: usize = 4;
 pub const BACKTRACE_UNWIND_WORD_REGISTERS: usize = 5;
 
+/// Value for the `bt_module_row_ranges` map.
+///
+/// The map key is a module cookie (`u64`). The value points at a half-open
+/// range in `bt_unwind_rows`, allowing one module's CFI rows to be shared by
+/// every PID that maps the same object.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BacktraceModuleRowRange {
+    pub row_start: u32,
+    pub row_end: u32,
+}
+
+pub const BACKTRACE_MODULE_ROW_RANGE_ROW_START_OFFSET: usize =
+    std::mem::offset_of!(BacktraceModuleRowRange, row_start);
+pub const BACKTRACE_MODULE_ROW_RANGE_ROW_END_OFFSET: usize =
+    std::mem::offset_of!(BacktraceModuleRowRange, row_end);
+pub const BACKTRACE_MODULE_ROW_RANGE_SIZE: usize = std::mem::size_of::<BacktraceModuleRowRange>();
+
 pub fn backtrace_unwind_row_register_word(row: BacktraceUnwindRow) -> u64 {
     u64::from(row.cfa_register)
         | (u64::from(row.ra_register) << 16)
@@ -238,8 +256,8 @@ pub const BACKTRACE_RA_SAME_VALUE: u8 = BACKTRACE_RECOVERY_SAME_VALUE;
 #[cfg(feature = "aya-pod")]
 mod aya_pod {
     use super::{
-        BacktraceTailCallState, BacktraceUnwindRow, PidAliasValue, ProcModuleKey,
-        ProcModuleOffsetsValue,
+        BacktraceModuleRowRange, BacktraceTailCallState, BacktraceUnwindRow, PidAliasValue,
+        ProcModuleKey, ProcModuleOffsetsValue,
     };
 
     // SAFETY: ProcModuleKey is repr(C), Copy, 'static, and contains only
@@ -254,6 +272,9 @@ mod aya_pod {
     // SAFETY: BacktraceUnwindRow is repr(C), Copy, 'static, and contains only
     // integer fields with no invalid bit patterns.
     unsafe impl aya::Pod for BacktraceUnwindRow {}
+    // SAFETY: BacktraceModuleRowRange is repr(C), Copy, 'static, and contains
+    // only integer fields with no invalid bit patterns.
+    unsafe impl aya::Pod for BacktraceModuleRowRange {}
     // SAFETY: BacktraceTailCallState is repr(C), Copy, 'static, and contains
     // only integer fields with no invalid bit patterns.
     unsafe impl aya::Pod for BacktraceTailCallState {}
@@ -320,6 +341,13 @@ mod tests {
             backtrace_unwind_row_word(row, BACKTRACE_UNWIND_WORD_REGISTERS),
         ];
         assert_eq!(backtrace_unwind_row_from_words(words), row);
+    }
+
+    #[test]
+    fn backtrace_module_row_range_layout_matches_bpf_map_value() {
+        assert_eq!(BACKTRACE_MODULE_ROW_RANGE_SIZE, 8);
+        assert_eq!(BACKTRACE_MODULE_ROW_RANGE_ROW_START_OFFSET, 0);
+        assert_eq!(BACKTRACE_MODULE_ROW_RANGE_ROW_END_OFFSET, 4);
     }
 
     #[test]

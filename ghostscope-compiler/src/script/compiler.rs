@@ -55,6 +55,9 @@ pub struct UProbeConfig {
     /// BPF-facing compact DWARF CFI rows used by the `bt` unwinder.
     pub backtrace_unwind_rows: Vec<ghostscope_protocol::BacktraceUnwindRow>,
 
+    /// Module cookie to row range entries used by the `bt` unwinder.
+    pub backtrace_module_row_ranges: Vec<(u64, ghostscope_protocol::BacktraceModuleRowRange)>,
+
     /// Optional eBPF tail-call step program used by the `bt` unwinder.
     pub backtrace_tail_call_program: Option<crate::ebpf::context::BacktraceTailCallProgram>,
 
@@ -785,6 +788,11 @@ impl<'a> AstCompiler<'a> {
             assigned_trace_id,
             trace_context,
             backtrace_unwind_rows: codegen.backtrace_unwind_rows.clone(),
+            backtrace_module_row_ranges: codegen
+                .backtrace_module_row_ranges
+                .iter()
+                .map(|entry| (entry.cookie, entry.range))
+                .collect(),
             backtrace_tail_call_program: codegen.backtrace_tail_call_program(),
             resolved_address_index,
         })
