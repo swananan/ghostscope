@@ -1,5 +1,6 @@
 use crate::config::{ParsedArgs, PidViews, ResolvedConfig};
 use crate::source_path::SourcePathResolver;
+use crate::trace::backtrace_runtime::BacktraceRuntimeRunner;
 use crate::trace::TraceManager;
 use anyhow::Result;
 use ghostscope_debuginfod::{DebuginfodClient, DebuginfodConfig};
@@ -8,8 +9,6 @@ use ghostscope_process::{
     PidFilterSpec, PidNamespaceId, ProcessManager, ProcessSysmon, SysEventKind, SysmonConfig,
     SysmonEventMask,
 };
-use ghostscope_protocol::BacktraceUnwindRow;
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -427,212 +426,10 @@ impl GhostSession {
             return Ok(0);
         };
 
-        let (runtime_modules, pinned_offsets) = {
+        let runtime_modules = {
             let mut coordinator = self.coordinator.lock().expect("coordinator mutex poisoned");
-            coordinator.refresh_prefill_pid(proc_pid)?;
-
-            let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(proc_pid) else {
-                return Ok(0);
-            };
-
-            let pinned_offsets = entries
-                .iter()
-                .map(|entry| {
-                    (
-                        entry.cookie,
-                        ghostscope_process::pinned_bpf_maps::ProcModuleOffsetsValue::new(
-                            entry.offsets.text,
-                            entry.offsets.rodata,
-                            entry.offsets.data,
-                            entry.offsets.bss,
-                            entry.base,
-                            entry.size,
-                        ),
-                    )
-                })
-                .collect::<Vec<_>>();
-
-            (
-                DwarfAnalyzer::runtime_modules_from_pid_offsets(entries),
-                pinned_offsets,
-            )
+            BacktraceRuntimeRunner::refresh_pid_modules(&mut coordinator, proc_pid)?
         };
-        if let Err(error) =
-            ghostscope_process::pinned_bpf_maps::insert_offsets_for_pid(proc_pid, &pinned_offsets)
-        {
-            warn!(
-                "Failed to write PID-mode module offsets for PID {}: {}",
-                proc_pid, error
-            );
-        }
-        if let Err(error) =
-            ghostscope_process::pinned_bpf_maps::replace_ranges_for_pid(proc_pid, &pinned_offsets)
-        {
-            warn!(
-                "Failed to write PID-mode module ranges for PID {}: {}",
-                proc_pid, error
-            );
-        }
-
-        let debug_search_paths = self.get_debug_search_paths();
-        let allow_loose = self.get_allow_loose_debug_match();
-        let debuginfod_client = self.build_debuginfod_client()?;
-
-        let Some(analyzer) = self.process_analyzer.as_mut() else {
-            return Ok(0);
-        };
-
-        let loaded = analyzer
-            .refresh_pid_runtime_modules_with_config_and_debuginfod(
-                runtime_modules,
-                &debug_search_paths,
-                allow_loose,
-                debuginfod_client,
-                |_| {},
-            )
-            .await?;
-
-        if loaded > 0 {
-            self.append_runtime_backtrace_unwind_rows();
-            info!(
-                "Refreshed PID {} runtime module analysis with {} new module(s)",
-                proc_pid, loaded
-            );
-        }
-
-        Ok(loaded)
-    }
-
-    fn collect_target_runtime_modules(
-        &self,
-    ) -> Result<Vec<ghostscope_dwarf::LoadedModuleRuntimeInfo>> {
-        let Some(target_binary) = self.target_binary.as_ref() else {
-            return Ok(Vec::new());
-        };
-
-        let mut coordinator = self.coordinator.lock().expect("coordinator mutex poisoned");
-        coordinator.refresh_prefill_module(target_binary)?;
-
-        let target_pids = coordinator
-            .cached_offsets_for_module(target_binary)
-            .into_iter()
-            .map(|(pid, _, _, _, _)| pid)
-            .collect::<BTreeSet<_>>();
-        if target_pids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut modules_by_cookie = BTreeMap::new();
-        for pid in target_pids {
-            if let Err(error) = coordinator.refresh_prefill_pid(pid) {
-                warn!(
-                    "Failed to refresh module offsets for target-mode PID {}: {}",
-                    pid, error
-                );
-                continue;
-            }
-
-            let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(pid) else {
-                continue;
-            };
-            let pinned_offsets = entries
-                .iter()
-                .map(|entry| {
-                    (
-                        entry.cookie,
-                        ghostscope_process::pinned_bpf_maps::ProcModuleOffsetsValue::new(
-                            entry.offsets.text,
-                            entry.offsets.rodata,
-                            entry.offsets.data,
-                            entry.offsets.bss,
-                            entry.base,
-                            entry.size,
-                        ),
-                    )
-                })
-                .collect::<Vec<_>>();
-            if let Err(error) =
-                ghostscope_process::pinned_bpf_maps::insert_offsets_for_pid(pid, &pinned_offsets)
-            {
-                warn!(
-                    "Failed to write target-mode module offsets for PID {}: {}",
-                    pid, error
-                );
-            }
-            if let Err(error) =
-                ghostscope_process::pinned_bpf_maps::replace_ranges_for_pid(pid, &pinned_offsets)
-            {
-                warn!(
-                    "Failed to write target-mode module ranges for PID {}: {}",
-                    pid, error
-                );
-            }
-            for entry in entries {
-                modules_by_cookie.entry(entry.cookie).or_insert_with(|| {
-                    ghostscope_dwarf::LoadedModuleRuntimeInfo {
-                        module_path: PathBuf::from(&entry.module_path),
-                        loaded_address: Some(entry.base),
-                        load_bias: Some(entry.offsets.text),
-                        size: entry.size,
-                    }
-                });
-            }
-        }
-
-        Ok(modules_by_cookie.into_values().collect())
-    }
-
-    fn collect_runtime_backtrace_unwind_rows(&self) -> Vec<(u64, Vec<BacktraceUnwindRow>)> {
-        let Some(analyzer) = self.process_analyzer.as_ref() else {
-            return Vec::new();
-        };
-
-        let mut modules_by_cookie = BTreeMap::<u64, Vec<BacktraceUnwindRow>>::new();
-        for module in analyzer.loaded_module_runtime_info() {
-            let Some(module_id) = analyzer.module_id_for_path(&module.module_path) else {
-                continue;
-            };
-            let Ok(Some(table)) = analyzer.compact_unwind_table_for_module(module_id) else {
-                continue;
-            };
-            let mut rows = table
-                .rows
-                .iter()
-                .filter_map(ghostscope_compiler::backtrace_unwind_row_from_compact)
-                .collect::<Vec<_>>();
-            if rows.is_empty() {
-                continue;
-            }
-            rows.sort_by_key(|row| (row.pc_start, row.pc_end));
-            let module_path = module.module_path.to_string_lossy();
-            let cookie = ghostscope_compiler::module_cookie_for_path(&module_path);
-            modules_by_cookie.entry(cookie).or_insert(rows);
-        }
-
-        modules_by_cookie.into_iter().collect()
-    }
-
-    fn append_runtime_backtrace_unwind_rows(&mut self) -> usize {
-        let modules = self.collect_runtime_backtrace_unwind_rows();
-        let stats = self
-            .trace_manager
-            .append_backtrace_unwind_rows_for_modules(&modules);
-        if stats.modules > 0 {
-            info!(
-                modules = stats.modules,
-                rows = stats.rows,
-                "Appended runtime DWARF bt unwind rows to active traces"
-            );
-        }
-        stats.modules
-    }
-
-    pub async fn refresh_target_runtime_modules(&mut self) -> Result<usize> {
-        if self.proc_pid().is_some() {
-            return Ok(0);
-        }
-
-        let runtime_modules = self.collect_target_runtime_modules()?;
         if runtime_modules.is_empty() {
             return Ok(0);
         }
@@ -645,18 +442,61 @@ impl GhostSession {
             return Ok(0);
         };
 
-        let loaded = analyzer
-            .refresh_pid_runtime_modules_with_config_and_debuginfod(
-                runtime_modules,
-                &debug_search_paths,
-                allow_loose,
-                debuginfod_client,
-                |_| {},
-            )
-            .await?;
+        let loaded = BacktraceRuntimeRunner::refresh_analyzer_modules(
+            analyzer,
+            runtime_modules,
+            &debug_search_paths,
+            allow_loose,
+            debuginfod_client,
+        )
+        .await?;
 
         if loaded > 0 {
-            self.append_runtime_backtrace_unwind_rows();
+            BacktraceRuntimeRunner::append_loaded_module_cfi(analyzer, &mut self.trace_manager);
+            info!(
+                "Refreshed PID {} runtime module analysis with {} new module(s)",
+                proc_pid, loaded
+            );
+        }
+
+        Ok(loaded)
+    }
+
+    pub async fn refresh_target_runtime_modules(&mut self) -> Result<usize> {
+        if self.proc_pid().is_some() {
+            return Ok(0);
+        }
+
+        let Some(target_binary) = self.target_binary.clone() else {
+            return Ok(0);
+        };
+        let runtime_modules = {
+            let mut coordinator = self.coordinator.lock().expect("coordinator mutex poisoned");
+            BacktraceRuntimeRunner::collect_target_modules(&mut coordinator, &target_binary)?
+        };
+        if runtime_modules.is_empty() {
+            return Ok(0);
+        }
+
+        let debug_search_paths = self.get_debug_search_paths();
+        let allow_loose = self.get_allow_loose_debug_match();
+        let debuginfod_client = self.build_debuginfod_client()?;
+
+        let Some(analyzer) = self.process_analyzer.as_mut() else {
+            return Ok(0);
+        };
+
+        let loaded = BacktraceRuntimeRunner::refresh_analyzer_modules(
+            analyzer,
+            runtime_modules,
+            &debug_search_paths,
+            allow_loose,
+            debuginfod_client,
+        )
+        .await?;
+
+        if loaded > 0 {
+            BacktraceRuntimeRunner::append_loaded_module_cfi(analyzer, &mut self.trace_manager);
             info!(
                 "Refreshed target-mode runtime module analysis with {} new module(s)",
                 loaded
