@@ -5,7 +5,9 @@ use anyhow::Context;
 use aya::maps::{HashMap as AyaHashMap, Map, MapData, MapError};
 use aya_obj::maps::bpf_map_def;
 use aya_obj::{
-    generated::bpf_map_type::BPF_MAP_TYPE_HASH, maps::LegacyMap, EbpfSectionKind, Map as ObjMap,
+    generated::bpf_map_type::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH},
+    maps::LegacyMap,
+    EbpfSectionKind, Map as ObjMap,
 };
 use std::io;
 use std::path::{Path, PathBuf};
@@ -160,6 +162,8 @@ pub const PROC_MODULE_RANGES_MAP_NAME: &str = "proc_module_ranges";
 pub const ALLOWED_PIDS_MAP_NAME: &str = "allowed_pids";
 pub const PID_ALIASES_MAP_NAME: &str = "pid_aliases";
 pub const TARGET_EXEC_COMM_MAP_NAME: &str = "target_exec_comm";
+pub const BT_UNWIND_ROWS_MAP_NAME: &str = "bt_unwind_rows";
+pub const BT_MODULE_ROW_RANGES_MAP_NAME: &str = "bt_module_row_ranges";
 
 fn bpffs_is_mounted() -> bool {
     let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
@@ -225,14 +229,19 @@ fn proc_offsets_pin_layout_matches(map: &MapData) -> bool {
     }
 }
 
-fn hash_map_pin_layout_matches(
+fn map_pin_layout_matches(
     map: &MapData,
     map_name: &str,
     key_size: u32,
     value_size: u32,
+    min_entries: Option<u32>,
 ) -> bool {
     match map.info() {
-        Ok(info) => info.key_size() == key_size && info.value_size() == value_size,
+        Ok(info) => {
+            info.key_size() == key_size
+                && info.value_size() == value_size
+                && min_entries.is_none_or(|entries| info.max_entries() >= entries)
+        }
         Err(e) => {
             warn!("Unable to inspect pinned {map_name} map layout: {e}");
             false
@@ -262,7 +271,15 @@ fn create_and_pin_hash_map(
 
     if pin_path.exists() {
         match MapData::from_pin(pin_path) {
-            Ok(map) if hash_map_pin_layout_matches(&map, map_name, key_size, value_size) => {
+            Ok(map)
+                if map_pin_layout_matches(
+                    &map,
+                    map_name,
+                    key_size,
+                    value_size,
+                    Some(max_entries),
+                ) =>
+            {
                 info!(
                     "Reusing existing pinned map at {} (layout ok)",
                     pin_path.display()
@@ -309,7 +326,108 @@ fn create_and_pin_hash_map(
             Ok(())
         }
         Err(e) => match MapData::from_pin(pin_path) {
-            Ok(map) if hash_map_pin_layout_matches(&map, map_name, key_size, value_size) => {
+            Ok(map)
+                if map_pin_layout_matches(
+                    &map,
+                    map_name,
+                    key_size,
+                    value_size,
+                    Some(max_entries),
+                ) =>
+            {
+                info!(
+                    "Pin path {} already exists; reusing existing map ({}).",
+                    pin_path.display(),
+                    e
+                );
+                Ok(())
+            }
+            Ok(_) | Err(_) => {
+                let _ = std::fs::remove_file(pin_path);
+                let hint = bpffs_mount_hint_for_pin_path(pin_path)
+                    .map(|hint| format!(" {hint}"))
+                    .unwrap_or_default();
+                Err(anyhow::anyhow!(
+                    "Failed to pin {} at {}: {}",
+                    map_name,
+                    pin_path.display(),
+                    e
+                )
+                .context(format!("Unable to persist {map_name} in bpffs.{hint}")))
+            }
+        },
+    }
+}
+
+fn create_and_pin_array_map(
+    map_name: &str,
+    pin_path: &Path,
+    value_size: u32,
+    max_entries: u32,
+) -> anyhow::Result<()> {
+    ensure_pin_dir(pin_path).map_err(|e| {
+        let hint = bpffs_mount_hint_for_pin_path(pin_path)
+            .map(|hint| format!(" {hint}"))
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "Failed to create pin directory for {} at {}: {}.{}",
+            map_name,
+            pin_path.display(),
+            e,
+            hint
+        )
+    })?;
+
+    if pin_path.exists() {
+        match MapData::from_pin(pin_path) {
+            Ok(map) if map_pin_layout_matches(&map, map_name, 4, value_size, Some(max_entries)) => {
+                info!(
+                    "Reusing existing pinned map at {} (layout ok)",
+                    pin_path.display()
+                );
+                return Ok(());
+            }
+            Ok(_) => {
+                warn!(
+                    "Pinned {} at {} has stale ABI layout; recreating",
+                    map_name,
+                    pin_path.display()
+                );
+                let _ = std::fs::remove_file(pin_path);
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(pin_path);
+            }
+        }
+    }
+
+    let obj_map = ObjMap::Legacy(LegacyMap {
+        section_index: 0,
+        section_kind: EbpfSectionKind::Maps,
+        symbol_index: None,
+        def: bpf_map_def {
+            map_type: BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size,
+            max_entries,
+            map_flags: 0,
+            id: 0,
+            pinning: aya_obj::maps::PinningType::None,
+        },
+        inner_def: None,
+        data: Vec::new(),
+    });
+
+    let map = MapData::create(obj_map, map_name, None)?;
+    info!("Created {map_name} map with capacity {max_entries} entries");
+
+    match map.pin(pin_path) {
+        Ok(()) => {
+            info!("Pinned {} at {}", map_name, pin_path.display());
+            Ok(())
+        }
+        Err(e) => match MapData::from_pin(pin_path) {
+            Ok(map) if map_pin_layout_matches(&map, map_name, 4, value_size, Some(max_entries)) => {
                 info!(
                     "Pin path {} already exists; reusing existing map ({}).",
                     pin_path.display(),
@@ -486,6 +604,20 @@ pub fn proc_module_range_meta_pin_path() -> anyhow::Result<PathBuf> {
 pub fn proc_module_ranges_pin_path() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(format!(
         "{BPFFS_ROOT}/{}/proc_module_ranges",
+        current_process_dir_name()?
+    )))
+}
+
+pub fn bt_unwind_rows_pin_path() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(format!(
+        "{BPFFS_ROOT}/{}/bt_unwind_rows",
+        current_process_dir_name()?
+    )))
+}
+
+pub fn bt_module_row_ranges_pin_path() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(format!(
+        "{BPFFS_ROOT}/{}/bt_module_row_ranges",
         current_process_dir_name()?
     )))
 }
@@ -686,6 +818,45 @@ pub fn ensure_pinned_proc_module_ranges_exist(max_entries: u32) -> anyhow::Resul
         format!(
             "Unable to prepare pinned {} map at {}",
             PROC_MODULE_RANGES_MAP_NAME,
+            ranges_pin_path.display()
+        )
+    })
+}
+
+/// Ensure the session-shared backtrace CFI maps exist under the per-process
+/// pin directory. These maps are shared by all trace loaders in one
+/// GhostScope process when backtrace rows are module-normalized.
+pub fn ensure_pinned_backtrace_cfi_maps_exist(
+    unwind_row_entries: u32,
+    module_entries: u32,
+) -> anyhow::Result<()> {
+    let rows_pin_path = bt_unwind_rows_pin_path()?;
+    create_and_pin_array_map(
+        BT_UNWIND_ROWS_MAP_NAME,
+        &rows_pin_path,
+        ghostscope_protocol::BACKTRACE_UNWIND_ROW_SIZE as u32,
+        unwind_row_entries.max(1),
+    )
+    .with_context(|| {
+        format!(
+            "Unable to prepare pinned {} map at {}",
+            BT_UNWIND_ROWS_MAP_NAME,
+            rows_pin_path.display()
+        )
+    })?;
+
+    let ranges_pin_path = bt_module_row_ranges_pin_path()?;
+    create_and_pin_hash_map(
+        BT_MODULE_ROW_RANGES_MAP_NAME,
+        &ranges_pin_path,
+        std::mem::size_of::<u64>() as u32,
+        ghostscope_protocol::BACKTRACE_MODULE_ROW_RANGE_SIZE as u32,
+        module_entries.max(1),
+    )
+    .with_context(|| {
+        format!(
+            "Unable to prepare pinned {} map at {}",
+            BT_MODULE_ROW_RANGES_MAP_NAME,
             ranges_pin_path.display()
         )
     })

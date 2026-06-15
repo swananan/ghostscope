@@ -6,7 +6,7 @@ use inkwell::module::Module;
 use inkwell::values::PointerValue;
 use inkwell::AddressSpace;
 // AddressSpace was used for pointer-typed BTF encodings; no longer needed after int-field BTF
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{error, info};
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +57,7 @@ impl SizedType {
 pub struct MapManager<'ctx> {
     context: &'ctx Context,
     map_types: HashMap<String, BpfMapType>,
+    pinned_maps: HashSet<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +85,7 @@ impl<'ctx> MapManager<'ctx> {
         MapManager {
             context,
             map_types: HashMap::new(),
+            pinned_maps: HashSet::new(),
         }
     }
 
@@ -94,6 +96,23 @@ impl<'ctx> MapManager<'ctx> {
         )
     }
 
+    pub fn mark_pinned_map(&mut self, name: &str) {
+        self.pinned_maps.insert(name.to_string());
+    }
+
+    fn map_is_pinned(&self, name: &str) -> bool {
+        Self::map_is_pinned_by_name(name) || self.pinned_maps.contains(name)
+    }
+
+    fn map_definition_field_count_for(&self, name: &str, map_type: BpfMapType) -> usize {
+        match map_type {
+            BpfMapType::Ringbuf => 2,
+            _ if self.map_is_pinned(name) => 5,
+            _ => 4,
+        }
+    }
+
+    #[cfg(test)]
     fn map_definition_field_count(name: &str, map_type: BpfMapType) -> usize {
         match map_type {
             BpfMapType::Ringbuf => 2,
@@ -135,7 +154,7 @@ impl<'ctx> MapManager<'ctx> {
 
         // Keep the concrete map variable layout in sync with the BTF map
         // definition. Pinned maps include the optional `pinning` field.
-        let field_count = Self::map_definition_field_count(&var_name, map_type);
+        let field_count = self.map_definition_field_count_for(&var_name, map_type);
         let elements: Vec<_> = (0..field_count).map(|_| ptr_ty.into()).collect();
         let initializer_values: Vec<_> = (0..field_count)
             .map(|_| ptr_ty.const_null().into())
@@ -496,7 +515,7 @@ impl<'ctx> MapManager<'ctx> {
                     ),
                 ];
                 // For pinned maps, include optional 'pinning' to signal Aya ByName pinning.
-                if Self::map_is_pinned_by_name(map_name) {
+                if self.map_is_pinned(map_name) {
                     // ByName is typically encoded as 1 in aya_obj::maps::PinningType
                     let pinning_ptr = mk_ptr_to_array("pinning", 1);
                     v.push(di_builder.create_member_type(
@@ -519,7 +538,7 @@ impl<'ctx> MapManager<'ctx> {
         let member_types: Vec<_> = members.iter().map(|m| m.as_type()).collect();
 
         // Total structure size: pointers (64-bit) per field.
-        let field_count = Self::map_definition_field_count(map_name, map_type);
+        let field_count = self.map_definition_field_count_for(map_name, map_type);
         let total_size_bits = (field_count as u64) * 64;
 
         // Create the map structure type (anonymous like reference)

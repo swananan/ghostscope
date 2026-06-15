@@ -91,9 +91,11 @@ use uprobe::UprobeAttachmentParams;
 
 // Use shared map types from ghostscope-process
 use ghostscope_process::pinned_bpf_maps::{
-    bpffs_mount_hint_for_pin_path, pid_aliases_pin_path, proc_module_range_meta_pin_path,
-    proc_module_ranges_pin_path, proc_offsets_pin_dir, proc_offsets_pin_path, PID_ALIASES_MAP_NAME,
-    PROC_MODULE_RANGES_MAP_NAME, PROC_MODULE_RANGE_META_MAP_NAME, PROC_OFFSETS_MAP_NAME,
+    bpffs_mount_hint_for_pin_path, bt_module_row_ranges_pin_path, bt_unwind_rows_pin_path,
+    pid_aliases_pin_path, proc_module_range_meta_pin_path, proc_module_ranges_pin_path,
+    proc_offsets_pin_dir, proc_offsets_pin_path, BT_MODULE_ROW_RANGES_MAP_NAME,
+    BT_UNWIND_ROWS_MAP_NAME, PID_ALIASES_MAP_NAME, PROC_MODULE_RANGES_MAP_NAME,
+    PROC_MODULE_RANGE_META_MAP_NAME, PROC_OFFSETS_MAP_NAME,
 };
 
 /// Event output map type wrapper
@@ -303,6 +305,8 @@ pub struct GhostScopeLoader {
     backtrace_unwind_row_count: u32,
     /// Module cookies already published in bt_module_row_ranges.
     backtrace_module_row_cookies: HashSet<u64>,
+    /// Whether bt_unwind_rows and bt_module_row_ranges are shared pinned maps.
+    shared_backtrace_maps: bool,
 }
 
 impl std::fmt::Debug for GhostScopeLoader {
@@ -322,6 +326,7 @@ impl std::fmt::Debug for GhostScopeLoader {
                 "backtrace_module_row_cookies",
                 &self.backtrace_module_row_cookies.len(),
             )
+            .field("shared_backtrace_maps", &self.shared_backtrace_maps)
             .finish()
     }
 }
@@ -333,6 +338,15 @@ impl GhostScopeLoader {
 
     /// Create a new loader instance from eBPF bytecode
     pub fn new(bytecode: &[u8]) -> Result<Self> {
+        Self::new_with_shared_backtrace_maps(bytecode, false)
+    }
+
+    /// Create a new loader instance from eBPF bytecode, optionally binding
+    /// module-normalized backtrace CFI maps to the per-process shared pins.
+    pub fn new_with_shared_backtrace_maps(
+        bytecode: &[u8],
+        shared_backtrace_maps: bool,
+    ) -> Result<Self> {
         info!(
             "Loading eBPF program from bytecode ({} bytes)",
             bytecode.len()
@@ -390,6 +404,46 @@ impl GhostScopeLoader {
                 hint
             )));
         }
+        let bt_rows_pin_path = if shared_backtrace_maps {
+            let path = bt_unwind_rows_pin_path().map_err(|e| {
+                LoaderError::Generic(format!(
+                    "Failed to resolve pinned bt_unwind_rows map path: {e}"
+                ))
+            })?;
+            if !path.exists() {
+                let hint = bpffs_mount_hint_for_pin_path(&path)
+                    .map(|hint| format!(" {hint}"))
+                    .unwrap_or_default();
+                return Err(LoaderError::Generic(format!(
+                    "Pinned map '{}' not found. Please call ghostscope-process to create it first.{}",
+                    path.display(),
+                    hint
+                )));
+            }
+            Some(path)
+        } else {
+            None
+        };
+        let bt_ranges_pin_path = if shared_backtrace_maps {
+            let path = bt_module_row_ranges_pin_path().map_err(|e| {
+                LoaderError::Generic(format!(
+                    "Failed to resolve pinned bt_module_row_ranges map path: {e}"
+                ))
+            })?;
+            if !path.exists() {
+                let hint = bpffs_mount_hint_for_pin_path(&path)
+                    .map(|hint| format!(" {hint}"))
+                    .unwrap_or_default();
+                return Err(LoaderError::Generic(format!(
+                    "Pinned map '{}' not found. Please call ghostscope-process to create it first.{}",
+                    path.display(),
+                    hint
+                )));
+            }
+            Some(path)
+        } else {
+            None
+        };
 
         let mut loader = EbpfLoader::new();
         let use_verbose = cfg!(debug_assertions)
@@ -413,6 +467,12 @@ impl GhostScopeLoader {
             loader.map_pin_path(PID_ALIASES_MAP_NAME, alias_pin_path);
             loader.map_pin_path(PROC_MODULE_RANGE_META_MAP_NAME, range_meta_pin_path);
             loader.map_pin_path(PROC_MODULE_RANGES_MAP_NAME, ranges_pin_path);
+            if let (Some(rows_path), Some(ranges_path)) =
+                (bt_rows_pin_path.as_ref(), bt_ranges_pin_path.as_ref())
+            {
+                loader.map_pin_path(BT_UNWIND_ROWS_MAP_NAME, rows_path);
+                loader.map_pin_path(BT_MODULE_ROW_RANGES_MAP_NAME, ranges_path);
+            }
             tracing::info!(
                 "Configured map pin directory for reuse: {}",
                 pin_dir.display()
@@ -433,6 +493,7 @@ impl GhostScopeLoader {
                     perf_page_count: None,
                     backtrace_unwind_row_count: 0,
                     backtrace_module_row_cookies: HashSet::new(),
+                    shared_backtrace_maps,
                 })
             }
             Err(e) => {
@@ -1157,6 +1218,99 @@ impl GhostScopeLoader {
         self.trace_context = Some(trace_context);
     }
 
+    fn sync_shared_backtrace_row_state(&mut self) -> Result<()> {
+        if !self.shared_backtrace_maps {
+            return Ok(());
+        }
+
+        let Some(map) = self.bpf.map_mut(BT_MODULE_ROW_RANGES_MAP_NAME) else {
+            return Ok(());
+        };
+        let hash: AyaHashMap<_, u64, BacktraceModuleRowRange> = map.try_into().map_err(|e| {
+            LoaderError::Generic(format!(
+                "Failed to convert shared bt_module_row_ranges map: {e}"
+            ))
+        })?;
+        let keys = hash
+            .keys()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+                LoaderError::Generic(format!(
+                    "Failed to list shared bt_module_row_ranges keys: {e}"
+                ))
+            })?;
+
+        let mut max_row_end = self.backtrace_unwind_row_count;
+        for cookie in keys {
+            match hash.get(&cookie, 0) {
+                Ok(range) => {
+                    self.backtrace_module_row_cookies.insert(cookie);
+                    max_row_end = max_row_end.max(range.row_end);
+                }
+                Err(e) => {
+                    debug!(
+                        cookie = format_args!("0x{cookie:016x}"),
+                        "Skipped shared bt module row range during sync: {}", e
+                    );
+                }
+            }
+        }
+        self.backtrace_unwind_row_count = max_row_end;
+        Ok(())
+    }
+
+    pub fn populate_backtrace_unwind_rows_and_module_row_ranges(
+        &mut self,
+        rows: &[BacktraceUnwindRow],
+        ranges: &[(u64, BacktraceModuleRowRange)],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        if ranges.is_empty() || !self.shared_backtrace_maps {
+            self.populate_backtrace_unwind_rows(rows)?;
+            self.populate_backtrace_module_row_ranges(ranges)?;
+            return Ok(());
+        }
+
+        self.sync_shared_backtrace_row_state()?;
+        for (cookie, range) in ranges.iter().copied() {
+            if self.backtrace_module_row_cookies.contains(&cookie) {
+                continue;
+            }
+
+            let row_start = usize::try_from(range.row_start).map_err(|_| {
+                LoaderError::Generic(format!(
+                    "Invalid row_start for module cookie 0x{cookie:016x}: {}",
+                    range.row_start
+                ))
+            })?;
+            let row_end = usize::try_from(range.row_end).map_err(|_| {
+                LoaderError::Generic(format!(
+                    "Invalid row_end for module cookie 0x{cookie:016x}: {}",
+                    range.row_end
+                ))
+            })?;
+            if row_start > row_end || row_end > rows.len() {
+                return Err(LoaderError::Generic(format!(
+                    "Invalid bt row range for module cookie 0x{cookie:016x}: \
+                     {}..{} with {} rows",
+                    range.row_start,
+                    range.row_end,
+                    rows.len()
+                )));
+            }
+
+            self.append_backtrace_unwind_rows_for_module_after_sync(
+                cookie,
+                &rows[row_start..row_end],
+            )?;
+        }
+
+        Ok(())
+    }
+
     pub fn populate_backtrace_unwind_rows(&mut self, rows: &[BacktraceUnwindRow]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -1222,6 +1376,17 @@ impl GhostScopeLoader {
     }
 
     pub fn append_backtrace_unwind_rows_for_module(
+        &mut self,
+        cookie: u64,
+        rows: &[BacktraceUnwindRow],
+    ) -> Result<Option<BacktraceModuleRowRange>> {
+        if self.shared_backtrace_maps {
+            self.sync_shared_backtrace_row_state()?;
+        }
+        self.append_backtrace_unwind_rows_for_module_after_sync(cookie, rows)
+    }
+
+    fn append_backtrace_unwind_rows_for_module_after_sync(
         &mut self,
         cookie: u64,
         rows: &[BacktraceUnwindRow],
@@ -1306,9 +1471,12 @@ impl GhostScopeLoader {
         modules: &[(u64, Vec<BacktraceUnwindRow>)],
     ) -> Result<BacktraceUnwindRowsAppendStats> {
         let mut stats = BacktraceUnwindRowsAppendStats::default();
+        if self.shared_backtrace_maps {
+            self.sync_shared_backtrace_row_state()?;
+        }
         for (cookie, rows) in modules {
             if self
-                .append_backtrace_unwind_rows_for_module(*cookie, rows)?
+                .append_backtrace_unwind_rows_for_module_after_sync(*cookie, rows)?
                 .is_some()
             {
                 stats.modules += 1;

@@ -247,9 +247,40 @@ async fn create_and_attach_loader(
             range_meta_pin_path.display()
         )));
     }
+    let share_backtrace_cfi_maps = !config.backtrace_module_row_ranges.is_empty();
+    if share_backtrace_cfi_maps {
+        let unwind_row_entries = compile_options
+            .backtrace_unwind_rows_max_entries
+            .max(config.backtrace_unwind_rows.len() as u32)
+            .max(1);
+        let module_entries = u32::try_from(compile_options.proc_module_offsets_max_entries)
+            .unwrap_or(u32::MAX)
+            .max(1);
+        let rows_pin_path = ghostscope_process::pinned_bpf_maps::bt_unwind_rows_pin_path()
+            .context("Failed to resolve pinned bt_unwind_rows map path")?;
+        if let Err(e) = ghostscope_process::pinned_bpf_maps::ensure_pinned_backtrace_cfi_maps_exist(
+            unwind_row_entries,
+            module_entries,
+        ) {
+            error!(
+                "Failed to ensure pinned backtrace CFI maps at {} (rows={}, modules={}): {:#}",
+                rows_pin_path.display(),
+                unwind_row_entries,
+                module_entries,
+                e
+            );
+            return Err(e.context(format!(
+                "Unable to prepare pinned backtrace CFI maps at {}",
+                rows_pin_path.display()
+            )));
+        }
+    }
 
-    let mut loader = GhostScopeLoader::new(&config.ebpf_bytecode)
-        .context("Failed to create eBPF loader for uprobe config")?;
+    let mut loader = GhostScopeLoader::new_with_shared_backtrace_maps(
+        &config.ebpf_bytecode,
+        share_backtrace_cfi_maps,
+    )
+    .context("Failed to create eBPF loader for uprobe config")?;
 
     // Apply PerfEventArray page count from config (for kernels without RingBuf or forced Perf mode)
     if let Some(cfg) = &session.config {
@@ -268,11 +299,11 @@ async fn create_and_attach_loader(
     );
     loader.set_trace_context(config.trace_context.clone());
     loader
-        .populate_backtrace_unwind_rows(&config.backtrace_unwind_rows)
+        .populate_backtrace_unwind_rows_and_module_row_ranges(
+            &config.backtrace_unwind_rows,
+            &config.backtrace_module_row_ranges,
+        )
         .context("Failed to populate DWARF backtrace unwind rows")?;
-    loader
-        .populate_backtrace_module_row_ranges(&config.backtrace_module_row_ranges)
-        .context("Failed to populate DWARF backtrace module row ranges")?;
     loader
         .register_backtrace_tail_call_program(
             config
