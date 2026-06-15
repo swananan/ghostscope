@@ -757,6 +757,8 @@ backtrace: truncated, 2 frames (max 2)
 
 `status=complete` 表示 DWARF unwind 在达到配置的深度上限前自然结束。`status=truncated` 表示 GhostScope 达到了配置的深度上限，或先达到了 eBPF tail-call unwind 预算。其他状态会说明 unwind 停止的原因，例如当前 PC 没有可用的 unwind row、CFI 不支持、模块偏移不可用、读取用户栈内存失败，或下一帧地址/CFA 不合法。可用时，`stopped:` 会附带稳定的原因标签和数字 code。
 
+只要进程模块映射和对应模块的 compact DWARF CFI 可用，`bt` 可以跨模块 unwind。在 `-p` 和启用 sysmon 的独立 `-t` 下，运行时模块刷新可以为后续通过 `dlopen` 加载的库补充 backtrace 元数据；它不会为 setup 阶段尚未知的目标自动新增 trace probe。具体覆盖边界见[使用限制](limitations.md#7-栈回溯覆盖范围)。
+
 ## 示例
 
 本节集中展示常见的用法示例。

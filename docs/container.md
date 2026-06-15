@@ -424,8 +424,10 @@ It mainly listens for:
 - `exec`
 - `fork`
 - `exit`
+- map changes (`mmap`, `mprotect`, `munmap`, `mremap`) when runtime module
+  refresh is enabled
 
-In the current implementation, standalone `-t` starts this pipeline by default unless `enable_sysmon_for_target = false` is set in config. `-p` mode does not start it. A combined `-t <path> -p <pid>` run also does not start `sysmon`: `-t` scopes function/source/address target resolution to one module, while `-p` supplies the concrete process mappings and PID filter. `sysmon` mainly serves standalone `-t` mode, especially when GhostScope needs to keep module offsets, allowlists, and exit cleanup up to date after the target starts.
+In the current implementation, standalone `-t` starts this pipeline by default unless `enable_sysmon_for_target = false` is set in config. `-p` mode uses a narrower sysmon path for watched-PID map changes. A combined `-t <path> -p <pid>` run uses the `-p` process context rather than target-mode sysmon: `-t` scopes function/source/address target resolution to one module, while `-p` supplies the concrete process mappings and PID filter. `sysmon` mainly serves standalone `-t` mode, especially when GhostScope needs to keep module offsets, runtime backtrace modules, allowlists, and exit cleanup up to date after the target starts.
 
 #### Which PID View sysmon Depends On
 
@@ -545,8 +547,8 @@ So today's container support should be understood more narrowly:
 
 ### `-t`-Specific Limits
 
-- `-t` depends on sysmon to maintain runtime process lifecycle state. sysmon's `event_pid` comes from `bpf_get_current_pid_tgid() >> 32` and aligns with host-view PID semantics.
-- In cross-PID-namespace cases, `-t` must keep `event_pid`, `proc_pid`, and `proc_module_offsets` aligned strongly enough for `/proc` reads, offset insertion, and exit cleanup. That alignment is still the structural weak point.
+- `-t` depends on sysmon to maintain runtime process lifecycle and module-map state. sysmon's `event_pid` comes from `bpf_get_current_pid_tgid() >> 32` and aligns with host-view PID semantics.
+- In cross-PID-namespace cases, `-t` must keep `event_pid`, `proc_pid`, and `proc_module_offsets` aligned strongly enough for `/proc` reads, offset insertion, runtime module refresh, and exit cleanup. That alignment is still the structural weak point.
 - Nested child-container `-t` tests are currently skipped in e2e. They need a stable mapping between host-view runtime/event PID and the outer container's `proc_pid`, because `proc_module_offsets` is still populated from the outer `/proc/<pid>/maps` view used for global-variable and shared-library rebasing.
 
 These limitations do not change the user contract defined earlier. They describe what the current implementation can support reliably, and where it will deliberately refuse to guess.
