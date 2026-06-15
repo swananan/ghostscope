@@ -80,6 +80,17 @@ impl SysmonEventMask {
         }
     }
 
+    fn without_map_change(self) -> Self {
+        Self {
+            map_change: false,
+            ..self
+        }
+    }
+
+    fn has_lifecycle_events(self) -> bool {
+        self.exec || self.fork || self.exit
+    }
+
     #[cfg(feature = "sysmon-ebpf")]
     fn bits(self) -> u32 {
         let mut bits = 0u32;
@@ -941,9 +952,23 @@ fn load_and_attach_sysmon_bpf(
             if event_mask.map_change {
                 let map_attached = attach_classic_map_change_tracepoints(&mut bpf)?;
                 if map_attached == 0 {
-                    return Err(anyhow::anyhow!(
-                        "map-change events requested but no syscall tracepoints attached"
-                    ));
+                    if !event_mask.has_lifecycle_events() {
+                        return Err(anyhow::anyhow!(
+                            "map-change events requested but no syscall tracepoints attached"
+                        ));
+                    }
+
+                    let fallback_mask = event_mask.without_map_change();
+                    configure_sysmon_event_filter(
+                        &mut bpf,
+                        fallback_mask,
+                        watched_pid,
+                        watched_pid_ns,
+                    )?;
+                    tracing::warn!(
+                        "Sysmon: map-change events requested but no syscall tracepoints attached; \
+                         continuing with exec/fork/exit lifecycle events only"
+                    );
                 }
             }
             Ok::<_, anyhow::Error>(bpf)
