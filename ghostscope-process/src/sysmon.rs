@@ -32,6 +32,15 @@ impl SysEventKind {
             _ => None,
         }
     }
+
+    fn as_u32(self) -> u32 {
+        match self {
+            SysEventKind::Exec => 1,
+            SysEventKind::Fork => 2,
+            SysEventKind::Exit => 3,
+            SysEventKind::MapChange => 4,
+        }
+    }
 }
 
 /// Internal sysmon event selector.
@@ -1103,6 +1112,7 @@ fn run_sysmon_loop(
                 target.as_deref(),
                 &mut last_module_refresh,
                 &proc_pid_for_event,
+                &tx,
             );
             if !had_event {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1174,6 +1184,7 @@ fn run_sysmon_loop(
                 target.as_deref(),
                 &mut last_module_refresh,
                 &proc_pid_for_event,
+                &tx,
             );
         }
     } else {
@@ -1628,8 +1639,11 @@ fn refresh_target_module_offsets(
     target: Option<&Path>,
     last_refresh: &mut Instant,
     proc_pid_for_event: &impl Fn(u32) -> u32,
+    tx: &mpsc::SyncSender<SysEvent>,
 ) {
-    use crate::pinned_bpf_maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
+    use crate::pinned_bpf_maps::{
+        allowed_pid_exists, insert_allowed_pid, insert_offsets_for_pid, ProcModuleOffsetsValue,
+    };
 
     let Some(target_path) = target else {
         return;
@@ -1665,13 +1679,38 @@ fn refresh_target_module_offsets(
     }
 
     let mut total = 0usize;
+    let mut newly_allowed_event_pids = BTreeSet::new();
     for (pid, items) in by_pid {
+        let event_pid = resolve_event_pid_for_proc(pid);
+        let was_allowed = match allowed_pid_exists(event_pid) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::debug!(
+                    "Sysmon: allowed_pids lookup failed for event pid {} (proc pid {}): {}",
+                    event_pid,
+                    pid,
+                    e
+                );
+                false
+            }
+        };
         match insert_offsets_for_pid(pid, &items) {
             Ok(inserted) => {
                 if inserted > 0 {
                     total += inserted;
-                    let _ =
-                        crate::pinned_bpf_maps::insert_allowed_pid(resolve_event_pid_for_proc(pid));
+                    match insert_allowed_pid(event_pid) {
+                        Ok(()) => {
+                            if !was_allowed {
+                                newly_allowed_event_pids.insert(event_pid);
+                            }
+                        }
+                        Err(e) => tracing::debug!(
+                            "Sysmon: periodic module refresh failed to allowlist event pid {} (proc pid {}): {}",
+                            event_pid,
+                            pid,
+                            e
+                        ),
+                    }
                 }
             }
             Err(e) => tracing::debug!(
@@ -1690,6 +1729,18 @@ fn refresh_target_module_offsets(
                 pid,
                 event_pid,
                 e
+            );
+        }
+    }
+    for event_pid in newly_allowed_event_pids {
+        let ev = SysEvent {
+            tgid: event_pid,
+            kind: SysEventKind::MapChange.as_u32(),
+        };
+        if try_publish_sys_event(tx, ev) {
+            tracing::debug!(
+                "Sysmon: published synthetic map-change for newly discovered target pid {}",
+                event_pid
             );
         }
     }

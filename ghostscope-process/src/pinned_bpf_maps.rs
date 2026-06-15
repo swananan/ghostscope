@@ -2,7 +2,7 @@ use crate::pid::{
     host_pid_for_proc_pid, read_nspid_chain, read_pid_ns_inode, INITIAL_PID_NAMESPACE_INO,
 };
 use anyhow::Context;
-use aya::maps::{HashMap as AyaHashMap, Map, MapData};
+use aya::maps::{HashMap as AyaHashMap, Map, MapData, MapError};
 use aya_obj::maps::bpf_map_def;
 use aya_obj::{
     generated::bpf_map_type::BPF_MAP_TYPE_HASH, maps::LegacyMap, EbpfSectionKind, Map as ObjMap,
@@ -696,6 +696,20 @@ pub fn insert_allowed_pid(pid: u32) -> anyhow::Result<()> {
     let mut map = open_pinned_hash_map::<u32, u8>(allowed_pids_pin_path()?)?;
     map.insert(pid, 1, 0)
         .map_err(|e| anyhow::anyhow!("allowed_pids update failed for {}: {}", pid, e))
+}
+
+/// Return whether a PID is already present in the allowed_pids pinned map.
+pub fn allowed_pid_exists(pid: u32) -> anyhow::Result<bool> {
+    let map = open_pinned_hash_map::<u32, u8>(allowed_pids_pin_path()?)?;
+    match map.get(&pid, 0) {
+        Ok(_) => Ok(true),
+        Err(MapError::KeyNotFound) => Ok(false),
+        Err(e) => Err(anyhow::anyhow!(
+            "allowed_pids lookup failed for {}: {}",
+            pid,
+            e
+        )),
+    }
 }
 
 /// Remove a PID from the allowed_pids pinned map.
