@@ -364,7 +364,7 @@ fn create_and_pin_array_map(
     pin_path: &Path,
     value_size: u32,
     max_entries: u32,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     ensure_pin_dir(pin_path).map_err(|e| {
         let hint = bpffs_mount_hint_for_pin_path(pin_path)
             .map(|hint| format!(" {hint}"))
@@ -385,7 +385,7 @@ fn create_and_pin_array_map(
                     "Reusing existing pinned map at {} (layout ok)",
                     pin_path.display()
                 );
-                return Ok(());
+                return Ok(false);
             }
             Ok(_) => {
                 warn!(
@@ -424,7 +424,7 @@ fn create_and_pin_array_map(
     match map.pin(pin_path) {
         Ok(()) => {
             info!("Pinned {} at {}", map_name, pin_path.display());
-            Ok(())
+            Ok(true)
         }
         Err(e) => match MapData::from_pin(pin_path) {
             Ok(map) if map_pin_layout_matches(&map, map_name, 4, value_size, Some(max_entries)) => {
@@ -433,7 +433,7 @@ fn create_and_pin_array_map(
                     pin_path.display(),
                     e
                 );
-                Ok(())
+                Ok(false)
             }
             Ok(_) | Err(_) => {
                 let _ = std::fs::remove_file(pin_path);
@@ -831,7 +831,7 @@ pub fn ensure_pinned_backtrace_cfi_maps_exist(
     module_entries: u32,
 ) -> anyhow::Result<()> {
     let rows_pin_path = bt_unwind_rows_pin_path()?;
-    create_and_pin_array_map(
+    let rows_created = create_and_pin_array_map(
         BT_UNWIND_ROWS_MAP_NAME,
         &rows_pin_path,
         ghostscope_protocol::BACKTRACE_UNWIND_ROW_SIZE as u32,
@@ -846,6 +846,28 @@ pub fn ensure_pinned_backtrace_cfi_maps_exist(
     })?;
 
     let ranges_pin_path = bt_module_row_ranges_pin_path()?;
+    if rows_created && ranges_pin_path.exists() {
+        match std::fs::remove_file(&ranges_pin_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Unable to remove stale {} map at {} after recreating {}",
+                        BT_MODULE_ROW_RANGES_MAP_NAME,
+                        ranges_pin_path.display(),
+                        BT_UNWIND_ROWS_MAP_NAME
+                    )
+                });
+            }
+        }
+        info!(
+            "Recreating {} because {} was recreated at {}",
+            BT_MODULE_ROW_RANGES_MAP_NAME,
+            BT_UNWIND_ROWS_MAP_NAME,
+            rows_pin_path.display()
+        );
+    }
     create_and_pin_hash_map(
         BT_MODULE_ROW_RANGES_MAP_NAME,
         &ranges_pin_path,
