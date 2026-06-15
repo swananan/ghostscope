@@ -1,6 +1,8 @@
 use super::{AddressQueryResult, DwarfAnalyzer};
 use crate::core::{ModuleAddress, Result};
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleDefaultPolicy {
@@ -25,9 +27,16 @@ impl DwarfAnalyzer {
             return true;
         }
 
+        if proc_root_paths_equivalent(left, right) {
+            return true;
+        }
+
         match (left.canonicalize(), right.canonicalize()) {
             (Ok(left), Ok(right)) => left == right,
-            _ => false,
+            _ => match (std::fs::metadata(left), std::fs::metadata(right)) {
+                (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+                _ => false,
+            },
         }
     }
 
@@ -223,6 +232,47 @@ impl DwarfAnalyzer {
     }
 }
 
+fn proc_root_paths_equivalent(left: &Path, right: &Path) -> bool {
+    match (strip_proc_root_prefix(left), strip_proc_root_prefix(right)) {
+        (Some(left), Some(right)) => left == right,
+        (Some(left), None) => left.as_path() == right,
+        (None, Some(right)) => left == right.as_path(),
+        (None, None) => false,
+    }
+}
+
+fn strip_proc_root_prefix(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return None;
+    }
+    if !matches!(
+        components.next(),
+        Some(Component::Normal(component)) if component == OsStr::new("proc")
+    ) {
+        return None;
+    }
+    if !matches!(
+        components.next(),
+        Some(Component::Normal(pid)) if pid.as_encoded_bytes().iter().all(u8::is_ascii_digit)
+    ) {
+        return None;
+    }
+    if !matches!(
+        components.next(),
+        Some(Component::Normal(component)) if component == OsStr::new("root")
+    ) {
+        return None;
+    }
+
+    let remaining = components.as_path();
+    let mut stripped = PathBuf::from("/");
+    if !remaining.as_os_str().is_empty() {
+        stripped.push(remaining);
+    }
+    Some(stripped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +298,30 @@ mod tests {
         assert!(DwarfAnalyzer::module_spec_matches_path(
             "/opt/app/lib/libfoo.so.1",
             "libfoo.so.1"
+        ));
+    }
+
+    #[test]
+    fn proc_root_paths_match_same_inner_path() {
+        assert!(proc_root_paths_equivalent(
+            Path::new("/proc/123/root/usr/lib/libfoo.so"),
+            Path::new("/proc/456/root/usr/lib/libfoo.so")
+        ));
+        assert!(proc_root_paths_equivalent(
+            Path::new("/proc/123/root/usr/lib/libfoo.so"),
+            Path::new("/usr/lib/libfoo.so")
+        ));
+    }
+
+    #[test]
+    fn proc_root_paths_reject_non_pid_prefixes() {
+        assert!(!proc_root_paths_equivalent(
+            Path::new("/proc/self/root/usr/lib/libfoo.so"),
+            Path::new("/usr/lib/libfoo.so")
+        ));
+        assert!(!proc_root_paths_equivalent(
+            Path::new("/proc/123/maps"),
+            Path::new("/maps")
         ));
     }
 

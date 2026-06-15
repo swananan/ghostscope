@@ -1,11 +1,66 @@
 use crate::core::GhostSession;
 use anyhow::{Context, Result};
+use ghostscope_compiler::script::Statement;
 use ghostscope_loader::GhostScopeLoader;
 use ghostscope_ui::events::{ExecutionStatus, ScriptCompilationDetails, ScriptExecutionResult};
 use tracing::{error, info, warn};
 
 fn map_compile_error_message(e: &ghostscope_compiler::CompileError) -> String {
     e.user_message().into_owned()
+}
+
+fn statement_contains_backtrace(statement: &Statement) -> bool {
+    match statement {
+        Statement::Backtrace(_) => true,
+        Statement::TracePoint { body, .. } | Statement::Block(body) => {
+            statements_contain_backtrace(body)
+        }
+        Statement::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            statements_contain_backtrace(then_body)
+                || else_body
+                    .as_deref()
+                    .is_some_and(statement_contains_backtrace)
+        }
+        _ => false,
+    }
+}
+
+fn statements_contain_backtrace(statements: &[Statement]) -> bool {
+    statements.iter().any(statement_contains_backtrace)
+}
+
+fn script_contains_backtrace(script: &str) -> bool {
+    ghostscope_compiler::script::parser::parse(script)
+        .map(|program| statements_contain_backtrace(&program.statements))
+        .unwrap_or(false)
+}
+
+async fn refresh_runtime_modules_before_compile(
+    script: &str,
+    session: &mut GhostSession,
+) -> Result<()> {
+    if let Err(e) = session.refresh_pid_runtime_modules_if_needed().await {
+        warn!(
+            "Failed to refresh PID runtime modules after sysmon map-change event: {:#}",
+            e
+        );
+    }
+
+    if session.is_target_mode() && script_contains_backtrace(script) {
+        session.enable_target_backtrace_runtime_modules();
+        if let Err(e) = session.refresh_target_runtime_modules().await {
+            warn!(
+                "Failed to refresh target-mode runtime modules before backtrace compilation: {:#}",
+                e
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn pid_alias_runtime_pid(
@@ -306,12 +361,7 @@ pub async fn compile_and_load_script_for_tui(
     session: &mut GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<ScriptCompilationDetails> {
-    if let Err(e) = session.refresh_pid_runtime_modules_if_needed().await {
-        warn!(
-            "Failed to refresh PID runtime modules after sysmon map-change event: {:#}",
-            e
-        );
-    }
+    refresh_runtime_modules_before_compile(script, session).await?;
 
     let fallback_host_pid = session.host_pid();
 
@@ -631,12 +681,7 @@ pub async fn compile_and_load_script_for_cli(
     session: &mut GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<()> {
-    if let Err(e) = session.refresh_pid_runtime_modules_if_needed().await {
-        warn!(
-            "Failed to refresh PID runtime modules after sysmon map-change event: {:#}",
-            e
-        );
-    }
+    refresh_runtime_modules_before_compile(script, session).await?;
 
     let compilation_result = compile_script_for_cli(script, session, compile_options)?;
 
