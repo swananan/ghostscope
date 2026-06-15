@@ -434,6 +434,35 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| {
                 CodeGenError::LLVMError(format!("Failed to create pid_aliases map in test: {e}"))
+            })?;
+        self.map_manager
+            .create_proc_module_range_meta_map(
+                &self.module,
+                &self.di_builder,
+                &self.compile_unit,
+                "proc_module_range_meta",
+                self.compile_options.proc_module_offsets_max_entries,
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!(
+                    "Failed to create proc_module_range_meta map in test: {e}"
+                ))
+            })?;
+        self.map_manager
+            .create_proc_module_ranges_map(
+                &self.module,
+                &self.di_builder,
+                &self.compile_unit,
+                "proc_module_ranges",
+                self.compile_options
+                    .proc_module_offsets_max_entries
+                    .saturating_mul(2)
+                    .max(1),
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!(
+                    "Failed to create proc_module_ranges map in test: {e}"
+                ))
             })
     }
 
@@ -618,6 +647,35 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     CodeGenError::LLVMError(format!("Failed to create bt_unwind_rows map: {e}"))
                 })?;
             if !self.backtrace_module_row_ranges.is_empty() {
+                self.map_manager
+                    .create_proc_module_range_meta_map(
+                        &self.module,
+                        &self.di_builder,
+                        &self.compile_unit,
+                        "proc_module_range_meta",
+                        self.compile_options.proc_module_offsets_max_entries,
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!(
+                            "Failed to create proc_module_range_meta map: {e}"
+                        ))
+                    })?;
+                self.map_manager
+                    .create_proc_module_ranges_map(
+                        &self.module,
+                        &self.di_builder,
+                        &self.compile_unit,
+                        "proc_module_ranges",
+                        self.compile_options
+                            .proc_module_offsets_max_entries
+                            .saturating_mul(2)
+                            .max(1),
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!(
+                            "Failed to create proc_module_ranges map: {e}"
+                        ))
+                    })?;
                 self.map_manager
                     .create_hash_map(
                         &self.module,

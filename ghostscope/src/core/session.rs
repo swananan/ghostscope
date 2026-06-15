@@ -426,7 +426,7 @@ impl GhostSession {
             return Ok(0);
         };
 
-        let runtime_modules = {
+        let (runtime_modules, pinned_offsets) = {
             let mut coordinator = self.coordinator.lock().expect("coordinator mutex poisoned");
             coordinator.refresh_prefill_pid(proc_pid)?;
 
@@ -434,8 +434,44 @@ impl GhostSession {
                 return Ok(0);
             };
 
-            DwarfAnalyzer::runtime_modules_from_pid_offsets(entries)
+            let pinned_offsets = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.cookie,
+                        ghostscope_process::pinned_bpf_maps::ProcModuleOffsetsValue::new(
+                            entry.offsets.text,
+                            entry.offsets.rodata,
+                            entry.offsets.data,
+                            entry.offsets.bss,
+                            entry.base,
+                            entry.size,
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            (
+                DwarfAnalyzer::runtime_modules_from_pid_offsets(entries),
+                pinned_offsets,
+            )
         };
+        if let Err(error) =
+            ghostscope_process::pinned_bpf_maps::insert_offsets_for_pid(proc_pid, &pinned_offsets)
+        {
+            warn!(
+                "Failed to write PID-mode module offsets for PID {}: {}",
+                proc_pid, error
+            );
+        }
+        if let Err(error) =
+            ghostscope_process::pinned_bpf_maps::replace_ranges_for_pid(proc_pid, &pinned_offsets)
+        {
+            warn!(
+                "Failed to write PID-mode module ranges for PID {}: {}",
+                proc_pid, error
+            );
+        }
 
         let debug_search_paths = self.get_debug_search_paths();
         let allow_loose = self.get_allow_loose_debug_match();
@@ -518,6 +554,14 @@ impl GhostSession {
             {
                 warn!(
                     "Failed to write target-mode module offsets for PID {}: {}",
+                    pid, error
+                );
+            }
+            if let Err(error) =
+                ghostscope_process::pinned_bpf_maps::replace_ranges_for_pid(pid, &pinned_offsets)
+            {
+                warn!(
+                    "Failed to write target-mode module ranges for PID {}: {}",
                     pid, error
                 );
             }

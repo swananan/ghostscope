@@ -84,8 +84,9 @@ use uprobe::UprobeAttachmentParams;
 
 // Use shared map types from ghostscope-process
 use ghostscope_process::pinned_bpf_maps::{
-    bpffs_mount_hint_for_pin_path, pid_aliases_pin_path, proc_offsets_pin_dir,
-    proc_offsets_pin_path, PID_ALIASES_MAP_NAME, PROC_OFFSETS_MAP_NAME,
+    bpffs_mount_hint_for_pin_path, pid_aliases_pin_path, proc_module_range_meta_pin_path,
+    proc_module_ranges_pin_path, proc_offsets_pin_dir, proc_offsets_pin_path, PID_ALIASES_MAP_NAME,
+    PROC_MODULE_RANGES_MAP_NAME, PROC_MODULE_RANGE_META_MAP_NAME, PROC_OFFSETS_MAP_NAME,
 };
 
 /// Event output map type wrapper
@@ -344,6 +345,32 @@ impl GhostScopeLoader {
                 hint
             )));
         }
+        let range_meta_pin_path = proc_module_range_meta_pin_path().map_err(|e| {
+            LoaderError::Generic(format!("Failed to resolve pinned range meta map path: {e}"))
+        })?;
+        if !range_meta_pin_path.exists() {
+            let hint = bpffs_mount_hint_for_pin_path(&range_meta_pin_path)
+                .map(|hint| format!(" {hint}"))
+                .unwrap_or_default();
+            return Err(LoaderError::Generic(format!(
+                "Pinned map '{}' not found. Please call ghostscope-process to create it first.{}",
+                range_meta_pin_path.display(),
+                hint
+            )));
+        }
+        let ranges_pin_path = proc_module_ranges_pin_path().map_err(|e| {
+            LoaderError::Generic(format!("Failed to resolve pinned ranges map path: {e}"))
+        })?;
+        if !ranges_pin_path.exists() {
+            let hint = bpffs_mount_hint_for_pin_path(&ranges_pin_path)
+                .map(|hint| format!(" {hint}"))
+                .unwrap_or_default();
+            return Err(LoaderError::Generic(format!(
+                "Pinned map '{}' not found. Please call ghostscope-process to create it first.{}",
+                ranges_pin_path.display(),
+                hint
+            )));
+        }
 
         let mut loader = EbpfLoader::new();
         let use_verbose = cfg!(debug_assertions)
@@ -365,6 +392,8 @@ impl GhostScopeLoader {
         if pin_dir.exists() {
             loader.map_pin_path(PROC_OFFSETS_MAP_NAME, pin_path);
             loader.map_pin_path(PID_ALIASES_MAP_NAME, alias_pin_path);
+            loader.map_pin_path(PROC_MODULE_RANGE_META_MAP_NAME, range_meta_pin_path);
+            loader.map_pin_path(PROC_MODULE_RANGES_MAP_NAME, ranges_pin_path);
             tracing::info!(
                 "Configured map pin directory for reuse: {}",
                 pin_dir.display()

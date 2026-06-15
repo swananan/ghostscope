@@ -1,6 +1,7 @@
 use crate::pid::{
     host_pid_for_proc_pid, read_nspid_chain, read_pid_ns_inode, INITIAL_PID_NAMESPACE_INO,
 };
+use anyhow::Context;
 use aya::maps::{HashMap as AyaHashMap, Map, MapData};
 use aya_obj::maps::bpf_map_def;
 use aya_obj::{
@@ -154,6 +155,8 @@ pub fn proc_offsets_pin_dir() -> anyhow::Result<PathBuf> {
 
 /// Map name as embedded in BPF object
 pub const PROC_OFFSETS_MAP_NAME: &str = "proc_module_offsets";
+pub const PROC_MODULE_RANGE_META_MAP_NAME: &str = "proc_module_range_meta";
+pub const PROC_MODULE_RANGES_MAP_NAME: &str = "proc_module_ranges";
 pub const ALLOWED_PIDS_MAP_NAME: &str = "allowed_pids";
 pub const PID_ALIASES_MAP_NAME: &str = "pid_aliases";
 pub const TARGET_EXEC_COMM_MAP_NAME: &str = "target_exec_comm";
@@ -204,7 +207,10 @@ pub fn bpffs_mount_hint_for_pin_path(pin_path: &Path) -> Option<String> {
     )
 }
 
-pub use ghostscope_protocol::{PidAliasValue, ProcModuleKey, ProcModuleOffsetsValue};
+pub use ghostscope_protocol::{
+    PidAliasValue, ProcModuleKey, ProcModuleOffsetsValue, ProcModuleRangeKey, ProcModuleRangeMeta,
+    ProcModuleRangeValue,
+};
 
 fn proc_offsets_pin_layout_matches(map: &MapData) -> bool {
     match map.info() {
@@ -216,6 +222,115 @@ fn proc_offsets_pin_layout_matches(map: &MapData) -> bool {
             warn!("Unable to inspect pinned proc_module_offsets map layout: {e}");
             false
         }
+    }
+}
+
+fn hash_map_pin_layout_matches(
+    map: &MapData,
+    map_name: &str,
+    key_size: u32,
+    value_size: u32,
+) -> bool {
+    match map.info() {
+        Ok(info) => info.key_size() == key_size && info.value_size() == value_size,
+        Err(e) => {
+            warn!("Unable to inspect pinned {map_name} map layout: {e}");
+            false
+        }
+    }
+}
+
+fn create_and_pin_hash_map(
+    map_name: &str,
+    pin_path: &Path,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+) -> anyhow::Result<()> {
+    ensure_pin_dir(pin_path).map_err(|e| {
+        let hint = bpffs_mount_hint_for_pin_path(pin_path)
+            .map(|hint| format!(" {hint}"))
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "Failed to create pin directory for {} at {}: {}.{}",
+            map_name,
+            pin_path.display(),
+            e,
+            hint
+        )
+    })?;
+
+    if pin_path.exists() {
+        match MapData::from_pin(pin_path) {
+            Ok(map) if hash_map_pin_layout_matches(&map, map_name, key_size, value_size) => {
+                info!(
+                    "Reusing existing pinned map at {} (layout ok)",
+                    pin_path.display()
+                );
+                return Ok(());
+            }
+            Ok(_) => {
+                warn!(
+                    "Pinned {} at {} has stale ABI layout; recreating",
+                    map_name,
+                    pin_path.display()
+                );
+                let _ = std::fs::remove_file(pin_path);
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(pin_path);
+            }
+        }
+    }
+
+    let obj_map = ObjMap::Legacy(LegacyMap {
+        section_index: 0,
+        section_kind: EbpfSectionKind::Maps,
+        symbol_index: None,
+        def: bpf_map_def {
+            map_type: BPF_MAP_TYPE_HASH as u32,
+            key_size,
+            value_size,
+            max_entries,
+            map_flags: 0,
+            id: 0,
+            pinning: aya_obj::maps::PinningType::None,
+        },
+        inner_def: None,
+        data: Vec::new(),
+    });
+
+    let map = MapData::create(obj_map, map_name, None)?;
+    info!("Created {map_name} map with capacity {max_entries} entries");
+
+    match map.pin(pin_path) {
+        Ok(()) => {
+            info!("Pinned {} at {}", map_name, pin_path.display());
+            Ok(())
+        }
+        Err(e) => match MapData::from_pin(pin_path) {
+            Ok(map) if hash_map_pin_layout_matches(&map, map_name, key_size, value_size) => {
+                info!(
+                    "Pin path {} already exists; reusing existing map ({}).",
+                    pin_path.display(),
+                    e
+                );
+                Ok(())
+            }
+            Ok(_) | Err(_) => {
+                let _ = std::fs::remove_file(pin_path);
+                let hint = bpffs_mount_hint_for_pin_path(pin_path)
+                    .map(|hint| format!(" {hint}"))
+                    .unwrap_or_default();
+                Err(anyhow::anyhow!(
+                    "Failed to pin {} at {}: {}",
+                    map_name,
+                    pin_path.display(),
+                    e
+                )
+                .context(format!("Unable to persist {map_name} in bpffs.{hint}")))
+            }
+        },
     }
 }
 
@@ -357,6 +472,26 @@ pub fn pid_aliases_pin_path() -> anyhow::Result<PathBuf> {
         "{BPFFS_ROOT}/{}/pid_aliases",
         current_process_dir_name()?
     )))
+}
+
+/// Compute the bpffs pin path for the proc_module_range_meta map.
+pub fn proc_module_range_meta_pin_path() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(format!(
+        "{BPFFS_ROOT}/{}/proc_module_range_meta",
+        current_process_dir_name()?
+    )))
+}
+
+/// Compute the bpffs pin path for the proc_module_ranges map.
+pub fn proc_module_ranges_pin_path() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(format!(
+        "{BPFFS_ROOT}/{}/proc_module_ranges",
+        current_process_dir_name()?
+    )))
+}
+
+pub fn proc_module_ranges_max_entries(proc_offsets_max_entries: u32) -> u32 {
+    proc_offsets_max_entries.saturating_mul(2).max(1)
 }
 
 /// Ensure the pinned allowed_pids map exists under the per-process directory.
@@ -521,6 +656,41 @@ pub fn ensure_pinned_pid_aliases_exists(max_entries: u32) -> anyhow::Result<()> 
     }
 }
 
+/// Ensure the pinned module range maps exist under the per-process directory.
+pub fn ensure_pinned_proc_module_ranges_exist(max_entries: u32) -> anyhow::Result<()> {
+    let meta_pin_path = proc_module_range_meta_pin_path()?;
+    create_and_pin_hash_map(
+        PROC_MODULE_RANGE_META_MAP_NAME,
+        &meta_pin_path,
+        std::mem::size_of::<u32>() as u32,
+        ghostscope_protocol::PROC_MODULE_RANGE_META_SIZE as u32,
+        max_entries.max(1),
+    )
+    .with_context(|| {
+        format!(
+            "Unable to prepare pinned {} map at {}",
+            PROC_MODULE_RANGE_META_MAP_NAME,
+            meta_pin_path.display()
+        )
+    })?;
+
+    let ranges_pin_path = proc_module_ranges_pin_path()?;
+    create_and_pin_hash_map(
+        PROC_MODULE_RANGES_MAP_NAME,
+        &ranges_pin_path,
+        ghostscope_protocol::PROC_MODULE_RANGE_KEY_SIZE as u32,
+        ghostscope_protocol::PROC_MODULE_RANGE_VALUE_SIZE as u32,
+        proc_module_ranges_max_entries(max_entries),
+    )
+    .with_context(|| {
+        format!(
+            "Unable to prepare pinned {} map at {}",
+            PROC_MODULE_RANGES_MAP_NAME,
+            ranges_pin_path.display()
+        )
+    })
+}
+
 /// Insert a PID into the allowed_pids pinned map.
 pub fn insert_allowed_pid(pid: u32) -> anyhow::Result<()> {
     let mut map = open_pinned_hash_map::<u32, u8>(allowed_pids_pin_path()?)?;
@@ -586,6 +756,58 @@ pub fn purge_offsets_for_pid(pid: u32) -> anyhow::Result<usize> {
     Ok(deleted)
 }
 
+fn purge_ranges_for_pid_slot(
+    map: &mut AyaHashMap<MapData, ProcModuleRangeKey, ProcModuleRangeValue>,
+    pid: u32,
+    slot: u32,
+) -> anyhow::Result<usize> {
+    let keys: Vec<ProcModuleRangeKey> = map.keys().collect::<Result<_, _>>()?;
+    let mut deleted = 0usize;
+    for key in keys {
+        if key.pid == pid && key.slot == slot {
+            map.remove(&key).map_err(|e| {
+                anyhow::anyhow!(
+                    "proc_module_ranges delete failed for pid={} slot={} index={}: {}",
+                    pid,
+                    key.slot,
+                    key.index,
+                    e
+                )
+            })?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+/// Purge all module range index entries for a given pid.
+pub fn purge_ranges_for_pid(pid: u32) -> anyhow::Result<usize> {
+    let mut ranges = open_pinned_hash_map::<ProcModuleRangeKey, ProcModuleRangeValue>(
+        proc_module_ranges_pin_path()?,
+    )?;
+    let keys: Vec<ProcModuleRangeKey> = ranges.keys().collect::<Result<_, _>>()?;
+    let mut deleted = 0usize;
+    for key in keys {
+        if key.pid == pid {
+            ranges.remove(&key).map_err(|e| {
+                anyhow::anyhow!(
+                    "proc_module_ranges delete failed for pid={} slot={} index={}: {}",
+                    pid,
+                    key.slot,
+                    key.index,
+                    e
+                )
+            })?;
+            deleted += 1;
+        }
+    }
+
+    let mut meta =
+        open_pinned_hash_map::<u32, ProcModuleRangeMeta>(proc_module_range_meta_pin_path()?)?;
+    let _ = meta.remove(&pid);
+    Ok(deleted)
+}
+
 /// Open the pinned global proc_module_offsets map and insert entries.
 pub fn insert_offsets_for_pid(
     pid: u32,
@@ -615,6 +837,87 @@ pub fn insert_offsets_for_pid(
             ),
         }
     }
+    Ok(inserted)
+}
+
+/// Replace the raw-address range index for a PID using a full `/proc/<pid>/maps`
+/// snapshot. The inactive slot is rewritten first, then the PID meta entry is
+/// flipped so eBPF readers either see the old complete snapshot or the new one.
+pub fn replace_ranges_for_pid(
+    pid: u32,
+    items: &[(u64, ProcModuleOffsetsValue)],
+) -> anyhow::Result<usize> {
+    let mut meta =
+        open_pinned_hash_map::<u32, ProcModuleRangeMeta>(proc_module_range_meta_pin_path()?)?;
+    let active_slot = meta
+        .get(&pid, 0)
+        .map(|value| value.active_slot & 1)
+        .unwrap_or(0);
+    let inactive_slot = active_slot ^ 1;
+
+    let mut ranges = open_pinned_hash_map::<ProcModuleRangeKey, ProcModuleRangeValue>(
+        proc_module_ranges_pin_path()?,
+    )?;
+    let purged = purge_ranges_for_pid_slot(&mut ranges, pid, inactive_slot)?;
+    if purged > 0 {
+        tracing::debug!(
+            "proc_module_ranges purged {} inactive-slot entries for pid={} slot={}",
+            purged,
+            pid,
+            inactive_slot
+        );
+    }
+
+    let mut values = items
+        .iter()
+        .filter_map(|(cookie, offsets)| {
+            let end = offsets.base.checked_add(offsets.size)?;
+            (offsets.base < end)
+                .then(|| ProcModuleRangeValue::new(offsets.base, end, offsets.text, *cookie))
+        })
+        .collect::<Vec<_>>();
+    values.sort_by_key(|value| (value.base, value.end, value.module_cookie()));
+
+    let mut inserted = 0usize;
+    for (index, value) in values.iter().enumerate() {
+        let key = ProcModuleRangeKey::new(pid, inactive_slot, index as u32);
+        match ranges.insert(key, *value, 0) {
+            Ok(()) => {
+                tracing::debug!(
+                    "proc_module_ranges insert ok: pid={} slot={} index={} base=0x{:x} end=0x{:x} text=0x{:x} cookie=0x{:08x}{:08x}",
+                    pid,
+                    inactive_slot,
+                    index,
+                    value.base,
+                    value.end,
+                    value.text,
+                    value.cookie_hi,
+                    value.cookie_lo
+                );
+                inserted += 1;
+            }
+            Err(e) => warn!(
+                "proc_module_ranges insert failed for pid={} slot={} index={}: {}",
+                pid, inactive_slot, index, e
+            ),
+        }
+    }
+
+    meta.insert(
+        pid,
+        ProcModuleRangeMeta::new(inactive_slot, inserted as u32),
+        0,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "proc_module_range_meta update failed for pid={} slot={} count={}: {}",
+            pid,
+            inactive_slot,
+            inserted,
+            e
+        )
+    })?;
+
     Ok(inserted)
 }
 

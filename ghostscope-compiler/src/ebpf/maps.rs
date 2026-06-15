@@ -87,10 +87,17 @@ impl<'ctx> MapManager<'ctx> {
         }
     }
 
+    fn map_is_pinned_by_name(name: &str) -> bool {
+        matches!(
+            name,
+            "proc_module_offsets" | "pid_aliases" | "proc_module_range_meta" | "proc_module_ranges"
+        )
+    }
+
     fn map_definition_field_count(name: &str, map_type: BpfMapType) -> usize {
         match map_type {
             BpfMapType::Ringbuf => 2,
-            _ if matches!(name, "proc_module_offsets" | "pid_aliases") => 5,
+            _ if Self::map_is_pinned_by_name(name) => 5,
             _ => 4,
         }
     }
@@ -292,6 +299,46 @@ impl<'ctx> MapManager<'ctx> {
         )
     }
 
+    pub fn create_proc_module_range_meta_map(
+        &mut self,
+        module: &Module<'ctx>,
+        di_builder: &DebugInfoBuilder<'ctx>,
+        compile_unit: &inkwell::debug_info::DICompileUnit<'ctx>,
+        name: &str,
+        max_entries: u64,
+    ) -> Result<()> {
+        self.create_map_definition(
+            module,
+            di_builder,
+            compile_unit,
+            name,
+            BpfMapType::Hash,
+            max_entries,
+            SizedType::integer(32),
+            SizedType::integer(ghostscope_protocol::PROC_MODULE_RANGE_META_SIZE as u64 * 8),
+        )
+    }
+
+    pub fn create_proc_module_ranges_map(
+        &mut self,
+        module: &Module<'ctx>,
+        di_builder: &DebugInfoBuilder<'ctx>,
+        compile_unit: &inkwell::debug_info::DICompileUnit<'ctx>,
+        name: &str,
+        max_entries: u64,
+    ) -> Result<()> {
+        self.create_map_definition(
+            module,
+            di_builder,
+            compile_unit,
+            name,
+            BpfMapType::Hash,
+            max_entries,
+            SizedType::integer(ghostscope_protocol::PROC_MODULE_RANGE_KEY_SIZE as u64 * 8),
+            SizedType::integer(ghostscope_protocol::PROC_MODULE_RANGE_VALUE_SIZE as u64 * 8),
+        )
+    }
+
     pub fn create_event_loss_counter_map(
         &mut self,
         module: &Module<'ctx>,
@@ -449,7 +496,7 @@ impl<'ctx> MapManager<'ctx> {
                     ),
                 ];
                 // For pinned maps, include optional 'pinning' to signal Aya ByName pinning.
-                if matches!(map_name, "proc_module_offsets" | "pid_aliases") {
+                if Self::map_is_pinned_by_name(map_name) {
                     // ByName is typically encoded as 1 in aya_obj::maps::PinningType
                     let pinning_ptr = mk_ptr_to_array("pinning", 1);
                     v.push(di_builder.create_member_type(
