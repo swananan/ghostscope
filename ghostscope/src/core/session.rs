@@ -8,6 +8,7 @@ use ghostscope_process::{
     PidFilterSpec, PidNamespaceId, ProcessManager, ProcessSysmon, SysEventKind, SysmonConfig,
     SysmonEventMask,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -75,6 +76,7 @@ pub struct GhostSession {
     pub config: Option<ResolvedConfig>, // Holds the resolved configuration
     pub coordinator: Arc<Mutex<ProcessManager>>, // Manages PID/module offsets prefill and application
     pub sysmon: Option<Arc<Mutex<ProcessSysmon>>>, // Realtime process monitor (exec/fork/exit)
+    target_backtrace_runtime_modules_enabled: bool,
 }
 
 impl GhostSession {
@@ -96,6 +98,7 @@ impl GhostSession {
             config: Some(config.clone()),
             coordinator: Arc::new(Mutex::new(ProcessManager::new())),
             sysmon: None,
+            target_backtrace_runtime_modules_enabled: false,
         };
 
         if let Some(pid_views) = s.pid_views() {
@@ -210,6 +213,7 @@ impl GhostSession {
             config: None,
             coordinator: Arc::new(Mutex::new(ProcessManager::new())),
             sysmon: None,
+            target_backtrace_runtime_modules_enabled: false,
         };
         if let Some(pid_context) = s.pid_context.as_ref() {
             info!(
@@ -332,7 +336,7 @@ impl GhostSession {
         Ok(DwarfAnalyzer::runtime_modules_from_pid_offsets(entries))
     }
 
-    fn drain_sysmon_map_change_events(&self, grace: Duration) -> bool {
+    fn drain_sysmon_refresh_events(&self, grace: Duration, include_target_events: bool) -> bool {
         let Some(sysmon) = self.sysmon.as_ref() else {
             return false;
         };
@@ -341,20 +345,27 @@ impl GhostSession {
             return false;
         };
 
-        let mut saw_map_change = false;
+        let mut saw_refresh_event = false;
         let deadline = Instant::now() + grace;
         let mut timeout = Duration::ZERO;
 
         loop {
             match sysmon.recv_timeout(timeout) {
                 Some(event) => {
-                    if matches!(event.event_kind(), Some(SysEventKind::MapChange)) {
-                        saw_map_change = true;
+                    let refresh_event = match event.event_kind() {
+                        Some(SysEventKind::MapChange) => true,
+                        Some(SysEventKind::Exec | SysEventKind::Fork | SysEventKind::Exit) => {
+                            include_target_events
+                        }
+                        None => false,
+                    };
+                    if refresh_event {
+                        saw_refresh_event = true;
                     }
                     timeout = Duration::ZERO;
                 }
                 None => {
-                    if saw_map_change || grace == Duration::ZERO {
+                    if saw_refresh_event || grace == Duration::ZERO {
                         break;
                     }
 
@@ -369,16 +380,22 @@ impl GhostSession {
             }
         }
 
-        saw_map_change
+        saw_refresh_event
     }
 
     pub async fn refresh_pid_runtime_modules_if_needed(&mut self) -> Result<usize> {
         if self.proc_pid().is_none() {
-            let _ = self.drain_sysmon_map_change_events(Duration::ZERO);
+            let saw_refresh_event = self.drain_sysmon_refresh_events(
+                Duration::ZERO,
+                self.target_backtrace_runtime_modules_enabled,
+            );
+            if saw_refresh_event && self.target_backtrace_runtime_modules_enabled {
+                return self.refresh_target_runtime_modules().await;
+            }
             return Ok(0);
         }
 
-        if !self.drain_sysmon_map_change_events(Duration::ZERO) {
+        if !self.drain_sysmon_refresh_events(Duration::ZERO, false) {
             return Ok(0);
         }
 
@@ -387,11 +404,17 @@ impl GhostSession {
 
     pub async fn refresh_pid_runtime_modules_before_rendering(&mut self) -> Result<usize> {
         if self.proc_pid().is_none() {
-            let _ = self.drain_sysmon_map_change_events(Duration::ZERO);
+            let saw_refresh_event = self.drain_sysmon_refresh_events(
+                SYSMON_MAP_CHANGE_RENDER_GRACE,
+                self.target_backtrace_runtime_modules_enabled,
+            );
+            if saw_refresh_event && self.target_backtrace_runtime_modules_enabled {
+                return self.refresh_target_runtime_modules().await;
+            }
             return Ok(0);
         }
 
-        if !self.drain_sysmon_map_change_events(SYSMON_MAP_CHANGE_RENDER_GRACE) {
+        if !self.drain_sysmon_refresh_events(SYSMON_MAP_CHANGE_RENDER_GRACE, false) {
             return Ok(0);
         }
 
@@ -436,6 +459,115 @@ impl GhostSession {
             info!(
                 "Refreshed PID {} runtime module analysis with {} new module(s)",
                 proc_pid, loaded
+            );
+        }
+
+        Ok(loaded)
+    }
+
+    fn collect_target_runtime_modules(
+        &self,
+    ) -> Result<Vec<ghostscope_dwarf::LoadedModuleRuntimeInfo>> {
+        let Some(target_binary) = self.target_binary.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut coordinator = self.coordinator.lock().expect("coordinator mutex poisoned");
+        coordinator.refresh_prefill_module(target_binary)?;
+
+        let target_pids = coordinator
+            .cached_offsets_for_module(target_binary)
+            .into_iter()
+            .map(|(pid, _, _, _, _)| pid)
+            .collect::<BTreeSet<_>>();
+        if target_pids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut modules_by_cookie = BTreeMap::new();
+        for pid in target_pids {
+            if let Err(error) = coordinator.refresh_prefill_pid(pid) {
+                warn!(
+                    "Failed to refresh module offsets for target-mode PID {}: {}",
+                    pid, error
+                );
+                continue;
+            }
+
+            let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(pid) else {
+                continue;
+            };
+            let pinned_offsets = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.cookie,
+                        ghostscope_process::pinned_bpf_maps::ProcModuleOffsetsValue::new(
+                            entry.offsets.text,
+                            entry.offsets.rodata,
+                            entry.offsets.data,
+                            entry.offsets.bss,
+                            entry.base,
+                            entry.size,
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Err(error) =
+                ghostscope_process::pinned_bpf_maps::insert_offsets_for_pid(pid, &pinned_offsets)
+            {
+                warn!(
+                    "Failed to write target-mode module offsets for PID {}: {}",
+                    pid, error
+                );
+            }
+            for entry in entries {
+                modules_by_cookie.entry(entry.cookie).or_insert_with(|| {
+                    ghostscope_dwarf::LoadedModuleRuntimeInfo {
+                        module_path: PathBuf::from(&entry.module_path),
+                        loaded_address: Some(entry.base),
+                        load_bias: Some(entry.offsets.text),
+                        size: entry.size,
+                    }
+                });
+            }
+        }
+
+        Ok(modules_by_cookie.into_values().collect())
+    }
+
+    pub async fn refresh_target_runtime_modules(&mut self) -> Result<usize> {
+        if self.proc_pid().is_some() {
+            return Ok(0);
+        }
+
+        let runtime_modules = self.collect_target_runtime_modules()?;
+        if runtime_modules.is_empty() {
+            return Ok(0);
+        }
+
+        let debug_search_paths = self.get_debug_search_paths();
+        let allow_loose = self.get_allow_loose_debug_match();
+        let debuginfod_client = self.build_debuginfod_client()?;
+
+        let Some(analyzer) = self.process_analyzer.as_mut() else {
+            return Ok(0);
+        };
+
+        let loaded = analyzer
+            .refresh_pid_runtime_modules_with_config_and_debuginfod(
+                runtime_modules,
+                &debug_search_paths,
+                allow_loose,
+                debuginfod_client,
+                |_| {},
+            )
+            .await?;
+
+        if loaded > 0 {
+            info!(
+                "Refreshed target-mode runtime module analysis with {} new module(s)",
+                loaded
             );
         }
 
@@ -623,6 +755,12 @@ impl GhostSession {
     /// Check if session was started with target path (target file mode)
     pub fn is_target_mode(&self) -> bool {
         self.proc_pid().is_none() && self.target_binary.is_some()
+    }
+
+    pub fn enable_target_backtrace_runtime_modules(&mut self) {
+        if self.is_target_mode() {
+            self.target_backtrace_runtime_modules_enabled = true;
+        }
     }
 }
 

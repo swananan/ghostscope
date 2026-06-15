@@ -4,6 +4,7 @@ mod common;
 
 use common::{init, targets::TargetHandle, FIXTURES};
 use ghostscope_dwarf::{CfaRulePlan, ModuleAddress, RegisterRecoveryPlan};
+use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -128,6 +129,41 @@ async fn run_backtrace_binary_with_args(
     Ok((count, stdout, stderr))
 }
 
+async fn run_backtrace_target_mode_library_with_depth(
+    binary_path: &Path,
+    target_path: &Path,
+    script: &str,
+    depth: u8,
+    output_events_per_sec: u32,
+    timeout_secs: u64,
+) -> anyhow::Result<(usize, String, String)> {
+    let target = spawn_backtrace_fixture_program(binary_path).await?;
+    let rate_arg = output_events_per_sec.to_string();
+    let depth_arg = depth.to_string();
+
+    let result = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_target(target_path)
+        .timeout_secs(timeout_secs)
+        .with_cli_args([
+            OsString::from("--script-output-events-per-sec"),
+            OsString::from(rate_arg),
+            OsString::from("--backtrace-depth"),
+            OsString::from(depth_arg),
+        ])
+        .run()
+        .await;
+
+    target.terminate().await?;
+    let (exit_code, stdout, stderr) = result?;
+    if exit_code != 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok((0, stdout, stderr));
+    }
+    anyhow::ensure!(exit_code == 0, "stderr={stderr} stdout={stdout}");
+    let count = stdout.matches("backtrace: ").count();
+    Ok((count, stdout, stderr))
+}
+
 fn get_backtrace_hot_nopie_binary() -> anyhow::Result<std::path::PathBuf> {
     let program_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/backtrace_hot_program");
@@ -182,6 +218,28 @@ fn touch_dlopen_trigger_in_target_sandbox(
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
+}
+
+fn skip_if_nested_t_mode_unsupported() -> bool {
+    let target_mode = match env::var("E2E_TARGET_MODE") {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return false,
+        Err(err) => {
+            eprintln!("continuing nested -t test despite unreadable E2E_TARGET_MODE: {err}");
+            return false;
+        }
+    };
+    let nested_child_container = matches!(
+        target_mode.trim().to_ascii_lowercase().as_str(),
+        "child-container" | "child" | "nested" | "descendant"
+    );
+    if nested_child_container {
+        eprintln!(
+            "skipping nested child-container -t backtrace test: nested target-path mode is \
+             currently unsupported"
+        );
+    }
+    nested_child_container
 }
 
 async fn run_hot_backtrace(script: &str) -> anyhow::Result<(usize, String, String)> {
@@ -904,6 +962,67 @@ trace cross_module_lib_leaf {
             && !block.contains("stopped: unsupported CFI")
             && !block.contains("stopped: no unwind rows for PC"),
         "cross-module stack should not stop on an unwind error\nBLOCK:\n{block}\nSTDERR:\n{stderr}"
+    );
+    assert_no_adjacent_duplicate_frame_locations(block)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_t_mode_cross_module_backtrace_resolves_so_and_exe_frames() -> anyhow::Result<()> {
+    init();
+    if skip_if_nested_t_mode_unsupported() {
+        return Ok(());
+    }
+
+    let binary_path = FIXTURES.get_test_binary("backtrace_cross_module_program")?;
+    let lib_path = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cross-module fixture has no parent directory"))?
+        .join("libbacktrace_cross_module.so");
+    let script = r#"
+trace cross_module_lib_leaf {
+    print "T_MODE_CROSS_MODULE_STACK";
+    bt full;
+}
+"#;
+
+    let (count, stdout, stderr) =
+        run_backtrace_target_mode_library_with_depth(&binary_path, &lib_path, script, 5, 250, 3)
+            .await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+
+    let block = first_backtrace_block_after(&stdout, "T_MODE_CROSS_MODULE_STACK", 5)?;
+    assert!(
+        block.contains("backtrace: truncated, 5 frames (max 5)"),
+        "expected a bounded target-mode cross-module stack prefix\nBLOCK:\n{block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert_ordered_patterns(
+        block,
+        &[
+            "#0 cross_module_lib_leaf",
+            "#1 cross_module_lib_probe",
+            "#2 cross_module_main_caller",
+            "#3 cross_module_main_loop",
+            "#4 main",
+        ],
+    )?;
+    assert!(
+        block.contains("[libbacktrace_cross_module.so+"),
+        "expected at least one shared-library frame\nBLOCK:\n{block}"
+    );
+    assert!(
+        block.contains("[backtrace_cross_module_program+"),
+        "expected at least one executable frame\nBLOCK:\n{block}"
+    );
+    assert!(
+        !block.contains("stopped: invalid frame")
+            && !block.contains("stopped: read error")
+            && !block.contains("stopped: unsupported CFI")
+            && !block.contains("stopped: no unwind rows for PC"),
+        "target-mode cross-module stack should not stop on an unwind error\nBLOCK:\n{block}\nSTDERR:\n{stderr}"
     );
     assert_no_adjacent_duplicate_frame_locations(block)?;
 

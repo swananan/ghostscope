@@ -38,20 +38,20 @@ impl DwarfAnalyzer {
     }
 
     fn resolve_pc_uncached(&self, module_address: &ModuleAddress) -> Result<PcContext> {
-        let module_data = self
-            .modules
-            .get(&module_address.module_path)
+        let module_path = self
+            .loaded_module_path_for(&module_address.module_path)
             .ok_or_else(|| {
                 anyhow::anyhow!("Module {} not loaded", module_address.module_display())
             })?;
-        let module = self
-            .module_id_for_path(&module_address.module_path)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Module {} has no semantic module id",
-                    module_address.module_display()
-                )
-            })?;
+        let module_data = self.modules.get(module_path).ok_or_else(|| {
+            anyhow::anyhow!("Module {} not loaded", module_address.module_display())
+        })?;
+        let module = self.module_id_for_path(module_path).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Module {} has no semantic module id",
+                module_address.module_display()
+            )
+        })?;
 
         let (cu, function, lexical_scopes, inline_chain) = module_data
             .resolve_pc_scopes(module, module_address.address)

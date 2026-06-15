@@ -357,8 +357,8 @@ impl DwarfAnalyzer {
         &self,
         module_address: &ModuleAddress,
     ) -> Option<String> {
-        self.modules
-            .get(&module_address.module_path)
+        self.loaded_module_path_for(&module_address.module_path)
+            .and_then(|module_path| self.modules.get(module_path))
             .and_then(|module_data| {
                 module_data.find_function_name_by_address(module_address.address)
             })
@@ -370,12 +370,26 @@ impl DwarfAnalyzer {
         paths
     }
 
-    /// Return the deterministic per-analyzer module id for a loaded module path.
-    pub fn module_id_for_path<P: AsRef<Path>>(&self, module_path: P) -> Option<crate::ModuleId> {
+    pub(crate) fn loaded_module_path_for<P: AsRef<Path>>(
+        &self,
+        module_path: P,
+    ) -> Option<&PathBuf> {
         let module_path = module_path.as_ref();
+        if let Some((path, _)) = self.modules.get_key_value(module_path) {
+            return Some(path);
+        }
+
         self.sorted_module_paths()
             .into_iter()
-            .position(|path| path.as_path() == module_path)
+            .find(|path| Self::module_paths_equivalent(path.as_path(), module_path))
+    }
+
+    /// Return the deterministic per-analyzer module id for a loaded module path.
+    pub fn module_id_for_path<P: AsRef<Path>>(&self, module_path: P) -> Option<crate::ModuleId> {
+        let module_path = self.loaded_module_path_for(module_path)?;
+        self.sorted_module_paths()
+            .into_iter()
+            .position(|path| path.as_path() == module_path.as_path())
             .map(|index| crate::ModuleId(index as u32))
     }
 
@@ -395,7 +409,10 @@ impl DwarfAnalyzer {
     /// Returns Some(true) if inline, Some(false) if a normal (non-inline) context,
     /// or None if the module/address cannot be resolved.
     pub fn is_inline_at(&self, module_address: &ModuleAddress) -> Option<bool> {
-        if let Some(module_data) = self.modules.get(&module_address.module_path) {
+        if let Some(module_data) = self
+            .loaded_module_path_for(&module_address.module_path)
+            .and_then(|module_path| self.modules.get(module_path))
+        {
             module_data.is_inline_at(module_address.address)
         } else {
             None
@@ -971,7 +988,10 @@ impl DwarfAnalyzer {
         module_address: &ModuleAddress,
         registers: &[u16],
     ) -> Result<Option<CallerFrameRecovery>> {
-        if let Some(module_data) = self.modules.get(&module_address.module_path) {
+        if let Some(module_data) = self
+            .loaded_module_path_for(&module_address.module_path)
+            .and_then(|module_path| self.modules.get(module_path))
+        {
             module_data.recover_caller_frame(module_address.address, registers)
         } else {
             Ok(None)
@@ -1097,7 +1117,10 @@ impl DwarfAnalyzer {
     /// Lookup source location by module address
     /// Returns source location for the given module address
     pub fn lookup_source_location(&self, module_address: &ModuleAddress) -> Option<SourceLocation> {
-        if let Some(module_data) = self.modules.get(&module_address.module_path) {
+        if let Some(module_data) = self
+            .loaded_module_path_for(&module_address.module_path)
+            .and_then(|module_path| self.modules.get(module_path))
+        {
             module_data.lookup_source_location(module_address.address)
         } else {
             tracing::warn!("Module {} not found", module_address.module_display());
