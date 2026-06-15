@@ -1,5 +1,5 @@
 use super::*;
-use crate::ebpf::context::BacktraceModuleRowRange;
+use crate::ebpf::context::BacktraceModuleRowRangeEntry;
 use crate::script::{BacktraceStatement, Statement};
 use aya_ebpf_bindings::bindings::bpf_func_id::{BPF_FUNC_map_lookup_elem, BPF_FUNC_tail_call};
 use ghostscope_dwarf::{
@@ -195,10 +195,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             rows.extend(module.bpf_rows.iter().copied());
             let row_end = rows.len();
             self.backtrace_module_row_ranges
-                .push(BacktraceModuleRowRange {
+                .push(BacktraceModuleRowRangeEntry {
                     cookie: module.cookie,
-                    row_start,
-                    row_end,
+                    range: ghostscope_protocol::BacktraceModuleRowRange {
+                        row_start: row_start as u32,
+                        row_end: row_end as u32,
+                    },
                 });
             tracing::info!(
                 module = %module.module_path.display(),
@@ -2086,42 +2088,195 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         let i64_type = self.context.i64_type();
-        let mut start = i32_type.const_zero();
-        let mut end = i32_type.const_zero();
-        let ranges = self.backtrace_module_row_ranges.clone();
-        for (idx, range) in ranges.into_iter().enumerate() {
-            let matches = self
-                .builder
-                .build_int_compare(
-                    inkwell::IntPredicate::EQ,
-                    module_cookie,
-                    i64_type.const_int(range.cookie, false),
-                    &format!("{name_prefix}_{idx}_module_matches"),
-                )
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-            start = self
-                .builder
-                .build_select::<BasicValueEnum<'ctx>, _>(
-                    matches,
-                    i32_type.const_int(range.row_start as u64, false).into(),
-                    start.into(),
-                    &format!("{name_prefix}_{idx}_row_start"),
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let map_global = self
+            .module
+            .get_global("bt_module_row_ranges")
+            .ok_or_else(|| {
+                CodeGenError::LLVMError("bt_module_row_ranges map not found".to_string())
+            })?;
+        let map_ptr = self
+            .builder
+            .build_bit_cast(
+                map_global.as_pointer_value(),
+                ptr_type,
+                &format!("{name_prefix}_row_ranges_map_ptr"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let key_alloca = self.pm_key_alloca.ok_or_else(|| {
+            CodeGenError::LLVMError("pm_key not allocated in entry block".to_string())
+        })?;
+        let key_arr_ty = i32_type.array_type(4);
+        let zero = i32_type.const_zero();
+        let cookie_lo = self
+            .builder
+            .build_int_truncate(
+                module_cookie,
+                i32_type,
+                &format!("{name_prefix}_row_range_cookie_lo"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let cookie_hi_shifted = self
+            .builder
+            .build_right_shift(
+                module_cookie,
+                i64_type.const_int(32, false),
+                false,
+                &format!("{name_prefix}_row_range_cookie_hi_shift"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let cookie_hi = self
+            .builder
+            .build_int_truncate(
+                cookie_hi_shifted,
+                i32_type,
+                &format!("{name_prefix}_row_range_cookie_hi"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        // SAFETY: pm_key_alloca is a [4 x i32] entry-block alloca. The first
+        // two words are the u64 hash key consumed by bt_module_row_ranges.
+        let cookie_lo_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    key_arr_ty,
+                    key_alloca,
+                    &[zero, zero],
+                    &format!("{name_prefix}_row_range_cookie_lo_ptr"),
                 )
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                .into_int_value();
-            end = self
-                .builder
-                .build_select::<BasicValueEnum<'ctx>, _>(
-                    matches,
-                    i32_type.const_int(range.row_end as u64, false).into(),
-                    end.into(),
-                    &format!("{name_prefix}_{idx}_row_end"),
+        };
+        self.builder
+            .build_store(cookie_lo_ptr, cookie_lo)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let cookie_hi_index = i32_type.const_int(1, false);
+        // SAFETY: index 1 is within the [4 x i32] key scratch space.
+        let cookie_hi_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    key_arr_ty,
+                    key_alloca,
+                    &[zero, cookie_hi_index],
+                    &format!("{name_prefix}_row_range_cookie_hi_ptr"),
                 )
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                .into_int_value();
-        }
+        };
+        self.builder
+            .build_store(cookie_hi_ptr, cookie_hi)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let key_ptr = self
+            .builder
+            .build_bit_cast(
+                key_alloca,
+                ptr_type,
+                &format!("{name_prefix}_row_range_key_void"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let result = self.create_bpf_helper_call(
+            BPF_FUNC_map_lookup_elem as u64,
+            &[map_ptr, key_ptr],
+            ptr_type.into(),
+            &format!("{name_prefix}_row_range_lookup"),
+        )?;
+        let range_ptr = match result {
+            BasicValueEnum::PointerValue(ptr) => ptr,
+            _ => {
+                return Err(CodeGenError::LLVMError(
+                    "bt_module_row_ranges lookup did not return pointer".to_string(),
+                ))
+            }
+        };
+        let is_null = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                self.builder
+                    .build_ptr_to_int(
+                        range_ptr,
+                        i64_type,
+                        &format!("{name_prefix}_row_range_ptr_i64"),
+                    )
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?,
+                i64_type.const_zero(),
+                &format!("{name_prefix}_row_range_is_null"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let current_fn = self.current_function("lookup bt row range")?;
+        let found_block = self
+            .context
+            .append_basic_block(current_fn, &format!("{name_prefix}_found_row_range"));
+        let miss_block = self
+            .context
+            .append_basic_block(current_fn, &format!("{name_prefix}_miss_row_range"));
+        let cont_block = self
+            .context
+            .append_basic_block(current_fn, &format!("{name_prefix}_cont_row_range"));
+        self.builder
+            .build_conditional_branch(is_null, miss_block, found_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
-        Ok(BtRowBounds { start, end })
+        self.builder.position_at_end(found_block);
+        let load_range_field = |offset: usize,
+                                field_name: &str,
+                                ctx: &mut EbpfContext<'ctx, 'dw>|
+         -> Result<IntValue<'ctx>> {
+            let offset_i32 = ctx.context.i32_type().const_int(offset as u64, false);
+            // SAFETY: range_ptr is a non-null BacktraceModuleRowRange pointer
+            // returned by bpf_map_lookup_elem, and offsets are shared ABI
+            // constants from ghostscope-protocol.
+            let field_ptr = unsafe {
+                ctx.builder
+                    .build_gep(ctx.context.i8_type(), range_ptr, &[offset_i32], field_name)
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            };
+            Ok(ctx
+                .builder
+                .build_load(ctx.context.i32_type(), field_ptr, field_name)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                .into_int_value())
+        };
+        let found_start = load_range_field(
+            ghostscope_protocol::BACKTRACE_MODULE_ROW_RANGE_ROW_START_OFFSET,
+            &format!("{name_prefix}_row_range_start"),
+            self,
+        )?;
+        let found_end = load_range_field(
+            ghostscope_protocol::BACKTRACE_MODULE_ROW_RANGE_ROW_END_OFFSET,
+            &format!("{name_prefix}_row_range_end"),
+            self,
+        )?;
+        self.builder
+            .build_unconditional_branch(cont_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let found_end_block = self.current_insert_block("finish bt row range found block")?;
+
+        self.builder.position_at_end(miss_block);
+        self.builder
+            .build_unconditional_branch(cont_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let miss_end_block = self.current_insert_block("finish bt row range miss block")?;
+
+        self.builder.position_at_end(cont_block);
+        let start_phi = self
+            .builder
+            .build_phi(i32_type, &format!("{name_prefix}_row_start_phi"))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        start_phi.add_incoming(&[
+            (&found_start, found_end_block),
+            (&i32_type.const_zero(), miss_end_block),
+        ]);
+        let end_phi = self
+            .builder
+            .build_phi(i32_type, &format!("{name_prefix}_row_end_phi"))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        end_phi.add_incoming(&[
+            (&found_end, found_end_block),
+            (&i32_type.const_zero(), miss_end_block),
+        ]);
+
+        Ok(BtRowBounds {
+            start: start_phi.as_basic_value().into_int_value(),
+            end: end_phi.as_basic_value().into_int_value(),
+        })
     }
 
     fn lookup_backtrace_unwind_row_in_range(
@@ -4223,15 +4378,19 @@ mod tests {
                 .expect("pm_key alloca"),
         );
         ctx.backtrace_module_row_ranges = vec![
-            BacktraceModuleRowRange {
+            BacktraceModuleRowRangeEntry {
                 cookie: 0x1111,
-                row_start: 0,
-                row_end: 1,
+                range: ghostscope_protocol::BacktraceModuleRowRange {
+                    row_start: 0,
+                    row_end: 1,
+                },
             },
-            BacktraceModuleRowRange {
+            BacktraceModuleRowRangeEntry {
                 cookie: 0x2222,
-                row_start: 1,
-                row_end: 2,
+                range: ghostscope_protocol::BacktraceModuleRowRange {
+                    row_start: 1,
+                    row_end: 2,
+                },
             },
         ];
 
@@ -4280,12 +4439,26 @@ mod tests {
         let function = ctx.module.add_function("bt_row_bounds", fn_type, None);
         let entry = context.append_basic_block(function, "entry");
         ctx.builder.position_at_end(entry);
+        let map_global = ctx.module.add_global(
+            context.i64_type(),
+            Some(AddressSpace::default()),
+            "bt_module_row_ranges",
+        );
+        map_global.set_initializer(&context.i64_type().const_zero());
+        let key_type = context.i32_type().array_type(4);
+        ctx.pm_key_alloca = Some(
+            ctx.builder
+                .build_alloca(key_type, "pm_key")
+                .expect("pm_key alloca"),
+        );
 
         ctx.backtrace_module_row_ranges = (0..=BPF_BACKTRACE_MODULE_CANDIDATE_LIMIT)
-            .map(|idx| BacktraceModuleRowRange {
+            .map(|idx| BacktraceModuleRowRangeEntry {
                 cookie: 0x1000 + idx as u64,
-                row_start: idx * 2,
-                row_end: idx * 2 + 2,
+                range: ghostscope_protocol::BacktraceModuleRowRange {
+                    row_start: (idx * 2) as u32,
+                    row_end: (idx * 2 + 2) as u32,
+                },
             })
             .collect();
 
@@ -4304,9 +4477,13 @@ mod tests {
 
         let ir = ctx.module.print_to_string().to_string();
         assert!(
-            ir.contains("test_bt_row_bounds_16_module_matches")
-                && ir.contains("test_bt_row_bounds_16_row_end"),
-            "row bounds lookup should cover modules beyond the address candidate cap\nIR:\n{ir}"
+            ir.contains("bt_module_row_ranges")
+                && ir.contains("test_bt_row_bounds_row_range_lookup"),
+            "row bounds lookup should use the module range map\nIR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("test_bt_row_bounds_16_module_matches"),
+            "row bounds lookup should not be capped by static candidate comparisons\nIR:\n{ir}"
         );
     }
 }

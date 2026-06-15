@@ -552,6 +552,29 @@ impl<'ctx> MapManager<'ctx> {
         )
     }
 
+    /// Create a regular Hash map with caller-specified key/value sizes.
+    pub fn create_hash_map(
+        &mut self,
+        module: &Module<'ctx>,
+        di_builder: &DebugInfoBuilder<'ctx>,
+        compile_unit: &inkwell::debug_info::DICompileUnit<'ctx>,
+        name: &str,
+        max_entries: u64,
+        key_value_size_bytes: (u64, u64),
+    ) -> Result<()> {
+        let (key_size_bytes, value_size_bytes) = key_value_size_bytes;
+        self.create_map_definition(
+            module,
+            di_builder,
+            compile_unit,
+            name,
+            BpfMapType::Hash,
+            max_entries,
+            SizedType::integer(key_size_bytes * 8),
+            SizedType::integer(value_size_bytes * 8),
+        )
+    }
+
     /// Create a ProgramArray map for eBPF tail calls.
     pub fn create_program_array_map(
         &mut self,

@@ -191,6 +191,9 @@ async fn create_and_attach_loader(
         .populate_backtrace_unwind_rows(&config.backtrace_unwind_rows)
         .context("Failed to populate DWARF backtrace unwind rows")?;
     loader
+        .populate_backtrace_module_row_ranges(&config.backtrace_module_row_ranges)
+        .context("Failed to populate DWARF backtrace module row ranges")?;
+    loader
         .register_backtrace_tail_call_program(
             config
                 .backtrace_tail_call_program

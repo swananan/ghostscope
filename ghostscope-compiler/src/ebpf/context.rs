@@ -39,10 +39,9 @@ pub(crate) struct PendingBacktraceTailCall {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BacktraceModuleRowRange {
+pub(crate) struct BacktraceModuleRowRangeEntry {
     pub cookie: u64,
-    pub row_start: usize,
-    pub row_end: usize,
+    pub range: ghostscope_protocol::BacktraceModuleRowRange,
 }
 
 #[derive(Error, Debug)]
@@ -168,7 +167,7 @@ pub struct EbpfContext<'ctx, 'dw> {
 
     // === DWARF compact unwind rows for bt ===
     pub backtrace_unwind_rows: Vec<ghostscope_protocol::BacktraceUnwindRow>,
-    pub(crate) backtrace_module_row_ranges: Vec<BacktraceModuleRowRange>,
+    pub(crate) backtrace_module_row_ranges: Vec<BacktraceModuleRowRangeEntry>,
     pub(crate) backtrace_tail_call_slots: u8,
     pub(crate) next_backtrace_tail_call_slot: u8,
     pub(crate) pending_backtrace_tail_call: Option<PendingBacktraceTailCall>,
@@ -618,6 +617,25 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .map_err(|e| {
                     CodeGenError::LLVMError(format!("Failed to create bt_unwind_rows map: {e}"))
                 })?;
+            if !self.backtrace_module_row_ranges.is_empty() {
+                self.map_manager
+                    .create_hash_map(
+                        &self.module,
+                        &self.di_builder,
+                        &self.compile_unit,
+                        "bt_module_row_ranges",
+                        self.backtrace_module_row_ranges.len() as u64,
+                        (
+                            std::mem::size_of::<u64>() as u64,
+                            ghostscope_protocol::BACKTRACE_MODULE_ROW_RANGE_SIZE as u64,
+                        ),
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!(
+                            "Failed to create bt_module_row_ranges map: {e}"
+                        ))
+                    })?;
+            }
             self.map_manager
                 .create_percpu_array_map(
                     &self.module,
