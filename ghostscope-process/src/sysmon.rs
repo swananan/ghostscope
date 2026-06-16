@@ -3,7 +3,10 @@ use crate::{
     offsets::{PidOffsetsEntry, ProcessManager},
     pid::{resolve_event_pid_for_proc, resolve_proc_pid_for_event, PidNamespaceId},
     pinned_bpf_maps,
-    proc_maps::{visit_proc_maps, ModuleIdentity},
+    proc_maps::{
+        normalize_mapped_module_path, read_proc_maps, should_skip_mapped_module_path,
+        visit_proc_maps, ModuleIdentity,
+    },
 };
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
@@ -596,6 +599,31 @@ fn sysmon_proc_pid_resolver(
     }
 }
 
+fn write_pinned_runtime_pid_alias(runtime_pid: u32, proc_pid: u32) {
+    if runtime_pid == proc_pid {
+        return;
+    }
+    if let Err(e) = crate::pinned_bpf_maps::insert_pid_alias(runtime_pid, proc_pid) {
+        tracing::debug!(
+            "Sysmon: failed to insert PID alias runtime pid {} -> proc pid {}: {}",
+            runtime_pid,
+            proc_pid,
+            e
+        );
+    }
+}
+
+fn record_runtime_pid_alias_for_event(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    runtime_pid: u32,
+    proc_pid: u32,
+) {
+    write_pinned_runtime_pid_alias(runtime_pid, proc_pid);
+    if let Ok(mut guard) = mgr.lock() {
+        guard.record_runtime_pid_alias(runtime_pid, proc_pid);
+    }
+}
+
 #[cfg(feature = "sysmon-ebpf")]
 #[derive(Debug, Clone, Copy)]
 enum SysmonAttachBackend {
@@ -1069,6 +1097,8 @@ fn run_sysmon_loop(
                         // Add event PID (kernel namespace) to allowlist so subsequent
                         // fork/exit events are filtered in-kernel.
                         let event_pid = resolve_event_pid_for_proc(pid);
+                        guard.record_runtime_pid_alias(event_pid, pid);
+                        write_pinned_runtime_pid_alias(event_pid, pid);
                         let _ = crate::pinned_bpf_maps::insert_allowed_pid(event_pid);
                     }
                     tracing::info!(
@@ -1099,6 +1129,7 @@ fn run_sysmon_loop(
     // path that inserts proc_module_offsets and allowed_pids. A fallback /proc
     // scan here can delay a short-lived target past its only probe.
     let mut last_module_refresh = Instant::now();
+    let mut target_pid_map_signatures = HashMap::<u32, PidMapsSignature>::new();
 
     // Event loop: prefer ringbuf; fallback to perf
     if let Some(map) = bpf.take_map("sysmon_events") {
@@ -1136,7 +1167,7 @@ fn run_sysmon_loop(
                 &mgr,
                 target.as_deref(),
                 &mut last_module_refresh,
-                &proc_pid_for_event,
+                &mut target_pid_map_signatures,
                 &tx,
             );
             if !had_event {
@@ -1208,7 +1239,7 @@ fn run_sysmon_loop(
                 &mgr,
                 target.as_deref(),
                 &mut last_module_refresh,
-                &proc_pid_for_event,
+                &mut target_pid_map_signatures,
                 &tx,
             );
         }
@@ -1396,16 +1427,7 @@ fn write_offsets_for_pid(
     };
 
     let proc_pid = proc_pid_for_event(event_pid);
-    if proc_pid != event_pid {
-        if let Err(e) = crate::pinned_bpf_maps::insert_pid_alias(event_pid, proc_pid) {
-            tracing::debug!(
-                "Sysmon: failed to insert PID alias event pid {} -> proc pid {}: {}",
-                event_pid,
-                proc_pid,
-                e
-            );
-        }
-    }
+    record_runtime_pid_alias_for_event(mgr, event_pid, proc_pid);
     let mut inserted_any = false;
     if let Ok(mut guard) = mgr.lock() {
         let prefilled = match if force_refresh {
@@ -1447,15 +1469,16 @@ fn write_offsets_for_pid(
                         ));
                     }
                     for (pid, items) in by_pid {
+                        let runtime_pid = resolve_event_pid_for_proc(pid);
+                        guard.record_runtime_pid_alias(runtime_pid, pid);
+                        write_pinned_runtime_pid_alias(runtime_pid, pid);
                         match insert_offsets_for_pid(pid, &items) {
                             Ok(inserted) if inserted > 0 => {
                                 tracing::info!(
                                     "Sysmon: module refresh inserted {} offset entries for proc pid {} (event pid {})",
                                     inserted, pid, event_pid
                                 );
-                                let _ = crate::pinned_bpf_maps::insert_allowed_pid(
-                                    resolve_event_pid_for_proc(pid),
-                                );
+                                let _ = crate::pinned_bpf_maps::insert_allowed_pid(runtime_pid);
                                 inserted_any = true;
                             }
                             Ok(_) => {}
@@ -1577,16 +1600,7 @@ fn prefill_full_offsets_for_pid_if_new(
     use crate::pinned_bpf_maps::{insert_offsets_for_pid, replace_ranges_for_pid};
 
     let proc_pid = proc_pid_for_event(event_pid);
-    if proc_pid != event_pid {
-        if let Err(e) = crate::pinned_bpf_maps::insert_pid_alias(event_pid, proc_pid) {
-            tracing::debug!(
-                "Sysmon: failed to insert PID alias event pid {} -> proc pid {}: {}",
-                event_pid,
-                proc_pid,
-                e
-            );
-        }
-    }
+    record_runtime_pid_alias_for_event(mgr, event_pid, proc_pid);
 
     let items = {
         let Ok(mut guard) = mgr.lock() else {
@@ -1638,6 +1652,77 @@ fn prefill_full_offsets_for_pid_if_new(
     }
 }
 
+type PidMapsSignature = Vec<(String, u64, u64, u64, u64, u64, bool)>;
+
+fn pid_maps_signature(pid: u32) -> anyhow::Result<PidMapsSignature> {
+    let mut signature = read_proc_maps(pid)?
+        .into_iter()
+        .filter_map(|entry| {
+            let path = entry.path()?;
+            if should_skip_mapped_module_path(path) {
+                return None;
+            }
+            Some((
+                normalize_mapped_module_path(path).to_string(),
+                entry.start,
+                entry.end,
+                entry.offset,
+                entry.inode,
+                (entry.dev_major << 32) | entry.dev_minor,
+                entry.executable(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    signature.sort_unstable();
+    Ok(signature)
+}
+
+fn refresh_full_offsets_for_pid(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    proc_pid: u32,
+    event_pid: u32,
+) -> anyhow::Result<bool> {
+    use crate::pinned_bpf_maps::{
+        insert_allowed_pid, insert_offsets_for_pid, purge_offsets_for_pid, replace_ranges_for_pid,
+    };
+
+    record_runtime_pid_alias_for_event(mgr, event_pid, proc_pid);
+
+    let items = {
+        let Ok(mut guard) = mgr.lock() else {
+            return Ok(false);
+        };
+        guard.refresh_prefill_pid(proc_pid)?;
+        let Some(entries) = guard.cached_offsets_with_paths_for_pid(proc_pid) else {
+            return Ok(false);
+        };
+        offset_items_from_entries(entries.iter())
+    };
+
+    if items.is_empty() {
+        return Ok(false);
+    }
+
+    let purged = purge_offsets_for_pid(proc_pid)?;
+    if purged > 0 {
+        tracing::debug!(
+            "Sysmon: purged {} stale offset entries before periodic full refresh for proc pid {}",
+            purged,
+            proc_pid
+        );
+    }
+    let inserted = insert_offsets_for_pid(proc_pid, &items)?;
+    replace_ranges_for_pid(proc_pid, &items)?;
+    insert_allowed_pid(event_pid)?;
+    tracing::debug!(
+        "Sysmon: periodic full refresh wrote {} offset entries for proc pid {} (event pid {})",
+        inserted,
+        proc_pid,
+        event_pid
+    );
+    Ok(inserted > 0)
+}
+
 fn offset_items_from_entries<'a>(
     entries: impl IntoIterator<Item = &'a PidOffsetsEntry>,
 ) -> Vec<(u64, crate::pinned_bpf_maps::ProcModuleOffsetsValue)> {
@@ -1663,7 +1748,7 @@ fn refresh_target_module_offsets(
     mgr: &Arc<Mutex<ProcessManager>>,
     target: Option<&Path>,
     last_refresh: &mut Instant,
-    proc_pid_for_event: &impl Fn(u32) -> u32,
+    target_pid_map_signatures: &mut HashMap<u32, PidMapsSignature>,
     tx: &mpsc::SyncSender<SysEvent>,
 ) {
     use crate::pinned_bpf_maps::{
@@ -1707,6 +1792,7 @@ fn refresh_target_module_offsets(
     let mut newly_allowed_event_pids = BTreeSet::new();
     for (pid, items) in by_pid {
         let event_pid = resolve_event_pid_for_proc(pid);
+        record_runtime_pid_alias_for_event(mgr, event_pid, pid);
         let was_allowed = match allowed_pid_exists(event_pid) {
             Ok(value) => value,
             Err(e) => {
@@ -1746,17 +1832,41 @@ fn refresh_target_module_offsets(
             ),
         }
     }
-    for pid in target_pids {
-        let event_pid = resolve_event_pid_for_proc(pid);
-        if let Err(e) = prefill_full_offsets_for_pid_if_new(mgr, event_pid, proc_pid_for_event) {
-            tracing::debug!(
-                "Sysmon: periodic full offset prefill failed for proc pid {} (event pid {}): {}",
-                pid,
-                event_pid,
-                e
-            );
+    for pid in &target_pids {
+        let event_pid = resolve_event_pid_for_proc(*pid);
+        let maps_signature = match pid_maps_signature(*pid) {
+            Ok(signature) => signature,
+            Err(e) => {
+                tracing::debug!(
+                    "Sysmon: periodic maps signature failed for proc pid {} (event pid {}): {}",
+                    *pid,
+                    event_pid,
+                    e
+                );
+                continue;
+            }
+        };
+        if target_pid_map_signatures.get(pid) == Some(&maps_signature) {
+            continue;
+        }
+        target_pid_map_signatures.insert(*pid, maps_signature);
+
+        match refresh_full_offsets_for_pid(mgr, *pid, event_pid) {
+            Ok(true) => {
+                newly_allowed_event_pids.insert(event_pid);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::debug!(
+                    "Sysmon: periodic full offset refresh failed for proc pid {} (event pid {}): {}",
+                    *pid,
+                    event_pid,
+                    e
+                );
+            }
         }
     }
+    target_pid_map_signatures.retain(|pid, _| target_pids.contains(pid));
     for event_pid in newly_allowed_event_pids {
         let ev = SysEvent {
             tgid: event_pid,

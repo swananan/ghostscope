@@ -1,5 +1,5 @@
 use ghostscope_dwarf::{DwarfAnalyzer, FunctionParameter, ModuleAddress, PcContext};
-use ghostscope_process::{PidOffsetsEntry, ProcessManager};
+use ghostscope_process::ProcessManager;
 #[cfg(test)]
 use ghostscope_protocol::trace_event::backtrace_error_label;
 use ghostscope_protocol::trace_event::{
@@ -7,16 +7,17 @@ use ghostscope_protocol::trace_event::{
 };
 use ghostscope_protocol::{ParsedBacktraceFrame, ParsedInstruction, ParsedTraceEvent};
 use ghostscope_ui::{BacktraceDisplay, BacktraceDisplayFrame, TraceDisplayItem, UiTraceEvent};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
 const FRAME_RENDER_CACHE_MAX_ENTRIES: usize = 16_384;
 const STATUS_CACHE_MAX_ENTRIES: usize = 4_096;
 
-#[derive(Clone, Copy)]
-struct ResolvedFrameModule<'a> {
-    entry: &'a PidOffsetsEntry,
+#[derive(Clone)]
+struct ResolvedFrameModule {
+    module_path: PathBuf,
+    cookie: u64,
     pc: u64,
 }
 
@@ -85,6 +86,7 @@ where
 struct PidCacheKey {
     first: u32,
     second: u32,
+    third: u32,
     len: u8,
 }
 
@@ -93,7 +95,8 @@ impl PidCacheKey {
         Self {
             first: pids.first().copied().unwrap_or_default(),
             second: pids.get(1).copied().unwrap_or_default(),
-            len: pids.len().min(2) as u8,
+            third: pids.get(2).copied().unwrap_or_default(),
+            len: pids.len().min(3) as u8,
         }
     }
 }
@@ -234,7 +237,7 @@ impl BacktraceRenderer {
             return Vec::new();
         };
 
-        let pids = candidate_pids(event_pid, proc_pid_hint);
+        let pids = candidate_pids(event_pid, proc_pid_hint, coordinator);
         let display_status = self.display_backtrace_status(
             *status,
             *error_code,
@@ -291,7 +294,7 @@ impl BacktraceRenderer {
             };
         };
 
-        let pids = candidate_pids(event_pid, proc_pid_hint);
+        let pids = candidate_pids(event_pid, proc_pid_hint, coordinator);
         let display_status = self.display_backtrace_status(
             *status,
             *error_code,
@@ -360,17 +363,16 @@ impl BacktraceRenderer {
             return cached;
         }
 
-        let Some(module) = resolve_frame_module(coordinator, pids, last_frame) else {
-            self.status_cache.insert(cache_key, status);
+        let Some(module) = resolve_frame_module(coordinator, Some(analyzer), pids, last_frame)
+        else {
             return status;
         };
 
-        let display_status =
-            if is_process_entry_frame(analyzer, module.entry.module_path.as_ref(), module.pc) {
-                BacktraceStatus::Complete
-            } else {
-                status
-            };
+        let display_status = if is_process_entry_frame(analyzer, &module.module_path, module.pc) {
+            BacktraceStatus::Complete
+        } else {
+            status
+        };
         self.status_cache.insert(cache_key, display_status);
         display_status
     }
@@ -401,31 +403,34 @@ impl BacktraceRenderer {
 
         let raw = (flags & BACKTRACE_FLAG_RAW) != 0;
         let inline = (flags & BACKTRACE_FLAG_INLINE) != 0;
-        let module = resolve_frame_module(coordinator, pids, frame);
-        let frame_pc = module.map(|module| module.pc).unwrap_or(frame.pc);
+        let module = resolve_frame_module(coordinator, analyzer, pids, frame);
+        let frame_pc = module.as_ref().map(|module| module.pc).unwrap_or(frame.pc);
 
         if raw {
-            let lines = vec![format_raw_frame(index, frame, module, true)];
-            self.frame_cache.insert(cache_key, lines.clone());
+            let lines = vec![format_raw_frame(index, frame, module.as_ref(), true)];
+            if module.is_some() {
+                self.frame_cache.insert(cache_key, lines.clone());
+            }
             return lines;
         }
 
         let resolved = analyzer
-            .and_then(|analyzer| module.map(|module| (analyzer, module)))
+            .and_then(|analyzer| module.as_ref().map(|module| (analyzer, module)))
             .and_then(|(analyzer, module)| {
                 let lookup_pc = if index == 0 {
                     module.pc
                 } else {
                     module.pc.saturating_sub(1)
                 };
-                let address =
-                    ModuleAddress::new(PathBuf::from(&module.entry.module_path), lookup_pc);
+                let address = ModuleAddress::new(module.module_path.clone(), lookup_pc);
                 analyzer.resolve_pc(&address).ok()
             });
 
         let Some(ctx) = resolved else {
-            let lines = vec![format_raw_frame(index, frame, module, false)];
-            self.frame_cache.insert(cache_key, lines.clone());
+            let lines = vec![format_raw_frame(index, frame, module.as_ref(), false)];
+            if module.is_some() {
+                self.frame_cache.insert(cache_key, lines.clone());
+            }
             return lines;
         };
 
@@ -453,7 +458,8 @@ impl BacktraceRenderer {
             .map(format_line_info)
             .unwrap_or_else(|| "??".to_string());
         let module_text = module
-            .map(|module| format_module_offset(&module.entry.module_path, frame_pc))
+            .as_ref()
+            .map(|module| format_module_offset(&module.module_path, frame_pc))
             .unwrap_or_else(|| format!("0x{:x}", frame.pc));
         lines.push(format!(
             "  #{index} {function} at {location} [{module_text}]"
@@ -487,36 +493,40 @@ impl BacktraceRenderer {
 
         let raw = (flags & BACKTRACE_FLAG_RAW) != 0;
         let inline = (flags & BACKTRACE_FLAG_INLINE) != 0;
-        let module = resolve_frame_module(coordinator, pids, frame);
-        let frame_pc = module.map(|module| module.pc).unwrap_or(frame.pc);
+        let module = resolve_frame_module(coordinator, analyzer, pids, frame);
+        let frame_pc = module.as_ref().map(|module| module.pc).unwrap_or(frame.pc);
 
         if raw {
-            let frames = vec![raw_display_frame(index, frame, module, true)];
-            self.frame_display_cache.insert(cache_key, frames.clone());
+            let frames = vec![raw_display_frame(index, frame, module.as_ref(), true)];
+            if module.is_some() {
+                self.frame_display_cache.insert(cache_key, frames.clone());
+            }
             return frames;
         }
 
         let resolved = analyzer
-            .and_then(|analyzer| module.map(|module| (analyzer, module)))
+            .and_then(|analyzer| module.as_ref().map(|module| (analyzer, module)))
             .and_then(|(analyzer, module)| {
                 let lookup_pc = if index == 0 {
                     module.pc
                 } else {
                     module.pc.saturating_sub(1)
                 };
-                let address =
-                    ModuleAddress::new(PathBuf::from(&module.entry.module_path), lookup_pc);
+                let address = ModuleAddress::new(module.module_path.clone(), lookup_pc);
                 analyzer.resolve_pc(&address).ok()
             });
 
         let Some(ctx) = resolved else {
-            let frames = vec![raw_display_frame(index, frame, module, false)];
-            self.frame_display_cache.insert(cache_key, frames.clone());
+            let frames = vec![raw_display_frame(index, frame, module.as_ref(), false)];
+            if module.is_some() {
+                self.frame_display_cache.insert(cache_key, frames.clone());
+            }
             return frames;
         };
 
         let module_text = module
-            .map(|module| format_module_offset(&module.entry.module_path, frame_pc))
+            .as_ref()
+            .map(|module| format_module_offset(&module.module_path, frame_pc))
             .unwrap_or_else(|| format!("0x{:x}", frame.pc));
 
         let mut display_frames = Vec::new();
@@ -583,8 +593,12 @@ fn flush_text_chunk(
     items.extend(UiTraceEvent::from_protocol_event(&chunk_event).items);
 }
 
-fn is_process_entry_frame(analyzer: &DwarfAnalyzer, module_path: &str, pc: u64) -> bool {
-    let module_path = Path::new(module_path);
+fn is_process_entry_frame(
+    analyzer: &DwarfAnalyzer,
+    module_path: impl AsRef<Path>,
+    pc: u64,
+) -> bool {
+    let module_path = module_path.as_ref();
     if let Some(entry) = analyzer.module_entry_address(module_path) {
         if pc >= entry && pc < entry.saturating_add(0x100) {
             return true;
@@ -601,13 +615,12 @@ fn is_process_entry_frame(analyzer: &DwarfAnalyzer, module_path: &str, pc: u64) 
         })
 }
 
-fn candidate_pids(event_pid: u32, proc_pid_hint: Option<u32>) -> Vec<u32> {
-    let mut seen = BTreeSet::new();
-    if let Some(pid) = proc_pid_hint {
-        seen.insert(pid);
-    }
-    seen.insert(event_pid);
-    seen.into_iter().collect()
+fn candidate_pids(
+    event_pid: u32,
+    proc_pid_hint: Option<u32>,
+    coordinator: &ProcessManager,
+) -> Vec<u32> {
+    coordinator.candidate_proc_pids_for_runtime_pid(event_pid, proc_pid_hint)
 }
 
 #[cfg(test)]
@@ -622,18 +635,20 @@ fn format_backtrace_header(status: BacktraceStatus, frames: usize, requested_dep
     )
 }
 
-fn resolve_frame_module<'a>(
-    coordinator: &'a ProcessManager,
+fn resolve_frame_module(
+    coordinator: &ProcessManager,
+    analyzer: Option<&DwarfAnalyzer>,
     pids: &[u32],
     frame: &ParsedBacktraceFrame,
-) -> Option<ResolvedFrameModule<'a>> {
+) -> Option<ResolvedFrameModule> {
     for pid in pids {
         if let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(*pid) {
             if let Some(entry) = entries.iter().find(|entry| {
                 frame.raw_ip >= entry.base && frame.raw_ip < entry.base.saturating_add(entry.size)
             }) {
                 return Some(ResolvedFrameModule {
-                    entry,
+                    module_path: PathBuf::from(&entry.module_path),
+                    cookie: entry.cookie,
                     pc: frame.raw_ip.saturating_sub(entry.offsets.text),
                 });
             }
@@ -642,29 +657,55 @@ fn resolve_frame_module<'a>(
                 .find(|entry| entry.cookie == frame.module_cookie && frame.pc < entry.size)
             {
                 return Some(ResolvedFrameModule {
-                    entry,
+                    module_path: PathBuf::from(&entry.module_path),
+                    cookie: entry.cookie,
                     pc: frame.pc,
                 });
             }
         }
     }
-    None
+    resolve_frame_module_from_analyzer(analyzer, frame)
+}
+
+fn resolve_frame_module_from_analyzer(
+    analyzer: Option<&DwarfAnalyzer>,
+    frame: &ParsedBacktraceFrame,
+) -> Option<ResolvedFrameModule> {
+    let analyzer = analyzer?;
+    analyzer
+        .loaded_module_runtime_info()
+        .into_iter()
+        .find_map(|module| {
+            let module_path = module.module_path.to_string_lossy();
+            let cookie = ghostscope_compiler::module_cookie_for_path(&module_path);
+            if cookie != frame.module_cookie {
+                return None;
+            }
+            if module.size != 0 && frame.pc >= module.size {
+                return None;
+            }
+            Some(ResolvedFrameModule {
+                module_path: module.module_path,
+                cookie,
+                pc: frame.pc,
+            })
+        })
 }
 
 #[cfg(test)]
 fn format_raw_frame(
     index: usize,
     frame: &ParsedBacktraceFrame,
-    module: Option<ResolvedFrameModule<'_>>,
+    module: Option<&ResolvedFrameModule>,
     include_metadata: bool,
 ) -> String {
     let pc = module.map(|module| module.pc).unwrap_or(frame.pc);
     let module_text = module
-        .map(|module| format_module_offset(&module.entry.module_path, pc))
+        .map(|module| format_module_offset(&module.module_path, pc))
         .unwrap_or_else(|| format!("0x{:x}", frame.pc));
     let metadata_text = if include_metadata {
         let cookie = module
-            .map(|module| module.entry.cookie)
+            .map(|module| module.cookie)
             .unwrap_or(frame.module_cookie);
         format!(" raw=0x{:x} cookie=0x{:016x}", frame.raw_ip, cookie)
     } else {
@@ -681,16 +722,16 @@ fn format_raw_frame(
 fn raw_display_frame(
     index: usize,
     frame: &ParsedBacktraceFrame,
-    module: Option<ResolvedFrameModule<'_>>,
+    module: Option<&ResolvedFrameModule>,
     include_metadata: bool,
 ) -> BacktraceDisplayFrame {
     let pc = module.map(|module| module.pc).unwrap_or(frame.pc);
     let module_text = module
-        .map(|module| format_module_offset(&module.entry.module_path, pc))
+        .map(|module| format_module_offset(&module.module_path, pc))
         .unwrap_or_else(|| format!("0x{:x}", frame.pc));
     let cookie = include_metadata.then(|| {
         module
-            .map(|module| module.entry.cookie)
+            .map(|module| module.cookie)
             .unwrap_or(frame.module_cookie)
     });
 
@@ -750,11 +791,12 @@ fn normalize_signature_type(type_name: &str) -> String {
     type_name.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn format_module_offset(module_path: &str, pc: u64) -> String {
-    let name = Path::new(module_path)
+fn format_module_offset(module_path: impl AsRef<Path>, pc: u64) -> String {
+    let module_path = module_path.as_ref();
+    let name = module_path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(module_path);
+        .unwrap_or_else(|| module_path.to_str().unwrap_or("<unknown>"));
     format!("{name}+0x{pc:x}")
 }
 
@@ -810,6 +852,27 @@ mod tests {
         assert_eq!(
             format_backtrace_header(BacktraceStatus::NoUnwindRowsForPc, 1, 3),
             "backtrace: no unwind rows for PC, 1 frame (max 3)"
+        );
+    }
+
+    #[test]
+    fn candidate_pids_include_runtime_alias_before_event_pid() {
+        let mut coordinator = ProcessManager::new();
+        coordinator.record_runtime_pid_alias(4242, 42);
+
+        assert_eq!(candidate_pids(4242, None, &coordinator), vec![42, 4242]);
+        assert_eq!(
+            candidate_pids(4242, Some(7), &coordinator),
+            vec![7, 42, 4242]
+        );
+        assert_eq!(
+            PidCacheKey::from_pids(&[7, 42, 4242]),
+            PidCacheKey {
+                first: 7,
+                second: 42,
+                third: 4242,
+                len: 3,
+            }
         );
     }
 

@@ -25,9 +25,11 @@ impl BacktraceRuntimeRunner {
         let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(proc_pid) else {
             return Ok(Vec::new());
         };
+        let entries = entries.to_vec();
 
-        Self::write_pinned_offsets_for_pid("PID-mode", proc_pid, entries);
-        Ok(DwarfAnalyzer::runtime_modules_from_pid_offsets(entries))
+        Self::record_runtime_pid_alias(coordinator, proc_pid);
+        Self::write_pinned_offsets_for_pid("PID-mode", proc_pid, &entries);
+        Ok(DwarfAnalyzer::runtime_modules_from_pid_offsets(&entries))
     }
 
     pub fn collect_target_modules(
@@ -58,9 +60,11 @@ impl BacktraceRuntimeRunner {
             let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(pid) else {
                 continue;
             };
+            let entries = entries.to_vec();
 
-            Self::write_pinned_offsets_for_pid("target-mode", pid, entries);
-            for entry in entries {
+            Self::record_runtime_pid_alias(coordinator, pid);
+            Self::write_pinned_offsets_for_pid("target-mode", pid, &entries);
+            for entry in &entries {
                 modules_by_cookie
                     .entry(entry.cookie)
                     .or_insert_with(|| LoadedModuleRuntimeInfo {
@@ -135,6 +139,22 @@ impl BacktraceRuntimeRunner {
         }
 
         modules_by_cookie.into_iter().collect()
+    }
+
+    fn record_runtime_pid_alias(coordinator: &mut ProcessManager, proc_pid: u32) {
+        let runtime_pid = ghostscope_process::resolve_event_pid_for_proc(proc_pid);
+        coordinator.record_runtime_pid_alias(runtime_pid, proc_pid);
+        if runtime_pid == proc_pid {
+            return;
+        }
+        if let Err(error) =
+            ghostscope_process::pinned_bpf_maps::insert_pid_alias(runtime_pid, proc_pid)
+        {
+            warn!(
+                "Failed to write runtime PID alias {} -> {}: {}",
+                runtime_pid, proc_pid, error
+            );
+        }
     }
 
     fn write_pinned_offsets_for_pid(mode: &str, pid: u32, entries: &[PidOffsetsEntry]) {

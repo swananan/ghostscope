@@ -37,6 +37,7 @@ pub struct ProcessManager {
     prefilled_modules: HashSet<String>,
     pid_cache: HashMap<u32, Vec<PidOffsetsEntry>>,
     prefilled_pids: HashSet<u32>,
+    runtime_pid_aliases: HashMap<u32, u32>,
 }
 
 impl Default for ProcessManager {
@@ -185,6 +186,7 @@ impl ProcessManager {
             prefilled_modules: HashSet::new(),
             pid_cache: HashMap::new(),
             prefilled_pids: HashSet::new(),
+            runtime_pid_aliases: HashMap::new(),
         }
     }
 
@@ -548,13 +550,48 @@ impl ProcessManager {
         self.pid_cache.get(&pid).map(|v| v.as_slice())
     }
 
+    pub fn record_runtime_pid_alias(&mut self, runtime_pid: u32, proc_pid: u32) {
+        if runtime_pid == proc_pid {
+            self.runtime_pid_aliases.remove(&runtime_pid);
+        } else {
+            self.runtime_pid_aliases.insert(runtime_pid, proc_pid);
+        }
+    }
+
+    pub fn resolve_runtime_proc_pid(&self, runtime_pid: u32) -> Option<u32> {
+        self.runtime_pid_aliases.get(&runtime_pid).copied()
+    }
+
+    pub fn candidate_proc_pids_for_runtime_pid(
+        &self,
+        runtime_pid: u32,
+        proc_pid_hint: Option<u32>,
+    ) -> Vec<u32> {
+        let mut pids = Vec::with_capacity(3);
+        push_unique_pid(&mut pids, proc_pid_hint);
+        push_unique_pid(&mut pids, self.resolve_runtime_proc_pid(runtime_pid));
+        push_unique_pid(&mut pids, Some(runtime_pid));
+        pids
+    }
+
     /// Drop per-PID caches when a process exits so PID reuse can prefill again.
     pub fn forget_pid(&mut self, pid: u32) {
         self.prefilled_pids.remove(&pid);
         self.pid_cache.remove(&pid);
+        self.runtime_pid_aliases
+            .retain(|runtime_pid, proc_pid| *runtime_pid != pid && *proc_pid != pid);
         for entries in self.module_cache.values_mut() {
             entries.retain(|entry| entry.pid != pid);
         }
+    }
+}
+
+fn push_unique_pid(pids: &mut Vec<u32>, pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return;
+    };
+    if !pids.contains(&pid) {
+        pids.push(pid);
     }
 }
 
@@ -643,6 +680,8 @@ mod tests {
     fn forget_pid_clears_pid_caches_and_module_entries() {
         let mut mgr = ProcessManager::new();
         mgr.prefilled_pids.insert(42);
+        mgr.record_runtime_pid_alias(4242, 42);
+        mgr.record_runtime_pid_alias(4343, 43);
         mgr.pid_cache.insert(
             42,
             vec![PidOffsetsEntry {
@@ -677,9 +716,37 @@ mod tests {
 
         assert!(!mgr.prefilled_pids.contains(&42));
         assert!(!mgr.pid_cache.contains_key(&42));
+        assert_eq!(mgr.resolve_runtime_proc_pid(4242), None);
+        assert_eq!(mgr.resolve_runtime_proc_pid(4343), Some(43));
         let module_entries = mgr.module_cache.get("/tmp/a.so").unwrap();
         assert_eq!(module_entries.len(), 1);
         assert_eq!(module_entries[0].pid, 7);
+    }
+
+    #[test]
+    fn runtime_pid_aliases_build_ordered_candidate_pids() {
+        let mut mgr = ProcessManager::new();
+        mgr.record_runtime_pid_alias(4242, 42);
+
+        assert_eq!(
+            mgr.candidate_proc_pids_for_runtime_pid(4242, None),
+            vec![42, 4242]
+        );
+        assert_eq!(
+            mgr.candidate_proc_pids_for_runtime_pid(4242, Some(7)),
+            vec![7, 42, 4242]
+        );
+        assert_eq!(
+            mgr.candidate_proc_pids_for_runtime_pid(4242, Some(42)),
+            vec![42, 4242]
+        );
+
+        mgr.record_runtime_pid_alias(4242, 4242);
+        assert_eq!(mgr.resolve_runtime_proc_pid(4242), None);
+        assert_eq!(
+            mgr.candidate_proc_pids_for_runtime_pid(4242, None),
+            vec![4242]
+        );
     }
 
     #[test]
