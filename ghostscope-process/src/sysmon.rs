@@ -1423,7 +1423,6 @@ fn write_offsets_for_pid(
 ) -> anyhow::Result<bool> {
     use crate::pinned_bpf_maps::{
         insert_offsets_for_pid, purge_offsets_for_pid, replace_ranges_for_pid,
-        ProcModuleOffsetsValue,
     };
 
     let proc_pid = proc_pid_for_event(event_pid);
@@ -1456,34 +1455,19 @@ fn write_offsets_for_pid(
                             module_path
                         );
                     }
-                    let mut by_pid: HashMap<u32, Vec<(u64, ProcModuleOffsetsValue)>> =
-                        HashMap::new();
-                    for (pid, cookie, off, base, size) in
-                        guard.cached_offsets_for_module(&module_path)
-                    {
-                        by_pid.entry(pid).or_default().push((
-                            cookie,
-                            ProcModuleOffsetsValue::new(
-                                off.text, off.rodata, off.data, off.bss, base, size,
-                            ),
-                        ));
+                    let mut target_pids = BTreeSet::new();
+                    for (pid, _, _, _, _) in guard.cached_offsets_for_module(&module_path) {
+                        target_pids.insert(pid);
                     }
-                    for (pid, items) in by_pid {
+                    drop(guard);
+
+                    for pid in target_pids {
                         let runtime_pid = resolve_event_pid_for_proc(pid);
-                        guard.record_runtime_pid_alias(runtime_pid, pid);
-                        write_pinned_runtime_pid_alias(runtime_pid, pid);
-                        match insert_offsets_for_pid(pid, &items) {
-                            Ok(inserted) if inserted > 0 => {
-                                tracing::info!(
-                                    "Sysmon: module refresh inserted {} offset entries for proc pid {} (event pid {})",
-                                    inserted, pid, event_pid
-                                );
-                                let _ = crate::pinned_bpf_maps::insert_allowed_pid(runtime_pid);
-                                inserted_any = true;
-                            }
-                            Ok(_) => {}
+                        match refresh_full_offsets_for_pid(mgr, pid, runtime_pid) {
+                            Ok(true) => inserted_any = true,
+                            Ok(false) => {}
                             Err(err) => tracing::warn!(
-                                "Sysmon: module refresh failed to insert offsets for proc pid {}: {}",
+                                "Sysmon: module refresh failed to publish full snapshot for proc pid {}: {}",
                                 pid,
                                 err
                             ),
