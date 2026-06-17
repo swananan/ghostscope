@@ -2108,65 +2108,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 &format!("{name_prefix}_row_ranges_map_ptr"),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let key_alloca = self.pm_key_alloca.ok_or_else(|| {
-            CodeGenError::LLVMError("pm_key not allocated in entry block".to_string())
-        })?;
-        let key_arr_ty = i32_type.array_type(4);
-        let zero = i32_type.const_zero();
-        let cookie_lo = self
-            .builder
-            .build_int_truncate(
-                module_cookie,
-                i32_type,
-                &format!("{name_prefix}_row_range_cookie_lo"),
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let cookie_hi_shifted = self
-            .builder
-            .build_right_shift(
-                module_cookie,
-                i64_type.const_int(32, false),
-                false,
-                &format!("{name_prefix}_row_range_cookie_hi_shift"),
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let cookie_hi = self
-            .builder
-            .build_int_truncate(
-                cookie_hi_shifted,
-                i32_type,
-                &format!("{name_prefix}_row_range_cookie_hi"),
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        // SAFETY: pm_key_alloca is a [4 x i32] entry-block alloca. The first
-        // two words are the u64 hash key consumed by bt_module_row_ranges.
-        let cookie_lo_ptr = unsafe {
-            self.builder
-                .build_gep(
-                    key_arr_ty,
-                    key_alloca,
-                    &[zero, zero],
-                    &format!("{name_prefix}_row_range_cookie_lo_ptr"),
-                )
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-        };
+        let key_alloca =
+            self.build_entry_alloca(i64_type, &format!("{name_prefix}_row_range_key"))?;
         self.builder
-            .build_store(cookie_lo_ptr, cookie_lo)
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let cookie_hi_index = i32_type.const_int(1, false);
-        // SAFETY: index 1 is within the [4 x i32] key scratch space.
-        let cookie_hi_ptr = unsafe {
-            self.builder
-                .build_gep(
-                    key_arr_ty,
-                    key_alloca,
-                    &[zero, cookie_hi_index],
-                    &format!("{name_prefix}_row_range_cookie_hi_ptr"),
-                )
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-        };
-        self.builder
-            .build_store(cookie_hi_ptr, cookie_hi)
+            .build_store(key_alloca, module_cookie)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let key_ptr = self
             .builder
@@ -5012,6 +4957,10 @@ mod tests {
         assert!(
             !ir.contains("module_matches"),
             "row bounds lookup should not use static candidate comparisons\nIR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("row_range_cookie_lo") && !ir.contains("row_range_cookie_hi"),
+            "row bounds lookup should store the native u64 module cookie\nIR:\n{ir}"
         );
     }
 }
