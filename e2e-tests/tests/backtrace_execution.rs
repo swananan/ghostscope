@@ -333,6 +333,31 @@ fn backtrace_blocks_after(stdout: &str, marker: &str, depth: u8) -> anyhow::Resu
     Ok(blocks)
 }
 
+fn matching_backtrace_block_with_ordered_patterns_after(
+    stdout: &str,
+    stderr: &str,
+    marker: &str,
+    depth: u8,
+    description: &str,
+    patterns: &[&str],
+) -> anyhow::Result<String> {
+    let chunks = event_chunks_with_marker(stdout, marker);
+    anyhow::ensure!(
+        !chunks.is_empty(),
+        "missing marker {marker:?}\nSTDOUT: {stdout}"
+    );
+    let mut blocks = Vec::new();
+    for chunk in chunks {
+        blocks.extend(backtrace_blocks_after(chunk, marker, depth)?);
+    }
+    blocks
+        .into_iter()
+        .find(|block| assert_ordered_patterns(block, patterns).is_ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("expected {description}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}")
+        })
+}
+
 fn event_chunks_with_marker<'a>(stdout: &'a str, marker: &str) -> Vec<&'a str> {
     stdout
         .split("\n[")
@@ -994,21 +1019,26 @@ trace cross_module_lib_leaf {
         return Ok(());
     }
 
-    let block = first_backtrace_block_after(&stdout, "T_MODE_CROSS_MODULE_STACK", 5)?;
+    let expected_frames = [
+        "#0 cross_module_lib_leaf",
+        "#1 cross_module_lib_probe",
+        "#2 cross_module_main_caller",
+        "#3 cross_module_main_loop",
+        "#4 main",
+    ];
+    let block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "T_MODE_CROSS_MODULE_STACK",
+        5,
+        "a bounded target-mode cross-module stack prefix",
+        &expected_frames,
+    )?;
     assert!(
         block.contains("backtrace: truncated, 5 frames (max 5)"),
         "expected a bounded target-mode cross-module stack prefix\nBLOCK:\n{block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
-    assert_ordered_patterns(
-        block,
-        &[
-            "#0 cross_module_lib_leaf",
-            "#1 cross_module_lib_probe",
-            "#2 cross_module_main_caller",
-            "#3 cross_module_main_loop",
-            "#4 main",
-        ],
-    )?;
+    assert_ordered_patterns(&block, &expected_frames)?;
     assert!(
         block.contains("[libbacktrace_cross_module.so+"),
         "expected at least one shared-library frame\nBLOCK:\n{block}"
@@ -1024,7 +1054,7 @@ trace cross_module_lib_leaf {
             && !block.contains("stopped: no unwind rows for PC"),
         "target-mode cross-module stack should not stop on an unwind error\nBLOCK:\n{block}\nSTDERR:\n{stderr}"
     );
-    assert_no_adjacent_duplicate_frame_locations(block)?;
+    assert_no_adjacent_duplicate_frame_locations(&block)?;
 
     Ok(())
 }
@@ -1064,40 +1094,50 @@ trace cross_module_lib_leaf {
         "expected both target-mode backtrace traces to emit events\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
 
-    let probe_block = first_backtrace_block_after(&stdout, "T_MODE_SHARED_CFI_PROBE", 5)?;
-    assert_ordered_patterns(
-        probe_block,
-        &[
-            "#0 cross_module_lib_probe",
-            "#1 cross_module_main_caller",
-            "#2 cross_module_main_loop",
-            "#3 main",
-        ],
+    let expected_probe_frames = [
+        "#0 cross_module_lib_probe",
+        "#1 cross_module_main_caller",
+        "#2 cross_module_main_loop",
+        "#3 main",
+    ];
+    let probe_block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "T_MODE_SHARED_CFI_PROBE",
+        5,
+        "a target-mode shared-CFI probe stack",
+        &expected_probe_frames,
     )?;
+    assert_ordered_patterns(&probe_block, &expected_probe_frames)?;
     assert!(
         probe_block.contains("[libbacktrace_cross_module.so+")
             && probe_block.contains("[backtrace_cross_module_program+"),
         "probe trace should unwind across the shared library and executable\nBLOCK:\n{probe_block}"
     );
 
-    let leaf_block = first_backtrace_block_after(&stdout, "T_MODE_SHARED_CFI_LEAF", 5)?;
-    assert_ordered_patterns(
-        leaf_block,
-        &[
-            "#0 cross_module_lib_leaf",
-            "#1 cross_module_lib_probe",
-            "#2 cross_module_main_caller",
-            "#3 cross_module_main_loop",
-            "#4 main",
-        ],
+    let expected_leaf_frames = [
+        "#0 cross_module_lib_leaf",
+        "#1 cross_module_lib_probe",
+        "#2 cross_module_main_caller",
+        "#3 cross_module_main_loop",
+        "#4 main",
+    ];
+    let leaf_block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "T_MODE_SHARED_CFI_LEAF",
+        5,
+        "a target-mode shared-CFI leaf stack",
+        &expected_leaf_frames,
     )?;
+    assert_ordered_patterns(&leaf_block, &expected_leaf_frames)?;
     assert!(
         leaf_block.contains("[libbacktrace_cross_module.so+")
             && leaf_block.contains("[backtrace_cross_module_program+"),
         "leaf trace should unwind across the shared library and executable\nBLOCK:\n{leaf_block}"
     );
-    assert_no_adjacent_duplicate_frame_locations(probe_block)?;
-    assert_no_adjacent_duplicate_frame_locations(leaf_block)?;
+    assert_no_adjacent_duplicate_frame_locations(&probe_block)?;
+    assert_no_adjacent_duplicate_frame_locations(&leaf_block)?;
 
     Ok(())
 }
