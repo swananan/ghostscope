@@ -3,6 +3,9 @@
 //! This module handles compilation of various expression types to LLVM IR.
 
 use super::context::{CodeGenError, EbpfContext, Result, RuntimeAddress};
+use super::expression_plan::{
+    BinaryEmitKind, BinaryIntegerSemantics, BuiltinCallPlan, SpecialVarPlan,
+};
 use crate::script::{BinaryOp, Expr};
 use aya_ebpf_bindings::bindings::bpf_func_id::BPF_FUNC_probe_read_user;
 use ghostscope_dwarf::{
@@ -32,14 +35,6 @@ struct IndexableElementInfo {
     element_type: DwarfType,
     stride: u64,
     module_path: Option<PathBuf>,
-}
-
-#[derive(Clone, Copy, Default)]
-struct BinaryIntegerSemantics {
-    unsigned_ordering_width: Option<u32>,
-    unsigned_division_width: Option<u32>,
-    unsigned_bitwise_width: Option<u32>,
-    unsigned_right_shift_width: Option<u32>,
 }
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
@@ -215,7 +210,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok((selected_pid, selected_tid))
     }
 
-    fn is_dwarf_aggregate_expr(&mut self, expr: &Expr) -> bool {
+    pub(super) fn is_dwarf_aggregate_expr(&mut self, expr: &Expr) -> bool {
         if let Expr::Cast { target_type, .. } = expr {
             return self
                 .resolve_cast_target_type(target_type)
@@ -237,7 +232,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// - Script string literals (compile to pointer data)
     /// - Alias variables bound to addresses
     /// - DWARF-backed expressions whose type is pointer or array
-    fn is_pointer_like_expr(&mut self, expr: &Expr) -> bool {
+    pub(super) fn is_pointer_like_expr(&mut self, expr: &Expr) -> bool {
         use crate::script::Expr as E;
         match expr {
             E::AddressOf(_) => return true,
@@ -901,7 +896,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         ))
     }
 
-    fn unsigned_ordering_width_for_exprs(&mut self, left: &Expr, right: &Expr) -> Option<u32> {
+    pub(super) fn unsigned_ordering_width_for_exprs(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Option<u32> {
         let plan = self.integer_comparison_plan_for_exprs(left, right)?;
         if plan.is_unsigned {
             Some((plan.size * 8) as u32)
@@ -910,7 +909,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
-    fn unsigned_shift_width_for_expr(&mut self, expr: &Expr) -> Option<u32> {
+    pub(super) fn unsigned_shift_width_for_expr(&mut self, expr: &Expr) -> Option<u32> {
         let c_type = self.dwarf_integer_comparison_expr(expr)?.promoted();
         if c_type.is_unsigned {
             Some((c_type.size * 8) as u32)
@@ -2501,19 +2500,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 let sanitized = name.trim_start_matches('$');
                 self.handle_special_variable(sanitized)
             }
-            Expr::BuiltinCall { name, args } => match name.as_str() {
-                "memcmp" => {
-                    if args.len() != 3 {
-                        return Err(CodeGenError::TypeError("memcmp expects 3 arguments".into()));
-                    }
+            Expr::BuiltinCall { name, args } => match self.plan_builtin_call(name, args)? {
+                BuiltinCallPlan::Memcmp => {
                     self.compile_memcmp_builtin(&args[0], &args[1], &args[2])
                 }
-                "strncmp" => {
-                    if args.len() != 3 {
-                        return Err(CodeGenError::TypeError(
-                            "strncmp expects 3 arguments".into(),
-                        ));
-                    }
+                BuiltinCallPlan::Strncmp => {
                     // Accept string on either side: string literal or script string variable
                     fn extract_script_string(
                         this: &mut EbpfContext<'_, '_>,
@@ -2548,12 +2539,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         )),
                     }
                 }
-                "starts_with" => {
-                    if args.len() != 2 {
-                        return Err(CodeGenError::TypeError(
-                            "starts_with expects 2 arguments".into(),
-                        ));
-                    }
+                BuiltinCallPlan::StartsWith => {
                     // Accept string on either side (literal or script string var)
                     fn extract_script_string(
                         this: &mut EbpfContext<'_, '_>,
@@ -2596,68 +2582,23 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         )),
                     }
                 }
-                _ => Err(CodeGenError::NotImplemented(format!(
-                    "Unknown builtin function: {name}"
-                ))),
             },
             Expr::BinaryOp { left, op, right } => {
-                // Guard: disallow arithmetic/ordered comparisons that involve DWARF aggregates
-                let is_integer_op = matches!(
-                    op,
-                    BinaryOp::Add
-                        | BinaryOp::Subtract
-                        | BinaryOp::Multiply
-                        | BinaryOp::Divide
-                        | BinaryOp::Modulo
-                        | BinaryOp::BitAnd
-                        | BinaryOp::BitXor
-                        | BinaryOp::BitOr
-                        | BinaryOp::ShiftLeft
-                        | BinaryOp::ShiftRight
-                );
-                let is_ordered = matches!(
-                    op,
-                    BinaryOp::LessThan
-                        | BinaryOp::LessEqual
-                        | BinaryOp::GreaterThan
-                        | BinaryOp::GreaterEqual
-                );
-                if (is_integer_op || is_ordered)
-                    && (self.is_dwarf_aggregate_expr(left) || self.is_dwarf_aggregate_expr(right))
-                {
-                    return Err(CodeGenError::TypeError(
-                        "Unsupported arithmetic/ordered comparison involving struct/union/array, or unsupported bitwise operation involving struct/union/array. Select a scalar field (e.g., 'obj.field'), or use '&expr +/- <integer literal>' in an alias/address context if you need a raw address."
-                            .to_string(),
-                    ));
-                }
-
-                // Guard: disallow ordered comparisons on pointers/addresses; only ==/!= are allowed
-                if is_ordered
-                    && (self.is_pointer_like_expr(left) || self.is_pointer_like_expr(right))
-                {
-                    return Err(CodeGenError::TypeError(
-                        "Pointer ordered comparison ('<', '<=', '>', '>=') is not supported. Use '==' or '!=' to compare addresses. If you need to adjust an address, use '&expr +/- <integer literal>' in an alias/address context; to compare values, select a scalar field (e.g., 'obj.field')."
-                            .to_string(),
-                    ));
-                }
-                // String comparison fast-path: script string vs DWARF char*/char[N]
-                if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
-                    if let (Expr::String(lit), other) = (&**left, &**right) {
-                        return self.compile_string_comparison(
-                            other,
-                            lit,
-                            matches!(op, BinaryOp::Equal),
-                        );
-                    } else if let (other, Expr::String(lit)) = (&**left, &**right) {
-                        return self.compile_string_comparison(
-                            other,
-                            lit,
-                            matches!(op, BinaryOp::Equal),
-                        );
-                    }
+                let binary_plan = self.plan_binary_expr(left, op, right)?;
+                if let BinaryEmitKind::StringComparison(string_plan) = &binary_plan.emit_kind {
+                    let other = if string_plan.literal_on_left {
+                        right.as_ref()
+                    } else {
+                        left.as_ref()
+                    };
+                    return self.compile_string_comparison(
+                        other,
+                        &string_plan.literal,
+                        string_plan.equal,
+                    );
                 }
                 // Implement short-circuit for logical OR (||) and logical AND (&&)
-                if matches!(op, BinaryOp::LogicalOr) {
+                if matches!(&binary_plan.emit_kind, BinaryEmitKind::LogicalOr) {
                     // Evaluate LHS to boolean (non-zero => true). Accept integer or pointer.
                     let lhs_val = self.compile_expr(left)?;
                     let lhs_int = match lhs_val {
@@ -2741,7 +2682,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     let one = i1.const_int(1, false);
                     phi.add_incoming(&[(&one, curr_block), (&rhs_bool, rhs_end_block)]);
                     return Ok(phi.as_basic_value());
-                } else if matches!(op, BinaryOp::LogicalAnd) {
+                } else if matches!(&binary_plan.emit_kind, BinaryEmitKind::LogicalAnd) {
                     // Evaluate LHS to boolean (non-zero => true). Accept integer or pointer.
                     let lhs_val = self.compile_expr(left)?;
                     let lhs_int = match lhs_val {
@@ -2826,42 +2767,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     return Ok(phi.as_basic_value());
                 }
 
-                let unsigned_ordering_width = if is_ordered {
-                    self.unsigned_ordering_width_for_exprs(left, right)
-                } else {
-                    None
-                };
-                let unsigned_division_width = if matches!(op, BinaryOp::Divide | BinaryOp::Modulo) {
-                    self.unsigned_ordering_width_for_exprs(left, right)
-                } else {
-                    None
-                };
-                let unsigned_bitwise_width =
-                    if matches!(op, BinaryOp::BitAnd | BinaryOp::BitXor | BinaryOp::BitOr) {
-                        self.unsigned_ordering_width_for_exprs(left, right)
-                    } else {
-                        None
-                    };
-                let unsigned_right_shift_width = if matches!(op, BinaryOp::ShiftRight) {
-                    self.unsigned_shift_width_for_expr(left)
-                } else {
-                    None
-                };
-                let integer_semantics = BinaryIntegerSemantics {
-                    unsigned_ordering_width,
-                    unsigned_division_width,
-                    unsigned_bitwise_width,
-                    unsigned_right_shift_width,
-                };
-
                 // Default eager evaluation for other binary ops
                 let left_val = self.compile_expr(left)?;
                 let right_val = self.compile_expr(right)?;
                 self.compile_binary_op_with_ordering(
                     left_val,
-                    op.clone(),
+                    binary_plan.op,
                     right_val,
-                    integer_semantics,
+                    binary_plan.integer_semantics,
                 )
             }
             Expr::MemberAccess(_, _) => {
@@ -2959,16 +2872,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     /// Handle special variables like $pid, $tid, etc.
     pub fn handle_special_variable(&mut self, name: &str) -> Result<BasicValueEnum<'ctx>> {
-        match name {
-            "pid" => {
+        match self.plan_special_variable(name)? {
+            SpecialVarPlan::Pid => {
                 let (pid, _tid) = self.get_special_pid_tid_values()?;
                 Ok(pid.into())
             }
-            "tid" => {
+            SpecialVarPlan::Tid => {
                 let (_pid, tid) = self.get_special_pid_tid_values()?;
                 Ok(tid.into())
             }
-            "host_pid" => {
+            SpecialVarPlan::HostPid => {
                 let (host_pid, _host_tid) = self.get_host_pid_tid_values()?;
                 let host_pid = self
                     .builder
@@ -2976,7 +2889,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                 Ok(host_pid.into())
             }
-            "input_pid" => {
+            SpecialVarPlan::InputPid => {
                 let input_pid = self.compile_options.input_pid.ok_or_else(|| {
                     CodeGenError::NotImplemented(
                         "Special variable '$input_pid' is only available in -p mode".to_string(),
@@ -2988,28 +2901,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .const_int(input_pid as u64, false)
                     .into())
             }
-            "timestamp" => {
+            SpecialVarPlan::Timestamp => {
                 // Use BPF helper to get current timestamp
                 let ts = self.get_current_timestamp()?;
                 Ok(ts.into())
             }
-            "pc" => self.load_special_register_value(16),
-            "sp" => self.load_special_register_value(7),
-            _ => {
-                let supported = [
-                    "$pid",
-                    "$tid",
-                    "$host_pid",
-                    "$input_pid",
-                    "$timestamp",
-                    "$pc",
-                    "$sp",
-                ]
-                .join(", ");
-                Err(CodeGenError::NotImplemented(format!(
-                    "Unknown special variable '${name}'. Supported: {supported}"
-                )))
-            }
+            SpecialVarPlan::Pc => self.load_special_register_value(16),
+            SpecialVarPlan::Sp => self.load_special_register_value(7),
         }
     }
 

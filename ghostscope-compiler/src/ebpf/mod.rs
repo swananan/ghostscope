@@ -7,6 +7,7 @@ pub mod codegen; // New instruction analysis and variable resolution
 pub mod context;
 pub mod dwarf_bridge;
 pub mod expression;
+mod expression_plan;
 pub mod helper_functions;
 pub mod instruction; // New staged transmission and ringbuf messaging
 pub mod maps;
