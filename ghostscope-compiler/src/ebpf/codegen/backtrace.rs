@@ -1,18 +1,17 @@
+use super::backtrace_plan::{
+    BacktraceEmitMode, BacktraceInstructionPlan, BPF_INLINE_BACKTRACE_FRAME_LIMIT,
+};
 use super::*;
-use crate::ebpf::context::BacktraceModuleRowRangeEntry;
-use crate::script::{BacktraceStatement, Statement};
+use crate::script::BacktraceStatement;
 use aya_ebpf_bindings::bindings::bpf_func_id::{BPF_FUNC_map_lookup_elem, BPF_FUNC_tail_call};
 use ghostscope_dwarf::{CompactUnwindRow, MemoryAccessSize, ModuleAddress};
 use inkwell::basic_block::BasicBlock;
 use inkwell::values::BasicMetadataValueEnum;
-use std::{path::PathBuf, time::Instant};
+use std::path::PathBuf;
 
 const X86_64_DWARF_RIP: u16 = 16;
 const X86_64_DWARF_RBP: u16 = 6;
 const X86_64_DWARF_RSP: u16 = 7;
-// DWARF row lookup expands into BPF branches, so large depths move to the
-// tail-call step program after a short prefix to avoid LLVM branch-range limits.
-const BPF_INLINE_BACKTRACE_FRAME_LIMIT: u8 = 5;
 const BPF_BACKTRACE_FRAMES_PER_TAIL_CALL: u8 = 4;
 const BPF_BACKTRACE_MAX_STEP_INVOCATIONS: u8 = 32;
 const BPF_BACKTRACE_STEP_PROG_INDEX: u32 = 0;
@@ -100,155 +99,13 @@ enum BacktraceUnwindRowForPc {
 }
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
-    pub(crate) fn prepare_backtrace_unwind_rows(&mut self, statements: &[Statement]) {
-        self.backtrace_unwind_rows.clear();
-        self.backtrace_module_row_ranges.clear();
-        self.backtrace_tail_call_slots = 1;
-        self.next_backtrace_tail_call_slot = 0;
-        if !statements_have_backtrace(statements) {
-            return;
-        }
-
-        let Some(analyzer) = self.process_analyzer else {
-            return;
-        };
-        let Some(compile_ctx) = self.current_compile_time_context.clone() else {
-            return;
-        };
-
-        let runtime_rows = self.runtime_backtrace_unwind_rows(analyzer);
-        if !runtime_rows.is_empty() {
-            self.backtrace_unwind_rows = runtime_rows;
-            self.backtrace_tail_call_slots = self.required_backtrace_tail_call_slots(statements);
-            return;
-        }
-
-        let module_address = ModuleAddress::new(
-            PathBuf::from(&compile_ctx.module_path),
-            compile_ctx.pc_address,
-        );
-        let Ok(ctx) = analyzer.resolve_pc(&module_address) else {
-            return;
-        };
-        let Ok(Some(table)) = analyzer.compact_unwind_table_for_context(&ctx) else {
-            return;
-        };
-
-        self.backtrace_unwind_rows = table
-            .rows
-            .iter()
-            .filter_map(crate::backtrace_unwind_row_from_compact)
-            .collect();
-        self.backtrace_unwind_rows
-            .sort_by_key(|row| (row.pc_start, row.pc_end));
-        self.backtrace_tail_call_slots = self.required_backtrace_tail_call_slots(statements);
-    }
-
-    fn required_backtrace_tail_call_slots(&self, statements: &[Statement]) -> u8 {
-        let depth = self
-            .compile_options
-            .backtrace_depth
-            .clamp(1, crate::MAX_BACKTRACE_DEPTH);
-        if depth <= BPF_INLINE_BACKTRACE_FRAME_LIMIT {
-            return 1;
-        }
-        count_backtrace_statements(statements).clamp(1, u8::MAX as usize) as u8
-    }
-
-    fn runtime_backtrace_unwind_rows(
-        &mut self,
-        analyzer: &ghostscope_dwarf::DwarfAnalyzer,
-    ) -> Vec<ghostscope_protocol::BacktraceUnwindRow> {
-        struct ModuleRows {
-            cookie: u64,
-            module_path: PathBuf,
-            compact_rows: usize,
-            bpf_rows: Vec<ghostscope_protocol::BacktraceUnwindRow>,
-            elapsed_ms: u128,
-        }
-
-        let started_at = Instant::now();
-        let mut modules = Vec::<ModuleRows>::new();
-        for module in analyzer.loaded_module_runtime_info() {
-            let Some(module_id) = analyzer.module_id_for_path(&module.module_path) else {
-                continue;
-            };
-            let module_started_at = Instant::now();
-            let Ok(Some(table)) = analyzer.compact_unwind_table_for_module(module_id) else {
-                continue;
-            };
-            let mut bpf_rows = table
-                .rows
-                .iter()
-                .filter_map(crate::backtrace_unwind_row_from_compact)
-                .collect::<Vec<_>>();
-            bpf_rows.sort_by_key(|row| (row.pc_start, row.pc_end));
-            if bpf_rows.is_empty() {
-                continue;
-            }
-            let module_path = module.module_path.to_string_lossy();
-            let cookie = self.cookie_for_module_or_fallback(&module_path);
-            if modules.iter().any(|module| module.cookie == cookie) {
-                continue;
-            }
-            modules.push(ModuleRows {
-                cookie,
-                module_path: module.module_path.clone(),
-                compact_rows: table.rows.len(),
-                bpf_rows,
-                elapsed_ms: module_started_at.elapsed().as_millis(),
-            });
-        }
-        modules.sort_by_key(|module| module.cookie);
-
-        let mut rows = Vec::new();
-        for module in modules.iter() {
-            let row_start = rows.len();
-            rows.extend(module.bpf_rows.iter().copied());
-            let row_end = rows.len();
-            self.backtrace_module_row_ranges
-                .push(BacktraceModuleRowRangeEntry {
-                    cookie: module.cookie,
-                    range: ghostscope_protocol::BacktraceModuleRowRange {
-                        row_start: row_start as u32,
-                        row_end: row_end as u32,
-                    },
-                });
-            tracing::info!(
-                module = %module.module_path.display(),
-                compact_rows = module.compact_rows,
-                bpf_rows = module.bpf_rows.len(),
-                row_start,
-                row_end,
-                elapsed_ms = module.elapsed_ms,
-                "Prepared module-normalized bt unwind rows for module"
-            );
-        }
-        tracing::info!(
-            modules = self.backtrace_module_row_ranges.len(),
-            rows = rows.len(),
-            elapsed_ms = started_at.elapsed().as_millis(),
-            "Prepared module-normalized runtime DWARF bt unwind rows"
-        );
-        rows
-    }
-
     pub fn generate_backtrace_instruction(&mut self, stmt: &BacktraceStatement) -> Result<()> {
-        if self.should_use_tail_call_backtrace() {
-            return self.generate_tail_call_backtrace_instruction(stmt);
+        let plan = self.plan_backtrace_instruction(stmt);
+        if matches!(plan.mode, BacktraceEmitMode::TailCall) {
+            return self.generate_tail_call_backtrace_instruction(&plan);
         }
 
-        self.generate_inline_backtrace_instruction(stmt)
-    }
-
-    fn should_use_tail_call_backtrace(&self) -> bool {
-        let depth = self
-            .compile_options
-            .backtrace_depth
-            .clamp(1, crate::MAX_BACKTRACE_DEPTH);
-        depth > BPF_INLINE_BACKTRACE_FRAME_LIMIT
-            && !self.backtrace_unwind_rows.is_empty()
-            && self.current_compile_time_context.is_some()
+        self.generate_inline_backtrace_instruction(&plan)
     }
 
     /// Generate a DWARF-backed Backtrace instruction.
@@ -256,17 +113,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// eBPF records `(module_cookie, normalized_pc, raw_ip)` frames and advances
     /// the unwind state from compact DWARF CFI rows. Userspace owns final source
     /// line and inline-chain symbolization.
-    fn generate_inline_backtrace_instruction(&mut self, stmt: &BacktraceStatement) -> Result<()> {
-        let depth = self
-            .compile_options
-            .backtrace_depth
-            .clamp(1, crate::MAX_BACKTRACE_DEPTH);
-        let flags = backtrace_flags(stmt);
+    fn generate_inline_backtrace_instruction(
+        &mut self,
+        plan: &BacktraceInstructionPlan,
+    ) -> Result<()> {
+        let depth = plan.depth;
+        let flags = plan.flags;
         info!("Generating Backtrace instruction: depth={}", depth);
 
-        let payload_size =
-            BACKTRACE_DATA_SIZE + depth as usize * std::mem::size_of::<BacktraceFrameData>();
-        let instruction_size = INSTRUCTION_HEADER_SIZE + payload_size;
+        let payload_size = plan.payload_size;
+        let instruction_size = plan.instruction_size;
         let inst_buffer = self
             .reserve_instruction_region_or_return_zero(instruction_size as u64)?
             .into_value_after_runtime_returns();
@@ -665,21 +521,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     fn generate_tail_call_backtrace_instruction(
         &mut self,
-        stmt: &BacktraceStatement,
+        plan: &BacktraceInstructionPlan,
     ) -> Result<()> {
-        let depth = self
-            .compile_options
-            .backtrace_depth
-            .clamp(1, crate::MAX_BACKTRACE_DEPTH);
-        let flags = backtrace_flags(stmt);
+        let depth = plan.depth;
+        let flags = plan.flags;
         info!(
             "Generating tail-call Backtrace instruction: depth={}",
             depth
         );
 
-        let payload_size =
-            BACKTRACE_DATA_SIZE + depth as usize * std::mem::size_of::<BacktraceFrameData>();
-        let instruction_size = INSTRUCTION_HEADER_SIZE + payload_size;
+        let payload_size = plan.payload_size;
+        let instruction_size = plan.instruction_size;
         let offset_ptr = self.event_offset_alloca.ok_or_else(|| {
             CodeGenError::LLVMError("event_offset not allocated in entry block".to_string())
         })?;
@@ -4753,10 +4605,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 }
 
-fn statements_have_backtrace(statements: &[Statement]) -> bool {
-    count_backtrace_statements(statements) > 0
-}
-
 fn backtrace_row_binary_search_steps(row_count: usize) -> usize {
     if row_count <= 1 {
         1
@@ -4765,48 +4613,10 @@ fn backtrace_row_binary_search_steps(row_count: usize) -> usize {
     }
 }
 
-fn count_backtrace_statements(statements: &[Statement]) -> usize {
-    statements.iter().map(count_statement_backtraces).sum()
-}
-
-fn count_statement_backtraces(statement: &Statement) -> usize {
-    match statement {
-        Statement::Backtrace(_) => 1,
-        Statement::TracePoint { body, .. } | Statement::Block(body) => {
-            count_backtrace_statements(body)
-        }
-        Statement::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            count_backtrace_statements(then_body)
-                + else_body
-                    .as_deref()
-                    .map(count_statement_backtraces)
-                    .unwrap_or(0)
-        }
-        _ => 0,
-    }
-}
-
-fn backtrace_flags(stmt: &BacktraceStatement) -> u8 {
-    let mut flags = 0u8;
-    if stmt.raw {
-        flags |= BACKTRACE_FLAG_RAW;
-    }
-    if stmt.full {
-        flags |= BACKTRACE_FLAG_FULL;
-    }
-    if stmt.inline {
-        flags |= BACKTRACE_FLAG_INLINE;
-    }
-    flags
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ebpf::context::BacktraceModuleRowRangeEntry;
     use crate::CompileOptions;
     use inkwell::AddressSpace;
 
