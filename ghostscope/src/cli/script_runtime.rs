@@ -131,6 +131,22 @@ fn events_include_backtrace(events: &[ghostscope_protocol::ParsedTraceEvent]) ->
     })
 }
 
+fn target_mode_event_pids(
+    session: &GhostSession,
+    events: &[ghostscope_protocol::ParsedTraceEvent],
+) -> Vec<u32> {
+    if session.proc_pid().is_some() {
+        return Vec::new();
+    }
+    events
+        .iter()
+        .map(|event| event.pid)
+        .filter(|pid| *pid != 0)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Run GhostScope in command line mode with merged configuration
 pub async fn run_command_line_runtime_with_config(config: ResolvedConfig) -> Result<()> {
     info!("Starting GhostScope in command line mode");
@@ -414,10 +430,19 @@ async fn run_cli_with_session(
                 match result {
                     Ok(events) => {
                         if !events.is_empty() {
+                            let runtime_pids = target_mode_event_pids(&session, &events);
                             let refresh_result = if events_include_backtrace(&events) {
-                                session.refresh_pid_runtime_modules_before_rendering().await
+                                session
+                                    .refresh_pid_runtime_modules_before_rendering_for_runtime_pids(
+                                        &runtime_pids,
+                                    )
+                                    .await
                             } else {
-                                session.refresh_pid_runtime_modules_if_needed().await
+                                session
+                                    .refresh_pid_runtime_modules_if_needed_for_runtime_pids(
+                                        &runtime_pids,
+                                    )
+                                    .await
                             };
                             match refresh_result {
                                 Ok(loaded) if loaded > 0 => {

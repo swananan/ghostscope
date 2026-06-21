@@ -63,12 +63,20 @@ pub fn build_runtime_pid_plan(
     }
 
     if input.helper_supported {
-        plan.special_vars_pid_ns = input.target_pid_views.and_then(helper_pid_ns).or_else(|| {
-            input
-                .in_container
-                .then_some(input.self_pid_views.and_then(helper_pid_ns))
-                .flatten()
-        });
+        let self_pid_ns_for_target_mode = input
+            .target_pid_views
+            .is_none()
+            .then_some(input.self_pid_views.and_then(helper_pid_ns))
+            .flatten();
+        let self_pid_ns_for_container_fallback = input
+            .in_container
+            .then_some(input.self_pid_views.and_then(helper_pid_ns))
+            .flatten();
+
+        plan.special_vars_pid_ns = input
+            .target_pid_views
+            .and_then(helper_pid_ns)
+            .or_else(|| self_pid_ns_for_target_mode.or(self_pid_ns_for_container_fallback));
 
         plan.proc_offsets_pid_ns = input
             .target_pid_views
@@ -77,12 +85,7 @@ pub fn build_runtime_pid_plan(
                     .then_some(helper_pid_ns(pid_views))
                     .flatten()
             })
-            .or_else(|| {
-                input
-                    .in_container
-                    .then_some(input.self_pid_views.and_then(helper_pid_ns))
-                    .flatten()
-            });
+            .or_else(|| self_pid_ns_for_target_mode.or(self_pid_ns_for_container_fallback));
     }
 
     Ok(plan)
@@ -224,6 +227,33 @@ mod tests {
             target_pid_views: None,
             self_pid_views: Some(&self_pid_views),
             in_container: true,
+            helper_supported: true,
+        })
+        .unwrap();
+
+        assert_eq!(plan.pid_filter, None);
+        assert_eq!(plan.special_vars_pid_ns, self_pid_views.pid_ns);
+        assert_eq!(plan.proc_offsets_pid_ns, self_pid_views.pid_ns);
+    }
+
+    #[test]
+    fn target_mode_uses_self_namespace_when_container_detection_misses() {
+        let self_pid_views = PidViews {
+            proc_pid: 123,
+            host_pid: 456,
+            container_pid: Some(123),
+            pid_ns: Some(PidNamespaceId {
+                dev: Some(7),
+                inode: 8,
+            }),
+            nspid_chain: Some(vec![456, 123]),
+            source: PidResolveSource::DirectProcStatus,
+        };
+
+        let plan = build_runtime_pid_plan(RuntimePidPlanInput {
+            target_pid_views: None,
+            self_pid_views: Some(&self_pid_views),
+            in_container: false,
             helper_supported: true,
         })
         .unwrap();

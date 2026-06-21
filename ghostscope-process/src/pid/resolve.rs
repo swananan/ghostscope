@@ -3,6 +3,23 @@ use super::procfs::{
 };
 use super::types::{PidResolveSource, PidViews};
 
+fn push_unique_pid(pids: &mut Vec<u32>, pid: u32) {
+    if !pids.contains(&pid) {
+        pids.push(pid);
+    }
+}
+
+fn runtime_pid_candidates_from_chain(proc_pid: u32, nspid_chain: Option<&[u32]>) -> Vec<u32> {
+    let mut pids = Vec::new();
+    push_unique_pid(&mut pids, proc_pid);
+    if let Some(chain) = nspid_chain {
+        for pid in chain {
+            push_unique_pid(&mut pids, *pid);
+        }
+    }
+    pids
+}
+
 pub fn resolve_input_pid(input_pid: u32) -> anyhow::Result<PidViews> {
     if !process_exists(input_pid) {
         return Err(anyhow::anyhow!(
@@ -71,4 +88,35 @@ pub fn resolve_event_pid_for_proc(proc_pid: u32) -> u32 {
     read_nspid_chain(proc_pid)
         .and_then(|chain| chain.first().copied())
         .unwrap_or(proc_pid)
+}
+
+/// Return PID values that eBPF-side runtime lookups may observe for a process.
+///
+/// Userspace stores proc-module offsets under the PID visible in its `/proc`
+/// view, but eBPF helpers and sysmon events may report any PID in the visible
+/// namespace chain for nested containers.
+pub fn runtime_pid_candidates_for_proc(proc_pid: u32) -> Vec<u32> {
+    let chain = read_nspid_chain(proc_pid);
+    runtime_pid_candidates_from_chain(proc_pid, chain.as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_pid_candidates_include_proc_and_full_nspid_chain() {
+        assert_eq!(
+            runtime_pid_candidates_from_chain(445, Some(&[1000, 531, 17])),
+            vec![445, 1000, 531, 17]
+        );
+    }
+
+    #[test]
+    fn runtime_pid_candidates_deduplicate_proc_pid() {
+        assert_eq!(
+            runtime_pid_candidates_from_chain(531, Some(&[1000, 531, 17])),
+            vec![531, 1000, 17]
+        );
+    }
 }

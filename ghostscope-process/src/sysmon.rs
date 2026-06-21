@@ -1,7 +1,10 @@
 use crate::{
     module_probe::cookie_for_path,
     offsets::{PidOffsetsEntry, ProcessManager},
-    pid::{resolve_event_pid_for_proc, resolve_proc_pid_for_event, PidNamespaceId},
+    pid::{
+        resolve_event_pid_for_proc, resolve_proc_pid_for_event, runtime_pid_candidates_for_proc,
+        PidNamespaceId,
+    },
     pinned_bpf_maps,
     proc_maps::{
         normalize_mapped_module_path, read_proc_maps, should_skip_mapped_module_path,
@@ -124,11 +127,14 @@ impl Default for SysmonEventMask {
 /// `ghostscope-process/ebpf/sysmon-bpf/src/lib.rs`. We intentionally keep
 /// two copies for now to avoid entangling the BPF build with the workspace.
 /// Keep repr(C), field order and sizes identical on both sides. Current
-/// layout (8 bytes): { tgid: u32, kind: u32 }.
+/// layout (12 bytes): { tgid: u32, host_tgid: u32, kind: u32 }.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SysEvent {
+    /// Runtime TGID in the configured sysmon event namespace when available.
     pub tgid: u32,
+    /// Host/initial-namespace TGID from bpf_get_current_pid_tgid().
+    pub host_tgid: u32,
     pub kind: u32, // 1=exec,2=fork,3=exit,4=map-change
 }
 
@@ -153,12 +159,33 @@ const SYSMON_EVENT_MASK_EXIT: u32 = 1 << 2;
 #[cfg(feature = "sysmon-ebpf")]
 const SYSMON_EVENT_MASK_MAP_CHANGE: u32 = 1 << 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingOffsetsKind {
+    Retry,
+    MapChangeCandidate,
+}
+
+impl PendingOffsetsKind {
+    fn keep_for_map_changes_after_retry_exhaustion(self) -> bool {
+        matches!(self, Self::MapChangeCandidate)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingOffsetsEntry {
     target_path: PathBuf,
     attempts: u32,
+    kind: PendingOffsetsKind,
+    retry_exhausted: bool,
     last_poll: Instant,
-    first_seen: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOffsetsDue {
+    event_pid: u32,
+    target_path: PathBuf,
+    attempts: u32,
+    kind: PendingOffsetsKind,
 }
 
 #[derive(Debug, Default)]
@@ -174,6 +201,14 @@ impl PendingOffsets {
     }
 
     fn register(&mut self, pid: u32, target: &Path) {
+        self.register_with_kind(pid, target, PendingOffsetsKind::Retry);
+    }
+
+    fn register_map_change_candidate(&mut self, pid: u32, target: &Path) {
+        self.register_with_kind(pid, target, PendingOffsetsKind::MapChangeCandidate);
+    }
+
+    fn register_with_kind(&mut self, pid: u32, target: &Path, kind: PendingOffsetsKind) {
         let now = Instant::now();
         let last_poll = now.checked_sub(PENDING_POLL_INTERVAL).unwrap_or(now);
         self.entries
@@ -181,14 +216,16 @@ impl PendingOffsets {
             .and_modify(|entry| {
                 entry.target_path = target.to_path_buf();
                 entry.attempts = 0;
+                entry.kind = kind;
+                entry.retry_exhausted = false;
                 entry.last_poll = last_poll;
-                entry.first_seen = now;
             })
             .or_insert(PendingOffsetsEntry {
                 target_path: target.to_path_buf(),
                 attempts: 0,
+                kind,
+                retry_exhausted: false,
                 last_poll,
-                first_seen: now,
             });
     }
 
@@ -196,14 +233,37 @@ impl PendingOffsets {
         self.entries.remove(&pid);
     }
 
-    fn take_due(&mut self) -> Vec<(u32, PathBuf, u32)> {
+    fn contains_map_change_candidate(&self, pid: u32, target: &Path) -> bool {
+        self.entries
+            .get(&pid)
+            .map(|entry| {
+                entry.kind == PendingOffsetsKind::MapChangeCandidate && entry.target_path == target
+            })
+            .unwrap_or(false)
+    }
+
+    fn mark_retry_exhausted(&mut self, pid: u32) {
+        if let Some(entry) = self.entries.get_mut(&pid) {
+            entry.retry_exhausted = true;
+        }
+    }
+
+    fn take_due(&mut self) -> Vec<PendingOffsetsDue> {
         let mut due = Vec::new();
         let now = Instant::now();
         for (&pid, entry) in self.entries.iter_mut() {
+            if entry.retry_exhausted {
+                continue;
+            }
             if now.duration_since(entry.last_poll) >= PENDING_POLL_INTERVAL {
                 entry.last_poll = now;
                 entry.attempts = entry.attempts.saturating_add(1);
-                due.push((pid, entry.target_path.clone(), entry.attempts));
+                due.push(PendingOffsetsDue {
+                    event_pid: pid,
+                    target_path: entry.target_path.clone(),
+                    attempts: entry.attempts,
+                    kind: entry.kind,
+                });
             }
         }
         due
@@ -213,6 +273,22 @@ impl PendingOffsets {
 #[derive(Debug, Clone)]
 pub(crate) struct PendingMapRefreshEntry {
     last_seen: Instant,
+    event_pid: u32,
+    host_pid: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingMapRefreshDue {
+    event_pid: u32,
+    host_pid: u32,
+    proc_pid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingMapChangeCandidate {
+    event_pid: u32,
+    host_pid: u32,
+    proc_pid: u32,
 }
 
 #[derive(Debug, Default)]
@@ -227,26 +303,34 @@ impl PendingMapRefreshes {
         }
     }
 
-    fn register(&mut self, pid: u32) {
+    fn register(&mut self, event_pid: u32, host_pid: u32, proc_pid: u32) {
         self.entries.insert(
-            pid,
+            proc_pid,
             PendingMapRefreshEntry {
                 last_seen: Instant::now(),
+                event_pid,
+                host_pid,
             },
         );
     }
 
-    fn take_due(&mut self) -> Vec<u32> {
+    fn take_due(&mut self) -> Vec<PendingMapRefreshDue> {
         let now = Instant::now();
-        let due: Vec<u32> = self
+        let due: Vec<PendingMapRefreshDue> = self
             .entries
             .iter()
-            .filter_map(|(&pid, entry)| {
-                (now.duration_since(entry.last_seen) >= MAP_CHANGE_DEBOUNCE_INTERVAL).then_some(pid)
+            .filter_map(|(&proc_pid, entry)| {
+                (now.duration_since(entry.last_seen) >= MAP_CHANGE_DEBOUNCE_INTERVAL).then_some(
+                    PendingMapRefreshDue {
+                        event_pid: entry.event_pid,
+                        host_pid: entry.host_pid,
+                        proc_pid,
+                    },
+                )
             })
             .collect();
-        for pid in &due {
-            self.entries.remove(pid);
+        for entry in &due {
+            self.entries.remove(&entry.proc_pid);
         }
         due
     }
@@ -263,10 +347,14 @@ pub struct SysmonConfig {
     pub perf_page_count: Option<usize>,
     /// Internal event selector for the sysmon eBPF side.
     pub event_mask: SysmonEventMask,
+    /// Whether map-change events should be emitted before the PID allowlist is populated.
+    pub map_change_unfiltered: bool,
     /// Optional event PID to watch. `None` means system-wide.
     pub watched_pid: Option<u32>,
     /// Optional PID namespace for interpreting `watched_pid`.
     pub watched_pid_ns: Option<PidNamespaceId>,
+    /// Optional PID namespace for reporting target-mode event TGIDs.
+    pub event_pid_ns: Option<PidNamespaceId>,
     /// Optional `/proc` PID corresponding to `watched_pid`.
     pub watched_proc_pid: Option<u32>,
 }
@@ -278,8 +366,10 @@ impl SysmonConfig {
             proc_offsets_max_entries: 4096,
             perf_page_count: None,
             event_mask: SysmonEventMask::target_mode(),
+            map_change_unfiltered: false,
             watched_pid: None,
             watched_pid_ns: None,
+            event_pid_ns: None,
             watched_proc_pid: None,
         }
     }
@@ -412,6 +502,7 @@ impl ProcessSysmon {
         match kind {
             SysEventKind::Exec | SysEventKind::Fork => {
                 let proc_pid = proc_pid_for_event(ev.tgid);
+                record_runtime_pid_aliases_for_sys_event(mgr, ev, proc_pid);
                 if let Some(tpath) = target {
                     let path = tpath.as_path();
                     if crate::util::is_shared_object(path) {
@@ -423,13 +514,26 @@ impl ProcessSysmon {
                                     proc_pid
                                 );
                                 if let Ok(mut guard) = pending.lock() {
-                                    guard.register(ev.tgid, path);
+                                    guard.register_map_change_candidate(ev.tgid, path);
                                 }
                             } else {
-                                tracing::trace!(
-                                    "Sysmon: event pid {} is not visible in current /proc namespace; rely on module refresh fallback",
-                                    ev.tgid
-                                );
+                                let host_pid = sys_event_host_pid(ev);
+                                if host_pid != ev.tgid && pid_alive(host_pid) {
+                                    tracing::debug!(
+                                        "Sysmon: event pid {} is not visible in current /proc namespace; scheduling host pid {} retry",
+                                        ev.tgid,
+                                        host_pid
+                                    );
+                                    if let Ok(mut guard) = pending.lock() {
+                                        guard.register_map_change_candidate(host_pid, path);
+                                    }
+                                } else {
+                                    tracing::debug!(
+                                        "Sysmon: event pid {} (host pid {}) is not visible in current /proc namespace; skip exec-based target retry",
+                                        ev.tgid,
+                                        host_pid
+                                    );
+                                }
                             }
                             return Ok(());
                         } else if let Ok(mut guard) = pending.lock() {
@@ -453,6 +557,12 @@ impl ProcessSysmon {
                 }
                 let inserted =
                     prefill_offsets_for_pid(mgr, ev.tgid, target.as_deref(), &proc_pid_for_event)?;
+                if inserted {
+                    let host_pid = sys_event_host_pid(ev);
+                    if host_pid != ev.tgid {
+                        let _ = crate::pinned_bpf_maps::insert_allowed_pid(host_pid);
+                    }
+                }
                 if kind == SysEventKind::Exec {
                     if let Some(tpath) = target {
                         if inserted {
@@ -472,35 +582,30 @@ impl ProcessSysmon {
             }
             SysEventKind::Exit => {
                 let proc_pid = proc_pid_for_event(ev.tgid);
+                let host_pid = sys_event_host_pid(ev);
                 if let Ok(mut guard) = pending.lock() {
                     guard.remove(ev.tgid);
+                    if host_pid != ev.tgid {
+                        guard.remove(host_pid);
+                    }
                 }
                 if let Ok(mut guard) = mgr.lock() {
                     guard.forget_pid(proc_pid);
                     if proc_pid != ev.tgid {
                         guard.forget_pid(ev.tgid);
                     }
+                    if host_pid != ev.tgid && host_pid != proc_pid {
+                        guard.forget_pid(host_pid);
+                    }
                 }
-                // Cleanup: purge keys for this PID in pinned map and remove from allowlist
-                match crate::pinned_bpf_maps::purge_offsets_for_pid(proc_pid) {
-                    Ok(n) => info!(
-                        "Sysmon: observed exit for event pid {} (proc pid {}) (purged {} entries)",
-                        ev.tgid, proc_pid, n
-                    ),
-                    Err(e) => tracing::warn!(
-                        "Sysmon: purge failed for event pid {} (proc pid {}): {}",
-                        ev.tgid,
-                        proc_pid,
-                        e
-                    ),
-                }
-                let _ = crate::pinned_bpf_maps::purge_ranges_for_pid(proc_pid);
-                if proc_pid != ev.tgid {
-                    let _ = crate::pinned_bpf_maps::purge_offsets_for_pid(ev.tgid);
-                    let _ = crate::pinned_bpf_maps::purge_ranges_for_pid(ev.tgid);
-                }
-                let _ = crate::pinned_bpf_maps::remove_allowed_pid(ev.tgid);
-                let _ = crate::pinned_bpf_maps::remove_pid_alias(ev.tgid);
+                let purged = purge_runtime_pid_artifacts(proc_pid, ev.tgid, host_pid);
+                info!(
+                    "Sysmon: observed exit for event pid {} (host pid {}, proc pid {}) (purged {} entries)",
+                    ev.tgid,
+                    host_pid,
+                    proc_pid,
+                    purged
+                );
             }
             SysEventKind::MapChange => {
                 tracing::trace!(
@@ -542,45 +647,263 @@ fn dispatch_sysmon_event(
     pending_map_refreshes: &Arc<Mutex<PendingMapRefreshes>>,
     proc_pid_for_event: &impl Fn(u32) -> u32,
     ev: &SysEvent,
-) {
+) -> bool {
     match SysEventKind::from_u32(ev.kind) {
         Some(SysEventKind::MapChange) => {
-            if let Ok(mut guard) = pending_map_refreshes.lock() {
-                guard.register(ev.tgid);
+            if let Some(proc_pid) =
+                proc_pid_for_map_change_event(mgr, target, proc_pid_for_event, ev)
+            {
+                let proc_pid = target
+                    .as_deref()
+                    .map(|target_path| {
+                        canonicalize_cached_target_proc_pid(mgr, target_path, proc_pid)
+                    })
+                    .unwrap_or(proc_pid);
+                record_runtime_pid_aliases_for_sys_event(mgr, ev, proc_pid);
+                if let Ok(mut guard) = pending_map_refreshes.lock() {
+                    guard.register(ev.tgid, sys_event_host_pid(ev), proc_pid);
+                }
+                true
+            } else if let Some(target_path) = target.as_deref() {
+                let candidates = pending
+                    .lock()
+                    .ok()
+                    .map(|guard| {
+                        pending_map_change_candidates(&guard, target_path, proc_pid_for_event, ev)
+                    })
+                    .unwrap_or_default();
+
+                if candidates.is_empty() {
+                    tracing::trace!(
+                        "Sysmon: map-change event pid {} (host pid {}) did not resolve to a target /proc pid; skipping per-pid refresh",
+                        ev.tgid,
+                        sys_event_host_pid(ev)
+                    );
+                    false
+                } else {
+                    if let Ok(mut guard) = pending_map_refreshes.lock() {
+                        for candidate in &candidates {
+                            guard.register(
+                                candidate.event_pid,
+                                candidate.host_pid,
+                                candidate.proc_pid,
+                            );
+                        }
+                    }
+                    tracing::trace!(
+                        "Sysmon: queued map-change refresh for {} pending target candidate(s) from event pid {} (host pid {})",
+                        candidates.len(),
+                        ev.tgid,
+                        sys_event_host_pid(ev)
+                    );
+                    false
+                }
+            } else {
+                tracing::trace!(
+                    "Sysmon: map-change event pid {} (host pid {}) did not resolve to a target /proc pid; skipping per-pid refresh",
+                    ev.tgid,
+                    sys_event_host_pid(ev)
+                );
+                false
             }
         }
         Some(_) => {
-            if let Err(e) = ProcessSysmon::handle_event_with_proc_pid_resolver(
+            match ProcessSysmon::handle_event_with_proc_pid_resolver(
                 mgr,
                 target,
                 pending,
                 ev,
                 proc_pid_for_event,
             ) {
-                tracing::debug!(
-                    "Sysmon: handle_event failed for pid {} kind {}: {}",
-                    ev.tgid,
-                    ev.kind,
-                    e
-                );
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::debug!(
+                        "Sysmon: handle_event failed for pid {} kind {}: {}",
+                        ev.tgid,
+                        ev.kind,
+                        e
+                    );
+                    false
+                }
             }
         }
         None => {
-            if let Err(e) = ProcessSysmon::handle_event_with_proc_pid_resolver(
+            match ProcessSysmon::handle_event_with_proc_pid_resolver(
                 mgr,
                 target,
                 pending,
                 ev,
                 proc_pid_for_event,
             ) {
-                tracing::debug!(
-                    "Sysmon: handle_event rejected invalid event for pid {} kind {}: {}",
-                    ev.tgid,
-                    ev.kind,
-                    e
-                );
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::debug!(
+                        "Sysmon: handle_event rejected invalid event for pid {} kind {}: {}",
+                        ev.tgid,
+                        ev.kind,
+                        e
+                    );
+                    false
+                }
             }
         }
+    }
+}
+
+fn proc_pid_for_map_change_event(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    target: &Option<PathBuf>,
+    proc_pid_for_event: &impl Fn(u32) -> u32,
+    ev: &SysEvent,
+) -> Option<u32> {
+    let host_pid = sys_event_host_pid(ev);
+    let mut candidates = Vec::with_capacity(2);
+    push_unique_pid(&mut candidates, proc_pid_for_event(ev.tgid));
+    if host_pid != ev.tgid {
+        push_unique_pid(&mut candidates, proc_pid_for_event(host_pid));
+    }
+
+    for proc_pid in candidates {
+        if !pid_alive(proc_pid) {
+            continue;
+        }
+        if target.is_some() && is_current_process_pid(proc_pid) {
+            tracing::trace!(
+                "Sysmon: ignoring self map-change candidate proc pid {}",
+                proc_pid
+            );
+            continue;
+        }
+
+        let Some(target_path) = target.as_deref() else {
+            return Some(proc_pid);
+        };
+
+        if pid_maps_target_module(proc_pid, target_path)
+            || cached_offsets_exist_for_target_pid(mgr, target_path, proc_pid)
+        {
+            return Some(proc_pid);
+        }
+    }
+
+    None
+}
+
+fn pending_map_change_candidates(
+    pending: &PendingOffsets,
+    target_path: &Path,
+    proc_pid_for_event: &impl Fn(u32) -> u32,
+    ev: &SysEvent,
+) -> Vec<PendingMapChangeCandidate> {
+    let host_pid = sys_event_host_pid(ev);
+    let mut candidates = Vec::with_capacity(2);
+    push_pending_map_change_candidate(
+        &mut candidates,
+        pending,
+        target_path,
+        proc_pid_for_event,
+        ev.tgid,
+        host_pid,
+    );
+    if host_pid != ev.tgid {
+        push_pending_map_change_candidate(
+            &mut candidates,
+            pending,
+            target_path,
+            proc_pid_for_event,
+            host_pid,
+            host_pid,
+        );
+    }
+    candidates
+}
+
+fn push_pending_map_change_candidate(
+    candidates: &mut Vec<PendingMapChangeCandidate>,
+    pending: &PendingOffsets,
+    target_path: &Path,
+    proc_pid_for_event: &impl Fn(u32) -> u32,
+    event_pid: u32,
+    host_pid: u32,
+) {
+    if !pending.contains_map_change_candidate(event_pid, target_path) {
+        return;
+    }
+
+    let proc_pid = proc_pid_for_event(event_pid);
+    if !pid_alive(proc_pid) || is_current_process_pid(proc_pid) {
+        return;
+    }
+
+    if candidates
+        .iter()
+        .any(|candidate| candidate.proc_pid == proc_pid)
+    {
+        return;
+    }
+
+    candidates.push(PendingMapChangeCandidate {
+        event_pid,
+        host_pid,
+        proc_pid,
+    });
+}
+
+fn is_current_process_pid(proc_pid: u32) -> bool {
+    proc_pid == std::process::id()
+}
+
+fn cached_single_target_proc_pid(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    target_path: &Path,
+) -> Option<u32> {
+    let module_path = target_path.to_string_lossy();
+    let mut target_pids = BTreeSet::new();
+    let guard = mgr.lock().ok()?;
+    for (pid, _, _, _, _) in guard.cached_offsets_for_module(module_path.as_ref()) {
+        if !is_current_process_pid(pid)
+            && pid_alive(pid)
+            && pid_maps_target_module(pid, target_path)
+        {
+            target_pids.insert(pid);
+        }
+    }
+
+    if target_pids.len() == 1 {
+        target_pids.iter().next().copied()
+    } else {
+        None
+    }
+}
+
+fn canonicalize_cached_target_proc_pid(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    target_path: &Path,
+    fallback_proc_pid: u32,
+) -> u32 {
+    if pid_alive(fallback_proc_pid) && pid_maps_target_module(fallback_proc_pid, target_path) {
+        return fallback_proc_pid;
+    }
+
+    let Some(proc_pid) = cached_single_target_proc_pid(mgr, target_path) else {
+        return fallback_proc_pid;
+    };
+
+    if proc_pid != fallback_proc_pid {
+        tracing::debug!(
+            "Sysmon: canonicalized map-change proc pid {} -> {} for target {}",
+            fallback_proc_pid,
+            proc_pid,
+            target_path.display()
+        );
+    }
+
+    proc_pid
+}
+
+fn push_unique_pid(pids: &mut Vec<u32>, pid: u32) {
+    if !pids.contains(&pid) {
+        pids.push(pid);
     }
 }
 
@@ -603,13 +926,20 @@ fn write_pinned_runtime_pid_alias(runtime_pid: u32, proc_pid: u32) {
     if runtime_pid == proc_pid {
         return;
     }
-    if let Err(e) = crate::pinned_bpf_maps::insert_pid_alias(runtime_pid, proc_pid) {
-        tracing::debug!(
-            "Sysmon: failed to insert PID alias runtime pid {} -> proc pid {}: {}",
+    match crate::pinned_bpf_maps::insert_pid_alias(runtime_pid, proc_pid) {
+        Ok(()) => tracing::trace!(
+            "Sysmon: inserted PID alias runtime pid {} -> proc pid {}",
             runtime_pid,
-            proc_pid,
-            e
-        );
+            proc_pid
+        ),
+        Err(e) => {
+            tracing::debug!(
+                "Sysmon: failed to insert PID alias runtime pid {} -> proc pid {}: {}",
+                runtime_pid,
+                proc_pid,
+                e
+            );
+        }
     }
 }
 
@@ -622,6 +952,161 @@ fn record_runtime_pid_alias_for_event(
     if let Ok(mut guard) = mgr.lock() {
         guard.record_runtime_pid_alias(runtime_pid, proc_pid);
     }
+}
+
+fn record_runtime_pid_aliases_for_proc_pid_locked(guard: &mut ProcessManager, proc_pid: u32) {
+    for runtime_pid in runtime_pid_candidates_for_proc(proc_pid) {
+        write_pinned_runtime_pid_alias(runtime_pid, proc_pid);
+        guard.record_runtime_pid_alias(runtime_pid, proc_pid);
+    }
+}
+
+fn record_runtime_pid_aliases_for_proc_pid(mgr: &Arc<Mutex<ProcessManager>>, proc_pid: u32) {
+    if let Ok(mut guard) = mgr.lock() {
+        record_runtime_pid_aliases_for_proc_pid_locked(&mut guard, proc_pid);
+    } else {
+        for runtime_pid in runtime_pid_candidates_for_proc(proc_pid) {
+            write_pinned_runtime_pid_alias(runtime_pid, proc_pid);
+        }
+    }
+}
+
+fn runtime_pid_keys_for_proc_event(
+    proc_pid: u32,
+    event_pid: u32,
+    extra_runtime_pids: impl IntoIterator<Item = u32>,
+) -> Vec<u32> {
+    let mut keys = BTreeSet::new();
+    keys.insert(proc_pid);
+    keys.insert(event_pid);
+    for runtime_pid in runtime_pid_candidates_for_proc(proc_pid) {
+        keys.insert(runtime_pid);
+    }
+    for runtime_pid in extra_runtime_pids {
+        if runtime_pid != 0 {
+            keys.insert(runtime_pid);
+        }
+    }
+    keys.into_iter().collect()
+}
+
+fn record_runtime_pid_aliases_for_keys(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    proc_pid: u32,
+    runtime_pids: &[u32],
+) {
+    for runtime_pid in runtime_pids {
+        write_pinned_runtime_pid_alias(*runtime_pid, proc_pid);
+    }
+    if let Ok(mut guard) = mgr.lock() {
+        for runtime_pid in runtime_pids {
+            guard.record_runtime_pid_alias(*runtime_pid, proc_pid);
+        }
+    }
+}
+
+fn insert_allowed_runtime_pid_keys(runtime_pids: &[u32]) {
+    for runtime_pid in runtime_pids {
+        let _ = crate::pinned_bpf_maps::insert_allowed_pid(*runtime_pid);
+    }
+}
+
+fn publish_offsets_for_runtime_pid_keys(
+    proc_pid: u32,
+    event_pid: u32,
+    runtime_pids: &[u32],
+    items: &[(u64, crate::pinned_bpf_maps::ProcModuleOffsetsValue)],
+    log_context: &str,
+) -> anyhow::Result<usize> {
+    use crate::pinned_bpf_maps::{insert_offsets_for_pid, replace_ranges_for_pid};
+
+    let mut total_inserted = 0usize;
+    for runtime_pid in runtime_pids {
+        match insert_offsets_for_pid(*runtime_pid, items) {
+            Ok(inserted) => {
+                if inserted == 0 {
+                    tracing::warn!(
+                        "Sysmon: no offsets inserted for {} runtime pid {} (event pid {}, proc pid {}) (entry count={})",
+                        log_context,
+                        runtime_pid,
+                        event_pid,
+                        proc_pid,
+                        items.len()
+                    );
+                    continue;
+                }
+                total_inserted += inserted;
+                if let Err(e) = replace_ranges_for_pid(*runtime_pid, items) {
+                    tracing::warn!(
+                        "Sysmon: failed to replace module ranges for {} runtime pid {} (event pid {}, proc pid {}): {}",
+                        log_context,
+                        runtime_pid,
+                        event_pid,
+                        proc_pid,
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Sysmon: failed to insert offsets for {} runtime pid {} (event pid {}, proc pid {}): {}",
+                    log_context,
+                    runtime_pid,
+                    event_pid,
+                    proc_pid,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(total_inserted)
+}
+
+fn purge_offsets_for_runtime_pid_keys(runtime_pids: &[u32]) -> anyhow::Result<usize> {
+    let mut purged = 0usize;
+    for runtime_pid in runtime_pids {
+        purged += crate::pinned_bpf_maps::purge_offsets_for_pid(*runtime_pid)?;
+        let _ = crate::pinned_bpf_maps::purge_ranges_for_pid(*runtime_pid);
+    }
+    Ok(purged)
+}
+
+fn purge_runtime_pid_artifacts(proc_pid: u32, event_pid: u32, host_pid: u32) -> usize {
+    let runtime_pids = runtime_pid_keys_for_proc_event(proc_pid, event_pid, [host_pid]);
+    let mut purged_offsets = 0usize;
+    for runtime_pid in runtime_pids {
+        if let Ok(purged) = crate::pinned_bpf_maps::purge_offsets_for_pid(runtime_pid) {
+            purged_offsets += purged;
+        }
+        let _ = crate::pinned_bpf_maps::purge_ranges_for_pid(runtime_pid);
+        let _ = crate::pinned_bpf_maps::remove_allowed_pid(runtime_pid);
+        if runtime_pid != proc_pid {
+            let _ = crate::pinned_bpf_maps::remove_pid_alias(runtime_pid);
+        }
+    }
+    purged_offsets
+}
+
+fn sys_event_host_pid(ev: &SysEvent) -> u32 {
+    if ev.host_tgid != 0 {
+        ev.host_tgid
+    } else {
+        ev.tgid
+    }
+}
+
+fn record_runtime_pid_aliases_for_sys_event(
+    mgr: &Arc<Mutex<ProcessManager>>,
+    ev: &SysEvent,
+    proc_pid: u32,
+) {
+    record_runtime_pid_alias_for_event(mgr, ev.tgid, proc_pid);
+    let host_pid = sys_event_host_pid(ev);
+    if host_pid != ev.tgid {
+        record_runtime_pid_alias_for_event(mgr, host_pid, proc_pid);
+    }
+    record_runtime_pid_aliases_for_proc_pid(mgr, proc_pid);
 }
 
 #[cfg(feature = "sysmon-ebpf")]
@@ -730,6 +1215,10 @@ fn load_sysmon_bpf(obj: &[u8], use_verbose: bool) -> anyhow::Result<aya::Ebpf> {
         crate::pinned_bpf_maps::TARGET_EXEC_COMM_MAP_NAME,
         pin_dir.join(crate::pinned_bpf_maps::TARGET_EXEC_COMM_MAP_NAME),
     );
+    loader.map_pin_path(
+        crate::pinned_bpf_maps::SYSMON_MAP_CHANGE_UNFILTERED_MAP_NAME,
+        pin_dir.join(crate::pinned_bpf_maps::SYSMON_MAP_CHANGE_UNFILTERED_MAP_NAME),
+    );
 
     Ok(loader.load(obj)?)
 }
@@ -788,8 +1277,10 @@ fn configure_sysmon_exec_comm_filter(
 fn configure_sysmon_event_filter(
     bpf: &mut aya::Ebpf,
     event_mask: SysmonEventMask,
+    map_change_unfiltered: bool,
     watched_pid: Option<u32>,
     watched_pid_ns: Option<PidNamespaceId>,
+    event_pid_ns: Option<PidNamespaceId>,
 ) -> anyhow::Result<()> {
     use aya::maps::Array;
 
@@ -805,6 +1296,23 @@ fn configure_sysmon_event_filter(
         );
     } else {
         tracing::warn!("Sysmon: sysmon_event_mask map missing; event filtering unavailable");
+    }
+
+    if let Some(map) = bpf.map_mut("sysmon_map_change_unfiltered") {
+        let mut array: Array<_, u32> = map.try_into()?;
+        array.set(0, u32::from(map_change_unfiltered), 0)?;
+        tracing::info!(
+            "Sysmon: map-change pre-allowlist emission {}",
+            if map_change_unfiltered {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+    } else if map_change_unfiltered {
+        tracing::warn!(
+            "Sysmon: sysmon_map_change_unfiltered map missing; pre-allowlist map-change events unavailable"
+        );
     }
 
     if let Some(map) = bpf.map_mut("sysmon_watched_pid") {
@@ -845,6 +1353,35 @@ fn configure_sysmon_event_filter(
         tracing::info!(
             "Sysmon: watched PID namespace configured: pid={} ns_dev={} ns_inode={}",
             pid,
+            dev,
+            ino
+        );
+    }
+
+    let event_ns_spec = event_pid_ns.and_then(|pid_ns| pid_ns.helper_dev_inode());
+    let (event_ns_dev, event_ns_ino) = event_ns_spec.unwrap_or((0, 0));
+
+    if let Some(map) = bpf.map_mut("sysmon_event_pid_ns_dev") {
+        let mut array: Array<_, u64> = map.try_into()?;
+        array.set(0, event_ns_dev, 0)?;
+    } else if event_ns_spec.is_some() {
+        tracing::warn!(
+            "Sysmon: sysmon_event_pid_ns_dev map missing; event namespace reporting unavailable"
+        );
+    }
+
+    if let Some(map) = bpf.map_mut("sysmon_event_pid_ns_ino") {
+        let mut array: Array<_, u64> = map.try_into()?;
+        array.set(0, event_ns_ino, 0)?;
+    } else if event_ns_spec.is_some() {
+        tracing::warn!(
+            "Sysmon: sysmon_event_pid_ns_ino map missing; event namespace reporting unavailable"
+        );
+    }
+
+    if let Some((dev, ino)) = event_ns_spec {
+        tracing::info!(
+            "Sysmon: event PID namespace configured: ns_dev={} ns_inode={}",
             dev,
             ino
         );
@@ -959,10 +1496,7 @@ fn attach_classic_map_change_tracepoints(bpf: &mut aya::Ebpf) -> anyhow::Result<
 #[cfg(feature = "sysmon-ebpf")]
 fn load_and_attach_sysmon_bpf(
     obj: &[u8],
-    target: Option<&Path>,
-    event_mask: SysmonEventMask,
-    watched_pid: Option<u32>,
-    watched_pid_ns: Option<PidNamespaceId>,
+    cfg: &SysmonConfig,
     use_verbose: bool,
 ) -> anyhow::Result<aya::Ebpf> {
     let mut failures = Vec::new();
@@ -974,24 +1508,33 @@ fn load_and_attach_sysmon_bpf(
         tracing::info!("Sysmon: trying {} backend", backend.label());
         let result = (|| {
             let mut bpf = load_sysmon_bpf(obj, use_verbose)?;
-            configure_sysmon_exec_comm_filter(&mut bpf, target)?;
-            configure_sysmon_event_filter(&mut bpf, event_mask, watched_pid, watched_pid_ns)?;
+            configure_sysmon_exec_comm_filter(&mut bpf, cfg.target_module.as_deref())?;
+            configure_sysmon_event_filter(
+                &mut bpf,
+                cfg.event_mask,
+                cfg.map_change_unfiltered,
+                cfg.watched_pid,
+                cfg.watched_pid_ns,
+                cfg.event_pid_ns,
+            )?;
             attach_sysmon_backend(&mut bpf, backend)?;
-            if event_mask.map_change {
+            if cfg.event_mask.map_change {
                 let map_attached = attach_classic_map_change_tracepoints(&mut bpf)?;
                 if map_attached == 0 {
-                    if !event_mask.has_lifecycle_events() {
+                    if !cfg.event_mask.has_lifecycle_events() {
                         return Err(anyhow::anyhow!(
                             "map-change events requested but no syscall tracepoints attached"
                         ));
                     }
 
-                    let fallback_mask = event_mask.without_map_change();
+                    let fallback_mask = cfg.event_mask.without_map_change();
                     configure_sysmon_event_filter(
                         &mut bpf,
                         fallback_mask,
-                        watched_pid,
-                        watched_pid_ns,
+                        cfg.map_change_unfiltered,
+                        cfg.watched_pid,
+                        cfg.watched_pid_ns,
+                        cfg.event_pid_ns,
                     )?;
                     tracing::warn!(
                         "Sysmon: map-change events requested but no syscall tracepoints attached; \
@@ -1052,14 +1595,7 @@ fn run_sysmon_loop(
     let target = cfg.target_module.clone();
     let use_verbose =
         cfg!(debug_assertions) || log_enabled!(LogLevel::Trace) || log_enabled!(LogLevel::Debug);
-    let mut bpf = load_and_attach_sysmon_bpf(
-        obj,
-        target.as_deref(),
-        cfg.event_mask,
-        cfg.watched_pid,
-        cfg.watched_pid_ns,
-        use_verbose,
-    )?;
+    let mut bpf = load_and_attach_sysmon_bpf(obj, &cfg, use_verbose)?;
     let proc_pid_for_event = sysmon_proc_pid_resolver(cfg.watched_pid, cfg.watched_proc_pid);
 
     // Using allowlist-based gating in kernel; userspace decides allow on exec.
@@ -1076,11 +1612,13 @@ fn run_sysmon_loop(
                 );
                 let entries = guard.cached_offsets_for_module(tpath.to_string_lossy().as_ref());
                 if !entries.is_empty() {
-                    use crate::pinned_bpf_maps::{insert_offsets_for_pid, ProcModuleOffsetsValue};
-                    use std::collections::HashMap;
+                    use crate::pinned_bpf_maps::ProcModuleOffsetsValue;
                     let mut by_pid: HashMap<u32, Vec<(u64, ProcModuleOffsetsValue)>> =
                         HashMap::new();
                     for (pid, cookie, off, base, size) in entries {
+                        if is_current_process_pid(pid) {
+                            continue;
+                        }
                         by_pid.entry(pid).or_default().push((
                             cookie,
                             ProcModuleOffsetsValue::new(
@@ -1091,15 +1629,24 @@ fn run_sysmon_loop(
                     let mut total = 0usize;
                     for (pid, items) in by_pid {
                         initial_target_pids.insert(pid);
-                        if let Ok(n) = insert_offsets_for_pid(pid, &items) {
-                            total += n;
-                        }
                         // Add event PID (kernel namespace) to allowlist so subsequent
                         // fork/exit events are filtered in-kernel.
                         let event_pid = resolve_event_pid_for_proc(pid);
-                        guard.record_runtime_pid_alias(event_pid, pid);
-                        write_pinned_runtime_pid_alias(event_pid, pid);
-                        let _ = crate::pinned_bpf_maps::insert_allowed_pid(event_pid);
+                        let runtime_pids = runtime_pid_keys_for_proc_event(pid, event_pid, []);
+                        for runtime_pid in &runtime_pids {
+                            write_pinned_runtime_pid_alias(*runtime_pid, pid);
+                            guard.record_runtime_pid_alias(*runtime_pid, pid);
+                        }
+                        if let Ok(n) = publish_offsets_for_runtime_pid_keys(
+                            pid,
+                            event_pid,
+                            &runtime_pids,
+                            &items,
+                            "initial prefill",
+                        ) {
+                            total += n;
+                        }
+                        insert_allowed_runtime_pid_keys(&runtime_pids);
                     }
                     tracing::info!(
                         "Sysmon: initial inserted {} offset entries for module {}",
@@ -1145,7 +1692,7 @@ fn run_sysmon_loop(
                     // SAFETY: The ring buffer sample length was checked to match SysEvent;
                     // read_unaligned handles any alignment from the byte slice.
                     let ev = unsafe { core::ptr::read_unaligned(item.as_ptr() as *const SysEvent) };
-                    dispatch_sysmon_event(
+                    let matched = dispatch_sysmon_event(
                         &mgr,
                         &target,
                         &pending,
@@ -1153,7 +1700,9 @@ fn run_sysmon_loop(
                         &proc_pid_for_event,
                         &ev,
                     );
-                    try_publish_sys_event(&tx, ev);
+                    if matched {
+                        try_publish_sys_event(&tx, ev);
+                    }
                 }
             }
             poll_pending_offsets(&mgr, &pending, &proc_pid_for_event);
@@ -1161,7 +1710,8 @@ fn run_sysmon_loop(
                 &mgr,
                 target.as_deref(),
                 &pending_map_refreshes,
-                &proc_pid_for_event,
+                &pending,
+                &tx,
             );
             refresh_target_module_offsets(
                 &mgr,
@@ -1212,7 +1762,7 @@ fn run_sysmon_loop(
                             let ev = unsafe {
                                 core::ptr::read_unaligned(raw.as_ptr() as *const SysEvent)
                             };
-                            dispatch_sysmon_event(
+                            let matched = dispatch_sysmon_event(
                                 &mgr,
                                 &target,
                                 &pending,
@@ -1220,7 +1770,9 @@ fn run_sysmon_loop(
                                 &proc_pid_for_event,
                                 &ev,
                             );
-                            try_publish_sys_event(&tx, ev);
+                            if matched {
+                                try_publish_sys_event(&tx, ev);
+                            }
                         }
                     }
                     PerfEvent::Lost { count } => {
@@ -1233,7 +1785,8 @@ fn run_sysmon_loop(
                 &mgr,
                 target.as_deref(),
                 &pending_map_refreshes,
-                &proc_pid_for_event,
+                &pending,
+                &tx,
             );
             refresh_target_module_offsets(
                 &mgr,
@@ -1403,15 +1956,17 @@ fn prefill_offsets_for_pid(
     target: Option<&Path>,
     proc_pid_for_event: &impl Fn(u32) -> u32,
 ) -> anyhow::Result<bool> {
-    write_offsets_for_pid(mgr, event_pid, target, false, proc_pid_for_event)
+    write_offsets_for_pid(mgr, event_pid, target, false, &[], proc_pid_for_event)
 }
 
-fn refresh_offsets_for_pid(
+fn refresh_offsets_for_known_proc_pid(
     mgr: &Arc<Mutex<ProcessManager>>,
     event_pid: u32,
-    proc_pid_for_event: &impl Fn(u32) -> u32,
+    host_pid: u32,
+    proc_pid: u32,
 ) -> anyhow::Result<bool> {
-    write_offsets_for_pid(mgr, event_pid, None, true, proc_pid_for_event)
+    let proc_pid_for_event = |_: u32| proc_pid;
+    write_offsets_for_pid(mgr, event_pid, None, true, &[host_pid], &proc_pid_for_event)
 }
 
 fn write_offsets_for_pid(
@@ -1419,16 +1974,22 @@ fn write_offsets_for_pid(
     event_pid: u32,
     target: Option<&Path>,
     force_refresh: bool,
+    extra_runtime_pids: &[u32],
     proc_pid_for_event: &impl Fn(u32) -> u32,
 ) -> anyhow::Result<bool> {
-    use crate::pinned_bpf_maps::{
-        insert_offsets_for_pid, purge_offsets_for_pid, replace_ranges_for_pid,
-    };
-
     let proc_pid = proc_pid_for_event(event_pid);
-    record_runtime_pid_alias_for_event(mgr, event_pid, proc_pid);
+    let runtime_pids =
+        runtime_pid_keys_for_proc_event(proc_pid, event_pid, extra_runtime_pids.iter().copied());
+    record_runtime_pid_aliases_for_keys(mgr, proc_pid, &runtime_pids);
     let mut inserted_any = false;
     if let Ok(mut guard) = mgr.lock() {
+        if target.is_some() && is_current_process_pid(proc_pid) {
+            tracing::debug!(
+                "Sysmon: skipping self proc pid {} for target-module offset prefill",
+                proc_pid
+            );
+            return Ok(false);
+        }
         let prefilled = match if force_refresh {
             guard.refresh_prefill_pid(proc_pid)
         } else {
@@ -1515,44 +2076,45 @@ fn write_offsets_for_pid(
         }
 
         if force_refresh && target.is_none() {
-            let purged = purge_offsets_for_pid(proc_pid)?;
+            let purged = purge_offsets_for_runtime_pid_keys(&runtime_pids)?;
             if purged > 0 {
                 tracing::debug!(
-                    "Sysmon: purged {} stale offset entries before map-change refresh for event pid {} (proc pid {})",
+                    "Sysmon: purged {} stale offset entries before map-change refresh for event pid {} (proc pid {}, runtime keys={:?})",
                     purged,
                     event_pid,
-                    proc_pid
+                    proc_pid,
+                    runtime_pids
                 );
             }
         }
 
         if !entries.is_empty() && (target.is_none() || target_match_count > 0) {
             let items = offset_items_from_entries(entries.iter());
-            match insert_offsets_for_pid(proc_pid, &items) {
+            match publish_offsets_for_runtime_pid_keys(
+                proc_pid,
+                event_pid,
+                &runtime_pids,
+                &items,
+                "prefill",
+            ) {
                 Ok(inserted) => {
                     if inserted == 0 {
                         tracing::warn!(
-                            "Sysmon: no offsets inserted for event pid {} (proc pid {}) (entry count={})",
+                            "Sysmon: no offsets inserted for event pid {} (proc pid {}, runtime keys={:?}) (entry count={})",
                             event_pid,
                             proc_pid,
+                            runtime_pids,
                             items.len()
                         );
                     } else {
-                        if let Err(e) = replace_ranges_for_pid(proc_pid, &items) {
-                            tracing::warn!(
-                                "Sysmon: failed to replace module ranges for event pid {} (proc pid {}): {}",
-                                event_pid,
-                                proc_pid,
-                                e
-                            );
-                        }
                         tracing::info!(
-                            "Sysmon: inserted {} offset entries for event pid {} (proc pid {})",
+                            "Sysmon: inserted {} offset entries for event pid {} (proc pid {}, runtime keys={:?})",
                             inserted,
                             event_pid,
-                            proc_pid
+                            proc_pid,
+                            runtime_pids
                         );
-                        let _ = crate::pinned_bpf_maps::insert_allowed_pid(event_pid);
+                        insert_allowed_runtime_pid_keys(&runtime_pids);
                         inserted_any = true;
                     }
                 }
@@ -1581,10 +2143,9 @@ fn prefill_full_offsets_for_pid_if_new(
     event_pid: u32,
     proc_pid_for_event: &impl Fn(u32) -> u32,
 ) -> anyhow::Result<bool> {
-    use crate::pinned_bpf_maps::{insert_offsets_for_pid, replace_ranges_for_pid};
-
     let proc_pid = proc_pid_for_event(event_pid);
-    record_runtime_pid_alias_for_event(mgr, event_pid, proc_pid);
+    let runtime_pids = runtime_pid_keys_for_proc_event(proc_pid, event_pid, []);
+    record_runtime_pid_aliases_for_keys(mgr, proc_pid, &runtime_pids);
 
     let items = {
         let Ok(mut guard) = mgr.lock() else {
@@ -1604,23 +2165,22 @@ fn prefill_full_offsets_for_pid_if_new(
         return Ok(false);
     }
 
-    match insert_offsets_for_pid(proc_pid, &items) {
+    match publish_offsets_for_runtime_pid_keys(
+        proc_pid,
+        event_pid,
+        &runtime_pids,
+        &items,
+        "full prefill",
+    ) {
         Ok(inserted) if inserted > 0 => {
-            if let Err(e) = replace_ranges_for_pid(proc_pid, &items) {
-                tracing::warn!(
-                    "Sysmon: failed to replace module ranges for event pid {} (proc pid {}): {}",
-                    event_pid,
-                    proc_pid,
-                    e
-                );
-            }
             tracing::info!(
-                "Sysmon: inserted {} full offset entries for event pid {} (proc pid {})",
+                "Sysmon: inserted {} full offset entries for event pid {} (proc pid {}, runtime keys={:?})",
                 inserted,
                 event_pid,
-                proc_pid
+                proc_pid,
+                runtime_pids
             );
-            let _ = crate::pinned_bpf_maps::insert_allowed_pid(event_pid);
+            insert_allowed_runtime_pid_keys(&runtime_pids);
             Ok(true)
         }
         Ok(_) => Ok(false),
@@ -1666,11 +2226,8 @@ fn refresh_full_offsets_for_pid(
     proc_pid: u32,
     event_pid: u32,
 ) -> anyhow::Result<bool> {
-    use crate::pinned_bpf_maps::{
-        insert_allowed_pid, insert_offsets_for_pid, purge_offsets_for_pid, replace_ranges_for_pid,
-    };
-
-    record_runtime_pid_alias_for_event(mgr, event_pid, proc_pid);
+    let runtime_pids = runtime_pid_keys_for_proc_event(proc_pid, event_pid, []);
+    record_runtime_pid_aliases_for_keys(mgr, proc_pid, &runtime_pids);
 
     let items = {
         let Ok(mut guard) = mgr.lock() else {
@@ -1687,22 +2244,29 @@ fn refresh_full_offsets_for_pid(
         return Ok(false);
     }
 
-    let purged = purge_offsets_for_pid(proc_pid)?;
+    let purged = purge_offsets_for_runtime_pid_keys(&runtime_pids)?;
     if purged > 0 {
         tracing::debug!(
-            "Sysmon: purged {} stale offset entries before periodic full refresh for proc pid {}",
+            "Sysmon: purged {} stale offset entries before periodic full refresh for proc pid {} (runtime keys={:?})",
             purged,
-            proc_pid
+            proc_pid,
+            runtime_pids
         );
     }
-    let inserted = insert_offsets_for_pid(proc_pid, &items)?;
-    replace_ranges_for_pid(proc_pid, &items)?;
-    insert_allowed_pid(event_pid)?;
+    let inserted = publish_offsets_for_runtime_pid_keys(
+        proc_pid,
+        event_pid,
+        &runtime_pids,
+        &items,
+        "periodic full refresh",
+    )?;
+    insert_allowed_runtime_pid_keys(&runtime_pids);
     tracing::debug!(
-        "Sysmon: periodic full refresh wrote {} offset entries for proc pid {} (event pid {})",
+        "Sysmon: periodic full refresh wrote {} offset entries for proc pid {} (event pid {}, runtime keys={:?})",
         inserted,
         proc_pid,
-        event_pid
+        event_pid,
+        runtime_pids
     );
     Ok(inserted > 0)
 }
@@ -1735,9 +2299,7 @@ fn refresh_target_module_offsets(
     target_pid_map_signatures: &mut HashMap<u32, PidMapsSignature>,
     tx: &mpsc::SyncSender<SysEvent>,
 ) {
-    use crate::pinned_bpf_maps::{
-        allowed_pid_exists, insert_allowed_pid, insert_offsets_for_pid, ProcModuleOffsetsValue,
-    };
+    use crate::pinned_bpf_maps::{allowed_pid_exists, ProcModuleOffsetsValue};
 
     let Some(target_path) = target else {
         return;
@@ -1761,6 +2323,9 @@ fn refresh_target_module_offsets(
             return;
         }
         for (pid, cookie, off, base, size) in guard.cached_offsets_for_module(&module_path) {
+            if is_current_process_pid(pid) {
+                continue;
+            }
             target_pids.insert(pid);
             by_pid.entry(pid).or_default().push((
                 cookie,
@@ -1776,7 +2341,8 @@ fn refresh_target_module_offsets(
     let mut newly_allowed_event_pids = BTreeSet::new();
     for (pid, items) in by_pid {
         let event_pid = resolve_event_pid_for_proc(pid);
-        record_runtime_pid_alias_for_event(mgr, event_pid, pid);
+        let runtime_pids = runtime_pid_keys_for_proc_event(pid, event_pid, []);
+        record_runtime_pid_aliases_for_keys(mgr, pid, &runtime_pids);
         let was_allowed = match allowed_pid_exists(event_pid) {
             Ok(value) => value,
             Err(e) => {
@@ -1789,22 +2355,23 @@ fn refresh_target_module_offsets(
                 false
             }
         };
-        match insert_offsets_for_pid(pid, &items) {
+        match publish_offsets_for_runtime_pid_keys(
+            pid,
+            event_pid,
+            &runtime_pids,
+            &items,
+            "periodic module refresh",
+        ) {
             Ok(inserted) => {
                 if inserted > 0 {
                     total += inserted;
-                    match insert_allowed_pid(event_pid) {
-                        Ok(()) => {
-                            if !was_allowed {
-                                newly_allowed_event_pids.insert(event_pid);
-                            }
-                        }
-                        Err(e) => tracing::debug!(
-                            "Sysmon: periodic module refresh failed to allowlist event pid {} (proc pid {}): {}",
-                            event_pid,
-                            pid,
-                            e
-                        ),
+                    insert_allowed_runtime_pid_keys(&runtime_pids);
+                    if !was_allowed {
+                        tracing::debug!(
+                            "Sysmon: event pid {} became allowed during periodic module refresh",
+                            event_pid
+                        );
+                        newly_allowed_event_pids.insert(event_pid);
                     }
                 }
             }
@@ -1854,6 +2421,7 @@ fn refresh_target_module_offsets(
     for event_pid in newly_allowed_event_pids {
         let ev = SysEvent {
             tgid: event_pid,
+            host_tgid: event_pid,
             kind: SysEventKind::MapChange.as_u32(),
         };
         if try_publish_sys_event(tx, ev) {
@@ -1888,8 +2456,12 @@ fn poll_pending_offsets(
     }
 
     let mut to_remove: Vec<u32> = Vec::new();
+    let mut to_exhaust: Vec<u32> = Vec::new();
 
-    for (event_pid, target_path, attempts) in due {
+    for due in due {
+        let event_pid = due.event_pid;
+        let target_path = due.target_path;
+        let attempts = due.attempts;
         let proc_pid = proc_pid_for_event(event_pid);
         if !pid_alive(proc_pid) {
             tracing::debug!(
@@ -1903,14 +2475,25 @@ fn poll_pending_offsets(
 
         if !pid_maps_target_module(proc_pid, &target_path) {
             if attempts >= PENDING_MAX_ATTEMPTS {
-                tracing::warn!(
-                    "Sysmon: event pid {} (proc pid {}) still missing module {} after {} retries; giving up",
-                    event_pid,
-                    proc_pid,
-                    target_path.display(),
-                    attempts
-                );
-                to_remove.push(event_pid);
+                if due.kind.keep_for_map_changes_after_retry_exhaustion() {
+                    tracing::debug!(
+                        "Sysmon: event pid {} (proc pid {}) still missing module {} after {} retries; waiting for map-change trigger",
+                        event_pid,
+                        proc_pid,
+                        target_path.display(),
+                        attempts
+                    );
+                    to_exhaust.push(event_pid);
+                } else {
+                    tracing::warn!(
+                        "Sysmon: event pid {} (proc pid {}) still missing module {} after {} retries; giving up",
+                        event_pid,
+                        proc_pid,
+                        target_path.display(),
+                        attempts
+                    );
+                    to_remove.push(event_pid);
+                }
             }
             continue;
         }
@@ -1932,13 +2515,23 @@ fn poll_pending_offsets(
             }
             Ok(false) => {
                 if attempts >= PENDING_MAX_ATTEMPTS {
-                    tracing::warn!(
-                        "Sysmon: deferred prefill produced no entries for event pid {} (proc pid {}) after {} retries; giving up",
-                        event_pid,
-                        proc_pid,
-                        attempts
-                    );
-                    to_remove.push(event_pid);
+                    if due.kind.keep_for_map_changes_after_retry_exhaustion() {
+                        tracing::debug!(
+                            "Sysmon: deferred prefill produced no entries for event pid {} (proc pid {}) after {} retries; waiting for map-change trigger",
+                            event_pid,
+                            proc_pid,
+                            attempts
+                        );
+                        to_exhaust.push(event_pid);
+                    } else {
+                        tracing::warn!(
+                            "Sysmon: deferred prefill produced no entries for event pid {} (proc pid {}) after {} retries; giving up",
+                            event_pid,
+                            proc_pid,
+                            attempts
+                        );
+                        to_remove.push(event_pid);
+                    }
                 }
             }
             Err(e) => {
@@ -1950,16 +2543,23 @@ fn poll_pending_offsets(
                     e
                 );
                 if attempts >= PENDING_MAX_ATTEMPTS {
-                    to_remove.push(event_pid);
+                    if due.kind.keep_for_map_changes_after_retry_exhaustion() {
+                        to_exhaust.push(event_pid);
+                    } else {
+                        to_remove.push(event_pid);
+                    }
                 }
             }
         }
     }
 
-    if !to_remove.is_empty() {
+    if !to_remove.is_empty() || !to_exhaust.is_empty() {
         if let Ok(mut guard) = pending.lock() {
             for pid in to_remove {
                 guard.remove(pid);
+            }
+            for pid in to_exhaust {
+                guard.mark_retry_exhausted(pid);
             }
         }
     }
@@ -1986,6 +2586,7 @@ fn cached_offsets_exist_for_target_pid(
 fn forget_pid_offsets_after_target_unmap(
     mgr: &Arc<Mutex<ProcessManager>>,
     event_pid: u32,
+    host_pid: u32,
     proc_pid: u32,
 ) {
     if let Ok(mut guard) = mgr.lock() {
@@ -1993,37 +2594,29 @@ fn forget_pid_offsets_after_target_unmap(
         if proc_pid != event_pid {
             guard.forget_pid(event_pid);
         }
+        if host_pid != event_pid && host_pid != proc_pid {
+            guard.forget_pid(host_pid);
+        }
     }
 
-    match crate::pinned_bpf_maps::purge_offsets_for_pid(proc_pid) {
-        Ok(n) if n > 0 => tracing::info!(
-            "Sysmon: target unmapped for event pid {} (proc pid {}); purged {} offset entries",
+    let purged = purge_runtime_pid_artifacts(proc_pid, event_pid, host_pid);
+    if purged > 0 {
+        tracing::info!(
+            "Sysmon: target unmapped for event pid {} (host pid {}, proc pid {}); purged {} offset entries",
             event_pid,
+            host_pid,
             proc_pid,
-            n
-        ),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(
-            "Sysmon: purge after target unmap failed for event pid {} (proc pid {}): {}",
-            event_pid,
-            proc_pid,
-            e
-        ),
+            purged
+        );
     }
-    let _ = crate::pinned_bpf_maps::purge_ranges_for_pid(proc_pid);
-    if proc_pid != event_pid {
-        let _ = crate::pinned_bpf_maps::purge_offsets_for_pid(event_pid);
-        let _ = crate::pinned_bpf_maps::purge_ranges_for_pid(event_pid);
-    }
-    let _ = crate::pinned_bpf_maps::remove_allowed_pid(event_pid);
-    let _ = crate::pinned_bpf_maps::remove_pid_alias(event_pid);
 }
 
 fn poll_pending_map_refreshes(
     mgr: &Arc<Mutex<ProcessManager>>,
     target: Option<&Path>,
     pending_map_refreshes: &Arc<Mutex<PendingMapRefreshes>>,
-    proc_pid_for_event: &impl Fn(u32) -> u32,
+    pending: &Arc<Mutex<PendingOffsets>>,
+    tx: &mpsc::SyncSender<SysEvent>,
 ) {
     let due = if let Ok(mut guard) = pending_map_refreshes.lock() {
         guard.take_due()
@@ -2035,8 +2628,14 @@ fn poll_pending_map_refreshes(
         return;
     }
 
-    for event_pid in due {
-        let proc_pid = proc_pid_for_event(event_pid);
+    for event in due {
+        let event_pid = event.event_pid;
+        let host_pid = event.host_pid;
+        let proc_pid = target
+            .map(|target_path| {
+                canonicalize_cached_target_proc_pid(mgr, target_path, event.proc_pid)
+            })
+            .unwrap_or(event.proc_pid);
         if !pid_alive(proc_pid) {
             tracing::trace!(
                 "Sysmon: event pid {} (proc pid {}) exited before map refresh",
@@ -2049,7 +2648,13 @@ fn poll_pending_map_refreshes(
         if let Some(target_path) = target {
             if !pid_maps_target_module(proc_pid, target_path) {
                 if cached_offsets_exist_for_target_pid(mgr, target_path, proc_pid) {
-                    forget_pid_offsets_after_target_unmap(mgr, event_pid, proc_pid);
+                    forget_pid_offsets_after_target_unmap(mgr, event_pid, host_pid, proc_pid);
+                    let ev = SysEvent {
+                        tgid: event_pid,
+                        host_tgid: host_pid,
+                        kind: SysEventKind::MapChange.as_u32(),
+                    };
+                    try_publish_sys_event(tx, ev);
                 }
                 tracing::trace!(
                     "Sysmon: event pid {} (proc pid {}) map-change does not include target {}; skip",
@@ -2061,12 +2666,27 @@ fn poll_pending_map_refreshes(
             }
         }
 
-        match refresh_offsets_for_pid(mgr, event_pid, proc_pid_for_event) {
-            Ok(true) => tracing::debug!(
-                "Sysmon: refreshed offsets after map-change for event pid {} (proc pid {})",
-                event_pid,
-                proc_pid
-            ),
+        match refresh_offsets_for_known_proc_pid(mgr, event_pid, host_pid, proc_pid) {
+            Ok(true) => {
+                tracing::debug!(
+                    "Sysmon: refreshed offsets after map-change for event pid {} (host pid {}, proc pid {})",
+                    event_pid,
+                    host_pid,
+                    proc_pid
+                );
+                if let Ok(mut guard) = pending.lock() {
+                    guard.remove(event_pid);
+                    if host_pid != event_pid {
+                        guard.remove(host_pid);
+                    }
+                }
+                let ev = SysEvent {
+                    tgid: event_pid,
+                    host_tgid: host_pid,
+                    kind: SysEventKind::MapChange.as_u32(),
+                };
+                try_publish_sys_event(tx, ev);
+            }
             Ok(false) => tracing::trace!(
                 "Sysmon: map-change refresh inserted no offsets for event pid {} (proc pid {})",
                 event_pid,
@@ -2154,12 +2774,172 @@ mod tests {
     fn sysmon_event_publish_drops_when_queue_is_full() {
         let (tx, rx) = mpsc::sync_channel(1);
 
-        assert!(try_publish_sys_event(&tx, SysEvent { tgid: 1, kind: 1 }));
-        assert!(!try_publish_sys_event(&tx, SysEvent { tgid: 2, kind: 2 }));
+        assert!(try_publish_sys_event(
+            &tx,
+            SysEvent {
+                tgid: 1,
+                host_tgid: 1,
+                kind: 1
+            }
+        ));
+        assert!(!try_publish_sys_event(
+            &tx,
+            SysEvent {
+                tgid: 2,
+                host_tgid: 2,
+                kind: 2
+            }
+        ));
 
         let queued = rx.try_recv().expect("first event should be queued");
         assert_eq!(queued.tgid, 1);
         assert_eq!(queued.kind, 1);
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn invisible_shared_object_exec_does_not_queue_unresolved_alias() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target_path = dir.path().join("libtarget.so");
+        let mut elf = [0u8; 64];
+        elf[0..4].copy_from_slice(b"\x7FELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+        std::fs::write(&target_path, elf)?;
+
+        let mgr = Arc::new(Mutex::new(ProcessManager::new()));
+        let pending = Arc::new(Mutex::new(PendingOffsets::new()));
+        let ev = SysEvent {
+            tgid: u32::MAX - 1,
+            host_tgid: u32::MAX - 2,
+            kind: SysEventKind::Exec.as_u32(),
+        };
+
+        ProcessSysmon::handle_event_with_proc_pid_resolver(
+            &mgr,
+            &Some(target_path),
+            &pending,
+            &ev,
+            |pid| pid,
+        )?;
+
+        assert!(
+            pending
+                .lock()
+                .expect("pending offsets lock")
+                .entries
+                .is_empty(),
+            "unresolved exec events must not be deferred without target-map proof"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn visible_shared_object_exec_queues_map_change_candidate() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target_path = dir.path().join("libtarget.so");
+        let mut elf = [0u8; 64];
+        elf[0..4].copy_from_slice(b"\x7FELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+        std::fs::write(&target_path, elf)?;
+
+        let event_pid = std::process::id();
+        let mgr = Arc::new(Mutex::new(ProcessManager::new()));
+        let pending = Arc::new(Mutex::new(PendingOffsets::new()));
+        let ev = SysEvent {
+            tgid: event_pid,
+            host_tgid: event_pid,
+            kind: SysEventKind::Exec.as_u32(),
+        };
+
+        ProcessSysmon::handle_event_with_proc_pid_resolver(
+            &mgr,
+            &Some(target_path.clone()),
+            &pending,
+            &ev,
+            |pid| pid,
+        )?;
+
+        let guard = pending.lock().expect("pending offsets lock");
+        let entry = guard
+            .entries
+            .get(&event_pid)
+            .expect("visible shared-object exec should be queued for retry");
+        assert_eq!(entry.target_path, target_path);
+        assert_eq!(entry.kind, PendingOffsetsKind::MapChangeCandidate);
+        Ok(())
+    }
+
+    #[test]
+    fn invisible_shared_object_exec_queues_visible_host_pid_retry() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target_path = dir.path().join("libtarget.so");
+        let mut elf = [0u8; 64];
+        elf[0..4].copy_from_slice(b"\x7FELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+        std::fs::write(&target_path, elf)?;
+
+        let host_pid = std::process::id();
+        let mgr = Arc::new(Mutex::new(ProcessManager::new()));
+        let pending = Arc::new(Mutex::new(PendingOffsets::new()));
+        let ev = SysEvent {
+            tgid: u32::MAX - 1,
+            host_tgid: host_pid,
+            kind: SysEventKind::Exec.as_u32(),
+        };
+
+        ProcessSysmon::handle_event_with_proc_pid_resolver(
+            &mgr,
+            &Some(target_path.clone()),
+            &pending,
+            &ev,
+            |pid| pid,
+        )?;
+
+        let guard = pending.lock().expect("pending offsets lock");
+        let entry = guard
+            .entries
+            .get(&host_pid)
+            .expect("visible host PID should be queued for maps-based retry");
+        assert_eq!(entry.target_path, target_path);
+        assert_eq!(entry.kind, PendingOffsetsKind::MapChangeCandidate);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_object_candidate_survives_retry_exhaustion() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target_path = dir.path().join("libtarget.so");
+        std::fs::write(&target_path, b"not actually mapped")?;
+
+        let event_pid = std::process::id();
+        let pending = Arc::new(Mutex::new(PendingOffsets::new()));
+        {
+            let mut guard = pending.lock().expect("pending offsets lock");
+            guard.register_map_change_candidate(event_pid, &target_path);
+            let entry = guard
+                .entries
+                .get_mut(&event_pid)
+                .expect("pending candidate");
+            entry.attempts = PENDING_MAX_ATTEMPTS - 1;
+            entry.last_poll = Instant::now() - PENDING_POLL_INTERVAL;
+        }
+
+        let mgr = Arc::new(Mutex::new(ProcessManager::new()));
+        poll_pending_offsets(&mgr, &pending, &|pid| pid);
+
+        let guard = pending.lock().expect("pending offsets lock");
+        let entry = guard
+            .entries
+            .get(&event_pid)
+            .expect("map-change candidate should remain after retry exhaustion");
+        assert!(entry.retry_exhausted);
+        assert!(guard.contains_map_change_candidate(event_pid, &target_path));
+        Ok(())
     }
 }
