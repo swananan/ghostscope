@@ -9,7 +9,7 @@ use ghostscope_process::{
     PidFilterSpec, PidNamespaceId, ProcessManager, ProcessSysmon, SysEventKind, SysmonConfig,
     SysmonEventMask,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -28,6 +28,14 @@ fn sysmon_watch_from_config(
         Some(PidFilterSpec::HostTgid { filter_pid }) => (Some(filter_pid), None),
         None => (fallback_host_pid, None),
     }
+}
+
+fn target_mode_sysmon_event_mask(_target: &Path) -> SysmonEventMask {
+    SysmonEventMask::target_mode_with_map_changes()
+}
+
+fn target_mode_map_change_unfiltered(target: &Path) -> bool {
+    ghostscope_process::is_shared_object(target)
 }
 
 #[derive(Debug, Clone)]
@@ -145,8 +153,10 @@ impl GhostSession {
                 proc_offsets_max_entries: config.ebpf_config.proc_module_offsets_max_entries as u32,
                 perf_page_count: Some(config.ebpf_config.perf_page_count as usize),
                 event_mask: SysmonEventMask::pid_module_changes(),
+                map_change_unfiltered: false,
                 watched_pid,
                 watched_pid_ns,
+                event_pid_ns: None,
                 watched_proc_pid: s.proc_pid(),
             };
             let mgr = Arc::clone(&s.coordinator);
@@ -169,9 +179,11 @@ impl GhostSession {
                     proc_offsets_max_entries: config.ebpf_config.proc_module_offsets_max_entries
                         as u32,
                     perf_page_count: Some(config.ebpf_config.perf_page_count as usize),
-                    event_mask: SysmonEventMask::target_mode_with_map_changes(),
+                    event_mask: target_mode_sysmon_event_mask(&tpath),
+                    map_change_unfiltered: target_mode_map_change_unfiltered(&tpath),
                     watched_pid: None,
                     watched_pid_ns: None,
+                    event_pid_ns: config.runtime.proc_offsets_pid_ns,
                     watched_proc_pid: None,
                 };
                 let mgr = Arc::clone(&s.coordinator);
@@ -227,8 +239,10 @@ impl GhostSession {
                 proc_offsets_max_entries: 4096,
                 perf_page_count: None,
                 event_mask: SysmonEventMask::pid_module_changes(),
+                map_change_unfiltered: false,
                 watched_pid: s.host_pid(),
                 watched_pid_ns: None,
+                event_pid_ns: None,
                 watched_proc_pid: s.proc_pid(),
             };
             let mgr = Arc::clone(&s.coordinator);
@@ -238,13 +252,22 @@ impl GhostSession {
             info!("Sysmon started (-p map-change mode)");
         } else if s.target_binary.is_some() {
             let target_module = s.target_binary.as_ref().map(PathBuf::from);
+            let event_mask = target_module
+                .as_deref()
+                .map(target_mode_sysmon_event_mask)
+                .unwrap_or_else(SysmonEventMask::target_mode);
+            let map_change_unfiltered = target_module
+                .as_deref()
+                .is_some_and(target_mode_map_change_unfiltered);
             let cfg = SysmonConfig {
                 target_module,
                 proc_offsets_max_entries: 4096,
                 perf_page_count: None,
-                event_mask: SysmonEventMask::target_mode_with_map_changes(),
+                event_mask,
+                map_change_unfiltered,
                 watched_pid: None,
                 watched_pid_ns: None,
+                event_pid_ns: None,
                 watched_proc_pid: None,
             };
             let mgr = Arc::clone(&s.coordinator);
@@ -384,13 +407,23 @@ impl GhostSession {
     }
 
     pub async fn refresh_pid_runtime_modules_if_needed(&mut self) -> Result<usize> {
+        self.refresh_pid_runtime_modules_if_needed_for_runtime_pids(&[])
+            .await
+    }
+
+    pub async fn refresh_pid_runtime_modules_if_needed_for_runtime_pids(
+        &mut self,
+        extra_runtime_pids: &[u32],
+    ) -> Result<usize> {
         if self.proc_pid().is_none() {
             let saw_refresh_event = self.drain_sysmon_refresh_events(
                 Duration::ZERO,
                 self.target_backtrace_runtime_modules_enabled,
             );
             if saw_refresh_event && self.target_backtrace_runtime_modules_enabled {
-                return self.refresh_target_runtime_modules().await;
+                return self
+                    .refresh_target_runtime_modules_for_runtime_pids(extra_runtime_pids)
+                    .await;
             }
             return Ok(0);
         }
@@ -402,14 +435,19 @@ impl GhostSession {
         self.refresh_pid_runtime_modules().await
     }
 
-    pub async fn refresh_pid_runtime_modules_before_rendering(&mut self) -> Result<usize> {
+    pub async fn refresh_pid_runtime_modules_before_rendering_for_runtime_pids(
+        &mut self,
+        extra_runtime_pids: &[u32],
+    ) -> Result<usize> {
         if self.proc_pid().is_none() {
             let saw_refresh_event = self.drain_sysmon_refresh_events(
                 SYSMON_MAP_CHANGE_RENDER_GRACE,
                 self.target_backtrace_runtime_modules_enabled,
             );
             if saw_refresh_event && self.target_backtrace_runtime_modules_enabled {
-                return self.refresh_target_runtime_modules().await;
+                return self
+                    .refresh_target_runtime_modules_for_runtime_pids(extra_runtime_pids)
+                    .await;
             }
             return Ok(0);
         }
@@ -463,6 +501,14 @@ impl GhostSession {
     }
 
     pub async fn refresh_target_runtime_modules(&mut self) -> Result<usize> {
+        self.refresh_target_runtime_modules_for_runtime_pids(&[])
+            .await
+    }
+
+    pub async fn refresh_target_runtime_modules_for_runtime_pids(
+        &mut self,
+        extra_runtime_pids: &[u32],
+    ) -> Result<usize> {
         if self.proc_pid().is_some() {
             return Ok(0);
         }
@@ -472,7 +518,11 @@ impl GhostSession {
         };
         let runtime_modules = {
             let mut coordinator = self.coordinator.lock().expect("coordinator mutex poisoned");
-            BacktraceRuntimeRunner::collect_target_modules(&mut coordinator, &target_binary)?
+            BacktraceRuntimeRunner::collect_target_modules(
+                &mut coordinator,
+                &target_binary,
+                extra_runtime_pids,
+            )?
         };
         if runtime_modules.is_empty() {
             return Ok(0);

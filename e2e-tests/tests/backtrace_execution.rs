@@ -4,7 +4,7 @@ mod common;
 
 use common::{init, targets::TargetHandle, FIXTURES};
 use ghostscope_dwarf::{CfaRulePlan, ModuleAddress, RegisterRecoveryPlan};
-use std::env;
+use serial_test::serial;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -221,25 +221,7 @@ fn touch_dlopen_trigger_in_target_sandbox(
 }
 
 fn skip_if_nested_t_mode_unsupported() -> bool {
-    let target_mode = match env::var("E2E_TARGET_MODE") {
-        Ok(value) => value,
-        Err(env::VarError::NotPresent) => return false,
-        Err(err) => {
-            eprintln!("continuing nested -t test despite unreadable E2E_TARGET_MODE: {err}");
-            return false;
-        }
-    };
-    let nested_child_container = matches!(
-        target_mode.trim().to_ascii_lowercase().as_str(),
-        "child-container" | "child" | "nested" | "descendant"
-    );
-    if nested_child_container {
-        eprintln!(
-            "skipping nested child-container -t backtrace test: nested target-path mode is \
-             currently unsupported"
-        );
-    }
-    nested_child_container
+    false
 }
 
 async fn run_hot_backtrace(script: &str) -> anyhow::Result<(usize, String, String)> {
@@ -994,6 +976,7 @@ trace cross_module_lib_leaf {
 }
 
 #[tokio::test]
+#[serial(backtrace_t_mode)]
 async fn test_t_mode_cross_module_backtrace_resolves_so_and_exe_frames() -> anyhow::Result<()> {
     init();
     if skip_if_nested_t_mode_unsupported() {
@@ -1060,6 +1043,7 @@ trace cross_module_lib_leaf {
 }
 
 #[tokio::test]
+#[serial(backtrace_t_mode)]
 async fn test_t_mode_multiple_backtrace_traces_share_cross_module_cfi() -> anyhow::Result<()> {
     init();
     if skip_if_nested_t_mode_unsupported() {
@@ -1084,7 +1068,7 @@ trace cross_module_lib_leaf {
 "#;
 
     let (count, stdout, stderr) =
-        run_backtrace_target_mode_library_with_depth(&binary_path, &lib_path, script, 5, 250, 3)
+        run_backtrace_target_mode_library_with_depth(&binary_path, &lib_path, script, 5, 1000, 5)
             .await?;
     if count == 0 && stderr.contains("BPF_PROG_LOAD") {
         return Ok(());
@@ -1143,6 +1127,7 @@ trace cross_module_lib_leaf {
 }
 
 #[tokio::test]
+#[serial(backtrace_dlopen)]
 async fn test_pid_backtrace_reports_frame_from_library_loaded_by_dlopen() -> anyhow::Result<()> {
     init();
 
@@ -1226,6 +1211,7 @@ trace dlopen_main_callback {
 }
 
 #[tokio::test]
+#[serial(backtrace_t_mode, backtrace_dlopen)]
 async fn test_t_mode_backtrace_unwinds_library_loaded_by_dlopen() -> anyhow::Result<()> {
     init();
     if skip_if_nested_t_mode_unsupported() {
@@ -1249,7 +1235,7 @@ trace dlopen_main_callback {
         .timeout_secs(5)
         .with_cli_args([
             OsString::from("--script-output-events-per-sec"),
-            OsString::from("200"),
+            OsString::from("1000"),
             OsString::from("--backtrace-depth"),
             OsString::from("6"),
         ])
@@ -1296,6 +1282,7 @@ trace dlopen_main_callback {
 }
 
 #[tokio::test]
+#[serial(backtrace_t_mode, backtrace_dlopen)]
 async fn test_t_mode_backtrace_unwinds_shared_library_loaded_by_dlopen() -> anyhow::Result<()> {
     init();
     if skip_if_nested_t_mode_unsupported() {

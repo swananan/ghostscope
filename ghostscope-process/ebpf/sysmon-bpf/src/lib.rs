@@ -13,11 +13,14 @@ use aya_ebpf::{
 // SysEvent is a shared event layout with userspace (see ghostscope-process/src/sysmon.rs).
 // For now it is defined in two places to keep the BPF build isolated from the workspace.
 // Keep repr(C), field order and sizes identical on both sides.
-// Current layout (8 bytes): { tgid: u32, kind: u32 }.
+// Current layout (12 bytes): { tgid: u32, host_tgid: u32, kind: u32 }.
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct SysEvent {
+    /// Runtime TGID in the configured sysmon event namespace when available.
     pub tgid: u32,
+    /// Host/initial-namespace TGID from bpf_get_current_pid_tgid().
+    pub host_tgid: u32,
     pub kind: u32, // 1=Exec,2=Fork,3=Exit,4=MapChange
 }
 
@@ -57,6 +60,15 @@ static SYSMON_WATCHED_PID_NS_DEV: Array<u64> = Array::with_max_entries(1, 0);
 #[map(name = "sysmon_watched_pid_ns_ino")]
 static SYSMON_WATCHED_PID_NS_INO: Array<u64> = Array::with_max_entries(1, 0);
 
+#[map(name = "sysmon_event_pid_ns_dev")]
+static SYSMON_EVENT_PID_NS_DEV: Array<u64> = Array::with_max_entries(1, 0);
+
+#[map(name = "sysmon_event_pid_ns_ino")]
+static SYSMON_EVENT_PID_NS_INO: Array<u64> = Array::with_max_entries(1, 0);
+
+#[map(name = "sysmon_map_change_unfiltered")]
+static SYSMON_MAP_CHANGE_UNFILTERED: Array<u32> = Array::with_max_entries(1, 0);
+
 fn write_event<C: EbpfContext>(ctx: &C, ev: SysEvent) {
     if SYS_EVENTS.output::<SysEvent>(&ev, 0).is_err() {
         SYS_EVENTS_PERF.output(ctx, &ev, 0);
@@ -68,7 +80,8 @@ fn emit_exec<C: EbpfContext>(ctx: &C) -> u32 {
     if !event_enabled(SYS_EVENT_MASK_EXEC) {
         return 0;
     }
-    let pid = current_filtered_tgid();
+    let host_pid = current_host_tgid();
+    let pid = current_filtered_tgid(host_pid);
     if pid == 0 {
         return 0;
     }
@@ -77,7 +90,8 @@ fn emit_exec<C: EbpfContext>(ctx: &C) -> u32 {
     }
     // Emit exec only when filter (if present) passes; userspace handles mapping and allowlist.
     let ev = SysEvent {
-        tgid: pid,
+        tgid: current_event_tgid(host_pid, pid),
+        host_tgid: host_pid,
         kind: SYS_EVENT_EXEC,
     };
     write_event(ctx, ev);
@@ -89,15 +103,18 @@ fn emit_fork<C: EbpfContext>(ctx: &C) -> u32 {
     if !event_enabled(SYS_EVENT_MASK_FORK) {
         return 0;
     }
-    let pid = current_filtered_tgid();
+    let host_pid = current_host_tgid();
+    let pid = current_filtered_tgid(host_pid);
     if pid == 0 {
         return 0;
     }
-    if ALLOWED_PIDS.get_ptr(&pid).is_none() {
+    let event_pid = current_event_tgid(host_pid, pid);
+    if ALLOWED_PIDS.get_ptr(&pid).is_none() && ALLOWED_PIDS.get_ptr(&event_pid).is_none() {
         return 0;
     }
     let ev = SysEvent {
-        tgid: pid,
+        tgid: event_pid,
+        host_tgid: host_pid,
         kind: SYS_EVENT_FORK,
     };
     write_event(ctx, ev);
@@ -109,15 +126,18 @@ fn emit_exit<C: EbpfContext>(ctx: &C) -> u32 {
     if !event_enabled(SYS_EVENT_MASK_EXIT) {
         return 0;
     }
-    let pid = current_filtered_tgid();
+    let host_pid = current_host_tgid();
+    let pid = current_filtered_tgid(host_pid);
     if pid == 0 {
         return 0;
     }
-    if ALLOWED_PIDS.get_ptr(&pid).is_none() {
+    let event_pid = current_event_tgid(host_pid, pid);
+    if ALLOWED_PIDS.get_ptr(&pid).is_none() && ALLOWED_PIDS.get_ptr(&event_pid).is_none() {
         return 0;
     }
     let ev = SysEvent {
-        tgid: pid,
+        tgid: event_pid,
+        host_tgid: host_pid,
         kind: SYS_EVENT_EXIT,
     };
     write_event(ctx, ev);
@@ -129,15 +149,27 @@ fn emit_map_change<C: EbpfContext>(ctx: &C) -> u32 {
     if !event_enabled(SYS_EVENT_MASK_MAP_CHANGE) {
         return 0;
     }
-    let pid = current_filtered_tgid();
+    let host_pid = current_host_tgid();
+    let pid = current_filtered_tgid(host_pid);
     if pid == 0 {
         return 0;
     }
-    if !watched_pid_configured() && ALLOWED_PIDS.get_ptr(&pid).is_none() {
+    let event_pid = current_event_tgid(host_pid, pid);
+    // In target-mode shared-object tracing, the first useful signal is often
+    // the map change that loads the target module, before userspace has had a
+    // chance to populate allowed_pids. Executable target-mode keeps map-change
+    // gated on allowed_pids so all-process mmap traffic cannot delay exec
+    // handling for short-lived targets.
+    if !watched_pid_configured()
+        && !map_change_unfiltered()
+        && ALLOWED_PIDS.get_ptr(&pid).is_none()
+        && ALLOWED_PIDS.get_ptr(&event_pid).is_none()
+    {
         return 0;
     }
     let ev = SysEvent {
-        tgid: pid,
+        tgid: event_pid,
+        host_tgid: host_pid,
         kind: SYS_EVENT_MAP_CHANGE,
     };
     write_event(ctx, ev);
@@ -160,6 +192,14 @@ fn event_enabled(bit: u32) -> bool {
 }
 
 #[inline(always)]
+fn map_change_unfiltered() -> bool {
+    match SYSMON_MAP_CHANGE_UNFILTERED.get(0) {
+        Some(enabled) => *enabled != 0,
+        None => false,
+    }
+}
+
+#[inline(always)]
 fn watched_pid_configured() -> bool {
     match SYSMON_WATCHED_PID.get(0) {
         Some(watched) => *watched != 0,
@@ -168,8 +208,7 @@ fn watched_pid_configured() -> bool {
 }
 
 #[inline(always)]
-fn current_filtered_tgid() -> u32 {
-    let host_pid = current_host_tgid();
+fn current_filtered_tgid(host_pid: u32) -> u32 {
     let watched = match SYSMON_WATCHED_PID.get(0) {
         Some(watched) => *watched,
         None => 0,
@@ -208,6 +247,39 @@ fn current_filtered_tgid() -> u32 {
     } else {
         0
     }
+}
+
+#[inline(always)]
+fn current_event_tgid(host_pid: u32, filtered_pid: u32) -> u32 {
+    if watched_pid_configured() {
+        return filtered_pid;
+    }
+
+    let ns_dev = match SYSMON_EVENT_PID_NS_DEV.get(0) {
+        Some(dev) => *dev,
+        None => 0,
+    };
+    let ns_ino = match SYSMON_EVENT_PID_NS_INO.get(0) {
+        Some(ino) => *ino,
+        None => 0,
+    };
+
+    if ns_dev != 0 && ns_ino != 0 {
+        let mut nsdata = bpf_pidns_info { pid: 0, tgid: 0 };
+        let ret = unsafe {
+            aya_ebpf::helpers::generated::bpf_get_ns_current_pid_tgid(
+                ns_dev,
+                ns_ino,
+                &mut nsdata,
+                core::mem::size_of::<bpf_pidns_info>() as u32,
+            )
+        };
+        if ret == 0 && nsdata.tgid != 0 {
+            return nsdata.tgid;
+        }
+    }
+
+    host_pid
 }
 
 #[inline(always)]

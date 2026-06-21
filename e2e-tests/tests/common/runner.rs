@@ -366,9 +366,9 @@ impl GhostscopeRunner {
         if !ready_fired {
             let pre_ready_task = async {
                 loop {
-                    if let Ok(Some(output_line)) =
-                        timeout(Duration::from_millis(100), output_rx.recv()).await
-                    {
+                    let mut saw_output = false;
+                    while let Ok(output_line) = output_rx.try_recv() {
+                        saw_output = true;
                         if handle_output_line(
                             output_line,
                             &mut stdout_content,
@@ -381,11 +381,32 @@ impl GhostscopeRunner {
                             break;
                         }
                     }
+                    if ready_fired {
+                        break;
+                    }
+                    if !saw_output {
+                        match timeout(Duration::from_millis(100), output_rx.recv()).await {
+                            Ok(Some(output_line)) => {
+                                if handle_output_line(
+                                    output_line,
+                                    &mut stdout_content,
+                                    &mut stderr_content,
+                                    ready_marker.as_deref(),
+                                    runner_debug,
+                                    &sandbox,
+                                ) {
+                                    ready_fired = true;
+                                    break;
+                                }
+                            }
+                            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+                            Err(_) => {}
+                        }
+                    }
 
                     if let Ok(Some(_status)) = child.try_wait() {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Ok::<(), anyhow::Error>(())
             };
@@ -481,9 +502,9 @@ impl GhostscopeRunner {
         let timed_out = if ready_fired {
             let read_task = async {
                 loop {
-                    if let Ok(Some(output_line)) =
-                        timeout(Duration::from_millis(100), output_rx.recv()).await
-                    {
+                    let mut saw_output = false;
+                    while let Ok(output_line) = output_rx.try_recv() {
+                        saw_output = true;
                         handle_output_line(
                             output_line,
                             &mut stdout_content,
@@ -493,11 +514,26 @@ impl GhostscopeRunner {
                             &sandbox,
                         );
                     }
+                    if !saw_output {
+                        match timeout(Duration::from_millis(100), output_rx.recv()).await {
+                            Ok(Some(output_line)) => {
+                                handle_output_line(
+                                    output_line,
+                                    &mut stdout_content,
+                                    &mut stderr_content,
+                                    ready_marker.as_deref(),
+                                    runner_debug,
+                                    &sandbox,
+                                );
+                            }
+                            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+                            Err(_) => {}
+                        }
+                    }
 
                     if let Ok(Some(_status)) = child.try_wait() {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Ok::<(), anyhow::Error>(())
             };

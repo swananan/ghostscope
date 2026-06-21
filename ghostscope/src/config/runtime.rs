@@ -121,7 +121,9 @@ impl RuntimeContext {
                     "proc_module_offsets remains on GhostScope /proc PID view because target-namespace filtering is not active for this session"
                 );
             }
-        } else if helper_supported && in_container {
+        } else if helper_supported
+            && (in_container || self.special_pid_ns.is_some() || self.proc_offsets_pid_ns.is_some())
+        {
             let self_pid = std::process::id();
             if let Some(pid_ns) = self.special_pid_ns {
                 let (pid_ns_dev, pid_ns_inode) = pid_ns

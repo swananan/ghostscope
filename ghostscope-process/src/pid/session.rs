@@ -55,7 +55,7 @@ pub fn resolve_pid_session(
     let in_container = runtime_env.is_container_likely();
 
     let target_pid_views = input_pid.map(resolve_input_pid).transpose()?;
-    let self_pid_views = if helper_supported && in_container {
+    let self_pid_views = if helper_supported {
         let self_pid = std::process::id();
         match resolve_input_pid(self_pid) {
             Ok(pid_views) => Some(pid_views),

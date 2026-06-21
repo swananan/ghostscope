@@ -162,6 +162,7 @@ pub const PROC_MODULE_RANGES_MAP_NAME: &str = "proc_module_ranges";
 pub const ALLOWED_PIDS_MAP_NAME: &str = "allowed_pids";
 pub const PID_ALIASES_MAP_NAME: &str = "pid_aliases";
 pub const TARGET_EXEC_COMM_MAP_NAME: &str = "target_exec_comm";
+pub const SYSMON_MAP_CHANGE_UNFILTERED_MAP_NAME: &str = "sysmon_map_change_unfiltered";
 pub const BT_UNWIND_ROWS_MAP_NAME: &str = "bt_unwind_rows";
 pub const BT_MODULE_ROW_RANGES_MAP_NAME: &str = "bt_module_row_ranges";
 
