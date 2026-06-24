@@ -297,7 +297,7 @@ Notes:
 - When GhostScope and target use the same sandbox kind, the topology-aware e2e helper automatically reuses the same sandbox instance.
 - Routine host-host e2e, including the main `CI` workflow, skips the explicit `container_topology_execution` cases by default.
 - `host -> docker-private`, `docker-private -> same docker-private`, and `docker-private -> child-container` are the explicit topology scenarios that currently run the full e2e suite in the dedicated `Container E2E` workflow.
-- `docker-private -> child-container` uses `E2E_TARGET_MODE=child-container` and launches the target in a nested Docker child container inside the outer private sandbox. The full suite now runs in CI for that topology, while nested child-container `-t` cases still follow the existing explicit skip path inside the Rust tests.
+- `docker-private -> child-container` uses `E2E_TARGET_MODE=child-container` and launches the target in a nested Docker child container inside the outer private sandbox. The full suite now runs in CI for that topology, but target-mode coverage is still split: nested backtrace `-t` cases run, while `globals_target` nested `-t` cases still follow their explicit skip path.
 - `docker-host -> same docker-host` remains a smoke run because it is close to the default host PID view.
 - Running the `docker-private` variant usually requires `sudo` because the host-side test harness must inspect the sandbox PID namespace.
 - By default the topology-aware e2e framework uses a pinned digest of the dedicated Ubuntu 24.04 runtime image published for container e2e: `ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4`.
