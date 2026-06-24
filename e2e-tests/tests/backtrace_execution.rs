@@ -25,6 +25,19 @@ async fn spawn_backtrace_fixture_program(
     Ok(target)
 }
 
+fn signal_backtrace_target(target: &TargetHandle, signal: &str) -> anyhow::Result<()> {
+    let command = format!("kill -{signal} {}", target.sandbox_pid());
+    let output = target.sandbox().run_shell(&command)?;
+    anyhow::ensure!(
+        output.status.success(),
+        "failed to send SIG{signal} to target pid {} in target sandbox\nSTDOUT: {}\nSTDERR: {}",
+        target.sandbox_pid(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 async fn run_hot_backtrace_with_depth(
     script: &str,
     depth: u8,
@@ -137,11 +150,54 @@ async fn run_backtrace_target_mode_library_with_depth(
     output_events_per_sec: u32,
     timeout_secs: u64,
 ) -> anyhow::Result<(usize, String, String)> {
+    run_backtrace_target_mode_library_with_depth_and_pid_scope(
+        binary_path,
+        target_path,
+        script,
+        depth,
+        output_events_per_sec,
+        timeout_secs,
+        false,
+    )
+    .await
+}
+
+async fn run_backtrace_target_mode_library_for_spawned_pid_with_depth(
+    binary_path: &Path,
+    target_path: &Path,
+    script: &str,
+    depth: u8,
+    output_events_per_sec: u32,
+    timeout_secs: u64,
+) -> anyhow::Result<(usize, String, String)> {
+    run_backtrace_target_mode_library_with_depth_and_pid_scope(
+        binary_path,
+        target_path,
+        script,
+        depth,
+        output_events_per_sec,
+        timeout_secs,
+        true,
+    )
+    .await
+}
+
+async fn run_backtrace_target_mode_library_with_depth_and_pid_scope(
+    binary_path: &Path,
+    target_path: &Path,
+    script: &str,
+    depth: u8,
+    output_events_per_sec: u32,
+    timeout_secs: u64,
+    attach_spawned_target: bool,
+) -> anyhow::Result<(usize, String, String)> {
     let target = spawn_backtrace_fixture_program(binary_path).await?;
+    signal_backtrace_target(&target, "STOP")?;
     let rate_arg = output_events_per_sec.to_string();
     let depth_arg = depth.to_string();
 
-    let result = common::runner::GhostscopeRunner::new()
+    let target_for_ready = target.clone();
+    let mut runner = common::runner::GhostscopeRunner::new()
         .with_script(script)
         .with_target(target_path)
         .timeout_secs(timeout_secs)
@@ -150,12 +206,20 @@ async fn run_backtrace_target_mode_library_with_depth(
             OsString::from(rate_arg),
             OsString::from("--backtrace-depth"),
             OsString::from(depth_arg),
-        ])
-        .run()
+        ]);
+    if attach_spawned_target {
+        runner = runner.attach_to(&target);
+    }
+    let result = runner
+        .run_after_ready(move || async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            signal_backtrace_target(&target_for_ready, "CONT")
+        })
         .await;
 
+    let _ = signal_backtrace_target(&target, "CONT");
     target.terminate().await?;
-    let (exit_code, stdout, stderr) = result?;
+    let (exit_code, stdout, stderr, ()) = result?;
     if exit_code != 0 && stderr.contains("BPF_PROG_LOAD") {
         return Ok((0, stdout, stderr));
     }
@@ -1057,22 +1121,36 @@ async fn test_t_mode_multiple_backtrace_traces_share_cross_module_cfi() -> anyho
         .join("libbacktrace_cross_module.so");
     let script = r#"
 trace cross_module_lib_probe {
-    print "T_MODE_SHARED_CFI_PROBE";
-    bt full;
+    if value > 2048 && value % 64 == 0 {
+        print "T_MODE_SHARED_CFI_PROBE";
+        bt full;
+    }
 }
 
 trace cross_module_lib_leaf {
-    print "T_MODE_SHARED_CFI_LEAF";
-    bt full;
+    if value > 2048 && value % 64 == 1 {
+        print "T_MODE_SHARED_CFI_LEAF";
+        bt full;
+    }
 }
 "#;
 
-    let (count, stdout, stderr) =
-        run_backtrace_target_mode_library_with_depth(&binary_path, &lib_path, script, 5, 1000, 5)
-            .await?;
+    let (count, stdout, stderr) = run_backtrace_target_mode_library_for_spawned_pid_with_depth(
+        &binary_path,
+        &lib_path,
+        script,
+        5,
+        250,
+        8,
+    )
+    .await?;
     if count == 0 && stderr.contains("BPF_PROG_LOAD") {
         return Ok(());
     }
+    assert!(
+        !stderr.contains("script output saturated"),
+        "shared-CFI test should not saturate script output\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
     assert!(
         count >= 2,
         "expected both target-mode backtrace traces to emit events\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
