@@ -111,7 +111,31 @@ async fn run_backtrace_binary_with_args(
     extra_args: Vec<OsString>,
     config_content: Option<&str>,
 ) -> anyhow::Result<(usize, String, String)> {
+    run_backtrace_binary_with_args_and_mapped_module(
+        binary_path,
+        script,
+        output_events_per_sec,
+        timeout_secs,
+        extra_args,
+        config_content,
+        None,
+    )
+    .await
+}
+
+async fn run_backtrace_binary_with_args_and_mapped_module(
+    binary_path: &Path,
+    script: &str,
+    output_events_per_sec: u32,
+    timeout_secs: u64,
+    extra_args: Vec<OsString>,
+    config_content: Option<&str>,
+    required_mapped_module: Option<&str>,
+) -> anyhow::Result<(usize, String, String)> {
     let target = spawn_backtrace_fixture_program(binary_path).await?;
+    if let Some(module) = required_mapped_module {
+        wait_for_target_maps_to_contain(&target, module, Duration::from_secs(2)).await?;
+    }
     let rate_arg = output_events_per_sec.to_string();
 
     let mut cli_args = vec![
@@ -140,6 +164,40 @@ async fn run_backtrace_binary_with_args(
     anyhow::ensure!(exit_code == 0, "stderr={stderr} stdout={stdout}");
     let count = stdout.matches("backtrace: ").count();
     Ok((count, stdout, stderr))
+}
+
+async fn wait_for_target_maps_to_contain(
+    target: &TargetHandle,
+    module_name: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let maps_path = format!("/proc/{}/maps", target.sandbox_pid());
+    let command = format!(
+        "grep -F -- {} {} >/dev/null",
+        shell_quote(module_name),
+        shell_quote(&maps_path)
+    );
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let output = target.sandbox().run_shell(&command)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let maps_output = target.sandbox().run_shell(&format!(
+                "cat {} 2>/dev/null || true",
+                shell_quote(&maps_path)
+            ))?;
+            anyhow::bail!(
+                "timed out waiting for target pid {} maps to include {}\nMAPS:\n{}",
+                target.sandbox_pid(),
+                module_name,
+                String::from_utf8_lossy(&maps_output.stdout)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn run_backtrace_target_mode_library_with_depth(
@@ -992,12 +1050,20 @@ trace cross_module_lib_leaf {
 }
 "#;
 
-    let (count, stdout, stderr) = run_backtrace_fixture_with_depth_and_rate(
-        "backtrace_cross_module_program",
+    let binary_path = FIXTURES.get_test_binary("backtrace_cross_module_program")?;
+    let depth_arg = OsString::from("5");
+    let (count, stdout, stderr) = run_backtrace_binary_with_args_and_mapped_module(
+        &binary_path,
         script,
-        5,
         250,
         3,
+        vec![OsString::from("--backtrace-depth"), depth_arg],
+        None,
+        // PID-mode function targets are resolved from the initial
+        // /proc/<pid>/maps snapshot. Runtime map-change refresh can improve
+        // later backtrace rendering, but it cannot add a probe whose shared
+        // object was not mapped before script compilation.
+        Some("libbacktrace_cross_module.so"),
     )
     .await?;
     if count == 0 && stderr.contains("BPF_PROG_LOAD") {
