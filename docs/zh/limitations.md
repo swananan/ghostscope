@@ -56,6 +56,14 @@ GhostScope 能识别 `DW_OP_form_tls_address`，但运行时 TLS 地址解析目
 ### 9. 动态加载库（dlopen）
 GhostScope 启动时会扫描进程的 `/proc/PID/maps` 获取已加载的动态库信息；现在在 `-p <pid>` 和启用 sysmon 的独立 `-t <path>` 下，也会通过运行时 map-change 监控刷新模块映射。对 `bt`/`backtrace` 来说，这可以为后续通过 `dlopen` 加载的库追加 compact DWARF CFI rows 和模块偏移，但仍受 `backtrace_unwind_rows_max_entries` 以及上文提到的 map-change 竞态限制。
 
+`-p <pid>` 有一个启动边界：trace setup 会先快照该 PID 当前的
+`/proc/<pid>/maps`，再解析函数名目标。如果 GhostScope 紧贴进程启动，而
+动态加载器还没有把某个共享库映射进来，脚本又要 trace 这个库里的函数，
+setup 可能在运行时 map-change 监控有机会刷新之前失败。这主要影响“启动后
+立刻 attach”的流程；attach 到已运行的进程、等目标库出现在
+`/proc/<pid>/maps` 后再启动 GhostScope，或对已知库目标使用
+`-t <path> -p <pid>`，都可以避开这个竞态。
+
 这条运行时刷新链路不会自动新增 trace probe，也不会让脚本编译/附加时尚未知的库立即支持 print 或全局变量目标。这些目标仍依赖 trace setup 阶段能够看到对应目标模块和调试信息。
 
 ### 10. -t 模式下的全局变量支持

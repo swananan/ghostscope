@@ -56,6 +56,16 @@ Compiler optimizations (-O2, -O3) can cause variables to be optimized away or ge
 ### 9. Dynamically Loaded Libraries (dlopen)
 GhostScope scans `/proc/PID/maps` at startup, and runtime map-change monitoring now refreshes module mappings for `-p <pid>` and standalone `-t <path>` runs while sysmon is enabled. For `bt`/`backtrace`, this can add compact DWARF CFI rows and module offsets for libraries loaded later through `dlopen`, subject to `backtrace_unwind_rows_max_entries` and the map-change race noted above.
 
+`-p <pid>` has one startup edge case: trace setup snapshots the PID's
+current `/proc/<pid>/maps` before resolving function-name targets. If
+GhostScope attaches immediately after launching a process and the dynamic
+loader has not mapped a shared library yet, a trace whose target function
+lives in that library can fail setup before runtime map-change monitoring has
+anything to refresh. This mainly affects launch-and-immediately-attach
+workflows; attaching to an already-running process, waiting until the library
+appears in `/proc/<pid>/maps`, or using `-t <path> -p <pid>` for a known
+library target avoids the race.
+
 This runtime refresh does not automatically create new trace probes or make print/global-variable targets available for a library that was unknown when the script was compiled and attached. Those targets still depend on the target module and debug information being available during trace setup.
 
 ### 10. Global Variables in `-t` Mode
