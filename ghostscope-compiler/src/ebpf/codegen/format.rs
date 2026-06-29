@@ -155,7 +155,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             format,
             args.len()
         );
-        let format_string_index = self.trace_context.add_string(format.to_string());
+        let format_string_index = self.trace_context.add_string(format.to_string())?;
         let mut complex_args: Vec<ComplexArg<'ctx>> = Vec::with_capacity(args.len());
 
         // Parse placeholders from the format string to support extended specifiers
@@ -274,8 +274,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         complex_args.push(ComplexArg {
                             var_name_index: self
                                 .trace_context
-                                .add_variable_name(self.expr_to_name(expr)),
-                            type_index: self.add_synthesized_type_index_for_kind(TypeKind::Pointer),
+                                .add_variable_name(self.expr_to_name(expr))?,
+                            type_index: self
+                                .add_synthesized_type_index_for_kind(TypeKind::Pointer)?,
                             access_path: Vec::new(),
                             data_len: 8,
                             source: ComplexArgSource::ComputedAddress { address },
@@ -306,8 +307,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     complex_args.push(ComplexArg {
                         var_name_index: self
                             .trace_context
-                            .add_variable_name(self.expr_to_name(expr)),
-                        type_index: self.add_synthesized_type_index_for_kind(TypeKind::Pointer),
+                            .add_variable_name(self.expr_to_name(expr))?,
+                        type_index: self.add_synthesized_type_index_for_kind(TypeKind::Pointer)?,
                         access_path: Vec::new(),
                         data_len: 8,
                         source: ComplexArgSource::ComputedInt {
@@ -329,7 +330,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             complex_args.push(ComplexArg {
                                 var_name_index: self
                                     .trace_context
-                                    .add_variable_name(self.expr_to_name(expr)),
+                                    .add_variable_name(self.expr_to_name(expr))?,
                                 type_index: self
                                     .trace_context
                                     .add_type(ghostscope_dwarf::TypeInfo::ArrayType {
@@ -342,7 +343,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     }),
                                     element_count: Some(n as u64),
                                     total_size: Some(n as u64),
-                                }),
+                                })?,
                                 access_path: Vec::new(),
                                 data_len: n,
                                 source: ComplexArgSource::MemDump {
@@ -371,8 +372,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             complex_args.push(ComplexArg {
                                 var_name_index: self
                                     .trace_context
-                                    .add_variable_name("__len".into()),
-                                type_index: self.add_synthesized_type_index_for_kind(TypeKind::U64),
+                                    .add_variable_name("__len".into())?,
+                                type_index: self
+                                    .add_synthesized_type_index_for_kind(TypeKind::U64)?,
                                 access_path: Vec::new(),
                                 data_len: byte_len,
                                 source: ComplexArgSource::ComputedInt {
@@ -389,7 +391,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             complex_args.push(ComplexArg {
                                 var_name_index: self
                                     .trace_context
-                                    .add_variable_name(self.expr_to_name(val_expr)),
+                                    .add_variable_name(self.expr_to_name(val_expr))?,
                                 type_index: self
                                     .trace_context
                                     .add_type(ghostscope_dwarf::TypeInfo::ArrayType {
@@ -402,7 +404,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     }),
                                     element_count: Some(cap as u64),
                                     total_size: Some(cap as u64),
-                                }),
+                                })?,
                                 access_path: Vec::new(),
                                 data_len: cap,
                                 source: ComplexArgSource::MemDumpDynamic {
@@ -444,8 +446,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 }
                             };
                             complex_args.push(ComplexArg {
-                                var_name_index: self.trace_context.add_variable_name(name.clone()),
-                                type_index: self.add_synthesized_type_index_for_kind(TypeKind::U64),
+                                var_name_index: self
+                                    .trace_context
+                                    .add_variable_name(name.clone())?,
+                                type_index: self
+                                    .add_synthesized_type_index_for_kind(TypeKind::U64)?,
                                 access_path: Vec::new(),
                                 data_len: byte_len,
                                 source: ComplexArgSource::ComputedInt {
@@ -461,7 +466,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             complex_args.push(ComplexArg {
                                 var_name_index: self
                                     .trace_context
-                                    .add_variable_name(self.expr_to_name(val_expr)),
+                                    .add_variable_name(self.expr_to_name(val_expr))?,
                                 type_index: self
                                     .trace_context
                                     .add_type(ghostscope_dwarf::TypeInfo::ArrayType {
@@ -474,7 +479,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     }),
                                     element_count: Some(cap as u64),
                                     total_size: Some(cap as u64),
-                                }),
+                                })?,
                                 access_path: Vec::new(),
                                 data_len: cap,
                                 source: ComplexArgSource::MemDumpDynamic {

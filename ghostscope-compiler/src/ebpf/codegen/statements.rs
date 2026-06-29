@@ -118,7 +118,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 // Prepare condition context (runtime error capture)
                 // Pretty expression text for warning
                 let expr_text = self.expr_to_name(condition);
-                let expr_index = self.trace_context.add_string(expr_text);
+                let expr_index = self.trace_context.add_string(expr_text)?;
                 // Activate condition context (compile-time flag) and reset runtime error byte
                 self.condition_context_active = true;
                 self.reset_condition_error()?;
@@ -302,7 +302,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             PrintStatement::String(s) => {
                 info!("Processing string literal: {}", s);
                 // 1. Add string to TraceContext
-                let string_index = self.trace_context.add_string(s.to_string());
+                let string_index = self.trace_context.add_string(s.to_string())?;
                 // 2. Generate eBPF code for PrintStringIndex
                 self.generate_print_string_index(string_index)?;
                 Ok(1) // Generated 1 instruction

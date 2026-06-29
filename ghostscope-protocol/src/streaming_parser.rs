@@ -864,7 +864,9 @@ mod tests {
     #[test]
     fn test_streaming_parser() {
         let mut trace_context = TraceContext::new();
-        let _str_idx = trace_context.add_string("hello world".to_string());
+        let _str_idx = trace_context
+            .add_string("hello world".to_string())
+            .expect("add test string");
 
         let mut parser = StreamingTraceParser::new();
 
@@ -902,7 +904,9 @@ mod tests {
     #[test]
     fn test_parse_exprerror_instruction() {
         let mut trace_context = TraceContext::new();
-        let expr_idx = trace_context.add_string("memcmp(buf, hex(\"504f\"), 2)".to_string());
+        let expr_idx = trace_context
+            .add_string("memcmp(buf, hex(\"504f\"), 2)".to_string())
+            .expect("add test expression");
 
         let mut parser = StreamingTraceParser::new();
 

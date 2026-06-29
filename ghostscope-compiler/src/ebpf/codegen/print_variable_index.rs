@@ -16,12 +16,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Resolve type_index from DWARF if available; otherwise synthesize from TypeKind
         let type_index = match self.query_dwarf_for_variable(var_name)? {
             Some(var) => match var.dwarf_type {
-                Some(ref t) => self.trace_context.add_type(t.clone()),
-                None => self.add_synthesized_type_index_for_kind(type_encoding),
+                Some(ref t) => self.trace_context.add_type(t.clone())?,
+                None => self.add_synthesized_type_index_for_kind(type_encoding)?,
             },
             None => {
                 // Variable not found via DWARF; fall back to synthesized type info based on TypeKind
-                self.add_synthesized_type_index_for_kind(type_encoding)
+                self.add_synthesized_type_index_for_kind(type_encoding)?
             }
         };
 

@@ -19,8 +19,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     name: materialized.name.clone(),
                 };
                 Ok(ComplexArg {
-                    var_name_index: self.trace_context.add_variable_name(display_name),
-                    type_index: self.trace_context.add_type(optimized_type),
+                    var_name_index: self.trace_context.add_variable_name(display_name)?,
+                    type_index: self.trace_context.add_type(optimized_type)?,
                     access_path: Vec::new(),
                     data_len: 0,
                     source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
@@ -46,8 +46,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 let module_hint =
                     Self::module_path_for_offsets(materialized.module_path.as_deref());
                 Ok(ComplexArg {
-                    var_name_index: self.trace_context.add_variable_name(display_name),
-                    type_index: self.trace_context.add_type(dwarf_type.clone()),
+                    var_name_index: self.trace_context.add_variable_name(display_name)?,
+                    type_index: self.trace_context.add_type(dwarf_type.clone())?,
                     access_path: Vec::new(),
                     data_len,
                     source: ComplexArgSource::RuntimeRead {
@@ -80,8 +80,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 };
                 let data_len = Self::compute_read_size_for_type(&dwarf_type).clamp(1, 8);
                 Ok(ComplexArg {
-                    var_name_index: self.trace_context.add_variable_name(display_name),
-                    type_index: self.trace_context.add_type(dwarf_type),
+                    var_name_index: self.trace_context.add_variable_name(display_name)?,
+                    type_index: self.trace_context.add_type(dwarf_type)?,
                     access_path: Vec::new(),
                     data_len,
                     source: ComplexArgSource::ComputedInt { value, byte_len: data_len },
@@ -110,8 +110,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(ComplexArg {
             var_name_index: self
                 .trace_context
-                .add_variable_name(self.expr_to_name(expr)),
-            type_index: self.trace_context.add_type(dwarf_type),
+                .add_variable_name(self.expr_to_name(expr))?,
+            type_index: self.trace_context.add_type(dwarf_type)?,
             access_path: Vec::new(),
             data_len,
             source: ComplexArgSource::MemDump {
@@ -132,8 +132,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.expr_to_name(source_expr),
             target_type
         );
-        let var_name_index = self.trace_context.add_variable_name(display_name.clone());
-        let type_index = self.trace_context.add_type(dwarf_type.clone());
+        let var_name_index = self.trace_context.add_variable_name(display_name.clone())?;
+        let type_index = self.trace_context.add_type(dwarf_type.clone())?;
 
         if matches!(
             ghostscope_dwarf::strip_type_aliases(&dwarf_type),
@@ -206,10 +206,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             E::Variable(name) if self.alias_variable_exists(name) => {
                 let aliased = self.get_alias_variable(name).expect("alias exists");
                 let addr_i64 = self.resolve_ptr_i64_from_expr(&aliased)?;
-                let var_name_index = self.trace_context.add_variable_name(name.clone());
+                let var_name_index = self.trace_context.add_variable_name(name.clone())?;
                 Ok(ComplexArg {
                     var_name_index,
-                    type_index: self.add_synthesized_type_index_for_kind(TypeKind::Pointer),
+                    type_index: self.add_synthesized_type_index_for_kind(TypeKind::Pointer)?,
                     access_path: Vec::new(),
                     data_len: 8,
                     source: ComplexArgSource::ComputedInt {
@@ -221,7 +221,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             // 1) Script variables first
             E::Variable(name) if self.variable_exists(name) => {
                 let val = self.load_variable(name)?;
-                let var_name_index = self.trace_context.add_variable_name(name.clone());
+                let var_name_index = self.trace_context.add_variable_name(name.clone())?;
                 // If this is a string variable, print its contents instead of address
                 if self
                     .get_variable_type(name)
@@ -242,7 +242,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         };
                         return Ok(ComplexArg {
                             var_name_index,
-                            type_index: self.trace_context.add_type(array_type),
+                            type_index: self.trace_context.add_type(array_type)?,
                             access_path: Vec::new(),
                             data_len: bytes.len(),
                             source: ComplexArgSource::ImmediateBytes { bytes },
@@ -266,7 +266,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         };
                         Ok(ComplexArg {
                             var_name_index,
-                            type_index: self.add_synthesized_type_index_for_kind(kind),
+                            type_index: self.add_synthesized_type_index_for_kind(kind)?,
                             access_path: Vec::new(),
                             data_len: byte_len,
                             source: ComplexArgSource::ComputedInt {
@@ -283,7 +283,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
                         Ok(ComplexArg {
                             var_name_index,
-                            type_index: self.add_synthesized_type_index_for_kind(TypeKind::Pointer),
+                            type_index: self
+                                .add_synthesized_type_index_for_kind(TypeKind::Pointer)?,
                             access_path: Vec::new(),
                             data_len: 8,
                             source: ComplexArgSource::ComputedInt {
@@ -315,8 +316,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 Ok(ComplexArg {
                     var_name_index: self
                         .trace_context
-                        .add_variable_name("__str_literal".to_string()),
-                    type_index: self.trace_context.add_type(array_type),
+                        .add_variable_name("__str_literal".to_string())?,
+                    type_index: self.trace_context.add_type(array_type)?,
                     access_path: Vec::new(),
                     data_len: bytes.len(),
                     source: ComplexArgSource::ImmediateBytes { bytes },
@@ -335,8 +336,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 Ok(ComplexArg {
                     var_name_index: self
                         .trace_context
-                        .add_variable_name("__int_literal".to_string()),
-                    type_index: self.trace_context.add_type(int_type),
+                        .add_variable_name("__int_literal".to_string())?,
+                    type_index: self.trace_context.add_type(int_type)?,
                     access_path: Vec::new(),
                     data_len: 8,
                     source: ComplexArgSource::ImmediateBytes { bytes },
@@ -356,8 +357,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     return Ok(ComplexArg {
                         var_name_index: self
                             .trace_context
-                            .add_variable_name(self.expr_to_name(expr)),
-                        type_index: self.trace_context.add_type(ptr_ty),
+                            .add_variable_name(self.expr_to_name(expr))?,
+                        type_index: self.trace_context.add_type(ptr_ty)?,
                         access_path: Vec::new(),
                         data_len: 8,
                         source: ComplexArgSource::ComputedAddress {
@@ -401,8 +402,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 Ok(ComplexArg {
                     var_name_index: self
                         .trace_context
-                        .add_variable_name(self.expr_to_name(expr)),
-                    type_index: self.trace_context.add_type(ptr_ty),
+                        .add_variable_name(self.expr_to_name(expr))?,
+                    type_index: self.trace_context.add_type(ptr_ty)?,
                     access_path: Vec::new(),
                     data_len: 8,
                     source: ComplexArgSource::AddressValue {
@@ -440,8 +441,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         return Ok(ComplexArg {
                             var_name_index: self
                                 .trace_context
-                                .add_variable_name(self.expr_to_name(expr)),
-                            type_index: self.add_synthesized_type_index_for_kind(kind),
+                                .add_variable_name(self.expr_to_name(expr))?,
+                            type_index: self.add_synthesized_type_index_for_kind(kind)?,
                             access_path: Vec::new(),
                             data_len: byte_len,
                             source: ComplexArgSource::ComputedInt { value, byte_len },
@@ -467,8 +468,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         return Ok(ComplexArg {
                             var_name_index: self
                                 .trace_context
-                                .add_variable_name(self.expr_to_name(expr)),
-                            type_index: self.add_synthesized_type_index_for_kind(kind),
+                                .add_variable_name(self.expr_to_name(expr))?,
+                            type_index: self.add_synthesized_type_index_for_kind(kind)?,
                             access_path: Vec::new(),
                             data_len: byte_len,
                             source: ComplexArgSource::ComputedInt { value, byte_len },
@@ -557,8 +558,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 return Ok(ComplexArg {
                                     var_name_index: self
                                         .trace_context
-                                        .add_variable_name(self.expr_to_name(expr)),
-                                    type_index: self.trace_context.add_type(ptr_ti),
+                                        .add_variable_name(self.expr_to_name(expr))?,
+                                    type_index: self.trace_context.add_type(ptr_ti)?,
                                     access_path: Vec::new(),
                                     data_len: 8,
                                     source: ComplexArgSource::AddressValue {
@@ -570,8 +571,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             return Ok(ComplexArg {
                                 var_name_index: self
                                     .trace_context
-                                    .add_variable_name(self.expr_to_name(expr)),
-                                type_index: self.trace_context.add_type(elem_ty.clone()),
+                                    .add_variable_name(self.expr_to_name(expr))?,
+                                type_index: self.trace_context.add_type(elem_ty.clone())?,
                                 access_path: Vec::new(),
                                 data_len,
                                 source: ComplexArgSource::RuntimeRead {
@@ -602,8 +603,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     Ok(ComplexArg {
                         var_name_index: self
                             .trace_context
-                            .add_variable_name(self.expr_to_name(expr)),
-                        type_index: self.add_synthesized_type_index_for_kind(kind),
+                            .add_variable_name(self.expr_to_name(expr))?,
+                        type_index: self.add_synthesized_type_index_for_kind(kind)?,
                         access_path: Vec::new(),
                         data_len: byte_len,
                         source: ComplexArgSource::ComputedInt {
@@ -637,8 +638,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     Ok(ComplexArg {
                         var_name_index: self
                             .trace_context
-                            .add_variable_name(self.expr_to_name(other)),
-                        type_index: self.add_synthesized_type_index_for_kind(kind),
+                            .add_variable_name(self.expr_to_name(other))?,
+                        type_index: self.add_synthesized_type_index_for_kind(kind)?,
                         access_path: Vec::new(),
                         data_len: byte_len,
                         source: ComplexArgSource::ComputedInt {
@@ -690,13 +691,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             | ComplexArgSource::ComputedAddress { .. }
             | ComplexArgSource::ImmediateBytes { .. } => {
                 // Use ComplexFormat with "{}" to render address/immediate nicely
-                let fmt_idx = self.trace_context.add_string("{}".to_string());
+                let fmt_idx = self.trace_context.add_string("{}".to_string())?;
                 self.generate_print_complex_format_instruction(fmt_idx, &[arg])?;
                 Ok(1)
             }
             ComplexArgSource::MemDump { .. } | ComplexArgSource::MemDumpDynamic { .. } => {
                 // Use ComplexFormat with "{}"; generate_print_complex_format_instruction handles MemDump
-                let fmt_idx = self.trace_context.add_string("{}".to_string());
+                let fmt_idx = self.trace_context.add_string("{}".to_string())?;
                 self.generate_print_complex_format_instruction(fmt_idx, &[arg])?;
                 Ok(1)
             }
@@ -899,7 +900,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             return compile(self);
         }
 
-        let expr_index = self.trace_context.add_string(self.expr_to_name(expr));
+        let expr_index = self.trace_context.add_string(self.expr_to_name(expr))?;
         let entry_event_bytes = self.compile_time_event_bytes_upper_bound;
 
         self.reset_condition_error()?;
