@@ -15,7 +15,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             let type_encoding = self.infer_type_from_llvm_value(&loaded_value);
 
             // Add to TraceContext
-            let var_name_index = self.trace_context.add_variable_name(var_name.to_string());
+            let var_name_index = self.trace_context.add_variable_name(var_name.to_string())?;
 
             return Ok((var_name_index, type_encoding));
         }
@@ -44,7 +44,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let type_encoding = TypeKind::from(dwarf_type);
 
         // Add to StringTable
-        let var_name_index = self.trace_context.add_variable_name(var_name.to_string());
+        let var_name_index = self.trace_context.add_variable_name(var_name.to_string())?;
 
         info!(
             "DWARF variable '{}' resolved successfully with type: {:?}",
@@ -143,9 +143,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
-    pub(super) fn add_synthesized_type_index_for_kind(&mut self, kind: TypeKind) -> u16 {
+    pub(super) fn add_synthesized_type_index_for_kind(&mut self, kind: TypeKind) -> Result<u16> {
         let ti = self.synthesize_typeinfo_for_typekind(kind);
-        self.trace_context.add_type(ti)
+        Ok(self.trace_context.add_type(ti)?)
     }
 
     /// Infer TypeKind from LLVM value type

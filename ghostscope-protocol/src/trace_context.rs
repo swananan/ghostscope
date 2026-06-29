@@ -5,6 +5,63 @@
 
 use crate::type_info::TypeInfo;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+/// Trace context table identifiers used in overflow errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceContextTable {
+    Strings,
+    Types,
+    VariableNames,
+}
+
+impl fmt::Display for TraceContextTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Strings => write!(f, "string"),
+            Self::Types => write!(f, "type"),
+            Self::VariableNames => write!(f, "variable name"),
+        }
+    }
+}
+
+/// Error returned when a trace context table can no longer be indexed by u16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceContextOverflow {
+    table: TraceContextTable,
+    attempted_index: usize,
+}
+
+impl TraceContextOverflow {
+    fn new(table: TraceContextTable, attempted_index: usize) -> Self {
+        Self {
+            table,
+            attempted_index,
+        }
+    }
+
+    pub fn table(&self) -> TraceContextTable {
+        self.table
+    }
+
+    pub fn attempted_index(&self) -> usize {
+        self.attempted_index
+    }
+}
+
+impl fmt::Display for TraceContextOverflow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "trace context {} table overflow: index {} exceeds u16::MAX",
+            self.table, self.attempted_index
+        )
+    }
+}
+
+impl std::error::Error for TraceContextOverflow {}
+
+pub type TraceContextResult<T> = std::result::Result<T, TraceContextOverflow>;
 
 /// Unified context for trace execution containing strings, types, and variable names
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,55 +87,58 @@ impl TraceContext {
     }
 
     /// Add a string to the context and return its index
-    pub fn add_string(&mut self, s: String) -> u16 {
+    pub fn add_string(&mut self, s: String) -> TraceContextResult<u16> {
         // Check if string already exists to avoid duplicates
         if let Some(index) = self.strings.iter().position(|existing| existing == &s) {
-            return index as u16;
+            return Ok(index as u16);
         }
 
         let index = self.strings.len();
         if index > u16::MAX as usize {
-            panic!("String table overflow: too many strings");
+            return Err(TraceContextOverflow::new(TraceContextTable::Strings, index));
         }
 
         self.strings.push(s);
-        index as u16
+        Ok(index as u16)
     }
 
     /// Add a type to the context and return its index
-    pub fn add_type(&mut self, type_info: TypeInfo) -> u16 {
+    pub fn add_type(&mut self, type_info: TypeInfo) -> TraceContextResult<u16> {
         // For now, don't deduplicate types as they can be complex to compare
         // TODO: Implement type deduplication for performance optimization
         let index = self.types.len();
         if index > u16::MAX as usize {
-            panic!("Type table overflow: too many types");
+            return Err(TraceContextOverflow::new(TraceContextTable::Types, index));
         }
 
         // Debug: Log the type being added
         tracing::debug!("Adding type at index {}: {:#?}", index, type_info);
 
         self.types.push(type_info);
-        index as u16
+        Ok(index as u16)
     }
 
     /// Add a variable name to the context and return its index
-    pub fn add_variable_name(&mut self, name: String) -> u16 {
+    pub fn add_variable_name(&mut self, name: String) -> TraceContextResult<u16> {
         // Check if variable name already exists to avoid duplicates
         if let Some(index) = self
             .variable_names
             .iter()
             .position(|existing| existing == &name)
         {
-            return index as u16;
+            return Ok(index as u16);
         }
 
         let index = self.variable_names.len();
         if index > u16::MAX as usize {
-            panic!("Variable name table overflow: too many variable names");
+            return Err(TraceContextOverflow::new(
+                TraceContextTable::VariableNames,
+                index,
+            ));
         }
 
         self.variable_names.push(name);
-        index as u16
+        Ok(index as u16)
     }
 
     /// Get a string by index
@@ -146,9 +206,9 @@ mod tests {
     fn test_trace_context_strings() {
         let mut ctx = TraceContext::new();
 
-        let idx1 = ctx.add_string("Hello".to_string());
-        let idx2 = ctx.add_string("World".to_string());
-        let idx3 = ctx.add_string("Hello".to_string()); // Duplicate
+        let idx1 = ctx.add_string("Hello".to_string()).unwrap();
+        let idx2 = ctx.add_string("World".to_string()).unwrap();
+        let idx3 = ctx.add_string("Hello".to_string()).unwrap(); // Duplicate
 
         assert_eq!(idx1, 0);
         assert_eq!(idx2, 1);
@@ -163,9 +223,9 @@ mod tests {
     fn test_trace_context_variable_names() {
         let mut ctx = TraceContext::new();
 
-        let idx1 = ctx.add_variable_name("person".to_string());
-        let idx2 = ctx.add_variable_name("name".to_string());
-        let idx3 = ctx.add_variable_name("person".to_string()); // Duplicate
+        let idx1 = ctx.add_variable_name("person".to_string()).unwrap();
+        let idx2 = ctx.add_variable_name("name".to_string()).unwrap();
+        let idx3 = ctx.add_variable_name("person".to_string()).unwrap(); // Duplicate
 
         assert_eq!(idx1, 0);
         assert_eq!(idx2, 1);
@@ -202,8 +262,8 @@ mod tests {
             }],
         };
 
-        let idx1 = ctx.add_type(type1.clone());
-        let idx2 = ctx.add_type(type2.clone());
+        let idx1 = ctx.add_type(type1.clone()).unwrap();
+        let idx2 = ctx.add_type(type2.clone()).unwrap();
 
         assert_eq!(idx1, 0);
         assert_eq!(idx2, 1);
@@ -217,13 +277,15 @@ mod tests {
     fn test_trace_context_combined() {
         let mut ctx = TraceContext::new();
 
-        let str_idx = ctx.add_string("format: {} = {}".to_string());
-        let var_idx = ctx.add_variable_name("person.name".to_string());
-        let type_idx = ctx.add_type(TypeInfo::BaseType {
-            name: "char[32]".to_string(),
-            size: 32,
-            encoding: gimli::constants::DW_ATE_signed_char.0 as u16,
-        });
+        let str_idx = ctx.add_string("format: {} = {}".to_string()).unwrap();
+        let var_idx = ctx.add_variable_name("person.name".to_string()).unwrap();
+        let type_idx = ctx
+            .add_type(TypeInfo::BaseType {
+                name: "char[32]".to_string(),
+                size: 32,
+                encoding: gimli::constants::DW_ATE_signed_char.0 as u16,
+            })
+            .unwrap();
 
         assert_eq!(str_idx, 0);
         assert_eq!(var_idx, 0);
@@ -239,15 +301,29 @@ mod tests {
     fn test_trace_context_memory_usage() {
         let mut ctx = TraceContext::new();
 
-        ctx.add_string("Hello World".to_string()); // 11 bytes
-        ctx.add_variable_name("variable".to_string()); // 8 bytes
+        ctx.add_string("Hello World".to_string()).unwrap(); // 11 bytes
+        ctx.add_variable_name("variable".to_string()).unwrap(); // 8 bytes
         ctx.add_type(TypeInfo::BaseType {
             name: "int".to_string(),
             size: 4,
             encoding: gimli::constants::DW_ATE_signed.0 as u16,
-        }); // ~100 bytes estimate
+        })
+        .unwrap(); // ~100 bytes estimate
 
         let usage = ctx.estimated_memory_usage();
         assert!(usage >= 119); // At least the string sizes + type estimate
+    }
+
+    #[test]
+    fn test_trace_context_reports_table_overflow() {
+        let mut ctx = TraceContext::new();
+        ctx.variable_names = (0..=u16::MAX).map(|i| format!("v{i}")).collect();
+
+        let err = ctx
+            .add_variable_name("overflow".to_string())
+            .expect_err("variable name table should overflow");
+
+        assert_eq!(err.table(), TraceContextTable::VariableNames);
+        assert_eq!(err.attempted_index(), usize::from(u16::MAX) + 1);
     }
 }

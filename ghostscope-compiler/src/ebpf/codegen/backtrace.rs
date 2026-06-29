@@ -3663,7 +3663,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 (&hit_value, hit_end),
                 (&ctx.context.i32_type().const_zero(), miss_end),
             ]);
-            Ok(phi.as_basic_value().into_int_value())
+            Ok::<_, CodeGenError>(phi.as_basic_value().into_int_value())
         };
         Ok(BtModuleRangeMeta {
             found: found_phi.as_basic_value().into_int_value(),
@@ -3922,7 +3922,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .build_phi(ctx.context.i64_type(), name)
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
             phi.add_incoming(&[(&hit_value, hit_end), (&zero_i64, miss_end)]);
-            Ok(phi.as_basic_value().into_int_value())
+            Ok::<_, CodeGenError>(phi.as_basic_value().into_int_value())
         };
         Ok(BtModuleRangeValue {
             found: found_phi.as_basic_value().into_int_value(),

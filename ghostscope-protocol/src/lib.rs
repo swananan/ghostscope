@@ -74,7 +74,9 @@ pub use bpf_abi::{
     PROC_MODULE_RANGE_VALUE_SIZE, PROC_MODULE_RANGE_VALUE_TEXT_OFFSET,
 };
 
-pub use trace_context::TraceContext;
+pub use trace_context::{
+    TraceContext, TraceContextOverflow, TraceContextResult, TraceContextTable,
+};
 
 pub use format_printer::FormatPrinter;
 

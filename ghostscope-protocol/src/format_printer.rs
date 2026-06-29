@@ -1213,7 +1213,9 @@ mod tests {
     #[test]
     fn test_format_print_data_with_trace_context() {
         let mut trace_context = TraceContext::new();
-        let format_index = trace_context.add_string("Hello {}, you are {} years old!".to_string());
+        let format_index = trace_context
+            .add_string("Hello {}, you are {} years old!".to_string())
+            .expect("add format string");
         let rendered: Vec<String> = vec!["Alice".to_string(), "25".to_string()];
         let fmt = trace_context.get_string(format_index).unwrap();
         let result = FormatPrinter::apply_format_strings(fmt, &rendered);
@@ -1225,7 +1227,9 @@ mod tests {
         use crate::type_info::{StructMember, TypeInfo};
 
         let mut trace_context = TraceContext::new();
-        let var_name_idx = trace_context.add_variable_name("person".to_string());
+        let var_name_idx = trace_context
+            .add_variable_name("person".to_string())
+            .expect("add variable name");
 
         let person_type = TypeInfo::StructType {
             name: "Person".to_string(),
@@ -1256,7 +1260,9 @@ mod tests {
             ],
         };
 
-        let type_idx = trace_context.add_type(person_type);
+        let type_idx = trace_context
+            .add_type(person_type)
+            .expect("add person type");
 
         // Data: age=25 (4 bytes) + id=12345 (8 bytes)
         let data = vec![
@@ -1282,7 +1288,9 @@ mod tests {
         use crate::type_info::TypeInfo;
 
         let mut trace_context = TraceContext::new();
-        let var_name_idx = trace_context.add_variable_name("name".to_string());
+        let var_name_idx = trace_context
+            .add_variable_name("name".to_string())
+            .expect("add variable name");
         // Define char array type: char name[16]
         let char_type = TypeInfo::BaseType {
             name: "char".to_string(),
@@ -1294,13 +1302,15 @@ mod tests {
             element_count: Some(16),
             total_size: Some(16),
         };
-        let type_idx = trace_context.add_type(arr_type);
+        let type_idx = trace_context.add_type(arr_type).expect("add array type");
 
         // Data buffer with "Alice\0" and padding
         let mut data = b"Alice\0".to_vec();
         data.resize(16, 0u8);
 
-        let fmt_idx = trace_context.add_string("{}".to_string());
+        let fmt_idx = trace_context
+            .add_string("{}".to_string())
+            .expect("add format string");
         let complex_vars = vec![ParsedComplexVariable {
             var_name_index: var_name_idx,
             type_index: type_idx,
@@ -1437,7 +1447,9 @@ mod tests {
     #[test]
     fn test_ext_hex_preserves_null_deref_error() {
         let mut trace_context = TraceContext::new();
-        let fmt_idx = trace_context.add_string("{:x.16}".to_string());
+        let fmt_idx = trace_context
+            .add_string("{:x.16}".to_string())
+            .expect("add format string");
 
         // Array<u8,16> as the value type
         let arr_type = TypeInfo::ArrayType {
@@ -1449,8 +1461,10 @@ mod tests {
             element_count: Some(16),
             total_size: Some(16),
         };
-        let type_idx = trace_context.add_type(arr_type);
-        let var_name_idx = trace_context.add_variable_name("buf".to_string());
+        let type_idx = trace_context.add_type(arr_type).expect("add array type");
+        let var_name_idx = trace_context
+            .add_variable_name("buf".to_string())
+            .expect("add variable name");
 
         let vars = vec![ParsedComplexVariable {
             var_name_index: var_name_idx,
@@ -1474,7 +1488,9 @@ mod tests {
     #[test]
     fn test_ext_s_preserves_read_error_errno_addr() {
         let mut trace_context = TraceContext::new();
-        let fmt_idx = trace_context.add_string("{:s.16}".to_string());
+        let fmt_idx = trace_context
+            .add_string("{:s.16}".to_string())
+            .expect("add format string");
 
         // Array<u8,16>
         let arr_type = TypeInfo::ArrayType {
@@ -1486,8 +1502,10 @@ mod tests {
             element_count: Some(16),
             total_size: Some(16),
         };
-        let type_idx = trace_context.add_type(arr_type);
-        let var_name_idx = trace_context.add_variable_name("buf".to_string());
+        let type_idx = trace_context.add_type(arr_type).expect("add array type");
+        let var_name_idx = trace_context
+            .add_variable_name("buf".to_string())
+            .expect("add variable name");
 
         // Encode errno:i32 + addr:u64 into data
         let errno: i32 = -14; // EFAULT-like
@@ -1515,7 +1533,9 @@ mod tests {
     #[test]
     fn test_ext_p_preserves_offsets_unavailable() {
         let mut trace_context = TraceContext::new();
-        let fmt_idx = trace_context.add_string("P={:p}".to_string());
+        let fmt_idx = trace_context
+            .add_string("P={:p}".to_string())
+            .expect("add format string");
 
         let ptr_type = TypeInfo::PointerType {
             target_type: Box::new(TypeInfo::BaseType {
@@ -1525,8 +1545,10 @@ mod tests {
             }),
             size: 8,
         };
-        let type_idx = trace_context.add_type(ptr_type);
-        let var_name_idx = trace_context.add_variable_name("ptr".to_string());
+        let type_idx = trace_context.add_type(ptr_type).expect("add pointer type");
+        let var_name_idx = trace_context
+            .add_variable_name("ptr".to_string())
+            .expect("add variable name");
 
         let vars = vec![ParsedComplexVariable {
             var_name_index: var_name_idx,
@@ -1547,7 +1569,9 @@ mod tests {
     #[test]
     fn test_ext_star_len_error_precedence() {
         let mut trace_context = TraceContext::new();
-        let fmt_idx = trace_context.add_string("S={:x.*}".to_string());
+        let fmt_idx = trace_context
+            .add_string("S={:x.*}".to_string())
+            .expect("add format string");
 
         // length argument (will surface its error), use base type for simplicity
         let len_type = TypeInfo::BaseType {
@@ -1555,8 +1579,10 @@ mod tests {
             size: 8,
             encoding: gimli::constants::DW_ATE_signed.0 as u16,
         };
-        let len_ty_idx = trace_context.add_type(len_type);
-        let len_name_idx = trace_context.add_variable_name("len".to_string());
+        let len_ty_idx = trace_context.add_type(len_type).expect("add length type");
+        let len_name_idx = trace_context
+            .add_variable_name("len".to_string())
+            .expect("add length variable");
 
         // value argument (OK)
         let arr_type = TypeInfo::ArrayType {
@@ -1568,8 +1594,10 @@ mod tests {
             element_count: Some(16),
             total_size: Some(16),
         };
-        let val_ty_idx = trace_context.add_type(arr_type);
-        let val_name_idx = trace_context.add_variable_name("buf".to_string());
+        let val_ty_idx = trace_context.add_type(arr_type).expect("add array type");
+        let val_name_idx = trace_context
+            .add_variable_name("buf".to_string())
+            .expect("add variable name");
         let val_data: Vec<u8> = (0u8..16).collect();
 
         let vars = vec![
