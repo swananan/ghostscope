@@ -1026,7 +1026,6 @@ dependencies = [
  "aya",
  "aya-obj",
  "bytes",
- "ghostscope-compiler",
  "ghostscope-process",
  "ghostscope-protocol",
  "libc",

@@ -271,10 +271,6 @@ fn uprobe_scope(pid: Option<i32>) -> std::result::Result<UProbeScope, ProgramErr
     }
 }
 
-pub fn hello() -> String {
-    format!("Loader: {}", ghostscope_compiler::hello())
-}
-
 /// Main eBPF program loader and manager
 ///
 /// Manages the lifecycle of eBPF programs and provides methods for:
