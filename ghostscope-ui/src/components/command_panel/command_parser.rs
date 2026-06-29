@@ -1238,7 +1238,7 @@ impl CommandParser {
         let filename = if command.starts_with("source ") {
             command.strip_prefix("source ").unwrap().trim()
         } else if command.starts_with("s ")
-            && !command.starts_with("s t")
+            && !Self::matches_shortcut(command, "s t")
             && !command.starts_with("save")
         {
             // Handle "s <filename>" but not "s t" (save traces) or "save"
@@ -1445,9 +1445,9 @@ impl CommandParser {
 
         // Handle "s <filename>" -> "source <filename>" (but not "s t", "s o", "s s")
         if command.starts_with("s ")
-            && !command.starts_with("s t")
-            && !command.starts_with("s o")
-            && !command.starts_with("s s")
+            && !Self::matches_shortcut(command, "s t")
+            && !Self::matches_shortcut(command, "s o")
+            && !Self::matches_shortcut(command, "s s")
         {
             return Self::parse_source_command(state, command);
         }
@@ -1600,11 +1600,109 @@ impl CommandParser {
             }
         }
     }
+
+    fn matches_shortcut(command: &str, shortcut: &str) -> bool {
+        command == shortcut
+            || command
+                .strip_prefix(shortcut)
+                .is_some_and(|rest| rest.starts_with(' '))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::components::command_panel::trace_persistence::SaveFilter;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    static SOURCE_SHORTCUT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+    fn write_temp_trace_file(name: &str) -> PathBuf {
+        let id = SOURCE_SHORTCUT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "ghostscope-command-parser-{name}-{}-{id}.gs",
+            std::process::id()
+        ));
+
+        std::fs::write(
+            &path,
+            "trace main {\n    print \"loaded from shortcut\";\n}\n",
+        )
+        .expect("write trace fixture");
+        path
+    }
+
+    #[test]
+    fn source_shortcut_treats_t_prefix_filename_as_source_file() {
+        let path = write_temp_trace_file("test");
+        let path_str = path.to_string_lossy().to_string();
+        let mut state = CommandPanelState::new();
+
+        let actions = CommandParser::parse_command(&mut state, &format!("s {path_str}"));
+
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            state.input_state,
+            InputState::WaitingResponse {
+                command_type: CommandType::LoadTraces,
+                ..
+            }
+        ));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::SendRuntimeCommand(RuntimeCommand::LoadTraces { filename, traces })]
+                if filename == &path_str && traces.len() == 1
+        ));
+    }
+
+    #[test]
+    fn source_shortcut_treats_o_and_s_prefix_filenames_as_source_files() {
+        for name in ["output", "script"] {
+            let path = write_temp_trace_file(name);
+            let path_str = path.to_string_lossy().to_string();
+            let mut state = CommandPanelState::new();
+
+            let actions = CommandParser::parse_command(&mut state, &format!("s {path_str}"));
+
+            let _ = std::fs::remove_file(&path);
+            assert!(matches!(
+                state.input_state,
+                InputState::WaitingResponse {
+                    command_type: CommandType::LoadTraces,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                actions.as_slice(),
+                [Action::SendRuntimeCommand(RuntimeCommand::LoadTraces { filename, traces })]
+                    if filename == &path_str && traces.len() == 1
+            ));
+        }
+    }
+
+    #[test]
+    fn save_traces_shortcut_still_matches_complete_token() {
+        let mut state = CommandPanelState::new();
+
+        let actions = CommandParser::parse_command(&mut state, "s t session.gs");
+
+        assert!(matches!(
+            state.input_state,
+            InputState::WaitingResponse {
+                command_type: CommandType::SaveTraces,
+                ..
+            }
+        ));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::SendRuntimeCommand(RuntimeCommand::SaveTraces {
+                filename: Some(filename),
+                filter: SaveFilter::All
+            })] if filename == "session.gs"
+        ));
+    }
 
     #[test]
     fn test_command_completion_exact_match() {
