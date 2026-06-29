@@ -43,7 +43,7 @@ where
             }
             gimli::Operation::Deref { size, space, .. } => {
                 if space {
-                    return Err(anyhow!("unsupported CFA expression operation: {:?}", op));
+                    return Err(anyhow!("unsupported CFA expression operation: {op:?}"));
                 }
                 let size = match size {
                     1 => MemoryAccessSize::U8,
@@ -52,10 +52,8 @@ where
                     8 => MemoryAccessSize::U64,
                     _ => {
                         return Err(anyhow!(
-                            "unsupported CFA expression dereference size {} in operation: {:?}",
-                            size,
-                            op
-                        ))
+                        "unsupported CFA expression dereference size {size} in operation: {op:?}"
+                    ))
                     }
                 };
                 steps.push(PlanExprOp::Dereference { size });
@@ -68,7 +66,7 @@ where
             gimli::Operation::Xor => steps.push(PlanExprOp::Xor),
             gimli::Operation::Nop => {}
             _ => {
-                return Err(anyhow!("unsupported CFA expression operation: {:?}", op));
+                return Err(anyhow!("unsupported CFA expression operation: {op:?}"));
             }
         }
     }

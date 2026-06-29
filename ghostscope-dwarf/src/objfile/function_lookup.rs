@@ -176,16 +176,16 @@ impl LoadedObjfile {
         let dwarf = self.dwarf();
         let header = dwarf
             .unit_header(entry.unit_offset)
-            .map_err(|e| anyhow::anyhow!("unit header error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("unit header error: {e}"))?;
         let unit = dwarf
             .unit(header)
-            .map_err(|e| anyhow::anyhow!("unit load error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("unit load error: {e}"))?;
         let die = unit
             .entry(entry.die_offset)
-            .map_err(|e| anyhow::anyhow!("entry load error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("entry load error: {e}"))?;
 
         let ranges = RangeExtractor::extract_all_ranges(&die, &unit, dwarf)
-            .map_err(|e| anyhow::anyhow!("range extraction error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("range extraction error: {e}"))?;
         self.function_ranges_cache
             .write()
             .expect("function range cache lock poisoned")
@@ -401,13 +401,13 @@ impl LoadedObjfile {
         let dwarf = self.dwarf();
         let header = dwarf
             .unit_header(idx_entry.unit_offset)
-            .map_err(|e| anyhow::anyhow!("unit header error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("unit header error: {e}"))?;
         let unit = dwarf
             .unit(header)
-            .map_err(|e| anyhow::anyhow!("unit load error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("unit load error: {e}"))?;
         let entry = unit
             .entry(idx_entry.die_offset)
-            .map_err(|e| anyhow::anyhow!("entry load error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("entry load error: {e}"))?;
         Self::subprogram_uses_entry_value_at(dwarf, &unit, &entry, pc)
     }
 
@@ -463,7 +463,7 @@ impl LoadedObjfile {
             if let Some(value) = entry.attr_value(origin_attr) {
                 if let Some((origin_abs, origin_unit, origin_entry)) =
                     resolve_origin_entry(dwarf, unit, value)
-                        .map_err(|e| anyhow::anyhow!("origin resolution error: {}", e))?
+                        .map_err(|e| anyhow::anyhow!("origin resolution error: {e}"))?
                 {
                     if visited.insert(origin_abs)
                         && Self::subprogram_uses_entry_value_with_pc(
@@ -583,7 +583,7 @@ impl LoadedObjfile {
         let mut default_location_uses_entry_value = None;
         while let Some(raw_entry) = raw_locations
             .next()
-            .map_err(|e| anyhow::anyhow!("raw location list iteration error: {:?}", e))?
+            .map_err(|e| anyhow::anyhow!("raw location list iteration error: {e:?}"))?
         {
             match raw_entry {
                 gimli::RawLocListEntry::BaseAddress { addr } => {

@@ -23,10 +23,8 @@ fn runtime_pid_candidates_from_chain(proc_pid: u32, nspid_chain: Option<&[u32]>)
 pub fn resolve_input_pid(input_pid: u32) -> anyhow::Result<PidViews> {
     if !process_exists(input_pid) {
         return Err(anyhow::anyhow!(
-            "Process with PID {} is not running. Use 'ps -p {}' to verify the process exists.\n\
-             Additional check: -p expects a PID visible in the current PID namespace.",
-            input_pid,
-            input_pid
+            "Process with PID {input_pid} is not running. Use 'ps -p {input_pid}' to verify the process exists.\n\
+             Additional check: -p expects a PID visible in the current PID namespace."
         ));
     }
 

@@ -1043,7 +1043,7 @@ impl DwarfAnalyzer {
     ) -> Result<Option<Arc<CompactUnwindTable>>> {
         let module_path = self
             .module_path_for_id(module)
-            .ok_or_else(|| anyhow::anyhow!("Semantic module id {:?} is not loaded", module))?;
+            .ok_or_else(|| anyhow::anyhow!("Semantic module id {module:?} is not loaded"))?;
         self.modules
             .get(module_path)
             .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?

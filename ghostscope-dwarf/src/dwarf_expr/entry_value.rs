@@ -114,11 +114,7 @@ pub(crate) fn resolve_register(
         |incoming_error| {
             recover_register_from_cfi(current_pc, register, cfi_index).map_err(|cfi_error| {
                 anyhow::anyhow!(
-                    "failed to recover DW_OP_entry_value register {} at 0x{:x}: {}; fallback via CFI also failed: {}",
-                    register,
-                    current_pc,
-                    incoming_error,
-                    cfi_error
+                    "failed to recover DW_OP_entry_value register {register} at 0x{current_pc:x}: {incoming_error}; fallback via CFI also failed: {cfi_error}"
                 )
             })
         },
@@ -133,10 +129,7 @@ fn build_incoming_lookup(
     cfi_index: Option<&CfiIndex>,
 ) -> Result<Vec<PlanExprOp>> {
     let cfi_index = cfi_index.ok_or_else(|| {
-        anyhow::anyhow!(
-            "DW_OP_entry_value register recovery needs CFI at 0x{:x}",
-            current_pc
-        )
+        anyhow::anyhow!("DW_OP_entry_value register recovery needs CFI at 0x{current_pc:x}")
     })?;
     let recovery = cfi_index.recover_caller_frame(current_pc, &[])?;
 
@@ -147,11 +140,7 @@ fn build_incoming_lookup(
             materialize_caller_value_steps(&caller_value_steps, current_pc, Some(cfi_index))
                 .map_err(|error| {
                     anyhow::anyhow!(
-                        "failed to materialize incoming call-site parameter for DW_OP_entry_value register {} at 0x{:x} (caller return pc 0x{:x}): {}",
-                        register,
-                        current_pc,
-                        caller_return_pc,
-                        error
+                        "failed to materialize incoming call-site parameter for DW_OP_entry_value register {register} at 0x{current_pc:x} (caller return pc 0x{caller_return_pc:x}): {error}"
                     )
                 })?;
         match cases_by_return_pc.entry(caller_return_pc) {
@@ -161,10 +150,7 @@ fn build_incoming_lookup(
             std::collections::btree_map::Entry::Occupied(entry) => {
                 if entry.get() != &value_steps {
                     return Err(anyhow::anyhow!(
-                        "ambiguous incoming call-site parameter for DW_OP_entry_value register {} at 0x{:x} (caller return pc 0x{:x})",
-                        register,
-                        current_pc,
-                        caller_return_pc
+                        "ambiguous incoming call-site parameter for DW_OP_entry_value register {register} at 0x{current_pc:x} (caller return pc 0x{caller_return_pc:x})"
                     ));
                 }
             }
@@ -173,9 +159,7 @@ fn build_incoming_lookup(
 
     if cases_by_return_pc.is_empty() {
         return Err(anyhow::anyhow!(
-            "no call-site parameter found for DW_OP_entry_value register {} at 0x{:x}",
-            register,
-            current_pc
+            "no call-site parameter found for DW_OP_entry_value register {register} at 0x{current_pc:x}"
         ));
     }
 
@@ -236,12 +220,7 @@ pub(crate) fn resolve_register_offset(
             let mut steps =
                 recover_register_from_cfi(current_pc, register, cfi_index).map_err(|cfi_error| {
                     anyhow::anyhow!(
-                        "failed to recover DW_OP_entry_value base register {} with offset {} at 0x{:x}: {}; fallback via CFI also failed: {}",
-                        register,
-                        offset,
-                        current_pc,
-                        entry_error,
-                        cfi_error
+                        "failed to recover DW_OP_entry_value base register {register} with offset {offset} at 0x{current_pc:x}: {entry_error}; fallback via CFI also failed: {cfi_error}"
                     )
                 })?;
             append_constant_offset(&mut steps, offset);
@@ -256,18 +235,13 @@ fn recover_register_from_cfi(
     cfi_index: Option<&CfiIndex>,
 ) -> Result<Vec<PlanExprOp>> {
     let cfi_index = cfi_index.ok_or_else(|| {
-        anyhow::anyhow!(
-            "DW_OP_entry_value register recovery needs CFI at 0x{:x}",
-            current_pc
-        )
+        anyhow::anyhow!("DW_OP_entry_value register recovery needs CFI at 0x{current_pc:x}")
     })?;
     cfi_index
         .recover_caller_register_steps(current_pc, register)?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no entry register recovery rule for DWARF register {} at 0x{:x}",
-                register,
-                current_pc
+                "no entry register recovery rule for DWARF register {register} at 0x{current_pc:x}"
             )
         })
 }
@@ -279,10 +253,7 @@ fn recover_stack_pointer_steps(
     cfi_index: Option<&CfiIndex>,
 ) -> Result<Vec<PlanExprOp>> {
     let cfi_index = cfi_index.ok_or_else(|| {
-        anyhow::anyhow!(
-            "DW_OP_entry_value stack-pointer recovery needs CFI at 0x{:x}",
-            current_pc
-        )
+        anyhow::anyhow!("DW_OP_entry_value stack-pointer recovery needs CFI at 0x{current_pc:x}")
     })?;
     let mut steps = cfa_to_steps(cfi_index.get_cfa_result(current_pc)?);
     // This assumes the common x86/x86_64 call-frame convention where the CFA
@@ -354,17 +325,14 @@ fn materialize_caller_value_steps(
             PlanExprOp::LoadRegister(register) => {
                 let cfi_index = cfi_index.ok_or_else(|| {
                     anyhow::anyhow!(
-                        "DW_OP_entry_value register recovery needs CFI at 0x{:x}",
-                        current_pc
+                        "DW_OP_entry_value register recovery needs CFI at 0x{current_pc:x}"
                     )
                 })?;
                 let recovered = cfi_index
                     .recover_caller_register_steps(current_pc, *register)?
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "no caller register recovery rule for DWARF register {} at 0x{:x}; DW_OP_entry_value can only materialize caller values for registers with unwind recovery, and caller-saved argument registers are often unavailable after the call",
-                            register,
-                            current_pc
+                            "no caller register recovery rule for DWARF register {register} at 0x{current_pc:x}; DW_OP_entry_value can only materialize caller values for registers with unwind recovery, and caller-saved argument registers are often unavailable after the call"
                         )
                     })?;
                 materialized.extend(recovered);

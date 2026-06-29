@@ -313,9 +313,7 @@ impl DwarfAnalyzer {
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(anyhow::anyhow!(
-                "Ambiguous variable '{name}' at PC 0x{:x}: candidates [{}]",
-                pc,
-                names
+                "Ambiguous variable '{name}' at PC 0x{pc:x}: candidates [{names}]"
             ));
         }
 

@@ -195,9 +195,7 @@ impl CfiIndex {
             .register_rule_steps(&unwind_row, return_address_register)?
             .ok_or_else(|| {
                 anyhow!(
-                    "no caller PC recovery rule for DWARF register {} at 0x{:x}",
-                    return_address_register,
-                    pc
+                    "no caller PC recovery rule for DWARF register {return_address_register} at 0x{pc:x}"
                 )
             })?;
 
@@ -302,7 +300,7 @@ impl CfiIndex {
                 }
             }
 
-            Err(anyhow!("No FDE found for address 0x{:x}", address))
+            Err(anyhow!("No FDE found for address 0x{address:x}"))
         }
     }
 

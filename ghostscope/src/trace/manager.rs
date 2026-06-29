@@ -126,7 +126,7 @@ impl TraceManager {
             info!("Deleted trace {} with target '{}'", trace_id, trace.target);
             Ok(())
         } else {
-            Err(anyhow::anyhow!("Trace {} not found", trace_id))
+            Err(anyhow::anyhow!("Trace {trace_id} not found"))
         }
     }
 
@@ -167,7 +167,7 @@ impl TraceManager {
 
             Ok(())
         } else {
-            Err(anyhow::anyhow!("Trace {} not found", trace_id))
+            Err(anyhow::anyhow!("Trace {trace_id} not found"))
         }
     }
 
@@ -176,7 +176,7 @@ impl TraceManager {
         if let Some(trace) = self.traces.get_mut(&trace_id) {
             trace.disable()
         } else {
-            Err(anyhow::anyhow!("Trace {} not found", trace_id))
+            Err(anyhow::anyhow!("Trace {trace_id} not found"))
         }
     }
 

@@ -255,8 +255,7 @@ impl TargetHandle {
                         )? {
                             Some(_) => Ok(()),
                             None => anyhow::bail!(
-                                "timed out waiting for host target pid {} to exit after SIGTERM",
-                                pid
+                                "timed out waiting for host target pid {pid} to exit after SIGTERM"
                             ),
                         }
                     })

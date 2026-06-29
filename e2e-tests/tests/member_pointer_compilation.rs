@@ -695,8 +695,7 @@ async fn test_member_pointer_fixture_builds_each_optimized_variant() -> anyhow::
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "failed to load DWARF for member_pointer_program {:?}: {e}",
-                    opt_level
+                    "failed to load DWARF for member_pointer_program {opt_level:?}: {e}"
                 )
             })?;
     }
@@ -723,10 +722,10 @@ async fn test_complex_bitfield_chain_planner_resolves_member_offsets() -> anyhow
         let pc_context = analyzer.resolve_pc(module_address)?;
         let active = analyzer
             .plan_variable_access_by_name(&pc_context, "c", &field_path(&["active"]))?
-            .ok_or_else(|| anyhow::anyhow!("missing plan for c.active at {:?}", module_address))?;
+            .ok_or_else(|| anyhow::anyhow!("missing plan for c.active at {module_address:?}"))?;
         let flags = analyzer
             .plan_variable_access_by_name(&pc_context, "c", &field_path(&["flags"]))?
-            .ok_or_else(|| anyhow::anyhow!("missing plan for c.flags at {:?}", module_address))?;
+            .ok_or_else(|| anyhow::anyhow!("missing plan for c.flags at {module_address:?}"))?;
 
         let expected_steps = vec![
             ghostscope_dwarf::PlanExprOp::LoadRegister(6),

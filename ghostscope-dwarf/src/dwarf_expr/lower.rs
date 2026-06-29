@@ -508,9 +508,9 @@ impl ExpressionEvaluator {
                 ),
             );
         };
-        dwarf.address(unit, index).map_err(|err| {
-            anyhow::anyhow!("failed to resolve DW_OP_addrx index {:?}: {}", index, err)
-        })
+        dwarf
+            .address(unit, index)
+            .map_err(|err| anyhow::anyhow!("failed to resolve DW_OP_addrx index {index:?}: {err}"))
     }
 
     fn has_piece_expression<R>(operations: &[ParsedOperation<R>]) -> bool
@@ -584,8 +584,7 @@ impl ExpressionEvaluator {
                     };
                     let Some(cfa) = get_cfa_fn(address)? else {
                         return Err(anyhow::anyhow!(
-                            "DW_OP_fbreg but no CFA available at address 0x{:x}",
-                            address
+                            "DW_OP_fbreg but no CFA available at address 0x{address:x}"
                         ));
                     };
 
@@ -668,9 +667,7 @@ impl ExpressionEvaluator {
                         8 => MemoryAccessSize::U64,
                         _ => {
                             return Err(anyhow::anyhow!(
-                                "unsupported DWARF dereference size {} in operation: {:?}",
-                                size,
-                                op
+                                "unsupported DWARF dereference size {size} in operation: {op:?}"
                             ))
                         }
                     };
@@ -1001,8 +998,7 @@ impl ExpressionEvaluator {
                         }
                     } else {
                         Err(anyhow::anyhow!(
-                            "DW_OP_fbreg but no CFA available at address 0x{:x}",
-                            address
+                            "DW_OP_fbreg but no CFA available at address 0x{address:x}"
                         ))
                     }
                 } else {
