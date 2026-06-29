@@ -299,9 +299,8 @@ fn map_pid_session_error(err: ResolvePidSessionError) -> anyhow::Error {
             anyhow::anyhow!(
                 "PID filtering with -p is not reliable in this container environment. \
                  Kernel helper bpf_get_ns_current_pid_tgid is unavailable and NSpid does not expose \
-                 an explicit host PID mapping for -p {}.\n\
-                 Please use target mode (-t <binary_path>) instead of -p in this environment.",
-                proc_pid
+                 an explicit host PID mapping for -p {proc_pid}.\n\
+                 Please use target mode (-t <binary_path>) instead of -p in this environment."
             )
         }
     }

@@ -95,18 +95,18 @@ fn validate_module_path(path: &str) -> Result<ValidatedModulePath> {
     // the resolved object is a regular file before it reaches the ELF path.
     let input_is_proc_root = is_safe_proc_root_path(path);
     if is_filtered_module_prefix(path) && !input_is_proc_root {
-        anyhow::bail!("refusing to read pseudo-filesystem path {}", path);
+        anyhow::bail!("refusing to read pseudo-filesystem path {path}");
     }
 
     let resolved_path = fs::canonicalize(path)?;
     let resolved_str = resolved_path.to_string_lossy();
     let resolved_is_safe_proc_root = input_is_proc_root && is_safe_proc_root_path(&resolved_str);
     if is_filtered_module_prefix(&resolved_str) && !resolved_is_safe_proc_root {
-        anyhow::bail!("refusing to read pseudo-filesystem path {}", resolved_str);
+        anyhow::bail!("refusing to read pseudo-filesystem path {resolved_str}");
     }
     let meta = fs::metadata(&resolved_path)?;
     if !meta.file_type().is_file() {
-        anyhow::bail!("refusing to read non-regular file {}", resolved_str);
+        anyhow::bail!("refusing to read non-regular file {resolved_str}");
     }
 
     Ok(ValidatedModulePath {

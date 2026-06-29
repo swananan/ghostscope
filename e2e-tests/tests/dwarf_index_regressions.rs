@@ -797,7 +797,7 @@ async fn test_late_globals_are_indexed_as_globals() -> anyhow::Result<()> {
     let binary_path = FIXTURES.get_test_binary("late_globals_program")?;
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for late_globals_program: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for late_globals_program: {e}"))?;
 
     // Scenario this test is meant to cover:
     //
@@ -866,7 +866,7 @@ async fn assert_static_scope_fixture_indexes_expected_symbols(
 ) -> anyhow::Result<()> {
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for {scenario}: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for {scenario}: {e}"))?;
 
     let file_scope_static = analyzer.find_global_variables_by_name("file_scope_static_counter");
     assert!(

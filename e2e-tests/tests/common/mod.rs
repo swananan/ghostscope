@@ -806,10 +806,7 @@ fn compile_sample_program_variants(opt_levels: &[OptimizationLevel]) -> anyhow::
         .current_dir(sample_program_dir)
         .output()
         .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to run make for sample_program variants [{requested}]: {}",
-                e
-            )
+            anyhow::anyhow!("Failed to run make for sample_program variants [{requested}]: {e}")
         })?;
 
     if output.status.success() {
@@ -818,8 +815,7 @@ fn compile_sample_program_variants(opt_levels: &[OptimizationLevel]) -> anyhow::
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(anyhow::anyhow!(
-            "Failed to compile sample_program variants [{requested}]: {}",
-            stderr
+            "Failed to compile sample_program variants [{requested}]: {stderr}"
         ))
     }
 }
@@ -988,10 +984,7 @@ fn compile_complex_program_variants(opt_levels: &[OptimizationLevel]) -> anyhow:
     }
 
     let output = command.current_dir(program_dir).output().map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to run make for complex_types_program variants [{requested}]: {}",
-            e
-        )
+        anyhow::anyhow!("Failed to run make for complex_types_program variants [{requested}]: {e}")
     })?;
 
     if output.status.success() {
@@ -1000,8 +993,7 @@ fn compile_complex_program_variants(opt_levels: &[OptimizationLevel]) -> anyhow:
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(anyhow::anyhow!(
-            "Failed to compile complex_types_program variants [{requested}]: {}",
-            stderr
+            "Failed to compile complex_types_program variants [{requested}]: {stderr}"
         ))
     }
 }
@@ -1139,10 +1131,7 @@ fn compile_member_pointer_program_variants(opt_levels: &[OptimizationLevel]) -> 
     }
 
     let output = command.current_dir(program_dir).output().map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to run make for member_pointer_program variants [{requested}]: {}",
-            e
-        )
+        anyhow::anyhow!("Failed to run make for member_pointer_program variants [{requested}]: {e}")
     })?;
 
     if output.status.success() {
@@ -1151,8 +1140,7 @@ fn compile_member_pointer_program_variants(opt_levels: &[OptimizationLevel]) -> 
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(anyhow::anyhow!(
-            "Failed to compile member_pointer_program variants [{requested}]: {}",
-            stderr
+            "Failed to compile member_pointer_program variants [{requested}]: {stderr}"
         ))
     }
 }
@@ -1242,10 +1230,7 @@ impl TestFixtures {
                     .current_dir(program_dir.clone())
                     .output()
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to run make for complex_types_program Non-PIE: {}",
-                            e
-                        )
+                        anyhow::anyhow!("Failed to run make for complex_types_program Non-PIE: {e}")
                     })?;
 
                 if output.status.success() {
@@ -1254,8 +1239,7 @@ impl TestFixtures {
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     Err(anyhow::anyhow!(
-                        "Failed to compile complex_types_program Non-PIE: {}",
-                        stderr
+                        "Failed to compile complex_types_program Non-PIE: {stderr}"
                     ))
                 }
             })();
@@ -1336,8 +1320,7 @@ fn ensure_globals_program_compiled() -> anyhow::Result<()> {
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 Err(anyhow::anyhow!(
-                    "Failed to compile globals_program: {}",
-                    stderr
+                    "Failed to compile globals_program: {stderr}"
                 ))
             }
         })();
@@ -1380,8 +1363,7 @@ fn ensure_globals_program_optimized_variants_compiled() -> anyhow::Result<()> {
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 Err(anyhow::anyhow!(
-                    "Failed to compile globals_program optimized variants: {}",
-                    stderr
+                    "Failed to compile globals_program optimized variants: {stderr}"
                 ))
             }
         })();
@@ -1419,8 +1401,7 @@ fn ensure_late_globals_program_compiled() -> anyhow::Result<()> {
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 Err(anyhow::anyhow!(
-                    "Failed to compile late_globals_program: {}",
-                    stderr
+                    "Failed to compile late_globals_program: {stderr}"
                 ))
             }
         })();
@@ -1458,8 +1439,7 @@ fn ensure_short_lived_long_comm_program_compiled() -> anyhow::Result<()> {
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 Err(anyhow::anyhow!(
-                    "Failed to compile short_lived_long_comm_program: {}",
-                    stderr
+                    "Failed to compile short_lived_long_comm_program: {stderr}"
                 ))
             }
         })();
@@ -1539,8 +1519,7 @@ fn ensure_backtrace_cross_module_program_compiled() -> anyhow::Result<()> {
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 Err(anyhow::anyhow!(
-                    "Failed to compile backtrace_cross_module_program: {}",
-                    stderr
+                    "Failed to compile backtrace_cross_module_program: {stderr}"
                 ))
             }
         })();
@@ -1586,8 +1565,7 @@ fn ensure_backtrace_dlopen_program_compiled() -> anyhow::Result<()> {
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 Err(anyhow::anyhow!(
-                    "Failed to compile backtrace_dlopen_program: {}",
-                    stderr
+                    "Failed to compile backtrace_dlopen_program: {stderr}"
                 ))
             }
         })();
@@ -1635,8 +1613,7 @@ fn compile_scalar_types_program_target(target: &str, description: &str) -> anyho
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr);
         Err(anyhow::anyhow!(
-            "Failed to compile scalar_types_program {description}: {}",
-            stderr
+            "Failed to compile scalar_types_program {description}: {stderr}"
         ))
     }
 }
@@ -1670,8 +1647,7 @@ fn ensure_scalar_types_program_optimized_variants_compiled() -> anyhow::Result<(
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 Err(anyhow::anyhow!(
-                    "Failed to compile scalar_types_program optimized variants: {}",
-                    stderr
+                    "Failed to compile scalar_types_program optimized variants: {stderr}"
                 ))
             }
         })();
@@ -1718,8 +1694,7 @@ fn ensure_cast_types_program_compiled() -> anyhow::Result<()> {
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 Err(anyhow::anyhow!(
-                    "Failed to compile cast_types_program: {}",
-                    stderr
+                    "Failed to compile cast_types_program: {stderr}"
                 ))
             }
         })();
@@ -1757,8 +1732,7 @@ fn ensure_rust_global_program_compiled() -> anyhow::Result<()> {
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 Err(anyhow::anyhow!(
-                    "Failed to compile rust_global_program: {}",
-                    stderr
+                    "Failed to compile rust_global_program: {stderr}"
                 ))
             }
         })();
@@ -1829,8 +1803,7 @@ fn ensure_inline_call_value_program_compiled() -> anyhow::Result<()> {
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 Err(anyhow::anyhow!(
-                    "Failed to compile inline_call_value_program: {}",
-                    stderr
+                    "Failed to compile inline_call_value_program: {stderr}"
                 ))
             }
         })();
@@ -1897,8 +1870,7 @@ fn compile_partitioned_ranges_program(compiler: FixtureCompiler) -> anyhow::Resu
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 Err(anyhow::anyhow!(
-                    "Failed to compile partitioned_ranges_program: {}",
-                    stderr
+                    "Failed to compile partitioned_ranges_program: {stderr}"
                 ))
             }
         }
@@ -1943,8 +1915,7 @@ fn ensure_cpp_complex_program_compiled() -> anyhow::Result<()> {
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 Err(anyhow::anyhow!(
-                    "Failed to compile cpp_complex_program: {}",
-                    stderr
+                    "Failed to compile cpp_complex_program: {stderr}"
                 ))
             }
         })();

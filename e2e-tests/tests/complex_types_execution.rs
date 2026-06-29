@@ -1225,7 +1225,7 @@ async fn test_trace_by_address_nopie_complex_types() -> anyhow::Result<()> {
     //    Choose 'c->age += 1;' which is consistently present near the top of the function.
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for Non-PIE test binary: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for Non-PIE test binary: {e}"))?;
     let addrs = analyzer.lookup_addresses_by_source_line("complex_types_program.c", 8);
     anyhow::ensure!(
         !addrs.is_empty(),

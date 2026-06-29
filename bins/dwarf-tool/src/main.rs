@@ -361,16 +361,10 @@ fn validate_args(cli: &Cli) -> Result<()> {
     if let Some(target_path) = &cli.target {
         let target_file = PathBuf::from(target_path);
         if !target_file.exists() {
-            return Err(anyhow::anyhow!(
-                "Target file does not exist: {}",
-                target_path
-            ));
+            return Err(anyhow::anyhow!("Target file does not exist: {target_path}"));
         }
         if !target_file.is_file() {
-            return Err(anyhow::anyhow!(
-                "Target path is not a file: {}",
-                target_path
-            ));
+            return Err(anyhow::anyhow!("Target path is not a file: {target_path}"));
         }
         println!("✓ Target file found: {target_path}");
     }
@@ -1247,8 +1241,7 @@ fn parse_source_line(source_str: &str) -> Result<(&str, u32)> {
     let parts: Vec<&str> = source_str.rsplitn(2, ':').collect();
     if parts.len() != 2 {
         return Err(anyhow::anyhow!(
-            "Invalid source format. Expected 'file:line', got '{}'",
-            source_str
+            "Invalid source format. Expected 'file:line', got '{source_str}'"
         ));
     }
 
@@ -1257,7 +1250,7 @@ fn parse_source_line(source_str: &str) -> Result<(&str, u32)> {
 
     let line_number: u32 = line_str
         .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid line number: {}", line_str))?;
+        .map_err(|_| anyhow::anyhow!("Invalid line number: {line_str}"))?;
 
     Ok((file_path, line_number))
 }
@@ -1268,7 +1261,7 @@ fn parse_address(address_str: &str) -> Result<u64> {
     } else {
         address_str.parse::<u64>()
     }
-    .map_err(|_| anyhow::anyhow!("Invalid address format: {}", address_str))
+    .map_err(|_| anyhow::anyhow!("Invalid address format: {address_str}"))
 }
 
 #[cfg(test)]

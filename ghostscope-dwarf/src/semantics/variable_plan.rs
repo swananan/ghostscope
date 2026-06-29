@@ -522,7 +522,7 @@ impl VariableReadPlan {
             }
             .into(),
             TypeLayoutError::InvalidMemberBase { type_name } => {
-                anyhow::anyhow!("member '{}' not found on type '{}'", field, type_name)
+                anyhow::anyhow!("member '{field}' not found on type '{type_name}'")
             }
         })?;
 

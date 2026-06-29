@@ -384,8 +384,7 @@ impl LoadedObjfile {
             .cloned()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "StrictIndex: no function found for address 0x{:x} in block index",
-                    address
+                    "StrictIndex: no function found for address 0x{address:x} in block index"
                 )
             })?;
 

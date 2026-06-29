@@ -622,7 +622,7 @@ async fn test_trace_by_address_via_dwarf_line_lookup() -> anyhow::Result<()> {
     //    We reuse the same file:line that existing tests rely on and pick the first returned PC.
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for test binary: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for test binary: {e}"))?;
     let addrs = analyzer.lookup_addresses_by_source_line("globals_program.c", 32);
     anyhow::ensure!(
         !addrs.is_empty(),
@@ -718,7 +718,7 @@ async fn test_trace_address_with_target_shared_library() -> anyhow::Result<()> {
     );
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lib_path)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for lib: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for lib: {e}"))?;
     let addrs = analyzer.lookup_function_addresses("lib_tick");
     anyhow::ensure!(
         !addrs.is_empty(),
@@ -767,7 +767,7 @@ async fn test_trace_module_qualified_address_in_pid_mode() -> anyhow::Result<()>
     );
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lib_path)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for lib: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load DWARF for lib: {e}"))?;
     let addrs = analyzer.lookup_function_addresses("lib_tick");
     anyhow::ensure!(
         !addrs.is_empty(),

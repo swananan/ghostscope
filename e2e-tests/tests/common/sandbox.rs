@@ -1844,11 +1844,7 @@ fn inspect_test_sandbox_if_present(container_id: &str) -> Result<Option<TestSand
             // stale-sandbox sweep cache.
             return Ok(None);
         }
-        anyhow::bail!(
-            "failed to inspect docker sandbox {}: {}",
-            container_id,
-            stderr
-        );
+        anyhow::bail!("failed to inspect docker sandbox {container_id}: {stderr}");
     }
 
     let line = String::from_utf8(output.stdout)
@@ -1898,11 +1894,7 @@ fn inspect_docker_container_state(container_name: &str) -> Result<Option<DockerC
         if is_missing_docker_container_error(&stderr) {
             return Ok(None);
         }
-        anyhow::bail!(
-            "failed to inspect docker sandbox {}: {}",
-            container_name,
-            stderr
-        );
+        anyhow::bail!("failed to inspect docker sandbox {container_name}: {stderr}");
     }
 
     let line =

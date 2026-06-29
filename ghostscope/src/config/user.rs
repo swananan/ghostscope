@@ -245,16 +245,10 @@ impl UserConfig {
         if let Some(target_path) = &self.target_path {
             let target_file = PathBuf::from(target_path);
             if !target_file.exists() {
-                return Err(anyhow::anyhow!(
-                    "Target file does not exist: {}",
-                    target_path
-                ));
+                return Err(anyhow::anyhow!("Target file does not exist: {target_path}"));
             }
             if !target_file.is_file() {
-                return Err(anyhow::anyhow!(
-                    "Target path is not a file: {}",
-                    target_path
-                ));
+                return Err(anyhow::anyhow!("Target path is not a file: {target_path}"));
             }
             info!("✓ Target file found: {}", target_path);
         }
@@ -262,9 +256,7 @@ impl UserConfig {
         if let Some(pid) = self.input_pid {
             if !pid_already_verified && !is_pid_running(pid) {
                 return Err(anyhow::anyhow!(
-                    "Process with PID {} is not running. Use 'ps -p {}' to verify the process exists",
-                    pid,
-                    pid
+                    "Process with PID {pid} is not running. Use 'ps -p {pid}' to verify the process exists"
                 ));
             }
             info!("✓ Target PID {} is running", pid);

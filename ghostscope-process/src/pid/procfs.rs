@@ -15,7 +15,7 @@ pub fn process_exists(pid: u32) -> bool {
 pub fn read_status(pid: u32) -> Result<String> {
     let path = format!("/proc/{pid}/status");
     fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("Failed to read {} while resolving PID mapping: {}", path, e))
+        .map_err(|e| anyhow::anyhow!("Failed to read {path} while resolving PID mapping: {e}"))
 }
 
 pub fn read_nspid_chain(pid: u32) -> Option<Vec<u32>> {

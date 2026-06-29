@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
 
     if let Err(e) = logging::initialize_from_user_config(&user_config) {
         eprintln!("Failed to initialize logging: {e}");
-        return Err(anyhow::anyhow!("Failed to initialize logging: {}", e));
+        return Err(anyhow::anyhow!("Failed to initialize logging: {e}"));
     }
 
     info!("{}", user_config.config_source_message());

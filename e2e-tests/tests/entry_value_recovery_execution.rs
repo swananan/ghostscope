@@ -341,8 +341,7 @@ fn ensure_debug_dump_contains_breg_entry_value(debug_file: &Path) -> anyhow::Res
             && (stdout.contains("contents 0x7708")
                 || stdout.contains("DW_OP_breg7")
                 || stdout.contains("DW_OP_breg7 8")),
-        "synthetic debug file did not contain the expected entry_value(breg7) expression:\n{}",
-        stdout
+        "synthetic debug file did not contain the expected entry_value(breg7) expression:\n{stdout}"
     );
     Ok(())
 }

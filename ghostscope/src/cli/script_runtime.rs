@@ -197,7 +197,7 @@ pub async fn run_command_line_runtime_with_config(config: ResolvedConfig) -> Res
             if let Ok(mut reporter) = reporter.lock() {
                 reporter.finish_failure(&e.to_string());
             }
-            return Err(anyhow::anyhow!("Failed to create debug session: {}", e));
+            return Err(anyhow::anyhow!("Failed to create debug session: {e}"));
         }
     };
 
@@ -296,11 +296,8 @@ async fn run_cli_with_session(
                 let requested_pid = config.input_pid.or(config.runtime.proc_pid).unwrap_or(0);
                 return Err(anyhow::anyhow!(
                     "Process analysis failed! Cannot proceed without process information. \
-                    Possible solutions: 1. Check that PID {} exists: ps -p {}, \
-                    2. Check process permissions, 3. Run with sudo if needed for /proc access{}",
-                    requested_pid,
-                    requested_pid,
-                    host_hint
+                    Possible solutions: 1. Check that PID {requested_pid} exists: ps -p {requested_pid}, \
+                    2. Check process permissions, 3. Run with sudo if needed for /proc access{host_hint}"
                 ));
             }
         }
@@ -397,7 +394,7 @@ async fn run_cli_with_session(
         session.trace_manager.active_trace_count()
     );
     crate::util::emit_ready_marker(config.emit_ready_marker.as_deref())
-        .map_err(|e| anyhow::anyhow!("failed to emit ready marker: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to emit ready marker: {e}"))?;
     if show_cli_status {
         eprintln!(
             "{} {}",

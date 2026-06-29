@@ -816,8 +816,7 @@ pub fn compile_script_for_cli(
             let friendly = map_compile_error_message(&e);
             error!("Script compilation failed: {}", friendly);
             return Err(anyhow::anyhow!(
-                "Script compilation failed: {}. Please check your script syntax and try again.",
-                friendly
+                "Script compilation failed: {friendly}. Please check your script syntax and try again."
             ));
         }
     };

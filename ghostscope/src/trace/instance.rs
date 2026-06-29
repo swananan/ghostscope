@@ -99,7 +99,7 @@ impl TraceInstance {
                             "❌ Failed to re-attach uprobe for trace {}: {}",
                             self.trace_id, e
                         );
-                        Err(anyhow::anyhow!("Failed to re-attach uprobe: {}", e))
+                        Err(anyhow::anyhow!("Failed to re-attach uprobe: {e}"))
                     }
                 }
             } else {
@@ -126,7 +126,7 @@ impl TraceInstance {
                             "❌ Failed to attach uprobe for trace {}: {}",
                             self.trace_id, e
                         );
-                        Err(anyhow::anyhow!("Failed to attach uprobe: {}", e))
+                        Err(anyhow::anyhow!("Failed to attach uprobe: {e}"))
                     }
                 }
             }
@@ -161,7 +161,7 @@ impl TraceInstance {
                         "❌ Failed to detach uprobe for trace {}: {}",
                         self.trace_id, e
                     );
-                    Err(anyhow::anyhow!("Failed to detach uprobe: {}", e))
+                    Err(anyhow::anyhow!("Failed to detach uprobe: {e}"))
                 }
             }
         } else {

@@ -69,8 +69,7 @@ impl LogLevel {
             "debug" => Ok(LogLevel::Debug),
             "trace" => Ok(LogLevel::Trace),
             _ => Err(anyhow::anyhow!(
-                "Invalid log level: {}. Valid options: error, warn, info, debug, trace",
-                s
+                "Invalid log level: {s}. Valid options: error, warn, info, debug, trace"
             )),
         }
     }

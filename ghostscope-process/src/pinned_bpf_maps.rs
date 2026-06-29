@@ -889,7 +889,7 @@ pub fn ensure_pinned_backtrace_cfi_maps_exist(
 pub fn insert_allowed_pid(pid: u32) -> anyhow::Result<()> {
     let mut map = open_pinned_hash_map::<u32, u8>(allowed_pids_pin_path()?)?;
     map.insert(pid, 1, 0)
-        .map_err(|e| anyhow::anyhow!("allowed_pids update failed for {}: {}", pid, e))
+        .map_err(|e| anyhow::anyhow!("allowed_pids update failed for {pid}: {e}"))
 }
 
 /// Return whether a PID is already present in the allowed_pids pinned map.
@@ -898,11 +898,7 @@ pub fn allowed_pid_exists(pid: u32) -> anyhow::Result<bool> {
     match map.get(&pid, 0) {
         Ok(_) => Ok(true),
         Err(MapError::KeyNotFound) => Ok(false),
-        Err(e) => Err(anyhow::anyhow!(
-            "allowed_pids lookup failed for {}: {}",
-            pid,
-            e
-        )),
+        Err(e) => Err(anyhow::anyhow!("allowed_pids lookup failed for {pid}: {e}")),
     }
 }
 
@@ -910,7 +906,7 @@ pub fn allowed_pid_exists(pid: u32) -> anyhow::Result<bool> {
 pub fn remove_allowed_pid(pid: u32) -> anyhow::Result<()> {
     let mut map = open_pinned_hash_map::<u32, u8>(allowed_pids_pin_path()?)?;
     map.remove(&pid)
-        .map_err(|e| anyhow::anyhow!("allowed_pids delete failed for {}: {}", pid, e))
+        .map_err(|e| anyhow::anyhow!("allowed_pids delete failed for {pid}: {e}"))
 }
 
 /// Insert a runtime-pid -> proc-pid alias into the pinned pid_aliases map.
@@ -919,10 +915,7 @@ pub fn insert_pid_alias(runtime_pid: u32, proc_pid: u32) -> anyhow::Result<()> {
     let val = PidAliasValue { proc_pid };
     map.insert(runtime_pid, val, 0).map_err(|e| {
         anyhow::anyhow!(
-            "pid_aliases update failed for runtime_pid={} proc_pid={}: {}",
-            runtime_pid,
-            proc_pid,
-            e
+            "pid_aliases update failed for runtime_pid={runtime_pid} proc_pid={proc_pid}: {e}"
         )
     })
 }
@@ -931,11 +924,7 @@ pub fn insert_pid_alias(runtime_pid: u32, proc_pid: u32) -> anyhow::Result<()> {
 pub fn remove_pid_alias(runtime_pid: u32) -> anyhow::Result<()> {
     let mut map = open_pinned_hash_map::<u32, PidAliasValue>(pid_aliases_pin_path()?)?;
     map.remove(&runtime_pid).map_err(|e| {
-        anyhow::anyhow!(
-            "pid_aliases delete failed for runtime_pid={}: {}",
-            runtime_pid,
-            e
-        )
+        anyhow::anyhow!("pid_aliases delete failed for runtime_pid={runtime_pid}: {e}")
     })
 }
 
@@ -1118,11 +1107,7 @@ pub fn replace_ranges_for_pid(
     )
     .map_err(|e| {
         anyhow::anyhow!(
-            "proc_module_range_meta update failed for pid={} slot={} count={}: {}",
-            pid,
-            inactive_slot,
-            inserted,
-            e
+            "proc_module_range_meta update failed for pid={pid} slot={inactive_slot} count={inserted}: {e}"
         )
     })?;
 

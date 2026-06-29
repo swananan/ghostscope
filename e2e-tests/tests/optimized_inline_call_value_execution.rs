@@ -53,11 +53,11 @@ fn assert_not_internal_call_register_aliases(
     let original_x = parameters
         .iter()
         .find(|param| param.name == "original_x")
-        .ok_or_else(|| anyhow::anyhow!("missing original_x at 0x{:x}", address))?;
+        .ok_or_else(|| anyhow::anyhow!("missing original_x at 0x{address:x}"))?;
     let original_y = parameters
         .iter()
         .find(|param| param.name == "original_y")
-        .ok_or_else(|| anyhow::anyhow!("missing original_y at 0x{:x}", address))?;
+        .ok_or_else(|| anyhow::anyhow!("missing original_y at 0x{address:x}"))?;
 
     assert_ne!(
         original_x.location,
