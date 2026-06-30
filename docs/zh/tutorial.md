@@ -22,6 +22,12 @@ curl -fsSL https://raw.githubusercontent.com/swananan/ghostscope/main/scripts/sk
 $ghostscope-runtime-analysis 跟踪正在运行的 nginx worker，并把请求 body 的原始字节打印出来
 ```
 
+如果你想看的不只是变量值，而是调用上下文，可以直接要求输出调用栈：
+
+```text
+$ghostscope-runtime-analysis 跟踪正在运行的 nginx worker，展示哪个请求到达了 ngx_http_process_request，并输出源码感知的调用栈
+```
+
 这条路径特别适合想先拿到一套可复用的 `--script-file` CLI 工作流的人。AI 给出初版之后，TUI 仍然是查看源码、微调设点和迭代脚本的最佳位置。如果你想继续了解 GhostScope 的具体使用细节，也可以继续参考下面的教程。
 
 ### 启动 GhostScope
