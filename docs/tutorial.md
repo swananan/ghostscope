@@ -22,6 +22,12 @@ Then ask for a concrete tracing workflow:
 $ghostscope-runtime-analysis trace the running nginx worker and show the raw request body bytes
 ```
 
+When you need call context instead of only values, ask for the stack explicitly:
+
+```text
+$ghostscope-runtime-analysis trace the running nginx worker and show which request reached ngx_http_process_request, plus the source-aware call stack
+```
+
 This works especially well when you want a repeatable CLI flow with `--script-file`. After the AI gives you a starting point, the TUI is still the best place to inspect source, tweak trace points, and iterate on the script interactively. If you want the hands-on details of using GhostScope itself, continue with the tutorial below.
 
 ### Launch GhostScope

@@ -1,6 +1,6 @@
 ---
 name: ghostscope-runtime-analysis
-description: Explain GhostScope and turn the project docs into concrete tracing commands, trace scripts, privilege setup, and issue-report workflows for source-aware runtime analysis. Use when the user asks how to install GhostScope, provide source tree and DWARF inputs, handle eBPF privileges, attach to a PID or binary, choose between `-p` and `-t`, inspect variables, write GhostScope trace scripts, use Input Mode commands, work through container or PID-namespace CLI scenarios, or triage GhostScope failures, crashes, and GitHub issue reports.
+description: Explain GhostScope and turn the project docs into concrete tracing commands, trace scripts, privilege setup, and issue-report workflows for source-aware runtime analysis. Use when the user asks how to install GhostScope, provide source tree and DWARF inputs, handle eBPF privileges, attach to a PID or binary, choose between `-p` and `-t`, inspect variables or source-aware call stacks, write GhostScope trace scripts, use Input Mode commands, work through container or PID-namespace CLI scenarios, or triage GhostScope failures, crashes, and GitHub issue reports.
 ---
 
 # GhostScope Runtime Analysis
@@ -61,6 +61,11 @@ copy of GhostScope behavior. When the user is writing in Chinese, prefer the
 - If the user needs TUI interaction, include the minimum command-panel sequence.
 - If the user needs a reusable trace file, emit a valid `trace <pattern> { ... }` block.
 - If the user needs an inline script body after `trace <target>`, emit only the statements inside the block, not another top-level `trace`.
+- When the user asks how execution reached a point, or asks for call context,
+  include `bt full;` in the trace block. Pair it with a `print` line when a
+  request, ID, argument, or state value helps identify the event. Add
+  `--backtrace-depth <N>` only when the user asks to bound stack depth or a
+  compact demo output is explicitly needed.
 - When generating a GhostScope trace script and the relevant source path is known, also include the source-backed rationale:
   - quote or summarize the specific function signature, source lines, struct fields, branches, or variables the script depends on
   - explain why each probe target, printed variable, condition, or field access matches that source context

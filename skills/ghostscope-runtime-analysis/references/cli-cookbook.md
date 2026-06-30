@@ -8,7 +8,7 @@ frozen source of truth.
 
 ## Capability Snapshot
 
-Use GhostScope when the user wants low-overhead userspace tracing with DWARF-aware access to locals, parameters, globals, source lines, and function entries without stopping the target process.
+Use GhostScope when the user wants low-overhead userspace tracing with DWARF-aware access to locals, parameters, globals, source lines, function entries, and DWARF-unwound call stacks without stopping the target process.
 
 ## Preconditions To Mention Early
 
@@ -168,6 +168,66 @@ When you generate a trace file for the user, do not stop at the DSL alone. Also 
 - a short explanation of why each printed variable or field is the right thing to capture
 
 If the source tree path is not known yet, first try to discover it locally. Ask for it only when that discovery fails or the path is still ambiguous.
+
+### Nginx Prompt Patterns
+
+These examples show the intended split between value inspection and call-stack
+context. Re-check `ghostscope --help`, `ghostscope --script-help`, and the local
+nginx source/debug-info state before emitting exact commands.
+
+Prompt 1: inspect values or bytes at a source point.
+
+```text
+$ghostscope-runtime-analysis trace the running nginx worker and show the raw request body bytes
+```
+
+Typical script:
+
+```ghostscope
+trace /path/to/nginx/src/http/ngx_http_request_body.c:671 {
+    if size > 0 {
+        let req_line_len = r.request_line.len;
+        let body_len = size;
+
+        print "src=discard-preread pid={} req={:p} line={:s.req_line_len$} body_len={} body={:x.body_len$}",
+            $pid, r, r.request_line.data, body_len, r.header_in.pos;
+    }
+}
+```
+
+Prompt 2: add call context.
+
+```text
+$ghostscope-runtime-analysis trace the running nginx worker and show which request reached ngx_http_process_request, plus the source-aware call stack
+```
+
+Typical command:
+
+```bash
+WORKER_PID=$(pgrep -n -f 'nginx: worker process')
+sudo ghostscope -p "$WORKER_PID" \
+  --script-file /tmp/ghostscope-nginx-request-stack.gs \
+  --script-output pretty
+```
+
+Typical script:
+
+```ghostscope
+trace ngx_http_process_request {
+    let method_len = r.method_name.len;
+    let uri_len = r.uri.len;
+    let line_len = r.request_line.len;
+
+    print "nginx pid={} method={:s.method_len$} uri={:s.uri_len$} line={:s.line_len$}",
+        $pid, r.method_name.data, r.uri.data, r.request_line.data;
+
+    bt full;
+}
+```
+
+Use the first pattern when the user asks "what value/bytes are here?" Use the
+second when they ask "how did execution get here?" In public examples, prefer
+the second pattern for showing that GhostScope is not only variable printing.
 
 ### Interactive TUI Workflow
 
