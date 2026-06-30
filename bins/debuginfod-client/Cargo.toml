@@ -20,6 +20,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-ghostscope-debuginfod = { version = "0.1.5", path = "../../ghostscope-debuginfod" }
+ghostscope-debuginfod = { version = "0.1.6", path = "../../ghostscope-debuginfod" }
 object.workspace = true
 tokio.workspace = true
