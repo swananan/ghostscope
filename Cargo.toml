@@ -29,7 +29,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 rust-version = "1.88"
 authors = ["swananan <jt26wzz@gmail.com>"]

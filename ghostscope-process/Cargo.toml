@@ -20,7 +20,7 @@ log = { workspace = true }
 object = { workspace = true }
 aya = { workspace = true }
 aya-obj = { workspace = true }
-ghostscope-protocol = { version = "0.1.5", path = "../ghostscope-protocol", features = ["aya-pod"] }
+ghostscope-protocol = { version = "0.1.6", path = "../ghostscope-protocol", features = ["aya-pod"] }
 libc = "0.2"
 bytes = "1"
 memmap2 = "0.9"
