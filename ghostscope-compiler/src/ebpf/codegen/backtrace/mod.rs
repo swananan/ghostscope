@@ -1,6 +1,3 @@
-use super::backtrace_plan::{
-    BacktraceEmitMode, BacktraceInstructionPlan, BPF_INLINE_BACKTRACE_FRAME_LIMIT,
-};
 use super::*;
 use crate::script::BacktraceStatement;
 use aya_ebpf_bindings::bindings::bpf_func_id::{BPF_FUNC_map_lookup_elem, BPF_FUNC_tail_call};
@@ -8,6 +5,8 @@ use ghostscope_dwarf::{CompactUnwindRow, MemoryAccessSize, ModuleAddress};
 use inkwell::basic_block::BasicBlock;
 use inkwell::values::BasicMetadataValueEnum;
 use std::path::PathBuf;
+
+use plan::{BacktraceEmitMode, BacktraceInstructionPlan, BPF_INLINE_BACKTRACE_FRAME_LIMIT};
 
 const X86_64_DWARF_RIP: u16 = 16;
 const X86_64_DWARF_RBP: u16 = 6;
@@ -102,6 +101,7 @@ mod frame_recovery;
 mod inline;
 mod module_ranges;
 mod payload;
+mod plan;
 mod tail_call;
 mod unwind_rows;
 

@@ -1,7 +1,7 @@
 //! Backtrace semantic planning for eBPF codegen.
 //!
 //! This module decides which backtrace strategy and data dependencies are
-//! required. The LLVM emitter in `backtrace.rs` owns the actual IR blocks,
+//! required. The LLVM emitters in sibling modules own the actual IR blocks,
 //! helper calls, and ABI stores.
 
 use super::*;
