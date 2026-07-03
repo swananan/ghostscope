@@ -173,7 +173,6 @@ fn allocate_dynamic_payload_reservations(max_lens: &[usize], available: usize) -
 
 mod args;
 mod backtrace;
-mod backtrace_plan;
 mod expr_error;
 mod format;
 mod instruction_common;
