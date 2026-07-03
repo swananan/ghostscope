@@ -7,103 +7,29 @@ use crate::{
     },
     loader::ExplicitDebugFile,
     objfile::LoadedObjfile,
-    semantics::{CompactUnwindRow, CompactUnwindTable, PcContext, VisibleVariable},
+    semantics::{CompactUnwindRow, CompactUnwindTable, PcContext},
 };
 use ghostscope_debuginfod::DebuginfodClient;
 use object::{Object, ObjectSection};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+mod cache;
 mod module_resolution;
 mod plan_global;
 mod plan_pc;
 mod source_resolution;
+#[cfg(test)]
+mod tests;
 mod type_lookup;
+mod types;
 
+use cache::PcContextCache;
 pub use module_resolution::ModuleDefaultPolicy;
 pub use source_resolution::{SourceLineAddressSearch, SourceLineQuerySearch};
 pub use type_lookup::TypeLookupAmbiguity;
-
-#[cfg(test)]
-use crate::{
-    core::{AddressExpr, Availability, Provenance, VariableLocation},
-    semantics::VariableReadPlan,
-};
-
-/// Events emitted during module loading process
-#[derive(Debug, Clone)]
-pub enum ModuleLoadingEvent {
-    /// Module discovered during process scanning
-    Discovered {
-        module_path: String,
-        current: usize,
-        total: usize,
-    },
-    /// Module loading started
-    LoadingStarted {
-        module_path: String,
-        current: usize,
-        total: usize,
-    },
-    /// Module loading completed successfully
-    LoadingCompleted {
-        module_path: String,
-        stats: ModuleLoadingStats,
-        current: usize,
-        total: usize,
-    },
-    /// Module loading failed
-    LoadingFailed {
-        module_path: String,
-        error: String,
-        current: usize,
-        total: usize,
-    },
-}
-
-/// Statistics for a loaded module
-#[derive(Debug, Clone)]
-pub struct ModuleLoadingStats {
-    pub functions: usize,
-    pub variables: usize,
-    pub types: usize,
-    pub debug_info_source: DebugInfoSource,
-    pub load_time_ms: u64,
-    pub parse_time_ms: u64,
-    pub index_time_ms: u64,
-    pub module_total_time_ms: u64,
-}
-
-/// Rich query result for a single address within a module.
-#[derive(Debug, Clone)]
-pub struct AddressQueryResult {
-    pub module_path: PathBuf,
-    pub address: u64,
-    pub source_file: Option<String>,
-    pub source_line: Option<u32>,
-    pub source_column: Option<u32>,
-    pub function_name: Option<String>,
-    pub is_inline: Option<bool>,
-    pub variables: Vec<VisibleVariable>,
-    pub parameters: Vec<VisibleVariable>,
-}
-
-/// Runtime mapping metadata for a loaded module.
-#[derive(Debug, Clone)]
-pub struct LoadedModuleRuntimeInfo {
-    pub module_path: PathBuf,
-    pub loaded_address: Option<u64>,
-    pub load_bias: Option<u64>,
-    pub size: u64,
-}
-
-/// Rich query result for a function lookup across modules.
-#[derive(Debug, Clone)]
-pub struct FunctionQueryResult {
-    pub function_name: String,
-    pub addresses: Vec<AddressQueryResult>,
-}
+pub use types::*;
 
 /// DWARF analyzer - unified entry point for all DWARF analysis
 #[derive(Debug)]
@@ -114,72 +40,6 @@ pub struct DwarfAnalyzer {
     modules: HashMap<PathBuf, LoadedObjfile>,
     /// Cached PC semantic contexts for repeated symbol/source lookups.
     pc_context_cache: RwLock<PcContextCache>,
-}
-
-const PC_CONTEXT_CACHE_MAX_ENTRIES: usize = 8192;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PcContextCacheKey {
-    module_path: PathBuf,
-    address: u64,
-}
-
-#[derive(Debug)]
-struct PcContextCache {
-    entries: HashMap<PathBuf, HashMap<u64, PcContext>>,
-    insertion_order: VecDeque<PcContextCacheKey>,
-    len: usize,
-    max_entries: usize,
-}
-
-impl Default for PcContextCache {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-            insertion_order: VecDeque::new(),
-            len: 0,
-            max_entries: PC_CONTEXT_CACHE_MAX_ENTRIES,
-        }
-    }
-}
-
-impl PcContextCache {
-    fn get(&self, module_path: &Path, address: u64) -> Option<PcContext> {
-        self.entries
-            .get(module_path)
-            .and_then(|entries| entries.get(&address))
-            .cloned()
-    }
-
-    fn insert(&mut self, module_path: PathBuf, address: u64, context: PcContext) {
-        if self.max_entries == 0 {
-            return;
-        }
-
-        let key = PcContextCacheKey {
-            module_path,
-            address,
-        };
-        let module_entries = self.entries.entry(key.module_path.clone()).or_default();
-        if module_entries.insert(address, context).is_none() {
-            self.insertion_order.push_back(key.clone());
-            self.len += 1;
-        }
-
-        while self.len > self.max_entries {
-            let Some(expired) = self.insertion_order.pop_front() else {
-                break;
-            };
-            if let Some(module_entries) = self.entries.get_mut(&expired.module_path) {
-                if module_entries.remove(&expired.address).is_some() {
-                    self.len -= 1;
-                }
-                if module_entries.is_empty() {
-                    self.entries.remove(&expired.module_path);
-                }
-            }
-        }
-    }
 }
 
 impl DwarfAnalyzer {
@@ -1495,236 +1355,5 @@ impl DwarfAnalyzer {
         }
 
         Ok(grouped)
-    }
-}
-
-///
-/// Module statistics compatible with ghostscope-binary
-#[derive(Debug, Clone)]
-pub struct ModuleStats {
-    pub total_modules: usize,
-    pub executable_modules: usize,
-    pub library_modules: usize,
-    pub total_symbols: usize,
-    pub modules_with_debug_info: usize,
-}
-
-/// Main executable information
-#[derive(Debug, Clone)]
-pub struct MainExecutableInfo {
-    pub path: String,
-}
-
-/// Statistics for debugging and monitoring
-#[derive(Debug, Clone)]
-pub struct AnalyzerStats {
-    pub pid: u32,
-    pub module_count: usize,
-    pub total_functions: usize,
-    pub total_variables: usize,
-    pub total_line_headers: usize,
-}
-
-/// Shared library information (compatible with ghostscope-ui)
-#[derive(Debug, Clone)]
-pub struct SharedLibraryInfo {
-    pub from_address: u64,               // Starting address in memory
-    pub to_address: u64,                 // Ending address in memory
-    pub symbols_read: bool,              // Whether symbols were successfully read
-    pub debug_info_available: bool,      // Whether debug information is available
-    pub library_path: String,            // Full path to the library file
-    pub size: u64,                       // Size of the library in memory
-    pub debug_file_path: Option<String>, // Path to separate debug file (if via .gnu_debuglink)
-}
-
-/// Executable file information (for "info file" command)
-#[derive(Debug, Clone)]
-pub struct ExecutableFileInfo {
-    pub file_path: String,
-    pub file_type: String,
-    pub entry_point: Option<u64>,
-    pub has_symbols: bool,
-    pub has_debug_info: bool,
-    pub debug_file_path: Option<String>,
-    pub text_section: Option<SectionInfo>,
-    pub data_section: Option<SectionInfo>,
-    pub mode_description: String,
-}
-
-/// Section information for executable files
-#[derive(Debug, Clone)]
-pub struct SectionInfo {
-    pub start_address: u64,
-    pub end_address: u64,
-    pub size: u64,
-}
-
-/// Simple file information compatible with ghostscope-binary
-#[derive(Debug, Clone)]
-pub struct SimpleFileInfo {
-    pub full_path: String,
-    pub basename: String,
-    pub directory: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn global_plan(name: &str, address: u64) -> VariableReadPlan {
-        VariableReadPlan {
-            name: name.to_string(),
-            type_name: "int".to_string(),
-            access_path: crate::VariableAccessPath::default(),
-            module_path: None,
-            dwarf_type: Some(crate::TypeInfo::BaseType {
-                name: "int".to_string(),
-                size: 4,
-                encoding: gimli::constants::DW_ATE_signed.0 as u16,
-            }),
-            declaration: None,
-            type_id: None,
-            location: VariableLocation::Address(AddressExpr::constant(address)),
-            availability: Availability::Available,
-            scope_depth: 0,
-            is_parameter: false,
-            is_artificial: false,
-            pc_range: None,
-            inline_context: None,
-            provenance: Provenance::Synthesized {
-                detail: "test".to_string(),
-            },
-        }
-    }
-
-    fn visible_var(name: &str, scope_depth: usize) -> VisibleVariable {
-        VisibleVariable {
-            name: name.to_string(),
-            type_name: "int".to_string(),
-            dwarf_type: Some(crate::TypeInfo::BaseType {
-                name: "int".to_string(),
-                size: 4,
-                encoding: gimli::constants::DW_ATE_signed.0 as u16,
-            }),
-            declaration: None,
-            type_id: None,
-            location: VariableLocation::RegisterValue { dwarf_reg: 0 },
-            availability: Availability::Available,
-            scope_depth,
-            is_parameter: false,
-            is_artificial: false,
-        }
-    }
-
-    fn diagnostic(
-        name: &str,
-        scope_depth: usize,
-        detail: &str,
-    ) -> crate::semantics::VariableQueryDiagnostic {
-        crate::semantics::VariableQueryDiagnostic {
-            pc: 0x1234,
-            name: Some(name.to_string()),
-            scope_depth,
-            availability: Availability::Unsupported(crate::UnsupportedReason::ExpressionShape {
-                detail: detail.to_string(),
-            }),
-            detail: detail.to_string(),
-        }
-    }
-
-    #[test]
-    fn variable_selection_rejects_inner_diagnostic_over_outer_match() {
-        let err = DwarfAnalyzer::select_visible_variable_by_name(
-            0x1234,
-            "state",
-            vec![visible_var("state", 1)],
-            &[diagnostic("state", 2, "DW_OP_bad is unsupported")],
-        )
-        .expect_err("inner unavailable variable should block outer fallback");
-
-        assert!(err.to_string().contains("Unavailable variable 'state'"));
-        assert!(err.to_string().contains("DW_OP_bad is unsupported"));
-    }
-
-    #[test]
-    fn variable_selection_keeps_inner_match_over_outer_diagnostic() {
-        let selected = DwarfAnalyzer::select_visible_variable_by_name(
-            0x1234,
-            "state",
-            vec![visible_var("state", 2)],
-            &[diagnostic("state", 1, "outer variable is unavailable")],
-        )
-        .expect("outer diagnostic should not block inner match")
-        .expect("inner match should be returned");
-
-        assert_eq!(selected.name, "state");
-        assert_eq!(selected.scope_depth, 2);
-    }
-
-    #[test]
-    fn global_plan_selection_rejects_ambiguous_matches() {
-        let err = DwarfAnalyzer::select_unambiguous_global_plan(
-            "state",
-            vec![
-                (PathBuf::from("/tmp/a"), global_plan("state", 0x1000)),
-                (PathBuf::from("/tmp/b"), global_plan("state", 0x2000)),
-            ],
-        )
-        .expect_err("multiple global candidates should be ambiguous");
-
-        assert!(err.to_string().contains("Ambiguous global 'state'"));
-        assert!(err.to_string().contains("2 matches"));
-    }
-
-    #[test]
-    fn global_plan_selection_accepts_single_match() {
-        let selected = DwarfAnalyzer::select_unambiguous_global_plan(
-            "state",
-            vec![(PathBuf::from("/tmp/a"), global_plan("state", 0x1000))],
-        )
-        .expect("single global candidate should be accepted")
-        .expect("single global candidate should be returned");
-
-        assert_eq!(selected.0, PathBuf::from("/tmp/a"));
-        assert_eq!(selected.1.name, "state");
-    }
-
-    #[test]
-    fn global_plan_selection_prefers_current_module_match() {
-        let selected = DwarfAnalyzer::select_global_plan_with_preferred_module(
-            "state",
-            Path::new("/tmp/current"),
-            vec![
-                (PathBuf::from("/tmp/other"), global_plan("state", 0x2000)),
-                (PathBuf::from("/tmp/current"), global_plan("state", 0x1000)),
-            ],
-        )
-        .expect("current module candidate should be accepted")
-        .expect("current module candidate should be returned");
-
-        assert_eq!(selected.0, PathBuf::from("/tmp/current"));
-        assert_eq!(
-            selected.1.location,
-            VariableLocation::Address(AddressExpr::constant(0x1000))
-        );
-    }
-
-    #[test]
-    fn global_plan_selection_rejects_ambiguous_current_module_matches() {
-        let err = DwarfAnalyzer::select_global_plan_with_preferred_module(
-            "state",
-            Path::new("/tmp/current"),
-            vec![
-                (PathBuf::from("/tmp/current"), global_plan("state", 0x1000)),
-                (PathBuf::from("/tmp/current"), global_plan("state", 0x1004)),
-                (PathBuf::from("/tmp/other"), global_plan("state", 0x2000)),
-            ],
-        )
-        .expect_err("duplicate current-module candidates should be ambiguous");
-
-        assert!(err.to_string().contains("Ambiguous global 'state'"));
-        assert!(err.to_string().contains("2 matches"));
-        assert!(err.to_string().contains("/tmp/current"));
-        assert!(!err.to_string().contains("/tmp/other"));
     }
 }
