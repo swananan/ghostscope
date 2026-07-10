@@ -17,18 +17,18 @@ GhostScope is designed for a narrow but high-value job: **source-aware userspace
 | Feature | GhostScope | GDB |
 |---|---|---|
 | Type | Tracer, closer to production printf debugging | Interactive debugger |
-| Execution model | Trace a live process without stopping it | Stop, inspect, and control execution |
+| Execution model | Trace without debugger-controlled suspension; each hit still runs a uprobe and eBPF program synchronously | Stop, inspect, and control execution |
 | Runtime overhead | Usually low when used selectively | High once breakpoints are involved |
-| Process interruption | Never | Yes |
+| Process interruption | No stop-the-world inspection; the hit thread still pays synchronous probe work | Yes, as part of the debugging model |
 | Production use | Designed for production-friendly observation | Better suited to development and postmortem work |
-| Timing preservation | Yes | No, breakpoints and stepping change timing |
-| Concurrency debugging | Strong when you need to preserve real timing | Often harder because stop-the-world behavior distorts interleavings |
+| Timing impact | Usually much smaller than interactive breakpoints, but not timing-transparent | Breakpoints and stepping deliberately change timing |
+| Concurrency debugging | Preserves normal execution better than stop-the-world inspection, while probes can still perturb interleavings | Stop-the-world behavior can strongly distort interleavings |
 | Interactive control | TUI and scripting, but not execution control | Full execution control: breakpoints, stepping, continue, mutation |
 | Variable access | Reads values at chosen trace points using DWARF + eBPF | Reads state after pausing execution |
 | Best at | Production-style runtime observation | Interactive debugging and state mutation |
 | When to choose it | You need observability | You need control |
 
-Use GhostScope when preserving process timing matters. Use GDB when you need to stop the world and reason step by step.
+Use GhostScope when avoiding stop-the-world inspection matters and you can budget for per-hit probe overhead. Use GDB when you need to control execution and reason step by step. Neither tool preserves the original timing exactly.
 
 ## GhostScope vs GDB Performance Snapshot
 

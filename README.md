@@ -3,7 +3,7 @@
   <h1 style="margin-top: 0.2em;">GhostScope</h1>
   <h3>⚡ Next-generation eBPF userspace runtime tracer</h3>
   <p>
-    <strong>Printf debugging evolved</strong> — Real-time tracing without stopping your application.
+    <strong>Printf debugging evolved</strong> — Real-time tracing without stop-the-world inspection.
   </p>
 
   <p>
@@ -22,7 +22,9 @@
 
 ## Overview
 
-GhostScope is a **source-aware userspace tracer** for live Linux processes. With DWARF debug info, it lets you attach at function, source-line, or instruction granularity, print the values that matter, and emit source-aware call stacks without stopping the target.
+GhostScope is a **source-aware userspace tracer** for live Linux processes. With DWARF debug info, it lets you attach at function, source-line, or instruction granularity, print the values that matter, and emit source-aware call stacks without debugger-controlled suspension of the target.
+
+The supported operating envelope and the invariants behind trustworthy output are defined in [Design Guarantees and Trust Model](docs/design-contract.md).
 
 > *"The most effective debugging tool is still careful thought, coupled with judiciously placed print statements."* — Brian Kernighan
 
@@ -31,7 +33,7 @@ GhostScope is a **source-aware userspace tracer** for live Linux processes. With
 - You are diagnosing a production service that must stay online: GDB-style stop-the-world debugging would cause too much disruption, and you prefer an eBPF-based workflow with stronger safety boundaries and lower overhead than traditional kernel-module instrumentation.
 - You need source-line probes that can read real locals, parameters, globals, and complex data, not just function entry arguments.
 - You want DWARF-unwound stack backtraces from the same live probe that prints the relevant state.
-- You need to explain how execution reached a specific source line, function, request, or code path without stopping the process.
+- You need to explain how execution reached a specific source line, function, request, or code path without stop-the-world inspection.
 - You want a low-friction path from "I wish I had one more printf here" to a repeatable CLI trace script.
 
 ### When Not To Use GhostScope
@@ -152,7 +154,7 @@ The demo below follows exactly that path on a DWARF-enabled nginx worker: locate
 
 Imagine navigating a vast, uncharted forest of binary data — memory addresses, register values, stack frames — all meaningless numbers without context. **DWARF debug information is our map**: it tells us that stack address `RSP-0x18` stores local variable `count`, heap address `0x5621a8c0` is a `user` object with string pointer `user.name` at offset `+0x20`; it tracks where each variable lives throughout program execution — parameter `x` is in register `RDI` now but will move to stack offset `RSP-0x10` later.
 
-With this map in hand, GhostScope leverages **eBPF and uprobe** technology to safely extract binary data from instruction points in your running program. The combination is powerful: DWARF reveals the meaning of bytes in the process's virtual address space, while eBPF safely retrieves exactly what we need. The result? You can print variable values (local or global), function arguments, complex data structures, and DWARF-unwound call stacks without stopping or modifying the program.
+With this map in hand, GhostScope leverages **eBPF and uprobe** technology to safely extract binary data from instruction points in your running program. The combination is powerful: DWARF reveals the meaning of bytes in the process's virtual address space, while eBPF retrieves the requested data. The result is source-aware variable values and call stacks without debugger-controlled suspension or intentional application-state changes. Each uprobe hit still adds synchronous trap and eBPF work, so tracing is not timing-transparent.
 
 ## ✨ Highlights
 
@@ -162,9 +164,9 @@ With this map in hand, GhostScope leverages **eBPF and uprobe** technology to sa
       <td align="center" width="25%">
         <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/performance.svg" width="60" alt="Performance"/>
         <br />
-        <strong>Low Overhead</strong>
+        <strong>Targeted Overhead</strong>
         <br />
-        <sub>One context switch + eBPF execution</sub>
+        <sub>Per-hit uprobe + bounded eBPF work</sub>
       </td>
       <td align="center" width="25%">
         <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/realtime.svg" width="60" alt="Real-time"/>
@@ -178,7 +180,7 @@ With this map in hand, GhostScope leverages **eBPF and uprobe** technology to sa
         <br />
         <strong>DWARF-Aware</strong>
         <br />
-        <sub>Full debug info support</sub>
+        <sub>PC-specific source semantics</sub>
       </td>
       <td align="center" width="25%">
         <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/rust.svg" width="60" alt="Rust"/>
@@ -191,15 +193,15 @@ With this map in hand, GhostScope leverages **eBPF and uprobe** technology to sa
   </table>
 </div>
 
-## ⚠️ Experimental Tool Disclaimer
+## ⚠️ Reliability and Development Status
 
-> **GhostScope is currently in early development** and under active iteration. While we strive for data accuracy, trace information may be incorrect or incomplete in certain scenarios, primarily due to unsupported features.
+> **GhostScope is currently in early development** and under active iteration. Within the supported envelope, a known inability to recover or attribute data should be reported explicitly rather than rendered as a plausible value.
 >
-> **Recommendation**: Use GhostScope's collected data as an **auxiliary reference** for troubleshooting, not as the sole source of truth. Cross-validate with other debugging tools before making critical decisions.
+> Implementation defects may still violate that contract. Use GhostScope's collected data as an **auxiliary reference** for troubleshooting, and cross-validate with other debugging tools before making critical decisions.
 >
-> We are continuously improving stability and accuracy, and look forward to removing this disclaimer in future versions.
+> The normative guarantees, assumptions, and failure semantics are documented in [Design Guarantees and Trust Model](docs/design-contract.md).
 
-See [Limitations](docs/limitations.md) for the current list of hard and soft constraints.
+See [Limitations](docs/limitations.md) for unsupported and explicitly degraded scenarios.
 
 ## 📚 Documentation
 
@@ -249,6 +251,9 @@ See [Limitations](docs/limitations.md) for the current list of hard and soft con
 
 - [**Architecture Overview**](docs/architecture.md)
   System design and internals
+
+- [**Design Guarantees and Trust Model**](docs/design-contract.md)
+  Supported operating envelope, invariants, and failure semantics
 
 - [**Development Guide**](docs/development.md)
   Build and extend GhostScope

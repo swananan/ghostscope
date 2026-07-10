@@ -2,6 +2,43 @@
 
 A deep dive into the design and implementation of GhostScope's eBPF-based runtime tracing system.
 
+The normative guarantees and failure semantics are defined in
+[Design Guarantees and Trust Model](design-contract.md). This document explains
+the mechanisms that enforce that contract.
+
+## Trustworthy Observation Path
+
+GhostScope does not obtain source semantics from any single component. A
+rendered value is the end of an evidence chain:
+
+```text
+requested target scope
+        |
+        v
+runtime PID / namespace / module mapping
+        |
+        v
+module-relative probe PC + matching DWARF
+        |
+        v
+PC-specific scope, type, and location plan
+        |
+        v
+bounded eBPF read + attributed event
+        |
+        v
+validated protocol record or explicit failure state
+```
+
+| Stage | Invariants | Enforcement and failure behavior |
+|---|---|---|
+| Target selection | `IDENT-1` | `-p`/`-t` mode semantics, PID filters, and namespace-aware discovery define the allowed runtime scope; unavailable scope fails setup. |
+| Module and debug information | `IDENT-1`, `SEM-1` | Runtime mappings, module cookies, load offsets, and available debug-file identity checks bind semantics to a module; unverifiable or loose matches are surfaced as weakened evidence. |
+| Semantic planning | `SEM-1`, `FAIL-1` | The DWARF engine resolves scope, type, location, and relocation at the probe PC; unsupported plans produce diagnostics instead of guessed values. |
+| eBPF execution | `SAFE-1`, `COST-1` | The compiler emits bounded observational programs, and the kernel verifier rejects unsafe programs. |
+| Event transport | `LOSS-1` | RingBuf or PerfEventArray carries events; output-helper failures increment per-trace loss counters. |
+| Protocol and rendering | `IDENT-1`, `FAIL-1` | Trace/PID/TID metadata and structured unavailable, expression-error, and backtrace states remain visible to consumers. |
+
 ## System Overview
 
 ```
@@ -58,7 +95,7 @@ GhostScope uses Cargo workspace for modular design:
 | **ghostscope** | Main binary and runtime coordinator - orchestrates all components via async event loop |
 | **ghostscope-compiler** | Script compilation pipeline - transforms user scripts into verified eBPF bytecode via LLVM |
 | **ghostscope-dwarf** | PC-context DWARF semantic engine - resolves source locations, visible variables, type layouts, address mappings, and compiler read plans |
-| **ghostscope-loader** | eBPF program lifecycle manager - handles uprobe attachment and ring buffer management via Aya |
+| **ghostscope-loader** | eBPF program lifecycle manager - handles uprobe attachment and RingBuf/PerfEventArray event transport via Aya |
 | **ghostscope-ui** | Terminal user interface - implements interactive TUI with TEA (The Elm Architecture) pattern |
 | **ghostscope-protocol** | Communication protocol - defines message format for eBPF-userspace data exchange |
 | **ghostscope-platform** | Platform abstraction - encapsulates architecture-specific code (calling conventions, ABIs) |
@@ -203,9 +240,12 @@ The diagram below is from [Crafting Interpreters](https://craftinginterpreters.c
 
 ### 7. eBPF to Userspace Communication
 
-**Core mechanism**: Ring buffer (per-CPU circular buffer in kernel memory).
+**Core mechanism**: A kernel event transport selected at startup. GhostScope
+prefers RingBuf on supported kernels and falls back to PerfEventArray. RingBuf
+is one shared multi-producer buffer across CPUs; PerfEventArray uses independent
+per-CPU buffers.
 
-#### Ring Buffer Architecture
+#### Event Transport Architecture
 
 ```
 ┌───────────────────────────────────────────────────────┐
@@ -218,11 +258,13 @@ The diagram below is from [Crafting Interpreters](https://craftinginterpreters.c
 │  └─────┬──────┘         ↓                             │
 │        │         Serialize to protocol format         │
 │        │                ↓                             │
-│        │         bpf_ringbuf_output()                 │
+│        │   bpf_ringbuf_output() /                     │
+│        │   bpf_perf_event_output()                    │
 │        │                ↓                             │
 │        └────────►┌─────────────────────┐              │
-│                  │  Ring Buffer        │              │
-│                  │  (per-CPU, 256KB)   │              │
+│                  │  RingBuf (shared)   │              │
+│                  │  or Perf buffers    │              │
+│                  │  (per CPU)          │              │
 │                  │                     │              │
 │                  │  [Event1][Event2]...│              │
 │                  └──────────┬──────────┘              │
@@ -234,7 +276,7 @@ The diagram below is from [Crafting Interpreters](https://craftinginterpreters.c
 │                             │                         │
 │  ┌──────────────────────────▼──────────┐              │
 │  │  Trace Manager                       │             │
-│  │  (polls ring buffer)                 │             │
+│  │  (polls selected transport)          │             │
 │  └──────────────────────┬───────────────┘             │
 │                         │                             │
 │              Read events (non-blocking)               │
@@ -259,22 +301,28 @@ The diagram below is from [Crafting Interpreters](https://craftinginterpreters.c
    - Uprobe fires when target instruction executes
    - eBPF program collects data (registers, stack, memory via DWARF locations)
    - Serializes data according to protocol format
-   - Calls `bpf_ringbuf_output()` to write to ring buffer
+   - Calls the selected RingBuf or PerfEventArray output helper
+   - Increments the trace's loss counter if the output helper fails
 
 2. **Event Polling** (User Space):
-   - Trace manager polls ring buffer (via Aya framework)
+   - Trace manager polls the selected transport (via Aya framework)
    - Non-blocking: Returns immediately if no events
-   - Memory-mapped: Zero-copy access to kernel buffer
+   - RingBuf uses a shared memory-mapped buffer; PerfEventArray drains per-CPU buffers
 
 3. **Event Parsing**:
    - Streaming parser handles variable-length messages
-   - State machine tracks partial reads across chunks
+   - Parser applies transport-specific framing and tracks partial RingBuf reads
    - Reconstructs complete events
 
 4. **Event Delivery**:
    - Parsed events sent to runtime coordinator
    - Coordinator forwards to UI via channel
    - UI updates display in real-time
+
+5. **Loss Reporting**:
+   - Runtime periodically reads each trace's eBPF output-failure counter
+   - CLI and TUI report interval and cumulative loss totals
+   - A nonzero counter marks the observation interval as incomplete
 
 #### Protocol Format
 
