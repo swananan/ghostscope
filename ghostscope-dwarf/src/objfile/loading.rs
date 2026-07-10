@@ -49,6 +49,16 @@ impl LoadedObjfile {
         );
 
         let binary_mapped = Arc::new(MappedFile::open(&module_mapping.path)?);
+        let binary_object = binary_mapped.parse_object().map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to parse target object {}: {}",
+                module_mapping.path.display(),
+                error
+            )
+        })?;
+        ghostscope_process::ensure_supported_target_object(&binary_object, &module_mapping.path)?;
+        drop(binary_object);
+
         let (dwarf, mapped_file_for_dwarf, debug_info_source) = if let Some(debug_file_path) =
             explicit_debug_file
         {
@@ -564,6 +574,7 @@ impl LoadedObjfile {
 
     fn load_dwarf_sections(file_data: &Arc<MappedFile>) -> Result<DwarfData> {
         let object = file_data.parse_object()?;
+        ghostscope_process::ensure_supported_target_object(&object, &file_data.path)?;
         let endian = dwarf_endian_from_object(&object);
 
         let load_section = |id: gimli::SectionId| -> Result<_> {

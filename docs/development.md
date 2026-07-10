@@ -151,7 +151,7 @@ only that a command exits successfully.
 
 | Invariant | Minimum evidence when affected |
 |---|---|
-| `SCOPE-1` | Build/release target remains Linux x86_64, plus platform-specific unit coverage |
+| `SCOPE-1` | Build/release target remains Linux x86_64, plus installer and unsupported-target ELF rejection coverage |
 | `SAFE-1` | Generated helper/operation review and a verifier-backed load test for new eBPF behavior |
 | `IDENT-1` | Positive target attribution and a wrong-PID/module/namespace negative case |
 | `SEM-1` | A fixture with an exact source-level value oracle at a known PC, including relevant optimization/module variants |

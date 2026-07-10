@@ -17,7 +17,7 @@ Both uprobes and GDB install breakpoint-based instrumentation in the target proc
 GhostScope's script and compiler surface is observational: it does not provide operations that intentionally modify application-visible state, variable values, or control flow. This does not mean the target is untouched. Uprobes install trap points, and each hit synchronously adds uprobe and eBPF execution to the target thread.
 
 ### 4. Platform and Architecture Support
-Official builds and correctness testing currently support **Linux x86_64 (AMD64)** only because GhostScope depends on Linux **eBPF** and **uprobes** and currently implements x86_64 register, ABI, TLS, and unwind behavior. Other architectures are outside the support contract even if the source happens to compile on them.
+Official builds and correctness testing currently support **Linux x86_64 (AMD64)** only because GhostScope depends on Linux **eBPF** and **uprobes** and currently implements x86_64 register, ABI, TLS, and unwind behavior. The runtime build fails on other build targets, the installer rejects non-Linux systems and other architectures, and trace setup rejects target objects that are not 64-bit little-endian x86_64 ELF files.
 
 ## Soft Limitations
 

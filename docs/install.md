@@ -10,6 +10,10 @@
     - Stable eBPF for tracing - recommended Linux 4.4+
 - **Architecture**: x86_64 (AMD64) only currently
 
+The installer rejects non-Linux hosts, non-x86_64 hosts, and unsupported
+`--arch` values. The runtime also rejects target executables and shared objects
+that are not 64-bit little-endian x86_64 ELF files.
+
 ## Installation
 
 ### Quick Install Script (Recommended)

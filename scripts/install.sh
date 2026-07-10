@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO="swananan/ghostscope"
 BIN_NAME="ghostscope"
+DEFAULT_OS="$(uname -s)"
 DEFAULT_ARCH="$(uname -m)"
 USER_DEFAULT_PREFIX=""
 if [[ -n "${HOME:-}" ]]; then
@@ -24,7 +25,7 @@ Options:
   --prefix DIR          Installation prefix (default: ~/.ghostscope or PREFIX env)
   --destdir DIR         Optional staging directory prepended to installation paths
   --version VER         Release tag or semver (default: latest)
-  --arch ARCH           Target architecture (default: host uname -m)
+  --arch ARCH           Target architecture: x86_64/amd64 only (default: host uname -m)
   --from-source         Build with cargo instead of downloading a release
   --profile NAME        Cargo profile when using --from-source (release|debug)
   --skip-config         Do not create ~/.ghostscope/config.toml
@@ -104,12 +105,25 @@ github_api_request() {
 }
 
 map_arch() {
-  # Map uname -m to release naming conventions
+  # Normalize the only architecture currently supported by GhostScope.
   local arch="$1"
   case "$arch" in
     x86_64|amd64) echo "x86_64" ;;
-    arm64|aarch64) echo "aarch64" ;;
-    *) echo "$arch" ;;
+    *)
+      echo "error: unsupported architecture '$arch'; GhostScope currently supports only x86_64 (amd64)" >&2
+      return 1
+      ;;
+  esac
+}
+
+ensure_supported_os() {
+  local os="$1"
+  case "$os" in
+    Linux) return 0 ;;
+    *)
+      echo "error: unsupported operating system '$os'; GhostScope currently supports only Linux x86_64" >&2
+      return 1
+      ;;
   esac
 }
 
@@ -169,8 +183,6 @@ release_asset_names_for_tag() {
   case "$arch" in
     x86_64) aliases+=("amd64") ;;
     amd64) aliases+=("x86_64") ;;
-    aarch64) aliases+=("arm64") ;;
-    arm64) aliases+=("aarch64") ;;
   esac
 
   local alias
@@ -330,10 +342,6 @@ if arch == "x86_64":
     aliases.add("amd64")
 elif arch == "amd64":
     aliases.add("x86_64")
-if arch == "aarch64":
-    aliases.add("arm64")
-elif arch == "arm64":
-    aliases.add("aarch64")
 
 patterns = []
 for alias in aliases:
@@ -360,11 +368,11 @@ for asset in assets:
 if not chosen:
     candidates = ", ".join(a.get("name", "<unnamed>") for a in assets)
     print(
-        f"warning: no asset matched architecture '{arch}'. Using the first asset instead. "
+        f"error: no release asset matched supported architecture '{arch}'. "
         f"Available assets: {candidates}",
         file=sys.stderr,
     )
-    chosen = assets[0]
+    sys.exit(1)
 
 name = chosen.get("name")
 url = chosen.get("browser_download_url")
@@ -658,6 +666,23 @@ main() {
     fi
   fi
 
+  if ! ensure_supported_os "$DEFAULT_OS"; then
+    return 1
+  fi
+
+  local host_arch
+  if ! host_arch="$(map_arch "$DEFAULT_ARCH")"; then
+    return 1
+  fi
+  local mapped_arch
+  if ! mapped_arch="$(map_arch "$arch")"; then
+    return 1
+  fi
+  if [[ "$host_arch" != "$mapped_arch" ]]; then
+    echo "error: cross-architecture installation is not supported (host=$host_arch requested=$mapped_arch)" >&2
+    return 1
+  fi
+
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   local project_root
@@ -668,8 +693,6 @@ main() {
     INSTALL_SOURCE="source"
     bin_path="$(build_from_source "$profile" "$project_root")"
   else
-    local mapped_arch
-    mapped_arch="$(map_arch "$arch")"
     local release_info
     if ! release_info="$(resolve_release_asset "$version" "$mapped_arch")"; then
       return 1

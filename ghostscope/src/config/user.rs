@@ -250,6 +250,7 @@ impl UserConfig {
             if !target_file.is_file() {
                 return Err(anyhow::anyhow!("Target path is not a file: {target_path}"));
             }
+            ghostscope_process::ensure_supported_target_path(&target_file)?;
             info!("✓ Target file found: {}", target_path);
         }
 

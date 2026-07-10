@@ -150,7 +150,7 @@ docker build -t ghostscope-builder:ubuntu20.04 -f docker/base-build/Dockerfile .
 
 | 不变量 | 受影响时的最低证据要求 |
 |---|---|
-| `SCOPE-1` | 构建/发布目标仍是 Linux x86_64，并具有平台相关单元测试 |
+| `SCOPE-1` | 构建/发布目标仍是 Linux x86_64，并覆盖安装器和不支持目标 ELF 的拒绝路径 |
 | `SAFE-1` | 审查新增的 helper/操作，并为新的 eBPF 行为提供经过 verifier 的加载测试 |
 | `IDENT-1` | 正向目标归因，以及错误 PID/模块/namespace 的负向场景 |
 | `SEM-1` | 在已知 PC 上使用具有精确源码级值 oracle 的 fixture，并覆盖相关优化或模块变体 |

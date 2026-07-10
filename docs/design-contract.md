@@ -16,9 +16,9 @@ does not permit known unsupported paths to return plausible but unproven data.
 
 ## Supported Operating Envelope
 
-- Official release artifacts and correctness testing target Linux x86_64.
-  Source code compiling on another architecture does not make that architecture
-  supported.
+- Official release artifacts and correctness testing target Linux x86_64. The
+  runtime build rejects other build targets, and trace setup rejects target
+  objects that are not 64-bit little-endian x86_64 ELF files.
 - Source-aware values require DWARF that corresponds to the module being
   traced. Embedded DWARF is read from that module. For separate debug files,
   available `.gnu_debuglink` CRC and Build ID evidence is checked strictly by
@@ -60,13 +60,17 @@ but it cannot guarantee unchanged timing.
 **Guarantee.** Official builds and correctness claims are scoped to Linux
 x86_64.
 
-**Enforcement.** Release artifacts are built and named for x86_64, and
-architecture-specific register, ABI, TLS, and unwind behavior is tested in that
-environment.
+**Enforcement.** The platform crate has a compile-time Linux x86_64 guard that
+makes the runtime build fail on other targets. The installer rejects unsupported
+hosts or requested architectures, and trace setup validates `-t` objects, `-p`
+process executables, and loaded DWARF modules before semantic interpretation.
+Release artifacts are built and named for x86_64, and architecture-specific
+register, ABI, TLS, and unwind behavior is tested in that environment.
 
-**Failure boundary.** Other architectures must not be presented as supported
-until their platform mappings and end-to-end behavior are implemented and
-tested. Accidental compilation is not evidence of support.
+**Failure boundary.** An unsupported host fails to build or install. An
+unsupported target object fails setup before DWARF interpretation or uprobe
+attachment. Other architectures must not be presented as supported until their
+platform mappings and end-to-end behavior are implemented and tested.
 
 ### SAFE-1: Observation does not control the target
 
@@ -189,7 +193,7 @@ main evidence currently lives in these areas:
 
 | Invariant | Primary evidence |
 |---|---|
-| `SCOPE-1` | x86_64 release workflow and platform-specific unit tests |
+| `SCOPE-1` | x86_64 release workflow, platform-specific unit tests, installer rejection, and unsupported-target ELF tests |
 | `SAFE-1` | Script/compiler operation surface, eBPF helper usage, verifier-backed load tests |
 | `IDENT-1` | PID-specific execution tests and container-topology tests |
 | `SEM-1` | PC-context, scalar, global, optimized-code, and cross-module fixtures with exact-value oracles |
