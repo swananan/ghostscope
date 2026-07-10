@@ -32,7 +32,7 @@ validated protocol record or explicit failure state
 
 | Stage | Invariants | Enforcement and failure behavior |
 |---|---|---|
-| Target selection | `IDENT-1` | `-p`/`-t` mode semantics, PID filters, and namespace-aware discovery define the allowed runtime scope; unavailable scope fails setup. |
+| Target selection | `SCOPE-1`, `IDENT-1` | Linux x86_64 build guards and target ELF validation establish the supported platform; `-p`/`-t` mode semantics, PID filters, and namespace-aware discovery define the allowed runtime scope. |
 | Module and debug information | `IDENT-1`, `SEM-1` | Runtime mappings, module cookies, load offsets, and available debug-file identity checks bind semantics to a module; unverifiable or loose matches are surfaced as weakened evidence. |
 | Semantic planning | `SEM-1`, `FAIL-1` | The DWARF engine resolves scope, type, location, and relocation at the probe PC; unsupported plans produce diagnostics instead of guessed values. |
 | eBPF execution | `SAFE-1`, `COST-1` | The compiler emits bounded observational programs, and the kernel verifier rejects unsafe programs. |

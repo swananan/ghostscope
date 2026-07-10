@@ -300,6 +300,48 @@ async fn test_startup_report_shows_explicit_debug_file_failure() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn test_startup_rejects_aarch64_target() -> Result<()> {
+    init();
+
+    if !is_host_topology() {
+        println!("skipping target architecture e2e outside host->host topology");
+        return Ok(());
+    }
+
+    let fixture = ensure_startup_report_fixture()?;
+    let temp_dir = TempDir::new().context("failed to create unsupported target temp dir")?;
+    let target = temp_dir.path().join("aarch64-target");
+    let mut target_bytes = fs::read(&fixture.embedded_binary).with_context(|| {
+        format!(
+            "failed to read fixture binary {}",
+            fixture.embedded_binary.display()
+        )
+    })?;
+    target_bytes[18..20].copy_from_slice(&183u16.to_le_bytes());
+    fs::write(&target, target_bytes)
+        .with_context(|| format!("failed to write unsupported target {}", target.display()))?;
+
+    let run = run_startup_report_command_for_binary(&fixture, &target, &[])?;
+
+    assert!(
+        !run.status.success(),
+        "AArch64 target should fail before DWARF loading\n{}",
+        run.output
+    );
+    assert_output_contains(&run.output, "unsupported target object");
+    assert_output_contains(&run.output, "expected 64-bit little-endian x86_64 ELF");
+    assert_output_contains(&run.output, "architecture=Aarch64");
+    assert!(
+        !run.output.contains("DWARF ready:"),
+        "unsupported target must not reach DWARF-ready state\n{}",
+        run.output
+    );
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct StartupReportFixture {
     binary: PathBuf,

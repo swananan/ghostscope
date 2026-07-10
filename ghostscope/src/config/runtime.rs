@@ -3,8 +3,8 @@ use std::ops::Deref;
 use anyhow::Result;
 use ghostscope_loader::KernelCapabilities;
 use ghostscope_process::{
-    resolve_pid_session, PidFilterSpec, PidNamespaceId, PidViews, ResolvePidSessionError,
-    ResolvedPidSession, RuntimeEnvironmentInfo,
+    ensure_supported_pid_executable, resolve_pid_session, PidFilterSpec, PidNamespaceId, PidViews,
+    ResolvePidSessionError, ResolvedPidSession, RuntimeEnvironmentInfo,
 };
 use tracing::{info, warn};
 
@@ -42,6 +42,10 @@ impl RuntimeContext {
             special_pid_ns: pid_session.runtime_pid_plan.special_vars_pid_ns,
             proc_offsets_pid_ns: pid_session.runtime_pid_plan.proc_offsets_pid_ns,
         };
+
+        if let Some(proc_pid) = runtime.proc_pid {
+            ensure_supported_pid_executable(proc_pid)?;
+        }
 
         runtime.log_resolution(&pid_session, helper_supported);
         // Successful PID resolution already proved `/proc/<pid>` exists, so validation can skip
