@@ -143,6 +143,33 @@ After rebuilding, a regular workspace build will pick up the new objects automat
 
 ## Testing
 
+### Invariant-Oriented Validation
+
+The [Design Guarantees and Trust Model](design-contract.md) defines the behavior
+that validation must protect. Tests should prove an observable contract, not
+only that a command exits successfully.
+
+| Invariant | Minimum evidence when affected |
+|---|---|
+| `SCOPE-1` | Build/release target remains Linux x86_64, plus platform-specific unit coverage |
+| `SAFE-1` | Generated helper/operation review and a verifier-backed load test for new eBPF behavior |
+| `IDENT-1` | Positive target attribution and a wrong-PID/module/namespace negative case |
+| `SEM-1` | A fixture with an exact source-level value oracle at a known PC, including relevant optimization/module variants |
+| `FAIL-1` | A negative fixture that asserts the structured error, unavailable marker, or stop reason |
+| `LOSS-1` | Counter propagation and CLI/TUI rendering, plus pressure coverage when transport behavior changes |
+| `COST-1` | Boundary/rejection behavior and a verifier-backed load for changed event-size, read, or unwind budgets |
+
+Relevant runtime evidence is organized in `e2e-tests/tests/`: PID filtering in
+`script_execution.rs`, namespace behavior in `container_topology_execution.rs`,
+PC-context semantics in `member_pointer_compilation.rs`, optimized values in
+`optimized_inline_call_value_execution.rs`, structured expression failures in
+`globals_execution.rs`, and unwind status/depth in `backtrace_execution.rs`.
+
+For a behavior change, identify the affected invariant in the review or
+handoff, run the corresponding positive oracle, and run at least one relevant
+failure-path oracle. The test command is evidence only when the asserted output
+matches the invariant.
+
 ### Workspace Tests
 
 ```bash

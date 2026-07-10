@@ -144,6 +144,24 @@ docker build -t ghostscope-builder:ubuntu20.04 -f docker/base-build/Dockerfile .
 
 ## 测试
 
+### 面向不变量的验证
+
+[设计保证与可信性模型](design-contract.md)定义验证必须保护的行为。测试需要证明可观测契约，而不能只证明命令成功退出。
+
+| 不变量 | 受影响时的最低证据要求 |
+|---|---|
+| `SCOPE-1` | 构建/发布目标仍是 Linux x86_64，并具有平台相关单元测试 |
+| `SAFE-1` | 审查新增的 helper/操作，并为新的 eBPF 行为提供经过 verifier 的加载测试 |
+| `IDENT-1` | 正向目标归因，以及错误 PID/模块/namespace 的负向场景 |
+| `SEM-1` | 在已知 PC 上使用具有精确源码级值 oracle 的 fixture，并覆盖相关优化或模块变体 |
+| `FAIL-1` | 使用负向 fixture 断言结构化错误、不可用标记或停止原因 |
+| `LOSS-1` | 验证计数传递和 CLI/TUI 展示；传输行为变化时补充压力覆盖 |
+| `COST-1` | 验证边界/拒绝行为，并为事件大小、读取或 unwind 预算变化提供经过 verifier 的加载测试 |
+
+主要运行时证据位于 `e2e-tests/tests/`：`script_execution.rs` 覆盖 PID 过滤，`container_topology_execution.rs` 覆盖 namespace 行为，`member_pointer_compilation.rs` 覆盖 PC 上下文语义，`optimized_inline_call_value_execution.rs` 覆盖优化代码中的值，`globals_execution.rs` 覆盖结构化表达式失败，`backtrace_execution.rs` 覆盖 unwind 状态与深度。
+
+行为变化需要在 review 或交接说明中指出受影响的不变量，运行对应的正向 oracle，并至少运行一个相关失败路径 oracle。只有断言结果与不变量一致时，测试命令才构成有效证据。
+
 ### Workspace 测试
 
 ```bash

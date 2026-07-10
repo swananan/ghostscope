@@ -17,22 +17,22 @@ GhostScope 的目标很明确：**针对带有 DWARF 调试信息的活跃进程
 | 特性 | GhostScope | GDB |
 |---|---|---|
 | 类型 | 追踪器，更接近生产环境下的 printf 调试 | 交互式调试器 |
-| 执行模型 | 不停进程，直接做运行时追踪 | 停住进程，再检查和控制执行 |
+| 执行模型 | 不由调试器控制暂停；每次命中仍会同步执行 uprobe 和 eBPF 程序 | 停住进程，再检查和控制执行 |
 | 运行时开销 | 选择性使用时通常较低 | 一旦依赖断点，开销通常较高 |
-| 进程中断 | 从不 | 会 |
+| 进程中断 | 不做 stop-the-world 检查；命中线程仍会同步承担探针工作 | 会，这是调试模型的一部分 |
 | 生产环境使用 | 面向生产友好的在线观测 | 更适合开发环境和事后调试 |
-| 时序保持 | 是 | 否，断点和单步都会改变时序 |
-| 并发调试 | 当你需要保留真实时序时更有优势 | stop-the-world 行为更容易扰动并发交错 |
+| 时序影响 | 通常远小于交互式断点，但并非对时序透明 | 断点和单步会主动改变时序 |
+| 并发调试 | 比 stop-the-world 检查更接近正常执行，但探针仍可能扰动并发交错 | stop-the-world 行为会明显扰动并发交错 |
 | 交互控制 | 有 TUI 和脚本，但不控制执行流程 | 完整执行控制：断点、单步、继续、改状态 |
 | 变量读取方式 | 在设定的追踪点上，借助 DWARF + eBPF 读值 | 在暂停后的时刻读取调试状态 |
 | 最擅长 | 生产风格的在线观测 | 交互式调试和状态修改 |
 | 适合的需求 | 你需要观测 | 你需要控制 |
 
-如果时序不能被破坏，优先用 GhostScope。如果你需要一步一步推进执行过程，优先用 GDB。
+如果必须避免 stop-the-world，并且能够为每次命中的探针开销做预算，优先用 GhostScope。如果需要控制执行过程，优先用 GDB。两者都不能保证原始时序完全不变。
 
 ## GhostScope vs GDB 实测性能快照
 
-现在仓库里已经有一套可重复执行的单线程 benchmark，用来回答一个很窄但很实际的问题：**在热点函数每次命中时，读取同一个局部变量到底要付出多大代价？** harness 在 [`../scripts/compare/compare_hot_function_bench.py`](../scripts/compare/compare_hot_function_bench.py)，目标程序在 [`../scripts/compare/compare_hot_function_target.c`](../scripts/compare/compare_hot_function_target.c)，runner service 的入口在 [`../e2e-tests/tests/manual_gdb_ghostscope_benchmark.rs`](../e2e-tests/tests/manual_gdb_ghostscope_benchmark.rs)。
+现在仓库里已经有一套可重复执行的单线程 benchmark，用来回答一个很窄但很实际的问题：**在热点函数每次命中时，读取同一个局部变量到底要付出多大代价？** harness 在 [`../../scripts/compare/compare_hot_function_bench.py`](../../scripts/compare/compare_hot_function_bench.py)，目标程序在 [`../../scripts/compare/compare_hot_function_target.c`](../../scripts/compare/compare_hot_function_target.c)，runner service 的入口在 [`../../e2e-tests/tests/manual_gdb_ghostscope_benchmark.rs`](../../e2e-tests/tests/manual_gdb_ghostscope_benchmark.rs)。
 
 ### 方法
 

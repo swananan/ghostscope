@@ -728,7 +728,7 @@ backtrace: truncated, 2 frames (max 2)
 
 `status=complete` means DWARF unwinding reached a natural stop before the configured depth cap. `status=truncated` means GhostScope hit the configured depth cap or the eBPF tail-call unwind budget before a natural stop. Other statuses explain where unwinding stopped, for example no unwind rows for the current PC, unsupported CFI, unavailable module offsets, a failed user-memory read, or an invalid next frame. When available, `stopped:` includes a stable reason label and numeric code.
 
-`bt` can cross module boundaries when process module mappings and compact DWARF CFI are available for those modules. In `-p` and standalone `-t` runs with sysmon enabled, runtime module refresh can add backtrace metadata for libraries loaded later through `dlopen`; it does not create new trace probes for targets that were unknown during setup. See [Limitations](limitations.md#7-stack-backtrace-coverage) for the exact coverage rules.
+`bt` can cross module boundaries when process module mappings and compact DWARF CFI are available for those modules. In `-p` and standalone `-t` runs with sysmon enabled, runtime module refresh can add backtrace metadata for libraries loaded later through `dlopen`; it does not create new trace probes for targets that were unknown during setup. See [Limitations](limitations.md#6-stack-backtrace-coverage) for the exact coverage rules.
 
 ## Examples
 
