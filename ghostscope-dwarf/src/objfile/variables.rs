@@ -53,7 +53,7 @@ fn type_id(
     }
 }
 
-fn complete_aggregate_declaration_entry(
+pub(super) fn complete_aggregate_declaration_entry(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
     type_name_index: &crate::index::TypeNameIndex,
     unit: &gimli::Unit<crate::binary::DwarfReader>,

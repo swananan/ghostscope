@@ -1,5 +1,6 @@
 pub mod c_types;
 pub mod pc_context;
+pub mod type_context;
 pub mod unwind_plan;
 pub mod variable_plan;
 
@@ -20,7 +21,12 @@ pub(crate) use pc::{range_contains_pc, ranges_contain_pc};
 pub use pc_context::{
     AddressSpaceInfo, FunctionParameter, InlineFrame, PcContext, PcLineInfo, PcRange,
 };
-pub(crate) use types::{resolve_type_ref_in_same_unit_with_origins, resolve_type_ref_with_origins};
+pub use type_context::{
+    CompilationUnitMetadata, ProducerInfo, SemanticType, SourceLanguage, TypeOrigin,
+};
+pub(crate) use types::{
+    resolve_type_ref_in_same_unit_with_origins, resolve_type_ref_with_origins, TypeLoc,
+};
 pub use unwind_plan::{
     CfaRulePlan, CompactUnwindRow, CompactUnwindStats, CompactUnwindTable, RegisterRecoveryPlan,
     UnwindDiagnostic, UnwindDiagnosticKind,

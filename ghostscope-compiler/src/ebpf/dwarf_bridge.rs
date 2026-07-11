@@ -1533,6 +1533,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.query_dwarf_for_variable_plan(var_name)
     }
 
+    pub(super) fn plan_dwarf_pointer_element_index(
+        &self,
+        plan: &VariableReadPlan,
+        index: i64,
+    ) -> Result<VariableReadPlan> {
+        self.process_analyzer
+            .ok_or_else(|| CodeGenError::DwarfError("No DWARF analyzer available".to_string()))?
+            .plan_pointer_element_index(plan, index)
+            .map_err(|err| CodeGenError::DwarfError(err.to_string()))
+    }
+
     fn query_dwarf_for_pc_access_plan(
         &mut self,
         base_name: &str,
