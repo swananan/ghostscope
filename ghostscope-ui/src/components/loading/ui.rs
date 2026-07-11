@@ -11,9 +11,11 @@ use super::{
     debug_source_style, push_debug_source_count_spans, LoadingProgress, LoadingState,
     ModuleLoadStatus, ModuleState, ProgressRenderer,
 };
+use crate::events::AnalysisCacheStatus;
 
 const MAX_WELCOME_DEBUG_SOURCE_DETAILS: usize = 8;
 const MAX_WELCOME_MISSING_EXAMPLES: usize = 3;
+const MAX_WELCOME_CACHE_REJECTIONS: usize = 5;
 
 /// Enhanced Loading UI component with detailed progress tracking
 #[derive(Clone, Debug)]
@@ -262,6 +264,8 @@ impl LoadingUI {
         }
         append_dwarf_index_details(&mut lines, &self.progress);
 
+        append_analysis_cache_details(&mut lines, &self.progress);
+
         // Empty line
         lines.push(Line::from(""));
 
@@ -466,6 +470,96 @@ fn append_dwarf_index_details(lines: &mut Vec<Line<'static>>, progress: &Loading
     }
 }
 
+fn append_analysis_cache_details(lines: &mut Vec<Line<'static>>, progress: &LoadingProgress) {
+    if !progress.analysis_cache.has_activity() {
+        return;
+    }
+
+    let mut summary = vec![Span::styled(
+        "• Analysis cache: ",
+        Style::default().fg(Color::White),
+    )];
+    push_cache_summary_count(
+        &mut summary,
+        "hit",
+        "hits",
+        progress.analysis_cache.hits,
+        Color::Green,
+    );
+    push_cache_summary_count(
+        &mut summary,
+        "miss",
+        "misses",
+        progress.analysis_cache.misses,
+        Color::Yellow,
+    );
+    push_cache_summary_count(
+        &mut summary,
+        "rejected",
+        "rejected",
+        progress.analysis_cache.rejected,
+        Color::Yellow,
+    );
+    lines.push(Line::from(summary));
+
+    let rejected = progress.rejected_cache_modules();
+    if rejected.is_empty() {
+        return;
+    }
+    lines.push(Line::from(Span::styled(
+        "• Cache fallback:",
+        Style::default().fg(Color::Yellow),
+    )));
+    for module in rejected.iter().take(MAX_WELCOME_CACHE_REJECTIONS) {
+        let Some(stats) = module.stats.as_ref() else {
+            continue;
+        };
+        let AnalysisCacheStatus::Rejected { reason } = &stats.analysis_cache_status else {
+            continue;
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                shorten_middle(&module_file_name(&module.path), 34),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled("  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate_end(reason, 100),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+    if rejected.len() > MAX_WELCOME_CACHE_REJECTIONS {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  ... {} more rejected cache entries omitted",
+                rejected.len() - MAX_WELCOME_CACHE_REJECTIONS
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+}
+
+fn push_cache_summary_count(
+    spans: &mut Vec<Span<'static>>,
+    singular: &str,
+    plural: &str,
+    count: usize,
+    color: Color,
+) {
+    if count == 0 {
+        return;
+    }
+    if spans.len() > 1 {
+        spans.push(Span::styled(", ", Style::default().fg(Color::DarkGray)));
+    }
+    spans.push(Span::styled(
+        format!("{count} {}", if count == 1 { singular } else { plural }),
+        Style::default().fg(color),
+    ));
+}
+
 fn append_debug_source_details(lines: &mut Vec<Line<'static>>, progress: &LoadingProgress) {
     let debug_source_modules: Vec<&ModuleLoadStatus> = progress
         .modules
@@ -603,6 +697,18 @@ fn shorten_middle(value: &str, max_width: usize) -> String {
     format!("{prefix}...{suffix}")
 }
 
+fn truncate_end(value: &str, max_width: usize) -> String {
+    let width = value.chars().count();
+    if width <= max_width {
+        return value.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+    let prefix: String = value.chars().take(max_width - 3).collect();
+    format!("{prefix}...")
+}
+
 impl Default for LoadingUI {
     fn default() -> Self {
         Self::new()
@@ -633,6 +739,7 @@ mod tests {
                 ),
                 dwarf_index: ".gdb_index-v9".to_string(),
                 dwarf_index_warning: None,
+                analysis_cache_status: AnalysisCacheStatus::Hit,
             },
         );
 
@@ -649,6 +756,9 @@ mod tests {
                 debug_source_path: None,
                 dwarf_index: "full-scan".to_string(),
                 dwarf_index_warning: None,
+                analysis_cache_status: AnalysisCacheStatus::Rejected {
+                    reason: "Failed to decode analysis cache payload".to_string(),
+                },
             },
         );
 
@@ -661,6 +771,10 @@ mod tests {
         assert!(text.contains("embedded"));
         assert!(text.contains("libluajit-5.1.so.2.1.ROLLING  /usr/local/openresty/luajit/lib/"));
         assert!(text.contains("Missing DWARF: 1 module (libcrypt.so.1.1.0)"));
+        assert!(text.contains("Analysis cache: 1 hit, 1 rejected"));
+        assert!(text.contains("Cache fallback:"));
+        assert!(text.contains("libcrypt.so.1.1.0"));
+        assert!(text.contains("Failed to decode analysis cache payload"));
     }
 
     fn plain_text(lines: &[Line<'static>]) -> String {

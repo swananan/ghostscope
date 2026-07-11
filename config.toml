@@ -108,6 +108,15 @@ backtrace_runtime_modules_max = 32
 
 # Stop automatic runtime CFI loading after one module exceeds this budget.
 backtrace_runtime_module_timeout_ms = 5000
+[dwarf.analysis_cache]
+# Read full-scan debug_info indexes populated by --prepare. Runtime
+# PID filters, module mappings, CFI map publication, and eBPF attachment are
+# never stored here.
+enabled = true
+
+# Leave unset to use $XDG_CACHE_HOME/ghostscope/analysis or
+# ~/.cache/ghostscope/analysis.
+# directory = "/home/user/.cache/ghostscope/analysis"
 
 [dwarf.debuginfod]
 # debuginfod fallback for separate debug information.

@@ -192,6 +192,36 @@ ghostscope -p 1234 --debug-file /path/to/binary.debug
 # 注意：如果在 config.toml 中覆盖 search_paths，请保留仍然依赖的系统调试目录。
 ```
 
+### 预生成分析缓存
+
+```bash
+# 不需要 root 或 eBPF capabilities。
+ghostscope --prepare --target /path/to/binary
+
+# prepare 和实际运行使用相同的显式 debug file 与缓存目录。
+ghostscope --prepare -t /path/to/binary -d /path/to/binary.debug \
+  --analysis-cache-dir /var/cache/ghostscope
+ghostscope -p 1234 -t /path/to/binary --script-file trace.gs \
+  --analysis-cache-dir /var/cache/ghostscope
+```
+
+Prepare 保存 `.debug_info` 全扫描的符号和编译单元索引。可用的 `.debug_names`、
+`.gdb_index` 和 GNU pubnames 优先；此时 prepare 会报告无需生成缓存。
+源码文件头仍正常读取，源码行继续按需解析。实际 tracing 时仍会解析 PID
+namespace、模块加载地址、`dlopen` 变化、CFI 和 eBPF attach。
+
+缓存绑定主 ELF、选中的 debug file 和 supplementary 文件的身份（含打开描述符的
+元数据），以及缓存 schema 和 GhostScope 版本。复制或替换文件后可能需要重新 prepare。
+Tracing 只读缓存，只有 `--prepare` 写入；checksum 用于检测内容损坏。
+若 prepare 与 tracing 使用不同用户，请显式指定相同的 `--analysis-cache-dir`。
+
+`--prepare` 参数生成分析索引，与生成脚本专用 trace bundle 的 `ghostscope prepare ...`
+子命令相互独立。设计细节见[分析缓存设计](../analysis-cache-design.md)。
+
+CLI 启动报告和 TUI 加载摘要会显示 cache hit、miss 和 rejected 数量。miss 与
+rejected 都不会导致启动失败：GhostScope 会解析原始 DWARF；rejected 还会显示
+fallback 原因。
+
 ### 日志配置
 
 ```bash
@@ -367,6 +397,9 @@ ghostscope bpffs prune --dry-run --json
 | `--backtrace-runtime-module-timeout-ms <MS>` | | 单模块运行时 CFI 加载超时（`100..=600000`） | 5000 |
 | `--dry-run` | | 编译脚本、解析 trace 目标，然后退出，不 attach uprobe。需要与真实运行相同的 eBPF 权限和内核能力。 | 关 |
 | `--dry-run-details` | | 在 dry-run 输出中包含源码、inline 和变量诊断；需要同时使用 `--dry-run` | 关 |
+| `--prepare` | | 将 `--target` 的调试数据解析到持久化分析缓存后退出；不需要 eBPF 权限 | 关 |
+| `--analysis-cache-dir <DIR>` | | 覆盖 DWARF 解析缓存目录 | 用户缓存目录 |
+| `--no-analysis-cache` | | 禁用持久化 DWARF 解析缓存 | 关 |
 | `--status` | | 启用交互式 DWARF/脚本/attach stderr 状态提示 | 开 |
 | `--no-status` | | 禁用交互式 DWARF/脚本/attach stderr 状态提示 | 关闭覆盖 |
 | `--script-timestamp <FORMAT>` | | pretty 输出时间戳：local, boot, none | local |
@@ -509,6 +542,15 @@ backtrace_runtime_modules_max = 32
 # 单模块时间预算。超时会关闭本次会话后续的自动运行时 CFI 加载，
 # tracing 和裸地址输出仍会继续。
 backtrace_runtime_module_timeout_ms = 5000
+[dwarf.analysis_cache]
+# 读取由 --prepare 生成的 debug_info 全扫描索引。
+# PID filter、ASLR/模块 ranges、CFI map 发布和 eBPF attach 状态会在每个
+# tracing session 中重新解析。
+enabled = true
+
+# 未设置时使用 $XDG_CACHE_HOME/ghostscope/analysis 或
+# ~/.cache/ghostscope/analysis。
+# directory = "/home/user/.cache/ghostscope/analysis"
 
 [dwarf.debuginfod]
 # 可选的 debuginfod 调试信息回退。

@@ -7,6 +7,7 @@
 pub(crate) mod core;
 
 // Internal implementation modules
+mod analysis_cache;
 pub(crate) mod binary;
 pub(crate) mod dwarf_expr;
 pub(crate) mod index;
@@ -23,14 +24,15 @@ pub(crate) mod type_syntax;
 pub(crate) mod analyzer;
 
 // Re-export main public API only
+pub use analysis_cache::AnalysisCache;
 pub use analyzer::{
-    AddressQueryResult, AnalyzerStats, DwarfAnalyzer, DwarfIndexStatus, ExecutableFileInfo,
-    FunctionQueryResult, LoadedModuleRuntimeInfo, MainExecutableInfo, ModuleDefaultPolicy,
-    ModuleLoadFailure, ModuleLoadingEvent, ModuleLoadingStats, ModuleStats, SectionInfo,
-    SharedLibraryInfo, SimpleFileInfo, SourceLineAddressSearch, SourceLineQuerySearch,
+    AddressQueryResult, AnalysisCacheStatus, AnalyzerStats, DwarfAnalyzer, DwarfIndexStatus,
+    ExecutableFileInfo, FunctionQueryResult, LoadedModuleRuntimeInfo, MainExecutableInfo,
+    ModuleDefaultPolicy, ModuleLoadFailure, ModuleLoadingEvent, ModuleLoadingStats, ModuleStats,
+    SectionInfo, SharedLibraryInfo, SimpleFileInfo, SourceLineAddressSearch, SourceLineQuerySearch,
     TypeLookupAmbiguity,
 };
-pub use loader::ExplicitDebugFile;
+pub use loader::{DwarfLoadOptions, ExplicitDebugFile};
 pub use runtime_unwind::{
     load_runtime_backtrace_metadata, RuntimeBacktraceLoadBudget, RuntimeBacktraceMetadata,
     RuntimeTextSymbol,

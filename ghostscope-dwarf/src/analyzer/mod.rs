@@ -1,12 +1,13 @@
 //! Main DWARF analyzer - unified entry point for all DWARF operations
 
 use crate::{
+    analysis_cache::AnalysisCache,
     core::{
         demangle::{demangle_by_lang_for_display, RustSymbolHashDisplay},
         mapping::ModuleMapping,
         CallerFrameRecovery, DebugInfoSource, ModuleAddress, Result, SectionType, SourceLocation,
     },
-    loader::ExplicitDebugFile,
+    loader::{DwarfLoadOptions, ExplicitDebugFile},
     objfile::LoadedObjfile,
     semantics::{CompactUnwindRow, CompactUnwindTable, PcContext},
     RuntimeTextSymbol,
@@ -65,6 +66,8 @@ pub struct DwarfAnalyzer {
     runtime_text_symbols: HashMap<u64, Vec<RuntimeTextSymbol>>,
     /// Cached PC semantic contexts for repeated symbol/source lookups.
     pc_context_cache: RwLock<PcContextCache>,
+    /// Persistent target-independent analysis cache used for newly loaded modules.
+    analysis_cache: Option<AnalysisCache>,
 }
 
 impl DwarfAnalyzer {
@@ -519,6 +522,7 @@ impl DwarfAnalyzer {
         }
         loader = loader.with_loose_debug_match(allow_loose_debug_match);
         loader = loader.with_debuginfod_client(debuginfod_client);
+        loader = loader.with_analysis_cache(self.analysis_cache.clone());
 
         let result = loader
             .with_progress_callback(progress_callback)
@@ -590,6 +594,32 @@ impl DwarfAnalyzer {
     where
         F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
     {
+        let options = DwarfLoadOptions {
+            debug_search_paths: debug_search_paths.to_vec(),
+            allow_loose_debug_match,
+            explicit_debug_file,
+            debuginfod_client,
+            analysis_cache: None,
+        };
+        Self::from_pid_runtime_modules_with_options_and_progress(
+            pid,
+            runtime_modules,
+            options,
+            progress_callback,
+        )
+        .await
+    }
+
+    /// Create a PID analyzer with explicit module-loading options.
+    pub async fn from_pid_runtime_modules_with_options_and_progress<F>(
+        pid: u32,
+        runtime_modules: Vec<LoadedModuleRuntimeInfo>,
+        options: DwarfLoadOptions,
+        progress_callback: F,
+    ) -> Result<Self>
+    where
+        F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
+    {
         tracing::info!(
             "Creating DWARF analyzer for PID {} from {} runtime module mappings",
             pid,
@@ -620,12 +650,13 @@ impl DwarfAnalyzer {
             .with_required_module(main_module_path);
 
         // Configure debug search paths if provided
-        if !debug_search_paths.is_empty() {
-            loader = loader.with_debug_search_paths(debug_search_paths.to_vec());
+        if !options.debug_search_paths.is_empty() {
+            loader = loader.with_debug_search_paths(options.debug_search_paths);
         }
-        loader = loader.with_loose_debug_match(allow_loose_debug_match);
-        loader = loader.with_explicit_debug_file(explicit_debug_file);
-        loader = loader.with_debuginfod_client(debuginfod_client);
+        loader = loader.with_loose_debug_match(options.allow_loose_debug_match);
+        loader = loader.with_explicit_debug_file(options.explicit_debug_file);
+        loader = loader.with_debuginfod_client(options.debuginfod_client);
+        loader = loader.with_analysis_cache(options.analysis_cache.clone());
 
         let result = loader
             .with_progress_callback(progress_callback)
@@ -639,6 +670,7 @@ impl DwarfAnalyzer {
         );
 
         let mut analyzer = Self::from_modules(pid, result.modules);
+        analyzer.analysis_cache = options.analysis_cache;
         analyzer.failed_modules = result
             .failures
             .into_iter()
@@ -761,6 +793,28 @@ impl DwarfAnalyzer {
         F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
     {
         let exec_path = exec_path.as_ref().to_path_buf();
+        let options = DwarfLoadOptions {
+            debug_search_paths: debug_search_paths.to_vec(),
+            allow_loose_debug_match,
+            explicit_debug_file: explicit_debug_file
+                .map(|debug_file| ExplicitDebugFile::new(exec_path.clone(), debug_file)),
+            debuginfod_client,
+            analysis_cache: None,
+        };
+        Self::from_exec_path_with_options_and_progress(exec_path, options, progress_callback).await
+    }
+
+    /// Create an executable analyzer with explicit module-loading options.
+    pub async fn from_exec_path_with_options_and_progress<P, F>(
+        exec_path: P,
+        options: DwarfLoadOptions,
+        progress_callback: F,
+    ) -> Result<Self>
+    where
+        P: AsRef<std::path::Path>,
+        F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
+    {
+        let exec_path = exec_path.as_ref().to_path_buf();
         tracing::info!(
             "Creating DWARF analyzer for executable: {}",
             exec_path.display()
@@ -774,6 +828,7 @@ impl DwarfAnalyzer {
             main_module: Some(exec_path.clone()),
             runtime_text_symbols: HashMap::new(),
             pc_context_cache: RwLock::new(PcContextCache::default()),
+            analysis_cache: options.analysis_cache.clone(),
         };
 
         // Create a single module mapping for the executable
@@ -801,10 +856,13 @@ impl DwarfAnalyzer {
         let start_time = std::time::Instant::now();
         match LoadedObjfile::load_parallel(
             module_mapping,
-            debug_search_paths,
-            allow_loose_debug_match,
-            explicit_debug_file,
-            debuginfod_client,
+            &options.debug_search_paths,
+            options.allow_loose_debug_match,
+            options
+                .explicit_debug_file
+                .map(|explicit| explicit.debug_file),
+            options.debuginfod_client,
+            options.analysis_cache,
         )
         .await
         {
@@ -825,6 +883,7 @@ impl DwarfAnalyzer {
                         parse_time_ms,
                         index_time_ms,
                         module_total_time_ms,
+                        analysis_cache_status: module_data.analysis_cache_status().clone(),
                     },
                     current: 1,
                     total: 1,
@@ -864,6 +923,7 @@ impl DwarfAnalyzer {
             main_module: None,
             runtime_text_symbols: HashMap::new(),
             pc_context_cache: RwLock::new(PcContextCache::default()),
+            analysis_cache: None,
         };
 
         // Preserve deterministic initial IDs regardless of module load order.

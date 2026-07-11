@@ -1,6 +1,7 @@
 use super::LoadedObjfile;
 use crate::{
-    analyzer::DwarfIndexStatus,
+    analysis_cache::AnalysisCache,
+    analyzer::{AnalysisCacheStatus, DwarfIndexStatus},
     binary::{
         dwarf_endian_from_object, dwarf_reader_from_arc_with_endian,
         empty_dwarf_reader_with_endian, load_explicit_debug_file, try_load_debug_file, DwarfData,
@@ -43,6 +44,7 @@ fn select_fallback_index(
     has_gdb_index: bool,
     mapped_file: &Arc<MappedFile>,
     mut rejection: Option<String>,
+    cache: &ScanCacheContext,
 ) -> Result<(DebugParseResult, InitialIndexSelection)> {
     if has_gdb_index {
         return Ok((
@@ -93,9 +95,52 @@ fn select_fallback_index(
         }
     }
 
-    parser
-        .parse_debug_info(module_path)
+    cache
+        .parse(parser, module_path)
         .map(|index| (index, InitialIndexSelection::FullScan { rejection }))
+}
+
+/// Consult the prepared full-scan cache only after native accelerators decline.
+struct ScanCacheContext {
+    cache: Option<AnalysisCache>,
+    binary: Arc<MappedFile>,
+    debug: Arc<MappedFile>,
+    supplementary: Option<Arc<MappedFile>>,
+    status: Mutex<AnalysisCacheStatus>,
+}
+
+impl ScanCacheContext {
+    fn parse(&self, parser: &DwarfParser<'_>, module_path: &str) -> Result<DebugParseResult> {
+        if let Some(cache) = &self.cache {
+            match cache.load(&self.binary, &self.debug, self.supplementary.as_deref()) {
+                Ok(Some(result)) => {
+                    *self.status.lock().unwrap() = AnalysisCacheStatus::Hit;
+                    tracing::info!("DWARF analysis cache hit for {}", module_path);
+                    return Ok(result);
+                }
+                Ok(None) => *self.status.lock().unwrap() = AnalysisCacheStatus::Miss,
+                Err(error) => {
+                    tracing::warn!(
+                        "Ignoring unusable DWARF analysis cache for {}: {error:#}",
+                        module_path
+                    );
+                    *self.status.lock().unwrap() = AnalysisCacheStatus::Rejected {
+                        reason: format!("{error:#}"),
+                    };
+                }
+            }
+        }
+        let result = parser.parse_debug_info(module_path)?;
+        if let Some(cache) = self.cache.as_ref().filter(|cache| cache.is_writable()) {
+            cache.store(
+                &self.binary,
+                &self.debug,
+                self.supplementary.as_deref(),
+                &result,
+            )?;
+        }
+        Ok(result)
+    }
 }
 
 impl LoadedObjfile {
@@ -106,6 +151,7 @@ impl LoadedObjfile {
         allow_loose_debug_match: bool,
         explicit_debug_file: Option<PathBuf>,
         debuginfod_client: Option<Arc<DebuginfodClient>>,
+        analysis_cache: Option<AnalysisCache>,
     ) -> Result<Self> {
         tracing::info!("Parallel loading for: {}", module_mapping.path.display());
         Self::load_internal_parallel(
@@ -114,6 +160,7 @@ impl LoadedObjfile {
             allow_loose_debug_match,
             explicit_debug_file,
             debuginfod_client,
+            analysis_cache,
         )
         .await
     }
@@ -125,6 +172,7 @@ impl LoadedObjfile {
         allow_loose_debug_match: bool,
         explicit_debug_file: Option<PathBuf>,
         debuginfod_client: Option<Arc<DebuginfodClient>>,
+        analysis_cache: Option<AnalysisCache>,
     ) -> Result<Self> {
         let load_started_at = Instant::now();
         let module_path =
@@ -255,6 +303,7 @@ impl LoadedObjfile {
         // before any parser/index observes the DWARF graph.
         let mut dwarf = Arc::try_unwrap(dwarf).expect("DWARF is not shared before parsing");
         let mut supplementary_debug_file = None;
+        let mut supplementary_mapped = None;
         if let Some(supplementary) =
             crate::binary::supplementary::discover(&mapped_file_for_dwarf, debug_search_paths)?
         {
@@ -263,6 +312,7 @@ impl LoadedObjfile {
                 gimli::Dwarf::load(|id| crate::binary::supplementary::reader(&supplementary, id))?;
             supplement.populate_abbreviations_cache(gimli::AbbreviationsCacheStrategy::All);
             dwarf.set_sup(supplement);
+            supplementary_mapped = Some(supplementary);
         }
         let dwarf = Arc::new(dwarf);
         let mapped_file = mapped_file_for_dwarf;
@@ -294,10 +344,18 @@ impl LoadedObjfile {
             "Starting parallel DWARF parsing with true debug_line || debug_info parallelism..."
         );
 
+        let scan_cache = Arc::new(ScanCacheContext {
+            cache: analysis_cache,
+            binary: Arc::clone(&binary_mapped),
+            debug: Arc::clone(&mapped_file),
+            supplementary: supplementary_mapped,
+            status: Mutex::new(AnalysisCacheStatus::Disabled),
+        });
         let (pair_result, unwind_info) = tokio::try_join!(
             tokio::task::spawn_blocking({
                 let dwarf = Arc::clone(&dwarf);
                 let mapped_file_for_index = Arc::clone(&mapped_file);
+                let scan_cache = Arc::clone(&scan_cache);
                 let module_path = module_path.clone();
                 move || -> Result<(
                     crate::parser::LineParseResult,
@@ -321,6 +379,7 @@ impl LoadedObjfile {
                                     has_gdb_index,
                                     &mapped_file_for_index,
                                     initial_rejection,
+                                    &scan_cache,
                                 ),
                                 Err(error) => {
                                     tracing::warn!(
@@ -338,6 +397,7 @@ impl LoadedObjfile {
                                         has_gdb_index,
                                         &mapped_file_for_index,
                                         rejection,
+                                        &scan_cache,
                                     )
                                 }
                             }
@@ -475,6 +535,7 @@ impl LoadedObjfile {
             load_parse_ms: parse_elapsed_ms as u64,
             load_index_ms: index_elapsed_ms as u64,
             load_total_ms,
+            analysis_cache_status: scan_cache.status.lock().unwrap().clone(),
         };
 
         let (function_count, variable_count, _) = module.get_index_stats();
