@@ -22,6 +22,7 @@ mod plan_pc;
 mod source_resolution;
 #[cfg(test)]
 mod tests;
+mod type_context;
 mod type_lookup;
 mod types;
 

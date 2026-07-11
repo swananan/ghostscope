@@ -290,6 +290,16 @@ async fn test_plan_variable_by_name_uses_pc_context() -> anyhow::Result<()> {
     assert_eq!(id_header_pos.name, "r.header_in.pos");
     assert!(id_header_pos.availability.is_available());
     assert!(id_header_pos.dwarf_type.is_some());
+    assert!(id_header_pos.type_id.is_some());
+
+    let semantic_type = analyzer
+        .semantic_type_for_plan(&id_header_pos)?
+        .ok_or_else(|| anyhow::anyhow!("expected semantic type for 'r.header_in.pos'"))?;
+    assert_eq!(semantic_type.id, id_header_pos.type_id);
+    assert_eq!(
+        semantic_type.origin.map(|origin| origin.language),
+        Some(ghostscope_dwarf::SourceLanguage::C)
+    );
 
     let header_pos = analyzer
         .plan_variable_access_by_name(
@@ -308,6 +318,11 @@ async fn test_plan_variable_by_name_uses_pc_context() -> anyhow::Result<()> {
         header_pos.dwarf_type.is_some(),
         "access plan should carry final member type: {header_pos:?}"
     );
+    assert_eq!(header_pos.type_id, id_header_pos.type_id);
+
+    let indexed = analyzer.plan_pointer_element_index(&plan, 1)?;
+    assert!(indexed.type_id.is_some(), "indexed plan: {indexed:?}");
+    assert_ne!(indexed.type_id, plan.type_id);
 
     Ok(())
 }

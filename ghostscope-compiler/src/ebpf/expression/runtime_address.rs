@@ -367,9 +367,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .map(|lvalue| lvalue.address);
             } else if let Some(var) = self.query_dwarf_for_complex_expr(&ptr_side)? {
                 if var.dwarf_type.is_some() {
-                    let pointed_plan = var
-                        .plan_pointer_element_index(index)
-                        .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
+                    let pointed_plan = self.plan_dwarf_pointer_element_index(&var, index)?;
                     let status_ptr = if self.condition_context_active {
                         Some(self.get_or_create_cond_error_global())
                     } else {

@@ -516,9 +516,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             .as_ref()
                             .is_some_and(ghostscope_dwarf::is_c_pointer_or_array_type)
                         {
-                            let pointed_plan = var
-                                .plan_pointer_element_index(index)
-                                .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
+                            let pointed_plan =
+                                self.plan_dwarf_pointer_element_index(&var, index)?;
                             let pc_address = self.get_compile_time_context()?.pc_address;
                             let materialized = self
                                 .variable_read_plan_to_materialization(pointed_plan, pc_address)?;
