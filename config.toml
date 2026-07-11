@@ -108,6 +108,16 @@ search_paths = [
 # ad-hoc environments; may cause inaccurate symbol/line info.
 allow_loose_debug_match = false
 
+[dwarf.analysis_cache]
+# Read parsed, target-independent DWARF indices populated by --prepare. Runtime
+# PID filters, module mappings, CFI map publication, and eBPF attachment are
+# never stored here.
+enabled = true
+
+# Leave unset to use $XDG_CACHE_HOME/ghostscope/analysis or
+# ~/.cache/ghostscope/analysis.
+# directory = "/home/user/.cache/ghostscope/analysis"
+
 [dwarf.debuginfod]
 # debuginfod fallback for separate debug information.
 # This follows GDB-style modes:

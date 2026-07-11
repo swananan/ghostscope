@@ -127,6 +127,28 @@ ghostscope -p 1234 --debug-file /path/to/binary.debug
 # directories that you still rely on.
 ```
 
+### Preparing the Analysis Cache
+
+```bash
+# Runs without root or eBPF capabilities.
+ghostscope --prepare --target /path/to/binary
+
+# Use the same explicit debug file and cache directory during prepare and run.
+ghostscope --prepare -t /path/to/binary -d /path/to/binary.debug \
+  --analysis-cache-dir /var/cache/ghostscope
+ghostscope -p 1234 -t /path/to/binary --script-file trace.gs \
+  --analysis-cache-dir /var/cache/ghostscope
+```
+
+Prepare stores parsed DWARF, source-line, and symbol indices. A tracing run still
+resolves PID namespaces, module load addresses, `dlopen` changes, CFI map state,
+kernel capabilities, and eBPF attachment at runtime. Cache entries are rejected
+when the target or selected debug file identity changes.
+
+CLI startup reports and the TUI loading summary show cache hits, misses, and
+rejected entries. Misses and rejected entries are non-fatal: GhostScope parses
+the original DWARF data, while rejected entries also include a fallback reason.
+
 ### Logging Configuration
 
 ```bash
@@ -242,6 +264,9 @@ Behavior:
 | `--backtrace-depth <N>` | | Max DWARF-unwound frames captured by each `bt`/`backtrace` instruction (`1..=128`) | 128 |
 | `--dry-run` | | Compile the script, resolve trace targets, and exit without attaching uprobes. Requires the same eBPF privileges and kernel capabilities as a real run. | Off |
 | `--dry-run-details` | | Include source, inline, and variable diagnostics in dry-run output; requires `--dry-run` | Off |
+| `--prepare` | | Parse `--target` debug data into the persistent analysis cache and exit. Does not require eBPF privileges. | Off |
+| `--analysis-cache-dir <DIR>` | | Override the parsed DWARF analysis cache directory | User cache directory |
+| `--no-analysis-cache` | | Disable persistent parsed DWARF analysis caching | Off |
 | `--status` | | Enable interactive DWARF/script/attach stderr status prompts | On |
 | `--no-status` | | Disable interactive DWARF/script/attach stderr status prompts | Off override |
 | `--script-timestamp <FORMAT>` | | Pretty output timestamp: local, boot, none | local |
@@ -371,6 +396,16 @@ search_paths = [
 # symbols, but may cause inaccurate symbol/line information. Prefer leaving
 # this off unless you know what you are doing.
 allow_loose_debug_match = false
+
+[dwarf.analysis_cache]
+# Read target-independent DWARF, source-line, and symbol indices populated by
+# --prepare. Runtime PID filters, ASLR/module ranges, CFI map publication, and
+# eBPF attach state are resolved again for every tracing session.
+enabled = true
+
+# Leave unset to use $XDG_CACHE_HOME/ghostscope/analysis or
+# ~/.cache/ghostscope/analysis.
+# directory = "/home/user/.cache/ghostscope/analysis"
 
 [dwarf.debuginfod]
 # Optional debuginfod fallback for separate debug information.

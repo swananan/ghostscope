@@ -1,7 +1,35 @@
 //! Pure address→line mapping lookup (no parsing, no file operations)
 
 use crate::{core::LineEntry, path_match};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use anyhow::{Context, Result};
+use memmap2::Mmap;
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
+
+pub(crate) const MAPPED_LINE_ROW_SIZE: usize = 49;
+pub(crate) const MAPPED_LINE_PATH_INDEX_SIZE: usize = 4;
+
+pub(crate) fn encode_mapped_line_row(
+    entry: &LineEntry,
+    path_id: u32,
+    compilation_unit_id: u32,
+) -> [u8; MAPPED_LINE_ROW_SIZE] {
+    let mut row = [0_u8; MAPPED_LINE_ROW_SIZE];
+    row[0..8].copy_from_slice(&entry.address.to_le_bytes());
+    row[8..16].copy_from_slice(&entry.end_address.unwrap_or_default().to_le_bytes());
+    row[16..20].copy_from_slice(&path_id.to_le_bytes());
+    row[20..28].copy_from_slice(&entry.file_index.to_le_bytes());
+    row[28..32].copy_from_slice(&compilation_unit_id.to_le_bytes());
+    row[32..40].copy_from_slice(&entry.line.to_le_bytes());
+    row[40..48].copy_from_slice(&entry.column.to_le_bytes());
+    row[48] = u8::from(entry.is_stmt)
+        | (u8::from(entry.prologue_end) << 1)
+        | (u8::from(entry.end_address.is_some()) << 2);
+    row
+}
 
 /// Pure line mapping table for fast address→line lookup
 #[derive(Debug)]
@@ -21,6 +49,20 @@ pub struct LineMappingTable {
     /// Basename to full paths mapping for flexible path matching
     /// e.g., "nginx.c" → ["/home/user/nginx/src/core/nginx.c", ...]
     basename_to_paths: HashMap<String, HashSet<String>>,
+
+    mapped: Option<MappedLineMapping>,
+}
+
+#[derive(Debug)]
+struct MappedLineMapping {
+    data: Arc<Mmap>,
+    rows_offset: usize,
+    row_count: usize,
+    path_index_offset: usize,
+    path_index_count: usize,
+    strings: Arc<[Arc<str>]>,
+    path_ids_by_full_path: HashMap<String, u32>,
+    path_ids_by_basename: HashMap<String, Vec<u32>>,
 }
 
 impl LineMappingTable {
@@ -76,7 +118,91 @@ impl LineMappingTable {
             address_to_line_map,
             path_line_to_addresses,
             basename_to_paths,
+            mapped: None,
         }
+    }
+
+    pub(crate) fn from_mapped_cache(
+        data: Arc<Mmap>,
+        rows_offset: usize,
+        row_count: usize,
+        path_index_offset: usize,
+        path_index_count: usize,
+        strings: Arc<[Arc<str>]>,
+        line_path_ids: &[u32],
+    ) -> Result<Self> {
+        checked_section_end(
+            rows_offset,
+            row_count,
+            MAPPED_LINE_ROW_SIZE,
+            data.len(),
+            "line rows",
+        )?;
+        checked_section_end(
+            path_index_offset,
+            path_index_count,
+            MAPPED_LINE_PATH_INDEX_SIZE,
+            data.len(),
+            "line path index",
+        )?;
+
+        let mut path_ids_by_full_path = HashMap::new();
+        let mut path_ids_by_basename: HashMap<String, Vec<u32>> = HashMap::new();
+        for &path_id in line_path_ids {
+            let path = strings
+                .get(path_id as usize)
+                .with_context(|| format!("Line path string ID {path_id} is out of bounds"))?;
+            if path.is_empty() {
+                continue;
+            }
+            path_ids_by_full_path.insert(path.to_string(), path_id);
+            if let Some(basename) = std::path::Path::new(path.as_ref())
+                .file_name()
+                .and_then(|name| name.to_str())
+            {
+                path_ids_by_basename
+                    .entry(basename.to_string())
+                    .or_default()
+                    .push(path_id);
+            }
+        }
+        for ids in path_ids_by_basename.values_mut() {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+
+        Ok(Self {
+            address_to_line_map: BTreeMap::new(),
+            path_line_to_addresses: HashMap::new(),
+            basename_to_paths: HashMap::new(),
+            mapped: Some(MappedLineMapping {
+                data,
+                rows_offset,
+                row_count,
+                path_index_offset,
+                path_index_count,
+                strings,
+                path_ids_by_full_path,
+                path_ids_by_basename,
+            }),
+        })
+    }
+
+    pub(crate) fn cache_entries(&self) -> Vec<Cow<'_, LineEntry>> {
+        if let Some(mapped) = &self.mapped {
+            return (0..mapped.row_count)
+                .filter_map(|index| mapped.row(index).map(Cow::Owned))
+                .collect();
+        }
+        self.address_to_line_map
+            .values()
+            .flat_map(|entries| entries.iter().map(Cow::Borrowed))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_mapped(&self) -> bool {
+        self.mapped.is_some()
     }
 
     fn representative_entry(entries: &[LineEntry]) -> Option<&LineEntry> {
@@ -84,7 +210,10 @@ impl LineMappingTable {
     }
 
     /// Find best matching line (closest address <= target address)
-    pub(crate) fn lookup_line(&self, address: u64) -> Option<&LineEntry> {
+    pub(crate) fn lookup_line(&self, address: u64) -> Option<Cow<'_, LineEntry>> {
+        if let Some(mapped) = &self.mapped {
+            return mapped.lookup_line(address).map(Cow::Owned);
+        }
         // Use BTreeMap's range to find the largest address <= target address
         let result = self
             .address_to_line_map
@@ -92,9 +221,10 @@ impl LineMappingTable {
             .next_back()
             .and_then(|(_, entries)| {
                 Self::representative_entry(entries).filter(|entry| entry.contains_address(address))
-            });
+            })
+            .map(Cow::Borrowed);
 
-        if let Some(entry) = result {
+        if let Some(entry) = &result {
             tracing::debug!(
                 "LineMapping::lookup_line: address=0x{:x} -> found entry at 0x{:x}, file='{}', line={}",
                 address, entry.address, entry.file_path, entry.line
@@ -110,11 +240,19 @@ impl LineMappingTable {
     }
 
     /// Find all line entries at exact address (for handling overlapping instructions)
-    pub(crate) fn lookup_all_lines_at_address(&self, address: u64) -> Vec<&LineEntry> {
+    pub(crate) fn lookup_all_lines_at_address(&self, address: u64) -> Vec<Cow<'_, LineEntry>> {
+        if let Some(mapped) = &self.mapped {
+            return mapped
+                .rows_at_address(address)
+                .into_iter()
+                .map(Cow::Owned)
+                .collect();
+        }
         if let Some(entries) = self.address_to_line_map.get(&address) {
             let active_entries: Vec<_> = entries
                 .iter()
                 .filter(|entry| entry.contains_address(address))
+                .map(Cow::Borrowed)
                 .collect();
             tracing::debug!(
                 "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> {} active entries",
@@ -139,6 +277,15 @@ impl LineMappingTable {
     ///
     /// For consecutive addresses on the same line, returns only the first is_stmt address
     pub(crate) fn lookup_addresses_by_path(&self, file_path: &str, line_number: u64) -> Vec<u64> {
+        if let Some(mapped) = &self.mapped {
+            let Some((addresses, resolved_path)) = mapped.lookup_addresses(file_path, line_number)
+            else {
+                tracing::debug!("No addresses found for {}:{}", file_path, line_number);
+                return Vec::new();
+            };
+            return self.filter_consecutive_addresses(addresses, &resolved_path, line_number);
+        }
+
         // Strategy 1: Try exact match first
         if let Some(addresses) = self
             .path_line_to_addresses
@@ -274,7 +421,8 @@ impl LineMappingTable {
             if group.len() == 1 {
                 // Single address - check if it's is_stmt
                 let addr = group[0];
-                if let Some(entries) = self.address_to_line_map.get(&addr) {
+                let entries = self.lookup_all_lines_at_address(addr);
+                if !entries.is_empty() {
                     if entries.iter().any(|entry| {
                         entry.is_stmt && entry.file_path == file_path && entry.line == line_number
                     }) {
@@ -296,15 +444,12 @@ impl LineMappingTable {
                 // Multiple consecutive addresses - find the first is_stmt address
                 let mut selected = None;
                 for &addr in &group {
-                    if let Some(entries) = self.address_to_line_map.get(&addr) {
-                        if entries.iter().any(|entry| {
-                            entry.is_stmt
-                                && entry.file_path == file_path
-                                && entry.line == line_number
-                        }) {
-                            selected = Some(addr);
-                            break;
-                        }
+                    let entries = self.lookup_all_lines_at_address(addr);
+                    if entries.iter().any(|entry| {
+                        entry.is_stmt && entry.file_path == file_path && entry.line == line_number
+                    }) {
+                        selected = Some(addr);
+                        break;
                     }
                 }
 
@@ -376,6 +521,10 @@ impl LineMappingTable {
             function_start
         );
 
+        if let Some(mapped) = &self.mapped {
+            return mapped.find_flagged_address(function_start, 1 << 1);
+        }
+
         let mut best_address: Option<u64> = None;
 
         // Iterate through addresses starting from function_start
@@ -428,6 +577,10 @@ impl LineMappingTable {
             function_start
         );
 
+        if let Some(mapped) = &self.mapped {
+            return mapped.find_flagged_address(function_start.saturating_add(1), 1);
+        }
+
         // Look for the first is_stmt=true address after function_start
         for (&address, entries) in self
             .address_to_line_map
@@ -467,11 +620,256 @@ impl LineMappingTable {
         &self,
         start_addr: u64,
         end_addr: u64,
-    ) -> impl Iterator<Item = (&u64, &LineEntry)> {
+    ) -> Vec<(u64, Cow<'_, LineEntry>)> {
+        if let Some(mapped) = &self.mapped {
+            return mapped
+                .rows_in_range(start_addr, end_addr)
+                .into_iter()
+                .map(|entry| (entry.address, Cow::Owned(entry)))
+                .collect();
+        }
         self.address_to_line_map
             .range(start_addr..=end_addr)
-            .flat_map(|(address, entries)| entries.iter().map(move |entry| (address, entry)))
+            .flat_map(|(&address, entries)| {
+                entries
+                    .iter()
+                    .map(move |entry| (address, Cow::Borrowed(entry)))
+            })
+            .collect()
     }
+}
+
+impl MappedLineMapping {
+    fn row_bytes(&self, index: usize) -> Option<&[u8]> {
+        let start = self
+            .rows_offset
+            .checked_add(index.checked_mul(MAPPED_LINE_ROW_SIZE)?)?;
+        self.data
+            .get(start..start.checked_add(MAPPED_LINE_ROW_SIZE)?)
+    }
+
+    fn row_address(&self, index: usize) -> Option<u64> {
+        read_u64(self.row_bytes(index)?, 0)
+    }
+
+    fn row_path_id(&self, index: usize) -> Option<u32> {
+        read_u32(self.row_bytes(index)?, 16)
+    }
+
+    fn row_line(&self, index: usize) -> Option<u64> {
+        read_u64(self.row_bytes(index)?, 32)
+    }
+
+    fn row_flags(&self, index: usize) -> Option<u8> {
+        self.row_bytes(index)?.get(48).copied()
+    }
+
+    fn row(&self, index: usize) -> Option<LineEntry> {
+        let row = self.row_bytes(index)?;
+        let path_id = read_u32(row, 16)? as usize;
+        let compilation_unit_id = read_u32(row, 28)? as usize;
+        let flags = *row.get(48)?;
+        let end_address = read_u64(row, 8)?;
+        Some(LineEntry {
+            address: read_u64(row, 0)?,
+            end_address: (flags & 4 != 0).then_some(end_address),
+            file_path: self.strings.get(path_id)?.to_string(),
+            file_index: read_u64(row, 20)?,
+            compilation_unit: Arc::clone(self.strings.get(compilation_unit_id)?),
+            line: read_u64(row, 32)?,
+            column: read_u64(row, 40)?,
+            is_stmt: flags & 1 != 0,
+            prologue_end: flags & 2 != 0,
+        })
+    }
+
+    fn lower_bound_address(&self, target: u64) -> usize {
+        let mut left = 0;
+        let mut right = self.row_count;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self.row_address(mid).unwrap_or(u64::MAX) < target {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        left
+    }
+
+    fn upper_bound_address(&self, target: u64) -> usize {
+        let mut left = 0;
+        let mut right = self.row_count;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self
+                .row_address(mid)
+                .is_some_and(|address| address <= target)
+            {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        left
+    }
+
+    fn lookup_line(&self, address: u64) -> Option<LineEntry> {
+        let upper = self.upper_bound_address(address);
+        let entry = self.row(upper.checked_sub(1)?)?;
+        entry.contains_address(address).then_some(entry)
+    }
+
+    fn rows_at_address(&self, address: u64) -> Vec<LineEntry> {
+        let start = self.lower_bound_address(address);
+        let end = self.upper_bound_address(address);
+        (start..end)
+            .filter_map(|index| self.row(index))
+            .filter(|entry| entry.contains_address(address))
+            .collect()
+    }
+
+    fn rows_in_range(&self, start_address: u64, end_address: u64) -> Vec<LineEntry> {
+        let start = self.lower_bound_address(start_address);
+        let end = self.upper_bound_address(end_address);
+        (start..end).filter_map(|index| self.row(index)).collect()
+    }
+
+    fn path_row_index(&self, index: usize) -> Option<usize> {
+        let start = self
+            .path_index_offset
+            .checked_add(index.checked_mul(MAPPED_LINE_PATH_INDEX_SIZE)?)?;
+        let bytes = self
+            .data
+            .get(start..start.checked_add(MAPPED_LINE_PATH_INDEX_SIZE)?)?;
+        Some(read_u32(bytes, 0)? as usize)
+    }
+
+    fn path_key(&self, index: usize) -> Option<(u32, u64)> {
+        let row_index = self.path_row_index(index)?;
+        Some((self.row_path_id(row_index)?, self.row_line(row_index)?))
+    }
+
+    fn lower_bound_path_line(&self, target: (u32, u64)) -> usize {
+        let mut left = 0;
+        let mut right = self.path_index_count;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self.path_key(mid).unwrap_or((u32::MAX, u64::MAX)) < target {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        left
+    }
+
+    fn addresses_for_path_line(&self, path_id: u32, line: u64) -> Vec<u64> {
+        let target = (path_id, line);
+        let mut index = self.lower_bound_path_line(target);
+        let mut addresses = Vec::new();
+        while index < self.path_index_count && self.path_key(index) == Some(target) {
+            if let Some(row_index) = self.path_row_index(index) {
+                if let Some(address) = self.row_address(row_index) {
+                    addresses.push(address);
+                }
+            }
+            index += 1;
+        }
+        addresses
+    }
+
+    fn lookup_addresses(&self, file_path: &str, line: u64) -> Option<(Vec<u64>, String)> {
+        if let Some(&path_id) = self.path_ids_by_full_path.get(file_path) {
+            let addresses = self.addresses_for_path_line(path_id, line);
+            if !addresses.is_empty() {
+                return Some((addresses, file_path.to_string()));
+            }
+        }
+
+        let basename = path_match::file_name(file_path);
+        let path_ids = self.path_ids_by_basename.get(basename)?;
+        if path_match::has_path_separator(file_path) {
+            for &path_id in path_ids {
+                let full_path = self.strings.get(path_id as usize)?.as_ref();
+                if path_match::path_component_suffix_matches(full_path, file_path)
+                    || path_match::path_component_suffix_matches(file_path, full_path)
+                {
+                    let addresses = self.addresses_for_path_line(path_id, line);
+                    if !addresses.is_empty() {
+                        return Some((addresses, full_path.to_string()));
+                    }
+                }
+            }
+        }
+
+        if path_ids.len() == 1 {
+            let path_id = path_ids[0];
+            let full_path = self.strings.get(path_id as usize)?.as_ref();
+            let addresses = self.addresses_for_path_line(path_id, line);
+            if !addresses.is_empty() {
+                return Some((addresses, full_path.to_string()));
+            }
+        }
+
+        for &path_id in path_ids {
+            let full_path = self.strings.get(path_id as usize)?.as_ref();
+            if path_match::path_component_suffix_matches(full_path, file_path)
+                || path_match::path_component_suffix_matches(file_path, full_path)
+            {
+                let addresses = self.addresses_for_path_line(path_id, line);
+                if !addresses.is_empty() {
+                    return Some((addresses, full_path.to_string()));
+                }
+            }
+        }
+        None
+    }
+
+    fn find_flagged_address(&self, start_address: u64, flag_mask: u8) -> Option<u64> {
+        let mut index = self.lower_bound_address(start_address);
+        while index < self.row_count {
+            let address = self.row_address(index)?;
+            let end = self.upper_bound_address(address);
+            if self.row_flags(end.checked_sub(1)?)? & flag_mask != 0 {
+                return Some(address);
+            }
+            index = end;
+        }
+        None
+    }
+}
+
+fn checked_section_end(
+    offset: usize,
+    count: usize,
+    record_size: usize,
+    data_len: usize,
+    section: &str,
+) -> Result<usize> {
+    let byte_len = count
+        .checked_mul(record_size)
+        .with_context(|| format!("Mapped {section} length overflow"))?;
+    let end = offset
+        .checked_add(byte_len)
+        .with_context(|| format!("Mapped {section} offset overflow"))?;
+    anyhow::ensure!(
+        end <= data_len,
+        "Mapped {section} section ends at {end}, beyond file length {data_len}"
+    );
+    Ok(end)
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
+    ))
 }
 
 #[cfg(test)]

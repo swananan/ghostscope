@@ -156,6 +156,18 @@ impl LightweightFileIndex {
     pub fn file_entries(&self) -> &[LightweightFileEntry] {
         &self.file_entries
     }
+
+    pub(crate) fn cache_comp_dir(&self) -> Option<&str> {
+        self.comp_dir.as_deref()
+    }
+
+    pub(crate) fn cache_directories(&self) -> impl Iterator<Item = &str> {
+        self.directories.iter().map(AsRef::as_ref)
+    }
+
+    pub(crate) fn cache_dwarf_version(&self) -> u16 {
+        self.dwarf_version
+    }
 }
 
 /// Scoped file index manager that maintains per-CU file indices
@@ -236,6 +248,12 @@ impl ScopedFileIndexManager {
         self.cu_file_indices
             .get(compilation_unit)
             .map(|arc| arc.as_ref())
+    }
+
+    pub(crate) fn cache_file_indices(&self) -> impl Iterator<Item = (&str, &LightweightFileIndex)> {
+        self.cu_file_indices
+            .iter()
+            .map(|(name, index)| (name.as_ref(), index.as_ref()))
     }
 }
 

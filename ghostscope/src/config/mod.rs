@@ -19,4 +19,4 @@ pub use args::{
 pub use ghostscope_process::PidViews;
 pub use runtime::ResolvedConfig;
 pub use settings::{CliColorMode, Config, LogLevel, PanelType};
-pub use user::UserConfig;
+pub use user::{ResolvedDebuginfodConfig, UserConfig};

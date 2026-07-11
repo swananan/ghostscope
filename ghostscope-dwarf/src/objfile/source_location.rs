@@ -17,18 +17,24 @@ impl LoadedObjfile {
 
         if all_line_entries.is_empty() {
             if let Some(line_entry) = self.line_mapping.lookup_line(address) {
-                return self.create_source_location_from_entry(line_entry);
+                return self.create_source_location_from_entry(&line_entry);
             }
             return None;
         }
 
-        let best_entry = if all_line_entries.len() == 1 {
-            let entry = all_line_entries[0];
-            self.find_alternative_source_file(entry).unwrap_or(entry)
-        } else {
-            self.select_best_line_entry(&all_line_entries)
-        };
+        if all_line_entries.len() == 1 {
+            let entry = all_line_entries[0].as_ref();
+            if let Some(alternative) = self.find_alternative_source_file(entry) {
+                return self.create_source_location_from_entry(&alternative);
+            }
+            return self.create_source_location_from_entry(entry);
+        }
 
+        let entries = all_line_entries
+            .iter()
+            .map(|entry| entry.as_ref())
+            .collect::<Vec<_>>();
+        let best_entry = self.select_best_line_entry(&entries);
         self.create_source_location_from_entry(best_entry)
     }
 
@@ -41,7 +47,7 @@ impl LoadedObjfile {
         let all_line_entries = self.line_mapping.lookup_all_lines_at_address(address);
         let matching_entries: Vec<_> = all_line_entries
             .iter()
-            .copied()
+            .map(|entry| entry.as_ref())
             .filter(|entry| {
                 entry.line == u64::from(line_number)
                     && self.line_entry_matches_requested_source(entry, file_path)
@@ -67,10 +73,10 @@ impl LoadedObjfile {
         path_match::source_path_matches(&candidate_path, requested_file_path)
     }
 
-    fn find_alternative_source_file<'a>(
-        &'a self,
-        entry: &'a crate::core::LineEntry,
-    ) -> Option<&'a crate::core::LineEntry> {
+    fn find_alternative_source_file(
+        &self,
+        entry: &crate::core::LineEntry,
+    ) -> Option<crate::core::LineEntry> {
         let current_file_path = self.get_file_path_for_entry(entry)?;
 
         let is_header = current_file_path.ends_with(".h")
@@ -98,7 +104,7 @@ impl LoadedObjfile {
                 continue;
             }
 
-            if let Some(candidate_file_path) = self.get_file_path_for_entry(candidate_entry) {
+            if let Some(candidate_file_path) = self.get_file_path_for_entry(&candidate_entry) {
                 let is_candidate_header = candidate_file_path.ends_with(".h")
                     || candidate_file_path.ends_with(".hpp")
                     || candidate_file_path.ends_with(".hxx")
@@ -110,7 +116,7 @@ impl LoadedObjfile {
                         "find_alternative_source_file: found alternative source file '{}' at address 0x{:x}",
                         candidate_file_path, addr
                     );
-                    return Some(candidate_entry);
+                    return Some(candidate_entry.into_owned());
                 }
             }
         }

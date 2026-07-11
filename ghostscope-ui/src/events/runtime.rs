@@ -368,6 +368,15 @@ pub struct ModuleLoadingStats {
     pub debug_source: String,
     pub debug_source_path: Option<String>,
     pub load_time_ms: u64,
+    pub analysis_cache_status: AnalysisCacheStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnalysisCacheStatus {
+    Disabled,
+    Hit,
+    Miss,
+    Rejected { reason: String },
 }
 
 /// Summary information for all traces

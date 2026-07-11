@@ -4,8 +4,11 @@ mod common;
 
 use anyhow::{bail, Context, Result};
 use common::init;
+use regex::Regex;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::OnceLock;
@@ -33,6 +36,120 @@ color = "auto"
 [dwarf.debuginfod]
 enabled = "off"
 "#;
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_prepare_analysis_cache_runs_without_root_and_reuses_entry() -> Result<()> {
+    init();
+
+    if !is_host_topology() {
+        println!("skipping analysis cache prepare e2e outside host->host topology");
+        return Ok(());
+    }
+
+    let fixture = ensure_startup_report_fixture()?;
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("e2e-tests must have a workspace parent")?;
+    let unprivileged_identity = workspace_owner_identity(workspace_root)?;
+    let temp_dir = TempDir::new_in(workspace_root)
+        .context("failed to create analysis cache temp dir in workspace")?;
+    fs::set_permissions(temp_dir.path(), fs::Permissions::from_mode(0o755))?;
+    let sandbox = common::sandbox::SandboxHandle::default_ghostscope()?;
+    let (ghostscope_program, sandbox_args) = sandbox.ghostscope_command()?;
+    if !sandbox_args.is_empty() {
+        bail!("analysis cache prepare e2e expects a host ghostscope command");
+    }
+    let public_ghostscope = temp_dir.path().join("ghostscope");
+    let public_binary = temp_dir.path().join(EMBEDDED_BINARY);
+    fs::copy(PathBuf::from(ghostscope_program), &public_ghostscope)?;
+    fs::copy(&fixture.embedded_binary, &public_binary)?;
+    fs::set_permissions(&public_ghostscope, fs::Permissions::from_mode(0o755))?;
+    fs::set_permissions(&public_binary, fs::Permissions::from_mode(0o755))?;
+    let cache_dir = temp_dir.path().join("analysis-cache");
+    fs::create_dir(&cache_dir)?;
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700))?;
+    if let Some((uid, gid)) = unprivileged_identity {
+        chown(&cache_dir, Some(uid), Some(gid))?;
+    }
+
+    let first = run_prepare_analysis_cache_command(
+        &public_ghostscope,
+        &public_binary,
+        &cache_dir,
+        unprivileged_identity,
+    )?;
+    assert!(
+        first.status.success(),
+        "rootless analysis prepare failed with status {}\n{}",
+        first.status,
+        first.output
+    );
+    assert_output_contains(&first.output, "Prepared analysis cache for");
+    assert!(
+        cache_dir.join("v2").is_dir(),
+        "prepare did not create a versioned cache under {}",
+        cache_dir.display()
+    );
+
+    let second = run_prepare_analysis_cache_command(
+        &public_ghostscope,
+        &public_binary,
+        &cache_dir,
+        unprivileged_identity,
+    )?;
+    assert!(
+        second.status.success(),
+        "analysis cache reuse failed with status {}\n{}",
+        second.status,
+        second.output
+    );
+    assert_output_contains(&second.output, "Reused analysis cache for");
+
+    let runtime = run_startup_report_command_for_binary(
+        &fixture,
+        &public_binary,
+        &[
+            OsString::from("--analysis-cache-dir"),
+            cache_dir.as_os_str().to_os_string(),
+        ],
+    )?;
+    assert!(
+        runtime.status.success(),
+        "runtime cache consumption failed with status {}\n{}",
+        runtime.status,
+        runtime.output
+    );
+    assert_plain_output_contains(&runtime.output, "analysis cache: 1 hit");
+
+    corrupt_analysis_cache_payload_length(&cache_dir)?;
+    let fallback = run_startup_report_command_for_binary(
+        &fixture,
+        &public_binary,
+        &[
+            OsString::from("--analysis-cache-dir"),
+            cache_dir.as_os_str().to_os_string(),
+        ],
+    )?;
+    assert!(
+        fallback.status.success(),
+        "runtime should ignore a malformed cache and reparse with status {}\n{}",
+        fallback.status,
+        fallback.output
+    );
+    let plain_fallback = output_without_ansi(&fallback.output);
+    assert!(
+        !plain_fallback.contains("analysis cache: 1 hit"),
+        "malformed cache must not be reported as a hit\n{}",
+        fallback.output
+    );
+    assert_plain_output_contains(&fallback.output, "analysis cache: 1 rejected");
+    assert_plain_output_contains(&fallback.output, "cache fallback:");
+    assert_plain_output_contains(&fallback.output, "Failed to decode analysis cache metadata");
+    assert_plain_output_contains(&fallback.output, "Dry run complete; no uprobes attached.");
+
+    Ok(())
+}
 
 #[tokio::test]
 #[serial_test::serial]
@@ -427,6 +544,98 @@ fn run_startup_report_command_for_binary_with_config(
     })
 }
 
+fn run_prepare_analysis_cache_command(
+    ghostscope: &Path,
+    binary: &Path,
+    cache_dir: &Path,
+    unprivileged_identity: Option<(u32, u32)>,
+) -> Result<StartupReportRun> {
+    let mut command = Command::new(ghostscope);
+    command.args([
+        OsStr::new("--prepare"),
+        OsStr::new("--target"),
+        binary.as_os_str(),
+        OsStr::new("--analysis-cache-dir"),
+        cache_dir.as_os_str(),
+        OsStr::new("--no-log"),
+    ]);
+    command.current_dir("/tmp");
+    if let Some(home) = cache_dir.parent() {
+        command.env("HOME", home);
+    }
+    if let Some((uid, gid)) = unprivileged_identity {
+        command.gid(gid).uid(uid);
+    }
+    let output = command
+        .output()
+        .context("failed to run rootless analysis cache prepare")?;
+
+    let mut combined = String::new();
+    combined.push_str(&String::from_utf8_lossy(&output.stdout));
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(StartupReportRun {
+        status: output.status,
+        output: combined,
+    })
+}
+
+fn workspace_owner_identity(workspace_root: &Path) -> Result<Option<(u32, u32)>> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(None);
+    }
+
+    let metadata = fs::metadata(workspace_root).with_context(|| {
+        format!(
+            "failed to inspect workspace owner for {}",
+            workspace_root.display()
+        )
+    })?;
+    if metadata.uid() == 0 {
+        bail!(
+            "rootless prepare e2e requires a workspace owned by a non-root user: {}",
+            workspace_root.display()
+        );
+    }
+    Ok(Some((metadata.uid(), metadata.gid())))
+}
+
+fn corrupt_analysis_cache_payload_length(cache_dir: &Path) -> Result<()> {
+    let entries = fs::read_dir(cache_dir.join("v2"))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    if entries.len() != 1 {
+        bail!(
+            "expected one analysis cache entry under {}, found {}",
+            cache_dir.display(),
+            entries.len()
+        );
+    }
+
+    let entry = &entries[0];
+    let mut encoded = fs::read(entry)?;
+    if encoded.len() < 24 {
+        bail!("analysis cache entry {} is too short", entry.display());
+    }
+    let header_len = u32::from_le_bytes(encoded[12..16].try_into()?) as usize;
+    let string_length_offset = 24_usize
+        .checked_add(header_len)
+        .and_then(|offset| offset.checked_add(8))
+        .context("analysis cache payload offset overflow")?;
+    let string_length_end = string_length_offset
+        .checked_add(8)
+        .context("analysis cache string length offset overflow")?;
+    if string_length_end > encoded.len() {
+        bail!(
+            "analysis cache entry {} has an invalid payload offset",
+            entry.display()
+        );
+    }
+    encoded[string_length_offset..string_length_end].copy_from_slice(&u64::MAX.to_le_bytes());
+    fs::write(entry, encoded)?;
+    Ok(())
+}
+
 fn startup_report_config(debug_search_paths: &[&Path]) -> String {
     let mut config = String::from(
         r#"
@@ -492,6 +701,22 @@ fn assert_output_contains(output: &str, needle: &str) {
         output.contains(needle),
         "expected output to contain {needle:?}\n{output}"
     );
+}
+
+fn assert_plain_output_contains(output: &str, needle: &str) {
+    let plain_output = output_without_ansi(output);
+    assert!(
+        plain_output.contains(needle),
+        "expected plain output to contain {needle:?}\n{output}"
+    );
+}
+
+fn output_without_ansi(output: &str) -> String {
+    static ANSI_ESCAPE: OnceLock<Regex> = OnceLock::new();
+    ANSI_ESCAPE
+        .get_or_init(|| Regex::new(r"\x1B\[[0-?]*[ -/]*[@-~]").expect("valid ANSI regex"))
+        .replace_all(output, "")
+        .into_owned()
 }
 
 fn is_host_topology() -> bool {

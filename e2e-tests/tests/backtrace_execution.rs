@@ -38,6 +38,46 @@ fn signal_backtrace_target(target: &TargetHandle, signal: &str) -> anyhow::Resul
     Ok(())
 }
 
+fn prepare_analysis_cache(binary_path: &Path, cache_dir: &Path) -> anyhow::Result<String> {
+    let sandbox = common::sandbox::SandboxHandle::default_ghostscope()?;
+    anyhow::ensure!(
+        sandbox.is_host_backend(),
+        "analysis-cache backtrace prepare requires host GhostScope"
+    );
+    let (program, sandbox_args) = sandbox.ghostscope_command()?;
+    anyhow::ensure!(
+        sandbox_args.is_empty(),
+        "host GhostScope command unexpectedly has sandbox arguments"
+    );
+    let output = Command::new(program)
+        .args([
+            OsString::from("--prepare"),
+            OsString::from("--target"),
+            binary_path.as_os_str().to_os_string(),
+            OsString::from("--analysis-cache-dir"),
+            cache_dir.as_os_str().to_os_string(),
+            OsString::from("--no-log"),
+        ])
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    anyhow::ensure!(
+        output.status.success(),
+        "analysis cache prepare failed with status {}\nSTDOUT:\n{}\nSTDERR:\n{}",
+        output.status,
+        stdout,
+        stderr
+    );
+    Ok(stdout)
+}
+
+fn analysis_cache_entry_count(cache_dir: &Path) -> anyhow::Result<usize> {
+    Ok(fs::read_dir(cache_dir.join("v2"))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .count())
+}
+
 async fn run_hot_backtrace_with_depth(
     script: &str,
     depth: u8,
@@ -1101,6 +1141,110 @@ trace cross_module_lib_leaf {
         "cross-module stack should not stop on an unwind error\nBLOCK:\n{block}\nSTDERR:\n{stderr}"
     );
     assert_no_adjacent_duplicate_frame_locations(block)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_prepared_main_cache_keeps_uncached_backtrace_modules_loadable() -> anyhow::Result<()>
+{
+    init();
+
+    let ghostscope_sandbox = common::sandbox::SandboxHandle::default_ghostscope()?;
+    let target_sandbox = common::sandbox::SandboxHandle::default_target()?;
+    if !ghostscope_sandbox.is_host_backend() || !target_sandbox.is_host_backend() {
+        println!("skipping prepared backtrace cache e2e outside host->host topology");
+        return Ok(());
+    }
+
+    let binary_path = FIXTURES.get_test_binary("backtrace_cross_module_program")?;
+    let cache = tempfile::tempdir()?;
+    let prepare_stdout = prepare_analysis_cache(&binary_path, cache.path())?;
+    assert!(
+        prepare_stdout.contains("Prepared analysis cache for"),
+        "prepare should populate a new analysis cache\nSTDOUT:\n{prepare_stdout}"
+    );
+    assert_eq!(
+        analysis_cache_entry_count(cache.path())?,
+        1,
+        "preparing only the main executable should create one cache entry"
+    );
+
+    let script = r#"
+trace cross_module_lib_leaf {
+    print "PREPARED_CROSS_MODULE_STACK";
+    bt full;
+}
+"#;
+    let log_path = cache.path().join("ghostscope.log");
+    let (count, stdout, stderr) = run_backtrace_binary_with_args_and_mapped_module(
+        &binary_path,
+        script,
+        250,
+        3,
+        vec![
+            OsString::from("--backtrace-depth"),
+            OsString::from("5"),
+            OsString::from("--analysis-cache-dir"),
+            cache.path().as_os_str().to_os_string(),
+            OsString::from("--log"),
+            OsString::from("--log-console"),
+            OsString::from("--log-level"),
+            OsString::from("info"),
+            OsString::from("--log-file"),
+            log_path.into_os_string(),
+        ],
+        None,
+        Some("libbacktrace_cross_module.so"),
+    )
+    .await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+
+    let main_cache_hit = stderr.lines().any(|line| {
+        line.contains("DWARF analysis cache hit for")
+            && line.contains("backtrace_cross_module_program")
+            && !line.contains("libbacktrace_cross_module.so")
+    });
+    assert!(
+        main_cache_hit,
+        "runtime should consume the prepared main executable cache\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !stderr.lines().any(|line| {
+            line.contains("DWARF analysis cache hit for")
+                && line.contains("libbacktrace_cross_module.so")
+        }),
+        "the shared library should remain uncached\nSTDERR:\n{stderr}"
+    );
+    assert_eq!(
+        analysis_cache_entry_count(cache.path())?,
+        1,
+        "runtime cache reads must not add an entry for the shared library"
+    );
+
+    let block = first_backtrace_block_after(&stdout, "PREPARED_CROSS_MODULE_STACK", 5)?;
+    assert_ordered_patterns(
+        block,
+        &[
+            "#0 cross_module_lib_leaf",
+            "#1 cross_module_lib_probe",
+            "#2 cross_module_main_caller",
+            "#3 cross_module_main_loop",
+            "#4 main",
+        ],
+    )?;
+    assert!(
+        block.contains("[libbacktrace_cross_module.so+")
+            && block.contains("[backtrace_cross_module_program+"),
+        "backtrace should load CFI and symbols from both cached and uncached modules\nBLOCK:\n{block}"
+    );
+    assert!(
+        !block.contains("stopped: no unwind rows for PC")
+            && !block.contains("stopped: unsupported CFI"),
+        "uncached module CFI should still be published\nBLOCK:\n{block}\nSTDERR:\n{stderr}"
+    );
 
     Ok(())
 }

@@ -1,10 +1,12 @@
-use crate::config::{ParsedArgs, PidViews, ResolvedConfig};
+use crate::config::{ParsedArgs, PidViews, ResolvedConfig, ResolvedDebuginfodConfig};
 use crate::source_path::SourcePathResolver;
 use crate::trace::backtrace_runtime::BacktraceRuntimeRunner;
 use crate::trace::TraceManager;
 use anyhow::Result;
 use ghostscope_debuginfod::{DebuginfodClient, DebuginfodConfig};
-use ghostscope_dwarf::{DwarfAnalyzer, ExplicitDebugFile, ModuleStats};
+use ghostscope_dwarf::{
+    AnalysisCache, DwarfAnalyzer, DwarfLoadOptions, ExplicitDebugFile, ModuleStats,
+};
 use ghostscope_process::{
     PidFilterSpec, PidNamespaceId, ProcessManager, ProcessSysmon, SysEventKind, SysmonConfig,
     SysmonEventMask,
@@ -36,6 +38,43 @@ fn target_mode_sysmon_event_mask(_target: &Path) -> SysmonEventMask {
 
 fn target_mode_map_change_unfiltered(target: &Path) -> bool {
     ghostscope_process::is_shared_object(target)
+}
+
+pub(crate) fn build_debuginfod_client(
+    debuginfod: &ResolvedDebuginfodConfig,
+) -> Result<Option<Arc<DebuginfodClient>>> {
+    if !debuginfod.is_effectively_enabled() {
+        return Ok(None);
+    }
+
+    let Some(cache_dir) = debuginfod.cache_dir.as_ref() else {
+        warn!("debuginfod is enabled but no cache directory was resolved; skipping");
+        return Ok(None);
+    };
+
+    let mut client_config =
+        DebuginfodConfig::new(debuginfod.urls.iter().map(String::as_str), cache_dir)?;
+    client_config = match debuginfod.timeout_secs {
+        Some(timeout_secs) => client_config.with_timeout(Duration::from_secs(timeout_secs)),
+        None => client_config.without_timeout(),
+    };
+    client_config = client_config.with_max_size(debuginfod.max_size_bytes);
+
+    info!(
+        "debuginfod fallback enabled: urls={}, cache_dir={}, timeout_secs={}, max_size_bytes={}",
+        debuginfod.urls.len(),
+        cache_dir.display(),
+        debuginfod
+            .timeout_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        debuginfod
+            .max_size_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+
+    Ok(Some(Arc::new(DebuginfodClient::new(client_config)?)))
 }
 
 #[derive(Debug, Clone)]
@@ -306,43 +345,25 @@ impl GhostSession {
         Some(ExplicitDebugFile::new(target_module, debug_file))
     }
 
+    fn dwarf_load_options(&self) -> Result<DwarfLoadOptions> {
+        Ok(DwarfLoadOptions {
+            debug_search_paths: self.get_debug_search_paths(),
+            allow_loose_debug_match: self.get_allow_loose_debug_match(),
+            explicit_debug_file: self.explicit_debug_file_for_target(),
+            debuginfod_client: self.build_debuginfod_client()?,
+            analysis_cache: self
+                .config
+                .as_ref()
+                .and_then(|config| config.dwarf_analysis_cache_dir.as_ref())
+                .map(AnalysisCache::read_only),
+        })
+    }
+
     fn build_debuginfod_client(&self) -> Result<Option<Arc<DebuginfodClient>>> {
         let Some(config) = self.config.as_ref() else {
             return Ok(None);
         };
-        let debuginfod = &config.dwarf_debuginfod;
-        if !debuginfod.is_effectively_enabled() {
-            return Ok(None);
-        }
-
-        let Some(cache_dir) = debuginfod.cache_dir.as_ref() else {
-            warn!("debuginfod is enabled but no cache directory was resolved; skipping");
-            return Ok(None);
-        };
-
-        let mut client_config =
-            DebuginfodConfig::new(debuginfod.urls.iter().map(String::as_str), cache_dir)?;
-        client_config = match debuginfod.timeout_secs {
-            Some(timeout_secs) => client_config.with_timeout(Duration::from_secs(timeout_secs)),
-            None => client_config.without_timeout(),
-        };
-        client_config = client_config.with_max_size(debuginfod.max_size_bytes);
-
-        info!(
-            "debuginfod fallback enabled: urls={}, cache_dir={}, timeout_secs={}, max_size_bytes={}",
-            debuginfod.urls.len(),
-            cache_dir.display(),
-            debuginfod
-                .timeout_secs
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            debuginfod
-                .max_size_bytes
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_string())
-        );
-
-        Ok(Some(Arc::new(DebuginfodClient::new(client_config)?)))
+        build_debuginfod_client(&config.dwarf_debuginfod)
     }
 
     fn ensure_pid_runtime_modules(
@@ -560,22 +581,16 @@ impl GhostSession {
     pub async fn load_binary_parallel(&mut self) -> Result<()> {
         info!("Loading binary and performing DWARF analysis (parallel mode)");
 
-        let debug_search_paths = self.get_debug_search_paths();
-        let allow_loose = self.get_allow_loose_debug_match();
-        let explicit_debug_file = self.explicit_debug_file_for_target();
-        let debuginfod_client = self.build_debuginfod_client()?;
+        let load_options = self.dwarf_load_options()?;
 
         let process_analyzer = if let Some(proc_pid) = self.proc_pid() {
             info!("Loading binary from PID: {} (parallel)", proc_pid);
             let runtime_modules = self.ensure_pid_runtime_modules(proc_pid)?;
             Some(
-                DwarfAnalyzer::from_pid_runtime_modules_with_config_debuginfod_and_explicit_debug_file(
+                DwarfAnalyzer::from_pid_runtime_modules_with_options_and_progress(
                     proc_pid,
                     runtime_modules,
-                    &debug_search_paths,
-                    allow_loose,
-                    debuginfod_client.clone(),
-                    explicit_debug_file.clone(),
+                    load_options,
                     |_| {},
                 )
                 .await?,
@@ -583,12 +598,9 @@ impl GhostSession {
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
             Some(
-                DwarfAnalyzer::from_exec_path_with_config_debuginfod_explicit_debug_file_and_progress(
+                DwarfAnalyzer::from_exec_path_with_options_and_progress(
                     binary_path,
-                    &debug_search_paths,
-                    allow_loose,
-                    debuginfod_client.clone(),
-                    explicit_debug_file.map(|explicit| explicit.debug_file),
+                    load_options,
                     |_| {},
                 )
                 .await?,
@@ -612,10 +624,7 @@ impl GhostSession {
     {
         info!("Loading binary and performing DWARF analysis (parallel mode with progress)");
 
-        let debug_search_paths = self.get_debug_search_paths();
-        let allow_loose = self.get_allow_loose_debug_match();
-        let explicit_debug_file = self.explicit_debug_file_for_target();
-        let debuginfod_client = self.build_debuginfod_client()?;
+        let load_options = self.dwarf_load_options()?;
 
         let process_analyzer = if let Some(proc_pid) = self.proc_pid() {
             info!(
@@ -624,13 +633,10 @@ impl GhostSession {
             );
             let runtime_modules = self.ensure_pid_runtime_modules(proc_pid)?;
             Some(
-                DwarfAnalyzer::from_pid_runtime_modules_with_config_debuginfod_and_explicit_debug_file(
+                DwarfAnalyzer::from_pid_runtime_modules_with_options_and_progress(
                     proc_pid,
                     runtime_modules,
-                    &debug_search_paths,
-                    allow_loose,
-                    debuginfod_client.clone(),
-                    explicit_debug_file.clone(),
+                    load_options,
                     progress_callback,
                 )
                 .await?,
@@ -638,12 +644,9 @@ impl GhostSession {
         } else if let Some(ref binary_path) = self.target_binary {
             info!("Loading binary from executable path: {}", binary_path);
             Some(
-                DwarfAnalyzer::from_exec_path_with_config_debuginfod_explicit_debug_file_and_progress(
+                DwarfAnalyzer::from_exec_path_with_options_and_progress(
                     binary_path,
-                    &debug_search_paths,
-                    allow_loose,
-                    debuginfod_client.clone(),
-                    explicit_debug_file.map(|explicit| explicit.debug_file),
+                    load_options,
                     progress_callback,
                 )
                 .await?,
@@ -775,6 +778,9 @@ mod tests {
             tui_mode: false,
             dry_run: false,
             dry_run_details: false,
+            prepare: false,
+            analysis_cache_dir: None,
+            no_analysis_cache: false,
             script_output: None,
             status_enabled: true,
             has_explicit_status_flag: false,

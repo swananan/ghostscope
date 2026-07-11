@@ -6,6 +6,7 @@ use ratatui::{
 };
 
 use super::{DebugSourceCounts, LoadingProgress, ModuleState};
+use crate::events::AnalysisCacheStatus;
 
 /// Progress bar component for loading
 pub struct ProgressRenderer;
@@ -60,6 +61,7 @@ impl ProgressRenderer {
                             Span::styled("  debug: ", Style::default().fg(Color::Gray)),
                         ];
                         push_module_debug_source_spans(&mut spans, stats);
+                        push_module_cache_status_spans(&mut spans, &stats.analysis_cache_status);
                         spans.push(Span::styled(
                             format!(
                                 " | Functions: {} | Variables: {} | Types: {} | Time: {:.1}s",
@@ -164,12 +166,66 @@ impl ProgressRenderer {
             ));
             push_debug_source_count_spans(&mut spans, &progress.debug_sources);
         }
+        if progress.analysis_cache.has_activity() {
+            spans.push(Span::styled(
+                " | Cache: ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            push_cache_count(
+                &mut spans,
+                "hit",
+                progress.analysis_cache.hits,
+                Color::Green,
+            );
+            push_cache_count(
+                &mut spans,
+                "miss",
+                progress.analysis_cache.misses,
+                Color::Yellow,
+            );
+            push_cache_count(
+                &mut spans,
+                "rejected",
+                progress.analysis_cache.rejected,
+                Color::Yellow,
+            );
+        }
 
         let stats_line = Line::from(spans);
 
         let paragraph = Paragraph::new(stats_line);
         f.render_widget(paragraph, area);
     }
+}
+
+fn push_module_cache_status_spans(spans: &mut Vec<Span<'static>>, status: &AnalysisCacheStatus) {
+    let (label, color) = match status {
+        AnalysisCacheStatus::Disabled => return,
+        AnalysisCacheStatus::Hit => ("hit", Color::Green),
+        AnalysisCacheStatus::Miss => ("miss", Color::Yellow),
+        AnalysisCacheStatus::Rejected { .. } => ("rejected", Color::Yellow),
+    };
+    spans.push(Span::styled(
+        " | cache: ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::styled(label, Style::default().fg(color)));
+}
+
+fn push_cache_count(spans: &mut Vec<Span<'static>>, label: &str, count: usize, color: Color) {
+    if count == 0 {
+        return;
+    }
+    if spans
+        .last()
+        .is_some_and(|span| span.content.as_ref() != " | Cache: ")
+    {
+        spans.push(Span::styled("  ", Style::default().fg(Color::DarkGray)));
+    }
+    spans.push(Span::styled(
+        format!("{label}:{count}"),
+        Style::default().fg(color),
+    ));
 }
 
 fn push_module_debug_source_spans(
