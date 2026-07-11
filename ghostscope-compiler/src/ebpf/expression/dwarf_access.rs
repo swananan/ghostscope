@@ -3,7 +3,7 @@ use crate::ebpf::context::{CodeGenError, EbpfContext, Result, RuntimeAddress};
 use crate::script::Expr;
 use ghostscope_dwarf::{
     AmbiguityReason, Availability, RuntimeRequirement, TypeInfo as DwarfType, TypeLayoutError,
-    UnsupportedReason, VariableReadPlan,
+    UnsupportedReason, VariableAccessSegment, VariableReadPlan,
 };
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use inkwell::AddressSpace;
@@ -82,6 +82,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         if let crate::script::Expr::MemberAccess(obj_expr, field) = expr {
             if let Some((value, _member_type)) =
                 self.compile_dynamic_member_access_value(obj_expr, field)?
+            {
+                return Ok(value);
+            }
+        }
+        if let crate::script::Expr::TupleAccess(obj_expr, index) = expr {
+            if let Some((value, _member_type)) =
+                self.compile_dynamic_tuple_access_value(obj_expr, *index)?
             {
                 return Ok(value);
             }
@@ -166,6 +173,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(Some((value, member_type)))
     }
 
+    pub(in crate::ebpf) fn compile_dynamic_tuple_access_value(
+        &mut self,
+        obj_expr: &Expr,
+        index: u32,
+    ) -> Result<Option<(BasicValueEnum<'ctx>, DwarfType)>> {
+        let tuple_expr = Expr::TupleAccess(Box::new(obj_expr.clone()), index);
+        let Some(member_lvalue) = self.dynamic_lvalue_address_and_type(&tuple_expr)? else {
+            return Ok(None);
+        };
+        let member_type = member_lvalue.type_info.dwarf_type;
+        let value = self.read_dynamic_address_value(member_lvalue.address, &member_type)?;
+        Ok(Some((value, member_type)))
+    }
+
     pub(in crate::ebpf) fn dynamic_lvalue_address_and_type(
         &mut self,
         expr: &Expr,
@@ -217,6 +238,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 type_info: DynamicTypeInfo {
                     dwarf_type: element_info.element_type,
                     module_path: element_info.module_path,
+                    type_id: element_info.type_id,
                 },
             }));
         }
@@ -231,6 +253,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             };
             let (member_offset, member_type) =
                 self.dynamic_member_offset_and_type(&base_lvalue.type_info, field)?;
+            let member_type_id = self.project_dynamic_type_id(
+                base_lvalue.type_info.type_id,
+                &VariableAccessSegment::Field(field.clone()),
+            )?;
             let member_offset = self.context.i64_type().const_int(member_offset, false);
             let member_address = self
                 .builder
@@ -245,6 +271,41 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 type_info: DynamicTypeInfo {
                     dwarf_type: member_type,
                     module_path: base_lvalue.type_info.module_path,
+                    type_id: member_type_id,
+                },
+            }));
+        }
+
+        if let Expr::TupleAccess(obj_expr, index) = expr {
+            let Some(object_lvalue) = self.dynamic_lvalue_address_and_type(obj_expr)? else {
+                return Ok(None);
+            };
+            let Some(base_lvalue) = self.dynamic_member_base_address_and_type(object_lvalue)?
+            else {
+                return Ok(None);
+            };
+            let module_path = base_lvalue.type_info.module_path.clone();
+            let (member_offset, member_type) =
+                self.dynamic_tuple_offset_and_type(&base_lvalue.type_info, *index)?;
+            let member_type_id = self.project_dynamic_type_id(
+                base_lvalue.type_info.type_id,
+                &VariableAccessSegment::TupleIndex(*index),
+            )?;
+            let member_offset = self.context.i64_type().const_int(member_offset, false);
+            let member_address = self
+                .builder
+                .build_int_add(
+                    base_lvalue.address.value,
+                    member_offset,
+                    "dynamic_tuple_lvalue_address",
+                )
+                .map_err(|err| CodeGenError::Builder(err.to_string()))?;
+            return Ok(Some(DynamicLvalue {
+                address: base_lvalue.address.with_value(member_address),
+                type_info: DynamicTypeInfo {
+                    dwarf_type: member_type,
+                    module_path,
+                    type_id: member_type_id,
                 },
             }));
         }
@@ -257,6 +318,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         object: DynamicLvalue<'ctx>,
     ) -> Result<Option<DynamicLvalue<'ctx>>> {
         let module_path = object.type_info.module_path.clone();
+        let type_id = object.type_info.type_id;
         let object_type = self.complete_dynamic_member_element_type(
             object.type_info.dwarf_type,
             module_path.as_deref(),
@@ -267,6 +329,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 type_info: DynamicTypeInfo {
                     dwarf_type: object_type,
                     module_path,
+                    type_id,
                 },
             })),
             DwarfType::PointerType { target_type, .. } => {
@@ -299,6 +362,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     type_info: DynamicTypeInfo {
                         dwarf_type: target_type,
                         module_path,
+                        type_id,
                     },
                 }))
             }
@@ -326,6 +390,51 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
+    fn dynamic_tuple_offset_and_type(
+        &self,
+        aggregate: &DynamicTypeInfo,
+        index: u32,
+    ) -> Result<(u64, DwarfType)> {
+        let aggregate_type = self.complete_dynamic_member_element_type(
+            aggregate.dwarf_type.clone(),
+            aggregate.module_path.as_deref(),
+        );
+        let analyzer = self
+            .process_analyzer
+            .ok_or_else(|| CodeGenError::DwarfError("No DWARF analyzer available".to_string()))?;
+        let fallback_module_path = self
+            .current_compile_time_context
+            .as_ref()
+            .map(|context| PathBuf::from(&context.module_path));
+        let module_path = aggregate
+            .module_path
+            .as_deref()
+            .or(fallback_module_path.as_deref())
+            .ok_or_else(|| {
+                CodeGenError::DwarfError("Tuple projection has no originating module".to_string())
+            })?;
+        let layout = match aggregate.type_id {
+            Some(type_id) => analyzer.tuple_member_layout(type_id, &aggregate_type, index),
+            None => analyzer.tuple_member_layout_in_module(module_path, &aggregate_type, index),
+        }
+        .map_err(|error| CodeGenError::DwarfError(error.to_string()))?;
+        Ok((layout.offset, layout.member_type))
+    }
+
+    fn project_dynamic_type_id(
+        &self,
+        current: Option<ghostscope_dwarf::TypeId>,
+        segment: &VariableAccessSegment,
+    ) -> Result<Option<ghostscope_dwarf::TypeId>> {
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        self.process_analyzer
+            .ok_or_else(|| CodeGenError::DwarfError("No DWARF analyzer available".to_string()))?
+            .project_type_id(current, segment)
+            .map_err(|error| CodeGenError::DwarfError(error.to_string()))
+    }
+
     fn dynamic_array_base_from_plan(
         &mut self,
         array_plan: &VariableReadPlan,
@@ -337,8 +446,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let array_type = array_plan.dwarf_type.as_ref().ok_or_else(|| {
             CodeGenError::DwarfError("Array expression has no DWARF type information".to_string())
         })?;
-        let element_info =
-            Self::indexable_info_from_type(array_type, module_path).ok_or_else(|| {
+        let element_type_id = self
+            .project_dynamic_type_id(array_plan.type_id, &VariableAccessSegment::ArrayIndex(0))?;
+        let element_info = Self::indexable_info_from_type(array_type, module_path, element_type_id)
+            .ok_or_else(|| {
                 CodeGenError::TypeError(format!(
                     "dynamic array index requires array or pointer type, got '{}'",
                     array_type.type_name()
@@ -432,9 +543,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         self.dynamic_lvalue_address_and_type(&expanded_array_expr)?
                     {
                         let module_path = array_lvalue.type_info.module_path.clone();
+                        let element_type_id = self.project_dynamic_type_id(
+                            array_lvalue.type_info.type_id,
+                            &VariableAccessSegment::ArrayIndex(0),
+                        )?;
                         let element_info = Self::indexable_info_from_type(
                             &array_lvalue.type_info.dwarf_type,
                             module_path,
+                            element_type_id,
                         )
                         .ok_or_else(|| {
                             CodeGenError::TypeError(format!(
@@ -520,6 +636,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             type_info: DynamicTypeInfo {
                 dwarf_type: element_info.element_type,
                 module_path: element_info.module_path,
+                type_id: element_info.type_id,
             },
         }))
     }
@@ -539,9 +656,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         if let Some(plan) = self.query_dwarf_for_complex_expr(&expanded)? {
             if let Some(dwarf_type) = plan.dwarf_type.as_ref() {
-                if let Some(info) =
-                    Self::indexable_info_from_type(dwarf_type, plan.module_path.clone())
-                {
+                let element_type_id = self
+                    .project_dynamic_type_id(plan.type_id, &VariableAccessSegment::ArrayIndex(0))?;
+                if let Some(info) = Self::indexable_info_from_type(
+                    dwarf_type,
+                    plan.module_path.clone(),
+                    element_type_id,
+                ) {
                     return Ok(Some(info));
                 }
             }
@@ -552,9 +673,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         {
             if let Some(plan) = self.query_dwarf_for_complex_expr(&base_expr)? {
                 if let Some(dwarf_type) = plan.dwarf_type.as_ref() {
-                    if let Some(info) =
-                        Self::indexable_info_from_type(dwarf_type, plan.module_path.clone())
-                    {
+                    let element_type_id = self.project_dynamic_type_id(
+                        plan.type_id,
+                        &VariableAccessSegment::ArrayIndex(0),
+                    )?;
+                    if let Some(info) = Self::indexable_info_from_type(
+                        dwarf_type,
+                        plan.module_path.clone(),
+                        element_type_id,
+                    ) {
                         return Ok(Some(info));
                     }
                 }
@@ -767,6 +894,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             Expr::Variable(name) => name.clone(),
             Expr::MemberAccess(obj, field) => {
                 format!("{}.{}", Self::expr_to_debug_string(obj), field)
+            }
+            Expr::TupleAccess(obj, index) => {
+                format!("{}.{}", Self::expr_to_debug_string(obj), index)
             }
             Expr::ArrayAccess(arr, _) => format!("{}[index]", Self::expr_to_debug_string(arr)),
             Expr::Cast { expr, target_type } => format!(

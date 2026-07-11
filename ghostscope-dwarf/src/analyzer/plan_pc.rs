@@ -196,11 +196,12 @@ impl DwarfAnalyzer {
         for segment in &path.segments {
             let pointer_type_name = plan.type_name.clone();
             self.complete_unknown_pointer_target_type(module_path, &mut plan, &pointer_type_name);
+            let layout_segment = self.layout_access_segment(plan.type_id, segment)?;
             let projected_type_id = match plan.type_id {
-                Some(type_id) => self.projected_type_id(type_id, segment)?,
+                Some(type_id) => self.projected_type_id(type_id, &layout_segment)?,
                 None => None,
             };
-            plan = plan.plan_access_path(&VariableAccessPath::new(vec![segment.clone()]))?;
+            plan = plan.plan_resolved_access_segment(segment, &layout_segment)?;
             plan.type_id = projected_type_id;
             if matches!(segment, VariableAccessSegment::Dereference) {
                 self.complete_unknown_pointer_target_type(

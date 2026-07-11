@@ -5,7 +5,7 @@
 use super::context::{CodeGenError, EbpfContext, Result, RuntimeAddress};
 use super::expression_plan::{BinaryEmitKind, BuiltinCallPlan};
 use crate::script::Expr;
-use ghostscope_dwarf::{CIntegerComparisonType, TypeInfo as DwarfType};
+use ghostscope_dwarf::{CIntegerComparisonType, TypeId, TypeInfo as DwarfType};
 use inkwell::values::BasicValueEnum;
 use inkwell::AddressSpace;
 
@@ -24,6 +24,7 @@ use tracing::debug;
 pub(super) struct DynamicTypeInfo {
     pub(super) dwarf_type: DwarfType,
     pub(super) module_path: Option<PathBuf>,
+    pub(super) type_id: Option<TypeId>,
 }
 
 pub(super) struct DynamicLvalue<'ctx> {
@@ -35,6 +36,7 @@ struct IndexableElementInfo {
     element_type: DwarfType,
     stride: u64,
     module_path: Option<PathBuf>,
+    type_id: Option<TypeId>,
 }
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
@@ -479,7 +481,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     binary_plan.integer_semantics,
                 )
             }
-            Expr::MemberAccess(_, _) => {
+            Expr::MemberAccess(_, _) | Expr::TupleAccess(_, _) => {
                 // Use unified DWARF expression compilation
                 self.compile_dwarf_expression(expr)
             }

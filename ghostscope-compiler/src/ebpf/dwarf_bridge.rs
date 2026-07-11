@@ -1345,6 +1345,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     let base = expand_aliases(ctx, obj, visited, depth + 1)?;
                     E::MemberAccess(Box::new(base), field.clone())
                 }
+                E::TupleAccess(obj, index) => {
+                    let base = expand_aliases(ctx, obj, visited, depth + 1)?;
+                    E::TupleAccess(Box::new(base), *index)
+                }
                 E::ArrayAccess(arr, idx) => {
                     let base = expand_aliases(ctx, arr, visited, depth + 1)?;
                     let idx2 = expand_aliases(ctx, idx, visited, depth + 1)?;
@@ -1426,6 +1430,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         match &expanded {
             Expr::Variable(var_name) => self.query_dwarf_for_variable_plan(var_name),
             Expr::MemberAccess(_, _)
+            | Expr::TupleAccess(_, _)
             | Expr::ArrayAccess(_, _)
             | Expr::ChainAccess(_)
             | Expr::PointerDeref(_) => {
@@ -1607,6 +1612,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     out.push('.');
                     out.push_str(field);
                 }
+                VariableAccessSegment::TupleIndex(index) => {
+                    out.push('.');
+                    out.push_str(&index.to_string());
+                }
                 VariableAccessSegment::ArrayIndex(index) => {
                     out.push('[');
                     out.push_str(&index.to_string());
@@ -1641,6 +1650,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         return Ok(None);
                     };
                     segments.push(VariableAccessSegment::Field(field.clone()));
+                    Ok(Some(base))
+                }
+                crate::script::Expr::TupleAccess(obj, index) => {
+                    let Some(base) = append_segments(obj, segments)? else {
+                        return Ok(None);
+                    };
+                    segments.push(VariableAccessSegment::TupleIndex(*index));
                     Ok(Some(base))
                 }
                 crate::script::Expr::ArrayAccess(array, index) => {
@@ -1766,6 +1782,34 @@ mod tests {
         assert_eq!(
             EbpfContext::<'static, 'static>::access_path_to_string(&base, &path),
             "request.headers[2].len"
+        );
+    }
+
+    #[test]
+    fn access_path_from_expr_preserves_tuple_indices() {
+        let expr = Expr::TupleAccess(
+            Box::new(Expr::TupleAccess(
+                Box::new(Expr::Variable("nested".to_string())),
+                1,
+            )),
+            0,
+        );
+
+        let (base, path) = EbpfContext::<'static, 'static>::access_path_from_expr(&expr)
+            .expect("access path should parse")
+            .expect("expression should be flattenable");
+
+        assert_eq!(base, "nested");
+        assert_eq!(
+            path.segments,
+            vec![
+                VariableAccessSegment::TupleIndex(1),
+                VariableAccessSegment::TupleIndex(0),
+            ]
+        );
+        assert_eq!(
+            EbpfContext::<'static, 'static>::access_path_to_string(&base, &path),
+            "nested.1.0"
         );
     }
 

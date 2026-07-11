@@ -83,6 +83,38 @@ pub(super) fn complete_aggregate_declaration_entry(
 }
 
 impl LoadedObjfile {
+    pub(crate) fn attach_variable_identity(
+        &self,
+        module: crate::ModuleId,
+        cu_offset: gimli::DebugInfoOffset,
+        die_offset: gimli::UnitOffset,
+        variable: &mut crate::parser::ParsedVariable,
+    ) {
+        variable.declaration = Some(die_ref(module, cu_offset, die_offset));
+
+        let dwarf = self.dwarf();
+        let Ok(header) = dwarf.unit_header(cu_offset) else {
+            return;
+        };
+        let Ok(unit) = dwarf.unit(header) else {
+            return;
+        };
+        let Ok(entry) = unit.entry(die_offset) else {
+            return;
+        };
+        let Ok(Some(type_loc)) = resolve_type_ref_with_origins(dwarf, &entry, &unit) else {
+            return;
+        };
+
+        variable.type_id = Some(type_id(module, type_loc.cu_off, type_loc.die_off));
+        if variable.dwarf_type.is_none() {
+            if let Some(ty) = self.detailed_shallow_type(type_loc.cu_off, type_loc.die_off) {
+                variable.type_name = ty.type_name();
+                variable.dwarf_type = Some(ty);
+            }
+        }
+    }
+
     fn find_innermost_inline_node(func: &FunctionBlocks, pc: u64) -> Option<usize> {
         let path = func.block_path_for_pc(pc);
         path.iter()
@@ -413,7 +445,6 @@ impl LoadedObjfile {
 
         let var_refs = func.variables_at_pc_with_scope_depth(address);
         let cfi_index = self.unwind_info.cfi_index().cloned();
-        let dwarf_ref = self.dwarf();
         let mut variables = Vec::with_capacity(var_refs.len());
         let mut diagnostics = Vec::new();
 
@@ -449,28 +480,12 @@ impl LoadedObjfile {
             let Some(mut variable) = resolved.pop() else {
                 continue;
             };
-            variable.declaration = Some(die_ref(module, var_ref.cu_offset, var_ref.die_offset));
-
-            if let Ok(header) = dwarf_ref.unit_header(var_ref.cu_offset) {
-                if let Ok(unit) = dwarf_ref.unit(header) {
-                    if let Ok(entry) = unit.entry(var_ref.die_offset) {
-                        if let Ok(Some(type_loc)) =
-                            resolve_type_ref_with_origins(dwarf_ref, &entry, &unit)
-                        {
-                            variable.type_id =
-                                Some(type_id(module, type_loc.cu_off, type_loc.die_off));
-                            if variable.dwarf_type.is_none() {
-                                if let Some(ty) =
-                                    self.detailed_shallow_type(type_loc.cu_off, type_loc.die_off)
-                                {
-                                    variable.type_name = ty.type_name();
-                                    variable.dwarf_type = Some(ty);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            self.attach_variable_identity(
+                module,
+                var_ref.cu_offset,
+                var_ref.die_offset,
+                &mut variable,
+            );
 
             variables.push(variable);
         }

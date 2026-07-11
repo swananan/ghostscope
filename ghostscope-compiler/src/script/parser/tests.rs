@@ -54,6 +54,35 @@ trace foo {
 }
 
 #[test]
+fn parse_tuple_index_access_preserves_numeric_members() {
+    let script = r#"
+trace foo {
+    print tuple_value.0;
+    print wrapper.1.value;
+}
+"#;
+    let program = parse(script).expect("parse should succeed");
+    let Statement::TracePoint { body, .. } = &program.statements[0] else {
+        panic!("expected trace point");
+    };
+    assert!(matches!(
+        &body[0],
+        Statement::Print(PrintStatement::ComplexVariable(Expr::TupleAccess(base, 0)))
+            if matches!(base.as_ref(), Expr::Variable(name) if name == "tuple_value")
+    ));
+    assert!(matches!(
+        &body[1],
+        Statement::Print(PrintStatement::ComplexVariable(Expr::MemberAccess(base, field)))
+            if field == "value"
+                && matches!(
+                    base.as_ref(),
+                    Expr::TupleAccess(tuple, 1)
+                        if matches!(tuple.as_ref(), Expr::Variable(name) if name == "wrapper")
+                )
+    ));
+}
+
+#[test]
 fn parse_memcmp_with_dynamic_len() {
     let script = r#"
 trace foo {

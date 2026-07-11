@@ -8,6 +8,7 @@ pub enum Expr {
     UnaryBitNot(Box<Expr>),
     Variable(String),
     MemberAccess(Box<Expr>, String),   // person.name
+    TupleAccess(Box<Expr>, u32),       // tuple.0
     PointerDeref(Box<Expr>),           // *ptr
     AddressOf(Box<Expr>),              // &expr
     ArrayAccess(Box<Expr>, Box<Expr>), // arr[0] (new)
@@ -216,8 +217,9 @@ pub fn infer_type(expr: &Expr) -> Result<VarType, String> {
         // For variable references, return a default type to allow compilation to continue, actual type checking will be done in code generation phase
         Expr::Variable(_) => Ok(VarType::Int), // Temporarily assume variables are integer type to let parsing pass
         Expr::MemberAccess(_, _) => Ok(VarType::Int), // Same as above
-        Expr::PointerDeref(_) => Ok(VarType::Int), // Same as above
-        Expr::AddressOf(_) => Ok(VarType::Int), // Address as integer/pointer value for now
+        Expr::TupleAccess(_, _) => Ok(VarType::Int), // Resolved through language-aware DWARF planning
+        Expr::PointerDeref(_) => Ok(VarType::Int),   // Same as above
+        Expr::AddressOf(_) => Ok(VarType::Int),      // Address as integer/pointer value for now
         Expr::ArrayAccess(_, _) => Ok(VarType::Int), // New: array access returns element type (assume int for now)
         Expr::Cast { .. } => Ok(VarType::Int),       // Cast type is resolved during codegen.
         Expr::ChainAccess(_) => Ok(VarType::Int), // New: chain access returns final member type (assume int for now)

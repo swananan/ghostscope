@@ -149,6 +149,9 @@ impl DwarfAnalyzer {
         provenance: Provenance,
     ) -> Result<VariableReadPlan> {
         let path_buf = module_path.as_ref().to_path_buf();
+        let module = self.module_id_for_path(&path_buf).ok_or_else(|| {
+            anyhow::anyhow!("Module {} has no semantic module id", path_buf.display())
+        })?;
         if let Some(module_data) = self.modules.get(&path_buf) {
             let items = vec![(cu_off, die_off)];
             let vars = module_data.resolve_variables_by_offsets_at_address(0, &items)?;
@@ -160,6 +163,7 @@ impl DwarfAnalyzer {
                     path_buf.display()
                 )
             })?;
+            module_data.attach_variable_identity(module, cu_off, die_off, &mut var);
             if var.dwarf_type.is_none() {
                 if let Some(ti) = module_data.shallow_type_for_variable_offsets(cu_off, die_off) {
                     var.type_name = ti.type_name();

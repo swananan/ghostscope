@@ -231,6 +231,10 @@ impl VariableAccessPath {
                     suffix.push('.');
                     suffix.push_str(field);
                 }
+                VariableAccessSegment::TupleIndex(index) => {
+                    suffix.push('.');
+                    suffix.push_str(&index.to_string());
+                }
                 VariableAccessSegment::ArrayIndex(index) => {
                     suffix.push('[');
                     suffix.push_str(&index.to_string());
@@ -246,6 +250,7 @@ impl VariableAccessPath {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VariableAccessSegment {
     Field(String),
+    TupleIndex(u32),
     ArrayIndex(i64),
     Dereference,
 }
@@ -262,6 +267,21 @@ pub enum PlanError {
         field: String,
         members: String,
     },
+
+    #[error("Tuple index '.{index}' requires DWARF type identity for language dispatch")]
+    TupleIndexMissingTypeIdentity { index: u32 },
+
+    #[error("Tuple index '.{index}' is not supported for source language {language:?}")]
+    TupleIndexUnsupportedLanguage {
+        index: u32,
+        language: crate::SourceLanguage,
+    },
+
+    #[error("Tuple index '.{index}' is not available on type '{type_name}'")]
+    UnknownTupleIndex { index: u32, type_name: String },
+
+    #[error("Tuple index '.{index}' must be resolved through DwarfAnalyzer")]
+    UnresolvedTupleIndex { index: u32 },
 
     #[error("array access requires array or pointer type, got '{type_name}'")]
     InvalidArrayAccess { type_name: String },
@@ -456,11 +476,36 @@ impl VariableReadPlan {
     pub fn plan_access_path(&self, path: &VariableAccessPath) -> Result<Self> {
         let mut plan = self.clone();
         for segment in &path.segments {
-            plan = plan.plan_access_segment(segment)?;
+            plan = plan.plan_resolved_access_segment(segment, segment)?;
         }
+        Ok(plan)
+    }
 
-        plan.access_path.segments.extend(path.segments.clone());
-        plan.name.push_str(&path.suffix());
+    pub(crate) fn plan_resolved_access_segment(
+        &self,
+        semantic_segment: &VariableAccessSegment,
+        layout_segment: &VariableAccessSegment,
+    ) -> Result<Self> {
+        let mut plan = match self.plan_access_segment(layout_segment) {
+            Ok(plan) => plan,
+            Err(error) => {
+                if let VariableAccessSegment::TupleIndex(index) = semantic_segment {
+                    if let Some(PlanError::UnknownMember { type_name, .. }) =
+                        error.downcast_ref::<PlanError>()
+                    {
+                        return Err(PlanError::UnknownTupleIndex {
+                            index: *index,
+                            type_name: type_name.clone(),
+                        }
+                        .into());
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let semantic_path = VariableAccessPath::new(vec![semantic_segment.clone()]);
+        plan.access_path.segments.push(semantic_segment.clone());
+        plan.name.push_str(&semantic_path.suffix());
         Ok(plan)
     }
 
@@ -494,6 +539,9 @@ impl VariableReadPlan {
 
         match segment {
             VariableAccessSegment::Field(field) => self.plan_field_access(&dwarf_type, field),
+            VariableAccessSegment::TupleIndex(index) => {
+                Err(PlanError::UnresolvedTupleIndex { index: *index }.into())
+            }
             VariableAccessSegment::ArrayIndex(index) => self.plan_array_index(&dwarf_type, *index),
             VariableAccessSegment::Dereference => self.plan_pointer_deref(&dwarf_type),
         }
