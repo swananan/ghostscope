@@ -415,6 +415,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
             // 5) Complex lvalue shapes -> DWARF runtime read
             expr @ (E::MemberAccess(_, _)
+            | E::TupleAccess(_, _)
             | E::ArrayAccess(_, _)
             | E::PointerDeref(_)
             | E::ChainAccess(_)) => {
@@ -793,6 +794,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             match e {
                 E::Variable(s) => s.clone(),
                 E::MemberAccess(obj, field) => format!("{}.{field}", inner(obj)),
+                E::TupleAccess(obj, index) => format!("{}.{index}", inner(obj)),
                 E::ArrayAccess(arr, idx) => format!("{}[{}]", inner(arr), inner(idx)),
                 E::PointerDeref(p) => format!("*{}", inner(p)),
                 E::AddressOf(p) => format!("&{}", inner(p)),
@@ -864,7 +866,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             | E::UnaryBitNot(inner)
             | E::PointerDeref(inner)
             | E::AddressOf(inner)
-            | E::MemberAccess(inner, _) => Self::expr_contains_builtin(inner),
+            | E::MemberAccess(inner, _)
+            | E::TupleAccess(inner, _) => Self::expr_contains_builtin(inner),
             E::Cast { expr, .. } => Self::expr_contains_builtin(expr),
             E::ArrayAccess(base, index) => {
                 Self::expr_contains_builtin(base) || Self::expr_contains_builtin(index)

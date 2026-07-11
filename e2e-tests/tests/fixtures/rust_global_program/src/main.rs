@@ -91,6 +91,7 @@ static DATA_STRINGS: [&[u8]; 2] = [DATA_ALPHA, DATA_OMEGA];
 
 pub static mut GLOBAL_TUPLE: (i32, bool) = (1, true);
 pub static mut GLOBAL_PAIR: Pair = Pair(2, 3);
+pub static GLOBAL_PAIRS: [Pair; 2] = [Pair(5, 8), Pair(13, 21)];
 pub static mut GLOBAL_UNION: NumberUnion = NumberUnion { int_value: 10 };
 pub static mut GLOBAL_SLICE: &'static [u8] = DATA_ALPHA;
 pub static mut GLOBAL_NICHE: Option<NonZeroU32> = NonZeroU32::new(7);
@@ -169,6 +170,7 @@ fn touch_globals() -> i32 {
 
         let total = CONFIG.a as i64
             + G_MESSAGE.len() as i64
+            + GLOBAL_PAIRS[0].0 as i64
             + union_value as i64
             + pinned_value as i64
             + GLOBAL_PHANTOM.value as i64

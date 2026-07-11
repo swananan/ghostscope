@@ -224,6 +224,9 @@ fn projected_type_loc(
         VariableAccessSegment::Field(field) => {
             projected_member_type_loc(dwarf, type_name_index, loc, field)
         }
+        VariableAccessSegment::TupleIndex(index) => Err(anyhow::anyhow!(
+            "tuple index '.{index}' was not resolved to a DWARF member"
+        )),
         VariableAccessSegment::ArrayIndex(_) => {
             projected_element_type_loc(dwarf, type_name_index, loc, false)
         }
@@ -254,6 +257,21 @@ impl LoadedObjfile {
             segment,
         )
         .map(|loc| loc.map(|loc| type_id_from_loc(current.module, loc)))
+    }
+
+    pub(crate) fn aggregate_type_id_by_name(&self, module: ModuleId, name: &str) -> Option<TypeId> {
+        [gimli::DW_TAG_structure_type, gimli::DW_TAG_class_type]
+            .into_iter()
+            .find_map(|tag| self.type_name_index.find_aggregate_definition(name, tag))
+            .map(|loc| {
+                type_id_from_loc(
+                    module,
+                    TypeLoc {
+                        cu_off: loc.cu_offset,
+                        die_off: loc.die_offset,
+                    },
+                )
+            })
     }
 }
 

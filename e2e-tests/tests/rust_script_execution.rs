@@ -32,6 +32,115 @@ async fn spawn_rust_global_program() -> anyhow::Result<common::targets::TargetHa
 }
 
 #[tokio::test]
+async fn test_rust_tuple_projection_plan_preserves_semantic_identity() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let tuple_path = ghostscope_dwarf::VariableAccessPath::new(vec![
+        ghostscope_dwarf::VariableAccessSegment::TupleIndex(0),
+    ]);
+    let (_, plan) = analyzer
+        .plan_global_access_read_plan(&binary_path, "GLOBAL_TUPLE", &tuple_path)?
+        .ok_or_else(|| anyhow::anyhow!("expected GLOBAL_TUPLE.0 read plan"))?;
+
+    assert_eq!(plan.name, "GLOBAL_TUPLE.0");
+    assert_eq!(plan.access_path, tuple_path);
+    assert!(plan.type_id.is_some(), "plan: {plan:?}");
+    let semantic_type = analyzer
+        .semantic_type_for_plan(&plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected semantic type for GLOBAL_TUPLE.0"))?;
+    assert_eq!(semantic_type.id, plan.type_id);
+    assert_eq!(
+        semantic_type.origin.map(|origin| origin.language),
+        Some(ghostscope_dwarf::SourceLanguage::Rust)
+    );
+
+    let (_, pair_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "GLOBAL_PAIR",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected GLOBAL_PAIR read plan"))?;
+    let pair_type = pair_plan
+        .dwarf_type
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("expected GLOBAL_PAIR type"))?;
+    let layout = analyzer.tuple_member_layout_in_module(&binary_path, pair_type, 1)?;
+    assert_eq!(layout.offset, 4);
+    assert_eq!(layout.member_type.type_name(), "i32");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_tuple_fields() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    let pair_index = 1;
+    print "RTUP:{}:{}", GLOBAL_TUPLE.0, GLOBAL_TUPLE.1;
+    print "RPAIR:{}:{}", GLOBAL_PAIR.0, GLOBAL_PAIR.1;
+    print "DPAIR:{}", GLOBAL_PAIRS[pair_index].0;
+    print "CPAIR:{}", cast(&GLOBAL_PAIR, "Pair *").0;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RTUP:") && (line.contains(":true") || line.contains(":false"))
+        }),
+        "Expected typed tuple output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            let Some((_, payload)) = line.split_once("RPAIR:") else {
+                return false;
+            };
+            let mut fields = payload.split(':');
+            let Some(left) = fields.next() else {
+                return false;
+            };
+            let Some(right) = fields.next() else {
+                return false;
+            };
+            left.trim().parse::<i64>().is_ok()
+                && right
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|value| value.parse::<i64>().is_ok())
+        }),
+        "Expected typed tuple struct output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+    assert!(
+        stdout.contains("DPAIR:13"),
+        "Expected dynamic-index tuple output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.split_once("CPAIR:")
+                .and_then(|(_, value)| value.split_whitespace().next())
+                .is_some_and(|value| value.parse::<i64>().is_ok())
+        }),
+        "Expected cast tuple output: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_globals() -> anyhow::Result<()> {
     init();
 

@@ -548,6 +548,47 @@ fn field_access_adds_member_offset_and_type() {
 }
 
 #[test]
+fn resolved_tuple_access_uses_dwarf_field_but_preserves_source_path() {
+    let int_type = TypeInfo::BaseType {
+        name: "i32".to_string(),
+        size: 4,
+        encoding: gimli::constants::DW_ATE_signed.0 as u16,
+    };
+    let plan = typed_read_plan(
+        VariableLocation::Address(AddressExpr::constant(0x1000)),
+        TypeInfo::StructType {
+            name: "Pair".to_string(),
+            size: 8,
+            members: vec![StructMember {
+                name: "__1".to_string(),
+                member_type: int_type.clone(),
+                offset: 4,
+                bit_offset: None,
+                bit_size: None,
+            }],
+        },
+    );
+
+    let planned = plan
+        .plan_resolved_access_segment(
+            &VariableAccessSegment::TupleIndex(1),
+            &VariableAccessSegment::Field("__1".to_string()),
+        )
+        .expect("resolved tuple access");
+
+    assert_eq!(planned.name, "value.1");
+    assert_eq!(
+        planned.access_path.segments,
+        vec![VariableAccessSegment::TupleIndex(1)]
+    );
+    assert_eq!(planned.dwarf_type, Some(int_type));
+    assert_eq!(
+        planned.location,
+        VariableLocation::Address(AddressExpr::constant(0x1004))
+    );
+}
+
+#[test]
 fn field_access_unknown_member_reports_known_members() {
     let int_type = TypeInfo::BaseType {
         name: "int".to_string(),

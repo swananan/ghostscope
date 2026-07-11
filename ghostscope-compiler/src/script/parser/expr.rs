@@ -887,13 +887,25 @@ fn parse_postfix_access(pair: Pair<Rule>) -> Result<Expr> {
             .ok_or(ParseError::InvalidExpression)?;
         match suffix_inner.as_rule() {
             Rule::member_suffix => {
-                let field = suffix_inner
+                let member = suffix_inner
                     .into_inner()
                     .next()
-                    .ok_or(ParseError::InvalidExpression)?
-                    .as_str()
-                    .to_string();
-                expr = Expr::MemberAccess(Box::new(expr), field);
+                    .ok_or(ParseError::InvalidExpression)?;
+                match member.as_rule() {
+                    Rule::identifier => {
+                        expr = Expr::MemberAccess(Box::new(expr), member.as_str().to_string());
+                    }
+                    Rule::tuple_index => {
+                        let index = member.as_str().parse::<u32>().map_err(|_| {
+                            ParseError::TypeError(format!(
+                                "tuple index is out of range: {}",
+                                member.as_str()
+                            ))
+                        })?;
+                        expr = Expr::TupleAccess(Box::new(expr), index);
+                    }
+                    _ => return Err(ParseError::UnexpectedToken(member.as_rule())),
+                }
             }
             Rule::index_suffix => {
                 let index_pair = suffix_inner

@@ -210,6 +210,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 type_info: DynamicTypeInfo {
                     dwarf_type: pointee_type,
                     module_path,
+                    type_id: None,
                 },
             });
         }
@@ -220,6 +221,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             type_info: DynamicTypeInfo {
                 dwarf_type: target_type,
                 module_path,
+                type_id: None,
             },
         })
     }
@@ -244,7 +246,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         match ghostscope_dwarf::strip_type_aliases(&target_type) {
             DwarfType::PointerType { .. } => {
-                let Some(element_info) = Self::indexable_info_from_type(&target_type, module_path)
+                let Some(element_info) =
+                    Self::indexable_info_from_type(&target_type, module_path, None)
                 else {
                     return Ok(None);
                 };
@@ -252,7 +255,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 Ok(Some((element_info, base_address)))
             }
             DwarfType::ArrayType { .. } => {
-                let Some(element_info) = Self::indexable_info_from_type(&target_type, module_path)
+                let Some(element_info) =
+                    Self::indexable_info_from_type(&target_type, module_path, None)
                 else {
                     return Ok(None);
                 };
@@ -266,11 +270,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(super) fn indexable_info_from_type(
         dwarf_type: &DwarfType,
         module_path: Option<PathBuf>,
+        type_id: Option<ghostscope_dwarf::TypeId>,
     ) -> Option<IndexableElementInfo> {
         ghostscope_dwarf::indexable_element_layout(dwarf_type).map(|layout| IndexableElementInfo {
             element_type: layout.element_type,
             stride: layout.stride,
             module_path,
+            type_id,
         })
     }
 
@@ -324,6 +330,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             type_info: DynamicTypeInfo {
                 dwarf_type: element_info.element_type,
                 module_path: element_info.module_path,
+                type_id: element_info.type_id,
             },
         })
     }
