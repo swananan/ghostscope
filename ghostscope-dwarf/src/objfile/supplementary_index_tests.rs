@@ -27,6 +27,7 @@ async fn supplementary_accelerators_keep_cu_parsing_and_type_imports_lazy() -> a
                     false,
                     None,
                     None,
+                    None,
                 )
                 .await?;
                 assert!(
@@ -93,6 +94,7 @@ async fn supplementary_full_scan_defers_type_imports_until_a_type_query() -> any
         false,
         None,
         None,
+        None,
     )
     .await?;
     assert!(matches!(
@@ -124,6 +126,7 @@ async fn supplementary_rejected_accelerator_falls_back_to_working_dwarf() -> any
         ModuleMapping::from_path(fixture.binary),
         &[],
         false,
+        None,
         None,
         None,
     )
@@ -164,6 +167,7 @@ async fn cross_cu_declarations_load_definitions_only_when_projected() -> anyhow:
                     ModuleMapping::from_path(fixture.binary.clone()),
                     &[],
                     false,
+                    None,
                     None,
                     None,
                 )
@@ -255,4 +259,72 @@ fn build_cross_cu_fixture(
         .arg(format!("--add-section={section_name}={}", link.display()))
         .arg(&fixture.binary))?;
     Ok(fixture)
+}
+
+#[tokio::test]
+async fn prepared_scan_preserves_supplementary_lookups_and_lazy_lines() -> anyhow::Result<()> {
+    use crate::{AnalysisCache, AnalysisCacheStatus};
+    for standard in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let fixture = fixture::build_rust(dir.path(), standard, false)?;
+        let cache_dir = dir.path().join("cache");
+        let mut addresses = None;
+        for (cache, expected) in [
+            (
+                Some(AnalysisCache::new(&cache_dir)),
+                AnalysisCacheStatus::Miss,
+            ),
+            (
+                Some(AnalysisCache::read_only(&cache_dir)),
+                AnalysisCacheStatus::Hit,
+            ),
+            (None, AnalysisCacheStatus::Disabled),
+        ] {
+            let module = LoadedObjfile::load_parallel(
+                ModuleMapping::from_path(fixture.binary.clone()),
+                &[],
+                false,
+                None,
+                None,
+                cache,
+            )
+            .await?;
+            assert_eq!(module.analysis_cache_status(), &expected);
+            assert!(module.indexed_line_cus.lock().unwrap().is_empty());
+            let actual = module.lookup_function_addresses("tick");
+            assert!(!actual.is_empty());
+            if let Some(previous) = &addresses {
+                assert_eq!(previous, &actual);
+            }
+            addresses = Some(actual);
+            assert!(!module
+                .find_global_variables_by_name("foreign_payload")
+                .is_empty());
+            let ty = module
+                .type_name_index()?
+                .find_typedef("SharedAlias")
+                .unwrap();
+            assert_eq!(ty.object, DwarfObjectId::Supplementary);
+        }
+        indexes::add_index(&fixture.binary, Index::Gdb)?;
+        let native = LoadedObjfile::load_parallel(
+            ModuleMapping::from_path(fixture.binary.clone()),
+            &[],
+            false,
+            None,
+            None,
+            Some(AnalysisCache::new(dir.path().join("unused-cache"))),
+        )
+        .await?;
+        assert!(matches!(
+            native.dwarf_index_status,
+            DwarfIndexStatus::GdbIndex { .. }
+        ));
+        assert_eq!(
+            native.analysis_cache_status(),
+            &AnalysisCacheStatus::Disabled
+        );
+        assert!(!dir.path().join("unused-cache").exists());
+    }
+    Ok(())
 }

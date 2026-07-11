@@ -9,6 +9,7 @@ use object::{Endianness, Object};
 pub(crate) struct MappedFile {
     pub data: memmap2::Mmap,
     pub path: PathBuf,
+    pub metadata: Option<std::fs::Metadata>,
 }
 
 impl MappedFile {
@@ -16,11 +17,16 @@ impl MappedFile {
     pub fn open<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = std::fs::File::open(&path)?;
+        let metadata = file.metadata()?;
         // SAFETY: The file is opened read-only and this type exposes the mapping
         // immutably for object/DWARF parsing; callers must not concurrently modify
         // the mapped file while the mapping is alive.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        Ok(Self { data: mmap, path })
+        Ok(Self {
+            data: mmap,
+            path,
+            metadata: Some(metadata),
+        })
     }
 
     /// Borrow the mapped file bytes.

@@ -161,6 +161,19 @@ pub struct DwarfConfig {
     /// debuginfod client configuration.
     #[serde(default)]
     pub debuginfod: DwarfDebuginfodConfig,
+    /// Persistent cache for parsed, target-independent DWARF indices.
+    #[serde(default)]
+    pub analysis_cache: DwarfAnalysisCacheConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DwarfAnalysisCacheConfig {
+    /// Enable transparent reads from caches populated by prepare mode.
+    #[serde(default = "default_analysis_cache_enabled")]
+    pub enabled: bool,
+    /// Cache directory. Empty/absent uses the platform user cache directory.
+    #[serde(default)]
+    pub directory: Option<PathBuf>,
 }
 
 /// Source-language semantic value adapter limits.
@@ -385,6 +398,10 @@ fn default_debug_search_paths() -> Vec<String> {
     ]
 }
 
+fn default_analysis_cache_enabled() -> bool {
+    true
+}
+
 fn default_ringbuf_size() -> u64 {
     262144 // 256KB
 }
@@ -522,6 +539,16 @@ impl Default for DwarfConfig {
             backtrace_runtime_modules_max: default_backtrace_runtime_modules_max(),
             backtrace_runtime_module_timeout_ms: default_backtrace_runtime_module_timeout_ms(),
             debuginfod: DwarfDebuginfodConfig::default(),
+            analysis_cache: DwarfAnalysisCacheConfig::default(),
+        }
+    }
+}
+
+impl Default for DwarfAnalysisCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_analysis_cache_enabled(),
+            directory: None,
         }
     }
 }

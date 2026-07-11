@@ -1775,6 +1775,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await?;
         Ok((dir, module))
@@ -2114,6 +2115,7 @@ mod tests {
             crate::core::mapping::ModuleMapping::from_path(binary),
             &[],
             false,
+            None,
             None,
             None,
         )

@@ -195,6 +195,40 @@ ghostscope -p 1234 --debug-file /path/to/binary.debug
 # directories that you still rely on.
 ```
 
+### Preparing the Analysis Cache
+
+```bash
+# Runs without root or eBPF capabilities.
+ghostscope --prepare --target /path/to/binary
+
+# Use the same explicit debug file and cache directory during prepare and run.
+ghostscope --prepare -t /path/to/binary -d /path/to/binary.debug \
+  --analysis-cache-dir /var/cache/ghostscope
+ghostscope -p 1234 -t /path/to/binary --script-file trace.gs \
+  --analysis-cache-dir /var/cache/ghostscope
+```
+
+Prepare stores the full-scan `.debug_info` symbol and compilation-unit indexes.
+Usable `.debug_names`, `.gdb_index`, and GNU pubnames take priority; prepare reports
+that no cache is needed for these targets. Source-file headers are read normally,
+and source-line rows remain lazy. A tracing run still resolves PID namespaces,
+module load addresses, `dlopen` changes, CFI, and eBPF attachment at runtime.
+
+Entries are bound to the target, selected debug file, and supplementary debug
+file identities (including descriptor metadata), plus the cache schema and
+GhostScope version. Copying or replacing a file may require preparing again.
+Tracing opens entries read-only; only `--prepare` writes them. A checksum detects
+payload corruption. Use an explicit `--analysis-cache-dir` when prepare and
+tracing run as different users, since their default cache directories differ.
+
+This `--prepare` flag prepares an analysis index, independently of the
+`ghostscope prepare ...` subcommand that creates a script-specific trace bundle.
+See [analysis cache design](analysis-cache-design.md) for scope and validation.
+
+CLI startup reports and the TUI loading summary show cache hits, misses, and
+rejected entries. Misses and rejected entries are non-fatal: GhostScope parses
+the original DWARF data, while rejected entries also include a fallback reason.
+
 ### Logging Configuration
 
 ```bash
@@ -379,6 +413,9 @@ index is reported in CLI/TUI startup status before falling back.
 | `--backtrace-runtime-module-timeout-ms <MS>` | | Per-module runtime CFI loading timeout (`100..=600000`) | 5000 |
 | `--dry-run` | | Compile the script, resolve trace targets, and exit without attaching uprobes. Requires the same eBPF privileges and kernel capabilities as a real run. | Off |
 | `--dry-run-details` | | Include source, inline, and variable diagnostics in dry-run output; requires `--dry-run` | Off |
+| `--prepare` | | Parse `--target` debug data into the persistent analysis cache and exit. Does not require eBPF privileges. | Off |
+| `--analysis-cache-dir <DIR>` | | Override the parsed DWARF analysis cache directory | User cache directory |
+| `--no-analysis-cache` | | Disable persistent parsed DWARF analysis caching | Off |
 | `--status` | | Enable interactive DWARF/script/attach stderr status prompts | On |
 | `--no-status` | | Disable interactive DWARF/script/attach stderr status prompts | Off override |
 | `--script-timestamp <FORMAT>` | | Pretty output timestamp: local, boot, none | local |
@@ -526,6 +563,15 @@ backtrace_runtime_modules_max = 32
 # Per-module time budget. A timeout disables further automatic runtime CFI
 # loading for the session, while tracing and raw-address rendering continue.
 backtrace_runtime_module_timeout_ms = 5000
+[dwarf.analysis_cache]
+# Read full-scan debug_info indexes populated by
+# --prepare. Runtime PID filters, ASLR/module ranges, CFI map publication, and
+# eBPF attach state are resolved again for every tracing session.
+enabled = true
+
+# Leave unset to use $XDG_CACHE_HOME/ghostscope/analysis or
+# ~/.cache/ghostscope/analysis.
+# directory = "/home/user/.cache/ghostscope/analysis"
 
 [dwarf.debuginfod]
 # Optional debuginfod fallback for separate debug information.

@@ -11,9 +11,9 @@ pub use debug_info::{
     SourceFileGroup, SourceFileInfo, TargetDebugInfo, TargetType, VariableDebugInfo,
 };
 pub use runtime::{
-    ExecutionStatus, LoadStatus, ModuleLoadingStats, RuntimeCommand, RuntimeStatus,
-    ScriptCompilationDetails, ScriptExecutionResult, TraceDefinition, TraceDetailInfo,
-    TraceLoadDetail, TraceStatus, TraceSummaryInfo,
+    AnalysisCacheStatus, ExecutionStatus, LoadStatus, ModuleLoadingStats, RuntimeCommand,
+    RuntimeStatus, ScriptCompilationDetails, ScriptExecutionResult, TraceDefinition,
+    TraceDetailInfo, TraceLoadDetail, TraceStatus, TraceSummaryInfo,
 };
 pub use source_path::{PathSubstitution, SourcePathInfo};
 pub use trace_display::{

@@ -32,6 +32,7 @@ impl App {
             debug_source_path: None,
             dwarf_index: "unknown".to_string(),
             dwarf_index_warning: None,
+            analysis_cache_status: crate::events::AnalysisCacheStatus::Disabled,
         };
         self.state
             .loading_ui
@@ -222,6 +223,7 @@ impl App {
                     debug_source_path: stats.debug_source_path.clone(),
                     dwarf_index: stats.dwarf_index.clone(),
                     dwarf_index_warning: stats.dwarf_index_warning.clone(),
+                    analysis_cache_status: stats.analysis_cache_status.clone(),
                 };
                 self.state
                     .loading_ui

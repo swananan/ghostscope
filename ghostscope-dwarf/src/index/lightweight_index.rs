@@ -92,8 +92,8 @@ impl LightweightIndexShard {
     }
 }
 
-#[derive(Debug, Default)]
-struct NameIndexShard {
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NameIndexShard {
     entry_base: usize,
     function_map: HashMap<String, Vec<usize>>,
     function_fragment_map: HashMap<String, Vec<usize>>,
@@ -421,6 +421,81 @@ impl LightweightIndex {
 
     pub(crate) fn entry_count(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(crate) fn cache_entries(&self) -> &[IndexEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn cache_cu_ranges(&self) -> Vec<(u64, u64, DebugInfoOffset)> {
+        self.cu_ranges
+            .iter()
+            .map(|range| (range.start, range.end, range.cu))
+            .collect()
+    }
+
+    pub(crate) fn cache_names(&self) -> Vec<NameIndexShard> {
+        self.name_shards.clone()
+    }
+
+    pub(crate) fn from_cached_entries(
+        entries: Vec<IndexEntry>,
+        names: Vec<NameIndexShard>,
+        cu_ranges: Vec<(u64, u64, DebugInfoOffset)>,
+    ) -> anyhow::Result<Self> {
+        for shard in &names {
+            anyhow::ensure!(
+                shard.entry_base <= entries.len(),
+                "Invalid cached name shard base"
+            );
+            for map in [
+                &shard.function_map,
+                &shard.function_fragment_map,
+                &shard.variable_map,
+                &shard.variable_fragment_map,
+                &shard.type_map,
+            ] {
+                for indices in map.values() {
+                    anyhow::ensure!(
+                        indices
+                            .iter()
+                            .all(|&index| index < entries.len() - shard.entry_base),
+                        "Invalid cached name entry index"
+                    );
+                }
+            }
+        }
+        let shard = LightweightIndexShard {
+            entries,
+            ..Default::default()
+        };
+        let mut index = Self::from_shards(vec![shard]);
+        index.name_shards = names;
+        index.cu_ranges = cu_ranges
+            .into_iter()
+            .map(|(start, end, cu)| CuRange {
+                start,
+                end,
+                cu,
+                max_end: end,
+            })
+            .collect();
+        Self::finalize_cu_ranges(&mut index.cu_ranges);
+
+        let mut per_cu = HashMap::<DebugInfoOffset, BTreeMap<u64, usize>>::new();
+        for (idx, entry) in index.entries.iter().enumerate() {
+            if Self::is_function_tag(entry.tag) {
+                if let Some(address) = entry.representative_addr.or(entry.entry_pc) {
+                    per_cu
+                        .entry(entry.unit_offset)
+                        .or_default()
+                        .insert(address, idx);
+                }
+            }
+        }
+        index.func_addr_by_cu = per_cu;
+        index.cu_maps_built = true;
+        Ok(index)
     }
 
     /// Get total statistics

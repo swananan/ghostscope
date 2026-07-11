@@ -77,6 +77,7 @@ pub fn load_runtime_backtrace_metadata(
     // Reopening module_path here could parse a replacement under the old cookie.
     let mapped_file = Arc::new(MappedFile {
         data: probe.into_mmap(),
+        metadata: None,
         path: module_path.clone(),
     });
     budget.check()?;
