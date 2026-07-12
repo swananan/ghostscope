@@ -1,20 +1,143 @@
 //! Unified DWARF parser - true single-pass parsing
 
 use crate::{
-    binary::DwarfReader,
+    binary::{dwarf_reader_from_arc_with_endian, DwarfReader},
     core::{FunctionDieKind, IndexEntry, LineEntry, Result},
     index::{
         directory_from_index, resolve_file_path, LightweightFileIndex, LightweightIndex,
         LightweightIndexShard, LineMappingTable, ScopedFileIndexManager,
     },
 };
-use gimli::Reader;
+use gimli::{Reader, Section};
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 use tracing::debug;
+
+fn is_gdb2_name_index(header: &gimli::NameIndexHeader<DwarfReader>) -> Result<bool> {
+    let Some(augmentation) = header.augmentation_string() else {
+        return Ok(false);
+    };
+    Ok(augmentation.to_slice()?.starts_with(b"GDB2"))
+}
+
+fn checked_debug_names_table_size(count: u32, width: usize) -> Result<usize> {
+    usize::try_from(count)?
+        .checked_mul(width)
+        .ok_or_else(|| anyhow::anyhow!(".debug_names table size overflow"))
+}
+
+fn gdb2_abbreviation_range(
+    header: &gimli::NameIndexHeader<DwarfReader>,
+) -> Result<std::ops::Range<usize>> {
+    let word_size = usize::from(header.format().word_size());
+    let initial_length_size = match header.format() {
+        gimli::Format::Dwarf32 => 4,
+        gimli::Format::Dwarf64 => 12,
+    };
+    let augmentation_size = header.augmentation_string().map_or(0, gimli::Reader::len);
+    let padded_augmentation_size = augmentation_size
+        .checked_add(3)
+        .ok_or_else(|| anyhow::anyhow!(".debug_names augmentation size overflow"))?
+        & !3;
+
+    let mut start = header
+        .offset()
+        .0
+        .checked_add(initial_length_size + 2 + 2 + 7 * std::mem::size_of::<u32>())
+        .and_then(|offset| offset.checked_add(padded_augmentation_size))
+        .ok_or_else(|| anyhow::anyhow!(".debug_names header size overflow"))?;
+    for size in [
+        checked_debug_names_table_size(header.compile_unit_count(), word_size)?,
+        checked_debug_names_table_size(header.local_type_unit_count(), word_size)?,
+        checked_debug_names_table_size(
+            header.foreign_type_unit_count(),
+            std::mem::size_of::<u64>(),
+        )?,
+        checked_debug_names_table_size(header.bucket_count(), std::mem::size_of::<u32>())?,
+        if header.bucket_count() == 0 {
+            0
+        } else {
+            checked_debug_names_table_size(header.name_count(), std::mem::size_of::<u32>())?
+        },
+        checked_debug_names_table_size(header.name_count(), word_size)?,
+        checked_debug_names_table_size(header.name_count(), word_size)?,
+    ] {
+        start = start
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!(".debug_names table offset overflow"))?;
+    }
+    let end = start
+        .checked_add(usize::try_from(header.abbrev_table_size())?)
+        .ok_or_else(|| anyhow::anyhow!(".debug_names abbreviation size overflow"))?;
+    Ok(start..end)
+}
+
+fn read_debug_names_uleb128(bytes: &[u8], offset: &mut usize, end: usize) -> Result<u64> {
+    let mut value = 0_u64;
+    let mut shift = 0_u32;
+    loop {
+        if *offset >= end {
+            anyhow::bail!("truncated .debug_names abbreviation table");
+        }
+        let byte = bytes[*offset];
+        *offset += 1;
+        let low_bits = u64::from(byte & 0x7f);
+        if shift >= 64 || (shift == 63 && low_bits > 1) {
+            anyhow::bail!("overflowing ULEB128 in .debug_names abbreviation table");
+        }
+        value |= low_bits << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+    }
+}
+
+fn patch_gdb2_abbreviations(
+    bytes: &mut [u8],
+    range: std::ops::Range<usize>,
+    format: gimli::Format,
+) -> Result<()> {
+    if range.end > bytes.len() {
+        anyhow::bail!(".debug_names abbreviation table is out of bounds");
+    }
+    let replacement = match format {
+        gimli::Format::Dwarf32 => gimli::constants::DW_FORM_ref4.0,
+        gimli::Format::Dwarf64 => gimli::constants::DW_FORM_ref8.0,
+    };
+    let mut offset = range.start;
+    while offset < range.end {
+        let code = read_debug_names_uleb128(bytes, &mut offset, range.end)?;
+        if code == 0 {
+            break;
+        }
+        read_debug_names_uleb128(bytes, &mut offset, range.end)?;
+
+        loop {
+            let name = read_debug_names_uleb128(bytes, &mut offset, range.end)?;
+            let form_offset = offset;
+            let form = read_debug_names_uleb128(bytes, &mut offset, range.end)?;
+            if name == 0 && form == 0 {
+                break;
+            }
+            if name == 0 || form == 0 {
+                anyhow::bail!("invalid .debug_names abbreviation attribute");
+            }
+            if name == u64::from(gimli::constants::DW_IDX_die_offset.0)
+                && form == u64::from(gimli::constants::DW_FORM_ref_addr.0)
+            {
+                if offset != form_offset + 1 {
+                    anyhow::bail!("unsupported GDB2 DW_FORM_ref_addr encoding");
+                }
+                bytes[form_offset] = u8::try_from(replacement)?;
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Default)]
 struct FunctionMetadata {
@@ -96,6 +219,7 @@ type InfoShard = LightweightIndexShard;
 struct LineShard {
     line_entries: Vec<crate::core::LineEntry>,
     compilation_units: HashMap<String, CompilationUnit>,
+    source_unit_offsets: Vec<(String, gimli::DebugInfoOffset)>,
     file_indices: Vec<(String, LightweightFileIndex)>,
     files_count: usize,
 }
@@ -106,6 +230,7 @@ pub(crate) struct DwarfParseResult {
     pub line_mapping: LineMappingTable,
     pub scoped_file_manager: ScopedFileIndexManager,
     pub compilation_units: HashMap<String, CompilationUnit>,
+    pub line_source_unit_offsets: HashMap<String, Vec<gimli::DebugInfoOffset>>,
     pub stats: DwarfParseStats,
 }
 
@@ -114,6 +239,7 @@ pub(crate) struct LineParseResult {
     pub line_mapping: LineMappingTable,
     pub scoped_file_manager: ScopedFileIndexManager,
     pub compilation_units: HashMap<String, CompilationUnit>,
+    pub source_unit_offsets: HashMap<String, Vec<gimli::DebugInfoOffset>>,
     pub line_entries_count: usize,
     pub files_count: usize,
 }
@@ -1022,15 +1148,46 @@ impl<'a> DwarfParser<'a> {
     }
 
     /// Parse debug_line sections (for parallel processing)
+    #[cfg(test)]
     pub fn parse_line_info(&self, module_path: &str) -> Result<LineParseResult> {
+        self.parse_line_info_units(module_path, None, true)
+    }
+
+    pub(crate) fn parse_line_headers(&self, module_path: &str) -> Result<LineParseResult> {
+        self.parse_line_info_units(module_path, None, false)
+    }
+
+    pub(crate) fn parse_line_info_cus(
+        &self,
+        module_path: &str,
+        unit_offsets: &[gimli::DebugInfoOffset],
+    ) -> Result<LineParseResult> {
+        self.parse_line_info_units(module_path, Some(unit_offsets), true)
+    }
+
+    fn parse_line_info_units(
+        &self,
+        module_path: &str,
+        unit_offsets: Option<&[gimli::DebugInfoOffset]>,
+        include_rows: bool,
+    ) -> Result<LineParseResult> {
         debug!("Starting debug_line-only parsing for: {}", module_path);
 
         // Collect CU headers once
-        let mut headers: Vec<gimli::UnitHeader<DwarfReader>> = Vec::new();
-        let mut units = self.dwarf.units();
-        while let Some(header) = units.next()? {
-            headers.push(header);
-        }
+        let mut headers: Vec<gimli::UnitHeader<DwarfReader>> =
+            if let Some(unit_offsets) = unit_offsets {
+                unit_offsets
+                    .iter()
+                    .map(|unit_offset| self.dwarf.unit_header(*unit_offset).map_err(Into::into))
+                    .collect::<Result<_>>()?
+            } else {
+                let mut headers = Vec::new();
+                let mut units = self.dwarf.units();
+                while let Some(header) = units.next()? {
+                    headers.push(header);
+                }
+                headers
+            };
 
         // Sort headers by size (descending) for better load balance under work-stealing
         headers.sort_by_key(|h| std::cmp::Reverse(h.length_including_self() as u64));
@@ -1083,71 +1240,84 @@ impl<'a> DwarfParser<'a> {
                         &unit,
                         line_program,
                     )?;
+                    if let Some(unit_offset) = unit.header.debug_info_offset() {
+                        for file in &compilation_unit.files {
+                            for source_path in [&file.full_path, &file.filename] {
+                                if !source_path.is_empty() {
+                                    shard
+                                        .source_unit_offsets
+                                        .push((source_path.clone(), unit_offset));
+                                }
+                            }
+                        }
+                    }
                     shard.files_count += compilation_unit.files.len();
                     shard
                         .compilation_units
                         .insert(cu_name.clone(), compilation_unit);
                     shard.file_indices.push((cu_name.clone(), file_index));
 
-                    // Extract line rows for this CU
-                    let (line_program, sequences) = line_program.clone().sequences()?;
-                    for seq in sequences {
-                        let mut rows = line_program.resume_from(&seq);
-                        let mut pending_entries: Vec<LineEntry> = Vec::new();
-                        let mut pending_address: Option<u64> = None;
-                        while let Some((_, line_row)) = rows.next_row()? {
-                            let row_address = line_row.address();
-                            if line_row.end_sequence() {
-                                Self::flush_pending_line_entries(
-                                    &mut shard.line_entries,
-                                    &mut pending_entries,
-                                    Some(row_address),
-                                );
-                                pending_address = None;
-                                continue;
-                            }
-
-                            if let Some(address) = pending_address {
-                                if row_address > address {
+                    // Extract line rows for this CU only when a query needs them.
+                    if include_rows {
+                        let (line_program, sequences) = line_program.clone().sequences()?;
+                        for seq in sequences {
+                            let mut rows = line_program.resume_from(&seq);
+                            let mut pending_entries: Vec<LineEntry> = Vec::new();
+                            let mut pending_address: Option<u64> = None;
+                            while let Some((_, line_row)) = rows.next_row()? {
+                                let row_address = line_row.address();
+                                if line_row.end_sequence() {
                                     Self::flush_pending_line_entries(
                                         &mut shard.line_entries,
                                         &mut pending_entries,
                                         Some(row_address),
                                     );
-                                    pending_address = Some(row_address);
-                                } else if row_address < address {
-                                    Self::flush_pending_line_entries(
-                                        &mut shard.line_entries,
-                                        &mut pending_entries,
-                                        None,
-                                    );
+                                    pending_address = None;
+                                    continue;
+                                }
+
+                                if let Some(address) = pending_address {
+                                    if row_address > address {
+                                        Self::flush_pending_line_entries(
+                                            &mut shard.line_entries,
+                                            &mut pending_entries,
+                                            Some(row_address),
+                                        );
+                                        pending_address = Some(row_address);
+                                    } else if row_address < address {
+                                        Self::flush_pending_line_entries(
+                                            &mut shard.line_entries,
+                                            &mut pending_entries,
+                                            None,
+                                        );
+                                        pending_address = Some(row_address);
+                                    }
+                                } else {
                                     pending_address = Some(row_address);
                                 }
-                            } else {
-                                pending_address = Some(row_address);
-                            }
 
-                            let column = match line_row.column() {
-                                gimli::ColumnType::LeftEdge => 0,
-                                gimli::ColumnType::Column(x) => x.get(),
-                            };
-                            pending_entries.push(LineEntry {
-                                address: row_address,
-                                end_address: None,
-                                file_path: String::new(),
-                                file_index: line_row.file_index(),
-                                compilation_unit: std::sync::Arc::from(cu_name.as_str()),
-                                line: line_row.line().map(|l| l.get()).unwrap_or(0),
-                                column,
-                                is_stmt: line_row.is_stmt(),
-                                prologue_end: line_row.prologue_end(),
-                            });
+                                let column = match line_row.column() {
+                                    gimli::ColumnType::LeftEdge => 0,
+                                    gimli::ColumnType::Column(x) => x.get(),
+                                };
+                                pending_entries.push(LineEntry {
+                                    address: row_address,
+                                    end_address: None,
+                                    file_path: String::new(),
+                                    file_index: line_row.file_index(),
+                                    compilation_unit: std::sync::Arc::from(cu_name.as_str()),
+                                    line: line_row.line().map(|l| l.get()).unwrap_or(0),
+                                    column,
+                                    is_stmt: line_row.is_stmt(),
+                                    prologue_end: line_row.prologue_end(),
+                                });
+                            }
+                            Self::flush_pending_line_entries(
+                                &mut shard.line_entries,
+                                &mut pending_entries,
+                                None,
+                            );
                         }
-                        Self::flush_pending_line_entries(
-                            &mut shard.line_entries,
-                            &mut pending_entries,
-                            None,
-                        );
                     }
                 }
                 Ok(shard)
@@ -1158,6 +1328,7 @@ impl<'a> DwarfParser<'a> {
         let mut scoped_file_manager = ScopedFileIndexManager::new();
         let mut line_entries = Vec::new();
         let mut compilation_units: HashMap<String, CompilationUnit> = HashMap::new();
+        let mut source_unit_offsets: HashMap<String, Vec<gimli::DebugInfoOffset>> = HashMap::new();
         let mut total_files = 0usize;
 
         for sr in shard_results {
@@ -1167,9 +1338,19 @@ impl<'a> DwarfParser<'a> {
             for (cu, cuinfo) in shard.compilation_units {
                 compilation_units.insert(cu, cuinfo);
             }
+            for (source_path, unit_offset) in shard.source_unit_offsets {
+                source_unit_offsets
+                    .entry(source_path)
+                    .or_default()
+                    .push(unit_offset);
+            }
             for (cu, fi) in shard.file_indices {
                 scoped_file_manager.add_compilation_unit(cu, fi);
             }
+        }
+        for offsets in source_unit_offsets.values_mut() {
+            offsets.sort_unstable_by_key(|offset| offset.0);
+            offsets.dedup();
         }
 
         // Build final line mapping
@@ -1189,9 +1370,197 @@ impl<'a> DwarfParser<'a> {
             line_mapping,
             scoped_file_manager,
             compilation_units,
+            source_unit_offsets,
             line_entries_count: total_line_entries,
             files_count: total_files,
         })
+    }
+
+    fn compatible_debug_names(&self) -> Result<gimli::DebugNames<DwarfReader>> {
+        let mut patches = Vec::new();
+        let mut headers = self.dwarf.debug_names.headers();
+        while let Some(header) = headers.next()? {
+            if is_gdb2_name_index(&header)? {
+                patches.push((gdb2_abbreviation_range(&header)?, header.format()));
+            }
+        }
+        if patches.is_empty() {
+            return Ok(self.dwarf.debug_names.clone());
+        }
+
+        let reader = self.dwarf.debug_names.reader();
+        let endian = reader.endian();
+        let mut bytes = reader.to_slice()?.into_owned();
+        for (range, format) in patches {
+            patch_gdb2_abbreviations(&mut bytes, range, format)?;
+        }
+        Ok(gimli::DebugNames::from(dwarf_reader_from_arc_with_endian(
+            Arc::from(bytes),
+            endian,
+        )))
+    }
+
+    fn debug_names_die_offset(
+        &self,
+        unit_offset: gimli::DebugInfoOffset,
+        die_offset: gimli::UnitOffset,
+        gdb2: bool,
+    ) -> Result<gimli::UnitOffset> {
+        if !gdb2 {
+            return Ok(die_offset);
+        }
+
+        let relative = die_offset.0.checked_sub(unit_offset.0).ok_or_else(|| {
+            anyhow::anyhow!(
+                "GDB2 .debug_names DIE offset 0x{:x} precedes CU 0x{:x}",
+                die_offset.0,
+                unit_offset.0
+            )
+        })?;
+        let header = self.dwarf.unit_header(unit_offset)?;
+        if relative >= header.length_including_self() {
+            anyhow::bail!(
+                "GDB2 .debug_names DIE offset 0x{:x} is outside CU 0x{:x}",
+                die_offset.0,
+                unit_offset.0
+            );
+        }
+        Ok(gimli::UnitOffset(relative))
+    }
+
+    /// Parse debug_info sections (for parallel processing)
+    pub(crate) fn parse_debug_names(&self, module_path: &str) -> Result<Option<DebugParseResult>> {
+        debug!("Starting .debug_names parsing for: {}", module_path);
+        let debug_names = self.compatible_debug_names()?;
+        let mut headers = debug_names.headers();
+        let mut shards = Vec::new();
+        let mut saw_index = false;
+
+        while let Some(header) = headers.next()? {
+            saw_index = true;
+            let gdb2 = is_gdb2_name_index(&header)?;
+            let names = header.index()?;
+            let mut shard = LightweightIndexShard::default();
+
+            for name_index in names.names() {
+                let name = names
+                    .name_string(name_index, &self.dwarf.debug_str)?
+                    .to_string_lossy()?
+                    .into_owned();
+                let mut entries = names.name_entries(name_index)?;
+                while let Some(entry) = entries.next()? {
+                    let unit_offset = match entry.type_unit(&names)? {
+                        Some(gimli::NameTypeUnit::Local(unit)) => unit,
+                        Some(gimli::NameTypeUnit::Foreign(_)) => continue,
+                        None => {
+                            let Some(cu) = entry
+                                .compile_unit(&names)?
+                                .or(names.default_compile_unit()?)
+                            else {
+                                continue;
+                            };
+                            cu
+                        }
+                    };
+                    let Some(die_offset) = entry.die_offset()? else {
+                        continue;
+                    };
+                    let die_offset = self.debug_names_die_offset(unit_offset, die_offset, gdb2)?;
+                    let tag = entry.tag;
+                    let function_kind = match tag {
+                        gimli::constants::DW_TAG_subprogram => FunctionDieKind::ConcreteSubprogram,
+                        gimli::constants::DW_TAG_inlined_subroutine => {
+                            FunctionDieKind::InlineInstance
+                        }
+                        _ => FunctionDieKind::NotFunction,
+                    };
+                    let index_entry = IndexEntry {
+                        name: Arc::from(name.as_str()),
+                        die_offset,
+                        unit_offset,
+                        tag,
+                        flags: crate::core::IndexFlags {
+                            is_main: name == "main" || name == "_main",
+                            ..Default::default()
+                        },
+                        language: None,
+                        representative_addr: None,
+                        entry_pc: None,
+                        function_kind,
+                    };
+
+                    match tag {
+                        gimli::constants::DW_TAG_subprogram
+                        | gimli::constants::DW_TAG_inlined_subroutine => {
+                            shard.push_function_entry(name.clone(), index_entry);
+                        }
+                        gimli::constants::DW_TAG_variable => {
+                            shard.push_variable_entry(name.clone(), index_entry);
+                        }
+                        gimli::constants::DW_TAG_structure_type
+                        | gimli::constants::DW_TAG_class_type
+                        | gimli::constants::DW_TAG_union_type
+                        | gimli::constants::DW_TAG_enumeration_type
+                        | gimli::constants::DW_TAG_typedef => {
+                            shard.push_type_entry(name.clone(), index_entry);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            shards.push(shard);
+        }
+
+        if !saw_index {
+            return Ok(None);
+        }
+
+        let mut lightweight_index = LightweightIndex::from_shards(shards);
+        let functions_count = lightweight_index.get_stats().0;
+        let variables_count = lightweight_index.get_stats().1;
+        let has_aranges = lightweight_index.build_cu_maps_from_aranges(self.dwarf);
+        let has_root_ranges = lightweight_index.build_cu_maps_from_roots(self.dwarf);
+        let has_cu_ranges = has_aranges || has_root_ranges;
+        if !has_cu_ranges && functions_count > 0 {
+            anyhow::bail!(
+                ".debug_names for {module_path} has functions but no usable address-to-CU ranges",
+            );
+        }
+
+        debug!(
+            "Completed .debug_names parsing for {}: {} functions, {} variables",
+            module_path, functions_count, variables_count
+        );
+        Ok(Some(DebugParseResult {
+            lightweight_index,
+            functions_count,
+            variables_count,
+        }))
+    }
+
+    pub(crate) fn parse_debug_info_cus(
+        &self,
+        unit_offsets: &[gimli::DebugInfoOffset],
+    ) -> Result<Vec<LightweightIndexShard>> {
+        unit_offsets
+            .par_iter()
+            .map(|unit_offset| {
+                let header = self.dwarf.unit_header(*unit_offset)?;
+                let unit = self.dwarf.unit(header)?;
+                let cu_lang = self.extract_language(self.dwarf, &unit);
+                self.process_unit_shard(&unit, *unit_offset, cu_lang)
+            })
+            .collect()
+    }
+
+    pub(crate) fn initialize_lazy_debug_info(&self) -> DebugParseResult {
+        let mut lightweight_index = LightweightIndex::new();
+        lightweight_index.build_cu_maps_from_aranges(self.dwarf);
+        DebugParseResult {
+            lightweight_index,
+            functions_count: 0,
+            variables_count: 0,
+        }
     }
 
     /// Parse debug_info sections (for parallel processing)
@@ -1256,6 +1625,7 @@ impl<'a> DwarfParser<'a> {
             line_mapping,
             scoped_file_manager,
             compilation_units,
+            source_unit_offsets,
             line_entries_count,
             files_count,
         } = line_result;
@@ -1272,6 +1642,7 @@ impl<'a> DwarfParser<'a> {
             line_mapping,
             scoped_file_manager,
             compilation_units,
+            line_source_unit_offsets: source_unit_offsets,
             stats,
         }
     }

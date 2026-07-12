@@ -204,8 +204,7 @@ impl ModuleLoader {
                     match result {
                         Ok(module) => {
                             // Extract stats for progress reporting
-                            let (functions, variables, types) =
-                                module.get_lightweight_index().get_stats();
+                            let (functions, variables, types) = module.get_index_stats();
                             let (parse_time_ms, index_time_ms, module_total_time_ms) =
                                 module.get_load_timing_ms();
                             let stats = ModuleLoadingStats {
@@ -213,6 +212,7 @@ impl ModuleLoader {
                                 variables,
                                 types,
                                 debug_info_source: module.get_debug_info_source().clone(),
+                                dwarf_index_status: module.dwarf_index_status().clone(),
                                 load_time_ms,
                                 parse_time_ms,
                                 index_time_ms,

@@ -30,6 +30,8 @@ impl App {
             types,
             debug_source: "unknown".to_string(),
             debug_source_path: None,
+            dwarf_index: "unknown".to_string(),
+            dwarf_index_warning: None,
         };
         self.state
             .loading_ui
@@ -218,6 +220,8 @@ impl App {
                     types: stats.types,
                     debug_source: stats.debug_source.clone(),
                     debug_source_path: stats.debug_source_path.clone(),
+                    dwarf_index: stats.dwarf_index.clone(),
+                    dwarf_index_warning: stats.dwarf_index_warning.clone(),
                 };
                 self.state
                     .loading_ui

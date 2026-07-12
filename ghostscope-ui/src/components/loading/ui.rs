@@ -260,6 +260,7 @@ impl LoadingUI {
             lines.push(Line::from(source_spans));
             append_debug_source_details(&mut lines, &self.progress);
         }
+        append_dwarf_index_details(&mut lines, &self.progress);
 
         // Empty line
         lines.push(Line::from(""));
@@ -415,6 +416,53 @@ impl LoadingUI {
         )));
 
         f.render_widget(paragraph, area);
+    }
+}
+
+fn append_dwarf_index_details(lines: &mut Vec<Line<'static>>, progress: &LoadingProgress) {
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    let mut rejected = Vec::new();
+    for module in progress
+        .modules
+        .iter()
+        .filter(|module| matches!(module.state, ModuleState::Completed))
+    {
+        let Some(stats) = module.stats.as_ref() else {
+            continue;
+        };
+        *counts.entry(stats.dwarf_index.as_str()).or_default() += 1;
+        if let Some(reason) = stats.dwarf_index_warning.as_deref() {
+            rejected.push((module, reason));
+        }
+    }
+
+    if !counts.is_empty() {
+        let summary = counts
+            .into_iter()
+            .map(|(label, count)| format!("{label}:{count}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        lines.push(Line::from(vec![
+            Span::styled("• DWARF indexes: ", Style::default().fg(Color::White)),
+            Span::styled(summary, Style::default().fg(Color::Cyan)),
+        ]));
+    }
+
+    if !rejected.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "• DWARF index fallback:",
+            Style::default().fg(Color::Yellow),
+        )));
+        for (module, reason) in rejected.iter().take(MAX_WELCOME_DEBUG_SOURCE_DETAILS) {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {}  {}",
+                    shorten_middle(&module_file_name(&module.path), 34),
+                    shorten_middle(reason, 120)
+                ),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
     }
 }
 
@@ -583,6 +631,8 @@ mod tests {
                 debug_source_path: Some(
                     "/usr/local/openresty/luajit/lib/libluajit-5.1.so.2.1.ROLLING".to_string(),
                 ),
+                dwarf_index: ".gdb_index-v9".to_string(),
+                dwarf_index_warning: None,
             },
         );
 
@@ -597,12 +647,15 @@ mod tests {
                 types: 0,
                 debug_source: "missing".to_string(),
                 debug_source_path: None,
+                dwarf_index: "full-scan".to_string(),
+                dwarf_index_warning: None,
             },
         );
 
         let text = plain_text(&loading_ui.create_welcome_message(1.25));
 
         assert!(text.contains("Debug sources: embedded:1"));
+        assert!(text.contains("DWARF indexes: .gdb_index-v9:1"));
         assert!(text.contains("missing:1"));
         assert!(text.contains("Debug source files:"));
         assert!(text.contains("embedded"));

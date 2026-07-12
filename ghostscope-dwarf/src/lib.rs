@@ -22,10 +22,10 @@ pub(crate) mod analyzer;
 
 // Re-export main public API only
 pub use analyzer::{
-    AddressQueryResult, AnalyzerStats, DwarfAnalyzer, ExecutableFileInfo, FunctionQueryResult,
-    LoadedModuleRuntimeInfo, MainExecutableInfo, ModuleDefaultPolicy, ModuleLoadingEvent,
-    ModuleLoadingStats, ModuleStats, SectionInfo, SharedLibraryInfo, SimpleFileInfo,
-    SourceLineAddressSearch, SourceLineQuerySearch, TypeLookupAmbiguity,
+    AddressQueryResult, AnalyzerStats, DwarfAnalyzer, DwarfIndexStatus, ExecutableFileInfo,
+    FunctionQueryResult, LoadedModuleRuntimeInfo, MainExecutableInfo, ModuleDefaultPolicy,
+    ModuleLoadingEvent, ModuleLoadingStats, ModuleStats, SectionInfo, SharedLibraryInfo,
+    SimpleFileInfo, SourceLineAddressSearch, SourceLineQuerySearch, TypeLookupAmbiguity,
 };
 pub use loader::ExplicitDebugFile;
 

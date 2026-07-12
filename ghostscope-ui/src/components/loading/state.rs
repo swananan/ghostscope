@@ -75,6 +75,8 @@ pub struct ModuleStats {
     pub types: usize,
     pub debug_source: String,
     pub debug_source_path: Option<String>,
+    pub dwarf_index: String,
+    pub dwarf_index_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -259,6 +261,8 @@ impl LoadingProgress {
             types: 0,
             debug_source: "summary".to_string(),
             debug_source_path: None,
+            dwarf_index: "summary".to_string(),
+            dwarf_index_warning: None,
         };
 
         for module in &self.modules {

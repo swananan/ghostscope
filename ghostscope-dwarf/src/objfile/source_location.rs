@@ -13,10 +13,20 @@ mod file_selection_scoring {
 
 impl LoadedObjfile {
     pub(crate) fn lookup_source_location(&self, address: u64) -> Option<SourceLocation> {
-        let all_line_entries = self.line_mapping.lookup_all_lines_at_address(address);
+        if let Err(error) = self.ensure_line_info_for_address(address) {
+            tracing::warn!(
+                "Failed to load line information for address 0x{address:x} in {}: {error}",
+                self.module_path().display()
+            );
+        }
+        let line_mapping = self
+            .line_mapping
+            .read()
+            .expect("line mapping lock poisoned");
+        let all_line_entries = line_mapping.lookup_all_lines_at_address(address);
 
         if all_line_entries.is_empty() {
-            if let Some(line_entry) = self.line_mapping.lookup_line(address) {
+            if let Some(line_entry) = line_mapping.lookup_line(address) {
                 return self.create_source_location_from_entry(line_entry);
             }
             return None;
@@ -24,7 +34,8 @@ impl LoadedObjfile {
 
         let best_entry = if all_line_entries.len() == 1 {
             let entry = all_line_entries[0];
-            self.find_alternative_source_file(entry).unwrap_or(entry)
+            self.find_alternative_source_file(&line_mapping, entry)
+                .unwrap_or(entry)
         } else {
             self.select_best_line_entry(&all_line_entries)
         };
@@ -38,7 +49,19 @@ impl LoadedObjfile {
         file_path: &str,
         line_number: u32,
     ) -> Option<SourceLocation> {
-        let all_line_entries = self.line_mapping.lookup_all_lines_at_address(address);
+        if let Err(error) = self.ensure_line_info_for_source(file_path) {
+            tracing::warn!(
+                "Failed to load line information for {} in {}: {}",
+                file_path,
+                self.module_path().display(),
+                error
+            );
+        }
+        let line_mapping = self
+            .line_mapping
+            .read()
+            .expect("line mapping lock poisoned");
+        let all_line_entries = line_mapping.lookup_all_lines_at_address(address);
         let matching_entries: Vec<_> = all_line_entries
             .iter()
             .copied()
@@ -49,6 +72,7 @@ impl LoadedObjfile {
             .collect();
 
         if matching_entries.is_empty() {
+            drop(line_mapping);
             return self.lookup_source_location(address);
         }
 
@@ -69,6 +93,7 @@ impl LoadedObjfile {
 
     fn find_alternative_source_file<'a>(
         &'a self,
+        line_mapping: &'a crate::index::LineMappingTable,
         entry: &'a crate::core::LineEntry,
     ) -> Option<&'a crate::core::LineEntry> {
         let current_file_path = self.get_file_path_for_entry(entry)?;
@@ -92,8 +117,7 @@ impl LoadedObjfile {
         let start_addr = entry.address.saturating_sub(search_range);
         let end_addr = entry.address.saturating_add(search_range);
 
-        for (addr, candidate_entry) in self.line_mapping.get_entries_in_range(start_addr, end_addr)
-        {
+        for (addr, candidate_entry) in line_mapping.get_entries_in_range(start_addr, end_addr) {
             if candidate_entry.compilation_unit != entry.compilation_unit {
                 continue;
             }
@@ -117,6 +141,8 @@ impl LoadedObjfile {
 
         if let Some(cu_file_index) = self
             .scoped_file_manager
+            .read()
+            .expect("scoped file index lock poisoned")
             .get_cu_file_index(&entry.compilation_unit)
         {
             for file_entry in cu_file_index.file_entries() {
@@ -235,6 +261,8 @@ impl LoadedObjfile {
 
         if let Some(full_path) = self
             .scoped_file_manager
+            .read()
+            .expect("scoped file index lock poisoned")
             .lookup_by_scoped_index(&entry.compilation_unit, entry.file_index)
         {
             return Some(full_path);
@@ -260,6 +288,8 @@ impl LoadedObjfile {
         {
             if let Some(resolved_full_path) = self
                 .scoped_file_manager
+                .read()
+                .expect("scoped file index lock poisoned")
                 .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
             {
                 if self.is_path_like(&resolved_full_path) {
@@ -298,6 +328,8 @@ impl LoadedObjfile {
         let preferred_file_path = {
             let current_path = self
                 .scoped_file_manager
+                .read()
+                .expect("scoped file index lock poisoned")
                 .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
                 .unwrap_or_else(|| line_entry.file_path.clone());
 
@@ -365,7 +397,11 @@ impl LoadedObjfile {
     }
 
     fn find_main_source_file_in_cu(&self, compilation_unit: &str) -> Option<String> {
-        if let Some(cu_file_index) = self.scoped_file_manager.get_cu_file_index(compilation_unit) {
+        let scoped_file_manager = self
+            .scoped_file_manager
+            .read()
+            .expect("scoped file index lock poisoned");
+        if let Some(cu_file_index) = scoped_file_manager.get_cu_file_index(compilation_unit) {
             tracing::debug!(
                 "find_main_source_file_in_cu: searching for main source file in CU '{}'",
                 compilation_unit
@@ -410,8 +446,18 @@ impl LoadedObjfile {
         file_path: &str,
         line_number: u32,
     ) -> Vec<u64> {
+        if let Err(error) = self.ensure_line_info_for_source(file_path) {
+            tracing::warn!(
+                "Failed to load line information for {} in {}: {}",
+                file_path,
+                self.module_path().display(),
+                error
+            );
+        }
         let addresses = self
             .line_mapping
+            .read()
+            .expect("line mapping lock poisoned")
             .lookup_addresses_by_path(file_path, line_number as u64);
 
         if !addresses.is_empty() {
@@ -438,7 +484,11 @@ impl LoadedObjfile {
         let mut source_files = Vec::new();
         let mut seen_paths = HashSet::new();
 
-        for cu in self.compilation_units.values() {
+        let compilation_units = self
+            .compilation_units
+            .read()
+            .expect("compilation unit lock poisoned");
+        for cu in compilation_units.values() {
             for file in &cu.files {
                 if seen_paths.insert(file.full_path.clone()) {
                     source_files.push(file.clone());

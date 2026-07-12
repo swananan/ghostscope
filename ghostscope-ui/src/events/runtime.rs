@@ -367,6 +367,8 @@ pub struct ModuleLoadingStats {
     pub types: usize,
     pub debug_source: String,
     pub debug_source_path: Option<String>,
+    pub dwarf_index: String,
+    pub dwarf_index_warning: Option<String>,
     pub load_time_ms: u64,
 }
 

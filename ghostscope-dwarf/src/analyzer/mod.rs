@@ -44,6 +44,17 @@ pub struct DwarfAnalyzer {
 }
 
 impl DwarfAnalyzer {
+    pub fn dwarf_index_status_for_module<P: AsRef<Path>>(
+        &self,
+        module_path: P,
+    ) -> Option<&DwarfIndexStatus> {
+        let module_path = module_path.as_ref();
+        self.modules
+            .iter()
+            .find(|(path, _)| Self::module_paths_equivalent(path, module_path))
+            .map(|(_, module)| module.dwarf_index_status())
+    }
+
     fn build_address_query_result(
         &self,
         module_address: &ModuleAddress,
@@ -703,7 +714,7 @@ impl DwarfAnalyzer {
         .await
         {
             Ok(module_data) => {
-                let (functions, variables, types) = module_data.get_lightweight_index().get_stats();
+                let (functions, variables, types) = module_data.get_index_stats();
                 let (parse_time_ms, index_time_ms, module_total_time_ms) =
                     module_data.get_load_timing_ms();
                 progress_callback(ModuleLoadingEvent::LoadingCompleted {
@@ -713,6 +724,7 @@ impl DwarfAnalyzer {
                         variables,
                         types,
                         debug_info_source: module_data.get_debug_info_source().clone(),
+                        dwarf_index_status: module_data.dwarf_index_status().clone(),
                         load_time_ms: start_time.elapsed().as_millis() as u64,
                         parse_time_ms,
                         index_time_ms,

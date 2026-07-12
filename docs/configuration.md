@@ -229,6 +229,13 @@ Behavior:
 - `--all --force` removes all `pid-starttime` directories, including live ones.
 - Legacy numeric directories are ignored.
 
+### Native DWARF Indexes
+
+When the ELF file containing DWARF also contains `.debug_names` or
+`.gdb_index`, GhostScope uses that native index to select compilation units for
+on-demand parsing. Otherwise, it performs its normal full DWARF scan. An
+unusable index is reported in CLI/TUI startup status before falling back.
+
 ### Complete Command Reference
 
 | Option | Short | Description | Default |

@@ -60,6 +60,16 @@ impl ProgressRenderer {
                             Span::styled("  debug: ", Style::default().fg(Color::Gray)),
                         ];
                         push_module_debug_source_spans(&mut spans, stats);
+                        spans.push(Span::styled(" | index: ", Style::default().fg(Color::Gray)));
+                        let index_color = if stats.dwarf_index_warning.is_some() {
+                            Color::Yellow
+                        } else {
+                            Color::Cyan
+                        };
+                        spans.push(Span::styled(
+                            stats.dwarf_index.clone(),
+                            Style::default().fg(index_color),
+                        ));
                         spans.push(Span::styled(
                             format!(
                                 " | Functions: {} | Variables: {} | Types: {} | Time: {:.1}s",

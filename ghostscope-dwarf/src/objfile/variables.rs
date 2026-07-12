@@ -141,7 +141,12 @@ impl LoadedObjfile {
             {
                 self.add_block_index_functions_if_missing(address, vec![fb]);
             }
-        } else if let Some(cu_off) = self.lightweight_index.find_cu_by_address(address) {
+        } else if let Some(cu_off) = self
+            .lightweight_index
+            .read()
+            .expect("lightweight index lock poisoned")
+            .find_cu_by_address(address)
+        {
             if let Some(funcs) = builder.build_for_unit(cu_off) {
                 self.add_block_index_functions_if_missing(address, funcs);
             }
@@ -202,6 +207,8 @@ impl LoadedObjfile {
             .and_then(|file_index| {
                 cu_name.as_deref().and_then(|cu_name| {
                     self.scoped_file_manager
+                        .read()
+                        .expect("scoped file index lock poisoned")
                         .lookup_by_scoped_index(cu_name, file_index)
                 })
             })
@@ -369,13 +376,31 @@ impl LoadedObjfile {
         name: &str,
         tags: &[gimli::DwTag],
     ) -> Option<crate::TypeInfo> {
+        if let Err(error) = self.ensure_debug_info_for_type_name(name) {
+            tracing::warn!(
+                "Failed to load indexed DWARF for type '{}' in {}: {}",
+                name,
+                self.module_path().display(),
+                error
+            );
+        }
         for &tag in tags {
-            if let Some(loc) = self.type_name_index.find_aggregate_definition(name, tag) {
+            let loc = self
+                .type_name_index
+                .read()
+                .expect("type name index lock poisoned")
+                .find_aggregate_definition(name, tag);
+            if let Some(loc) = loc {
                 return self.detailed_shallow_type(loc.cu_offset, loc.die_offset);
             }
         }
 
-        if let Some(td) = self.type_name_index.find_typedef(name) {
+        let typedef = self
+            .type_name_index
+            .read()
+            .expect("type name index lock poisoned")
+            .find_typedef(name);
+        if let Some(td) = typedef {
             let dwarf = self.dwarf();
             if let Ok(header) = dwarf.unit_header(td.cu_offset) {
                 if let Ok(unit) = dwarf.unit(header) {
@@ -705,9 +730,16 @@ impl LoadedObjfile {
         let header = dwarf.unit_header(cu_off).ok()?;
         let unit = dwarf.unit(header).ok()?;
         let entry = unit.entry(die_off).ok()?;
-        if let Some((def_cu_off, def_die_off)) =
-            complete_aggregate_declaration_entry(dwarf, &self.type_name_index, &unit, &entry)
-        {
+        let definition = complete_aggregate_declaration_entry(
+            dwarf,
+            &self
+                .type_name_index
+                .read()
+                .expect("type name index lock poisoned"),
+            &unit,
+            &entry,
+        );
+        if let Some((def_cu_off, def_die_off)) = definition {
             let def_header = dwarf.unit_header(def_cu_off).ok()?;
             let def_unit = dwarf.unit(def_header).ok()?;
             return crate::parser::DetailedParser::resolve_type_shallow_at_offset(

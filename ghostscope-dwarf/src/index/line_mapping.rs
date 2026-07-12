@@ -79,6 +79,27 @@ impl LineMappingTable {
         }
     }
 
+    pub(crate) fn extend(&mut self, other: Self) {
+        for (address, mut entries) in other.address_to_line_map {
+            self.address_to_line_map
+                .entry(address)
+                .or_default()
+                .append(&mut entries);
+        }
+        for (key, mut addresses) in other.path_line_to_addresses {
+            let current = self.path_line_to_addresses.entry(key).or_default();
+            current.append(&mut addresses);
+            current.sort_unstable();
+            current.dedup();
+        }
+        for (basename, paths) in other.basename_to_paths {
+            self.basename_to_paths
+                .entry(basename)
+                .or_default()
+                .extend(paths);
+        }
+    }
+
     fn representative_entry(entries: &[LineEntry]) -> Option<&LineEntry> {
         entries.last()
     }

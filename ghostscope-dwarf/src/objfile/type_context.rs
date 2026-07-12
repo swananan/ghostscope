@@ -250,19 +250,30 @@ impl LoadedObjfile {
         current: TypeId,
         segment: &VariableAccessSegment,
     ) -> Result<Option<TypeId>> {
-        projected_type_loc(
-            self.dwarf(),
-            &self.type_name_index,
-            type_loc(current)?,
-            segment,
-        )
-        .map(|loc| loc.map(|loc| type_id_from_loc(current.module, loc)))
+        let type_name_index = self
+            .type_name_index
+            .read()
+            .expect("type name index lock poisoned");
+        projected_type_loc(self.dwarf(), &type_name_index, type_loc(current)?, segment)
+            .map(|loc| loc.map(|loc| type_id_from_loc(current.module, loc)))
     }
 
     pub(crate) fn aggregate_type_id_by_name(&self, module: ModuleId, name: &str) -> Option<TypeId> {
+        if let Err(error) = self.ensure_debug_info_for_type_name(name) {
+            tracing::warn!(
+                "Failed to load indexed DWARF for type '{}' in {}: {}",
+                name,
+                self.module_path().display(),
+                error
+            );
+        }
+        let type_name_index = self
+            .type_name_index
+            .read()
+            .expect("type name index lock poisoned");
         [gimli::DW_TAG_structure_type, gimli::DW_TAG_class_type]
             .into_iter()
-            .find_map(|tag| self.type_name_index.find_aggregate_definition(name, tag))
+            .find_map(|tag| type_name_index.find_aggregate_definition(name, tag))
             .map(|loc| {
                 type_id_from_loc(
                     module,

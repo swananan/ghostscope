@@ -1,6 +1,32 @@
 use crate::{core::DebugInfoSource, semantics::VisibleVariable};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DwarfIndexStatus {
+    FullScan,
+    DebugNames,
+    GdbIndex { version: u32 },
+    Rejected { reason: String },
+}
+
+impl DwarfIndexStatus {
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::FullScan => "full-scan".to_string(),
+            Self::DebugNames => ".debug_names".to_string(),
+            Self::GdbIndex { version } => format!(".gdb_index-v{version}"),
+            Self::Rejected { .. } => "full-scan (index rejected)".to_string(),
+        }
+    }
+
+    pub fn rejection_reason(&self) -> Option<&str> {
+        match self {
+            Self::Rejected { reason } => Some(reason),
+            _ => None,
+        }
+    }
+}
+
 /// Events emitted during module loading process
 #[derive(Debug, Clone)]
 pub enum ModuleLoadingEvent {
@@ -39,6 +65,7 @@ pub struct ModuleLoadingStats {
     pub variables: usize,
     pub types: usize,
     pub debug_info_source: DebugInfoSource,
+    pub dwarf_index_status: DwarfIndexStatus,
     pub load_time_ms: u64,
     pub parse_time_ms: u64,
     pub index_time_ms: u64,
