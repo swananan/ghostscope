@@ -228,6 +228,12 @@ ghostscope bpffs prune --dry-run --json
 - `--all --force` 会删除所有 `pid-starttime` 目录，包括活实例。
 - legacy 的纯数字目录会被忽略。
 
+### 原生 DWARF 索引
+
+当包含 DWARF 的 ELF 文件同时带有 `.debug_names` 或 `.gdb_index` 时，
+GhostScope 会使用该原生索引选择 CU，并按需调用 fast parser。否则执行原有
+的完整 DWARF 扫描。索引不可用时，CLI/TUI 启动状态会显示回退原因。
+
 ### 完整命令参考
 
 | 选项 | 简写 | 说明 | 默认值 |

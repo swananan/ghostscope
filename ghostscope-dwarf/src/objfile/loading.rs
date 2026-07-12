@@ -1,18 +1,33 @@
 use super::LoadedObjfile;
 use crate::{
+    analyzer::DwarfIndexStatus,
     binary::{
         dwarf_endian_from_object, dwarf_reader_from_arc_with_endian,
         empty_dwarf_reader_with_endian, load_explicit_debug_file, try_load_debug_file, DwarfData,
         MappedFile,
     },
     core::{mapping::ModuleMapping, DebugInfoSource, Result},
-    index::{BlockIndex, TypeNameIndex},
+    index::{BlockIndex, GdbIndex, TypeNameIndex},
     objfile::ModuleUnwindInfo,
     parser::DetailedParser,
 };
 use ghostscope_debuginfod::{build_id_to_hex, DebuginfodClient};
+use gimli::{Reader, Section};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
-use std::{borrow::Cow, collections::HashMap, path::Path, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    path::Path,
+    path::PathBuf,
+    sync::{Arc, Mutex, RwLock},
+    time::Instant,
+};
+
+enum InitialIndexSelection {
+    FullScan { rejection: Option<String> },
+    DebugNames,
+    GdbIndex,
+}
 
 impl LoadedObjfile {
     /// Parallel loading: debug_info || debug_line || CFI simultaneously.
@@ -166,6 +181,28 @@ impl LoadedObjfile {
         };
 
         let mapped_file = mapped_file_for_dwarf;
+        let (gdb_index, gdb_index_rejection) = match Self::load_gdb_index(&mapped_file, &dwarf) {
+            Ok(Some(index)) => {
+                tracing::info!(
+                    "Found .gdb_index v{} with {} compilation units in {}",
+                    index.version(),
+                    index.compilation_unit_count(),
+                    mapped_file.path.display()
+                );
+                (Some(index), None)
+            }
+            Ok(None) => (None, None),
+            Err(error) => {
+                tracing::warn!(
+                    "Ignoring unusable .gdb_index in {}: {}",
+                    mapped_file.path.display(),
+                    error
+                );
+                (None, Some(error.to_string()))
+            }
+        };
+        let has_gdb_index = gdb_index.is_some();
+        let initial_rejection = gdb_index_rejection.clone();
 
         tracing::debug!(
             "Starting parallel DWARF parsing with true debug_line || debug_info parallelism..."
@@ -175,19 +212,78 @@ impl LoadedObjfile {
             tokio::task::spawn_blocking({
                 let dwarf = Arc::clone(&dwarf);
                 let module_path = module_mapping.path.to_string_lossy().to_string();
-                move || -> Result<(crate::parser::LineParseResult, crate::parser::DebugParseResult)> {
+                move || -> Result<(
+                    crate::parser::LineParseResult,
+                    crate::parser::DebugParseResult,
+                    InitialIndexSelection,
+                )> {
                     let (line_res, info_res) = rayon::join(
                         || {
                             let parser = crate::parser::DwarfParser::new(&dwarf);
-                            parser.parse_line_info(&module_path)
+                            parser.parse_line_headers(&module_path)
                         },
                         || {
                             let parser = crate::parser::DwarfParser::new(&dwarf);
-                            parser.parse_debug_info(&module_path)
+                            match parser.parse_debug_names(&module_path) {
+                                Ok(Some(index)) => Ok((index, InitialIndexSelection::DebugNames)),
+                                Ok(None) if has_gdb_index => {
+                                    Ok((
+                                        parser.initialize_lazy_debug_info(),
+                                        InitialIndexSelection::GdbIndex,
+                                    ))
+                                }
+                                Ok(None) => parser
+                                    .parse_debug_info(&module_path)
+                                    .map(|index| {
+                                        (
+                                            index,
+                                            InitialIndexSelection::FullScan {
+                                                rejection: initial_rejection,
+                                            },
+                                        )
+                                    }),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "Ignoring unusable .debug_names for {}: {}",
+                                        module_path,
+                                        error
+                                    );
+                                    if has_gdb_index {
+                                        Ok((
+                                            parser.initialize_lazy_debug_info(),
+                                            InitialIndexSelection::GdbIndex,
+                                        ))
+                                    } else {
+                                        let debug_names_rejection = format!(
+                                            ".debug_names could not be used: {error}"
+                                        );
+                                        let rejection = initial_rejection.map_or(
+                                            debug_names_rejection.clone(),
+                                            |gdb_rejection| {
+                                                format!(
+                                                    ".gdb_index could not be used: {gdb_rejection}; {debug_names_rejection}"
+                                                )
+                                            },
+                                        );
+                                        parser
+                                            .parse_debug_info(&module_path)
+                                            .map(|index| {
+                                                (
+                                                    index,
+                                                    InitialIndexSelection::FullScan {
+                                                        rejection: Some(rejection),
+                                                    },
+                                                )
+                                            })
+                                    }
+                                }
+                            }
                         },
                     );
                     match (line_res, info_res) {
-                        (Ok(l), Ok(i)) => Ok((l, i)),
+                        (Ok(line), Ok((info, selection))) => {
+                            Ok((line, info, selection))
+                        }
                         (Err(e), _) => Err(e),
                         (_, Err(e)) => Err(e),
                     }
@@ -200,7 +296,24 @@ impl LoadedObjfile {
             })
         )?;
 
-        let (line_result, info_result) = pair_result?;
+        let (line_result, info_result, index_selection) = pair_result?;
+        let lazy_debug_info = !matches!(index_selection, InitialIndexSelection::FullScan { .. });
+        let (gdb_index, dwarf_index_status) = match index_selection {
+            InitialIndexSelection::FullScan { rejection } => {
+                let status = rejection.map_or(DwarfIndexStatus::FullScan, |reason| {
+                    DwarfIndexStatus::Rejected { reason }
+                });
+                (None, status)
+            }
+            InitialIndexSelection::DebugNames => (None, DwarfIndexStatus::DebugNames),
+            InitialIndexSelection::GdbIndex => {
+                let index = gdb_index.expect("selected GDB index must be loaded");
+                let status = DwarfIndexStatus::GdbIndex {
+                    version: index.version(),
+                };
+                (Some(index), status)
+            }
+        };
 
         let parse_result = crate::parser::DwarfParser::combine_parallel_results(
             line_result,
@@ -226,6 +339,7 @@ impl LoadedObjfile {
             line_mapping,
             scoped_file_manager,
             compilation_units,
+            line_source_unit_offsets,
             stats,
         } = parse_result;
         let index_started_at = Instant::now();
@@ -234,11 +348,9 @@ impl LoadedObjfile {
             (lightweight_index, type_name_index)
         })
         .await?;
-        let type_name_index = Arc::new(type_name_index);
         let dwarf =
             Arc::try_unwrap(dwarf).map_err(|_| anyhow::anyhow!("Failed to unwrap DWARF Arc"))?;
-        let mut detailed_parser = DetailedParser::new();
-        detailed_parser.set_type_name_index(Arc::clone(&type_name_index));
+        let detailed_parser = DetailedParser::new();
         let entry_address = Self::read_entry_address(&binary_mapped);
         let text_symbol_starts_by_name = Self::collect_text_symbol_starts(&binary_mapped);
 
@@ -267,15 +379,21 @@ impl LoadedObjfile {
 
         let module = Self {
             module_mapping: module_mapping.clone(),
-            lightweight_index,
-            line_mapping,
-            scoped_file_manager,
-            compilation_units,
+            lightweight_index: RwLock::new(lightweight_index),
+            line_mapping: RwLock::new(line_mapping),
+            scoped_file_manager: RwLock::new(scoped_file_manager),
+            compilation_units: RwLock::new(compilation_units),
+            line_source_unit_offsets,
+            indexed_line_cus: Mutex::new(HashSet::new()),
             unwind_info,
             dwarf,
             detailed_parser,
             block_index: std::sync::RwLock::new(BlockIndex::new()),
-            type_name_index,
+            type_name_index: RwLock::new(type_name_index),
+            gdb_index,
+            dwarf_index_status,
+            lazy_debug_info,
+            indexed_debug_info_cus: Mutex::new(HashSet::new()),
             _dwarf_mapped_file: mapped_file,
             _binary_mapped_file: binary_mapped,
             debug_info_source,
@@ -287,11 +405,18 @@ impl LoadedObjfile {
             load_total_ms,
         };
 
+        let (function_count, variable_count, _) = module.get_index_stats();
+        tracing::debug!(
+            "Initial DWARF index materialized {} functions and {} variables for {}",
+            stats.total_functions,
+            stats.total_variables,
+            module.module_mapping.path.display()
+        );
         tracing::info!(
             "True parallel loading completed for {}: {} functions, {} variables, {} line entries, {} files (state: {}, parse_ms: {}, index_ms: {}, total_ms: {})",
             module.module_mapping.path.display(),
-            stats.total_functions,
-            stats.total_variables,
+            function_count,
+            variable_count,
             stats.total_line_entries,
             stats.total_files,
             state_label,
@@ -570,6 +695,38 @@ impl LoadedObjfile {
         }
 
         by_name
+    }
+
+    fn load_gdb_index(file_data: &Arc<MappedFile>, dwarf: &DwarfData) -> Result<Option<GdbIndex>> {
+        let object = file_data.parse_object()?;
+        let reader = if let Some(section) = object.section_by_name(".gdb_index") {
+            let compressed_range = section.compressed_file_range()?;
+            if compressed_range.format != object::read::CompressionFormat::None {
+                let data = section.uncompressed_data()?;
+                let bytes: Arc<[u8]> = match data {
+                    Cow::Borrowed(bytes) => Arc::from(bytes),
+                    Cow::Owned(bytes) => Arc::from(bytes),
+                };
+                dwarf_reader_from_arc_with_endian(bytes, gimli::RunTimeEndian::Little)
+            } else if let Some((start, size)) = section.file_range() {
+                MappedFile::dwarf_reader_range(
+                    Arc::clone(file_data),
+                    start,
+                    size,
+                    gimli::RunTimeEndian::Little,
+                )
+                .ok_or_else(|| anyhow::anyhow!("invalid .gdb_index section range"))?
+            } else {
+                return Ok(None);
+            }
+        } else {
+            return Ok(None);
+        };
+        let index = GdbIndex::parse(reader)?;
+        index.validate_debug_info_size(dwarf.debug_info.reader().len())?;
+        index.validate_unit_headers(dwarf)?;
+        index.validate_symbol_data()?;
+        Ok(Some(index))
     }
 
     fn load_dwarf_sections(file_data: &Arc<MappedFile>) -> Result<DwarfData> {

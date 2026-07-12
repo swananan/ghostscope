@@ -161,15 +161,22 @@ impl LightweightIndex {
     /// Build cooked index directly from per-CU shards.
     pub(crate) fn from_shards(shards: Vec<LightweightIndexShard>) -> Self {
         debug!("Building lightweight index from parsed data");
+        let mut index = Self::new();
+        index.append_shards(shards);
+        index
+    }
 
-        let total_entry_capacity: usize = shards.iter().map(|shard| shard.entries.len()).sum();
-        let mut entries = Vec::with_capacity(total_entry_capacity);
-        let mut name_shards = Vec::with_capacity(shards.len());
+    /// Append newly parsed CU shards without rebuilding entries already loaded.
+    pub(crate) fn append_shards(&mut self, shards: Vec<LightweightIndexShard>) {
+        let added_entries: usize = shards.iter().map(|shard| shard.entries.len()).sum();
+        self.entries.reserve(added_entries);
+        self.name_shards.reserve(shards.len());
 
+        let first_new_entry = self.entries.len();
         for shard in shards {
-            let entry_base = entries.len();
-            entries.extend(shard.entries);
-            name_shards.push(NameIndexShard {
+            let entry_base = self.entries.len();
+            self.entries.extend(shard.entries);
+            self.name_shards.push(NameIndexShard {
                 entry_base,
                 function_map: shard.function_map,
                 function_fragment_map: shard.function_fragment_map,
@@ -179,51 +186,41 @@ impl LightweightIndex {
             });
         }
 
-        let mut address_map = BTreeMap::new();
-        let mut total_functions = 0;
-        let mut total_variables = 0;
-        let mut func_indices_by_cu: HashMap<DebugInfoOffset, Vec<usize>> = HashMap::new();
-        for (idx, entry) in entries.iter().enumerate() {
+        for (idx, entry) in self.entries.iter().enumerate().skip(first_new_entry) {
             match entry.tag {
                 gimli::constants::DW_TAG_subprogram
                 | gimli::constants::DW_TAG_inlined_subroutine => {
-                    total_functions += 1;
-                    func_indices_by_cu
+                    self.total_functions += 1;
+                    self.func_indices_by_cu
                         .entry(entry.unit_offset)
                         .or_default()
                         .push(idx);
                 }
                 gimli::constants::DW_TAG_variable => {
-                    total_variables += 1;
+                    self.total_variables += 1;
                 }
                 _ => {}
             }
 
             if let Some(address) = entry.representative_addr.or(entry.entry_pc) {
-                address_map.insert(address, idx);
+                self.address_map.insert(address, idx);
+                if self.cu_maps_built && Self::is_function_tag(entry.tag) {
+                    self.func_addr_by_cu
+                        .entry(entry.unit_offset)
+                        .or_default()
+                        .insert(address, idx);
+                }
             }
         }
 
         debug!(
-            "Built lightweight index: {} function entries, {} variable entries, {} total entries, {} shards, {} with addresses",
-            total_functions,
-            total_variables,
-            entries.len(),
-            name_shards.len(),
-            address_map.len()
+            "Extended lightweight index: {} function entries, {} variable entries, {} total entries, {} shards, {} with addresses",
+            self.total_functions,
+            self.total_variables,
+            self.entries.len(),
+            self.name_shards.len(),
+            self.address_map.len()
         );
-
-        Self {
-            entries,
-            name_shards,
-            address_map,
-            total_functions,
-            total_variables,
-            cu_range_map: BTreeMap::new(),
-            func_addr_by_cu: HashMap::new(),
-            func_indices_by_cu,
-            cu_maps_built: false,
-        }
     }
 
     fn is_function_tag(tag: gimli::DwTag) -> bool {
@@ -289,7 +286,7 @@ impl LightweightIndex {
     ) -> Vec<&'a String> {
         let mut names = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
-        for shard in &self.name_shards {
+        for shard in self.name_shards.iter().rev() {
             for name in map_of(shard).keys() {
                 if seen.insert(name.as_str()) {
                     names.push(name);
@@ -305,7 +302,7 @@ impl LightweightIndex {
         map_of: impl Fn(&'a NameIndexShard) -> &'a HashMap<String, Vec<usize>>,
     ) -> Vec<&'a IndexEntry> {
         let mut matches = Vec::new();
-        for shard in &self.name_shards {
+        for shard in self.name_shards.iter().rev() {
             if let Some(indices) = map_of(shard).get(name) {
                 matches.extend(
                     indices
@@ -358,7 +355,10 @@ impl LightweightIndex {
         }
 
         let mut ordered: Vec<usize> = candidates.into_iter().collect();
-        ordered.sort_unstable();
+        // Materialized CU shards are appended after native-index seeds. Visit
+        // newer entries first so callers that deduplicate by DIE retain the
+        // complete fast-parser entry.
+        ordered.sort_unstable_by(|left, right| right.cmp(left));
         ordered
     }
 
@@ -368,7 +368,7 @@ impl LightweightIndex {
         map_of: impl Fn(&'a NameIndexShard) -> &'a HashMap<String, Vec<usize>>,
     ) -> HashSet<usize> {
         let mut indices = HashSet::new();
-        for shard in &self.name_shards {
+        for shard in self.name_shards.iter().rev() {
             if let Some(local_indices) = map_of(shard).get(fragment) {
                 for &local_idx in local_indices {
                     indices.insert(shard.entry_base + local_idx);
@@ -398,7 +398,7 @@ impl LightweightIndex {
 
     /// Internal: visit type-map entries across all shards.
     pub(crate) fn for_each_type_map_entry(&self, mut visit: impl FnMut(&String, usize, &[usize])) {
-        for shard in &self.name_shards {
+        for shard in self.name_shards.iter().rev() {
             for (name, indices) in &shard.type_map {
                 visit(name, shard.entry_base, indices);
             }
@@ -554,6 +554,20 @@ impl LightweightIndex {
             }
         }
 
+        self.cu_maps_built = true;
+        added_any
+    }
+
+    /// Build only CU root ranges without walking every function DIE as a fallback.
+    pub(crate) fn build_cu_maps_from_roots(&mut self, dwarf: &gimli::Dwarf<DwarfReader>) -> bool {
+        let compilation_units = self.func_indices_by_cu.keys().copied().collect::<Vec<_>>();
+        let mut added_any = false;
+        for cu in compilation_units {
+            for (start, end) in Self::resolve_cu_root_ranges(dwarf, cu).unwrap_or_default() {
+                Self::insert_cu_range(&mut self.cu_range_map, start, end, cu);
+                added_any = true;
+            }
+        }
         self.cu_maps_built = true;
         added_any
     }

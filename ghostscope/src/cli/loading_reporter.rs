@@ -1,4 +1,4 @@
-use ghostscope_dwarf::{DebugInfoSource, ModuleLoadingEvent};
+use ghostscope_dwarf::{DebugInfoSource, DwarfIndexStatus, ModuleLoadingEvent};
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -196,6 +196,7 @@ impl LoadingProgress {
                 self.module_reports.push(ModuleLoadReport {
                     path: module_path.clone(),
                     source: stats.debug_info_source,
+                    dwarf_index_status: stats.dwarf_index_status,
                     functions: stats.functions,
                     variables: stats.variables,
                     types: stats.types,
@@ -312,8 +313,9 @@ impl LoadingProgress {
                 lines.push("  module details:".to_string());
                 for module in debuggable_modules.iter().take(MAX_MODULE_REPORT_LINES) {
                     lines.push(format!(
-                        "    {} {:>6} funcs {:>6} vars {:>6} types {:>5}ms  {}",
+                        "    {} {:<28} {:>6} funcs {:>6} vars {:>6} types {:>5}ms  {}",
                         format_source_column(&module.source, colors),
+                        module.dwarf_index_status.display_label(),
                         module.functions,
                         module.variables,
                         module.types,
@@ -336,6 +338,33 @@ impl LoadingProgress {
                 colors.yellow("missing DWARF:"),
                 self.missing_module_hint()
             ));
+        }
+
+        let rejected_indexes = self
+            .module_reports
+            .iter()
+            .filter(|module| module.dwarf_index_status.rejection_reason().is_some())
+            .collect::<Vec<_>>();
+        if !rejected_indexes.is_empty() {
+            lines.push(format!("  {}", colors.yellow("DWARF index fallback:")));
+            for module in rejected_indexes.iter().take(MAX_MODULE_REPORT_LINES) {
+                let reason = module
+                    .dwarf_index_status
+                    .rejection_reason()
+                    .expect("filtered rejected index must have a reason");
+                lines.push(format!(
+                    "    {} {:<64} {}",
+                    colors.yellow("rejected"),
+                    shorten_path(&module.path, 64),
+                    shorten_middle(reason, 120)
+                ));
+            }
+            if rejected_indexes.len() > MAX_MODULE_REPORT_LINES {
+                lines.push(format!(
+                    "    ... {} more rejected index entries omitted",
+                    rejected_indexes.len() - MAX_MODULE_REPORT_LINES
+                ));
+            }
         }
 
         if !self.module_failures.is_empty() {
@@ -437,6 +466,7 @@ impl LoadingProgress {
 struct ModuleLoadReport {
     path: String,
     source: DebugInfoSource,
+    dwarf_index_status: DwarfIndexStatus,
     functions: usize,
     variables: usize,
     types: usize,
@@ -634,7 +664,9 @@ mod tests {
         CliLoadingReporter, DebugSourceCounts,
     };
     use crate::config::CliColorMode;
-    use ghostscope_dwarf::{DebugInfoSource, ModuleLoadingEvent, ModuleLoadingStats};
+    use ghostscope_dwarf::{
+        DebugInfoSource, DwarfIndexStatus, ModuleLoadingEvent, ModuleLoadingStats,
+    };
     use std::time::Duration;
 
     #[test]
@@ -686,6 +718,7 @@ mod tests {
                 debug_info_source: DebugInfoSource::Embedded {
                     path: "/usr/bin/app".to_string(),
                 },
+                dwarf_index_status: DwarfIndexStatus::GdbIndex { version: 9 },
                 load_time_ms: 42,
                 parse_time_ms: 30,
                 index_time_ms: 8,
@@ -713,6 +746,7 @@ mod tests {
         assert!(report.contains("Startup load report:"));
         assert!(report.contains("module details:"));
         assert!(report.contains("embedded"));
+        assert!(report.contains(".gdb_index-v9"));
         assert!(report.contains("/usr/bin/app"));
     }
 
@@ -730,6 +764,9 @@ mod tests {
                 variables: 0,
                 types: 0,
                 debug_info_source: DebugInfoSource::Missing,
+                dwarf_index_status: DwarfIndexStatus::Rejected {
+                    reason: "truncated .gdb_index".to_string(),
+                },
                 load_time_ms: 5,
                 parse_time_ms: 0,
                 index_time_ms: 0,
@@ -746,6 +783,8 @@ mod tests {
 
         assert!(report.contains("missing DWARF: 1 module"));
         assert!(report.contains("libmissing.so"));
+        assert!(report.contains("DWARF index fallback:"));
+        assert!(report.contains("truncated .gdb_index"));
         assert!(!report.contains("module details:"));
         assert!(!report.contains("missing                           0 funcs"));
     }

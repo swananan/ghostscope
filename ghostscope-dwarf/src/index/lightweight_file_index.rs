@@ -200,6 +200,24 @@ impl ScopedFileIndexManager {
         self.total_compilation_units += 1;
     }
 
+    pub(crate) fn extend(&mut self, other: Self) {
+        for (name, file_index) in other.cu_file_indices {
+            if self
+                .cu_file_indices
+                .insert(name.clone(), file_index)
+                .is_none()
+            {
+                self.total_compilation_units += 1;
+            }
+            self.cu_name_pool.entry(name.to_string()).or_insert(name);
+        }
+        self.total_files = self
+            .cu_file_indices
+            .values()
+            .map(|index| index.total_files)
+            .sum();
+    }
+
     /// Lookup file by scoped index (primary method, conflict-free)
     ///
     /// This is equivalent to the old FileIndexManager::lookup_by_scoped_index

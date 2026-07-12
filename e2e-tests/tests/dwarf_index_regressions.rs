@@ -78,6 +78,37 @@ fn find_symbol_address(binary_path: &std::path::Path, symbol_name: &str) -> anyh
         })
 }
 
+fn assert_native_index_queries(
+    analyzer: &ghostscope_dwarf::DwarfAnalyzer,
+    target: &Path,
+    index_name: &str,
+) -> anyhow::Result<()> {
+    let expected_address = find_symbol_address(target, "calculate_something")?;
+    let addresses = analyzer.lookup_function_addresses("calculate_something");
+    assert!(
+        addresses.iter().any(|address| {
+            address.module_path == target
+                && address.address >= expected_address
+                && address.address <= expected_address.saturating_add(32)
+        }),
+        "native {index_name} function lookup did not resolve calculate_something: {addresses:?}"
+    );
+    assert!(
+        analyzer
+            .resolve_struct_type_shallow_by_name("DataRecord")
+            .is_some(),
+        "native {index_name} type lookup did not resolve DataRecord"
+    );
+    assert!(
+        analyzer
+            .find_global_variables_by_name("call_counter")
+            .iter()
+            .any(|(_, global)| global.link_address.is_some()),
+        "native {index_name} global lookup did not materialize the address of call_counter"
+    );
+    Ok(())
+}
+
 async fn spawn_inline_callsite_program(
     binary_path: &Path,
 ) -> anyhow::Result<common::targets::TargetHandle> {
@@ -113,6 +144,144 @@ fn read_uleb128(input: &[u8], offset: &mut usize) -> anyhow::Result<u64> {
     }
 }
 
+fn skip_leb128(input: &[u8], offset: &mut usize) -> anyhow::Result<()> {
+    loop {
+        let byte = *input
+            .get(*offset)
+            .context("Unexpected EOF while skipping LEB128")?;
+        *offset += 1;
+        if byte & 0x80 == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn first_dwarf_contribution_len(data: &[u8], endian: object::Endianness) -> anyhow::Result<usize> {
+    let initial = data
+        .get(..4)
+        .context("DWARF contribution is missing its initial length")?;
+    let length = match endian {
+        object::Endianness::Little => u32::from_le_bytes(initial.try_into()?),
+        object::Endianness::Big => u32::from_be_bytes(initial.try_into()?),
+    };
+    if length == u32::MAX {
+        let extended = data
+            .get(4..12)
+            .context("DWARF64 contribution is missing its extended length")?;
+        let length = match endian {
+            object::Endianness::Little => u64::from_le_bytes(extended.try_into()?),
+            object::Endianness::Big => u64::from_be_bytes(extended.try_into()?),
+        };
+        usize::try_from(length)?
+            .checked_add(12)
+            .context("DWARF64 contribution length overflow")
+    } else {
+        usize::try_from(length)?
+            .checked_add(4)
+            .context("DWARF32 contribution length overflow")
+    }
+}
+
+fn keep_first_debug_aranges_contribution(binary: &Path, scratch_dir: &Path) -> anyhow::Result<()> {
+    let bytes = fs::read(binary)?;
+    let object = object::File::parse(&*bytes)?;
+    let section = object
+        .section_by_name(".debug_aranges")
+        .context("binary has no .debug_aranges section")?;
+    let data = section.uncompressed_data()?.into_owned();
+    let first_len = first_dwarf_contribution_len(&data, object.endianness())?;
+    anyhow::ensure!(
+        first_len < data.len(),
+        ".debug_aranges does not contain multiple contributions"
+    );
+    let replacement = scratch_dir.join("partial-debug-aranges.bin");
+    fs::write(&replacement, &data[..first_len])?;
+    run_command(
+        StdCommand::new("objcopy")
+            .arg("--update-section")
+            .arg(format!(".debug_aranges={}", replacement.display()))
+            .arg(binary),
+        "objcopy partial .debug_aranges update",
+    )
+}
+
+fn debug_aranges_cover_address(binary: &Path, address: u64) -> anyhow::Result<bool> {
+    let dwarf = load_dwarf_from_binary(binary)?;
+    let mut headers = dwarf.debug_aranges.headers();
+    while let Some(header) = headers.next()? {
+        let mut entries = header.entries();
+        while let Some(entry) = entries.next()? {
+            if entry.address() <= address && address < entry.range().end {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn patch_compile_unit_range_attributes(abbrev: &mut [u8]) -> anyhow::Result<usize> {
+    let mut offset = 0;
+    let mut patched = 0;
+    while offset < abbrev.len() {
+        let code = read_uleb128(abbrev, &mut offset)?;
+        if code == 0 {
+            continue;
+        }
+        let tag = read_uleb128(abbrev, &mut offset)?;
+        offset = offset
+            .checked_add(1)
+            .filter(|next| *next <= abbrev.len())
+            .context("abbreviation is missing its children byte")?;
+
+        loop {
+            let name_offset = offset;
+            let name = read_uleb128(abbrev, &mut offset)?;
+            let name_end = offset;
+            let form = read_uleb128(abbrev, &mut offset)?;
+            if name == 0 && form == 0 {
+                break;
+            }
+            let is_cu_range = name == u64::from(ghostscope_dwarf::constants::DW_AT_low_pc.0)
+                || name == u64::from(ghostscope_dwarf::constants::DW_AT_high_pc.0)
+                || name == u64::from(ghostscope_dwarf::constants::DW_AT_ranges.0);
+            if tag == u64::from(ghostscope_dwarf::constants::DW_TAG_compile_unit.0) && is_cu_range {
+                anyhow::ensure!(
+                    name_end == name_offset + 1,
+                    "CU range attribute does not use a one-byte ULEB128"
+                );
+                abbrev[name_offset] = 0x7f;
+                patched += 1;
+            }
+            if form == u64::from(ghostscope_dwarf::constants::DW_FORM_implicit_const.0) {
+                skip_leb128(abbrev, &mut offset)?;
+            }
+        }
+    }
+    Ok(patched)
+}
+
+fn remove_all_cu_address_ranges(binary: &Path, scratch_dir: &Path) -> anyhow::Result<()> {
+    let bytes = fs::read(binary)?;
+    let object = object::File::parse(&*bytes)?;
+    let section = object
+        .section_by_name(".debug_abbrev")
+        .context("binary has no .debug_abbrev section")?;
+    let mut abbrev = section.uncompressed_data()?.into_owned();
+    let patched = patch_compile_unit_range_attributes(&mut abbrev)?;
+    anyhow::ensure!(patched > 0, "no CU root range attributes were patched");
+    let replacement = scratch_dir.join("no-cu-ranges-debug-abbrev.bin");
+    fs::write(&replacement, abbrev)?;
+    run_command(
+        StdCommand::new("objcopy")
+            .arg("--update-section")
+            .arg(format!(".debug_abbrev={}", replacement.display()))
+            .arg("--remove-section")
+            .arg(".debug_aranges")
+            .arg(binary),
+        "objcopy CU range removal",
+    )
+}
+
 #[test]
 fn test_read_uleb128_rejects_values_that_overflow_u64() {
     let overflow = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
@@ -122,6 +291,323 @@ fn test_read_uleb128_rejects_values_that_overflow_u64() {
         err.to_string().contains("exceeds u64"),
         "unexpected overflow error: {err}"
     );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_gdb_index_resolves_function_type_and_global_lazily() -> anyhow::Result<()> {
+    init();
+
+    let source = FIXTURES.get_test_binary("sample_program")?;
+    let temp_dir = tempfile::tempdir()?;
+    let indexed = temp_dir.path().join("sample_program.gdb-indexed");
+    fs::copy(&source, &indexed)?;
+
+    let output = match StdCommand::new("gdb-add-index").arg(&indexed).output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("Skipping .gdb_index integration test because gdb-add-index is unavailable");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        output.status.success(),
+        "gdb-add-index failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let indexed_bytes = fs::read(&indexed)?;
+    let indexed_object = object::File::parse(&*indexed_bytes)?;
+    anyhow::ensure!(
+        indexed_object.section_by_name(".gdb_index").is_some(),
+        "gdb-add-index did not add .gdb_index"
+    );
+
+    let embedded_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&indexed).await?;
+    assert!(
+        matches!(
+            embedded_analyzer.dwarf_index_status_for_module(&indexed),
+            Some(ghostscope_dwarf::DwarfIndexStatus::GdbIndex { version: 7..=9 })
+        ),
+        "GhostScope did not select the embedded .gdb_index: {:?}",
+        embedded_analyzer.dwarf_index_status_for_module(&indexed)
+    );
+    assert_native_index_queries(&embedded_analyzer, &indexed, ".gdb_index")?;
+
+    let (index_file_offset, index_size) = indexed_object
+        .section_by_name(".gdb_index")
+        .and_then(|section| section.file_range())
+        .context("embedded .gdb_index has no file range")?;
+    let index_start = usize::try_from(index_file_offset)?;
+    let index_end = index_start
+        .checked_add(usize::try_from(index_size)?)
+        .context("embedded .gdb_index range overflow")?;
+    let index_data = indexed_bytes
+        .get(index_start..index_end)
+        .context("embedded .gdb_index range is out of bounds")?;
+    let read_index_u32 = |word: usize| -> anyhow::Result<u32> {
+        let start = word
+            .checked_mul(std::mem::size_of::<u32>())
+            .context(".gdb_index header offset overflow")?;
+        let bytes = index_data
+            .get(start..start + std::mem::size_of::<u32>())
+            .context("truncated .gdb_index header")?;
+        Ok(u32::from_le_bytes(bytes.try_into()?))
+    };
+    let version = read_index_u32(0)?;
+    let symbol_table = usize::try_from(read_index_u32(4)?)?;
+    let (shortcut_table, constant_pool) = if version == 9 {
+        (
+            usize::try_from(read_index_u32(5)?)?,
+            usize::try_from(read_index_u32(6)?)?,
+        )
+    } else {
+        let constant_pool = usize::try_from(read_index_u32(5)?)?;
+        (constant_pool, constant_pool)
+    };
+    let mut vector_offset = None;
+    for slot in index_data[symbol_table..shortcut_table].chunks_exact(8) {
+        let name = u32::from_le_bytes(slot[..4].try_into()?);
+        let vector = u32::from_le_bytes(slot[4..].try_into()?);
+        if name != 0 || vector != 0 {
+            vector_offset = Some(usize::try_from(vector)?);
+            break;
+        }
+    }
+    let vector_offset = vector_offset.context(".gdb_index has no populated symbol slots")?;
+    let vector_count_offset = index_start
+        .checked_add(constant_pool)
+        .and_then(|offset| offset.checked_add(vector_offset))
+        .context(".gdb_index vector offset overflow")?;
+    let mut corrupted_bytes = indexed_bytes.clone();
+    corrupted_bytes
+        .get_mut(vector_count_offset..vector_count_offset + 4)
+        .context(".gdb_index vector count is out of bounds")?
+        .copy_from_slice(&u32::MAX.to_le_bytes());
+    let corrupted = temp_dir.path().join("sample_program.corrupt-gdb-index");
+    fs::write(&corrupted, corrupted_bytes)?;
+    let fallback_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&corrupted).await?;
+    match fallback_analyzer.dwarf_index_status_for_module(&corrupted) {
+        Some(ghostscope_dwarf::DwarfIndexStatus::Rejected { reason }) => {
+            assert!(
+                reason.contains("CU vector is truncated"),
+                "unexpected .gdb_index rejection: {reason}"
+            );
+        }
+        status => panic!("malformed .gdb_index did not fall back: {status:?}"),
+    }
+    assert_native_index_queries(
+        &fallback_analyzer,
+        &corrupted,
+        "rejected .gdb_index fallback",
+    )?;
+
+    let debug_names_indexed = temp_dir.path().join("sample_program.debug-names-indexed");
+    fs::copy(&source, &debug_names_indexed)?;
+    let debug_names_output = StdCommand::new("gdb-add-index")
+        .arg("-dwarf-5")
+        .arg(&debug_names_indexed)
+        .output()?;
+    anyhow::ensure!(
+        debug_names_output.status.success(),
+        "gdb-add-index -dwarf-5 failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        debug_names_output.status.code(),
+        String::from_utf8_lossy(&debug_names_output.stdout),
+        String::from_utf8_lossy(&debug_names_output.stderr)
+    );
+    let debug_names_bytes = fs::read(&debug_names_indexed)?;
+    let debug_names_object = object::File::parse(&*debug_names_bytes)?;
+    anyhow::ensure!(
+        debug_names_object.section_by_name(".debug_names").is_some(),
+        "gdb-add-index -dwarf-5 did not add .debug_names"
+    );
+    let debug_names_analyzer =
+        ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&debug_names_indexed).await?;
+    assert_eq!(
+        debug_names_analyzer.dwarf_index_status_for_module(&debug_names_indexed),
+        Some(&ghostscope_dwarf::DwarfIndexStatus::DebugNames),
+        "GhostScope did not select GDB2 .debug_names"
+    );
+    assert_native_index_queries(&debug_names_analyzer, &debug_names_indexed, ".debug_names")?;
+
+    if command_available("clang") {
+        let standard_debug_names = temp_dir.path().join("sample_program.clang-debug-names");
+        let fixture_dir = source
+            .parent()
+            .context("sample_program fixture has no parent directory")?;
+        run_command(
+            StdCommand::new("clang")
+                .arg("-gdwarf-5")
+                .arg("-gpubnames")
+                .arg("-O0")
+                .arg(fixture_dir.join("sample_program.c"))
+                .arg(fixture_dir.join("sample_lib.c"))
+                .arg("-o")
+                .arg(&standard_debug_names),
+            "clang standard .debug_names build",
+        )?;
+        let standard_bytes = fs::read(&standard_debug_names)?;
+        let standard_object = object::File::parse(&*standard_bytes)?;
+        anyhow::ensure!(
+            standard_object.section_by_name(".debug_names").is_some(),
+            "clang -gpubnames did not add .debug_names"
+        );
+        let standard_analyzer =
+            ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&standard_debug_names).await?;
+        assert_eq!(
+            standard_analyzer.dwarf_index_status_for_module(&standard_debug_names),
+            Some(&ghostscope_dwarf::DwarfIndexStatus::DebugNames),
+            "GhostScope did not select standard .debug_names"
+        );
+        assert_native_index_queries(
+            &standard_analyzer,
+            &standard_debug_names,
+            "standard .debug_names",
+        )?;
+
+        if command_available("clang++") && command_available("objcopy") {
+            let cpp_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/cpp_complex_program/main.cpp");
+            let debug_names_type_units = temp_dir.path().join("cpp-complex.debug-names-type-units");
+            run_command(
+                StdCommand::new("clang++")
+                    .arg("-gdwarf-5")
+                    .arg("-gpubnames")
+                    .arg("-fdebug-types-section")
+                    .arg("-O0")
+                    .arg(&cpp_source)
+                    .arg("-o")
+                    .arg(&debug_names_type_units),
+                "clang++ .debug_names type-unit build",
+            )?;
+            anyhow::ensure!(
+                dwarf_has_type_unit(&debug_names_type_units)?,
+                "clang++ did not emit a DWARF5 type unit"
+            );
+
+            let debug_names_type_analyzer =
+                ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&debug_names_type_units).await?;
+            assert_eq!(
+                debug_names_type_analyzer.dwarf_index_status_for_module(&debug_names_type_units),
+                Some(&ghostscope_dwarf::DwarfIndexStatus::DebugNames),
+                "GhostScope did not select type-unit .debug_names"
+            );
+            let outer_type = debug_names_type_analyzer
+                .resolve_struct_type_shallow_by_name("Outer")
+                .context(".debug_names did not resolve Outer from its type unit")?;
+            assert_eq!(outer_type.size(), 16, "unexpected Outer size");
+
+            let gdb_type_units = temp_dir.path().join("cpp-complex.gdb-type-units");
+            fs::copy(&debug_names_type_units, &gdb_type_units)?;
+            run_command(
+                StdCommand::new("objcopy")
+                    .arg("--remove-section")
+                    .arg(".debug_names")
+                    .arg(&gdb_type_units),
+                "objcopy type-unit .debug_names removal",
+            )?;
+            run_command(
+                StdCommand::new("gdb-add-index").arg(&gdb_type_units),
+                "gdb-add-index type-unit build",
+            )?;
+            let gdb_type_analyzer =
+                ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&gdb_type_units).await?;
+            assert!(
+                matches!(
+                    gdb_type_analyzer.dwarf_index_status_for_module(&gdb_type_units),
+                    Some(ghostscope_dwarf::DwarfIndexStatus::GdbIndex { version: 8..=9 })
+                ),
+                "GhostScope did not select type-unit .gdb_index: {:?}",
+                gdb_type_analyzer.dwarf_index_status_for_module(&gdb_type_units)
+            );
+            let outer_type = gdb_type_analyzer
+                .resolve_struct_type_shallow_by_name("Outer")
+                .context(".gdb_index did not resolve Outer from its type unit")?;
+            assert_eq!(outer_type.size(), 16, "unexpected indexed Outer size");
+        }
+    }
+
+    if command_available("gcc") && command_available("objcopy") {
+        let fixture_dir = source
+            .parent()
+            .context("sample_program fixture has no parent directory")?;
+        let gcc_debug_names = temp_dir.path().join("sample-program.gcc-debug-names");
+        run_command(
+            StdCommand::new("gcc")
+                .arg("-gdwarf-5")
+                .arg("-gpubnames")
+                .arg("-O0")
+                .arg(fixture_dir.join("sample_program.c"))
+                .arg(fixture_dir.join("sample_lib.c"))
+                .arg("-o")
+                .arg(&gcc_debug_names),
+            "gcc partial-aranges fixture build",
+        )?;
+        run_command(
+            StdCommand::new("gdb-add-index")
+                .arg("-dwarf-5")
+                .arg(&gcc_debug_names),
+            "gdb-add-index partial-aranges fixture build",
+        )?;
+
+        let rejected_ranges = temp_dir.path().join("sample-program.no-cu-ranges");
+        fs::copy(&gcc_debug_names, &rejected_ranges)?;
+
+        keep_first_debug_aranges_contribution(&gcc_debug_names, temp_dir.path())?;
+        let mut uncovered_function = None;
+        for name in ["calculate_something", "add_numbers", "multiply_numbers"] {
+            let address = find_symbol_address(&gcc_debug_names, name)?;
+            if !debug_aranges_cover_address(&gcc_debug_names, address)? {
+                uncovered_function = Some((name, address));
+                break;
+            }
+        }
+        let (function_name, function_address) = uncovered_function
+            .context("partial .debug_aranges still covers functions from every CU")?;
+        let partial_analyzer =
+            ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&gcc_debug_names).await?;
+        assert_eq!(
+            partial_analyzer.dwarf_index_status_for_module(&gcc_debug_names),
+            Some(&ghostscope_dwarf::DwarfIndexStatus::DebugNames),
+            "GhostScope did not select partial-aranges .debug_names"
+        );
+        let context = partial_analyzer.resolve_pc(&ghostscope_dwarf::ModuleAddress::new(
+            gcc_debug_names.clone(),
+            function_address,
+        ))?;
+        assert_eq!(
+            context.function_name.as_deref(),
+            Some(function_name),
+            "CU root ranges did not supplement partial .debug_aranges"
+        );
+        assert!(
+            context.line.is_some(),
+            "partial-aranges PC did not resolve source information: {context:?}"
+        );
+
+        remove_all_cu_address_ranges(&rejected_ranges, temp_dir.path())?;
+        let rejected_analyzer =
+            ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&rejected_ranges).await?;
+        match rejected_analyzer.dwarf_index_status_for_module(&rejected_ranges) {
+            Some(ghostscope_dwarf::DwarfIndexStatus::Rejected { reason }) => {
+                assert!(
+                    reason.contains("no usable address-to-CU ranges"),
+                    "unexpected .debug_names rejection: {reason}"
+                );
+            }
+            status => panic!("range-less .debug_names was not rejected: {status:?}"),
+        }
+        assert_native_index_queries(
+            &rejected_analyzer,
+            &rejected_ranges,
+            "rejected range-less .debug_names fallback",
+        )?;
+    }
+
+    Ok(())
 }
 
 fn patch_inlined_subroutine_low_pc_to_entry_pc(abbrev: &mut [u8]) -> anyhow::Result<usize> {
@@ -231,6 +717,20 @@ fn load_dwarf_from_binary(path: &Path) -> anyhow::Result<gimli::Dwarf<TestReader
     })?;
 
     Ok(dwarf)
+}
+
+fn dwarf_has_type_unit(path: &Path) -> anyhow::Result<bool> {
+    let dwarf = load_dwarf_from_binary(path)?;
+    let mut units = dwarf.units();
+    while let Some(header) = units.next()? {
+        if matches!(
+            header.type_(),
+            gimli::UnitType::Type { .. } | gimli::UnitType::SplitType { .. }
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn duplicate_line_row_address_for_source_line(

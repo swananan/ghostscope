@@ -3,7 +3,7 @@ use crate::{
     binary::DwarfReader,
     core::{demangled_name, normalize_demangled_signature, symbol_name_matches_query, Result},
     dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
-    index::LightweightIndex,
+    index::{GdbSymbolKind, LightweightIndex},
     parser::RangeExtractor,
     semantics::{range_contains_pc, resolve_attr_with_unit_origins, resolve_origin_entry},
 };
@@ -18,10 +18,42 @@ impl LoadedObjfile {
     pub(crate) fn lookup_function_addresses(&self, name: &str) -> Vec<u64> {
         tracing::debug!("LoadedObjfile: looking up function '{}'", name);
 
-        let entries = self.lightweight_index.find_dies_by_function_name(name);
+        if let Err(error) = self.ensure_debug_info_for_symbol(name, GdbSymbolKind::Function, false)
+        {
+            tracing::warn!(
+                "Failed to load indexed DWARF for function '{}' in {}: {}",
+                name,
+                self.module_path().display(),
+                error
+            );
+        }
+        let seed_entries = self
+            .lightweight_index
+            .read()
+            .expect("lightweight index lock poisoned")
+            .find_dies_by_function_name(name)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Err(error) = self.ensure_debug_info_for_entries(&seed_entries) {
+            tracing::warn!(
+                "Failed to materialize indexed DWARF for function '{}' in {}: {}",
+                name,
+                self.module_path().display(),
+                error
+            );
+        }
+        let entries = self
+            .lightweight_index
+            .read()
+            .expect("lightweight index lock poisoned")
+            .find_dies_by_function_name(name)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut addresses = Vec::new();
 
-        for entry in entries {
+        for entry in &entries {
             addresses.extend(self.compute_addresses_for_entry(entry));
         }
 
@@ -72,7 +104,7 @@ impl LoadedObjfile {
     }
 
     fn matching_fragment_candidate_indices(
-        &self,
+        lightweight_index: &LightweightIndex,
         name: &str,
         candidate_indices: Vec<usize>,
         tag_filter: impl Fn(gimli::DwTag) -> bool,
@@ -81,7 +113,7 @@ impl LoadedObjfile {
         candidate_indices
             .into_iter()
             .filter(|&idx| {
-                let Some(entry) = self.lightweight_index.entry(idx) else {
+                let Some(entry) = lightweight_index.entry(idx) else {
                     return false;
                 };
                 tag_filter(entry.tag)
@@ -98,7 +130,7 @@ impl LoadedObjfile {
         let normalized_query = normalize_demangled_signature(name);
         let mut matches = Vec::new();
 
-        for idx in 0..lightweight_index.entry_count() {
+        for idx in (0..lightweight_index.entry_count()).rev() {
             let Some(entry) = lightweight_index.entry(idx) else {
                 continue;
             };
@@ -112,11 +144,11 @@ impl LoadedObjfile {
         matches
     }
 
-    fn matching_function_candidate_indices(&self, name: &str) -> Vec<usize> {
-        let fragment_matches = self.matching_fragment_candidate_indices(
+    fn function_candidate_indices(lightweight_index: &LightweightIndex, name: &str) -> Vec<usize> {
+        let fragment_matches = Self::matching_fragment_candidate_indices(
+            lightweight_index,
             name,
-            self.lightweight_index
-                .function_candidate_indices_by_fragment(name),
+            lightweight_index.function_candidate_indices_by_fragment(name),
             |tag| {
                 matches!(
                     tag,
@@ -130,7 +162,7 @@ impl LoadedObjfile {
             return fragment_matches;
         }
 
-        Self::scan_matching_candidate_indices(&self.lightweight_index, name, |tag| {
+        Self::scan_matching_candidate_indices(lightweight_index, name, |tag| {
             matches!(
                 tag,
                 gimli::constants::DW_TAG_subprogram | gimli::constants::DW_TAG_inlined_subroutine
@@ -138,11 +170,11 @@ impl LoadedObjfile {
         })
     }
 
-    pub(super) fn matching_variable_candidate_indices(&self, name: &str) -> Vec<usize> {
-        let fragment_matches = self.matching_fragment_candidate_indices(
+    fn variable_candidate_indices(lightweight_index: &LightweightIndex, name: &str) -> Vec<usize> {
+        let fragment_matches = Self::matching_fragment_candidate_indices(
+            lightweight_index,
             name,
-            self.lightweight_index
-                .variable_candidate_indices_by_fragment(name),
+            lightweight_index.variable_candidate_indices_by_fragment(name),
             |tag| tag == gimli::constants::DW_TAG_variable,
         );
 
@@ -150,9 +182,81 @@ impl LoadedObjfile {
             return fragment_matches;
         }
 
-        Self::scan_matching_candidate_indices(&self.lightweight_index, name, |tag| {
+        Self::scan_matching_candidate_indices(lightweight_index, name, |tag| {
             tag == gimli::constants::DW_TAG_variable
         })
+    }
+
+    fn matching_function_candidate_indices(&self, name: &str) -> Vec<usize> {
+        if let Err(error) = self.ensure_debug_info_for_symbol(name, GdbSymbolKind::Function, true) {
+            tracing::warn!(
+                "Failed to load matching indexed DWARF for function '{}' in {}: {}",
+                name,
+                self.module_path().display(),
+                error
+            );
+        }
+        let seed_entries = {
+            let lightweight_index = self
+                .lightweight_index
+                .read()
+                .expect("lightweight index lock poisoned");
+            Self::function_candidate_indices(&lightweight_index, name)
+                .into_iter()
+                .filter_map(|index| lightweight_index.entry(index).cloned())
+                .collect::<Vec<_>>()
+        };
+        if let Err(error) = self.ensure_debug_info_for_entries(&seed_entries) {
+            tracing::warn!(
+                "Failed to materialize matching DWARF for function '{}' in {}: {}",
+                name,
+                self.module_path().display(),
+                error
+            );
+        }
+        Self::function_candidate_indices(
+            &self
+                .lightweight_index
+                .read()
+                .expect("lightweight index lock poisoned"),
+            name,
+        )
+    }
+
+    pub(super) fn matching_variable_candidate_indices(&self, name: &str) -> Vec<usize> {
+        if let Err(error) = self.ensure_debug_info_for_symbol(name, GdbSymbolKind::Variable, true) {
+            tracing::warn!(
+                "Failed to load matching indexed DWARF for variable '{}' in {}: {}",
+                name,
+                self.module_path().display(),
+                error
+            );
+        }
+        let seed_entries = {
+            let lightweight_index = self
+                .lightweight_index
+                .read()
+                .expect("lightweight index lock poisoned");
+            Self::variable_candidate_indices(&lightweight_index, name)
+                .into_iter()
+                .filter_map(|index| lightweight_index.entry(index).cloned())
+                .collect::<Vec<_>>()
+        };
+        if let Err(error) = self.ensure_debug_info_for_entries(&seed_entries) {
+            tracing::warn!(
+                "Failed to materialize matching DWARF for variable '{}' in {}: {}",
+                name,
+                self.module_path().display(),
+                error
+            );
+        }
+        Self::variable_candidate_indices(
+            &self
+                .lightweight_index
+                .read()
+                .expect("lightweight index lock poisoned"),
+            name,
+        )
     }
 
     fn resolve_function_ranges(&self, entry: &crate::core::IndexEntry) -> Result<Vec<(u64, u64)>> {
@@ -196,13 +300,32 @@ impl LoadedObjfile {
     pub(super) fn find_function_index_entry_by_address(
         &self,
         address: u64,
-    ) -> Option<&crate::core::IndexEntry> {
+    ) -> Option<crate::core::IndexEntry> {
+        if let Err(error) = self.ensure_debug_info_for_address(address) {
+            tracing::warn!(
+                "Failed to load indexed DWARF for address 0x{:x} in {}: {}",
+                address,
+                self.module_path().display(),
+                error
+            );
+        }
         self.lightweight_index
+            .read()
+            .expect("lightweight index lock poisoned")
             .find_function_by_address(address, |entry| self.resolve_function_ranges(entry).ok())
+            .cloned()
     }
 
     fn compute_addresses_for_entry(&self, entry: &crate::core::IndexEntry) -> Vec<u64> {
         let mut out = Vec::new();
+        if let Err(error) = self.ensure_line_info_for_unit(entry.unit_offset) {
+            tracing::warn!(
+                "Failed to load line information for function '{}' in {}: {}",
+                entry.name,
+                self.module_path().display(),
+                error
+            );
+        }
         let ranges = match self.resolve_function_ranges(entry) {
             Ok(ranges) => ranges,
             Err(err) => {
@@ -246,6 +369,8 @@ impl LoadedObjfile {
 
                 let entry_pc_has_line_entry = entry.entry_pc.is_some_and(|pc| {
                     self.line_mapping
+                        .read()
+                        .expect("line mapping lock poisoned")
                         .get_entries_in_range(pc, pc)
                         .next()
                         .is_some()
@@ -268,7 +393,11 @@ impl LoadedObjfile {
                 let nranges = Self::selected_non_inline_ranges(entry, &ranges, preferred_start);
                 for (start, end) in &nranges {
                     let candidate = {
-                        let first_exec = self.line_mapping.find_first_executable_address(*start);
+                        let first_exec = self
+                            .line_mapping
+                            .read()
+                            .expect("line mapping lock poisoned")
+                            .find_first_executable_address(*start);
                         Self::selected_non_inline_probe_address(*start, *end, first_exec)
                     };
                     let prefer_entry = self
@@ -663,10 +792,19 @@ impl LoadedObjfile {
         }
 
         let mut out = Vec::new();
-        for idx in self.matching_function_candidate_indices(name) {
-            if let Some(entry) = self.lightweight_index.entry(idx) {
-                out.extend(self.compute_addresses_for_entry(entry));
-            }
+        let candidate_indices = self.matching_function_candidate_indices(name);
+        let entries = {
+            let lightweight_index = self
+                .lightweight_index
+                .read()
+                .expect("lightweight index lock poisoned");
+            candidate_indices
+                .into_iter()
+                .filter_map(|idx| lightweight_index.entry(idx).cloned())
+                .collect::<Vec<_>>()
+        };
+        for entry in &entries {
+            out.extend(self.compute_addresses_for_entry(entry));
         }
         out.sort_unstable();
         out.dedup();

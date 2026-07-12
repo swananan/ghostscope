@@ -56,6 +56,19 @@ impl TypeNameIndex {
         Self { by_name }
     }
 
+    pub(crate) fn unit_offsets_for_name(&self, name: &str) -> Vec<gimli::DebugInfoOffset> {
+        let mut offsets = self
+            .by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|location| location.cu_offset)
+            .collect::<Vec<_>>();
+        offsets.sort_unstable_by_key(|offset| offset.0);
+        offsets.dedup();
+        offsets
+    }
+
     /// Find an aggregate definition by name and tag, preferring non-declarations
     pub fn find_aggregate_definition(&self, name: &str, tag: DwTag) -> Option<TypeLoc> {
         let cands = match self.by_name.get(name) {

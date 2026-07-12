@@ -1,5 +1,6 @@
 use super::LoadedObjfile;
 use crate::core::{GlobalVariableInfo, SectionType};
+use crate::index::GdbSymbolKind;
 use object::{Object, ObjectSection};
 use std::collections::HashSet;
 
@@ -23,36 +24,76 @@ impl LoadedObjfile {
         let mut out = Vec::new();
         let mut seen_offsets: HashSet<(u64, u64)> = HashSet::new();
 
-        for idx in candidate_indices {
-            if let Some(entry) = self.lightweight_index.entry(idx) {
-                let key = (entry.unit_offset.0 as u64, entry.die_offset.0 as u64);
-                if !seen_offsets.insert(key) {
-                    continue;
-                }
-                let link_address = entry.representative_addr;
-                let section = link_address.and_then(|addr| self.classify_section(&obj, addr));
-                out.push(GlobalVariableInfo {
-                    name: name.to_string(),
-                    link_address,
-                    section,
-                    die_offset: entry.die_offset,
-                    unit_offset: entry.unit_offset,
-                });
+        let entries = {
+            let lightweight_index = self
+                .lightweight_index
+                .read()
+                .expect("lightweight index lock poisoned");
+            candidate_indices
+                .into_iter()
+                .filter_map(|idx| lightweight_index.entry(idx).cloned())
+                .collect::<Vec<_>>()
+        };
+        for entry in entries {
+            let key = (entry.unit_offset.0 as u64, entry.die_offset.0 as u64);
+            if !seen_offsets.insert(key) {
+                continue;
             }
+            let link_address = entry.representative_addr;
+            let section = link_address.and_then(|addr| self.classify_section(&obj, addr));
+            out.push(GlobalVariableInfo {
+                name: name.to_string(),
+                link_address,
+                section,
+                die_offset: entry.die_offset,
+                unit_offset: entry.unit_offset,
+            });
         }
 
         out
     }
 
     pub(crate) fn find_global_variables_by_name(&self, name: &str) -> Vec<GlobalVariableInfo> {
+        if let Err(error) = self.ensure_debug_info_for_symbol(name, GdbSymbolKind::Variable, false)
+        {
+            tracing::warn!(
+                "Failed to load indexed DWARF for global '{}' in {}: {}",
+                name,
+                self.module_path().display(),
+                error
+            );
+        }
         let mut out = Vec::new();
-        let entries = self.lightweight_index.find_variables_by_name(name);
+        let seed_entries = self
+            .lightweight_index
+            .read()
+            .expect("lightweight index lock poisoned")
+            .find_variables_by_name(name)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Err(error) = self.ensure_debug_info_for_entries(&seed_entries) {
+            tracing::warn!(
+                "Failed to materialize indexed DWARF for global '{}' in {}: {}",
+                name,
+                self.module_path().display(),
+                error
+            );
+        }
+        let entries = self
+            .lightweight_index
+            .read()
+            .expect("lightweight index lock poisoned")
+            .find_variables_by_name(name)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut seen_offsets: HashSet<(u64, u64)> = HashSet::new();
 
         let obj = match object::File::parse(&self._binary_mapped_file.data[..]) {
             Ok(f) => f,
             Err(_) => {
-                for e in entries {
+                for e in &entries {
                     let key = (e.unit_offset.0 as u64, e.die_offset.0 as u64);
                     if !seen_offsets.insert(key) {
                         continue;
@@ -70,7 +111,7 @@ impl LoadedObjfile {
             }
         };
 
-        for e in entries {
+        for e in &entries {
             let key = (e.unit_offset.0 as u64, e.die_offset.0 as u64);
             if !seen_offsets.insert(key) {
                 continue;
@@ -135,8 +176,8 @@ impl LoadedObjfile {
             }
         };
 
-        for name in self.lightweight_index.get_variable_names() {
-            for info in self.find_global_variables_by_name(name) {
+        for name in self.get_variable_names() {
+            for info in self.find_global_variables_by_name(&name) {
                 out.push(info);
             }
         }

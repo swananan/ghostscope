@@ -3,6 +3,7 @@ pub(crate) mod cfi_index;
 pub(crate) mod lightweight_file_index;
 pub(crate) mod lightweight_index;
 pub(crate) mod line_mapping;
+pub(crate) mod native_gdb_index;
 pub(crate) mod path;
 pub(crate) mod type_index;
 
@@ -13,5 +14,6 @@ pub(crate) use cfi_index::CfiIndex;
 pub(crate) use lightweight_file_index::{LightweightFileIndex, ScopedFileIndexManager};
 pub(crate) use lightweight_index::{LightweightIndex, LightweightIndexShard};
 pub(crate) use line_mapping::LineMappingTable;
+pub(crate) use native_gdb_index::{GdbIndex, GdbSymbolKind};
 pub(crate) use path::{directory_from_index, resolve_file_path};
 pub(crate) use type_index::TypeNameIndex;

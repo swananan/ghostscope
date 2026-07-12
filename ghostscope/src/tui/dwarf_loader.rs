@@ -37,6 +37,11 @@ fn convert_loading_event_to_runtime_status(event: ModuleLoadingEvent) -> Runtime
                 types: stats.types,
                 debug_source: stats.debug_info_source.kind_label().to_string(),
                 debug_source_path: stats.debug_info_source.display_path().map(str::to_string),
+                dwarf_index: stats.dwarf_index_status.display_label(),
+                dwarf_index_warning: stats
+                    .dwarf_index_status
+                    .rejection_reason()
+                    .map(str::to_string),
                 load_time_ms: stats.load_time_ms,
             };
             RuntimeStatus::DwarfModuleLoadingCompleted {
