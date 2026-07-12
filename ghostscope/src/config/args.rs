@@ -246,6 +246,18 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub dry_run: bool,
 
+    /// Parse target debug information into the persistent analysis cache and exit
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub prepare: bool,
+
+    /// Directory for persistent parsed DWARF analysis data
+    #[arg(long, value_name = "DIR", conflicts_with = "no_analysis_cache")]
+    pub analysis_cache_dir: Option<PathBuf>,
+
+    /// Disable persistent parsed DWARF analysis caching
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub no_analysis_cache: bool,
+
     /// Include detailed target and variable diagnostics in dry-run output
     #[arg(long = "dry-run-details", requires = "dry_run", action = clap::ArgAction::SetTrue)]
     pub dry_run_details: bool,
@@ -347,6 +359,9 @@ pub struct ParsedArgs {
     pub tui_mode: bool,
     pub dry_run: bool,
     pub dry_run_details: bool,
+    pub prepare: bool,
+    pub analysis_cache_dir: Option<PathBuf>,
+    pub no_analysis_cache: bool,
     pub script_output: Option<ScriptOutputMode>,
     pub status_enabled: bool,
     pub has_explicit_status_flag: bool,
@@ -529,6 +544,9 @@ impl Args {
             tui_mode,
             dry_run,
             dry_run_details,
+            prepare: parsed.prepare,
+            analysis_cache_dir: parsed.analysis_cache_dir,
+            no_analysis_cache: parsed.no_analysis_cache,
             script_output: parsed.script_output,
             status_enabled,
             has_explicit_status_flag,
@@ -590,7 +608,7 @@ impl Args {
 
     /// Determine whether to start in TUI mode
     fn determine_tui_mode(parsed: &Args) -> bool {
-        if parsed.dry_run {
+        if parsed.dry_run || parsed.prepare {
             return false;
         }
 
@@ -660,7 +678,8 @@ impl Args {
         parsed: &Args,
     ) -> (bool, bool, crate::config::settings::LogLevel, bool, bool) {
         // Check if we're in script mode (script provided via --script or --script-file)
-        let is_script_mode = parsed.script.is_some() || parsed.script_file.is_some();
+        let is_script_mode =
+            parsed.prepare || parsed.script.is_some() || parsed.script_file.is_some();
 
         // Check if explicit log flags were provided
         let has_explicit_log_flag = parsed.log || parsed.no_log;
@@ -776,6 +795,31 @@ mod tests {
         assert!(help.contains("bpffs"));
         assert!(help.contains("--script-help"));
         assert!(help.contains("--args"));
+        assert!(help.contains("--prepare"));
+    }
+
+    #[test]
+    fn parses_prepare_analysis_cache_flags() {
+        let parsed = Args::parse_args_from(vec![
+            "ghostscope".to_string(),
+            "--prepare".to_string(),
+            "--target".to_string(),
+            "/tmp/app".to_string(),
+            "--analysis-cache-dir".to_string(),
+            "/tmp/ghostscope-cache".to_string(),
+        ]);
+
+        match parsed {
+            ParsedCommand::Trace(args) => {
+                assert!(args.prepare);
+                assert!(!args.tui_mode);
+                assert_eq!(
+                    args.analysis_cache_dir,
+                    Some(PathBuf::from("/tmp/ghostscope-cache"))
+                );
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
     }
 
     #[test]

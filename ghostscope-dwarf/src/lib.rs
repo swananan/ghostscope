@@ -7,6 +7,7 @@
 pub(crate) mod core;
 
 // Internal implementation modules
+mod analysis_cache;
 pub(crate) mod binary;
 pub(crate) mod dwarf_expr;
 pub(crate) mod index;
@@ -20,13 +21,14 @@ pub(crate) mod semantics;
 pub(crate) mod analyzer;
 
 // Re-export main public API only
+pub use analysis_cache::AnalysisCache;
 pub use analyzer::{
-    AddressQueryResult, AnalyzerStats, DwarfAnalyzer, ExecutableFileInfo, FunctionQueryResult,
-    LoadedModuleRuntimeInfo, MainExecutableInfo, ModuleDefaultPolicy, ModuleLoadingEvent,
-    ModuleLoadingStats, ModuleStats, SectionInfo, SharedLibraryInfo, SimpleFileInfo,
-    SourceLineAddressSearch, SourceLineQuerySearch, TypeLookupAmbiguity,
+    AddressQueryResult, AnalysisCacheStatus, AnalyzerStats, DwarfAnalyzer, ExecutableFileInfo,
+    FunctionQueryResult, LoadedModuleRuntimeInfo, MainExecutableInfo, ModuleDefaultPolicy,
+    ModuleLoadingEvent, ModuleLoadingStats, ModuleStats, SectionInfo, SharedLibraryInfo,
+    SimpleFileInfo, SourceLineAddressSearch, SourceLineQuerySearch, TypeLookupAmbiguity,
 };
-pub use loader::ExplicitDebugFile;
+pub use loader::{DwarfLoadOptions, ExplicitDebugFile};
 
 // Re-export essential core and semantic support types.
 pub use core::{

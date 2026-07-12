@@ -414,6 +414,65 @@ impl LightweightIndex {
         self.entries.len()
     }
 
+    pub(crate) fn cache_entries(&self) -> &[IndexEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn cache_cu_ranges(&self) -> Vec<(u64, u64, DebugInfoOffset)> {
+        self.cu_range_map
+            .iter()
+            .map(|(start, (end, cu))| (*start, *end, *cu))
+            .collect()
+    }
+
+    pub(crate) fn from_cached_entries(
+        entries: Vec<IndexEntry>,
+        cu_ranges: Vec<(u64, u64, DebugInfoOffset)>,
+    ) -> Self {
+        let mut shard = LightweightIndexShard::default();
+        for entry in entries {
+            let key = entry.name.to_string();
+            match entry.tag {
+                gimli::constants::DW_TAG_subprogram
+                | gimli::constants::DW_TAG_inlined_subroutine => {
+                    shard.push_function_entry(key, entry);
+                }
+                gimli::constants::DW_TAG_variable => {
+                    shard.push_variable_entry(key, entry);
+                }
+                gimli::constants::DW_TAG_structure_type
+                | gimli::constants::DW_TAG_class_type
+                | gimli::constants::DW_TAG_union_type
+                | gimli::constants::DW_TAG_enumeration_type
+                | gimli::constants::DW_TAG_typedef => {
+                    shard.push_type_entry(key, entry);
+                }
+                _ => shard.entries.push(entry),
+            }
+        }
+
+        let mut index = Self::from_shards(vec![shard]);
+        index.cu_range_map = cu_ranges
+            .into_iter()
+            .map(|(start, end, cu)| (start, (end, cu)))
+            .collect();
+
+        let mut per_cu = HashMap::<DebugInfoOffset, BTreeMap<u64, usize>>::new();
+        for (idx, entry) in index.entries.iter().enumerate() {
+            if Self::is_function_tag(entry.tag) {
+                if let Some(address) = entry.representative_addr.or(entry.entry_pc) {
+                    per_cu
+                        .entry(entry.unit_offset)
+                        .or_default()
+                        .insert(address, idx);
+                }
+            }
+        }
+        index.func_addr_by_cu = per_cu;
+        index.cu_maps_built = true;
+        index
+    }
+
     /// Get total statistics
     pub fn get_stats(&self) -> (usize, usize, usize) {
         (

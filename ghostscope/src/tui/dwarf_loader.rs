@@ -1,8 +1,13 @@
 use crate::config::ResolvedConfig;
 use crate::core::GhostSession;
 use anyhow::Result;
-use ghostscope_dwarf::ModuleLoadingEvent;
-use ghostscope_ui::{events::ModuleLoadingStats as UIModuleLoadingStats, RuntimeStatus};
+use ghostscope_dwarf::{AnalysisCacheStatus, ModuleLoadingEvent};
+use ghostscope_ui::{
+    events::{
+        AnalysisCacheStatus as UIAnalysisCacheStatus, ModuleLoadingStats as UIModuleLoadingStats,
+    },
+    RuntimeStatus,
+};
 use tracing::info;
 
 /// Convert ModuleLoadingEvent to RuntimeStatus
@@ -38,6 +43,14 @@ fn convert_loading_event_to_runtime_status(event: ModuleLoadingEvent) -> Runtime
                 debug_source: stats.debug_info_source.kind_label().to_string(),
                 debug_source_path: stats.debug_info_source.display_path().map(str::to_string),
                 load_time_ms: stats.load_time_ms,
+                analysis_cache_status: match stats.analysis_cache_status {
+                    AnalysisCacheStatus::Disabled => UIAnalysisCacheStatus::Disabled,
+                    AnalysisCacheStatus::Hit => UIAnalysisCacheStatus::Hit,
+                    AnalysisCacheStatus::Miss => UIAnalysisCacheStatus::Miss,
+                    AnalysisCacheStatus::Rejected { reason } => {
+                        UIAnalysisCacheStatus::Rejected { reason }
+                    }
+                },
             };
             RuntimeStatus::DwarfModuleLoadingCompleted {
                 module_path,

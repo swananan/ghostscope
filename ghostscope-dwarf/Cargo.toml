@@ -20,6 +20,8 @@ memmap2 = "0.9"
 anyhow.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+bincode.workspace = true
 ghostscope-platform = { version = "0.1.6", path = "../ghostscope-platform" }
 ghostscope-protocol = { version = "0.1.6", path = "../ghostscope-protocol" }
 ghostscope-process = { version = "0.1.6", path = "../ghostscope-process" }

@@ -244,12 +244,9 @@ impl LoadedObjfile {
                     tracing::debug!("Inline '{}' has no ranges; entry_pc={epc_dbg}", entry.name);
                 }
 
-                let entry_pc_has_line_entry = entry.entry_pc.is_some_and(|pc| {
-                    self.line_mapping
-                        .get_entries_in_range(pc, pc)
-                        .next()
-                        .is_some()
-                });
+                let entry_pc_has_line_entry = entry
+                    .entry_pc
+                    .is_some_and(|pc| !self.line_mapping.get_entries_in_range(pc, pc).is_empty());
                 if let Some(addr) =
                     Self::selected_inline_address(entry, &ranges, entry_pc_has_line_entry)
                 {

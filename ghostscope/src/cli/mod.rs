@@ -4,6 +4,7 @@ mod color;
 mod docs;
 mod dry_run;
 mod loading_reporter;
+mod prepare;
 pub mod script_output;
 pub mod script_runtime;
 
@@ -13,6 +14,8 @@ use ghostscope_process::pinned_bpf_maps::{
     self, BpffsPruneMode, BpffsPruneOptions, BpffsPruneReport, BpffsPruneStatus,
 };
 use serde::Serialize;
+
+pub use prepare::prepare_analysis_cache;
 
 #[derive(Serialize)]
 struct JsonPruneReport {

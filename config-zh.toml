@@ -101,6 +101,15 @@ search_paths = [
 # 也会继续使用该独立调试文件（会记录警告日志）。仅建议在排障或环境不规范时短期启用。
 allow_loose_debug_match = false
 
+[dwarf.analysis_cache]
+# 读取由 --prepare 生成、与运行时目标无关的 DWARF 解析索引。PID filter、
+# 模块映射、CFI map 发布和 eBPF attach 状态都不会写入这里。
+enabled = true
+
+# 未设置时使用 $XDG_CACHE_HOME/ghostscope/analysis 或
+# ~/.cache/ghostscope/analysis。
+# directory = "/home/user/.cache/ghostscope/analysis"
+
 [dwarf.debuginfod]
 # debuginfod 调试信息回退。
 # 模式参考 GDB：

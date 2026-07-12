@@ -33,6 +33,7 @@ pub struct UserConfig {
     pub tui_mode: bool,
     pub dry_run: bool,
     pub dry_run_details: bool,
+    pub prepare: bool,
 
     // File saving options
     pub should_save_llvm_ir: bool,
@@ -53,6 +54,7 @@ pub struct UserConfig {
     pub dwarf_search_paths: Vec<String>,
     pub dwarf_allow_loose_debug_match: bool,
     pub dwarf_debuginfod: ResolvedDebuginfodConfig,
+    pub dwarf_analysis_cache_dir: Option<PathBuf>,
 
     // eBPF configuration
     pub ebpf_config: crate::config::settings::EbpfConfig,
@@ -68,6 +70,12 @@ impl UserConfig {
     /// Create merged user configuration from parsed arguments and config file.
     pub fn new(args: ParsedArgs, config: Config) -> Self {
         let dwarf_debuginfod = ResolvedDebuginfodConfig::resolve(&args, &config);
+        let dwarf_analysis_cache_dir = resolve_analysis_cache_directory(
+            args.no_analysis_cache,
+            args.analysis_cache_dir.clone(),
+            config.dwarf.analysis_cache.enabled,
+            config.dwarf.analysis_cache.directory.clone(),
+        );
         let log_file = args
             .log_file
             .unwrap_or_else(|| PathBuf::from(&config.general.log_file));
@@ -174,6 +182,7 @@ impl UserConfig {
             tui_mode,
             dry_run: args.dry_run,
             dry_run_details: args.dry_run_details,
+            prepare: args.prepare,
             should_save_llvm_ir,
             should_save_ebpf,
             should_save_ast,
@@ -192,6 +201,7 @@ impl UserConfig {
                 config.dwarf.allow_loose_debug_match
             },
             dwarf_debuginfod,
+            dwarf_analysis_cache_dir,
             ebpf_config: {
                 let mut ebpf_config = config.ebpf;
                 if args.force_perf_event_array {
@@ -295,6 +305,41 @@ impl UserConfig {
 
         info!("✓ Command line arguments validated successfully");
         Ok(())
+    }
+
+    pub(crate) fn validate_prepare(&self) -> Result<()> {
+        if !self.prepare {
+            return Ok(());
+        }
+        if self.input_pid.is_some() {
+            return Err(anyhow::anyhow!(
+                "--prepare accepts --target only; PID and runtime state are resolved when tracing"
+            ));
+        }
+        if self.target_path.is_none() {
+            return Err(anyhow::anyhow!("--prepare requires --target <PATH>"));
+        }
+        if self.binary_path.is_some() || !self.binary_args.is_empty() {
+            return Err(anyhow::anyhow!(
+                "--prepare does not launch a target program; use --target <PATH>"
+            ));
+        }
+        if self.script.is_some() || self.script_file.is_some() {
+            return Err(anyhow::anyhow!(
+                "--prepare caches target analysis and does not accept a trace script"
+            ));
+        }
+        if self.dry_run {
+            return Err(anyhow::anyhow!(
+                "--prepare and --dry-run cannot be used together"
+            ));
+        }
+        if self.dwarf_analysis_cache_dir.is_none() {
+            return Err(anyhow::anyhow!(
+                "--prepare requires analysis caching; remove --no-analysis-cache or enable dwarf.analysis_cache"
+            ));
+        }
+        self.validate_with_pid_state(false)
     }
 }
 
@@ -466,9 +511,58 @@ fn default_enable_logging_for_mode(is_script_mode: bool) -> bool {
     !is_script_mode
 }
 
+fn resolve_analysis_cache_directory(
+    disabled: bool,
+    cli_directory: Option<PathBuf>,
+    config_enabled: bool,
+    config_directory: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if disabled {
+        return None;
+    }
+
+    cli_directory
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| {
+            config_enabled
+                .then_some(config_directory)
+                .flatten()
+                .filter(|path| !path.as_os_str().is_empty())
+        })
+        .or_else(|| config_enabled.then(ghostscope_dwarf::AnalysisCache::default_directory))
+}
+
 fn is_pid_running(pid: u32) -> bool {
     use std::path::Path;
 
     let proc_path = format!("/proc/{pid}");
     Path::new(&proc_path).is_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_configured_analysis_cache_directory_uses_default() {
+        let resolved = resolve_analysis_cache_directory(false, None, true, Some(PathBuf::new()));
+
+        assert_eq!(
+            resolved,
+            Some(ghostscope_dwarf::AnalysisCache::default_directory())
+        );
+    }
+
+    #[test]
+    fn empty_cli_analysis_cache_directory_follows_config() {
+        let configured = PathBuf::from("/configured/analysis-cache");
+        let resolved = resolve_analysis_cache_directory(
+            false,
+            Some(PathBuf::new()),
+            true,
+            Some(configured.clone()),
+        );
+
+        assert_eq!(resolved, Some(configured));
+    }
 }

@@ -30,6 +30,7 @@ impl App {
             types,
             debug_source: "unknown".to_string(),
             debug_source_path: None,
+            analysis_cache_status: crate::events::AnalysisCacheStatus::Disabled,
         };
         self.state
             .loading_ui
@@ -218,6 +219,7 @@ impl App {
                     types: stats.types,
                     debug_source: stats.debug_source.clone(),
                     debug_source_path: stats.debug_source_path.clone(),
+                    analysis_cache_status: stats.analysis_cache_status.clone(),
                 };
                 self.state
                     .loading_ui

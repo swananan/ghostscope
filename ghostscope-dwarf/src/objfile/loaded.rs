@@ -1,6 +1,7 @@
 //! Loaded object file: complete DWARF data for a single binary
 
 use crate::{
+    analyzer::AnalysisCacheStatus,
     binary::{DwarfReader, MappedFile},
     core::{mapping::ModuleMapping, DebugInfoSource, Result},
     index::{
@@ -40,6 +41,7 @@ pub(crate) struct LoadedObjfile {
     pub(super) load_parse_ms: u64,
     pub(super) load_index_ms: u64,
     pub(super) load_total_ms: u64,
+    pub(super) analysis_cache_status: AnalysisCacheStatus,
 }
 
 impl LoadedObjfile {
@@ -107,6 +109,10 @@ impl LoadedObjfile {
 
     pub(crate) fn get_load_timing_ms(&self) -> (u64, u64, u64) {
         (self.load_parse_ms, self.load_index_ms, self.load_total_ms)
+    }
+
+    pub(crate) fn analysis_cache_status(&self) -> &AnalysisCacheStatus {
+        &self.analysis_cache_status
     }
 
     pub(crate) fn get_cfa_result(&self, pc: u64) -> Result<Option<crate::core::CfaResult>> {

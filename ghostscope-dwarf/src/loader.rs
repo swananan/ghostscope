@@ -1,6 +1,7 @@
 //! Module loading with Builder pattern and parallel support
 
 use crate::{
+    analysis_cache::AnalysisCache,
     analyzer::{ModuleLoadingEvent, ModuleLoadingStats},
     core::{mapping::ModuleMapping, Result},
     objfile::LoadedObjfile,
@@ -32,6 +33,16 @@ impl ExplicitDebugFile {
     }
 }
 
+/// Target-independent options used while loading DWARF modules.
+#[derive(Debug, Clone, Default)]
+pub struct DwarfLoadOptions {
+    pub debug_search_paths: Vec<String>,
+    pub allow_loose_debug_match: bool,
+    pub explicit_debug_file: Option<ExplicitDebugFile>,
+    pub debuginfod_client: Option<Arc<DebuginfodClient>>,
+    pub analysis_cache: Option<AnalysisCache>,
+}
+
 /// Configuration for module loading (parallel only)
 #[derive(Debug, Clone)]
 pub struct LoadConfig {
@@ -45,6 +56,8 @@ pub struct LoadConfig {
     pub explicit_debug_file: Option<ExplicitDebugFile>,
     /// Optional debuginfod client for build-id based debug file lookup.
     pub debuginfod_client: Option<Arc<DebuginfodClient>>,
+    /// Optional persistent cache for parsed, target-independent DWARF indices.
+    pub analysis_cache: Option<AnalysisCache>,
 }
 
 impl Default for LoadConfig {
@@ -55,6 +68,7 @@ impl Default for LoadConfig {
             allow_loose_debug_match: false,
             explicit_debug_file: None,
             debuginfod_client: None,
+            analysis_cache: None,
         }
     }
 }
@@ -68,6 +82,7 @@ impl LoadConfig {
             allow_loose_debug_match: false,
             explicit_debug_file: None,
             debuginfod_client: None,
+            analysis_cache: None,
         }
     }
 }
@@ -117,6 +132,12 @@ impl ModuleLoader {
         self
     }
 
+    /// Use a persistent cache for parsed, target-independent DWARF indices.
+    pub fn with_analysis_cache(mut self, cache: Option<AnalysisCache>) -> Self {
+        self.config.analysis_cache = cache;
+        self
+    }
+
     /// Load with progress callback - always parallel
     pub async fn load_with_progress<F>(self, progress_callback: F) -> Result<Vec<LoadedObjfile>>
     where
@@ -159,6 +180,7 @@ impl ModuleLoader {
         let allow_loose = self.config.allow_loose_debug_match;
         let explicit_debug_file = self.config.explicit_debug_file.clone();
         let debuginfod_client = self.config.debuginfod_client.clone();
+        let analysis_cache = self.config.analysis_cache.clone();
 
         let tasks: Vec<_> = self
             .mappings
@@ -169,6 +191,7 @@ impl ModuleLoader {
                 let progress_callback = progress_callback.clone();
                 let debug_search_paths = debug_search_paths.clone();
                 let debuginfod_client = debuginfod_client.clone();
+                let analysis_cache = analysis_cache.clone();
                 let explicit_debug_file_for_module =
                     explicit_debug_file.as_ref().and_then(|explicit| {
                         explicit
@@ -196,6 +219,7 @@ impl ModuleLoader {
                         allow_loose,
                         explicit_debug_file_for_module,
                         debuginfod_client,
+                        analysis_cache,
                     )
                     .await;
 
@@ -217,6 +241,7 @@ impl ModuleLoader {
                                 parse_time_ms,
                                 index_time_ms,
                                 module_total_time_ms,
+                                analysis_cache_status: module.analysis_cache_status().clone(),
                             };
 
                             progress_callback(ModuleLoadingEvent::LoadingCompleted {

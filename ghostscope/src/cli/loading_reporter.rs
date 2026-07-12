@@ -1,4 +1,4 @@
-use ghostscope_dwarf::{DebugInfoSource, ModuleLoadingEvent};
+use ghostscope_dwarf::{AnalysisCacheStatus, DebugInfoSource, ModuleLoadingEvent};
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -146,6 +146,7 @@ struct LoadingProgress {
     functions: usize,
     variables: usize,
     types: usize,
+    analysis_cache: AnalysisCacheCounts,
 }
 
 impl LoadingProgress {
@@ -162,6 +163,7 @@ impl LoadingProgress {
             functions: 0,
             variables: 0,
             types: 0,
+            analysis_cache: AnalysisCacheCounts::default(),
         }
     }
 
@@ -193,6 +195,7 @@ impl LoadingProgress {
                 self.functions += stats.functions;
                 self.variables += stats.variables;
                 self.types += stats.types;
+                self.analysis_cache.record(&stats.analysis_cache_status);
                 self.module_reports.push(ModuleLoadReport {
                     path: module_path.clone(),
                     source: stats.debug_info_source,
@@ -200,6 +203,7 @@ impl LoadingProgress {
                     variables: stats.variables,
                     types: stats.types,
                     load_time_ms: stats.load_time_ms,
+                    analysis_cache_status: stats.analysis_cache_status,
                 });
                 if self.current_module.as_deref() == Some(module_path.as_str()) {
                     self.current_module = None;
@@ -302,6 +306,13 @@ impl LoadingProgress {
             ));
         }
 
+        if self.analysis_cache.has_activity() {
+            lines.push(format!(
+                "  analysis cache: {}",
+                self.analysis_cache.summary_colored(colors)
+            ));
+        }
+
         let debuggable_modules = self.debuggable_module_reports();
         if !self.module_reports.is_empty() || !self.module_failures.is_empty() {
             lines.push(format!(
@@ -338,6 +349,29 @@ impl LoadingProgress {
             ));
         }
 
+        let rejected_cache_modules = self.rejected_cache_modules();
+        if !rejected_cache_modules.is_empty() {
+            lines.push(format!("  {}", colors.yellow("cache fallback:")));
+            for module in rejected_cache_modules.iter().take(MAX_MODULE_REPORT_LINES) {
+                let AnalysisCacheStatus::Rejected { reason } = &module.analysis_cache_status else {
+                    continue;
+                };
+                lines.push(format!(
+                    "    {} {:<64} {}",
+                    colors.yellow("rejected"),
+                    shorten_path(&module.path, 64),
+                    truncate_text(reason, 120)
+                ));
+            }
+            if rejected_cache_modules.len() > MAX_MODULE_REPORT_LINES {
+                let omitted = rejected_cache_modules.len() - MAX_MODULE_REPORT_LINES;
+                lines.push(format!(
+                    "    ... {omitted} more rejected cache {} omitted",
+                    if omitted == 1 { "entry" } else { "entries" }
+                ));
+            }
+        }
+
         if !self.module_failures.is_empty() {
             lines.push("  module failures:".to_string());
             for failure in self.module_failures.iter().take(MAX_MODULE_REPORT_LINES) {
@@ -361,6 +395,18 @@ impl LoadingProgress {
         self.module_reports
             .iter()
             .filter(|module| !matches!(module.source, DebugInfoSource::Missing))
+            .collect()
+    }
+
+    fn rejected_cache_modules(&self) -> Vec<&ModuleLoadReport> {
+        self.module_reports
+            .iter()
+            .filter(|module| {
+                matches!(
+                    &module.analysis_cache_status,
+                    AnalysisCacheStatus::Rejected { .. }
+                )
+            })
             .collect()
     }
 
@@ -441,12 +487,65 @@ struct ModuleLoadReport {
     variables: usize,
     types: usize,
     load_time_ms: u64,
+    analysis_cache_status: AnalysisCacheStatus,
 }
 
 #[derive(Debug)]
 struct ModuleFailureReport {
     path: String,
     error: String,
+}
+
+#[derive(Debug, Default)]
+struct AnalysisCacheCounts {
+    hits: usize,
+    misses: usize,
+    rejected: usize,
+}
+
+impl AnalysisCacheCounts {
+    fn record(&mut self, status: &AnalysisCacheStatus) {
+        match status {
+            AnalysisCacheStatus::Disabled => {}
+            AnalysisCacheStatus::Hit => self.hits += 1,
+            AnalysisCacheStatus::Miss => self.misses += 1,
+            AnalysisCacheStatus::Rejected { .. } => self.rejected += 1,
+        }
+    }
+
+    fn has_activity(&self) -> bool {
+        self.hits + self.misses + self.rejected > 0
+    }
+
+    fn summary_colored(&self, colors: &crate::cli::color::CliColors) -> String {
+        let mut parts = Vec::new();
+        if self.hits > 0 {
+            parts.push(colors.green(format_count(self.hits, "hit", "hits")));
+        }
+        if self.misses > 0 {
+            parts.push(colors.yellow(format_count(self.misses, "miss", "misses")));
+        }
+        if self.rejected > 0 {
+            parts.push(colors.yellow(format_count(self.rejected, "rejected", "rejected")));
+        }
+        parts.join(", ")
+    }
+}
+
+fn format_count(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+fn truncate_text(value: &str, max_width: usize) -> String {
+    let width = value.chars().count();
+    if width <= max_width {
+        return value.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+    let prefix: String = value.chars().take(max_width - 3).collect();
+    format!("{prefix}...")
 }
 
 #[derive(Debug, Default)]
@@ -634,7 +733,9 @@ mod tests {
         CliLoadingReporter, DebugSourceCounts,
     };
     use crate::config::CliColorMode;
-    use ghostscope_dwarf::{DebugInfoSource, ModuleLoadingEvent, ModuleLoadingStats};
+    use ghostscope_dwarf::{
+        AnalysisCacheStatus, DebugInfoSource, ModuleLoadingEvent, ModuleLoadingStats,
+    };
     use std::time::Duration;
 
     #[test]
@@ -690,6 +791,7 @@ mod tests {
                 parse_time_ms: 30,
                 index_time_ms: 8,
                 module_total_time_ms: 40,
+                analysis_cache_status: AnalysisCacheStatus::Hit,
             },
             current: 1,
             total: 2,
@@ -714,6 +816,54 @@ mod tests {
         assert!(report.contains("module details:"));
         assert!(report.contains("embedded"));
         assert!(report.contains("/usr/bin/app"));
+        assert!(report.contains("analysis cache: 1 hit"));
+    }
+
+    #[test]
+    fn reporter_summarizes_cache_misses_and_rejections() {
+        let mut reporter = CliLoadingReporter::new_with_enabled(
+            false,
+            crate::cli::color::CliColors::new(false),
+            Duration::ZERO,
+        );
+        for (path, status) in [
+            ("/usr/bin/app", AnalysisCacheStatus::Miss),
+            (
+                "/usr/lib/libbadcache.so",
+                AnalysisCacheStatus::Rejected {
+                    reason: "Failed to decode analysis cache payload".to_string(),
+                },
+            ),
+        ] {
+            reporter.handle_event(ModuleLoadingEvent::LoadingCompleted {
+                module_path: path.to_string(),
+                stats: ModuleLoadingStats {
+                    functions: 1,
+                    variables: 0,
+                    types: 0,
+                    debug_info_source: DebugInfoSource::Embedded {
+                        path: path.to_string(),
+                    },
+                    load_time_ms: 5,
+                    parse_time_ms: 4,
+                    index_time_ms: 1,
+                    module_total_time_ms: 5,
+                    analysis_cache_status: status,
+                },
+                current: 1,
+                total: 2,
+            });
+        }
+
+        let report = reporter
+            .progress
+            .success_report_lines(&reporter.colors, Some("pid=123"))
+            .join("\n");
+
+        assert!(report.contains("analysis cache: 1 miss, 1 rejected"));
+        assert!(report.contains("cache fallback:"));
+        assert!(report.contains("libbadcache.so"));
+        assert!(report.contains("Failed to decode analysis cache payload"));
     }
 
     #[test]
@@ -734,6 +884,7 @@ mod tests {
                 parse_time_ms: 0,
                 index_time_ms: 0,
                 module_total_time_ms: 5,
+                analysis_cache_status: AnalysisCacheStatus::Miss,
             },
             current: 1,
             total: 1,

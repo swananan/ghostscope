@@ -49,6 +49,10 @@ async fn main() -> Result<()> {
 
     info!("{}", user_config.config_source_message());
 
+    if user_config.prepare {
+        return cli::prepare_analysis_cache(&user_config).await;
+    }
+
     // Dry-run does not attach uprobes, but it still validates the same eBPF
     // privileges and kernel capabilities as a real run.
     crate::util::ensure_privileges();

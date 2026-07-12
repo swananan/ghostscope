@@ -1,3 +1,4 @@
+use crate::events::AnalysisCacheStatus;
 use std::time::Instant;
 
 /// Loading states for different initialization phases
@@ -75,6 +76,29 @@ pub struct ModuleStats {
     pub types: usize,
     pub debug_source: String,
     pub debug_source_path: Option<String>,
+    pub analysis_cache_status: AnalysisCacheStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AnalysisCacheCounts {
+    pub hits: usize,
+    pub misses: usize,
+    pub rejected: usize,
+}
+
+impl AnalysisCacheCounts {
+    fn record(&mut self, status: &AnalysisCacheStatus) {
+        match status {
+            AnalysisCacheStatus::Disabled => {}
+            AnalysisCacheStatus::Hit => self.hits += 1,
+            AnalysisCacheStatus::Miss => self.misses += 1,
+            AnalysisCacheStatus::Rejected { .. } => self.rejected += 1,
+        }
+    }
+
+    pub fn has_activity(&self) -> bool {
+        self.hits + self.misses + self.rejected > 0
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -163,6 +187,7 @@ pub struct LoadingProgress {
     pub failed_count: usize,
     pub current_loading: Option<String>,
     pub debug_sources: DebugSourceCounts,
+    pub analysis_cache: AnalysisCacheCounts,
 }
 
 impl LoadingProgress {
@@ -174,6 +199,7 @@ impl LoadingProgress {
             failed_count: 0,
             current_loading: None,
             debug_sources: DebugSourceCounts::default(),
+            analysis_cache: AnalysisCacheCounts::default(),
         }
     }
 
@@ -191,6 +217,7 @@ impl LoadingProgress {
     pub fn complete_module(&mut self, path: &str, stats: ModuleStats) {
         if let Some(module) = self.modules.iter_mut().find(|m| m.path == path) {
             self.debug_sources.record(&stats.debug_source);
+            self.analysis_cache.record(&stats.analysis_cache_status);
             module.complete(stats);
             self.completed_count += 1;
             if self.current_loading.as_deref() == Some(path) {
@@ -243,6 +270,20 @@ impl LoadingProgress {
             .collect()
     }
 
+    pub fn rejected_cache_modules(&self) -> Vec<&ModuleLoadStatus> {
+        self.modules
+            .iter()
+            .filter(|module| {
+                module.stats.as_ref().is_some_and(|stats| {
+                    matches!(
+                        &stats.analysis_cache_status,
+                        AnalysisCacheStatus::Rejected { .. }
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub fn recently_finished(&self, limit: usize) -> Vec<&ModuleLoadStatus> {
         self.modules
             .iter()
@@ -259,6 +300,7 @@ impl LoadingProgress {
             types: 0,
             debug_source: "summary".to_string(),
             debug_source_path: None,
+            analysis_cache_status: AnalysisCacheStatus::Disabled,
         };
 
         for module in &self.modules {

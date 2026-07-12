@@ -1,6 +1,21 @@
 use crate::{core::DebugInfoSource, semantics::VisibleVariable};
 use std::path::PathBuf;
 
+/// Outcome of consulting the persistent analysis cache for one module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnalysisCacheStatus {
+    Disabled,
+    Hit,
+    Miss,
+    Rejected { reason: String },
+}
+
+impl AnalysisCacheStatus {
+    pub fn is_hit(&self) -> bool {
+        matches!(self, Self::Hit)
+    }
+}
+
 /// Events emitted during module loading process
 #[derive(Debug, Clone)]
 pub enum ModuleLoadingEvent {
@@ -43,6 +58,7 @@ pub struct ModuleLoadingStats {
     pub parse_time_ms: u64,
     pub index_time_ms: u64,
     pub module_total_time_ms: u64,
+    pub analysis_cache_status: AnalysisCacheStatus,
 }
 
 /// Rich query result for a single address within a module.

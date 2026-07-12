@@ -1,5 +1,7 @@
 use super::LoadedObjfile;
 use crate::{
+    analysis_cache::AnalysisCache,
+    analyzer::AnalysisCacheStatus,
     binary::{
         dwarf_endian_from_object, dwarf_reader_from_arc_with_endian,
         empty_dwarf_reader_with_endian, load_explicit_debug_file, try_load_debug_file, DwarfData,
@@ -22,6 +24,7 @@ impl LoadedObjfile {
         allow_loose_debug_match: bool,
         explicit_debug_file: Option<PathBuf>,
         debuginfod_client: Option<Arc<DebuginfodClient>>,
+        analysis_cache: Option<AnalysisCache>,
     ) -> Result<Self> {
         tracing::info!("Parallel loading for: {}", module_mapping.path.display());
         Self::load_internal_parallel(
@@ -30,6 +33,7 @@ impl LoadedObjfile {
             allow_loose_debug_match,
             explicit_debug_file,
             debuginfod_client,
+            analysis_cache,
         )
         .await
     }
@@ -41,6 +45,7 @@ impl LoadedObjfile {
         allow_loose_debug_match: bool,
         explicit_debug_file: Option<PathBuf>,
         debuginfod_client: Option<Arc<DebuginfodClient>>,
+        analysis_cache: Option<AnalysisCache>,
     ) -> Result<Self> {
         let load_started_at = Instant::now();
         tracing::debug!(
@@ -166,16 +171,72 @@ impl LoadedObjfile {
         };
 
         let mapped_file = mapped_file_for_dwarf;
+        let unwind_info_task = tokio::task::spawn_blocking({
+            let binary_for_cfi = Arc::clone(&binary_mapped);
+            let module_path = module_mapping.path.clone();
+            move || ModuleUnwindInfo::from_mapped_file(binary_for_cfi, &module_path)
+        });
 
-        tracing::debug!(
-            "Starting parallel DWARF parsing with true debug_line || debug_info parallelism..."
-        );
+        let (cached_parse_result, analysis_cache_status) = match analysis_cache.clone() {
+            Some(cache) => {
+                let binary_for_cache = Arc::clone(&binary_mapped);
+                let debug_file_for_cache = Arc::clone(&mapped_file);
+                match tokio::task::spawn_blocking(move || {
+                    cache.load(&binary_for_cache, &debug_file_for_cache)
+                })
+                .await
+                {
+                    Ok(Ok(Some(result))) => (Some(result), AnalysisCacheStatus::Hit),
+                    Ok(Ok(None)) => (None, AnalysisCacheStatus::Miss),
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            "Ignoring unusable DWARF analysis cache for {}: {}",
+                            module_mapping.path.display(),
+                            error
+                        );
+                        (
+                            None,
+                            AnalysisCacheStatus::Rejected {
+                                reason: error.to_string(),
+                            },
+                        )
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "Ignoring failed DWARF analysis cache task for {}: {}",
+                            module_mapping.path.display(),
+                            error
+                        );
+                        (
+                            None,
+                            AnalysisCacheStatus::Rejected {
+                                reason: format!("Cache loading task failed: {error}"),
+                            },
+                        )
+                    }
+                }
+            }
+            None => (None, AnalysisCacheStatus::Disabled),
+        };
 
-        let (pair_result, unwind_info) = tokio::try_join!(
-            tokio::task::spawn_blocking({
+        let (parse_result, unwind_info) = if let Some(parse_result) = cached_parse_result {
+            tracing::info!(
+                "DWARF analysis cache hit for {}",
+                module_mapping.path.display()
+            );
+            (parse_result, unwind_info_task.await?)
+        } else {
+            tracing::debug!(
+                "Starting parallel DWARF parsing with true debug_line || debug_info parallelism..."
+            );
+
+            let parse_task = tokio::task::spawn_blocking({
                 let dwarf = Arc::clone(&dwarf);
                 let module_path = module_mapping.path.to_string_lossy().to_string();
-                move || -> Result<(crate::parser::LineParseResult, crate::parser::DebugParseResult)> {
+                move || -> Result<(
+                    crate::parser::LineParseResult,
+                    crate::parser::DebugParseResult,
+                )> {
                     let (line_res, info_res) = rayon::join(
                         || {
                             let parser = crate::parser::DwarfParser::new(&dwarf);
@@ -192,21 +253,25 @@ impl LoadedObjfile {
                         (_, Err(e)) => Err(e),
                     }
                 }
-            }),
-            tokio::task::spawn_blocking({
-                let binary_for_cfi = Arc::clone(&binary_mapped);
-                let module_path = module_mapping.path.clone();
-                move || ModuleUnwindInfo::from_mapped_file(binary_for_cfi, &module_path)
-            })
-        )?;
+            });
+            let (pair_result, unwind_info) = tokio::try_join!(parse_task, unwind_info_task)?;
 
-        let (line_result, info_result) = pair_result?;
-
-        let parse_result = crate::parser::DwarfParser::combine_parallel_results(
-            line_result,
-            info_result,
-            module_mapping.path.to_string_lossy().to_string(),
-        );
+            let (line_result, info_result) = pair_result?;
+            let parse_result = crate::parser::DwarfParser::combine_parallel_results(
+                line_result,
+                info_result,
+                module_mapping.path.to_string_lossy().to_string(),
+            );
+            if let Some(cache) = analysis_cache.as_ref().filter(|cache| cache.is_writable()) {
+                let path = cache.store(&binary_mapped, &mapped_file, &parse_result)?;
+                tracing::info!(
+                    "Stored DWARF analysis cache for {} at {}",
+                    module_mapping.path.display(),
+                    path.display()
+                );
+            }
+            (parse_result, unwind_info)
+        };
         let parse_elapsed_ms = load_started_at.elapsed().as_millis();
 
         if let Some(cfi) = unwind_info.cfi_index() {
@@ -285,16 +350,18 @@ impl LoadedObjfile {
             load_parse_ms: parse_elapsed_ms as u64,
             load_index_ms: index_elapsed_ms as u64,
             load_total_ms,
+            analysis_cache_status: analysis_cache_status.clone(),
         };
 
         tracing::info!(
-            "True parallel loading completed for {}: {} functions, {} variables, {} line entries, {} files (state: {}, parse_ms: {}, index_ms: {}, total_ms: {})",
+            "True parallel loading completed for {}: {} functions, {} variables, {} line entries, {} files (state: {}, cache_status: {:?}, parse_ms: {}, index_ms: {}, total_ms: {})",
             module.module_mapping.path.display(),
             stats.total_functions,
             stats.total_variables,
             stats.total_line_entries,
             stats.total_files,
             state_label,
+            analysis_cache_status,
             parse_elapsed_ms,
             index_elapsed_ms,
             load_total_ms

@@ -12,6 +12,8 @@ pub(crate) use block_index::{BlockNode, CallSiteParameter, CallSiteRecord};
 pub(crate) use cfi_index::CfiIndex;
 pub(crate) use lightweight_file_index::{LightweightFileIndex, ScopedFileIndexManager};
 pub(crate) use lightweight_index::{LightweightIndex, LightweightIndexShard};
-pub(crate) use line_mapping::LineMappingTable;
+pub(crate) use line_mapping::{
+    encode_mapped_line_row, LineMappingTable, MAPPED_LINE_PATH_INDEX_SIZE, MAPPED_LINE_ROW_SIZE,
+};
 pub(crate) use path::{directory_from_index, resolve_file_path};
 pub(crate) use type_index::TypeNameIndex;
