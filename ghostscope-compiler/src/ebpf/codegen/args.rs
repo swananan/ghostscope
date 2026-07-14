@@ -101,7 +101,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         expr: &crate::script::ast::Expr,
         lvalue: crate::ebpf::expression::DynamicLvalue<'ctx>,
     ) -> Result<ComplexArg<'ctx>> {
-        let dwarf_type = lvalue.type_info.dwarf_type;
+        let dwarf_type = lvalue.type_info.resolved_type.summary;
         let data_len = Self::compute_read_size_for_type(&dwarf_type);
         if data_len == 0 {
             return Err(CodeGenError::TypeSizeNotAvailable(self.expr_to_name(expr)));
@@ -351,7 +351,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             E::AddressOf(inner) => {
                 if let Some(lvalue) = self.dynamic_lvalue_address_and_type(inner)? {
                     let ptr_ty = ghostscope_dwarf::TypeInfo::PointerType {
-                        target_type: Box::new(lvalue.type_info.dwarf_type),
+                        target_type: Box::new(lvalue.type_info.resolved_type.summary),
                         size: 8,
                     };
                     return Ok(ComplexArg {
@@ -515,7 +515,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         if var
                             .dwarf_type
                             .as_ref()
-                            .is_some_and(ghostscope_dwarf::is_c_pointer_or_array_type)
+                            .is_some_and(ghostscope_dwarf::is_pointer_or_array_type)
                         {
                             let pointed_plan =
                                 self.plan_dwarf_pointer_element_index(&var, index)?;

@@ -5,7 +5,7 @@
 use super::context::{CodeGenError, EbpfContext, Result, RuntimeAddress};
 use super::expression_plan::{BinaryEmitKind, BuiltinCallPlan};
 use crate::script::Expr;
-use ghostscope_dwarf::{CIntegerComparisonType, TypeId, TypeInfo as DwarfType};
+use ghostscope_dwarf::{CIntegerComparisonType, ResolvedType};
 use inkwell::values::BasicValueEnum;
 use inkwell::AddressSpace;
 
@@ -22,9 +22,8 @@ use tracing::debug;
 
 #[derive(Clone)]
 pub(super) struct DynamicTypeInfo {
-    pub(super) dwarf_type: DwarfType,
-    pub(super) module_path: Option<PathBuf>,
-    pub(super) type_id: Option<TypeId>,
+    pub(super) resolved_type: ResolvedType,
+    pub(super) type_module_path: Option<PathBuf>,
 }
 
 pub(super) struct DynamicLvalue<'ctx> {
@@ -33,10 +32,8 @@ pub(super) struct DynamicLvalue<'ctx> {
 }
 
 struct IndexableElementInfo {
-    element_type: DwarfType,
+    type_info: DynamicTypeInfo,
     stride: u64,
-    module_path: Option<PathBuf>,
-    type_id: Option<TypeId>,
 }
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {

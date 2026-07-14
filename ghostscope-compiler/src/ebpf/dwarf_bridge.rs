@@ -483,7 +483,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         };
         let addr = self.resolve_planned_address(address, runtime_status_ptr, module_hint)?;
 
-        if ghostscope_dwarf::is_c_aggregate_type(dwarf_type) {
+        if ghostscope_dwarf::is_aggregate_type(dwarf_type) {
             let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
             let as_ptr = self
                 .builder

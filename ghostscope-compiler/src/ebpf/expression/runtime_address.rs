@@ -155,7 +155,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .ok()
             .flatten()
             .and_then(|var| var.dwarf_type)
-            .is_some_and(|ty| ghostscope_dwarf::is_c_pointer_or_array_type(&ty))
+            .is_some_and(|ty| ghostscope_dwarf::is_pointer_or_array_type(&ty))
         {
             return Ok(true);
         }
@@ -175,7 +175,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .ok()
             .flatten()
             .and_then(|var| var.dwarf_type)
-            .is_some_and(|ty| ghostscope_dwarf::is_c_pointer_or_array_type(&ty)))
+            .is_some_and(|ty| ghostscope_dwarf::is_pointer_or_array_type(&ty)))
     }
 
     pub(super) fn expands_to_nonliteral_pointer_arithmetic(&mut self, expr: &Expr) -> Result<bool> {

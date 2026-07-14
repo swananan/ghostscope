@@ -1,8 +1,9 @@
 use super::DwarfAnalyzer;
 use crate::{
-    member_layout, semantics::PlanError, strip_type_aliases, CompilationUnitMetadata, CuId,
-    MemberLayout, ModuleId, PcContext, Result, SemanticType, TypeId, TypeInfo, TypeLayoutError,
-    TypeOrigin, VariableAccessSegment, VariableReadPlan,
+    indexable_element_layout, member_layout, semantics::PlanError, strip_type_aliases,
+    CompilationUnitMetadata, CuId, MemberLayout, ModuleId, PcContext, ResolvedType, Result,
+    SemanticType, TypeId, TypeIdentity, TypeInfo, TypeLayoutError, TypeOrigin, TypeProjection,
+    TypeProjectionLayout, VariableAccessSegment, VariableReadPlan,
 };
 use std::path::Path;
 
@@ -54,6 +55,12 @@ impl DwarfAnalyzer {
         Ok(Some(SemanticType::new(summary, plan.type_id, origin)))
     }
 
+    /// Combine a read plan's physical type with its stable identity and origin.
+    pub fn resolved_type_for_plan(&self, plan: &VariableReadPlan) -> Result<Option<ResolvedType>> {
+        self.semantic_type_for_plan(plan)
+            .map(|semantic| semantic.map(ResolvedType::from_semantic_type))
+    }
+
     /// Plan constant pointer arithmetic while preserving the projected type identity.
     pub fn plan_pointer_element_index(
         &self,
@@ -101,6 +108,142 @@ impl DwarfAnalyzer {
         aggregate_type: &TypeInfo,
         index: u32,
     ) -> Result<MemberLayout> {
+        let type_id =
+            self.tuple_aggregate_type_id_in_module(module_path.as_ref(), aggregate_type, index)?;
+        self.tuple_member_layout(type_id, aggregate_type, index)
+    }
+
+    /// Project physical layout, type summary, identity, and origin as one
+    /// operation so callers cannot accidentally advance only part of the type.
+    pub fn project_resolved_type(
+        &self,
+        current: &ResolvedType,
+        segment: &VariableAccessSegment,
+        type_module_path: Option<&Path>,
+    ) -> Result<TypeProjection> {
+        if let Some(projection) = current.project_structural(segment) {
+            return Ok(projection);
+        }
+
+        let (layout, summary, identity) = match segment {
+            VariableAccessSegment::Dereference => {
+                let TypeInfo::PointerType { target_type, .. } =
+                    strip_type_aliases(&current.summary)
+                else {
+                    return Err(anyhow::anyhow!(
+                        "dereference requires pointer type, got '{}'",
+                        current.summary.type_name()
+                    ));
+                };
+                (
+                    TypeProjectionLayout::Dereference,
+                    target_type.as_ref().clone(),
+                    self.project_type_identity(&current.identity, segment)?,
+                )
+            }
+            VariableAccessSegment::ArrayIndex(_) => {
+                let element = indexable_element_layout(&current.summary).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "array index requires array or pointer type, got '{}'",
+                        current.summary.type_name()
+                    )
+                })?;
+                (
+                    TypeProjectionLayout::Element {
+                        stride: element.stride,
+                    },
+                    element.element_type,
+                    self.project_type_identity(&current.identity, segment)?,
+                )
+            }
+            VariableAccessSegment::Field(field) => {
+                let member = member_layout(&current.summary, field)?;
+                (
+                    TypeProjectionLayout::Member {
+                        offset: member.offset,
+                    },
+                    member.member_type,
+                    self.project_type_identity(&current.identity, segment)?,
+                )
+            }
+            VariableAccessSegment::TupleIndex(index) => {
+                let aggregate_id = match current.identity.layout_dwarf_id() {
+                    Some(type_id) => type_id,
+                    None => {
+                        let module_path = type_module_path
+                            .ok_or(PlanError::TupleIndexMissingTypeIdentity { index: *index })?;
+                        self.tuple_aggregate_type_id_in_module(
+                            module_path,
+                            &current.summary,
+                            *index,
+                        )?
+                    }
+                };
+                let member = self.tuple_member_layout(aggregate_id, &current.summary, *index)?;
+                let identity = self
+                    .project_type_id(aggregate_id, segment)?
+                    .map(TypeIdentity::Dwarf)
+                    .unwrap_or(TypeIdentity::Unknown);
+                (
+                    TypeProjectionLayout::Member {
+                        offset: member.offset,
+                    },
+                    member.member_type,
+                    identity,
+                )
+            }
+        };
+        let origin = match identity.underlying_dwarf_id() {
+            Some(type_id) => self.type_origin(type_id)?,
+            None => None,
+        };
+
+        Ok(TypeProjection {
+            layout,
+            resolved_type: ResolvedType::new(summary, identity, origin),
+        })
+    }
+
+    fn project_type_id(
+        &self,
+        current: TypeId,
+        segment: &VariableAccessSegment,
+    ) -> Result<Option<TypeId>> {
+        let layout_segment = self.layout_access_segment(Some(current), segment)?;
+        self.projected_type_id(current, &layout_segment)
+    }
+
+    fn project_type_identity(
+        &self,
+        current: &TypeIdentity,
+        segment: &VariableAccessSegment,
+    ) -> Result<TypeIdentity> {
+        if let Some(projected) = current.project_structural(segment) {
+            return Ok(projected);
+        }
+        match current {
+            TypeIdentity::Dwarf(type_id) => Ok(self
+                .project_type_id(*type_id, segment)?
+                .map(TypeIdentity::Dwarf)
+                .unwrap_or(TypeIdentity::Unknown)),
+            TypeIdentity::Synthetic {
+                kind: crate::SyntheticTypeKind::Qualified,
+                inner,
+            } => self.project_type_identity(inner, segment),
+            TypeIdentity::Synthetic {
+                kind: crate::SyntheticTypeKind::Pointer | crate::SyntheticTypeKind::Array,
+                ..
+            }
+            | TypeIdentity::Unknown => Ok(TypeIdentity::Unknown),
+        }
+    }
+
+    fn tuple_aggregate_type_id_in_module(
+        &self,
+        module_path: &Path,
+        aggregate_type: &TypeInfo,
+        index: u32,
+    ) -> Result<TypeId> {
         let module_path = self
             .loaded_module_path_for(module_path)
             .ok_or_else(|| anyhow::anyhow!("Module is not loaded for tuple projection"))?;
@@ -117,22 +260,10 @@ impl DwarfAnalyzer {
                 .into())
             }
         };
-        let type_id = self
-            .modules
+        self.modules
             .get(module_path)
             .and_then(|module_data| module_data.aggregate_type_id_by_name(module, type_name))
-            .ok_or(PlanError::TupleIndexMissingTypeIdentity { index })?;
-        self.tuple_member_layout(type_id, aggregate_type, index)
-    }
-
-    /// Project a stable type identity through one source-level access segment.
-    pub fn project_type_id(
-        &self,
-        current: TypeId,
-        segment: &VariableAccessSegment,
-    ) -> Result<Option<TypeId>> {
-        let layout_segment = self.layout_access_segment(Some(current), segment)?;
-        self.projected_type_id(current, &layout_segment)
+            .ok_or_else(|| PlanError::TupleIndexMissingTypeIdentity { index }.into())
     }
 
     pub(super) fn projected_type_id(

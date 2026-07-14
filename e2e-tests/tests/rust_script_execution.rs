@@ -71,6 +71,54 @@ async fn test_rust_tuple_projection_plan_preserves_semantic_identity() -> anyhow
     assert_eq!(layout.offset, 4);
     assert_eq!(layout.member_type.type_name(), "i32");
 
+    let cast_type = analyzer
+        .try_resolve_c_style_semantic_type_spec_in_module(&binary_path, "Pair *")?
+        .ok_or_else(|| anyhow::anyhow!("expected semantic Pair pointer type"))?;
+    assert_eq!(
+        cast_type.origin.as_ref().map(|origin| origin.language),
+        Some(ghostscope_dwarf::SourceLanguage::Rust)
+    );
+    let pointee = analyzer.project_resolved_type(
+        &cast_type,
+        &ghostscope_dwarf::VariableAccessSegment::Dereference,
+        Some(&binary_path),
+    )?;
+    assert_eq!(
+        pointee.layout,
+        ghostscope_dwarf::TypeProjectionLayout::Dereference
+    );
+    assert_eq!(
+        pointee.resolved_type.identity.layout_dwarf_id(),
+        pair_plan.type_id
+    );
+    assert!(matches!(
+        ghostscope_dwarf::strip_type_aliases(&pointee.resolved_type.summary),
+        ghostscope_dwarf::TypeInfo::StructType { name, .. } if name == "Pair"
+    ));
+
+    let pair_member = analyzer.project_resolved_type(
+        &pointee.resolved_type,
+        &ghostscope_dwarf::VariableAccessSegment::TupleIndex(0),
+        Some(&binary_path),
+    )?;
+    assert_eq!(
+        pair_member.layout,
+        ghostscope_dwarf::TypeProjectionLayout::Member { offset: 0 }
+    );
+    assert_eq!(pair_member.resolved_type.summary.type_name(), "i32");
+    assert!(pair_member
+        .resolved_type
+        .identity
+        .layout_dwarf_id()
+        .is_some());
+    assert_eq!(
+        pair_member
+            .resolved_type
+            .origin
+            .map(|origin| origin.language),
+        Some(ghostscope_dwarf::SourceLanguage::Rust)
+    );
+
     Ok(())
 }
 

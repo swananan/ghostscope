@@ -7,7 +7,7 @@ use crate::{
     parser::ExpressionEvaluator,
     semantics::{
         resolve_attr_with_unit_origins, resolve_name_with_origins, resolve_origin_entry,
-        resolve_type_ref_with_origins, FunctionParameter, InlineFrame, PcLineInfo,
+        resolve_type_ref_with_origins, FunctionParameter, InlineFrame, PcLineInfo, TypeLoc,
         VariableQueryDiagnostic,
     },
 };
@@ -371,11 +371,11 @@ impl LoadedObjfile {
         Ok(vars)
     }
 
-    pub(crate) fn resolve_type_shallow_by_name_with_tags(
+    pub(crate) fn resolve_type_shallow_by_name_with_tags_and_loc(
         &self,
         name: &str,
         tags: &[gimli::DwTag],
-    ) -> Option<crate::TypeInfo> {
+    ) -> Option<(crate::TypeInfo, TypeLoc)> {
         if let Err(error) = self.ensure_debug_info_for_type_name(name) {
             tracing::warn!(
                 "Failed to load indexed DWARF for type '{}' in {}: {}",
@@ -391,7 +391,14 @@ impl LoadedObjfile {
                 .expect("type name index lock poisoned")
                 .find_aggregate_definition(name, tag);
             if let Some(loc) = loc {
-                return self.detailed_shallow_type(loc.cu_offset, loc.die_offset);
+                let ty = self.detailed_shallow_type(loc.cu_offset, loc.die_offset)?;
+                return Some((
+                    ty,
+                    TypeLoc {
+                        cu_off: loc.cu_offset,
+                        die_off: loc.die_offset,
+                    },
+                ));
             }
         }
 
@@ -405,16 +412,25 @@ impl LoadedObjfile {
             if let Ok(header) = dwarf.unit_header(td.cu_offset) {
                 if let Ok(unit) = dwarf.unit(header) {
                     if let Ok(entry) = unit.entry(td.die_offset) {
-                        if let Some(gimli::AttributeValue::UnitRef(under)) =
-                            entry.attr_value(gimli::DW_AT_type)
+                        if let Ok(Some(type_loc)) =
+                            resolve_type_ref_with_origins(dwarf, &entry, &unit)
                         {
-                            return self.detailed_shallow_type(td.cu_offset, under);
+                            let ty =
+                                self.detailed_shallow_type(type_loc.cu_off, type_loc.die_off)?;
+                            return Some((ty, type_loc));
                         }
-                        return crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+                        let ty = crate::parser::DetailedParser::resolve_type_shallow_at_offset(
                             dwarf,
                             &unit,
                             td.die_offset,
-                        );
+                        )?;
+                        return Some((
+                            ty,
+                            TypeLoc {
+                                cu_off: td.cu_offset,
+                                die_off: td.die_offset,
+                            },
+                        ));
                     }
                 }
             }
