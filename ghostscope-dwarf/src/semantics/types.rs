@@ -7,6 +7,21 @@ pub(crate) struct TypeLoc {
     pub die_off: gimli::UnitOffset,
 }
 
+impl TypeLoc {
+    pub(crate) fn type_id(self, module: crate::ModuleId) -> crate::TypeId {
+        let cu = crate::CuId(self.cu_off.0 as u32);
+        crate::TypeId {
+            module,
+            cu,
+            die: crate::DieRef {
+                module,
+                cu,
+                offset: self.die_off.0 as u64,
+            },
+        }
+    }
+}
+
 fn resolve_debug_info_ref(
     dwarf: &gimli::Dwarf<DwarfReader>,
     debug_info_off: gimli::DebugInfoOffset,

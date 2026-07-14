@@ -1,6 +1,6 @@
 use super::*;
 use crate::core::{AddressExpr, EntryValueCase, MemoryAccessSize, TargetArch};
-use crate::StructMember;
+use crate::{CuId, DieRef, ModuleId, StructMember, TypeId};
 
 fn capabilities(regular_uprobe: bool) -> RuntimeCapabilities {
     RuntimeCapabilities {
@@ -209,6 +209,27 @@ fn materialization_plan_preserves_module_path_origin() {
         materialized.module_path,
         Some(PathBuf::from("/tmp/libstate.so"))
     );
+}
+
+#[test]
+fn materialization_plan_preserves_type_identity() {
+    let type_id = TypeId {
+        module: ModuleId(3),
+        cu: CuId(5),
+        die: DieRef {
+            module: ModuleId(3),
+            cu: CuId(5),
+            offset: 0x42,
+        },
+    };
+    let plan = VariableReadPlan {
+        type_id: Some(type_id),
+        ..read_plan(VariableLocation::Address(AddressExpr::constant(0x1000)))
+    };
+
+    let materialized = plan.materialization_plan(&capabilities(true));
+
+    assert_eq!(materialized.type_id, Some(type_id));
 }
 
 #[test]

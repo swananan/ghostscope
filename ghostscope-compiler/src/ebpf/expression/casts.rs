@@ -1,7 +1,7 @@
 use super::{DynamicLvalue, DynamicTypeInfo, IndexableElementInfo};
 use crate::ebpf::context::{CodeGenError, EbpfContext, Result, RuntimeAddress};
 use crate::script::Expr;
-use ghostscope_dwarf::TypeInfo as DwarfType;
+use ghostscope_dwarf::{TypeInfo as DwarfType, TypeProjectionLayout, VariableAccessSegment};
 use inkwell::values::{BasicValueEnum, IntValue};
 use inkwell::AddressSpace;
 use std::path::{Path, PathBuf};
@@ -12,12 +12,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             return self
                 .resolve_cast_target_type(target_type)
                 .ok()
-                .is_some_and(|ty| ghostscope_dwarf::is_c_aggregate_type(&ty));
+                .is_some_and(|ty| ghostscope_dwarf::is_aggregate_type(&ty));
         }
 
         if let Ok(Some(var)) = self.query_dwarf_for_complex_expr(expr) {
             if let Some(ref ty) = var.dwarf_type {
-                return ghostscope_dwarf::is_c_aggregate_type(ty);
+                return ghostscope_dwarf::is_aggregate_type(ty);
             }
         }
         false
@@ -58,7 +58,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         if let Ok(Some(var)) = self.query_dwarf_for_complex_expr(expr) {
             if let Some(ref ty) = var.dwarf_type {
-                if ghostscope_dwarf::is_c_pointer_or_array_type(ty) {
+                if ghostscope_dwarf::is_pointer_or_array_type(ty) {
                     return true;
                 }
             }
@@ -67,27 +67,66 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     pub(in crate::ebpf) fn resolve_cast_target_type(&self, target_type: &str) -> Result<DwarfType> {
+        self.resolve_cast_target(target_type)
+            .map(|resolved| resolved.summary)
+    }
+
+    pub(in crate::ebpf) fn resolve_cast_target(
+        &self,
+        target_type: &str,
+    ) -> Result<ghostscope_dwarf::ResolvedType> {
         let analyzer = self.process_analyzer;
         let resolved = if let Some(context) = self.current_compile_time_context.as_ref() {
             let module_path = Path::new(&context.module_path);
             analyzer
-                .map(|analyzer| analyzer.try_resolve_type_spec_in_module(module_path, target_type))
+                .map(|analyzer| {
+                    analyzer
+                        .try_resolve_c_style_semantic_type_spec_in_module(module_path, target_type)
+                })
                 .transpose()
                 .map_err(|err| CodeGenError::DwarfError(err.to_string()))?
                 .flatten()
-                .or_else(|| ghostscope_dwarf::DwarfAnalyzer::resolve_builtin_type_spec(target_type))
+                .or_else(|| {
+                    ghostscope_dwarf::DwarfAnalyzer::resolve_builtin_c_style_semantic_type_spec(
+                        target_type,
+                    )
+                })
         } else {
             analyzer
-                .map(|analyzer| analyzer.try_resolve_type_spec(target_type))
+                .map(|analyzer| analyzer.try_resolve_c_style_semantic_type_spec(target_type))
                 .transpose()
                 .map_err(|err| CodeGenError::DwarfError(err.to_string()))?
                 .flatten()
-                .or_else(|| ghostscope_dwarf::DwarfAnalyzer::resolve_builtin_type_spec(target_type))
+                .or_else(|| {
+                    ghostscope_dwarf::DwarfAnalyzer::resolve_builtin_c_style_semantic_type_spec(
+                        target_type,
+                    )
+                })
         };
 
         resolved.ok_or_else(|| {
             CodeGenError::DwarfError(format!("cast target type '{target_type}' was not found"))
         })
+    }
+
+    pub(super) fn dynamic_type_info(
+        &self,
+        resolved_type: ghostscope_dwarf::ResolvedType,
+        fallback_module_path: Option<PathBuf>,
+    ) -> DynamicTypeInfo {
+        let type_module_path = resolved_type
+            .origin
+            .as_ref()
+            .and_then(|origin| {
+                self.process_analyzer
+                    .and_then(|analyzer| analyzer.module_path_for_id(origin.module))
+            })
+            .map(Path::to_path_buf)
+            .or(fallback_module_path);
+        DynamicTypeInfo {
+            resolved_type,
+            type_module_path,
+        }
     }
 
     pub(super) fn cast_pointer_target_type(target_type: &DwarfType) -> Option<DwarfType> {
@@ -197,32 +236,32 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         expr: &Expr,
         target_type: &str,
     ) -> Result<DynamicLvalue<'ctx>> {
-        let target_type = self.resolve_cast_target_type(target_type)?;
+        let target = self.resolve_cast_target(target_type)?;
         let module_path = self
             .current_compile_time_context
             .as_ref()
             .map(|context| PathBuf::from(&context.module_path));
 
-        if let Some(pointee_type) = Self::cast_pointer_target_type(&target_type) {
+        let target_type_info = self.dynamic_type_info(target, module_path);
+
+        if matches!(
+            ghostscope_dwarf::strip_type_aliases(&target_type_info.resolved_type.summary),
+            DwarfType::PointerType { .. }
+        ) {
+            let projection =
+                self.project_dynamic_type(&target_type_info, &VariableAccessSegment::Dereference)?;
             let address = self.cast_source_pointer_value(expr)?;
             return Ok(DynamicLvalue {
                 address,
-                type_info: DynamicTypeInfo {
-                    dwarf_type: pointee_type,
-                    module_path,
-                    type_id: None,
-                },
+                type_info: self
+                    .dynamic_type_info(projection.resolved_type, target_type_info.type_module_path),
             });
         }
 
         let address = self.cast_source_memory_address(expr)?;
         Ok(DynamicLvalue {
             address,
-            type_info: DynamicTypeInfo {
-                dwarf_type: target_type,
-                module_path,
-                type_id: None,
-            },
+            type_info: target_type_info,
         })
     }
 
@@ -238,26 +277,23 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             return Ok(None);
         };
 
-        let target_type = self.resolve_cast_target_type(target_type)?;
+        let target = self.resolve_cast_target(target_type)?;
         let module_path = self
             .current_compile_time_context
             .as_ref()
             .map(|context| PathBuf::from(&context.module_path));
 
-        match ghostscope_dwarf::strip_type_aliases(&target_type) {
+        let target_type_info = self.dynamic_type_info(target, module_path);
+        match ghostscope_dwarf::strip_type_aliases(&target_type_info.resolved_type.summary) {
             DwarfType::PointerType { .. } => {
-                let Some(element_info) =
-                    Self::indexable_info_from_type(&target_type, module_path, None)
-                else {
+                let Some(element_info) = self.project_indexable_type(&target_type_info)? else {
                     return Ok(None);
                 };
                 let base_address = self.cast_source_pointer_value(source_expr)?;
                 Ok(Some((element_info, base_address)))
             }
             DwarfType::ArrayType { .. } => {
-                let Some(element_info) =
-                    Self::indexable_info_from_type(&target_type, module_path, None)
-                else {
+                let Some(element_info) = self.project_indexable_type(&target_type_info)? else {
                     return Ok(None);
                 };
                 let base_address = self.cast_source_memory_address(source_expr)?;
@@ -267,17 +303,25 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
-    pub(super) fn indexable_info_from_type(
-        dwarf_type: &DwarfType,
-        module_path: Option<PathBuf>,
-        type_id: Option<ghostscope_dwarf::TypeId>,
-    ) -> Option<IndexableElementInfo> {
-        ghostscope_dwarf::indexable_element_layout(dwarf_type).map(|layout| IndexableElementInfo {
-            element_type: layout.element_type,
-            stride: layout.stride,
-            module_path,
-            type_id,
-        })
+    pub(super) fn project_indexable_type(
+        &self,
+        type_info: &DynamicTypeInfo,
+    ) -> Result<Option<IndexableElementInfo>> {
+        if !ghostscope_dwarf::is_pointer_or_array_type(&type_info.resolved_type.summary) {
+            return Ok(None);
+        }
+        let projection =
+            self.project_dynamic_type(type_info, &VariableAccessSegment::ArrayIndex(0))?;
+        let TypeProjectionLayout::Element { stride } = projection.layout else {
+            return Err(CodeGenError::DwarfError(
+                "index projection did not produce an element layout".to_string(),
+            ));
+        };
+        Ok(Some(IndexableElementInfo {
+            type_info: self
+                .dynamic_type_info(projection.resolved_type, type_info.type_module_path.clone()),
+            stride,
+        }))
     }
 
     pub(super) fn compiled_pointer_value_to_runtime_address(
@@ -327,11 +371,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         Ok(DynamicLvalue {
             address: base_address.with_value(element_address),
-            type_info: DynamicTypeInfo {
-                dwarf_type: element_info.element_type,
-                module_path: element_info.module_path,
-                type_id: element_info.type_id,
-            },
+            type_info: element_info.type_info,
         })
     }
 
@@ -447,7 +487,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .map_err(|err| CodeGenError::Builder(err.to_string()));
         }
 
-        if ghostscope_dwarf::is_c_aggregate_type(&target_type) {
+        if ghostscope_dwarf::is_aggregate_type(&target_type) {
             let address = self.cast_source_memory_address(expr)?;
             let ptr_ty = self.context.ptr_type(AddressSpace::default());
             return self

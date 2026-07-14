@@ -1,5 +1,10 @@
 use super::DwarfAnalyzer;
-use crate::semantics::{strip_type_aliases, VariableReadPlan};
+use crate::{
+    semantics::{
+        strip_type_aliases, ResolvedType, SemanticType, SyntheticTypeKind, VariableReadPlan,
+    },
+    type_syntax::c_style as type_spec,
+};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -29,7 +34,12 @@ impl std::error::Error for TypeLookupAmbiguity {}
 
 impl DwarfAnalyzer {
     pub fn resolve_builtin_type_spec(type_spec: &str) -> Option<crate::TypeInfo> {
-        resolve_type_spec_with(type_spec, |_| None)
+        Self::resolve_builtin_c_style_semantic_type_spec(type_spec).map(|resolved| resolved.summary)
+    }
+
+    /// Resolve the C-style type grammar accepted by GhostScope's `cast` DSL.
+    pub fn resolve_builtin_c_style_semantic_type_spec(type_spec: &str) -> Option<ResolvedType> {
+        resolve_c_style_semantic_type_spec_with(type_spec, |_| None)
     }
 
     pub fn resolve_type_spec_in_module<P: AsRef<Path>>(
@@ -37,10 +47,19 @@ impl DwarfAnalyzer {
         module_path: P,
         type_spec: &str,
     ) -> Option<crate::TypeInfo> {
+        self.resolve_c_style_semantic_type_spec_in_module(module_path, type_spec)
+            .map(|resolved| resolved.summary)
+    }
+
+    pub fn resolve_c_style_semantic_type_spec_in_module<P: AsRef<Path>>(
+        &self,
+        module_path: P,
+        type_spec: &str,
+    ) -> Option<ResolvedType> {
         let module_path = module_path.as_ref().to_path_buf();
-        resolve_type_spec_with(type_spec, |name| {
-            self.resolve_named_type_in_module(&module_path, name)
-                .or_else(|| self.resolve_named_type(name))
+        resolve_c_style_semantic_type_spec_with(type_spec, |name| {
+            self.resolve_named_semantic_type_in_module(&module_path, name)
+                .or_else(|| self.resolve_named_semantic_type(name))
         })
     }
 
@@ -49,92 +68,134 @@ impl DwarfAnalyzer {
         module_path: P,
         type_spec: &str,
     ) -> std::result::Result<Option<crate::TypeInfo>, TypeLookupAmbiguity> {
+        self.try_resolve_c_style_semantic_type_spec_in_module(module_path, type_spec)
+            .map(|resolved| resolved.map(|resolved| resolved.summary))
+    }
+
+    pub fn try_resolve_c_style_semantic_type_spec_in_module<P: AsRef<Path>>(
+        &self,
+        module_path: P,
+        type_spec: &str,
+    ) -> std::result::Result<Option<ResolvedType>, TypeLookupAmbiguity> {
         let module_path = module_path.as_ref().to_path_buf();
-        try_resolve_type_spec_with(type_spec, |name| {
-            if let Some(ty) = self.resolve_named_type_in_module(&module_path, name) {
+        try_resolve_c_style_semantic_type_spec_with(type_spec, |name| {
+            if let Some(ty) = self.resolve_named_semantic_type_in_module(&module_path, name) {
                 return Ok(Some(ty));
             }
-            self.resolve_unique_named_type_outside_module(&module_path, name)
+            self.resolve_unique_named_semantic_type_outside_module(&module_path, name)
         })
     }
 
     pub fn resolve_type_spec(&self, type_spec: &str) -> Option<crate::TypeInfo> {
-        resolve_type_spec_with(type_spec, |name| self.resolve_named_type(name))
+        self.resolve_c_style_semantic_type_spec(type_spec)
+            .map(|resolved| resolved.summary)
+    }
+
+    pub fn resolve_c_style_semantic_type_spec(&self, type_spec: &str) -> Option<ResolvedType> {
+        resolve_c_style_semantic_type_spec_with(type_spec, |name| {
+            self.resolve_named_semantic_type(name)
+        })
     }
 
     pub fn try_resolve_type_spec(
         &self,
         type_spec: &str,
     ) -> std::result::Result<Option<crate::TypeInfo>, TypeLookupAmbiguity> {
-        try_resolve_type_spec_with(type_spec, |name| self.resolve_unique_named_type(name))
+        self.try_resolve_c_style_semantic_type_spec(type_spec)
+            .map(|resolved| resolved.map(|resolved| resolved.summary))
     }
 
-    fn resolve_type_shallow_by_name_in_module_with_tags<P: AsRef<Path>>(
+    pub fn try_resolve_c_style_semantic_type_spec(
+        &self,
+        type_spec: &str,
+    ) -> std::result::Result<Option<ResolvedType>, TypeLookupAmbiguity> {
+        try_resolve_c_style_semantic_type_spec_with(type_spec, |name| {
+            self.resolve_unique_named_semantic_type(name)
+        })
+    }
+
+    fn resolve_semantic_type_shallow_by_name_in_module_with_tags<P: AsRef<Path>>(
         &self,
         module_path: P,
         name: &str,
         tags: &[gimli::DwTag],
-    ) -> Option<crate::TypeInfo> {
-        let path_buf = module_path.as_ref().to_path_buf();
-        self.modules
-            .get(&path_buf)
-            .and_then(|module_data| module_data.resolve_type_shallow_by_name_with_tags(name, tags))
+    ) -> Option<SemanticType> {
+        let module_path = self.loaded_module_path_for(module_path)?.clone();
+        let module = self.module_id_for_path(&module_path)?;
+        let (summary, loc) = self
+            .modules
+            .get(&module_path)?
+            .resolve_type_shallow_by_name_with_tags_and_loc(name, tags)?;
+        let id = loc.type_id(module);
+        Some(SemanticType::new(
+            summary,
+            Some(id),
+            self.type_origin(id).ok().flatten(),
+        ))
     }
 
-    fn resolve_type_shallow_by_name_with_tags(
+    fn resolve_semantic_type_shallow_by_name_with_tags(
         &self,
         name: &str,
         tags: &[gimli::DwTag],
-    ) -> Option<crate::TypeInfo> {
-        self.modules
-            .values()
-            .find_map(|module_data| module_data.resolve_type_shallow_by_name_with_tags(name, tags))
+    ) -> Option<SemanticType> {
+        self.sorted_module_paths()
+            .into_iter()
+            .find_map(|module_path| {
+                self.resolve_semantic_type_shallow_by_name_in_module_with_tags(
+                    module_path,
+                    name,
+                    tags,
+                )
+            })
     }
 
-    fn resolve_named_type_in_module(
+    fn resolve_named_semantic_type_in_module(
         &self,
         module_path: &Path,
         name: &str,
-    ) -> Option<crate::TypeInfo> {
+    ) -> Option<SemanticType> {
         let tags = [
             gimli::constants::DW_TAG_structure_type,
             gimli::constants::DW_TAG_class_type,
             gimli::constants::DW_TAG_union_type,
             gimli::constants::DW_TAG_enumeration_type,
         ];
-        self.resolve_type_shallow_by_name_in_module_with_tags(module_path, name, &tags)
+        self.resolve_semantic_type_shallow_by_name_in_module_with_tags(module_path, name, &tags)
     }
 
-    fn resolve_named_type(&self, name: &str) -> Option<crate::TypeInfo> {
+    fn resolve_named_semantic_type(&self, name: &str) -> Option<SemanticType> {
         let tags = [
             gimli::constants::DW_TAG_structure_type,
             gimli::constants::DW_TAG_class_type,
             gimli::constants::DW_TAG_union_type,
             gimli::constants::DW_TAG_enumeration_type,
         ];
-        self.resolve_type_shallow_by_name_with_tags(name, &tags)
+        self.resolve_semantic_type_shallow_by_name_with_tags(name, &tags)
     }
 
-    fn resolve_unique_named_type_outside_module(
+    fn resolve_unique_named_semantic_type_outside_module(
         &self,
         module_path: &Path,
         name: &str,
-    ) -> std::result::Result<Option<crate::TypeInfo>, TypeLookupAmbiguity> {
-        self.resolve_unique_named_type_with_filter(name, |candidate| candidate != module_path)
+    ) -> std::result::Result<Option<SemanticType>, TypeLookupAmbiguity> {
+        self.resolve_unique_named_semantic_type_with_filter(name, |candidate| {
+            candidate != module_path
+        })
     }
 
-    fn resolve_unique_named_type(
+    fn resolve_unique_named_semantic_type(
         &self,
         name: &str,
-    ) -> std::result::Result<Option<crate::TypeInfo>, TypeLookupAmbiguity> {
-        self.resolve_unique_named_type_with_filter(name, |_| true)
+    ) -> std::result::Result<Option<SemanticType>, TypeLookupAmbiguity> {
+        self.resolve_unique_named_semantic_type_with_filter(name, |_| true)
     }
 
-    fn resolve_unique_named_type_with_filter(
+    fn resolve_unique_named_semantic_type_with_filter(
         &self,
         name: &str,
         include_module: impl Fn(&Path) -> bool,
-    ) -> std::result::Result<Option<crate::TypeInfo>, TypeLookupAmbiguity> {
+    ) -> std::result::Result<Option<SemanticType>, TypeLookupAmbiguity> {
         let tags = [
             gimli::constants::DW_TAG_structure_type,
             gimli::constants::DW_TAG_class_type,
@@ -145,9 +206,8 @@ impl DwarfAnalyzer {
             .modules
             .iter()
             .filter(|(path, _)| include_module(path.as_path()))
-            .filter_map(|(path, module_data)| {
-                module_data
-                    .resolve_type_shallow_by_name_with_tags(name, &tags)
+            .filter_map(|(path, _)| {
+                self.resolve_semantic_type_shallow_by_name_in_module_with_tags(path, name, &tags)
                     .map(|ty| (path.clone(), ty))
             })
             .collect::<Vec<_>>();
@@ -373,7 +433,7 @@ impl DwarfAnalyzer {
         module_path: P,
         name: &str,
     ) -> Option<crate::TypeInfo> {
-        self.resolve_type_shallow_by_name_in_module_with_tags(
+        self.resolve_semantic_type_shallow_by_name_in_module_with_tags(
             module_path,
             name,
             &[
@@ -381,17 +441,19 @@ impl DwarfAnalyzer {
                 gimli::constants::DW_TAG_class_type,
             ],
         )
+        .map(|semantic| semantic.summary)
     }
 
     /// Resolve struct/class by name (shallow) across modules (first match)
     pub fn resolve_struct_type_shallow_by_name(&self, name: &str) -> Option<crate::TypeInfo> {
-        self.resolve_type_shallow_by_name_with_tags(
+        self.resolve_semantic_type_shallow_by_name_with_tags(
             name,
             &[
                 gimli::constants::DW_TAG_structure_type,
                 gimli::constants::DW_TAG_class_type,
             ],
         )
+        .map(|semantic| semantic.summary)
     }
 
     /// Resolve union by name (shallow) in a specific module
@@ -400,16 +462,21 @@ impl DwarfAnalyzer {
         module_path: P,
         name: &str,
     ) -> Option<crate::TypeInfo> {
-        self.resolve_type_shallow_by_name_in_module_with_tags(
+        self.resolve_semantic_type_shallow_by_name_in_module_with_tags(
             module_path,
             name,
             &[gimli::constants::DW_TAG_union_type],
         )
+        .map(|semantic| semantic.summary)
     }
 
     /// Resolve union by name (shallow) across modules (first match)
     pub fn resolve_union_type_shallow_by_name(&self, name: &str) -> Option<crate::TypeInfo> {
-        self.resolve_type_shallow_by_name_with_tags(name, &[gimli::constants::DW_TAG_union_type])
+        self.resolve_semantic_type_shallow_by_name_with_tags(
+            name,
+            &[gimli::constants::DW_TAG_union_type],
+        )
+        .map(|semantic| semantic.summary)
     }
 
     /// Resolve enum by name (shallow) in a specific module
@@ -418,144 +485,87 @@ impl DwarfAnalyzer {
         module_path: P,
         name: &str,
     ) -> Option<crate::TypeInfo> {
-        self.resolve_type_shallow_by_name_in_module_with_tags(
+        self.resolve_semantic_type_shallow_by_name_in_module_with_tags(
             module_path,
             name,
             &[gimli::constants::DW_TAG_enumeration_type],
         )
+        .map(|semantic| semantic.summary)
     }
 
     /// Resolve enum by name (shallow) across modules (first match)
     pub fn resolve_enum_type_shallow_by_name(&self, name: &str) -> Option<crate::TypeInfo> {
-        self.resolve_type_shallow_by_name_with_tags(
+        self.resolve_semantic_type_shallow_by_name_with_tags(
             name,
             &[gimli::constants::DW_TAG_enumeration_type],
         )
+        .map(|semantic| semantic.summary)
     }
 }
 
-fn resolve_type_spec_with<F>(type_spec: &str, mut resolve_named: F) -> Option<crate::TypeInfo>
+fn resolve_c_style_semantic_type_spec_with<F>(
+    type_spec: &str,
+    mut resolve_named: F,
+) -> Option<ResolvedType>
 where
-    F: FnMut(&str) -> Option<crate::TypeInfo>,
+    F: FnMut(&str) -> Option<SemanticType>,
 {
-    try_resolve_type_spec_with(type_spec, |name| {
+    try_resolve_c_style_semantic_type_spec_with(type_spec, |name| {
         Ok::<_, std::convert::Infallible>(resolve_named(name))
     })
     .ok()
     .flatten()
 }
 
-fn try_resolve_type_spec_with<F, E>(
+fn try_resolve_c_style_semantic_type_spec_with<F, E>(
     type_spec: &str,
     mut resolve_named: F,
-) -> std::result::Result<Option<crate::TypeInfo>, E>
+) -> std::result::Result<Option<ResolvedType>, E>
 where
-    F: FnMut(&str) -> std::result::Result<Option<crate::TypeInfo>, E>,
+    F: FnMut(&str) -> std::result::Result<Option<SemanticType>, E>,
 {
-    // TODO: This parser intentionally accepts only C/C++-style type specs for now.
-    // Add an explicit TypeSpec/parser layer before extending this to Rust or other languages.
-    let mut spec = type_spec.trim();
-    if spec.is_empty() {
-        return Ok(None);
-    }
-
-    let mut arrays = Vec::new();
-    while let Some((base, count)) = take_array_suffix(spec) {
-        arrays.push(count);
-        spec = base.trim_end();
-    }
-
-    let mut pointer_count = 0usize;
-    while let Some(base) = spec.strip_suffix('*') {
-        pointer_count += 1;
-        spec = base.trim_end();
-    }
-
-    let (qualifiers, base_spec) = strip_leading_qualifiers(spec);
-    let Some(mut ty) = try_resolve_base_type_spec(base_spec, &mut resolve_named)? else {
+    let Some(spec) = type_spec::parse(type_spec) else {
         return Ok(None);
     };
-
-    for qualifier in qualifiers.into_iter().rev() {
-        ty = crate::TypeInfo::QualifiedType {
-            qualifier,
-            underlying_type: Box::new(ty),
-        };
-    }
-
-    for _ in 0..pointer_count {
-        ty = crate::TypeInfo::PointerType {
-            target_type: Box::new(ty),
-            size: 8,
-        };
-    }
-
-    for count in arrays.into_iter().rev() {
-        let element_size = ty.size();
-        let total_size = count.and_then(|count| element_size.checked_mul(count));
-        ty = crate::TypeInfo::ArrayType {
-            element_type: Box::new(ty),
-            element_count: count,
-            total_size,
-        };
-    }
-
-    Ok(Some(ty))
-}
-
-fn take_array_suffix(spec: &str) -> Option<(&str, Option<u64>)> {
-    let spec = spec.trim_end();
-    if !spec.ends_with(']') {
-        return None;
-    }
-    let open = spec.rfind('[')?;
-    let inside = spec[open + 1..spec.len() - 1].trim();
-    let count = if inside.is_empty() {
-        None
+    let mut resolved = if let Some(builtin) = builtin_type_spec(&spec.base) {
+        ResolvedType::synthetic(builtin)
+    } else if let Some(named) = resolve_named(&spec.base)? {
+        ResolvedType::from_semantic_type(named)
     } else {
-        Some(inside.parse::<u64>().ok()?)
+        return Ok(None);
     };
-    Some((&spec[..open], count))
-}
 
-fn strip_leading_qualifiers(mut spec: &str) -> (Vec<crate::TypeQualifier>, &str) {
-    let mut qualifiers = Vec::new();
-    loop {
-        let trimmed = spec.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("const ") {
-            qualifiers.push(crate::TypeQualifier::Const);
-            spec = rest;
-        } else if let Some(rest) = trimmed.strip_prefix("volatile ") {
-            qualifiers.push(crate::TypeQualifier::Volatile);
-            spec = rest;
-        } else if let Some(rest) = trimmed.strip_prefix("restrict ") {
-            qualifiers.push(crate::TypeQualifier::Restrict);
-            spec = rest;
-        } else {
-            return (qualifiers, trimmed);
-        }
-    }
-}
-
-fn try_resolve_base_type_spec<F, E>(
-    spec: &str,
-    resolve_named: &mut F,
-) -> std::result::Result<Option<crate::TypeInfo>, E>
-where
-    F: FnMut(&str) -> std::result::Result<Option<crate::TypeInfo>, E>,
-{
-    let spec = spec.trim();
-    if let Some(ty) = builtin_type_spec(spec) {
-        return Ok(Some(ty));
+    for qualifier in spec.qualifiers.into_iter().rev() {
+        resolved = resolved.wrap(SyntheticTypeKind::Qualified, |underlying_type| {
+            crate::TypeInfo::QualifiedType {
+                qualifier,
+                underlying_type: Box::new(underlying_type),
+            }
+        });
     }
 
-    for prefix in ["struct ", "class ", "union ", "enum "] {
-        if let Some(name) = spec.strip_prefix(prefix) {
-            return resolve_named(name.trim());
-        }
+    for _ in 0..spec.pointer_count {
+        resolved = resolved.wrap(SyntheticTypeKind::Pointer, |target_type| {
+            crate::TypeInfo::PointerType {
+                target_type: Box::new(target_type),
+                size: 8,
+            }
+        });
     }
 
-    resolve_named(spec)
+    for count in spec.arrays.into_iter().rev() {
+        let element_size = resolved.summary.size();
+        let total_size = count.and_then(|count| element_size.checked_mul(count));
+        resolved = resolved.wrap(SyntheticTypeKind::Array, |element_type| {
+            crate::TypeInfo::ArrayType {
+                element_type: Box::new(element_type),
+                element_count: count,
+                total_size,
+            }
+        });
+    }
+
+    Ok(Some(resolved))
 }
 
 fn builtin_type_spec(spec: &str) -> Option<crate::TypeInfo> {
@@ -624,6 +634,21 @@ fn builtin_type_spec(spec: &str) -> Option<crate::TypeInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TypeIdentity;
+
+    fn type_id() -> crate::TypeId {
+        let module = crate::ModuleId(4);
+        let cu = crate::CuId(8);
+        crate::TypeId {
+            module,
+            cu,
+            die: crate::DieRef {
+                module,
+                cu,
+                offset: 16,
+            },
+        }
+    }
 
     #[test]
     fn resolves_builtin_pointer_and_array_specs() {
@@ -657,5 +682,63 @@ mod tests {
         let ty = DwarfAnalyzer::resolve_builtin_type_spec("uint64_t").expect("type should resolve");
         assert_eq!(ty.size(), 8);
         assert!(ty.is_unsigned_int());
+    }
+
+    #[test]
+    fn preserves_named_identity_under_synthetic_type_wrappers() {
+        let resolved = resolve_c_style_semantic_type_spec_with("const Pair *[2]", |name| {
+            (name == "Pair").then(|| {
+                SemanticType::new(
+                    crate::TypeInfo::StructType {
+                        name: "Pair".to_string(),
+                        size: 8,
+                        members: vec![],
+                    },
+                    Some(type_id()),
+                    None,
+                )
+            })
+        })
+        .expect("type spec");
+
+        let TypeIdentity::Synthetic {
+            kind: SyntheticTypeKind::Array,
+            inner,
+        } = resolved.identity
+        else {
+            panic!("expected synthetic array identity");
+        };
+        let TypeIdentity::Synthetic {
+            kind: SyntheticTypeKind::Pointer,
+            inner,
+        } = *inner
+        else {
+            panic!("expected synthetic pointer identity");
+        };
+        let TypeIdentity::Synthetic {
+            kind: SyntheticTypeKind::Qualified,
+            inner,
+        } = *inner
+        else {
+            panic!("expected synthetic qualifier identity");
+        };
+        assert_eq!(*inner, TypeIdentity::Dwarf(type_id()));
+
+        let element = TypeIdentity::Synthetic {
+            kind: SyntheticTypeKind::Array,
+            inner: Box::new(TypeIdentity::synthetic(
+                SyntheticTypeKind::Pointer,
+                TypeIdentity::Dwarf(type_id()),
+            )),
+        }
+        .project_structural(&crate::VariableAccessSegment::ArrayIndex(0))
+        .expect("synthetic array projection");
+        assert!(matches!(
+            element,
+            TypeIdentity::Synthetic {
+                kind: SyntheticTypeKind::Pointer,
+                ..
+            }
+        ));
     }
 }

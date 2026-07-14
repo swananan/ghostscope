@@ -16,6 +16,7 @@ pub(crate) mod objfile;
 pub(crate) mod parser;
 pub(crate) mod path_match;
 pub(crate) mod semantics;
+pub(crate) mod type_syntax;
 
 // Main entry point
 pub(crate) mod analyzer;
@@ -41,19 +42,28 @@ pub use core::{
 
 // Re-export semantic contract types.
 pub use semantics::{
-    c_integer_comparison_type, indexable_element_layout, is_c_aggregate_type,
-    is_c_pointer_or_array_type, is_c_signed_integer_type, member_layout, strip_type_aliases,
-    usual_c_arithmetic_comparison_plan, AddressOrigin, AddressSpaceInfo, CIntegerComparisonPlan,
-    CIntegerComparisonType, CfaRulePlan, CompactUnwindRow, CompactUnwindStats, CompactUnwindTable,
-    CompilationUnitMetadata, FunctionParameter, IndexableElementLayout, InlineFrame,
-    LvalueAddressPlan, MemberLayout, PcContext, PcLineInfo, PcRange, PlannedAddress,
-    PlannedAddressKind, PlannedValue, ProducerInfo, RegisterRecoveryPlan, RuntimeComputedExpr,
-    RuntimeComputedKind, SemanticType, SourceLanguage, TypeLayoutError, TypeOrigin,
-    UnwindDiagnostic, UnwindDiagnosticKind, VariableAccessPath, VariableAccessSegment,
-    VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
+    indexable_element_layout, is_aggregate_type, is_pointer_or_array_type, member_layout,
+    strip_type_aliases, AddressOrigin, AddressSpaceInfo, CfaRulePlan, CompactUnwindRow,
+    CompactUnwindStats, CompactUnwindTable, CompilationUnitMetadata, FunctionParameter,
+    IndexableElementLayout, InlineFrame, LvalueAddressPlan, MemberLayout, PcContext, PcLineInfo,
+    PcRange, PlannedAddress, PlannedAddressKind, PlannedValue, ProducerInfo, RegisterRecoveryPlan,
+    ResolvedType, RuntimeComputedExpr, RuntimeComputedKind, SemanticType, SourceLanguage,
+    SyntheticTypeKind, TypeIdentity, TypeLayoutError, TypeOrigin, TypeProjection,
+    TypeProjectionLayout, UnwindDiagnostic, UnwindDiagnosticKind, VariableAccessPath,
+    VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
     VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
     VisibleVariable, VisibleVariablesResult,
 };
+
+pub use semantics::{
+    c_integer_comparison_type, is_c_signed_integer_type, usual_c_arithmetic_comparison_plan,
+    CIntegerComparisonPlan, CIntegerComparisonType,
+};
+
+#[deprecated(note = "use is_aggregate_type; physical aggregate layout is language-neutral")]
+pub use semantics::is_aggregate_type as is_c_aggregate_type;
+#[deprecated(note = "use is_pointer_or_array_type; physical type layout is language-neutral")]
+pub use semantics::is_pointer_or_array_type as is_c_pointer_or_array_type;
 
 // Re-export type definitions from protocol (avoiding circular dependencies)
 pub use ghostscope_protocol::{
