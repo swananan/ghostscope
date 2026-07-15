@@ -5,6 +5,7 @@
 // Core modules
 pub mod bpf_abi;
 mod type_kind;
+mod value_presentation;
 
 pub mod format_printer;
 pub mod streaming_parser;
@@ -13,6 +14,7 @@ pub mod trace_event;
 pub mod type_info;
 
 pub use type_kind::{consts, TypeKind};
+pub use value_presentation::{ValuePresentation, INDIRECT_BYTES_LENGTH_PREFIX_SIZE};
 
 pub use trace_event::{
     EndInstructionData, ExprErrorData, InstructionHeader, InstructionType,

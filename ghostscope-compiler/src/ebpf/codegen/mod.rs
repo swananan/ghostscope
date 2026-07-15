@@ -60,6 +60,15 @@ enum ComplexArgSource<'ctx> {
         len_value: inkwell::values::IntValue<'ctx>,
         max_len: usize,
     },
+    /// Bounded byte capture through a pointer-and-length descriptor.
+    IndirectBytes {
+        descriptor: RuntimeAddress<'ctx>,
+        data_offset: u64,
+        data_access_size: ghostscope_dwarf::MemoryAccessSize,
+        length_offset: u64,
+        length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        max_len: usize,
+    },
     ImmediateBytes {
         bytes: Vec<u8>,
     },
@@ -146,8 +155,11 @@ fn allocate_dynamic_payload_reservations(max_lens: &[usize], available: usize) -
         return vec![0; max_lens.len()];
     }
 
-    let base_caps = vec![VARIABLE_READ_ERROR_PAYLOAD_LEN; max_lens.len()];
-    let base_budget = available.min(VARIABLE_READ_ERROR_PAYLOAD_LEN.saturating_mul(max_lens.len()));
+    let base_caps = max_lens
+        .iter()
+        .map(|max_len| (*max_len).min(VARIABLE_READ_ERROR_PAYLOAD_LEN))
+        .collect::<Vec<_>>();
+    let base_budget = available.min(base_caps.iter().sum());
     let mut reservations = distribute_budget_fairly(&base_caps, base_budget);
     let remaining_budget = available.saturating_sub(reservations.iter().sum::<usize>());
     if remaining_budget == 0 {
@@ -157,11 +169,7 @@ fn allocate_dynamic_payload_reservations(max_lens: &[usize], available: usize) -
     let extra_caps: Vec<usize> = max_lens
         .iter()
         .zip(reservations.iter())
-        .map(|(max_len, reserved)| {
-            max_len
-                .max(&VARIABLE_READ_ERROR_PAYLOAD_LEN)
-                .saturating_sub(*reserved)
-        })
+        .map(|(max_len, reserved)| max_len.saturating_sub(*reserved))
         .collect();
     let extras = distribute_budget_fairly(&extra_caps, remaining_budget);
     for (reservation, extra) in reservations.iter_mut().zip(extras) {

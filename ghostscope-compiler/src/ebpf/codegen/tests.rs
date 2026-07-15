@@ -44,6 +44,12 @@ fn dynamic_payload_reservations_keep_error_headroom_when_possible() {
 }
 
 #[test]
+fn dynamic_payload_reservations_never_exceed_requested_caps() {
+    let reservations = allocate_dynamic_payload_reservations(&[0, 8, 11], 64);
+    assert_eq!(reservations, vec![0, 8, 11]);
+}
+
+#[test]
 fn build_errno_i32_truncates_i64_errors() {
     let context = inkwell::context::Context::create();
     let opts = CompileOptions::default();

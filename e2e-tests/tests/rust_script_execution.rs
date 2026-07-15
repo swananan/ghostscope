@@ -119,6 +119,119 @@ async fn test_rust_tuple_projection_plan_preserves_semantic_identity() -> anyhow
         Some(ghostscope_dwarf::SourceLanguage::Rust)
     );
 
+    let (_, message_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_MESSAGE",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_MESSAGE read plan"))?;
+    let message_type = analyzer
+        .resolved_type_for_plan(&message_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected resolved G_MESSAGE type"))?;
+    let value_plan = analyzer
+        .value_read_plan(&message_type, Some(&binary_path))?
+        .ok_or_else(|| anyhow::anyhow!("expected Rust &str value read plan"))?;
+    assert_eq!(
+        value_plan.presentation,
+        ghostscope_dwarf::ValuePresentation::Utf8String
+    );
+    let ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } = value_plan.capture;
+    assert_eq!(
+        data.layout,
+        ghostscope_dwarf::TypeProjectionLayout::Member { offset: 0 }
+    );
+    assert_eq!(
+        length.layout,
+        ghostscope_dwarf::TypeProjectionLayout::Member { offset: 8 }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_str_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    print "RSTR:{}:{}:{}", G_MESSAGE, G_EMPTY_MESSAGE, G_NUL_MESSAGE;
+    print "RSTR_RAW:{:s}:{:x}", G_MESSAGE, G_MESSAGE;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains(r#"RSTR:"hello from rust":"":"left\0right""#)),
+        "Expected Rust str output: {stdout}"
+    );
+    let expected_raw = concat!(
+        "RSTR_RAW:hello from rust:",
+        "68 65 6c 6c 6f 20 66 72 6f 6d 20 72 75 73 74"
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains(expected_raw)),
+        "Expected raw Rust str output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_str_respects_mem_dump_cap() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    print "RSTR_CAP:{}", G_MESSAGE;
+}
+"#;
+
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_config_content(
+            r#"
+[ebpf]
+mem_dump_cap = 3
+"#,
+        )
+        .attach_to(&target)
+        .timeout_secs(9)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    let cap_line = stdout
+        .lines()
+        .find(|line| line.contains("RSTR_CAP:"))
+        .ok_or_else(|| anyhow::anyhow!("Expected capped Rust str output: {stdout}"))?;
+    assert!(
+        cap_line.contains(r#"RSTR_CAP:"hel" <truncated>"#),
+        "Unexpected capped Rust str output: {cap_line}"
+    );
+    assert!(
+        !cap_line.contains("hell"),
+        "Rust str read exceeded mem_dump_cap: {cap_line}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
     Ok(())
 }
 

@@ -49,10 +49,10 @@ pub use semantics::{
     PcRange, PlannedAddress, PlannedAddressKind, PlannedValue, ProducerInfo, RegisterRecoveryPlan,
     ResolvedType, RuntimeComputedExpr, RuntimeComputedKind, SemanticType, SourceLanguage,
     SyntheticTypeKind, TypeIdentity, TypeLayoutError, TypeOrigin, TypeProjection,
-    TypeProjectionLayout, UnwindDiagnostic, UnwindDiagnosticKind, VariableAccessPath,
-    VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
-    VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
-    VisibleVariable, VisibleVariablesResult,
+    TypeProjectionLayout, UnwindDiagnostic, UnwindDiagnosticKind, ValueCapturePlan, ValueReadPlan,
+    VariableAccessPath, VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan,
+    VariableMaterialization, VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic,
+    VariableReadPlan, VisibleVariable, VisibleVariablesResult,
 };
 
 pub use semantics::{
@@ -67,7 +67,7 @@ pub use semantics::is_pointer_or_array_type as is_c_pointer_or_array_type;
 
 // Re-export type definitions from protocol (avoiding circular dependencies)
 pub use ghostscope_protocol::{
-    EnumVariant, StructMember, TypeCache, TypeInfo, TypeKind, TypeQualifier,
+    EnumVariant, StructMember, TypeCache, TypeInfo, TypeKind, TypeQualifier, ValuePresentation,
 };
 
 // Re-export gimli types that external users need

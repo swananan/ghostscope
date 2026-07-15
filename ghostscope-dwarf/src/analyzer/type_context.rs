@@ -3,7 +3,7 @@ use crate::{
     indexable_element_layout, member_layout, semantics::PlanError, strip_type_aliases,
     CompilationUnitMetadata, CuId, MemberLayout, ModuleId, PcContext, ResolvedType, Result,
     SemanticType, TypeId, TypeIdentity, TypeInfo, TypeLayoutError, TypeOrigin, TypeProjection,
-    TypeProjectionLayout, VariableAccessSegment, VariableReadPlan,
+    TypeProjectionLayout, ValueCapturePlan, ValueReadPlan, VariableAccessSegment, VariableReadPlan,
 };
 use std::path::Path;
 
@@ -202,6 +202,33 @@ impl DwarfAnalyzer {
             layout,
             resolved_type: ResolvedType::new(summary, identity, origin),
         })
+    }
+
+    /// Build a semantic capture plan when a source-language adapter recognizes
+    /// the current physical type. Unknown values keep the ordinary DWARF path.
+    pub fn value_read_plan(
+        &self,
+        current: &ResolvedType,
+        type_module_path: Option<&Path>,
+    ) -> Result<Option<ValueReadPlan>> {
+        let Some(layout) = crate::language::resolve_value_layout(current) else {
+            return Ok(None);
+        };
+        let data = self.project_resolved_type(
+            current,
+            &VariableAccessSegment::Field(layout.data_field.to_string()),
+            type_module_path,
+        )?;
+        let length = self.project_resolved_type(
+            current,
+            &VariableAccessSegment::Field(layout.length_field.to_string()),
+            type_module_path,
+        )?;
+
+        Ok(Some(ValueReadPlan {
+            presentation: layout.presentation,
+            capture: ValueCapturePlan::IndirectBytes { data, length },
+        }))
     }
 
     fn project_type_id(

@@ -466,8 +466,10 @@ impl StreamingTraceParser {
                             type_index
                         );
                         // Use advanced formatting with full type information
-                        crate::format_printer::FormatPrinter::format_data_with_type_info(
-                            var_data, type_info,
+                        crate::format_printer::FormatPrinter::format_data_with_presentation(
+                            var_data,
+                            type_info,
+                            trace_context.get_value_presentation(type_index),
                         )
                     }
                     None => {
