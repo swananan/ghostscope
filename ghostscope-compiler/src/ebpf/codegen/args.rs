@@ -1,13 +1,105 @@
 use super::*;
 
+fn metadata_access_size(
+    projection: &ghostscope_dwarf::TypeProjection,
+    role: &str,
+) -> Result<ghostscope_dwarf::MemoryAccessSize> {
+    let size = projection.resolved_type.summary.size();
+    // Keep this exact; `from_size` falls back to U64 for unknown widths.
+    match size {
+        1 => Ok(ghostscope_dwarf::MemoryAccessSize::U8),
+        2 => Ok(ghostscope_dwarf::MemoryAccessSize::U16),
+        4 => Ok(ghostscope_dwarf::MemoryAccessSize::U32),
+        8 => Ok(ghostscope_dwarf::MemoryAccessSize::U64),
+        _ => Err(CodeGenError::DwarfError(format!(
+            "indirect byte {role} member has unsupported DWARF size {size}"
+        ))),
+    }
+}
+
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(super) const UNKNOWN_CHAR_ARRAY_READ_FALLBACK: usize = 256;
+
+    fn semantic_value_read_plan(
+        &self,
+        resolved_type: &ghostscope_dwarf::ResolvedType,
+        type_module_path: Option<&std::path::Path>,
+    ) -> Result<Option<ghostscope_dwarf::ValueReadPlan>> {
+        let Some(analyzer) = self.process_analyzer else {
+            return Ok(None);
+        };
+        analyzer
+            .value_read_plan(resolved_type, type_module_path)
+            .map_err(|error| CodeGenError::DwarfError(error.to_string()))
+    }
+
+    fn complex_arg_from_value_read_plan(
+        &mut self,
+        display_name: String,
+        dwarf_type: ghostscope_dwarf::TypeInfo,
+        descriptor: RuntimeAddress<'ctx>,
+        plan: ghostscope_dwarf::ValueReadPlan,
+    ) -> Result<ComplexArg<'ctx>> {
+        let ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } = plan.capture;
+        let data_access_size = metadata_access_size(&data, "data")?;
+        let length_access_size = metadata_access_size(&length, "length")?;
+        let data_offset = match data.layout {
+            ghostscope_dwarf::TypeProjectionLayout::Member { offset } => offset,
+            layout => {
+                return Err(CodeGenError::DwarfError(format!(
+                    "indirect byte data projection must be a member, got {layout:?}"
+                )))
+            }
+        };
+        let length_offset = match length.layout {
+            ghostscope_dwarf::TypeProjectionLayout::Member { offset } => offset,
+            layout => {
+                return Err(CodeGenError::DwarfError(format!(
+                    "indirect byte length projection must be a member, got {layout:?}"
+                )))
+            }
+        };
+        let max_len = self.compile_options.mem_dump_cap as usize;
+        let data_len =
+            ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE.saturating_add(max_len);
+
+        Ok(ComplexArg {
+            var_name_index: self.trace_context.add_variable_name(display_name)?,
+            type_index: self
+                .trace_context
+                .add_type_with_presentation(dwarf_type, plan.presentation)?,
+            access_path: Vec::new(),
+            data_len,
+            source: ComplexArgSource::IndirectBytes {
+                descriptor,
+                data_offset,
+                data_access_size,
+                length_offset,
+                length_access_size,
+                max_len,
+            },
+        })
+    }
+
     pub(super) fn complex_arg_from_dwarf_read_plan(
         &mut self,
         plan: ghostscope_dwarf::VariableReadPlan,
         display_name: Option<String>,
     ) -> Result<ComplexArg<'ctx>> {
         let pc_address = self.get_compile_time_context()?.pc_address;
+        let semantic_plan = if let Some(analyzer) = self.process_analyzer {
+            let resolved_type = analyzer
+                .resolved_type_for_plan(&plan)
+                .map_err(|error| CodeGenError::DwarfError(error.to_string()))?;
+            match resolved_type {
+                Some(resolved_type) => {
+                    self.semantic_value_read_plan(&resolved_type, plan.module_path.as_deref())?
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let materialized = self.variable_read_plan_to_materialization(plan, pc_address)?;
         let display_name = display_name.unwrap_or_else(|| materialized.name.clone());
 
@@ -39,12 +131,22 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         "Expression has no DWARF type information".to_string(),
                     )
                 })?;
+                let module_hint =
+                    Self::module_path_for_offsets(materialized.module_path.as_deref());
+                if let Some(semantic_plan) = semantic_plan {
+                    let descriptor =
+                        self.resolve_planned_address(address, None, module_hint.as_deref())?;
+                    return self.complex_arg_from_value_read_plan(
+                        display_name,
+                        dwarf_type,
+                        descriptor,
+                        semantic_plan,
+                    );
+                }
                 let data_len = Self::compute_read_size_for_type(&dwarf_type);
                 if data_len == 0 {
                     return Err(CodeGenError::TypeSizeNotAvailable(display_name));
                 }
-                let module_hint =
-                    Self::module_path_for_offsets(materialized.module_path.as_deref());
                 Ok(ComplexArg {
                     var_name_index: self.trace_context.add_variable_name(display_name)?,
                     type_index: self.trace_context.add_type(dwarf_type.clone())?,
@@ -101,6 +203,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         expr: &crate::script::ast::Expr,
         lvalue: crate::ebpf::expression::DynamicLvalue<'ctx>,
     ) -> Result<ComplexArg<'ctx>> {
+        if let Some(plan) = self.semantic_value_read_plan(
+            &lvalue.type_info.resolved_type,
+            lvalue.type_info.type_module_path.as_deref(),
+        )? {
+            return self.complex_arg_from_value_read_plan(
+                self.expr_to_name(expr),
+                lvalue.type_info.resolved_type.summary,
+                lvalue.address,
+                plan,
+            );
+        }
         let dwarf_type = lvalue.type_info.resolved_type.summary;
         let data_len = Self::compute_read_size_for_type(&dwarf_type);
         if data_len == 0 {
@@ -695,7 +808,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 self.generate_print_complex_format_instruction(fmt_idx, &[arg])?;
                 Ok(1)
             }
-            ComplexArgSource::MemDump { .. } | ComplexArgSource::MemDumpDynamic { .. } => {
+            ComplexArgSource::MemDump { .. }
+            | ComplexArgSource::MemDumpDynamic { .. }
+            | ComplexArgSource::IndirectBytes { .. } => {
                 // Use ComplexFormat with "{}"; generate_print_complex_format_instruction handles MemDump
                 let fmt_idx = self.trace_context.add_string("{}".to_string())?;
                 self.generate_print_complex_format_instruction(fmt_idx, &[arg])?;
@@ -1050,4 +1165,49 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     // removed old helpers (pure lvalue/binary_op detection) — unified resolver handles shapes
+}
+
+#[cfg(test)]
+mod semantic_value_tests {
+    use super::*;
+    use ghostscope_dwarf::{
+        MemoryAccessSize, ResolvedType, TypeIdentity, TypeInfo, TypeProjection,
+        TypeProjectionLayout,
+    };
+
+    fn projection(size: u64) -> TypeProjection {
+        let encoding = ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16;
+        TypeProjection {
+            layout: TypeProjectionLayout::Member { offset: 0 },
+            resolved_type: ResolvedType::new(
+                TypeInfo::BaseType {
+                    name: "metadata".to_string(),
+                    size,
+                    encoding,
+                },
+                TypeIdentity::Unknown,
+                None,
+            ),
+        }
+    }
+
+    #[test]
+    fn maps_indirect_metadata_size_from_projected_dwarf_type() {
+        assert_eq!(
+            metadata_access_size(&projection(4), "data").unwrap(),
+            MemoryAccessSize::U32
+        );
+        assert_eq!(
+            metadata_access_size(&projection(8), "length").unwrap(),
+            MemoryAccessSize::U64
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_indirect_metadata_size() {
+        let projected = projection(3);
+        let error = metadata_access_size(&projected, "data").unwrap_err();
+
+        assert!(error.to_string().contains("unsupported DWARF size 3"));
+    }
 }

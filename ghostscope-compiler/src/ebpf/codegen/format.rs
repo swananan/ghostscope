@@ -19,6 +19,15 @@ struct ComplexFormatArgPointers<'ctx> {
     var_data_ptr: PointerValue<'ctx>,
 }
 
+#[derive(Clone, Copy)]
+struct IndirectBytesCaptureConfig {
+    data_offset: u64,
+    data_access_size: ghostscope_dwarf::MemoryAccessSize,
+    length_offset: u64,
+    length_access_size: ghostscope_dwarf::MemoryAccessSize,
+    max_len: usize,
+}
+
 fn complex_format_arg_header_len(arg: &ComplexArg<'_>) -> usize {
     PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN + arg.access_path.len()
 }
@@ -36,7 +45,14 @@ fn complex_format_static_payload_len(arg: &ComplexArg<'_>) -> Option<usize> {
             Some(std::cmp::max(*len, VARIABLE_READ_ERROR_PAYLOAD_LEN))
         }
         ComplexArgSource::MemDumpDynamic { .. } => None,
+        ComplexArgSource::IndirectBytes { .. } => None,
     }
+}
+
+fn indirect_bytes_capture_capacity(reserved_len: usize, max_len: usize) -> usize {
+    reserved_len
+        .saturating_sub(ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE)
+        .min(max_len)
 }
 
 fn plan_complex_format_layout(
@@ -64,6 +80,10 @@ fn plan_complex_format_layout(
             static_payload_total += payload_len;
         } else if let ComplexArgSource::MemDumpDynamic { max_len, .. } = &arg.source {
             dynamic_max_lens.push(*max_len);
+        } else if let ComplexArgSource::IndirectBytes { max_len, .. } = &arg.source {
+            dynamic_max_lens.push(
+                ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE.saturating_add(*max_len),
+            );
         }
 
         arg_payload_plans.push((header_len, static_payload_len));
@@ -1457,6 +1477,429 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
+    fn emit_complex_format_read_error_payload(
+        &mut self,
+        var_data_ptr: PointerValue<'ctx>,
+        reserved_len: usize,
+        helper_result: IntValue<'ctx>,
+        address: IntValue<'ctx>,
+    ) -> Result<()> {
+        let i32_type = self.context.i32_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let errno_end = VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET + std::mem::size_of::<i32>();
+        if reserved_len >= errno_end {
+            // SAFETY: the reserved payload includes the errno field.
+            let errno_ptr_i8 = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        var_data_ptr,
+                        &[i32_type
+                            .const_int(VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET as u64, false)],
+                        "indirect_errno_ptr_i8",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            };
+            let errno_ptr = self
+                .builder
+                .build_pointer_cast(errno_ptr_i8, ptr_type, "indirect_errno_ptr")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let errno = self.build_errno_i32(helper_result, "indirect_errno_i32")?;
+            self.builder
+                .build_store(errno_ptr, errno)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        }
+
+        if reserved_len >= VARIABLE_READ_ERROR_PAYLOAD_LEN {
+            // SAFETY: the reserved payload includes the address field.
+            let addr_ptr_i8 = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        var_data_ptr,
+                        &[i32_type
+                            .const_int(VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET as u64, false)],
+                        "indirect_addr_ptr_i8",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            };
+            let addr_ptr = self
+                .builder
+                .build_pointer_cast(addr_ptr_i8, ptr_type, "indirect_addr_ptr")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder
+                .build_store(addr_ptr, address)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    fn emit_complex_format_indirect_bytes(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        var_data_ptr: PointerValue<'ctx>,
+        descriptor: &RuntimeAddress<'ctx>,
+        reserved_len: usize,
+        capture: IndirectBytesCaptureConfig,
+    ) -> Result<()> {
+        let prefix_len = ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE;
+        if reserved_len < prefix_len {
+            self.builder
+                .build_store(
+                    status_ptr,
+                    self.context
+                        .i8_type()
+                        .const_int(VariableStatus::Truncated as u64, false),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.mark_any_fail()?;
+            return Ok(());
+        }
+
+        let i64_type = self.context.i64_type();
+        let i32_type = self.context.i32_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let data_member = self
+            .builder
+            .build_int_add(
+                descriptor.value,
+                i64_type.const_int(capture.data_offset, false),
+                "indirect_data_member",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let length_member = self
+            .builder
+            .build_int_add(
+                descriptor.value,
+                i64_type.const_int(capture.length_offset, false),
+                "indirect_length_member",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let data_read = self.generate_memory_read_with_diagnostics(
+            descriptor.with_value(data_member),
+            capture.data_access_size,
+            Some(status_ptr),
+            "indirect_data_metadata",
+        )?;
+        let data_address = data_read.value.into_int_value();
+        let length_read = self.generate_memory_read_with_diagnostics(
+            descriptor.with_value(length_member),
+            capture.length_access_size,
+            Some(status_ptr),
+            "indirect_length_metadata",
+        )?;
+        let original_len = length_read.value.into_int_value();
+
+        let current_status = self
+            .builder
+            .build_load(
+                self.context.i8_type(),
+                status_ptr,
+                "indirect_metadata_status",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+        let metadata_ok = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                current_status,
+                self.context.i8_type().const_zero(),
+                "indirect_metadata_ok",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let function = self.current_function("compile indirect byte capture")?;
+        let metadata_ok_block = self
+            .context
+            .append_basic_block(function, "indirect_metadata_ok");
+        let metadata_error_block = self
+            .context
+            .append_basic_block(function, "indirect_metadata_error");
+        let continue_block = self
+            .context
+            .append_basic_block(function, "indirect_continue");
+        self.builder
+            .build_conditional_branch(metadata_ok, metadata_ok_block, metadata_error_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(metadata_error_block);
+        let metadata_read_error = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                current_status,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::ReadError as u64, false),
+                "indirect_metadata_read_error",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let metadata_payload_block = self
+            .context
+            .append_basic_block(function, "indirect_metadata_error_payload");
+        self.builder
+            .build_conditional_branch(metadata_read_error, metadata_payload_block, continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(metadata_payload_block);
+        let data_offsets_available = self
+            .builder
+            .build_not(data_read.not_found, "indirect_data_offsets_available")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let data_helper_failed = self
+            .builder
+            .build_and(
+                data_read.combined_fail,
+                data_offsets_available,
+                "indirect_data_helper_failed",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let metadata_helper_result = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                data_helper_failed,
+                data_read.helper_result.into(),
+                length_read.helper_result.into(),
+                "indirect_metadata_helper_result",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+        let metadata_error_address = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                data_helper_failed,
+                data_member.into(),
+                length_member.into(),
+                "indirect_metadata_error_address",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+        self.emit_complex_format_read_error_payload(
+            var_data_ptr,
+            reserved_len,
+            metadata_helper_result,
+            metadata_error_address,
+        )?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(metadata_ok_block);
+        let length_prefix_ptr = self
+            .builder
+            .build_pointer_cast(var_data_ptr, ptr_type, "indirect_length_prefix")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.builder
+            .build_store(length_prefix_ptr, original_len)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let is_empty = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                original_len,
+                i64_type.const_zero(),
+                "indirect_is_empty",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let empty_block = self.context.append_basic_block(function, "indirect_empty");
+        let nonempty_block = self
+            .context
+            .append_basic_block(function, "indirect_nonempty");
+        self.builder
+            .build_conditional_branch(is_empty, empty_block, nonempty_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(empty_block);
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::ZeroLength as u64, false),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.mark_any_success()?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(nonempty_block);
+        let capture_capacity = indirect_bytes_capture_capacity(reserved_len, capture.max_len);
+        if capture_capacity == 0 {
+            self.builder
+                .build_store(
+                    status_ptr,
+                    self.context
+                        .i8_type()
+                        .const_int(VariableStatus::Truncated as u64, false),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.mark_any_success()?;
+            self.mark_any_fail()?;
+            self.builder
+                .build_unconditional_branch(continue_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder.position_at_end(continue_block);
+            return Ok(());
+        }
+
+        let is_null = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                data_address,
+                i64_type.const_zero(),
+                "indirect_data_is_null",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let null_block = self.context.append_basic_block(function, "indirect_null");
+        let read_block = self.context.append_basic_block(function, "indirect_read");
+        self.builder
+            .build_conditional_branch(is_null, null_block, read_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(null_block);
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::NullDeref as u64, false),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(read_block);
+        let capture_limit = i64_type.const_int(capture_capacity as u64, false);
+        let is_truncated = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::UGT,
+                original_len,
+                capture_limit,
+                "indirect_is_truncated",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let read_len = self
+            .builder
+            .build_select(
+                is_truncated,
+                capture_limit,
+                original_len,
+                "indirect_read_len",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+        let read_len = self
+            .builder
+            .build_int_truncate(read_len, i32_type, "indirect_read_len_i32")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        // SAFETY: reserved_len includes the fixed length prefix.
+        let byte_payload_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    var_data_ptr,
+                    &[i32_type.const_int(prefix_len as u64, false)],
+                    "indirect_byte_payload",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+        };
+        let destination = self
+            .builder
+            .build_pointer_cast(byte_payload_ptr, ptr_type, "indirect_destination")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let source = self
+            .builder
+            .build_int_to_ptr(data_address, ptr_type, "indirect_source")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let read_result = self
+            .create_bpf_helper_call(
+                BPF_FUNC_probe_read_user as u64,
+                &[destination.into(), read_len.into(), source.into()],
+                i64_type.into(),
+                "probe_read_user_indirect_bytes",
+            )?
+            .into_int_value();
+        let read_ok = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                read_result,
+                i64_type.const_zero(),
+                "indirect_read_ok",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let read_ok_block = self
+            .context
+            .append_basic_block(function, "indirect_read_ok");
+        let read_error_block = self
+            .context
+            .append_basic_block(function, "indirect_read_error");
+        self.builder
+            .build_conditional_branch(read_ok, read_ok_block, read_error_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(read_error_block);
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::ReadError as u64, false),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.emit_complex_format_read_error_payload(
+            var_data_ptr,
+            reserved_len,
+            read_result,
+            data_address,
+        )?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(read_ok_block);
+        let truncated_block = self
+            .context
+            .append_basic_block(function, "indirect_truncated");
+        let complete_block = self
+            .context
+            .append_basic_block(function, "indirect_complete");
+        self.builder
+            .build_conditional_branch(is_truncated, truncated_block, complete_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(truncated_block);
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::Truncated as u64, false),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.mark_any_success()?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(complete_block);
+        self.mark_any_success()?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(continue_block);
+        Ok(())
+    }
+
     fn emit_complex_format_runtime_read(
         &mut self,
         status_ptr: PointerValue<'ctx>,
@@ -1655,6 +2098,26 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 *len_value,
                 reserved_len,
             ),
+            ComplexArgSource::IndirectBytes {
+                descriptor,
+                data_offset,
+                data_access_size,
+                length_offset,
+                length_access_size,
+                max_len,
+            } => self.emit_complex_format_indirect_bytes(
+                status_ptr,
+                var_data_ptr,
+                descriptor,
+                reserved_len,
+                IndirectBytesCaptureConfig {
+                    data_offset: *data_offset,
+                    data_access_size: *data_access_size,
+                    length_offset: *length_offset,
+                    length_access_size: *length_access_size,
+                    max_len: *max_len,
+                },
+            ),
             ComplexArgSource::ComputedInt { value, byte_len } => {
                 self.emit_complex_format_computed_int(var_data_ptr, *value, *byte_len)
             }
@@ -1756,6 +2219,69 @@ mod complex_format_layout_tests {
         }
     }
 
+    fn indirect_bytes_arg<'ctx>(context: &'ctx Context, max_len: usize) -> ComplexArg<'ctx> {
+        ComplexArg {
+            var_name_index: 0,
+            type_index: 0,
+            access_path: Vec::new(),
+            data_len: ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE + max_len,
+            source: ComplexArgSource::IndirectBytes {
+                descriptor: RuntimeAddress::available(context.i64_type().const_zero(), context),
+                data_offset: 0,
+                data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                length_offset: 8,
+                length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                max_len,
+            },
+        }
+    }
+
+    fn indirect_emitter_ir(capture: IndirectBytesCaptureConfig) -> String {
+        let context = Context::create();
+        let options = crate::CompileOptions::default();
+        let ebpf = EbpfContext::new(&context, "indirect", Some(0), &options);
+        let mut ebpf = ebpf.expect("create eBPF context");
+        let function_type = context.i64_type().fn_type(&[], false);
+        let function = ebpf
+            .module
+            .add_function("emit_indirect_bytes", function_type, None);
+        let entry = context.append_basic_block(function, "entry");
+        ebpf.builder.position_at_end(entry);
+        let status_ptr = ebpf
+            .builder
+            .build_alloca(context.i8_type(), "status")
+            .expect("allocate status");
+        let data_ptr = ebpf
+            .builder
+            .build_alloca(
+                context
+                    .i8_type()
+                    .array_type(VARIABLE_READ_ERROR_PAYLOAD_LEN as u32),
+                "payload",
+            )
+            .expect("allocate payload");
+        ebpf.builder
+            .build_store(status_ptr, context.i8_type().const_zero())
+            .expect("initialize status");
+        let descriptor_value = context.i64_type().const_int(0x1000, false);
+        let descriptor = RuntimeAddress::available(descriptor_value, &context);
+
+        ebpf.emit_complex_format_indirect_bytes(
+            status_ptr,
+            data_ptr,
+            &descriptor,
+            VARIABLE_READ_ERROR_PAYLOAD_LEN,
+            capture,
+        )
+        .expect("emit indirect byte capture");
+        ebpf.builder
+            .build_return(Some(&context.i64_type().const_zero()))
+            .expect("return from test function");
+        ebpf.module.verify().expect("verify generated LLVM IR");
+
+        ebpf.module.print_to_string().to_string()
+    }
+
     #[test]
     fn complex_format_layout_records_per_arg_lengths() {
         let context = Context::create();
@@ -1814,5 +2340,83 @@ mod complex_format_layout_tests {
                 VARIABLE_READ_ERROR_PAYLOAD_LEN,
             ]
         );
+    }
+
+    #[test]
+    fn complex_format_layout_includes_indirect_length_prefix() {
+        let context = Context::create();
+        let args = vec![indirect_bytes_arg(&context, 64)];
+
+        let layout = plan_complex_format_layout(4096, 0, &args);
+
+        assert_eq!(
+            layout.args[0].reserved_len,
+            ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE + 64
+        );
+    }
+
+    #[test]
+    fn indirect_bytes_capture_respects_caps_below_error_headroom() {
+        let context = Context::create();
+
+        for max_len in 0..=3 {
+            let args = vec![indirect_bytes_arg(&context, max_len)];
+            let layout = plan_complex_format_layout(4096, 0, &args);
+            let reserved_len = layout.args[0].reserved_len;
+
+            assert_eq!(
+                reserved_len,
+                ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE + max_len
+            );
+            assert_eq!(
+                indirect_bytes_capture_capacity(reserved_len, max_len),
+                max_len
+            );
+        }
+    }
+
+    #[test]
+    fn indirect_bytes_emitter_writes_standard_read_error_payload() {
+        let llvm_ir = indirect_emitter_ir(IndirectBytesCaptureConfig {
+            data_offset: 0,
+            data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            length_offset: 8,
+            length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            max_len: 4,
+        });
+
+        assert!(llvm_ir.contains("indirect_metadata_error_payload"));
+        assert!(llvm_ir.contains("indirect_errno_ptr_i8"));
+        assert!(llvm_ir.contains("indirect_addr_ptr_i8"));
+    }
+
+    #[test]
+    fn indirect_bytes_emitter_uses_dwarf_metadata_widths() {
+        let llvm_ir = indirect_emitter_ir(IndirectBytesCaptureConfig {
+            data_offset: 0,
+            data_access_size: ghostscope_dwarf::MemoryAccessSize::U32,
+            length_offset: 4,
+            length_access_size: ghostscope_dwarf::MemoryAccessSize::U32,
+            max_len: 4,
+        });
+        let metadata_loads = llvm_ir
+            .lines()
+            .filter(|line| {
+                let is_metadata = line.contains("loaded_value");
+                let is_i32_load = line.contains("load i32");
+                is_metadata && is_i32_load
+            })
+            .count();
+        let metadata_extensions = llvm_ir
+            .lines()
+            .filter(|line| {
+                let is_metadata = line.contains("extended");
+                let is_i32_extension = line.contains("zext i32");
+                is_metadata && is_i32_extension
+            })
+            .count();
+
+        assert_eq!(metadata_loads, 2, "{llvm_ir}");
+        assert_eq!(metadata_extensions, 2, "{llvm_ir}");
     }
 }

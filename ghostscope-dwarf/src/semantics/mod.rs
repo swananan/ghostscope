@@ -3,6 +3,7 @@ pub mod pc_context;
 pub mod type_context;
 pub mod type_layout;
 pub mod unwind_plan;
+pub mod value;
 pub mod variable_plan;
 
 pub(crate) mod origins;
@@ -35,6 +36,7 @@ pub use unwind_plan::{
     CfaRulePlan, CompactUnwindRow, CompactUnwindStats, CompactUnwindTable, RegisterRecoveryPlan,
     UnwindDiagnostic, UnwindDiagnosticKind,
 };
+pub use value::{ValueCapturePlan, ValueReadPlan};
 pub(crate) use variable_plan::PlanError;
 pub use variable_plan::{
     AddressOrigin, LvalueAddressPlan, PlannedAddress, PlannedAddressKind, PlannedValue,

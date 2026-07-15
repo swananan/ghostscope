@@ -18,8 +18,16 @@ use inkwell::AddressSpace;
 
 struct ProbeReadResult<'ctx> {
     loaded_i64: IntValue<'ctx>,
+    helper_result: IntValue<'ctx>,
     combined_fail: IntValue<'ctx>,
     not_found: IntValue<'ctx>,
+}
+
+pub(crate) struct MemoryReadDiagnostics<'ctx> {
+    pub(crate) value: BasicValueEnum<'ctx>,
+    pub(crate) helper_result: IntValue<'ctx>,
+    pub(crate) combined_fail: IntValue<'ctx>,
+    pub(crate) not_found: IntValue<'ctx>,
 }
 
 pub(crate) struct ProcModuleOffsetsLookup<'ctx> {
@@ -1028,6 +1036,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         Ok(ProbeReadResult {
             loaded_i64,
+            helper_result: ret_i32,
             combined_fail,
             not_found,
         })
@@ -1129,33 +1138,48 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         size: MemoryAccessSize,
         status_ptr: Option<PointerValue<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
+        Ok(self
+            .generate_memory_read_with_diagnostics(address, size, status_ptr, "probe_read_user")?
+            .value)
+    }
+
+    pub(crate) fn generate_memory_read_with_diagnostics(
+        &mut self,
+        address: RuntimeAddress<'ctx>,
+        size: MemoryAccessSize,
+        status_ptr: Option<PointerValue<'ctx>>,
+        name_suffix: &str,
+    ) -> Result<MemoryReadDiagnostics<'ctx>> {
         let zero_const = self.context.i64_type().const_zero();
         let ProbeReadResult {
             loaded_i64,
+            helper_result,
             combined_fail,
             not_found,
-        } = self.probe_read_user_core(address, size, "probe_read_user")?;
+        } = self.probe_read_user_core(address, size, name_suffix)?;
 
         if let Some(status_ptr) = status_ptr {
-            self.store_variable_read_status(
-                status_ptr,
-                combined_fail,
-                not_found,
-                "probe_read_user",
-            )?;
+            self.store_variable_read_status(status_ptr, combined_fail, not_found, name_suffix)?;
         }
-        self.update_any_fail_flag(combined_fail, "probe_read_user")?;
+        self.update_any_fail_flag(combined_fail, name_suffix)?;
 
         let zero_bv: BasicValueEnum = zero_const.into();
         let val_bv: BasicValueEnum = loaded_i64.into();
-        self.builder
+        let value = self
+            .builder
             .build_select::<BasicValueEnum<'ctx>, _>(
                 combined_fail,
                 zero_bv,
                 val_bv,
-                "value_or_zero",
+                &format!("{name_suffix}_value_or_zero"),
             )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        Ok(MemoryReadDiagnostics {
+            value,
+            helper_result,
+            combined_fail,
+            not_found,
+        })
     }
 
     /// Generate a user memory read and return both the zero-on-failure value and failure flag.

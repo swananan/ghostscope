@@ -10,6 +10,8 @@ use std::{
 
 pub static mut G_COUNTER: i32 = 0;
 pub static G_MESSAGE: &str = "hello from rust";
+pub static G_EMPTY_MESSAGE: &str = "";
+pub static G_NUL_MESSAGE: &str = "left\0right";
 
 #[repr(C)]
 pub struct Config {
@@ -170,6 +172,8 @@ fn touch_globals() -> i32 {
 
         let total = CONFIG.a as i64
             + G_MESSAGE.len() as i64
+            + G_EMPTY_MESSAGE.len() as i64
+            + G_NUL_MESSAGE.len() as i64
             + GLOBAL_PAIRS[0].0 as i64
             + union_value as i64
             + pinned_value as i64

@@ -4,6 +4,12 @@ mod rust;
 
 use crate::{semantics::PlanError, SourceLanguage, TypeOrigin, VariableAccessSegment};
 
+pub(crate) use rust::IndirectBytesLayout;
+
+pub(crate) fn resolve_value_layout(current: &crate::ResolvedType) -> Option<IndirectBytesLayout> {
+    rust::resolve_value_layout(current)
+}
+
 pub(crate) fn resolve_access_segment(
     origin: &TypeOrigin,
     segment: &VariableAccessSegment,

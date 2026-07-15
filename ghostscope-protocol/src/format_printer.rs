@@ -8,6 +8,7 @@ use crate::trace_event::{
     VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET, VARIABLE_READ_ERROR_PAYLOAD_LEN,
 };
 use crate::type_info::TypeInfo;
+use crate::{ValuePresentation, INDIRECT_BYTES_LENGTH_PREFIX_SIZE};
 
 // Removed legacy simple variable wrapper; use complex paths only.
 
@@ -369,24 +370,24 @@ impl FormatPrinter {
                                             continue;
                                         } else {
                                             let v = &vars[var_index];
-                                            let b = if v.status == VariableStatus::ZeroLength as u8
+                                            match Self::format_spec_payload_bytes(v, trace_context)
                                             {
-                                                &[][..]
-                                            } else {
-                                                v.data.as_slice()
-                                            };
-                                            let s = b
-                                                .iter()
-                                                .map(|vv| {
-                                                    if conv == 'x' {
-                                                        format!("{vv:02x}")
-                                                    } else {
-                                                        format!("{vv:02X}")
-                                                    }
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join(" ");
-                                            result.push_str(&s);
+                                                Ok(bytes) => {
+                                                    let formatted = bytes
+                                                        .iter()
+                                                        .map(|byte| {
+                                                            if conv == 'x' {
+                                                                format!("{byte:02x}")
+                                                            } else {
+                                                                format!("{byte:02X}")
+                                                            }
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                        .join(" ");
+                                                    result.push_str(&formatted);
+                                                }
+                                                Err(error) => result.push_str(error),
+                                            }
                                             var_index += 1;
                                             continue;
                                         }
@@ -394,7 +395,7 @@ impl FormatPrinter {
                                 }
                             }
                             's' => {
-                                let mut render_bytes = |b: &[u8]| {
+                                let render_bytes = |b: &[u8]| {
                                     let mut out = String::new();
                                     for &c in b.iter() {
                                         if c == 0 {
@@ -406,7 +407,7 @@ impl FormatPrinter {
                                             out.push_str(&format!("\\x{c:02x}"));
                                         }
                                     }
-                                    result.push_str(&out);
+                                    out
                                 };
 
                                 match lenspec {
@@ -432,7 +433,7 @@ impl FormatPrinter {
                                                 } else {
                                                     std::cmp::min(n, full.len())
                                                 };
-                                            render_bytes(&full[..take]);
+                                            result.push_str(&render_bytes(&full[..take]));
                                             var_index += 2;
                                             continue;
                                         }
@@ -453,7 +454,7 @@ impl FormatPrinter {
                                                 } else {
                                                     std::cmp::min(n, full.len())
                                                 };
-                                            render_bytes(&full[..take]);
+                                            result.push_str(&render_bytes(&full[..take]));
                                             var_index += 1;
                                             continue;
                                         }
@@ -480,7 +481,7 @@ impl FormatPrinter {
                                                 } else {
                                                     std::cmp::min(n, full.len())
                                                 };
-                                            render_bytes(&full[..take]);
+                                            result.push_str(&render_bytes(&full[..take]));
                                             var_index += 2;
                                             continue;
                                         }
@@ -494,13 +495,13 @@ impl FormatPrinter {
                                             continue;
                                         } else {
                                             let v = &vars[var_index];
-                                            let b = if v.status == VariableStatus::ZeroLength as u8
+                                            match Self::format_spec_payload_bytes(v, trace_context)
                                             {
-                                                &[][..]
-                                            } else {
-                                                v.data.as_slice()
-                                            };
-                                            render_bytes(b);
+                                                Ok(bytes) => {
+                                                    result.push_str(&render_bytes(bytes));
+                                                }
+                                                Err(error) => result.push_str(error),
+                                            }
                                             var_index += 1;
                                             continue;
                                         }
@@ -581,7 +582,11 @@ impl FormatPrinter {
             None => return format!("<INVALID_TYPE_INDEX_{type_index}>: {var_name}"),
         };
 
-        let formatted_data = Self::format_data_with_type_info(data, type_info);
+        let formatted_data = Self::format_data_with_presentation(
+            data,
+            type_info,
+            trace_context.get_value_presentation(type_index),
+        );
 
         if access_path.is_empty() {
             format!("{var_name} = {formatted_data}")
@@ -606,6 +611,26 @@ impl FormatPrinter {
             Some(t) => t,
             None => return format!("<INVALID_TYPE_INDEX_{type_index}>: {var_name}"),
         };
+        let presentation = trace_context.get_value_presentation(type_index);
+
+        if presentation == ValuePresentation::Utf8String
+            && matches!(
+                status,
+                s if s == VariableStatus::Ok as u8
+                    || s == VariableStatus::ZeroLength as u8
+                    || s == VariableStatus::Truncated as u8
+            )
+        {
+            let mut formatted_data = Self::format_utf8_string_payload(data);
+            if status == VariableStatus::Truncated as u8 {
+                formatted_data.push_str(" <truncated>");
+            }
+            return if access_path.is_empty() {
+                format!("{var_name} = {formatted_data}")
+            } else {
+                format!("{var_name}.{access_path} = {formatted_data}")
+            };
+        }
 
         // OK path delegates to existing formatter
         if status == VariableStatus::Ok as u8 {
@@ -672,6 +697,73 @@ impl FormatPrinter {
     pub fn format_data_with_type_info(data: &[u8], type_info: &TypeInfo) -> String {
         // Relax display limits: increase max depth to print more nested content.
         Self::format_data_with_type_info_impl(data, type_info, 0, 32)
+    }
+
+    /// Format captured data using its semantic presentation when one is
+    /// registered, otherwise preserve physical DWARF formatting.
+    pub fn format_data_with_presentation(
+        data: &[u8],
+        type_info: &TypeInfo,
+        presentation: ValuePresentation,
+    ) -> String {
+        match presentation {
+            ValuePresentation::Dwarf => Self::format_data_with_type_info(data, type_info),
+            ValuePresentation::Utf8String => Self::format_utf8_string_payload(data),
+        }
+    }
+
+    fn format_spec_payload_bytes<'a>(
+        variable: &'a ParsedComplexVariable,
+        trace_context: &TraceContext,
+    ) -> Result<&'a [u8], &'static str> {
+        if variable.status == VariableStatus::ZeroLength as u8 {
+            return Ok(&[]);
+        }
+
+        Self::presentation_payload_bytes(
+            &variable.data,
+            trace_context.get_value_presentation(variable.type_index),
+        )
+        .ok_or("<INVALID_UTF8_STRING_PAYLOAD>")
+    }
+
+    fn presentation_payload_bytes(data: &[u8], presentation: ValuePresentation) -> Option<&[u8]> {
+        match presentation {
+            ValuePresentation::Dwarf => Some(data),
+            ValuePresentation::Utf8String => {
+                let prefix = data.get(..INDIRECT_BYTES_LENGTH_PREFIX_SIZE)?;
+                let original_len = u64::from_le_bytes(prefix.try_into().ok()?);
+                let payload = &data[INDIRECT_BYTES_LENGTH_PREFIX_SIZE..];
+                let captured_len = usize::try_from(original_len)
+                    .unwrap_or(usize::MAX)
+                    .min(payload.len());
+                Some(&payload[..captured_len])
+            }
+        }
+    }
+
+    fn format_utf8_string_payload(data: &[u8]) -> String {
+        let Some(captured) = Self::presentation_payload_bytes(data, ValuePresentation::Utf8String)
+        else {
+            return "<INVALID_UTF8_STRING_PAYLOAD>".to_string();
+        };
+
+        match std::str::from_utf8(captured) {
+            Ok(value) => format!("{value:?}"),
+            Err(error) if error.error_len().is_none() => {
+                let valid = &captured[..error.valid_up_to()];
+                let valid = std::str::from_utf8(valid)
+                    .expect("UTF-8 error valid_up_to always identifies valid bytes");
+                format!("{valid:?}")
+            }
+            Err(_) => {
+                let escaped = captured
+                    .iter()
+                    .map(|byte| format!("\\x{byte:02x}"))
+                    .collect::<String>();
+                format!("<INVALID_UTF8:{escaped}>")
+            }
+        }
     }
 
     /// Internal implementation with depth control for recursion
@@ -1322,6 +1414,134 @@ mod tests {
         let result =
             FormatPrinter::format_complex_print_data(fmt_idx, &complex_vars, &trace_context);
         assert_eq!(result, "\"Alice\"");
+    }
+
+    fn rust_str_type() -> TypeInfo {
+        TypeInfo::StructType {
+            name: "&str".to_string(),
+            size: 16,
+            members: Vec::new(),
+        }
+    }
+
+    fn indirect_bytes_payload(original_len: u64, captured: &[u8]) -> Vec<u8> {
+        let mut data = original_len.to_le_bytes().to_vec();
+        data.extend_from_slice(captured);
+        data
+    }
+
+    #[test]
+    fn test_utf8_string_presentation_uses_length_not_nul_termination() {
+        let mut trace_context = TraceContext::new();
+        let format_idx = trace_context.add_string("{}".to_string()).unwrap();
+        let type_idx = trace_context
+            .add_type_with_presentation(rust_str_type(), ValuePresentation::Utf8String)
+            .unwrap();
+        let name_idx = trace_context
+            .add_variable_name("message".to_string())
+            .unwrap();
+        let data = indirect_bytes_payload(3, b"a\0b");
+        let vars = vec![ParsedComplexVariable {
+            var_name_index: name_idx,
+            type_index: type_idx,
+            access_path: String::new(),
+            status: VariableStatus::Ok as u8,
+            data,
+        }];
+
+        assert_eq!(
+            FormatPrinter::format_complex_print_data(format_idx, &vars, &trace_context),
+            "\"a\\0b\""
+        );
+    }
+
+    #[test]
+    fn test_raw_specs_decode_utf8_string_payload() {
+        let mut trace_context = TraceContext::new();
+        let format_idx = trace_context.add_string("{:s}|{:x}".to_string()).unwrap();
+        let type_idx = trace_context
+            .add_type_with_presentation(rust_str_type(), ValuePresentation::Utf8String)
+            .unwrap();
+        let name_idx = trace_context
+            .add_variable_name("message".to_string())
+            .unwrap();
+        let variable = ParsedComplexVariable {
+            var_name_index: name_idx,
+            type_index: type_idx,
+            access_path: String::new(),
+            status: VariableStatus::Ok as u8,
+            data: indirect_bytes_payload(3, b"abc"),
+        };
+
+        assert_eq!(
+            FormatPrinter::format_complex_print_data(
+                format_idx,
+                &[variable.clone(), variable],
+                &trace_context,
+            ),
+            "abc|61 62 63"
+        );
+    }
+
+    #[test]
+    fn test_utf8_string_presentation_renders_empty_and_truncated_values() {
+        let mut trace_context = TraceContext::new();
+        let type_idx = trace_context
+            .add_type_with_presentation(rust_str_type(), ValuePresentation::Utf8String)
+            .unwrap();
+        let name_idx = trace_context
+            .add_variable_name("message".to_string())
+            .unwrap();
+
+        let empty = FormatPrinter::format_complex_variable_with_status(
+            name_idx,
+            type_idx,
+            "",
+            &indirect_bytes_payload(0, &[]),
+            VariableStatus::ZeroLength as u8,
+            &trace_context,
+        );
+        let truncated = FormatPrinter::format_complex_variable_with_status(
+            name_idx,
+            type_idx,
+            "",
+            &indirect_bytes_payload(6, b"abc"),
+            VariableStatus::Truncated as u8,
+            &trace_context,
+        );
+
+        assert_eq!(empty, "message = \"\"");
+        assert_eq!(truncated, "message = \"abc\" <truncated>");
+    }
+
+    #[test]
+    fn test_utf8_string_read_error_uses_standard_error_payload() {
+        let mut trace_context = TraceContext::new();
+        let type_idx = trace_context
+            .add_type_with_presentation(rust_str_type(), ValuePresentation::Utf8String)
+            .unwrap();
+        let name_idx = trace_context
+            .add_variable_name("message".to_string())
+            .unwrap();
+        let mut payload = vec![0; VARIABLE_READ_ERROR_PAYLOAD_LEN];
+        let errno_end = VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET + std::mem::size_of::<i32>();
+        let addr_end = VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET + std::mem::size_of::<u64>();
+        payload[VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET..errno_end]
+            .copy_from_slice(&(-14i32).to_le_bytes());
+        payload[VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET..addr_end]
+            .copy_from_slice(&0x1234u64.to_le_bytes());
+
+        assert_eq!(
+            FormatPrinter::format_complex_variable_with_status(
+                name_idx,
+                type_idx,
+                "",
+                &payload,
+                VariableStatus::ReadError as u8,
+                &trace_context,
+            ),
+            "message = <read_user failed errno=-14 at 0x1234> (struct &str*)"
+        );
     }
 
     #[test]
