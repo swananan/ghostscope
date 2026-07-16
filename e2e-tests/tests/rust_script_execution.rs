@@ -150,6 +150,51 @@ async fn test_rust_tuple_projection_plan_preserves_semantic_identity() -> anyhow
 }
 
 #[tokio::test]
+async fn test_rust_string_value_plan_uses_type_namespace() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+
+    let (_, std_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_OWNED_MESSAGE",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_OWNED_MESSAGE read plan"))?;
+    let std_type = analyzer
+        .resolved_type_for_plan(&std_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected standard String type"))?;
+    let std_value_plan = analyzer
+        .value_read_plan(&std_type, Some(&binary_path))?
+        .ok_or_else(|| anyhow::anyhow!("expected standard String value plan"))?;
+    assert_eq!(
+        std_value_plan.presentation,
+        ghostscope_dwarf::ValuePresentation::Utf8String
+    );
+
+    let (_, user_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_USER_STRING",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_USER_STRING read plan"))?;
+    let user_type = analyzer
+        .resolved_type_for_plan(&user_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected user String type"))?;
+    assert!(
+        analyzer
+            .value_read_plan(&user_type, Some(&binary_path))?
+            .is_none(),
+        "user-defined String must retain DWARF presentation"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_str_values() -> anyhow::Result<()> {
     init();
 
@@ -189,6 +234,52 @@ trace do_stuff {
 }
 
 #[tokio::test]
+async fn test_rust_script_print_string_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    print "RSTRING:{}:{}:{}", G_OWNED_MESSAGE, G_EMPTY_OWNED, G_NUL_OWNED;
+    print "RSTRING_RAW:{:s}:{:x}", G_OWNED_MESSAGE, G_OWNED_MESSAGE;
+    print "RSTRING_SEPARATOR:{}", G_SEPARATOR_OWNED;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| { line.contains(r#"RSTRING:"owned from rust":"":"owned\0value""#) }),
+        "Expected Rust String output: {stdout}"
+    );
+    let expected_raw = concat!(
+        "RSTRING_RAW:owned from rust:",
+        "6f 77 6e 65 64 20 66 72 6f 6d 20 72 75 73 74"
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains(expected_raw)),
+        "Expected raw Rust String output: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains(r#"RSTRING_SEPARATOR:"left = right""#)),
+        "Expected Rust String separator output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_str_respects_mem_dump_cap() -> anyhow::Result<()> {
     init();
 
@@ -196,6 +287,7 @@ async fn test_rust_script_print_str_respects_mem_dump_cap() -> anyhow::Result<()
     let script = r#"
 trace do_stuff {
     print "RSTR_CAP:{}", G_MESSAGE;
+    print "RSTR_CAP_RAW:{:s}:{:x}", G_MESSAGE, G_MESSAGE;
 }
 "#;
 
@@ -226,6 +318,14 @@ mem_dump_cap = 3
     assert!(
         !cap_line.contains("hell"),
         "Rust str read exceeded mem_dump_cap: {cap_line}"
+    );
+    let cap_raw_line = stdout
+        .lines()
+        .find(|line| line.contains("RSTR_CAP_RAW:"))
+        .ok_or_else(|| anyhow::anyhow!("Expected raw capped Rust str output: {stdout}"))?;
+    assert!(
+        cap_raw_line.contains("RSTR_CAP_RAW:hel <truncated>:68 65 6c <truncated>"),
+        "Unexpected raw capped Rust str output: {cap_raw_line}"
     );
     assert!(
         !stdout.contains("ExprError"),

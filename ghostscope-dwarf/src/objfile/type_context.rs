@@ -4,8 +4,8 @@ use super::{variables::complete_aggregate_declaration_entry, LoadedObjfile};
 use crate::{
     core::Result,
     semantics::{
-        resolve_type_ref_with_origins, CompilationUnitMetadata, ProducerInfo, SourceLanguage,
-        TypeLoc, VariableAccessSegment,
+        resolve_name_with_origins, resolve_type_ref_with_origins, CompilationUnitMetadata,
+        ProducerInfo, SourceLanguage, TypeLoc, VariableAccessSegment,
     },
     CuId, ModuleId, TypeId,
 };
@@ -41,6 +41,45 @@ fn type_id_from_loc(module: ModuleId, loc: TypeLoc) -> TypeId {
         offset: loc.die_off.0 as u64,
     };
     TypeId { module, cu, die }
+}
+
+fn qualified_type_name_from_dwarf(
+    dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+    loc: TypeLoc,
+) -> Result<Option<String>> {
+    let header = dwarf.unit_header(loc.cu_off)?;
+    let unit = dwarf.unit(header)?;
+    let mut namespaces = Vec::<(isize, String)>::new();
+    let mut entries = unit.entries();
+
+    while let Some(entry) = entries.next_dfs()? {
+        while namespaces
+            .last()
+            .is_some_and(|(depth, _)| *depth >= entry.depth())
+        {
+            namespaces.pop();
+        }
+
+        if entry.offset() == loc.die_off {
+            let Some(name) = resolve_name_with_origins(dwarf, &unit, entry)? else {
+                return Ok(None);
+            };
+            let mut components = namespaces
+                .iter()
+                .map(|(_, namespace)| namespace.as_str())
+                .collect::<Vec<_>>();
+            components.push(&name);
+            return Ok(Some(components.join("::")));
+        }
+
+        if entry.tag() == gimli::DW_TAG_namespace {
+            if let Some(name) = resolve_name_with_origins(dwarf, &unit, entry)? {
+                namespaces.push((entry.depth(), name));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 fn compilation_unit_metadata_from_dwarf(
@@ -256,6 +295,10 @@ impl LoadedObjfile {
             .expect("type name index lock poisoned");
         projected_type_loc(self.dwarf(), &type_name_index, type_loc(current)?, segment)
             .map(|loc| loc.map(|loc| type_id_from_loc(current.module, loc)))
+    }
+
+    pub(crate) fn qualified_type_name(&self, current: TypeId) -> Result<Option<String>> {
+        qualified_type_name_from_dwarf(self.dwarf(), type_loc(current)?)
     }
 
     pub(crate) fn aggregate_type_id_by_name(&self, module: ModuleId, name: &str) -> Option<TypeId> {
@@ -512,6 +555,78 @@ mod tests {
         )
     }
 
+    fn build_qualified_name_fixture() -> (gimli::Dwarf<DwarfReader>, TypeLoc, TypeLoc) {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 5,
+            address_size: 8,
+        };
+        let mut dwarf = WriteDwarf::new();
+        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        {
+            let unit = dwarf.units.get_mut(unit_id);
+            let root = unit.root();
+
+            let alloc = unit.add(root, gimli::DW_TAG_namespace);
+            unit.get_mut(alloc).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"alloc".to_vec()),
+            );
+            let string = unit.add(alloc, gimli::DW_TAG_namespace);
+            unit.get_mut(string).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"string".to_vec()),
+            );
+            let std_string = unit.add(string, gimli::DW_TAG_structure_type);
+            unit.get_mut(std_string).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"String".to_vec()),
+            );
+
+            let app = unit.add(root, gimli::DW_TAG_namespace);
+            unit.get_mut(app).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"app".to_vec()),
+            );
+            let app_string = unit.add(app, gimli::DW_TAG_structure_type);
+            unit.get_mut(app_string).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"String".to_vec()),
+            );
+        }
+
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+        let sections = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                sections
+                    .get(id)
+                    .map(|section| section.slice().to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+        let dwarf =
+            sections.borrow(|section| dwarf_reader_from_arc(Arc::<[u8]>::from(section.as_slice())));
+
+        let header = dwarf.units().next().unwrap().unwrap();
+        let cu_off = header.debug_info_offset().unwrap();
+        let unit = dwarf.unit(header).unwrap();
+        let mut strings = Vec::new();
+        let mut entries = unit.entries();
+        while let Some(entry) = entries.next_dfs().unwrap() {
+            if entry.tag() == gimli::DW_TAG_structure_type {
+                strings.push(TypeLoc {
+                    cu_off,
+                    die_off: entry.offset(),
+                });
+            }
+        }
+        assert_eq!(strings.len(), 2);
+
+        (dwarf, strings[0], strings[1])
+    }
+
     #[test]
     fn reads_language_and_producer_from_compilation_unit() {
         let fixture = build_fixture();
@@ -599,6 +714,20 @@ mod tests {
                 .as_ref()
                 .map(|producer| producer.raw.as_str()),
             Some("clang version 18")
+        );
+    }
+
+    #[test]
+    fn reconstructs_type_names_from_exact_namespace_ancestors() {
+        let (dwarf, std_string, app_string) = build_qualified_name_fixture();
+
+        assert_eq!(
+            qualified_type_name_from_dwarf(&dwarf, std_string).unwrap(),
+            Some("alloc::string::String".to_string())
+        );
+        assert_eq!(
+            qualified_type_name_from_dwarf(&dwarf, app_string).unwrap(),
+            Some("app::String".to_string())
         );
     }
 }

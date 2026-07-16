@@ -12,6 +12,22 @@ pub static mut G_COUNTER: i32 = 0;
 pub static G_MESSAGE: &str = "hello from rust";
 pub static G_EMPTY_MESSAGE: &str = "";
 pub static G_NUL_MESSAGE: &str = "left\0right";
+pub static mut G_OWNED_MESSAGE: String = String::new();
+pub static mut G_EMPTY_OWNED: String = String::new();
+pub static mut G_NUL_OWNED: String = String::new();
+pub static mut G_SEPARATOR_OWNED: String = String::new();
+
+pub mod user_types {
+    pub struct String {
+        pub vec: Vec<u8>,
+        pub marker: u32,
+    }
+}
+
+pub static mut G_USER_STRING: user_types::String = user_types::String {
+    vec: Vec::new(),
+    marker: 41,
+};
 
 #[repr(C)]
 pub struct Config {
@@ -174,6 +190,12 @@ fn touch_globals() -> i32 {
             + G_MESSAGE.len() as i64
             + G_EMPTY_MESSAGE.len() as i64
             + G_NUL_MESSAGE.len() as i64
+            + G_OWNED_MESSAGE.len() as i64
+            + G_EMPTY_OWNED.len() as i64
+            + G_NUL_OWNED.len() as i64
+            + G_SEPARATOR_OWNED.len() as i64
+            + G_USER_STRING.vec.len() as i64
+            + G_USER_STRING.marker as i64
             + GLOBAL_PAIRS[0].0 as i64
             + union_value as i64
             + pinned_value as i64
@@ -185,6 +207,15 @@ fn touch_globals() -> i32 {
 }
 
 fn main() {
+    // SAFETY: The fixture initializes these globals before its tracing loop and
+    // does not mutate them afterward.
+    unsafe {
+        G_OWNED_MESSAGE = String::from("owned from rust");
+        G_NUL_OWNED = String::from("owned\0value");
+        G_SEPARATOR_OWNED = String::from("left = right");
+        G_USER_STRING.vec = b"user bytes".to_vec();
+    }
+
     let mut acc: i64 = 0;
     for _ in 0..50000 {
         acc += math::do_stuff(3) as i64;
