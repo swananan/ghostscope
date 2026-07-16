@@ -43,6 +43,16 @@ impl DwarfAnalyzer {
             .map(|metadata| metadata.map(TypeOrigin::from))
     }
 
+    fn qualified_type_name(&self, type_id: TypeId) -> Result<Option<String>> {
+        let module_path = self.module_path_for_id(type_id.module).ok_or_else(|| {
+            anyhow::anyhow!("Semantic module id {:?} is not loaded", type_id.module)
+        })?;
+        self.modules
+            .get(module_path)
+            .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?
+            .qualified_type_name(type_id)
+    }
+
     /// Combine the plan's protocol-compatible type summary with its DWARF origin.
     pub fn semantic_type_for_plan(&self, plan: &VariableReadPlan) -> Result<Option<SemanticType>> {
         let Some(summary) = plan.dwarf_type.clone() else {
@@ -211,24 +221,62 @@ impl DwarfAnalyzer {
         current: &ResolvedType,
         type_module_path: Option<&Path>,
     ) -> Result<Option<ValueReadPlan>> {
-        let Some(layout) = crate::language::resolve_value_layout(current) else {
+        let qualified_name = match (
+            crate::language::requires_dwarf_qualified_name(current),
+            current.identity.layout_dwarf_id(),
+        ) {
+            (true, Some(type_id)) => self.qualified_type_name(type_id)?,
+            _ => None,
+        };
+        let Some(layout) =
+            crate::language::resolve_value_layout(current, qualified_name.as_deref())
+        else {
             return Ok(None);
         };
-        let data = self.project_resolved_type(
-            current,
-            &VariableAccessSegment::Field(layout.data_field.to_string()),
-            type_module_path,
-        )?;
-        let length = self.project_resolved_type(
-            current,
-            &VariableAccessSegment::Field(layout.length_field.to_string()),
-            type_module_path,
-        )?;
+        let data =
+            self.project_resolved_member_path(current, &layout.data_path, type_module_path)?;
+        let length =
+            self.project_resolved_member_path(current, &layout.length_path, type_module_path)?;
 
         Ok(Some(ValueReadPlan {
             presentation: layout.presentation,
             capture: ValueCapturePlan::IndirectBytes { data, length },
         }))
+    }
+
+    fn project_resolved_member_path(
+        &self,
+        current: &ResolvedType,
+        path: &[String],
+        type_module_path: Option<&Path>,
+    ) -> Result<TypeProjection> {
+        let mut resolved_type = current.clone();
+        let mut offset = 0u64;
+
+        for field in path {
+            let projected = self.project_resolved_type(
+                &resolved_type,
+                &VariableAccessSegment::Field(field.clone()),
+                type_module_path,
+            )?;
+            let TypeProjectionLayout::Member {
+                offset: member_offset,
+            } = projected.layout
+            else {
+                return Err(anyhow::anyhow!(
+                    "semantic member path produced a non-member projection"
+                ));
+            };
+            offset = offset
+                .checked_add(member_offset)
+                .ok_or_else(|| anyhow::anyhow!("semantic member path offset overflow"))?;
+            resolved_type = projected.resolved_type;
+        }
+
+        Ok(TypeProjection {
+            layout: TypeProjectionLayout::Member { offset },
+            resolved_type,
+        })
     }
 
     fn project_type_id(

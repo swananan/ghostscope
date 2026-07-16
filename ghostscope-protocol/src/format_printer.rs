@@ -136,7 +136,7 @@ impl FormatPrinter {
                                     v.status,
                                     trace_context,
                                 );
-                                let value_part = s.split(" = ").last().unwrap_or(&s);
+                                let value_part = Self::formatted_value_part(&s);
                                 result.push_str(value_part);
                                 var_index += 1;
                             } else {
@@ -219,7 +219,7 @@ impl FormatPrinter {
                             }
                         }
 
-                        // helper: format error value for a var when status != Ok/ZeroLength
+                        // Format statuses that cannot be consumed by a conversion.
                         let err_value_part = |idx: usize| -> Option<String> {
                             if idx >= vars.len() {
                                 return None;
@@ -238,7 +238,16 @@ impl FormatPrinter {
                                     v.status,
                                     trace_context,
                                 );
-                                Some(s.split(" = ").last().unwrap_or(&s).to_string())
+                                Some(Self::formatted_value_part(&s).to_string())
+                            }
+                        };
+                        let raw_err_value_part = |idx: usize| -> Option<String> {
+                            if vars.get(idx).is_some_and(|variable| {
+                                Self::is_semantic_truncation(variable, trace_context)
+                            }) {
+                                None
+                            } else {
+                                err_value_part(idx)
                             }
                         };
 
@@ -364,7 +373,7 @@ impl FormatPrinter {
                                     Len::None => {
                                         if var_index >= vars.len() {
                                             result.push_str("<MISSING_ARG>");
-                                        } else if let Some(err) = err_value_part(var_index) {
+                                        } else if let Some(err) = raw_err_value_part(var_index) {
                                             result.push_str(&err);
                                             var_index += 1;
                                             continue;
@@ -388,6 +397,11 @@ impl FormatPrinter {
                                                 }
                                                 Err(error) => result.push_str(error),
                                             }
+                                            Self::append_semantic_truncation_marker(
+                                                &mut result,
+                                                v,
+                                                trace_context,
+                                            );
                                             var_index += 1;
                                             continue;
                                         }
@@ -489,7 +503,7 @@ impl FormatPrinter {
                                     Len::None => {
                                         if var_index >= vars.len() {
                                             result.push_str("<MISSING_ARG>");
-                                        } else if let Some(err) = err_value_part(var_index) {
+                                        } else if let Some(err) = raw_err_value_part(var_index) {
                                             result.push_str(&err);
                                             var_index += 1;
                                             continue;
@@ -502,6 +516,11 @@ impl FormatPrinter {
                                                 }
                                                 Err(error) => result.push_str(error),
                                             }
+                                            Self::append_semantic_truncation_marker(
+                                                &mut result,
+                                                v,
+                                                trace_context,
+                                            );
                                             var_index += 1;
                                             continue;
                                         }
@@ -541,7 +560,7 @@ impl FormatPrinter {
                                         v.status,
                                         trace_context,
                                     );
-                                    let value_part = s.split(" = ").last().unwrap_or(&s);
+                                    let value_part = Self::formatted_value_part(&s);
                                     result.push_str(value_part);
                                     var_index += 1;
                                 } else {
@@ -563,6 +582,31 @@ impl FormatPrinter {
             }
         }
         result
+    }
+
+    fn formatted_value_part(formatted: &str) -> &str {
+        formatted
+            .split_once(" = ")
+            .map_or(formatted, |(_, value)| value)
+    }
+
+    fn is_semantic_truncation(
+        variable: &ParsedComplexVariable,
+        trace_context: &TraceContext,
+    ) -> bool {
+        variable.status == VariableStatus::Truncated as u8
+            && trace_context.get_value_presentation(variable.type_index)
+                == ValuePresentation::Utf8String
+    }
+
+    fn append_semantic_truncation_marker(
+        output: &mut String,
+        variable: &ParsedComplexVariable,
+        trace_context: &TraceContext,
+    ) {
+        if Self::is_semantic_truncation(variable, trace_context) {
+            output.push_str(" <truncated>");
+        }
     }
 
     /// Format a complex variable with full DWARF type information
@@ -1456,6 +1500,30 @@ mod tests {
     }
 
     #[test]
+    fn test_utf8_string_presentation_preserves_embedded_wrapper_separator() {
+        let mut trace_context = TraceContext::new();
+        let format_idx = trace_context.add_string("{}".to_string()).unwrap();
+        let type_idx = trace_context
+            .add_type_with_presentation(rust_str_type(), ValuePresentation::Utf8String)
+            .unwrap();
+        let name_idx = trace_context
+            .add_variable_name("message".to_string())
+            .unwrap();
+        let vars = vec![ParsedComplexVariable {
+            var_name_index: name_idx,
+            type_index: type_idx,
+            access_path: String::new(),
+            status: VariableStatus::Ok as u8,
+            data: indirect_bytes_payload(5, b"a = b"),
+        }];
+
+        assert_eq!(
+            FormatPrinter::format_complex_print_data(format_idx, &vars, &trace_context),
+            r#""a = b""#
+        );
+    }
+
+    #[test]
     fn test_raw_specs_decode_utf8_string_payload() {
         let mut trace_context = TraceContext::new();
         let format_idx = trace_context.add_string("{:s}|{:x}".to_string()).unwrap();
@@ -1480,6 +1548,34 @@ mod tests {
                 &trace_context,
             ),
             "abc|61 62 63"
+        );
+    }
+
+    #[test]
+    fn test_raw_specs_decode_truncated_utf8_string_payload() {
+        let mut trace_context = TraceContext::new();
+        let format_idx = trace_context.add_string("{:s}|{:x}".to_string()).unwrap();
+        let type_idx = trace_context
+            .add_type_with_presentation(rust_str_type(), ValuePresentation::Utf8String)
+            .unwrap();
+        let name_idx = trace_context
+            .add_variable_name("message".to_string())
+            .unwrap();
+        let variable = ParsedComplexVariable {
+            var_name_index: name_idx,
+            type_index: type_idx,
+            access_path: String::new(),
+            status: VariableStatus::Truncated as u8,
+            data: indirect_bytes_payload(6, b"abc"),
+        };
+
+        assert_eq!(
+            FormatPrinter::format_complex_print_data(
+                format_idx,
+                &[variable.clone(), variable],
+                &trace_context,
+            ),
+            "abc <truncated>|61 62 63 <truncated>"
         );
     }
 

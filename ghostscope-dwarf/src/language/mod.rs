@@ -6,8 +6,15 @@ use crate::{semantics::PlanError, SourceLanguage, TypeOrigin, VariableAccessSegm
 
 pub(crate) use rust::IndirectBytesLayout;
 
-pub(crate) fn resolve_value_layout(current: &crate::ResolvedType) -> Option<IndirectBytesLayout> {
-    rust::resolve_value_layout(current)
+pub(crate) fn resolve_value_layout(
+    current: &crate::ResolvedType,
+    dwarf_qualified_name: Option<&str>,
+) -> Option<IndirectBytesLayout> {
+    rust::resolve_value_layout(current, dwarf_qualified_name)
+}
+
+pub(crate) fn requires_dwarf_qualified_name(current: &crate::ResolvedType) -> bool {
+    rust::requires_dwarf_qualified_name(current)
 }
 
 pub(crate) fn resolve_access_segment(
