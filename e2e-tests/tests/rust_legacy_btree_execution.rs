@@ -3,9 +3,11 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use common::{init, rust_toolchain::rustc_for_toolchain};
+use common::{
+    init,
+    rust_toolchain::{compile_standalone_fixture, fixture_tempdir, rustc_for_toolchain},
+};
 
 const TOOLCHAIN: &str = "1.35.0";
 const REQUIRE_TOOLCHAIN_ENV: &str = "GHOSTSCOPE_REQUIRE_RUST_135_E2E";
@@ -14,22 +16,7 @@ fn compile_fixture(rustc: &Path, output_dir: &Path) -> anyhow::Result<PathBuf> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/rust_legacy_btree_program/main.rs");
     let binary = output_dir.join("rust_legacy_btree_program");
-    let output = Command::new(rustc)
-        .args(["--edition=2018", "-g"])
-        .arg("-C")
-        .arg("opt-level=0")
-        .arg("-C")
-        .arg("link-dead-code")
-        .arg(&source)
-        .arg("-o")
-        .arg(&binary)
-        .output()?;
-    anyhow::ensure!(
-        output.status.success(),
-        "rustc {TOOLCHAIN} failed for {}:\n{}",
-        source.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    compile_standalone_fixture(rustc, TOOLCHAIN, &source, &binary)?;
     Ok(binary)
 }
 
@@ -46,7 +33,7 @@ async fn test_rust_135_btree_map_and_btree_set_values() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    let temp_dir = tempfile::tempdir()?;
+    let temp_dir = fixture_tempdir()?;
     let binary = compile_fixture(&rustc, temp_dir.path())?;
     let target = common::targets::TargetLauncher::binary(&binary)
         .current_dir(temp_dir.path())
