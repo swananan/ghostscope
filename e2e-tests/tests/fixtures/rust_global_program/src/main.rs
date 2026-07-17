@@ -2,6 +2,7 @@
 #![allow(static_mut_refs)]
 
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     marker::{PhantomData, PhantomPinned},
     num::NonZeroU32,
@@ -23,6 +24,8 @@ pub static mut G_VEC_U8: Vec<u8> = Vec::new();
 pub static mut G_VEC_I32: Vec<i32> = Vec::new();
 pub static mut G_EMPTY_VEC: Vec<i32> = Vec::new();
 pub static mut G_VEC_UNIT: Vec<()> = Vec::new();
+pub static mut G_VEC_DEQUE_I32: VecDeque<i32> = VecDeque::new();
+pub static mut G_VEC_DEQUE_UNIT: VecDeque<()> = VecDeque::new();
 pub static mut G_SLICE_I32: &[i32] = &[];
 pub static mut G_MUT_SLICE_U16: &mut [u16] = &mut [];
 pub static mut G_EMPTY_SLICE: &[i32] = &[];
@@ -195,6 +198,33 @@ pub mod math {
     ) -> usize {
         value.len() + invalid.len() + empty.len()
     }
+
+    #[inline(never)]
+    pub fn observe_vec_deque(
+        wrapped: std::collections::VecDeque<i32>,
+        contiguous: std::collections::VecDeque<u16>,
+        empty: std::collections::VecDeque<i32>,
+    ) -> usize {
+        wrapped.len() + contiguous.len() + empty.len()
+    }
+}
+
+fn wrapped_vec_deque() -> VecDeque<i32> {
+    let mut deque = VecDeque::with_capacity(4);
+    let filler_len = deque.capacity() - 2;
+
+    for _ in 0..filler_len {
+        deque.push_back(-1);
+    }
+    deque.push_back(10);
+    deque.push_back(20);
+    for _ in 0..filler_len {
+        deque.pop_front();
+    }
+    deque.push_back(30);
+    deque.push_back(40);
+
+    deque
 }
 
 fn touch_globals() -> i32 {
@@ -265,6 +295,8 @@ fn touch_globals() -> i32 {
             + G_VEC_I32.len() as i64
             + G_EMPTY_VEC.len() as i64
             + G_VEC_UNIT.len() as i64
+            + G_VEC_DEQUE_I32.len() as i64
+            + G_VEC_DEQUE_UNIT.len() as i64
             + G_SLICE_I32.len() as i64
             + G_MUT_SLICE_U16.len() as i64
             + G_EMPTY_SLICE.len() as i64
@@ -290,6 +322,8 @@ fn main() {
         G_VEC_U8 = vec![1, 2, 3, 255];
         G_VEC_I32 = vec![10, -20, 30, 40];
         G_VEC_UNIT = vec![(); 3];
+        G_VEC_DEQUE_I32 = VecDeque::from([10, 20, 30, 40]);
+        G_VEC_DEQUE_UNIT = VecDeque::from([(), (), ()]);
         G_SLICE_I32 = Box::leak(vec![7, -8, 9].into_boxed_slice());
         G_MUT_SLICE_U16 = Box::leak(vec![1000, 2000, 65535].into_boxed_slice());
     }
@@ -302,6 +336,11 @@ fn main() {
             OsString::from("os from rust"),
             OsString::from_vec(vec![b'o', b's', 0xff, b'x']),
             OsString::new(),
+        ) as i64;
+        acc += math::observe_vec_deque(
+            wrapped_vec_deque(),
+            VecDeque::from([7_u16, 8, 9]),
+            VecDeque::new(),
         ) as i64;
         acc += touch_globals() as i64;
         thread::sleep(Duration::from_millis(1000));

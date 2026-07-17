@@ -1,7 +1,10 @@
 mod access;
 mod value;
 
-pub(crate) use value::{IndirectSequenceKind, IndirectSequenceLayout};
+pub(crate) use value::{
+    IndirectSequenceAddressing, IndirectSequenceKind, IndirectSequenceLayout,
+    RingSequenceLengthKind,
+};
 
 pub(super) fn resolve_tuple_index(index: u32) -> crate::VariableAccessSegment {
     access::resolve_tuple_index(index)

@@ -259,18 +259,14 @@ impl DwarfAnalyzer {
         };
         let data =
             self.project_resolved_member_path(current, &layout.data_path, type_module_path)?;
-        let length =
-            self.project_resolved_member_path(current, &layout.length_path, type_module_path)?;
 
-        let (presentation, capture) = match layout.kind {
-            crate::language::IndirectSequenceKind::Utf8String => (
-                crate::ValuePresentation::Utf8String,
-                ValueCapturePlan::IndirectBytes { data, length },
-            ),
-            crate::language::IndirectSequenceKind::ByteString => (
-                crate::ValuePresentation::ByteString,
-                ValueCapturePlan::IndirectBytes { data, length },
-            ),
+        let (presentation, element_stride) = match layout.kind {
+            crate::language::IndirectSequenceKind::Utf8String => {
+                (crate::ValuePresentation::Utf8String, None)
+            }
+            crate::language::IndirectSequenceKind::ByteString => {
+                (crate::ValuePresentation::ByteString, None)
+            }
             crate::language::IndirectSequenceKind::PointerTarget => {
                 let TypeInfo::PointerType { target_type, .. } =
                     strip_type_aliases(&data.resolved_type.summary)
@@ -290,11 +286,7 @@ impl DwarfAnalyzer {
                         element_type: Box::new(element_type),
                         element_stride,
                     },
-                    ValueCapturePlan::IndirectSequence {
-                        data,
-                        length,
-                        element_stride,
-                    },
+                    Some(element_stride),
                 )
             }
             crate::language::IndirectSequenceKind::TypeParameter { index } => {
@@ -316,12 +308,72 @@ impl DwarfAnalyzer {
                         element_type: Box::new(element.summary),
                         element_stride,
                     },
-                    ValueCapturePlan::IndirectSequence {
+                    Some(element_stride),
+                )
+            }
+        };
+
+        let capture = match layout.addressing {
+            crate::language::IndirectSequenceAddressing::Contiguous { length_path } => {
+                let length =
+                    self.project_resolved_member_path(current, &length_path, type_module_path)?;
+                match element_stride {
+                    Some(element_stride) => ValueCapturePlan::IndirectSequence {
                         data,
                         length,
                         element_stride,
                     },
-                )
+                    None => ValueCapturePlan::IndirectBytes { data, length },
+                }
+            }
+            crate::language::IndirectSequenceAddressing::Ring {
+                start_path,
+                length_path,
+                length_kind,
+                capacity_path,
+            } => {
+                let Some(element_stride) = element_stride else {
+                    return Ok(None);
+                };
+                let length =
+                    self.project_resolved_member_path(current, &length_path, type_module_path)?;
+                if element_stride == 0
+                    && matches!(
+                        length_kind,
+                        crate::language::RingSequenceLengthKind::Explicit
+                    )
+                {
+                    // Physical order is unobservable for zero-sized elements.
+                    // Avoid depending on a producer-specific capacity encoding.
+                    ValueCapturePlan::IndirectSequence {
+                        data,
+                        length,
+                        element_stride,
+                    }
+                } else {
+                    let start =
+                        self.project_resolved_member_path(current, &start_path, type_module_path)?;
+                    let capacity = self.project_resolved_member_path(
+                        current,
+                        &capacity_path,
+                        type_module_path,
+                    )?;
+                    let length = Box::new(match length_kind {
+                        crate::language::RingSequenceLengthKind::Explicit => {
+                            crate::RingSequenceLength::Explicit(length)
+                        }
+                        crate::language::RingSequenceLengthKind::End => {
+                            crate::RingSequenceLength::End(length)
+                        }
+                    });
+                    ValueCapturePlan::IndirectRingSequence {
+                        data,
+                        start,
+                        length,
+                        capacity,
+                        element_stride,
+                    }
+                }
             }
         };
 

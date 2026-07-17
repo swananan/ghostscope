@@ -12,6 +12,15 @@ pub struct ValueReadPlan {
     pub capture: ValueCapturePlan,
 }
 
+/// Runtime source of a ring sequence's logical element count.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RingSequenceLength {
+    /// Read the element count directly from this member.
+    Explicit(TypeProjection),
+    /// Compute the wrapped distance from the start index to this end index.
+    End(TypeProjection),
+}
+
 /// Physical capture strategy used by a semantic value adapter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueCapturePlan {
@@ -26,6 +35,15 @@ pub enum ValueCapturePlan {
     IndirectSequence {
         data: TypeProjection,
         length: TypeProjection,
+        element_stride: u64,
+    },
+    /// Read a ring-buffer descriptor, then normalize up to two physical
+    /// segments into one logical sequence payload.
+    IndirectRingSequence {
+        data: TypeProjection,
+        start: TypeProjection,
+        length: Box<RingSequenceLength>,
+        capacity: TypeProjection,
         element_stride: u64,
     },
 }

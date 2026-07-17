@@ -4,7 +4,10 @@ mod rust;
 
 use crate::{semantics::PlanError, SourceLanguage, TypeOrigin, VariableAccessSegment};
 
-pub(crate) use rust::{IndirectSequenceKind, IndirectSequenceLayout};
+pub(crate) use rust::{
+    IndirectSequenceAddressing, IndirectSequenceKind, IndirectSequenceLayout,
+    RingSequenceLengthKind,
+};
 
 pub(crate) fn resolve_value_layout(
     current: &crate::ResolvedType,

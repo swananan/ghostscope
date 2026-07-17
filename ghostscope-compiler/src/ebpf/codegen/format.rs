@@ -20,11 +20,27 @@ struct ComplexFormatArgPointers<'ctx> {
 }
 
 #[derive(Clone, Copy)]
+enum RingCaptureLengthKind {
+    Explicit,
+    End,
+}
+
+#[derive(Clone, Copy)]
+struct RingCaptureConfig {
+    start_offset: u64,
+    start_access_size: ghostscope_dwarf::MemoryAccessSize,
+    capacity_offset: u64,
+    capacity_access_size: ghostscope_dwarf::MemoryAccessSize,
+    length_kind: RingCaptureLengthKind,
+}
+
+#[derive(Clone, Copy)]
 enum IndirectCaptureShape {
     Bytes,
     Sequence {
         element_stride: u64,
         max_elements: usize,
+        ring: Option<RingCaptureConfig>,
     },
 }
 
@@ -33,6 +49,13 @@ impl IndirectCaptureShape {
         match self {
             Self::Bytes => ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE,
             Self::Sequence { .. } => ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE,
+        }
+    }
+
+    fn reservation_factor(self) -> usize {
+        match self {
+            Self::Sequence { ring: Some(_), .. } => 2,
+            Self::Bytes | Self::Sequence { ring: None, .. } => 1,
         }
     }
 }
@@ -66,11 +89,20 @@ fn complex_format_static_payload_len(arg: &ComplexArg<'_>) -> Option<usize> {
         ComplexArgSource::MemDumpDynamic { .. } => None,
         ComplexArgSource::IndirectBytes { .. } => None,
         ComplexArgSource::IndirectSequence { .. } => None,
+        ComplexArgSource::IndirectRingSequence { .. } => None,
     }
 }
 
-fn indirect_capture_capacity(reserved_len: usize, max_len: usize, prefix_len: usize) -> usize {
-    reserved_len.saturating_sub(prefix_len).min(max_len)
+fn indirect_capture_capacity(
+    reserved_len: usize,
+    max_len: usize,
+    shape: IndirectCaptureShape,
+) -> usize {
+    reserved_len
+        .saturating_sub(shape.prefix_len())
+        .checked_div(shape.reservation_factor())
+        .unwrap_or(0)
+        .min(max_len)
 }
 
 fn plan_complex_format_layout(
@@ -105,6 +137,14 @@ fn plan_complex_format_layout(
         } else if let ComplexArgSource::IndirectSequence { max_len, .. } = &arg.source {
             dynamic_max_lens
                 .push(ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE.saturating_add(*max_len));
+        } else if let ComplexArgSource::IndirectRingSequence { max_len, .. } = &arg.source {
+            // The verifier cannot relate a second helper's destination offset to
+            // its length. An unused payload-sized tail gives both independent
+            // bounds enough map headroom; user space ignores the padding.
+            dynamic_max_lens.push(
+                ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE
+                    .saturating_add(max_len.saturating_mul(2)),
+            );
         }
 
         arg_payload_plans.push((header_len, static_payload_len));
@@ -1556,6 +1596,49 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
+    fn select_indirect_metadata_failure(
+        &self,
+        read: &crate::ebpf::helper_functions::MemoryReadDiagnostics<'ctx>,
+        address: IntValue<'ctx>,
+        fallback_result: IntValue<'ctx>,
+        fallback_address: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
+        let offsets_available = self
+            .builder
+            .build_not(read.not_found, &format!("{name}_offsets_available"))
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let helper_failed = self
+            .builder
+            .build_and(
+                read.combined_fail,
+                offsets_available,
+                &format!("{name}_helper_failed"),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let result = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                helper_failed,
+                read.helper_result.into(),
+                fallback_result.into(),
+                &format!("{name}_error_result"),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+        let address = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                helper_failed,
+                address.into(),
+                fallback_address.into(),
+                &format!("{name}_error_address"),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+        Ok((result, address))
+    }
+
     fn emit_complex_format_indirect(
         &mut self,
         status_ptr: PointerValue<'ctx>,
@@ -1581,6 +1664,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let i64_type = self.context.i64_type();
         let i32_type = self.context.i32_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let ring_config = match capture.shape {
+            IndirectCaptureShape::Sequence { ring, .. } => ring,
+            IndirectCaptureShape::Bytes => None,
+        };
         let data_member = self
             .builder
             .build_int_add(
@@ -1610,7 +1697,146 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             Some(status_ptr),
             "indirect_length_metadata",
         )?;
-        let original_len = length_read.value.into_int_value();
+        let length_value = length_read.value.into_int_value();
+        let ring_reads = if let Some(ring) = ring_config {
+            let start_member = self
+                .builder
+                .build_int_add(
+                    descriptor.value,
+                    i64_type.const_int(ring.start_offset, false),
+                    "indirect_ring_start_member",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let start_read = self.generate_memory_read_with_diagnostics(
+                descriptor.with_value(start_member),
+                ring.start_access_size,
+                Some(status_ptr),
+                "indirect_ring_start_metadata",
+            )?;
+            let capacity_member = self
+                .builder
+                .build_int_add(
+                    descriptor.value,
+                    i64_type.const_int(ring.capacity_offset, false),
+                    "indirect_ring_capacity_member",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let capacity_read = self.generate_memory_read_with_diagnostics(
+                descriptor.with_value(capacity_member),
+                ring.capacity_access_size,
+                Some(status_ptr),
+                "indirect_ring_capacity_metadata",
+            )?;
+            Some((
+                ring,
+                start_member,
+                start_read,
+                capacity_member,
+                capacity_read,
+            ))
+        } else {
+            None
+        };
+
+        let mut original_len = length_value;
+        let mut ring_start = None;
+        let mut ring_capacity = None;
+        let mut ring_metadata_valid = None;
+        if let Some((ring, _, start_read, _, capacity_read)) = &ring_reads {
+            let start = start_read.value.into_int_value();
+            let capacity = capacity_read.value.into_int_value();
+            if matches!(ring.length_kind, RingCaptureLengthKind::End) {
+                let direct_distance = self
+                    .builder
+                    .build_int_sub(length_value, start, "indirect_ring_direct_distance")
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                let wrapped_prefix = self
+                    .builder
+                    .build_int_sub(capacity, start, "indirect_ring_wrapped_prefix")
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                let wrapped_distance = self
+                    .builder
+                    .build_int_add(
+                        wrapped_prefix,
+                        length_value,
+                        "indirect_ring_wrapped_distance",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                let no_wrap = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::UGE,
+                        length_value,
+                        start,
+                        "indirect_ring_no_wrap",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                original_len = self
+                    .builder
+                    .build_select(
+                        no_wrap,
+                        direct_distance,
+                        wrapped_distance,
+                        "indirect_ring_distance",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                    .into_int_value();
+            }
+
+            let capacity_nonzero = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::NE,
+                    capacity,
+                    i64_type.const_zero(),
+                    "indirect_ring_capacity_nonzero",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let start_in_bounds = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::ULT,
+                    start,
+                    capacity,
+                    "indirect_ring_start_in_bounds",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let length_valid = match ring.length_kind {
+                RingCaptureLengthKind::Explicit => self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::ULE,
+                        original_len,
+                        capacity,
+                        "indirect_ring_length_in_bounds",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?,
+                RingCaptureLengthKind::End => self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::ULT,
+                        length_value,
+                        capacity,
+                        "indirect_ring_end_in_bounds",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?,
+            };
+            let indices_valid = self
+                .builder
+                .build_and(
+                    capacity_nonzero,
+                    start_in_bounds,
+                    "indirect_ring_indices_valid",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            ring_metadata_valid = Some(
+                self.builder
+                    .build_and(indices_valid, length_valid, "indirect_ring_metadata_valid")
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?,
+            );
+            ring_start = Some(start);
+            ring_capacity = Some(capacity);
+        }
 
         let current_status = self
             .builder
@@ -1664,38 +1890,36 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
 
         self.builder.position_at_end(metadata_payload_block);
-        let data_offsets_available = self
-            .builder
-            .build_not(data_read.not_found, "indirect_data_offsets_available")
-            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-        let data_helper_failed = self
-            .builder
-            .build_and(
-                data_read.combined_fail,
-                data_offsets_available,
-                "indirect_data_helper_failed",
-            )
-            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-        let metadata_helper_result = self
-            .builder
-            .build_select::<BasicValueEnum<'ctx>, _>(
-                data_helper_failed,
-                data_read.helper_result.into(),
-                length_read.helper_result.into(),
-                "indirect_metadata_helper_result",
-            )
-            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
-            .into_int_value();
-        let metadata_error_address = self
-            .builder
-            .build_select::<BasicValueEnum<'ctx>, _>(
-                data_helper_failed,
-                data_member.into(),
-                length_member.into(),
-                "indirect_metadata_error_address",
-            )
-            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
-            .into_int_value();
+        let (mut metadata_helper_result, mut metadata_error_address) = ring_reads
+            .as_ref()
+            .map(|(_, _, _, capacity_member, capacity_read)| {
+                (capacity_read.helper_result, *capacity_member)
+            })
+            .unwrap_or((length_read.helper_result, length_member));
+        if let Some((_, start_member, start_read, _, _)) = &ring_reads {
+            (metadata_helper_result, metadata_error_address) = self
+                .select_indirect_metadata_failure(
+                    start_read,
+                    *start_member,
+                    metadata_helper_result,
+                    metadata_error_address,
+                    "indirect_ring_start",
+                )?;
+        }
+        (metadata_helper_result, metadata_error_address) = self.select_indirect_metadata_failure(
+            &length_read,
+            length_member,
+            metadata_helper_result,
+            metadata_error_address,
+            "indirect_length",
+        )?;
+        (metadata_helper_result, metadata_error_address) = self.select_indirect_metadata_failure(
+            &data_read,
+            data_member,
+            metadata_helper_result,
+            metadata_error_address,
+            "indirect_data",
+        )?;
         self.emit_complex_format_read_error_payload(
             var_data_ptr,
             reserved_len,
@@ -1773,12 +1997,41 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
 
         self.builder.position_at_end(nonempty_block);
-        let capture_capacity = indirect_capture_capacity(reserved_len, capture.max_len, prefix_len);
+        if let Some(metadata_valid) = ring_metadata_valid {
+            let ring_valid_block = self
+                .context
+                .append_basic_block(function, "indirect_ring_valid");
+            let ring_invalid_block = self
+                .context
+                .append_basic_block(function, "indirect_ring_invalid");
+            self.builder
+                .build_conditional_branch(metadata_valid, ring_valid_block, ring_invalid_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+            self.builder.position_at_end(ring_invalid_block);
+            self.builder
+                .build_store(
+                    status_ptr,
+                    self.context
+                        .i8_type()
+                        .const_int(VariableStatus::AccessError as u64, false),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.mark_any_fail()?;
+            self.builder
+                .build_unconditional_branch(continue_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+            self.builder.position_at_end(ring_valid_block);
+        }
+        let capture_capacity =
+            indirect_capture_capacity(reserved_len, capture.max_len, capture.shape);
         let (unit_size, max_units) = match capture.shape {
             IndirectCaptureShape::Bytes => (1usize, capture_capacity),
             IndirectCaptureShape::Sequence {
                 element_stride,
                 max_elements,
+                ..
             } => {
                 let stride = usize::try_from(element_stride).map_err(|_| {
                     CodeGenError::DwarfError(format!(
@@ -1908,18 +2161,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
 
         self.builder.position_at_end(read_block);
-        let read_len = self
-            .builder
-            .build_int_mul(
-                captured_units,
-                i64_type.const_int(unit_size as u64, false),
-                "indirect_read_len_bytes",
-            )
-            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-        let read_len = self
-            .builder
-            .build_int_truncate(read_len, i32_type, "indirect_read_len_i32")
-            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
         // SAFETY: reserved_len includes the fixed length prefix.
         let byte_payload_ptr = unsafe {
             self.builder
@@ -1935,27 +2176,264 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .builder
             .build_pointer_cast(byte_payload_ptr, ptr_type, "indirect_destination")
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-        let source = self
-            .builder
-            .build_int_to_ptr(data_address, ptr_type, "indirect_source")
-            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-        let read_result = self
-            .create_bpf_helper_call(
-                BPF_FUNC_probe_read_user as u64,
-                &[destination.into(), read_len.into(), source.into()],
-                i64_type.into(),
-                "probe_read_user_indirect",
-            )?
-            .into_int_value();
-        let read_ok = self
-            .builder
-            .build_int_compare(
-                inkwell::IntPredicate::EQ,
-                read_result,
-                i64_type.const_zero(),
-                "indirect_read_ok",
-            )
-            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let (read_result, read_error_address, read_ok) = if let (Some(start), Some(capacity)) =
+            (ring_start, ring_capacity)
+        {
+            let available_before_wrap = self
+                .builder
+                .build_int_sub(capacity, start, "indirect_ring_available_before_wrap")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let wraps = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::UGT,
+                    captured_units,
+                    available_before_wrap,
+                    "indirect_ring_wraps",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let first_units = self
+                .builder
+                .build_select(
+                    wraps,
+                    available_before_wrap,
+                    captured_units,
+                    "indirect_ring_first_units",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                .into_int_value();
+            let stride = i64_type.const_int(unit_size as u64, false);
+            let start_offset = self
+                .builder
+                .build_int_mul(start, stride, "indirect_ring_start_offset")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let first_address = self
+                .builder
+                .build_int_add(data_address, start_offset, "indirect_ring_first_address")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let first_len = self
+                .builder
+                .build_int_mul(first_units, stride, "indirect_ring_first_len")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let first_len_i32 = self
+                .builder
+                .build_int_truncate(first_len, i32_type, "indirect_ring_first_len_i32")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let first_source = self
+                .builder
+                .build_int_to_ptr(first_address, ptr_type, "indirect_ring_first_source")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            // SAFETY: first_len is bounded by the reserved sequence payload.
+            let second_payload_ptr = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        byte_payload_ptr,
+                        &[first_len],
+                        "indirect_ring_second_payload",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            };
+            let second_destination = self
+                .builder
+                .build_pointer_cast(
+                    second_payload_ptr,
+                    ptr_type,
+                    "indirect_ring_second_destination",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let first_result = self
+                .create_bpf_helper_call(
+                    BPF_FUNC_probe_read_user as u64,
+                    &[
+                        destination.into(),
+                        first_len_i32.into(),
+                        first_source.into(),
+                    ],
+                    i64_type.into(),
+                    "probe_read_user_indirect_ring_first",
+                )?
+                .into_int_value();
+
+            let second_read_block = self
+                .context
+                .append_basic_block(function, "indirect_ring_second_read");
+            let no_second_read_block = self
+                .context
+                .append_basic_block(function, "indirect_ring_no_second_read");
+            let ring_read_complete_block = self
+                .context
+                .append_basic_block(function, "indirect_ring_read_complete");
+            self.builder
+                .build_conditional_branch(wraps, second_read_block, no_second_read_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+            self.builder.position_at_end(no_second_read_block);
+            self.builder
+                .build_unconditional_branch(ring_read_complete_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+            self.builder.position_at_end(second_read_block);
+            let unbounded_second_units = self
+                .builder
+                .build_int_sub(
+                    captured_units,
+                    available_before_wrap,
+                    "indirect_ring_unbounded_second_units",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let second_units_exceed_limit = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::UGT,
+                    unbounded_second_units,
+                    capture_limit,
+                    "indirect_ring_second_units_exceed_limit",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let second_units = self
+                .builder
+                .build_select(
+                    second_units_exceed_limit,
+                    capture_limit,
+                    unbounded_second_units,
+                    "indirect_ring_second_units",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                .into_int_value();
+            let second_len = self
+                .builder
+                .build_int_mul(second_units, stride, "indirect_ring_second_len")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let second_len_limit = i64_type.const_int(capture_capacity as u64, false);
+            let second_len_exceeds_limit = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::UGT,
+                    second_len,
+                    second_len_limit,
+                    "indirect_ring_second_len_exceeds_limit",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let bounded_second_len = self
+                .builder
+                .build_select(
+                    second_len_exceeds_limit,
+                    second_len_limit,
+                    second_len,
+                    "indirect_ring_bounded_second_len",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                .into_int_value();
+            let second_len_i32 = self
+                .builder
+                .build_int_truncate(bounded_second_len, i32_type, "indirect_ring_second_len_i32")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let second_source = self
+                .builder
+                .build_int_to_ptr(data_address, ptr_type, "indirect_ring_second_source")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let second_result = self
+                .create_bpf_helper_call(
+                    BPF_FUNC_probe_read_user as u64,
+                    &[
+                        second_destination.into(),
+                        second_len_i32.into(),
+                        second_source.into(),
+                    ],
+                    i64_type.into(),
+                    "probe_read_user_indirect_ring_second",
+                )?
+                .into_int_value();
+            self.builder
+                .build_unconditional_branch(ring_read_complete_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+            self.builder.position_at_end(ring_read_complete_block);
+            let second_result_phi = self
+                .builder
+                .build_phi(i64_type, "indirect_ring_second_result")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            second_result_phi.add_incoming(&[
+                (&i64_type.const_zero(), no_second_read_block),
+                (&second_result, second_read_block),
+            ]);
+            let second_result = second_result_phi.as_basic_value().into_int_value();
+            let first_failed = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::NE,
+                    first_result,
+                    i64_type.const_zero(),
+                    "indirect_ring_first_failed",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let read_result = self
+                .builder
+                .build_select(
+                    first_failed,
+                    first_result,
+                    second_result,
+                    "indirect_ring_read_result",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                .into_int_value();
+            let read_error_address = self
+                .builder
+                .build_select(
+                    first_failed,
+                    first_address,
+                    data_address,
+                    "indirect_ring_read_error_address",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                .into_int_value();
+            let read_ok = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    read_result,
+                    i64_type.const_zero(),
+                    "indirect_ring_read_ok",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            (read_result, read_error_address, read_ok)
+        } else {
+            let read_len = self
+                .builder
+                .build_int_mul(
+                    captured_units,
+                    i64_type.const_int(unit_size as u64, false),
+                    "indirect_read_len_bytes",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let read_len = self
+                .builder
+                .build_int_truncate(read_len, i32_type, "indirect_read_len_i32")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let source = self
+                .builder
+                .build_int_to_ptr(data_address, ptr_type, "indirect_source")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let read_result = self
+                .create_bpf_helper_call(
+                    BPF_FUNC_probe_read_user as u64,
+                    &[destination.into(), read_len.into(), source.into()],
+                    i64_type.into(),
+                    "probe_read_user_indirect",
+                )?
+                .into_int_value();
+            let read_ok = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    read_result,
+                    i64_type.const_zero(),
+                    "indirect_read_ok",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            (read_result, data_address, read_ok)
+        };
         let read_ok_block = self
             .context
             .append_basic_block(function, "indirect_read_ok");
@@ -1979,7 +2457,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             var_data_ptr,
             reserved_len,
             read_result,
-            data_address,
+            read_error_address,
         )?;
         self.mark_any_fail()?;
         self.builder
@@ -2264,9 +2742,58 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     shape: IndirectCaptureShape::Sequence {
                         element_stride: *element_stride,
                         max_elements: *max_elements,
+                        ring: None,
                     },
                 },
             ),
+            ComplexArgSource::IndirectRingSequence {
+                descriptor,
+                data_offset,
+                data_access_size,
+                start_offset,
+                start_access_size,
+                length,
+                capacity_offset,
+                capacity_access_size,
+                element_stride,
+                max_elements,
+                max_len,
+            } => {
+                let (length_offset, length_access_size, length_kind) = match length {
+                    RingSequenceLengthSource::Explicit {
+                        offset,
+                        access_size,
+                    } => (*offset, *access_size, RingCaptureLengthKind::Explicit),
+                    RingSequenceLengthSource::End {
+                        offset,
+                        access_size,
+                    } => (*offset, *access_size, RingCaptureLengthKind::End),
+                };
+                self.emit_complex_format_indirect(
+                    status_ptr,
+                    var_data_ptr,
+                    descriptor,
+                    reserved_len,
+                    IndirectCaptureConfig {
+                        data_offset: *data_offset,
+                        data_access_size: *data_access_size,
+                        length_offset,
+                        length_access_size,
+                        max_len: *max_len,
+                        shape: IndirectCaptureShape::Sequence {
+                            element_stride: *element_stride,
+                            max_elements: *max_elements,
+                            ring: Some(RingCaptureConfig {
+                                start_offset: *start_offset,
+                                start_access_size: *start_access_size,
+                                capacity_offset: *capacity_offset,
+                                capacity_access_size: *capacity_access_size,
+                                length_kind,
+                            }),
+                        },
+                    },
+                )
+            }
             ComplexArgSource::ComputedInt { value, byte_len } => {
                 self.emit_complex_format_computed_int(var_data_ptr, *value, *byte_len)
             }
@@ -2409,6 +2936,36 @@ mod complex_format_layout_tests {
         }
     }
 
+    fn indirect_ring_sequence_arg<'ctx>(
+        context: &'ctx Context,
+        element_stride: u64,
+        max_elements: usize,
+        max_len: usize,
+    ) -> ComplexArg<'ctx> {
+        ComplexArg {
+            var_name_index: 0,
+            type_index: 0,
+            access_path: Vec::new(),
+            data_len: ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE + max_len,
+            source: ComplexArgSource::IndirectRingSequence {
+                descriptor: RuntimeAddress::available(context.i64_type().const_zero(), context),
+                data_offset: 0,
+                data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                start_offset: 8,
+                start_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                length: RingSequenceLengthSource::Explicit {
+                    offset: 16,
+                    access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                },
+                capacity_offset: 24,
+                capacity_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                element_stride,
+                max_elements,
+                max_len,
+            },
+        }
+    }
+
     fn indirect_emitter_ir(capture: IndirectCaptureConfig) -> String {
         let context = Context::create();
         let options = crate::CompileOptions::default();
@@ -2424,8 +2981,13 @@ mod complex_format_layout_tests {
             .builder
             .build_alloca(context.i8_type(), "status")
             .expect("allocate status");
-        let reserved_len = VARIABLE_READ_ERROR_PAYLOAD_LEN
-            .max(capture.shape.prefix_len().saturating_add(capture.max_len));
+        let reserved_len = VARIABLE_READ_ERROR_PAYLOAD_LEN.max(
+            capture.shape.prefix_len().saturating_add(
+                capture
+                    .max_len
+                    .saturating_mul(capture.shape.reservation_factor()),
+            ),
+        );
         let data_ptr = ebpf
             .builder
             .build_alloca(context.i8_type().array_type(reserved_len as u32), "payload")
@@ -2522,13 +3084,38 @@ mod complex_format_layout_tests {
     #[test]
     fn complex_format_layout_includes_indirect_sequence_header() {
         let context = Context::create();
-        let args = vec![indirect_sequence_arg(&context, 4, 3, 12)];
+        let args = vec![
+            indirect_sequence_arg(&context, 4, 3, 12),
+            indirect_ring_sequence_arg(&context, 4, 3, 12),
+        ];
 
         let layout = plan_complex_format_layout(4096, 0, &args);
 
         assert_eq!(
             layout.args[0].reserved_len,
             ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE + 12
+        );
+        assert_eq!(
+            layout.args[1].reserved_len,
+            ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE + 24
+        );
+        assert_eq!(
+            indirect_capture_capacity(
+                layout.args[1].reserved_len,
+                12,
+                IndirectCaptureShape::Sequence {
+                    element_stride: 4,
+                    max_elements: 3,
+                    ring: Some(RingCaptureConfig {
+                        start_offset: 8,
+                        start_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                        capacity_offset: 24,
+                        capacity_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                        length_kind: RingCaptureLengthKind::Explicit,
+                    }),
+                },
+            ),
+            12
         );
     }
 
@@ -2546,11 +3133,7 @@ mod complex_format_layout_tests {
                 ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE + max_len
             );
             assert_eq!(
-                indirect_capture_capacity(
-                    reserved_len,
-                    max_len,
-                    ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE,
-                ),
+                indirect_capture_capacity(reserved_len, max_len, IndirectCaptureShape::Bytes),
                 max_len
             );
         }
@@ -2614,6 +3197,7 @@ mod complex_format_layout_tests {
             shape: IndirectCaptureShape::Sequence {
                 element_stride: 4,
                 max_elements: 2,
+                ring: None,
             },
         });
 
@@ -2633,10 +3217,65 @@ mod complex_format_layout_tests {
             shape: IndirectCaptureShape::Sequence {
                 element_stride: 0,
                 max_elements: 4,
+                ring: None,
             },
         });
 
         assert!(llvm_ir.contains("indirect_no_read_complete"));
         assert!(!llvm_ir.contains("probe_read_user_indirect"));
+    }
+
+    #[test]
+    fn ring_sequence_emitter_reads_two_segments_in_logical_order() {
+        let llvm_ir = indirect_emitter_ir(IndirectCaptureConfig {
+            data_offset: 0,
+            data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            length_offset: 16,
+            length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            max_len: 16,
+            shape: IndirectCaptureShape::Sequence {
+                element_stride: 4,
+                max_elements: 4,
+                ring: Some(RingCaptureConfig {
+                    start_offset: 8,
+                    start_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                    capacity_offset: 24,
+                    capacity_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                    length_kind: RingCaptureLengthKind::Explicit,
+                }),
+            },
+        });
+
+        assert!(llvm_ir.contains("indirect_ring_metadata_valid"));
+        assert!(llvm_ir.contains("indirect_ring_first_address"));
+        assert!(llvm_ir.contains("indirect_ring_second_payload"));
+        assert!(llvm_ir.contains("probe_read_user_indirect_ring_first"));
+        assert!(llvm_ir.contains("probe_read_user_indirect_ring_second"));
+    }
+
+    #[test]
+    fn legacy_ring_sequence_emitter_derives_wrapped_distance() {
+        let llvm_ir = indirect_emitter_ir(IndirectCaptureConfig {
+            data_offset: 0,
+            data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            length_offset: 16,
+            length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            max_len: 16,
+            shape: IndirectCaptureShape::Sequence {
+                element_stride: 4,
+                max_elements: 4,
+                ring: Some(RingCaptureConfig {
+                    start_offset: 8,
+                    start_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                    capacity_offset: 24,
+                    capacity_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                    length_kind: RingCaptureLengthKind::End,
+                }),
+            },
+        });
+
+        assert!(llvm_ir.contains("indirect_ring_direct_distance"));
+        assert!(llvm_ir.contains("indirect_ring_wrapped_distance"));
+        assert!(llvm_ir.contains("indirect_ring_distance"));
     }
 }

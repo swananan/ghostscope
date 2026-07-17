@@ -3,8 +3,61 @@ use crate::{strip_type_aliases, ResolvedType, SourceLanguage, TypeInfo};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndirectSequenceLayout {
     pub(crate) data_path: Vec<String>,
-    pub(crate) length_path: Vec<String>,
+    pub(crate) addressing: IndirectSequenceAddressing,
     pub(crate) kind: IndirectSequenceKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IndirectSequenceAddressing {
+    Contiguous {
+        length_path: Vec<String>,
+    },
+    Ring {
+        start_path: Vec<String>,
+        length_path: Vec<String>,
+        length_kind: RingSequenceLengthKind,
+        capacity_path: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RingSequenceLengthKind {
+    Explicit,
+    End,
+}
+
+impl IndirectSequenceLayout {
+    fn contiguous(
+        data_path: Vec<String>,
+        length_path: Vec<String>,
+        kind: IndirectSequenceKind,
+    ) -> Self {
+        Self {
+            data_path,
+            addressing: IndirectSequenceAddressing::Contiguous { length_path },
+            kind,
+        }
+    }
+
+    fn ring(
+        data_path: Vec<String>,
+        start_path: Vec<String>,
+        length_path: Vec<String>,
+        length_kind: RingSequenceLengthKind,
+        capacity_path: Vec<String>,
+        kind: IndirectSequenceKind,
+    ) -> Self {
+        Self {
+            data_path,
+            addressing: IndirectSequenceAddressing::Ring {
+                start_path,
+                length_path,
+                length_kind,
+                capacity_path,
+            },
+            kind,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +75,7 @@ pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
                 if name == "String"
                     || name == "OsString"
                     || is_short_vec_name(name)
+                    || is_short_vec_deque_name(name)
                     || is_short_box_str_name(name))
     })
 }
@@ -84,6 +138,8 @@ pub(super) fn resolve_value_layout(
         rust_os_string_layout(&current.summary)
     } else if is_std_vec(name, dwarf_qualified_name) {
         rust_vec_layout(&current.summary)
+    } else if is_std_vec_deque(name, dwarf_qualified_name) {
+        rust_vec_deque_layout(&current.summary)
     } else {
         None
     }
@@ -111,6 +167,10 @@ fn is_slice_name(name: &str) -> bool {
 
 fn is_short_vec_name(name: &str) -> bool {
     name.starts_with("Vec<") && name.ends_with('>')
+}
+
+fn is_short_vec_deque_name(name: &str) -> bool {
+    name.starts_with("VecDeque<") && name.ends_with('>')
 }
 
 fn is_short_box_str_name(name: &str) -> bool {
@@ -219,6 +279,31 @@ fn is_std_vec_name(name: &str) -> bool {
         && arguments.ends_with('>')
 }
 
+fn is_std_vec_deque(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_vec_deque_name(name)
+        || (is_short_vec_deque_name(name)
+            && dwarf_qualified_name.is_some_and(is_std_vec_deque_name))
+}
+
+fn is_std_vec_deque_name(name: &str) -> bool {
+    let Some(path) = name.strip_prefix("alloc::") else {
+        return false;
+    };
+    let Some((module, arguments)) = path.split_once("::VecDeque<") else {
+        return false;
+    };
+
+    !module.is_empty()
+        && module.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+        && !arguments.is_empty()
+        && arguments.ends_with('>')
+}
+
 fn rust_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
     // rust-gdb uses `buf.ptr` through Rust 1.81 and `buf.inner.ptr` from
     // Rust 1.82 onward. Keep both paths and validate whichever DWARF exposes.
@@ -265,6 +350,44 @@ fn rust_vec_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
     }
 
     None
+}
+
+fn rust_vec_deque_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
+    // Rust 1.67 replaced tail/head length derivation with head/len. Rust 1.82
+    // moved RawVec under `inner`; 1.75 and 1.95 introduced transparent
+    // wrappers around cap and head respectively. The validators below follow
+    // those wrappers through their first DWARF member, as rust-gdb does.
+    const CURRENT_STORAGE_PATHS: &[(&[&str], &[&str])] = &[
+        (
+            &["buf", "inner", "ptr", "pointer"],
+            &["buf", "inner", "cap"],
+        ),
+        (&["buf", "ptr", "pointer"], &["buf", "cap"]),
+    ];
+
+    for (data_fields, capacity_fields) in CURRENT_STORAGE_PATHS {
+        if let Some(layout) = validate_ring_sequence_layout(
+            root,
+            field_path(data_fields),
+            field_path(&["head"]),
+            field_path(&["len"]),
+            RingSequenceLengthKind::Explicit,
+            field_path(capacity_fields),
+            IndirectSequenceKind::TypeParameter { index: 0 },
+        ) {
+            return Some(layout);
+        }
+    }
+
+    validate_ring_sequence_layout(
+        root,
+        field_path(&["buf", "ptr", "pointer"]),
+        field_path(&["tail"]),
+        field_path(&["head"]),
+        RingSequenceLengthKind::End,
+        field_path(&["buf", "cap"]),
+        IndirectSequenceKind::TypeParameter { index: 0 },
+    )
 }
 
 fn rust_os_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
@@ -315,10 +438,15 @@ fn rust_os_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
 
 fn validate_wrapped_pointer_layout(
     root: &TypeInfo,
-    mut data_path: Vec<String>,
+    data_path: Vec<String>,
     length_path: Vec<String>,
     kind: IndirectSequenceKind,
 ) -> Option<IndirectSequenceLayout> {
+    let data_path = wrapped_pointer_path(root, data_path)?;
+    validate_indirect_sequence_layout(root, data_path, length_path, kind)
+}
+
+fn wrapped_pointer_path(root: &TypeInfo, mut data_path: Vec<String>) -> Option<Vec<String>> {
     let pointer_or_wrapper = resolve_member_path(root, &data_path)?;
     if !matches!(
         strip_type_aliases(pointer_or_wrapper.member_type),
@@ -341,7 +469,79 @@ fn validate_wrapped_pointer_layout(
         }
     }
 
-    validate_indirect_sequence_layout(root, data_path, length_path, kind)
+    Some(data_path)
+}
+
+fn unsigned_metadata_path(
+    root: &TypeInfo,
+    mut path: Vec<String>,
+    expected_size: u64,
+) -> Option<Vec<String>> {
+    let mut resolved = resolve_member_path(root, &path)?;
+    if let TypeInfo::StructType { members, .. } = strip_type_aliases(resolved.member_type) {
+        path.push(members.first()?.name.clone());
+        resolved = resolve_member_path(root, &path)?;
+    }
+
+    matches!(
+        strip_type_aliases(resolved.member_type),
+        TypeInfo::BaseType { size, encoding, .. }
+            if *size == expected_size && *encoding == gimli::DW_ATE_unsigned.0 as u16
+    )
+    .then_some(path)
+}
+
+fn validate_ring_sequence_layout(
+    root: &TypeInfo,
+    data_path: Vec<String>,
+    start_path: Vec<String>,
+    length_path: Vec<String>,
+    length_kind: RingSequenceLengthKind,
+    capacity_path: Vec<String>,
+    kind: IndirectSequenceKind,
+) -> Option<IndirectSequenceLayout> {
+    let data_path = wrapped_pointer_path(root, data_path)?;
+    let data = resolve_member_path(root, &data_path)?;
+    let TypeInfo::PointerType {
+        size: pointer_size, ..
+    } = strip_type_aliases(data.member_type)
+    else {
+        return None;
+    };
+    if *pointer_size == 0 {
+        return None;
+    }
+
+    let start_path = unsigned_metadata_path(root, start_path, *pointer_size)?;
+    let length_path = unsigned_metadata_path(root, length_path, *pointer_size)?;
+    let capacity_path = unsigned_metadata_path(root, capacity_path, *pointer_size)?;
+    let paths = [&data_path, &start_path, &length_path, &capacity_path];
+    let mut ranges = Vec::with_capacity(paths.len());
+    for path in paths {
+        let member = resolve_member_path(root, path)?;
+        let end = member.offset.checked_add(member.member_type.size())?;
+        if end > root.size() {
+            return None;
+        }
+        ranges.push((member.offset, end));
+    }
+    for (index, left) in ranges.iter().enumerate() {
+        if ranges[index + 1..]
+            .iter()
+            .any(|right| left.0 < right.1 && right.0 < left.1)
+        {
+            return None;
+        }
+    }
+
+    Some(IndirectSequenceLayout::ring(
+        data_path,
+        start_path,
+        length_path,
+        length_kind,
+        capacity_path,
+        kind,
+    ))
 }
 
 fn field_path(fields: &[&str]) -> Vec<String> {
@@ -433,11 +633,11 @@ fn validate_indirect_sequence_layout(
         return None;
     }
 
-    Some(IndirectSequenceLayout {
+    Some(IndirectSequenceLayout::contiguous(
         data_path,
         length_path,
         kind,
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -681,17 +881,95 @@ mod tests {
         ResolvedType::new(os_string, TypeIdentity::Unknown, origin)
     }
 
+    struct VecDequeTestLayout<'a> {
+        name: &'a str,
+        pointer_size: u64,
+        uses_raw_vec_inner: bool,
+        wraps_capacity: bool,
+        wraps_head: bool,
+        uses_legacy_tail: bool,
+    }
+
+    fn rust_vec_deque_type(layout: VecDequeTestLayout<'_>) -> ResolvedType {
+        let pointer_size = layout.pointer_size;
+        let raw_pointer = TypeInfo::PointerType {
+            target_type: Box::new(unsigned_type("u8", 1)),
+            size: pointer_size,
+        };
+        let non_null = single_member_struct("NonNull<u8>", "pointer", raw_pointer);
+        let unique = single_member_struct("Unique<u8>", "pointer", non_null);
+        let capacity = if layout.wraps_capacity {
+            single_member_struct(
+                "alloc::raw_vec::Cap",
+                "__0",
+                unsigned_type("usize", pointer_size),
+            )
+        } else {
+            unsigned_type("usize", pointer_size)
+        };
+        let raw_vec_storage = TypeInfo::StructType {
+            name: "alloc::raw_vec::RawVecInner".to_string(),
+            size: pointer_size * 2,
+            members: vec![
+                member("cap", capacity, 0),
+                member("ptr", unique, pointer_size),
+            ],
+        };
+        let raw_vec = if layout.uses_raw_vec_inner {
+            single_member_struct("alloc::raw_vec::RawVec<i32>", "inner", raw_vec_storage)
+        } else {
+            raw_vec_storage
+        };
+        let head = if layout.wraps_head {
+            single_member_struct(
+                "alloc::collections::vec_deque::WrappedIndex",
+                "__0",
+                unsigned_type("usize", pointer_size),
+            )
+        } else {
+            unsigned_type("usize", pointer_size)
+        };
+        let mut members = if layout.uses_legacy_tail {
+            vec![
+                member("tail", unsigned_type("usize", pointer_size), 0),
+                member("head", head, pointer_size),
+            ]
+        } else {
+            vec![
+                member("head", head, 0),
+                member("len", unsigned_type("usize", pointer_size), pointer_size),
+            ]
+        };
+        members.push(member("buf", raw_vec, pointer_size * 2));
+
+        ResolvedType::new(
+            TypeInfo::StructType {
+                name: layout.name.to_string(),
+                size: pointer_size * 4,
+                members,
+            },
+            TypeIdentity::Unknown,
+            Some(TypeOrigin {
+                module: ModuleId(0),
+                cu: CuId(0),
+                language: SourceLanguage::Rust,
+                producer: None,
+                dwarf_version: 5,
+            }),
+        )
+    }
+
     #[test]
     fn recognizes_rust_str_layout() {
         let current = rust_str_type_64("&str", SourceLanguage::Rust);
 
         assert_eq!(
             resolve_value_layout(&current, None),
-            Some(IndirectSequenceLayout {
-                data_path: field_path(&["data_ptr"]),
-                length_path: field_path(&["length"]),
-                kind: IndirectSequenceKind::Utf8String,
-            })
+            Some(IndirectSequenceLayout::contiguous(
+                field_path(&["data_ptr"]),
+                field_path(&["length"]),
+                IndirectSequenceKind::Utf8String,
+            ))
         );
     }
 
@@ -719,11 +997,11 @@ mod tests {
 
             assert_eq!(
                 resolve_value_layout(&current, None),
-                Some(IndirectSequenceLayout {
-                    data_path: field_path(&["data_ptr"]),
-                    length_path: field_path(&["length"]),
-                    kind: IndirectSequenceKind::PointerTarget,
-                }),
+                Some(IndirectSequenceLayout::contiguous(
+                    field_path(&["data_ptr"]),
+                    field_path(&["length"]),
+                    IndirectSequenceKind::PointerTarget,
+                )),
                 "name={name}"
             );
         }
@@ -746,11 +1024,11 @@ mod tests {
 
             assert_eq!(
                 resolve_value_layout(&current, None),
-                Some(IndirectSequenceLayout {
-                    data_path: field_path(&["data_ptr"]),
-                    length_path: field_path(&["length"]),
-                    kind: IndirectSequenceKind::Utf8String,
-                }),
+                Some(IndirectSequenceLayout::contiguous(
+                    field_path(&["data_ptr"]),
+                    field_path(&["length"]),
+                    IndirectSequenceKind::Utf8String,
+                )),
                 "name={name}"
             );
         }
@@ -819,11 +1097,11 @@ mod tests {
 
             assert_eq!(
                 resolve_value_layout(&current, None),
-                Some(IndirectSequenceLayout {
-                    data_path: field_path(data_fields),
-                    length_path: field_path(length_fields),
-                    kind: IndirectSequenceKind::ByteString,
-                }),
+                Some(IndirectSequenceLayout::contiguous(
+                    field_path(data_fields),
+                    field_path(length_fields),
+                    IndirectSequenceKind::ByteString,
+                )),
                 "raw_vec_inner={uses_raw_vec_inner} windows_field={windows_field:?}"
             );
         }
@@ -914,11 +1192,11 @@ mod tests {
 
         assert_eq!(
             layout,
-            IndirectSequenceLayout {
-                data_path: field_path(&["vec", "buf", "inner", "ptr", "pointer", "pointer",]),
-                length_path: field_path(&["vec", "len"]),
-                kind: IndirectSequenceKind::Utf8String,
-            }
+            IndirectSequenceLayout::contiguous(
+                field_path(&["vec", "buf", "inner", "ptr", "pointer", "pointer"]),
+                field_path(&["vec", "len"]),
+                IndirectSequenceKind::Utf8String,
+            )
         );
         assert_eq!(
             resolve_member_path(&current.summary, &layout.data_path)
@@ -926,8 +1204,11 @@ mod tests {
                 .offset,
             8
         );
+        let IndirectSequenceAddressing::Contiguous { length_path } = &layout.addressing else {
+            panic!("String must use contiguous addressing")
+        };
         assert_eq!(
-            resolve_member_path(&current.summary, &layout.length_path)
+            resolve_member_path(&current.summary, length_path)
                 .expect("length member")
                 .offset,
             16
@@ -946,11 +1227,11 @@ mod tests {
 
         assert_eq!(
             resolve_value_layout(&current, None),
-            Some(IndirectSequenceLayout {
-                data_path: field_path(&["vec", "buf", "inner", "ptr", "pointer",]),
-                length_path: field_path(&["vec", "len"]),
-                kind: IndirectSequenceKind::Utf8String,
-            })
+            Some(IndirectSequenceLayout::contiguous(
+                field_path(&["vec", "buf", "inner", "ptr", "pointer"]),
+                field_path(&["vec", "len"]),
+                IndirectSequenceKind::Utf8String,
+            ))
         );
     }
 
@@ -966,11 +1247,11 @@ mod tests {
 
         assert_eq!(
             resolve_value_layout(&current, None),
-            Some(IndirectSequenceLayout {
-                data_path: field_path(&["vec", "buf", "ptr", "pointer", "pointer",]),
-                length_path: field_path(&["vec", "len"]),
-                kind: IndirectSequenceKind::Utf8String,
-            })
+            Some(IndirectSequenceLayout::contiguous(
+                field_path(&["vec", "buf", "ptr", "pointer", "pointer"]),
+                field_path(&["vec", "len"]),
+                IndirectSequenceKind::Utf8String,
+            ))
         );
     }
 
@@ -1015,11 +1296,11 @@ mod tests {
 
         assert_eq!(
             resolve_value_layout(&current, Some("alloc::vec::Vec<i32, alloc::alloc::Global>")),
-            Some(IndirectSequenceLayout {
-                data_path: field_path(&["buf", "inner", "ptr", "pointer", "pointer"]),
-                length_path: field_path(&["len"]),
-                kind: IndirectSequenceKind::TypeParameter { index: 0 },
-            })
+            Some(IndirectSequenceLayout::contiguous(
+                field_path(&["buf", "inner", "ptr", "pointer", "pointer"]),
+                field_path(&["len"]),
+                IndirectSequenceKind::TypeParameter { index: 0 },
+            ))
         );
     }
 
@@ -1035,12 +1316,101 @@ mod tests {
 
         assert_eq!(
             resolve_value_layout(&current, None),
-            Some(IndirectSequenceLayout {
-                data_path: field_path(&["buf", "ptr", "pointer", "pointer"]),
-                length_path: field_path(&["len"]),
-                kind: IndirectSequenceKind::TypeParameter { index: 0 },
-            })
+            Some(IndirectSequenceLayout::contiguous(
+                field_path(&["buf", "ptr", "pointer", "pointer"]),
+                field_path(&["len"]),
+                IndirectSequenceKind::TypeParameter { index: 0 },
+            ))
         );
+    }
+
+    #[test]
+    fn recognizes_vec_deque_layouts_across_rust_versions() {
+        let current = rust_vec_deque_type(VecDequeTestLayout {
+            name: "VecDeque<i32, alloc::alloc::Global>",
+            pointer_size: 8,
+            uses_raw_vec_inner: true,
+            wraps_capacity: true,
+            wraps_head: true,
+            uses_legacy_tail: false,
+        });
+        assert_eq!(
+            resolve_value_layout(
+                &current,
+                Some("alloc::collections::vec_deque::VecDeque<i32, alloc::alloc::Global>"),
+            ),
+            Some(IndirectSequenceLayout::ring(
+                field_path(&["buf", "inner", "ptr", "pointer", "pointer"]),
+                field_path(&["head", "__0"]),
+                field_path(&["len"]),
+                RingSequenceLengthKind::Explicit,
+                field_path(&["buf", "inner", "cap", "__0"]),
+                IndirectSequenceKind::TypeParameter { index: 0 },
+            ))
+        );
+
+        let pre_raw_vec_inner = rust_vec_deque_type(VecDequeTestLayout {
+            name: "alloc::collections::vec_deque::VecDeque<i32>",
+            pointer_size: 4,
+            uses_raw_vec_inner: false,
+            wraps_capacity: false,
+            wraps_head: false,
+            uses_legacy_tail: false,
+        });
+        assert_eq!(
+            resolve_value_layout(&pre_raw_vec_inner, None),
+            Some(IndirectSequenceLayout::ring(
+                field_path(&["buf", "ptr", "pointer", "pointer"]),
+                field_path(&["head"]),
+                field_path(&["len"]),
+                RingSequenceLengthKind::Explicit,
+                field_path(&["buf", "cap"]),
+                IndirectSequenceKind::TypeParameter { index: 0 },
+            ))
+        );
+
+        let legacy = rust_vec_deque_type(VecDequeTestLayout {
+            name: "alloc::collections::vec_deque::VecDeque<i32>",
+            pointer_size: 8,
+            uses_raw_vec_inner: false,
+            wraps_capacity: false,
+            wraps_head: false,
+            uses_legacy_tail: true,
+        });
+        assert_eq!(
+            resolve_value_layout(&legacy, None),
+            Some(IndirectSequenceLayout::ring(
+                field_path(&["buf", "ptr", "pointer", "pointer"]),
+                field_path(&["tail"]),
+                field_path(&["head"]),
+                RingSequenceLengthKind::End,
+                field_path(&["buf", "cap"]),
+                IndirectSequenceKind::TypeParameter { index: 0 },
+            ))
+        );
+    }
+
+    #[test]
+    fn requires_standard_namespace_for_short_vec_deque_name() {
+        let current = rust_vec_deque_type(VecDequeTestLayout {
+            name: "VecDeque<i32>",
+            pointer_size: 8,
+            uses_raw_vec_inner: true,
+            wraps_capacity: true,
+            wraps_head: false,
+            uses_legacy_tail: false,
+        });
+
+        assert!(resolve_value_layout(
+            &current,
+            Some("alloc::collections::vec_deque::VecDeque<i32>"),
+        )
+        .is_some());
+        assert_eq!(
+            resolve_value_layout(&current, Some("app::VecDeque<i32>")),
+            None
+        );
+        assert_eq!(resolve_value_layout(&current, None), None);
     }
 
     #[test]
@@ -1091,6 +1461,26 @@ mod tests {
             8,
             true,
             true,
+        )));
+        assert!(requires_dwarf_qualified_name(&rust_vec_deque_type(
+            VecDequeTestLayout {
+                name: "VecDeque<i32>",
+                pointer_size: 8,
+                uses_raw_vec_inner: true,
+                wraps_capacity: true,
+                wraps_head: false,
+                uses_legacy_tail: false,
+            },
+        )));
+        assert!(!requires_dwarf_qualified_name(&rust_vec_deque_type(
+            VecDequeTestLayout {
+                name: "alloc::collections::vec_deque::VecDeque<i32>",
+                pointer_size: 8,
+                uses_raw_vec_inner: true,
+                wraps_capacity: true,
+                wraps_head: false,
+                uses_legacy_tail: false,
+            },
         )));
         assert!(requires_dwarf_qualified_name(&rust_str_type_64(
             "Box<str, alloc::alloc::Global>",
