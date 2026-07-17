@@ -525,6 +525,36 @@ trace do_stuff {
 }
 
 #[tokio::test]
+async fn test_rust_script_print_box_str_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_boxed_str {
+    print "RBOX:{}:{}", value, empty;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RBOX:\"boxed from rust\":\"\"")),
+        "Expected Rust Box<str> output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_str_respects_mem_dump_cap() -> anyhow::Result<()> {
     init();
 

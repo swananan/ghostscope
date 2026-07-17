@@ -178,6 +178,11 @@ pub mod math {
         // Simple function for DWARF function indexing
         x + 1
     }
+
+    #[inline(never)]
+    pub fn observe_boxed_str(value: Box<str>, empty: Box<str>) -> usize {
+        value.len() + empty.len()
+    }
 }
 
 fn touch_globals() -> i32 {
@@ -280,6 +285,7 @@ fn main() {
     let mut acc: i64 = 0;
     for _ in 0..50000 {
         acc += math::do_stuff(3) as i64;
+        acc += math::observe_boxed_str("boxed from rust".into(), "".into()) as i64;
         acc += touch_globals() as i64;
         thread::sleep(Duration::from_millis(1000));
     }
