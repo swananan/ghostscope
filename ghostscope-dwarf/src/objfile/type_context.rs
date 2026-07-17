@@ -253,6 +253,47 @@ fn projected_element_type_loc(
     resolve_type_ref_with_origins(dwarf, &entry, &unit)
 }
 
+fn template_type_parameter_loc(
+    dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+    type_name_index: &crate::index::TypeNameIndex,
+    loc: TypeLoc,
+    index: usize,
+) -> Result<Option<TypeLoc>> {
+    let Some(aggregate_loc) = normalize_type_loc(dwarf, type_name_index, loc)? else {
+        return Ok(None);
+    };
+    let header = dwarf.unit_header(aggregate_loc.cu_off)?;
+    let unit = dwarf.unit(header)?;
+    let entry = unit.entry(aggregate_loc.die_off)?;
+    if !matches!(
+        entry.tag(),
+        gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type | gimli::DW_TAG_union_type
+    ) {
+        return Ok(None);
+    }
+
+    let mut tree = unit.entries_tree(Some(entry.offset()))?;
+    let root = tree.root()?;
+    let mut children = root.children();
+    let mut type_parameter_index = 0usize;
+    while let Some(child) = children.next()? {
+        let parameter = child.entry();
+        if parameter.tag() != gimli::DW_TAG_template_type_parameter {
+            continue;
+        }
+        if type_parameter_index == index {
+            let Some(parameter_loc) = resolve_type_ref_with_origins(dwarf, parameter, &unit)?
+            else {
+                return Ok(None);
+            };
+            return normalize_type_loc(dwarf, type_name_index, parameter_loc);
+        }
+        type_parameter_index += 1;
+    }
+
+    Ok(None)
+}
+
 fn projected_type_loc(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
     type_name_index: &crate::index::TypeNameIndex,
@@ -301,6 +342,32 @@ impl LoadedObjfile {
         qualified_type_name_from_dwarf(self.dwarf(), type_loc(current)?)
     }
 
+    pub(crate) fn template_type_parameter(
+        &self,
+        current: TypeId,
+        index: usize,
+    ) -> Result<Option<(TypeId, crate::TypeInfo)>> {
+        let parameter_loc = {
+            let type_name_index = self
+                .type_name_index
+                .read()
+                .expect("type name index lock poisoned");
+            template_type_parameter_loc(self.dwarf(), &type_name_index, type_loc(current)?, index)?
+        };
+        let Some(parameter_loc) = parameter_loc else {
+            return Ok(None);
+        };
+        let Some(summary) = self.detailed_shallow_type(parameter_loc.cu_off, parameter_loc.die_off)
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some((
+            type_id_from_loc(current.module, parameter_loc),
+            summary,
+        )))
+    }
+
     pub(crate) fn aggregate_type_id_by_name(&self, module: ModuleId, name: &str) -> Option<TypeId> {
         if let Err(error) = self.ensure_debug_info_for_type_name(name) {
             tracing::warn!(
@@ -345,6 +412,7 @@ mod tests {
         dwarf: gimli::Dwarf<DwarfReader>,
         cu: CuId,
         pair: TypeLoc,
+        generic: TypeLoc,
         int: TypeLoc,
         pair_pointer: TypeLoc,
         int_array: TypeLoc,
@@ -397,6 +465,19 @@ mod tests {
             unit.get_mut(member)
                 .set(gimli::DW_AT_type, WriteAttributeValue::UnitRef(int));
 
+            let generic = unit.add(root, gimli::DW_TAG_structure_type);
+            unit.get_mut(generic).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"Generic".to_vec()),
+            );
+            let parameter = unit.add(generic, gimli::DW_TAG_template_type_parameter);
+            unit.get_mut(parameter).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"T".to_vec()),
+            );
+            unit.get_mut(parameter)
+                .set(gimli::DW_AT_type, WriteAttributeValue::UnitRef(int));
+
             let pair_pointer = unit.add(root, gimli::DW_TAG_pointer_type);
             unit.get_mut(pair_pointer)
                 .set(gimli::DW_AT_type, WriteAttributeValue::UnitRef(pair));
@@ -425,7 +506,7 @@ mod tests {
         let header = dwarf.units().next().unwrap().unwrap();
         let cu_off = header.debug_info_offset().unwrap();
         let unit = dwarf.unit(header).unwrap();
-        let mut pair = None;
+        let mut structures = Vec::new();
         let mut int = None;
         let mut pair_pointer = None;
         let mut int_array = None;
@@ -437,17 +518,19 @@ mod tests {
             };
             match entry.tag() {
                 gimli::DW_TAG_base_type => int = Some(loc),
-                gimli::DW_TAG_structure_type => pair = Some(loc),
+                gimli::DW_TAG_structure_type => structures.push(loc),
                 gimli::DW_TAG_pointer_type => pair_pointer = Some(loc),
                 gimli::DW_TAG_array_type => int_array = Some(loc),
                 _ => {}
             }
         }
 
+        assert_eq!(structures.len(), 2);
         Fixture {
             dwarf,
             cu: CuId(cu_off.0 as u32),
-            pair: pair.unwrap(),
+            pair: structures[0],
+            generic: structures[1],
             int: int.unwrap(),
             pair_pointer: pair_pointer.unwrap(),
             int_array: int_array.unwrap(),
@@ -685,6 +768,21 @@ mod tests {
         assert_eq!(pointer_member, Some(fixture.int));
         assert_eq!(dereferenced, Some(fixture.pair));
         assert_eq!(element, Some(fixture.int));
+    }
+
+    #[test]
+    fn resolves_template_type_parameter_by_dwarf_order() {
+        let fixture = build_fixture();
+        let types = TypeNameIndex::default();
+
+        assert_eq!(
+            template_type_parameter_loc(&fixture.dwarf, &types, fixture.generic, 0).unwrap(),
+            Some(fixture.int)
+        );
+        assert_eq!(
+            template_type_parameter_loc(&fixture.dwarf, &types, fixture.generic, 1).unwrap(),
+            None
+        );
     }
 
     #[test]

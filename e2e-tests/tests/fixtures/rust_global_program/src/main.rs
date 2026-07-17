@@ -16,17 +16,62 @@ pub static mut G_OWNED_MESSAGE: String = String::new();
 pub static mut G_EMPTY_OWNED: String = String::new();
 pub static mut G_NUL_OWNED: String = String::new();
 pub static mut G_SEPARATOR_OWNED: String = String::new();
+pub static mut G_VEC_U8: Vec<u8> = Vec::new();
+pub static mut G_VEC_I32: Vec<i32> = Vec::new();
+pub static mut G_EMPTY_VEC: Vec<i32> = Vec::new();
+pub static mut G_VEC_UNIT: Vec<()> = Vec::new();
 
 pub mod user_types {
     pub struct String {
-        pub vec: Vec<u8>,
+        pub vec: std::vec::Vec<u8>,
         pub marker: u32,
+    }
+
+    #[repr(C)]
+    pub struct Vec<T> {
+        pub buf: Buffer<T>,
+        pub len: usize,
+    }
+
+    #[repr(C)]
+    pub struct Buffer<T> {
+        pub inner: BufferInner<T>,
+    }
+
+    #[repr(C)]
+    pub struct BufferInner<T> {
+        pub padding: usize,
+        pub ptr: Unique<T>,
+    }
+
+    #[repr(C)]
+    pub struct Unique<T> {
+        pub pointer: NonNull<T>,
+    }
+
+    #[repr(C)]
+    pub struct NonNull<T> {
+        pub pointer: *mut T,
     }
 }
 
 pub static mut G_USER_STRING: user_types::String = user_types::String {
     vec: Vec::new(),
     marker: 41,
+};
+
+pub static mut G_USER_VEC: user_types::Vec<i32> = user_types::Vec {
+    buf: user_types::Buffer {
+        inner: user_types::BufferInner {
+            padding: 0,
+            ptr: user_types::Unique {
+                pointer: user_types::NonNull {
+                    pointer: std::ptr::null_mut(),
+                },
+            },
+        },
+    },
+    len: 0,
 };
 
 #[repr(C)]
@@ -196,6 +241,11 @@ fn touch_globals() -> i32 {
             + G_SEPARATOR_OWNED.len() as i64
             + G_USER_STRING.vec.len() as i64
             + G_USER_STRING.marker as i64
+            + G_VEC_U8.len() as i64
+            + G_VEC_I32.len() as i64
+            + G_EMPTY_VEC.len() as i64
+            + G_VEC_UNIT.len() as i64
+            + G_USER_VEC.len as i64
             + GLOBAL_PAIRS[0].0 as i64
             + union_value as i64
             + pinned_value as i64
@@ -214,6 +264,9 @@ fn main() {
         G_NUL_OWNED = String::from("owned\0value");
         G_SEPARATOR_OWNED = String::from("left = right");
         G_USER_STRING.vec = b"user bytes".to_vec();
+        G_VEC_U8 = vec![1, 2, 3, 255];
+        G_VEC_I32 = vec![10, -20, 30, 40];
+        G_VEC_UNIT = vec![(); 3];
     }
 
     let mut acc: i64 = 0;

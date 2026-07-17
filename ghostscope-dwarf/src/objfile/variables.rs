@@ -737,7 +737,7 @@ impl LoadedObjfile {
         None
     }
 
-    fn detailed_shallow_type(
+    pub(crate) fn detailed_shallow_type(
         &self,
         cu_off: gimli::DebugInfoOffset,
         die_off: gimli::UnitOffset,

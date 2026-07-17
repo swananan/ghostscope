@@ -4,12 +4,12 @@ mod rust;
 
 use crate::{semantics::PlanError, SourceLanguage, TypeOrigin, VariableAccessSegment};
 
-pub(crate) use rust::IndirectBytesLayout;
+pub(crate) use rust::{IndirectSequenceKind, IndirectSequenceLayout};
 
 pub(crate) fn resolve_value_layout(
     current: &crate::ResolvedType,
     dwarf_qualified_name: Option<&str>,
-) -> Option<IndirectBytesLayout> {
+) -> Option<IndirectSequenceLayout> {
     rust::resolve_value_layout(current, dwarf_qualified_name)
 }
 

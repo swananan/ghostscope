@@ -53,6 +53,30 @@ impl DwarfAnalyzer {
             .qualified_type_name(type_id)
     }
 
+    fn template_type_parameter(
+        &self,
+        type_id: TypeId,
+        index: usize,
+    ) -> Result<Option<ResolvedType>> {
+        let module_path = self.module_path_for_id(type_id.module).ok_or_else(|| {
+            anyhow::anyhow!("Semantic module id {:?} is not loaded", type_id.module)
+        })?;
+        let parameter = self
+            .modules
+            .get(module_path)
+            .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?
+            .template_type_parameter(type_id, index)?;
+        let Some((parameter_id, summary)) = parameter else {
+            return Ok(None);
+        };
+
+        Ok(Some(ResolvedType::new(
+            summary,
+            TypeIdentity::Dwarf(parameter_id),
+            self.type_origin(parameter_id)?,
+        )))
+    }
+
     /// Combine the plan's protocol-compatible type summary with its DWARF origin.
     pub fn semantic_type_for_plan(&self, plan: &VariableReadPlan) -> Result<Option<SemanticType>> {
         let Some(summary) = plan.dwarf_type.clone() else {
@@ -238,9 +262,42 @@ impl DwarfAnalyzer {
         let length =
             self.project_resolved_member_path(current, &layout.length_path, type_module_path)?;
 
+        let (presentation, capture) = match layout.kind {
+            crate::language::IndirectSequenceKind::Utf8String => (
+                crate::ValuePresentation::Utf8String,
+                ValueCapturePlan::IndirectBytes { data, length },
+            ),
+            crate::language::IndirectSequenceKind::TypeParameter { index } => {
+                let Some(type_id) = current.identity.layout_dwarf_id() else {
+                    return Ok(None);
+                };
+                let Some(element) = self.template_type_parameter(type_id, index)? else {
+                    return Ok(None);
+                };
+                if matches!(
+                    strip_type_aliases(&element.summary),
+                    TypeInfo::UnknownType { .. } | TypeInfo::OptimizedOut { .. }
+                ) {
+                    return Ok(None);
+                }
+                let element_stride = element.summary.size();
+                (
+                    crate::ValuePresentation::Sequence {
+                        element_type: Box::new(element.summary),
+                        element_stride,
+                    },
+                    ValueCapturePlan::IndirectSequence {
+                        data,
+                        length,
+                        element_stride,
+                    },
+                )
+            }
+        };
+
         Ok(Some(ValueReadPlan {
-            presentation: layout.presentation,
-            capture: ValueCapturePlan::IndirectBytes { data, length },
+            presentation,
+            capture,
         }))
     }
 

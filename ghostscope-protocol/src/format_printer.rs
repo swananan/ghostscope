@@ -8,7 +8,10 @@ use crate::trace_event::{
     VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET, VARIABLE_READ_ERROR_PAYLOAD_LEN,
 };
 use crate::type_info::TypeInfo;
-use crate::{ValuePresentation, INDIRECT_BYTES_LENGTH_PREFIX_SIZE};
+use crate::{
+    ValuePresentation, INDIRECT_BYTES_LENGTH_PREFIX_SIZE, INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET,
+    INDIRECT_SEQUENCE_HEADER_SIZE,
+};
 
 // Removed legacy simple variable wrapper; use complex paths only.
 
@@ -596,7 +599,7 @@ impl FormatPrinter {
     ) -> bool {
         variable.status == VariableStatus::Truncated as u8
             && trace_context.get_value_presentation(variable.type_index)
-                == ValuePresentation::Utf8String
+                != &ValuePresentation::Dwarf
     }
 
     fn append_semantic_truncation_marker(
@@ -626,11 +629,8 @@ impl FormatPrinter {
             None => return format!("<INVALID_TYPE_INDEX_{type_index}>: {var_name}"),
         };
 
-        let formatted_data = Self::format_data_with_presentation(
-            data,
-            type_info,
-            trace_context.get_value_presentation(type_index),
-        );
+        let presentation = trace_context.get_value_presentation(type_index);
+        let formatted_data = Self::format_data_with_presentation(data, type_info, presentation);
 
         if access_path.is_empty() {
             format!("{var_name} = {formatted_data}")
@@ -657,7 +657,7 @@ impl FormatPrinter {
         };
         let presentation = trace_context.get_value_presentation(type_index);
 
-        if presentation == ValuePresentation::Utf8String
+        if presentation != &ValuePresentation::Dwarf
             && matches!(
                 status,
                 s if s == VariableStatus::Ok as u8
@@ -665,8 +665,14 @@ impl FormatPrinter {
                     || s == VariableStatus::Truncated as u8
             )
         {
-            let mut formatted_data = Self::format_utf8_string_payload(data);
-            if status == VariableStatus::Truncated as u8 {
+            let payload_omitted = status == VariableStatus::Truncated as u8
+                && Self::presentation_payload_bytes(data, presentation).is_none();
+            let mut formatted_data = if payload_omitted {
+                "<truncated>".to_string()
+            } else {
+                Self::format_data_with_presentation(data, type_info, presentation)
+            };
+            if status == VariableStatus::Truncated as u8 && !payload_omitted {
                 formatted_data.push_str(" <truncated>");
             }
             return if access_path.is_empty() {
@@ -748,11 +754,15 @@ impl FormatPrinter {
     pub fn format_data_with_presentation(
         data: &[u8],
         type_info: &TypeInfo,
-        presentation: ValuePresentation,
+        presentation: &ValuePresentation,
     ) -> String {
         match presentation {
             ValuePresentation::Dwarf => Self::format_data_with_type_info(data, type_info),
             ValuePresentation::Utf8String => Self::format_utf8_string_payload(data),
+            ValuePresentation::Sequence {
+                element_type,
+                element_stride,
+            } => Self::format_sequence_payload(data, element_type, *element_stride),
         }
     }
 
@@ -764,14 +774,18 @@ impl FormatPrinter {
             return Ok(&[]);
         }
 
-        Self::presentation_payload_bytes(
-            &variable.data,
-            trace_context.get_value_presentation(variable.type_index),
-        )
-        .ok_or("<INVALID_UTF8_STRING_PAYLOAD>")
+        let presentation = trace_context.get_value_presentation(variable.type_index);
+        match Self::presentation_payload_bytes(&variable.data, presentation) {
+            Some(payload) => Ok(payload),
+            None if Self::is_semantic_truncation(variable, trace_context) => Ok(&[]),
+            None => Err("<INVALID_SEMANTIC_PAYLOAD>"),
+        }
     }
 
-    fn presentation_payload_bytes(data: &[u8], presentation: ValuePresentation) -> Option<&[u8]> {
+    fn presentation_payload_bytes<'a>(
+        data: &'a [u8],
+        presentation: &ValuePresentation,
+    ) -> Option<&'a [u8]> {
         match presentation {
             ValuePresentation::Dwarf => Some(data),
             ValuePresentation::Utf8String => {
@@ -783,11 +797,15 @@ impl FormatPrinter {
                     .min(payload.len());
                 Some(&payload[..captured_len])
             }
+            ValuePresentation::Sequence { element_stride, .. } => {
+                let (_, _, payload) = Self::parse_sequence_payload(data, *element_stride)?;
+                Some(payload)
+            }
         }
     }
 
     fn format_utf8_string_payload(data: &[u8]) -> String {
-        let Some(captured) = Self::presentation_payload_bytes(data, ValuePresentation::Utf8String)
+        let Some(captured) = Self::presentation_payload_bytes(data, &ValuePresentation::Utf8String)
         else {
             return "<INVALID_UTF8_STRING_PAYLOAD>".to_string();
         };
@@ -808,6 +826,64 @@ impl FormatPrinter {
                 format!("<INVALID_UTF8:{escaped}>")
             }
         }
+    }
+
+    fn parse_sequence_payload(data: &[u8], element_stride: u64) -> Option<(u64, u64, &[u8])> {
+        let original_count = u64::from_le_bytes(data.get(..8)?.try_into().ok()?);
+        let captured_count = u64::from_le_bytes(
+            data.get(INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET..INDIRECT_SEQUENCE_HEADER_SIZE)?
+                .try_into()
+                .ok()?,
+        );
+        if captured_count > original_count {
+            return None;
+        }
+        let stride = usize::try_from(element_stride).ok()?;
+        let captured = usize::try_from(captured_count).ok()?;
+        let byte_len = captured.checked_mul(stride)?;
+        let payload = data.get(INDIRECT_SEQUENCE_HEADER_SIZE..)?;
+        Some((original_count, captured_count, payload.get(..byte_len)?))
+    }
+
+    fn format_sequence_payload(
+        data: &[u8],
+        element_type: &TypeInfo,
+        element_stride: u64,
+    ) -> String {
+        if element_type.size() != element_stride {
+            return "<INVALID_SEQUENCE_ELEMENT_LAYOUT>".to_string();
+        }
+        let Some((_, captured_count, payload)) = Self::parse_sequence_payload(data, element_stride)
+        else {
+            return "<INVALID_SEQUENCE_PAYLOAD>".to_string();
+        };
+        let Ok(captured_count) = usize::try_from(captured_count) else {
+            return "<INVALID_SEQUENCE_PAYLOAD>".to_string();
+        };
+        let Ok(stride) = usize::try_from(element_stride) else {
+            return "<INVALID_SEQUENCE_ELEMENT_LAYOUT>".to_string();
+        };
+
+        let mut result = String::from("[");
+        for index in 0..captured_count {
+            if index > 0 {
+                result.push_str(", ");
+            }
+            let start = index * stride;
+            let element_data = &payload[start..start + stride];
+            if stride == 0 && element_type.type_name() == "()" {
+                result.push_str("()");
+            } else {
+                result.push_str(&Self::format_data_with_type_info_impl(
+                    element_data,
+                    element_type,
+                    1,
+                    32,
+                ));
+            }
+        }
+        result.push(']');
+        result
     }
 
     /// Internal implementation with depth control for recursion
@@ -838,13 +914,16 @@ impl FormatPrinter {
                     Self::extract_bits_le(&data[..u_size], *bit_offset as u32, *bit_size as u32);
                 Self::format_bitfield_value(val, underlying_type, *bit_size as u32)
             }
-            TypeInfo::PointerType { target_type, .. } => {
-                if data.len() < 8 {
+            TypeInfo::PointerType { target_type, size } => {
+                let Ok(pointer_size) = usize::try_from(*size) else {
+                    return "<INVALID_POINTER>".to_string();
+                };
+                if pointer_size == 0 || pointer_size > 8 || data.len() < pointer_size {
                     "<INVALID_POINTER>".to_string()
                 } else {
-                    let addr = u64::from_le_bytes([
-                        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                    ]);
+                    let mut address_bytes = [0u8; 8];
+                    address_bytes[..pointer_size].copy_from_slice(&data[..pointer_size]);
+                    let addr = u64::from_le_bytes(address_bytes);
                     let ty = format!("{}*", target_type.type_name());
                     if addr == 0 {
                         format!("NULL ({ty})")
@@ -1474,6 +1553,17 @@ mod tests {
         data
     }
 
+    fn indirect_sequence_payload(
+        original_count: u64,
+        captured_count: u64,
+        captured: &[u8],
+    ) -> Vec<u8> {
+        let mut data = original_count.to_le_bytes().to_vec();
+        data.extend_from_slice(&captured_count.to_le_bytes());
+        data.extend_from_slice(captured);
+        data
+    }
+
     #[test]
     fn test_utf8_string_presentation_uses_length_not_nul_termination() {
         let mut trace_context = TraceContext::new();
@@ -1637,6 +1727,184 @@ mod tests {
                 &trace_context,
             ),
             "message = <read_user failed errno=-14 at 0x1234> (struct &str*)"
+        );
+    }
+
+    #[test]
+    fn test_sequence_presentation_formats_dwarf_elements() {
+        let mut trace_context = TraceContext::new();
+        let format_idx = trace_context.add_string("{}".to_string()).unwrap();
+        let element_type = TypeInfo::BaseType {
+            name: "i32".to_string(),
+            size: 4,
+            encoding: gimli::constants::DW_ATE_signed.0 as u16,
+        };
+        let type_idx = trace_context
+            .add_type_with_presentation(
+                TypeInfo::StructType {
+                    name: "Vec<i32>".to_string(),
+                    size: 24,
+                    members: Vec::new(),
+                },
+                ValuePresentation::Sequence {
+                    element_type: Box::new(element_type),
+                    element_stride: 4,
+                },
+            )
+            .unwrap();
+        let name_idx = trace_context
+            .add_variable_name("values".to_string())
+            .unwrap();
+        let mut elements = Vec::new();
+        elements.extend_from_slice(&1i32.to_le_bytes());
+        elements.extend_from_slice(&(-2i32).to_le_bytes());
+        elements.extend_from_slice(&3i32.to_le_bytes());
+        let vars = vec![ParsedComplexVariable {
+            var_name_index: name_idx,
+            type_index: type_idx,
+            access_path: String::new(),
+            status: VariableStatus::Ok as u8,
+            data: indirect_sequence_payload(3, 3, &elements),
+        }];
+
+        assert_eq!(
+            FormatPrinter::format_complex_print_data(format_idx, &vars, &trace_context),
+            "[1, -2, 3]"
+        );
+    }
+
+    #[test]
+    fn test_sequence_presentation_formats_empty_truncated_and_zst_values() {
+        let mut trace_context = TraceContext::new();
+        let i32_type = TypeInfo::BaseType {
+            name: "i32".to_string(),
+            size: 4,
+            encoding: gimli::constants::DW_ATE_signed.0 as u16,
+        };
+        let vec_type = TypeInfo::StructType {
+            name: "Vec<i32>".to_string(),
+            size: 24,
+            members: Vec::new(),
+        };
+        let vec_idx = trace_context
+            .add_type_with_presentation(
+                vec_type.clone(),
+                ValuePresentation::Sequence {
+                    element_type: Box::new(i32_type),
+                    element_stride: 4,
+                },
+            )
+            .unwrap();
+        let zst_idx = trace_context
+            .add_type_with_presentation(
+                vec_type,
+                ValuePresentation::Sequence {
+                    element_type: Box::new(TypeInfo::BaseType {
+                        name: "()".to_string(),
+                        size: 0,
+                        encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+                    }),
+                    element_stride: 0,
+                },
+            )
+            .unwrap();
+        let name_idx = trace_context
+            .add_variable_name("values".to_string())
+            .unwrap();
+        let mut two_elements = Vec::new();
+        two_elements.extend_from_slice(&10i32.to_le_bytes());
+        two_elements.extend_from_slice(&20i32.to_le_bytes());
+
+        let empty = FormatPrinter::format_complex_variable_with_status(
+            name_idx,
+            vec_idx,
+            "",
+            &indirect_sequence_payload(0, 0, &[]),
+            VariableStatus::ZeroLength as u8,
+            &trace_context,
+        );
+        let truncated = FormatPrinter::format_complex_variable_with_status(
+            name_idx,
+            vec_idx,
+            "",
+            &indirect_sequence_payload(4, 2, &two_elements),
+            VariableStatus::Truncated as u8,
+            &trace_context,
+        );
+        let zst = FormatPrinter::format_complex_variable_with_status(
+            name_idx,
+            zst_idx,
+            "",
+            &indirect_sequence_payload(3, 3, &[]),
+            VariableStatus::Ok as u8,
+            &trace_context,
+        );
+
+        assert_eq!(empty, "values = []");
+        assert_eq!(truncated, "values = [10, 20] <truncated>");
+        assert_eq!(zst, "values = [(), (), ()]");
+    }
+
+    #[test]
+    fn test_sequence_presentation_uses_dwarf_pointer_size() {
+        let element_type = TypeInfo::PointerType {
+            target_type: Box::new(TypeInfo::BaseType {
+                name: "u8".to_string(),
+                size: 1,
+                encoding: gimli::constants::DW_ATE_unsigned_char.0 as u16,
+            }),
+            size: 4,
+        };
+        let presentation = ValuePresentation::Sequence {
+            element_type: Box::new(element_type),
+            element_stride: 4,
+        };
+        let payload = indirect_sequence_payload(1, 1, &0x1234_5678u32.to_le_bytes());
+
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(
+                &payload,
+                &TypeInfo::UnknownType {
+                    name: "Vec<*const u8>".to_string(),
+                },
+                &presentation,
+            ),
+            "[0x12345678 (u8*)]"
+        );
+    }
+
+    #[test]
+    fn test_truncated_sequence_without_complete_header_is_not_invalid() {
+        let mut trace_context = TraceContext::new();
+        let type_idx = trace_context
+            .add_type_with_presentation(
+                TypeInfo::UnknownType {
+                    name: "Vec<i32>".to_string(),
+                },
+                ValuePresentation::Sequence {
+                    element_type: Box::new(TypeInfo::BaseType {
+                        name: "i32".to_string(),
+                        size: 4,
+                        encoding: gimli::constants::DW_ATE_signed.0 as u16,
+                    }),
+                    element_stride: 4,
+                },
+            )
+            .unwrap();
+        let name_idx = trace_context
+            .add_variable_name("values".to_string())
+            .unwrap();
+
+        assert_eq!(
+            FormatPrinter::format_complex_variable_with_status(
+                name_idx,
+                type_idx,
+                "",
+                &[0; VARIABLE_READ_ERROR_PAYLOAD_LEN],
+                VariableStatus::Truncated as u8,
+                &trace_context,
+            ),
+            "values = <truncated>"
         );
     }
 

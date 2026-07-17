@@ -8,6 +8,8 @@ use crate::ValuePresentation;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+static DWARF_VALUE_PRESENTATION: ValuePresentation = ValuePresentation::Dwarf;
+
 /// Trace context table identifiers used in overflow errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceContextTable {
@@ -172,11 +174,10 @@ impl TraceContext {
 
     /// Get the presentation for a type index, defaulting to physical DWARF
     /// formatting for contexts serialized before this table was introduced.
-    pub fn get_value_presentation(&self, index: u16) -> ValuePresentation {
+    pub fn get_value_presentation(&self, index: u16) -> &ValuePresentation {
         self.value_presentations
             .get(index as usize)
-            .copied()
-            .unwrap_or_default()
+            .unwrap_or(&DWARF_VALUE_PRESENTATION)
     }
 
     /// Get a variable name by index
@@ -299,7 +300,7 @@ mod tests {
 
         assert_eq!(ctx.get_type(idx1), Some(&type1));
         assert_eq!(ctx.get_type(idx2), Some(&type2));
-        assert_eq!(ctx.get_value_presentation(idx1), ValuePresentation::Dwarf);
+        assert_eq!(ctx.get_value_presentation(idx1), &ValuePresentation::Dwarf);
         assert_eq!(ctx.type_count(), 2);
     }
 
@@ -315,8 +316,34 @@ mod tests {
 
         assert_eq!(
             ctx.get_value_presentation(index),
-            ValuePresentation::Utf8String
+            &ValuePresentation::Utf8String
         );
+    }
+
+    #[test]
+    fn test_sequence_presentation_round_trips_with_element_type() {
+        let mut ctx = TraceContext::new();
+        let presentation = ValuePresentation::Sequence {
+            element_type: Box::new(TypeInfo::BaseType {
+                name: "i32".to_string(),
+                size: 4,
+                encoding: gimli::constants::DW_ATE_signed.0 as u16,
+            }),
+            element_stride: 4,
+        };
+        let index = ctx
+            .add_type_with_presentation(
+                TypeInfo::UnknownType {
+                    name: "Vec<i32>".to_string(),
+                },
+                presentation.clone(),
+            )
+            .unwrap();
+
+        let json = serde_json::to_string(&ctx).unwrap();
+        let decoded: TraceContext = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.get_value_presentation(index), &presentation);
     }
 
     #[test]
@@ -328,7 +355,7 @@ mod tests {
         }"#;
         let ctx: TraceContext = serde_json::from_str(json).unwrap();
 
-        assert_eq!(ctx.get_value_presentation(0), ValuePresentation::Dwarf);
+        assert_eq!(ctx.get_value_presentation(0), &ValuePresentation::Dwarf);
     }
 
     #[test]
@@ -350,10 +377,10 @@ mod tests {
 
         assert_eq!(new_index, 1);
         assert_eq!(ctx.value_presentations.len(), ctx.types.len());
-        assert_eq!(ctx.get_value_presentation(0), ValuePresentation::Dwarf);
+        assert_eq!(ctx.get_value_presentation(0), &ValuePresentation::Dwarf);
         assert_eq!(
             ctx.get_value_presentation(new_index),
-            ValuePresentation::Utf8String
+            &ValuePresentation::Utf8String
         );
     }
 

@@ -21,4 +21,11 @@ pub enum ValueCapturePlan {
         data: TypeProjection,
         length: TypeProjection,
     },
+    /// Read a pointer and logical element count from an aggregate, then capture
+    /// a bounded number of complete, contiguous elements.
+    IndirectSequence {
+        data: TypeProjection,
+        length: TypeProjection,
+        element_stride: u64,
+    },
 }

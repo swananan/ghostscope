@@ -1,26 +1,30 @@
-use crate::{strip_type_aliases, ResolvedType, SourceLanguage, TypeInfo, ValuePresentation};
+use crate::{strip_type_aliases, ResolvedType, SourceLanguage, TypeInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IndirectBytesLayout {
+pub(crate) struct IndirectSequenceLayout {
     pub(crate) data_path: Vec<String>,
     pub(crate) length_path: Vec<String>,
-    pub(crate) presentation: ValuePresentation,
+    pub(crate) kind: IndirectSequenceKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndirectSequenceKind {
+    Utf8String,
+    TypeParameter { index: usize },
 }
 
 pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
     current.origin.as_ref().is_some_and(|origin| {
         origin.language == SourceLanguage::Rust
-            && matches!(
-                strip_type_aliases(&current.summary),
-                TypeInfo::StructType { name, .. } if name == "String"
-            )
+            && matches!(strip_type_aliases(&current.summary), TypeInfo::StructType { name, .. }
+                if name == "String" || is_short_vec_name(name))
     })
 }
 
 pub(super) fn resolve_value_layout(
     current: &ResolvedType,
     dwarf_qualified_name: Option<&str>,
-) -> Option<IndirectBytesLayout> {
+) -> Option<IndirectSequenceLayout> {
     if current.origin.as_ref()?.language != SourceLanguage::Rust {
         return None;
     }
@@ -40,10 +44,11 @@ pub(super) fn resolve_value_layout(
         name.as_str(),
         "&str" | "&mut str" | "&'static str" | "&'static mut str"
     ) {
-        validate_indirect_bytes_layout(
+        validate_indirect_sequence_layout(
             &current.summary,
             field_path(&["data_ptr"]),
             field_path(&["length"]),
+            IndirectSequenceKind::Utf8String,
         )
     // rustc commonly stores only `String` in DW_AT_name and represents
     // `alloc::string` with enclosing namespace DIEs. GDB presents the
@@ -52,9 +57,15 @@ pub(super) fn resolve_value_layout(
     // below remain responsible only for version-specific physical layout.
     } else if is_std_string(name, dwarf_qualified_name) {
         rust_string_layout(&current.summary)
+    } else if is_std_vec(name, dwarf_qualified_name) {
+        rust_vec_layout(&current.summary)
     } else {
         None
     }
+}
+
+fn is_short_vec_name(name: &str) -> bool {
+    name.starts_with("Vec<") && name.ends_with('>')
 }
 
 fn is_std_string(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
@@ -79,7 +90,31 @@ fn is_std_string_name(name: &str) -> bool {
         })
 }
 
-fn rust_string_layout(root: &TypeInfo) -> Option<IndirectBytesLayout> {
+fn is_std_vec(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_vec_name(name)
+        || (is_short_vec_name(name) && dwarf_qualified_name.is_some_and(is_std_vec_name))
+}
+
+fn is_std_vec_name(name: &str) -> bool {
+    let Some(path) = name.strip_prefix("alloc::") else {
+        return false;
+    };
+    let Some((module, arguments)) = path.split_once("::Vec<") else {
+        return false;
+    };
+
+    !module.is_empty()
+        && module.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+        && !arguments.is_empty()
+        && arguments.ends_with('>')
+}
+
+fn rust_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
     // rust-gdb uses `buf.ptr` through Rust 1.81 and `buf.inner.ptr` from
     // Rust 1.82 onward. Keep both paths and validate whichever DWARF exposes.
     const DATA_PATHS: &[&[&str]] = &[
@@ -98,9 +133,12 @@ fn rust_string_layout(root: &TypeInfo) -> Option<IndirectBytesLayout> {
             strip_type_aliases(pointer_or_wrapper.member_type),
             TypeInfo::PointerType { .. }
         ) {
-            if let Some(layout) =
-                validate_indirect_bytes_layout(root, data_path, length_path.clone())
-            {
+            if let Some(layout) = validate_indirect_sequence_layout(
+                root,
+                data_path,
+                length_path.clone(),
+                IndirectSequenceKind::Utf8String,
+            ) {
                 return Some(layout);
             }
             continue;
@@ -124,9 +162,77 @@ fn rust_string_layout(root: &TypeInfo) -> Option<IndirectBytesLayout> {
             strip_type_aliases(raw_pointer.member_type),
             TypeInfo::PointerType { .. }
         ) {
-            if let Some(layout) =
-                validate_indirect_bytes_layout(root, data_path, length_path.clone())
-            {
+            if let Some(layout) = validate_indirect_sequence_layout(
+                root,
+                data_path,
+                length_path.clone(),
+                IndirectSequenceKind::Utf8String,
+            ) {
+                return Some(layout);
+            }
+        }
+    }
+
+    None
+}
+
+fn rust_vec_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
+    // rust-gdb uses `buf.ptr` through Rust 1.81 and `buf.inner.ptr` from
+    // Rust 1.82 onward. In the latter layout RawVecInner erases `T` to `u8`,
+    // so the analyzer must recover the element type from the Vec DIE's first
+    // DW_TAG_template_type_parameter instead of trusting the pointer target.
+    const DATA_PATHS: &[&[&str]] = &[
+        &["buf", "inner", "ptr", "pointer"],
+        &["buf", "ptr", "pointer"],
+    ];
+
+    let length_path = field_path(&["len"]);
+    for fields in DATA_PATHS {
+        let mut data_path = field_path(fields);
+        let Some(pointer_or_wrapper) = resolve_member_path(root, &data_path) else {
+            continue;
+        };
+
+        if matches!(
+            strip_type_aliases(pointer_or_wrapper.member_type),
+            TypeInfo::PointerType { .. }
+        ) {
+            if let Some(layout) = validate_indirect_sequence_layout(
+                root,
+                data_path,
+                length_path.clone(),
+                IndirectSequenceKind::TypeParameter { index: 0 },
+            ) {
+                return Some(layout);
+            }
+            continue;
+        }
+
+        // Unique and NonNull wrappers changed shape in Rust 1.32 and 1.60.
+        // Follow the first DWARF member, matching rust-gdb's compatibility
+        // helper, and validate that the resulting field is a real pointer.
+        let TypeInfo::StructType { members, .. } =
+            strip_type_aliases(pointer_or_wrapper.member_type)
+        else {
+            continue;
+        };
+        let Some(first) = members.first() else {
+            continue;
+        };
+        data_path.push(first.name.clone());
+        let Some(raw_pointer) = resolve_member_path(root, &data_path) else {
+            continue;
+        };
+        if matches!(
+            strip_type_aliases(raw_pointer.member_type),
+            TypeInfo::PointerType { .. }
+        ) {
+            if let Some(layout) = validate_indirect_sequence_layout(
+                root,
+                data_path,
+                length_path.clone(),
+                IndirectSequenceKind::TypeParameter { index: 0 },
+            ) {
                 return Some(layout);
             }
         }
@@ -172,25 +278,18 @@ fn resolve_member_path<'a>(root: &'a TypeInfo, path: &[String]) -> Option<Resolv
     })
 }
 
-fn validate_indirect_bytes_layout(
+fn validate_indirect_sequence_layout(
     root: &TypeInfo,
     data_path: Vec<String>,
     length_path: Vec<String>,
-) -> Option<IndirectBytesLayout> {
+    kind: IndirectSequenceKind,
+) -> Option<IndirectSequenceLayout> {
     let data = resolve_member_path(root, &data_path)?;
     let length = resolve_member_path(root, &length_path)?;
     let TypeInfo::PointerType {
         target_type,
         size: pointer_size,
     } = strip_type_aliases(data.member_type)
-    else {
-        return None;
-    };
-    let TypeInfo::BaseType {
-        size: element_size,
-        encoding: element_encoding,
-        ..
-    } = strip_type_aliases(target_type)
     else {
         return None;
     };
@@ -203,8 +302,14 @@ fn validate_indirect_bytes_layout(
         return None;
     };
 
-    let byte_encoding = *element_encoding == gimli::DW_ATE_unsigned.0 as u16
-        || *element_encoding == gimli::DW_ATE_unsigned_char.0 as u16;
+    let utf8_byte_pointer = match strip_type_aliases(target_type) {
+        TypeInfo::BaseType { size, encoding, .. } => {
+            *size == 1
+                && (*encoding == gimli::DW_ATE_unsigned.0 as u16
+                    || *encoding == gimli::DW_ATE_unsigned_char.0 as u16)
+        }
+        _ => false,
+    };
     let unsigned_length = *length_encoding == gimli::DW_ATE_unsigned.0 as u16;
     // Aggregate size, member offsets, and metadata widths come from DWARF.
     let aggregate_size = root.size();
@@ -213,8 +318,7 @@ fn validate_indirect_bytes_layout(
     let members_overlap = data.offset < length_end && length.offset < data_end;
     if *pointer_size == 0
         || *pointer_size != *length_size
-        || *element_size != 1
-        || !byte_encoding
+        || (kind == IndirectSequenceKind::Utf8String && !utf8_byte_pointer)
         || !unsigned_length
         || data_end > aggregate_size
         || length_end > aggregate_size
@@ -223,10 +327,10 @@ fn validate_indirect_bytes_layout(
         return None;
     }
 
-    Some(IndirectBytesLayout {
+    Some(IndirectSequenceLayout {
         data_path,
         length_path,
-        presentation: ValuePresentation::Utf8String,
+        kind,
     })
 }
 
@@ -393,16 +497,46 @@ mod tests {
         )
     }
 
+    fn rust_vec_type(
+        name: &str,
+        language: SourceLanguage,
+        pointer_size: u64,
+        wraps_raw_pointer: bool,
+        uses_raw_vec_inner: bool,
+    ) -> ResolvedType {
+        let string = rust_string_type(
+            "alloc::string::String",
+            language,
+            pointer_size,
+            wraps_raw_pointer,
+            uses_raw_vec_inner,
+        );
+        let TypeInfo::StructType { members, .. } = string.summary else {
+            unreachable!("test String is a struct")
+        };
+        let mut vec_type = members
+            .into_iter()
+            .next()
+            .expect("test String has a Vec member")
+            .member_type;
+        let TypeInfo::StructType { name: vec_name, .. } = &mut vec_type else {
+            unreachable!("test Vec is a struct")
+        };
+        *vec_name = name.to_string();
+
+        ResolvedType::new(vec_type, TypeIdentity::Unknown, string.origin)
+    }
+
     #[test]
     fn recognizes_rust_str_layout() {
         let current = rust_str_type_64("&str", SourceLanguage::Rust);
 
         assert_eq!(
             resolve_value_layout(&current, None),
-            Some(IndirectBytesLayout {
+            Some(IndirectSequenceLayout {
                 data_path: field_path(&["data_ptr"]),
                 length_path: field_path(&["length"]),
-                presentation: ValuePresentation::Utf8String,
+                kind: IndirectSequenceKind::Utf8String,
             })
         );
     }
@@ -495,10 +629,10 @@ mod tests {
 
         assert_eq!(
             layout,
-            IndirectBytesLayout {
+            IndirectSequenceLayout {
                 data_path: field_path(&["vec", "buf", "inner", "ptr", "pointer", "pointer",]),
                 length_path: field_path(&["vec", "len"]),
-                presentation: ValuePresentation::Utf8String,
+                kind: IndirectSequenceKind::Utf8String,
             }
         );
         assert_eq!(
@@ -527,16 +661,16 @@ mod tests {
 
         assert_eq!(
             resolve_value_layout(&current, None),
-            Some(IndirectBytesLayout {
+            Some(IndirectSequenceLayout {
                 data_path: field_path(&["vec", "buf", "inner", "ptr", "pointer",]),
                 length_path: field_path(&["vec", "len"]),
-                presentation: ValuePresentation::Utf8String,
+                kind: IndirectSequenceKind::Utf8String,
             })
         );
     }
 
     #[test]
-    fn recognizes_pre_raw_vec_inner_layout() {
+    fn recognizes_pre_raw_vec_inner_string_layout() {
         let current = rust_string_type(
             "alloc::string::String",
             SourceLanguage::Rust,
@@ -547,10 +681,10 @@ mod tests {
 
         assert_eq!(
             resolve_value_layout(&current, None),
-            Some(IndirectBytesLayout {
+            Some(IndirectSequenceLayout {
                 data_path: field_path(&["vec", "buf", "ptr", "pointer", "pointer",]),
                 length_path: field_path(&["vec", "len"]),
-                presentation: ValuePresentation::Utf8String,
+                kind: IndirectSequenceKind::Utf8String,
             })
         );
     }
@@ -585,7 +719,55 @@ mod tests {
     }
 
     #[test]
-    fn qualified_name_lookup_is_limited_to_rust_short_string() {
+    fn recognizes_current_std_vec_layout() {
+        let current = rust_vec_type(
+            "Vec<i32, alloc::alloc::Global>",
+            SourceLanguage::Rust,
+            8,
+            true,
+            true,
+        );
+
+        assert_eq!(
+            resolve_value_layout(&current, Some("alloc::vec::Vec<i32, alloc::alloc::Global>")),
+            Some(IndirectSequenceLayout {
+                data_path: field_path(&["buf", "inner", "ptr", "pointer", "pointer"]),
+                length_path: field_path(&["len"]),
+                kind: IndirectSequenceKind::TypeParameter { index: 0 },
+            })
+        );
+    }
+
+    #[test]
+    fn recognizes_pre_raw_vec_inner_vec_layout() {
+        let current = rust_vec_type(
+            "alloc::vec::Vec<i32, alloc::alloc::Global>",
+            SourceLanguage::Rust,
+            8,
+            true,
+            false,
+        );
+
+        assert_eq!(
+            resolve_value_layout(&current, None),
+            Some(IndirectSequenceLayout {
+                data_path: field_path(&["buf", "ptr", "pointer", "pointer"]),
+                length_path: field_path(&["len"]),
+                kind: IndirectSequenceKind::TypeParameter { index: 0 },
+            })
+        );
+    }
+
+    #[test]
+    fn does_not_classify_user_vec_from_another_namespace() {
+        let current = rust_vec_type("Vec<i32>", SourceLanguage::Rust, 8, true, true);
+
+        assert_eq!(resolve_value_layout(&current, Some("app::Vec<i32>")), None);
+        assert_eq!(resolve_value_layout(&current, None), None);
+    }
+
+    #[test]
+    fn qualified_name_lookup_is_limited_to_ambiguous_rust_std_types() {
         assert!(requires_dwarf_qualified_name(&rust_string_type(
             "String",
             SourceLanguage::Rust,
@@ -610,6 +792,20 @@ mod tests {
         assert!(!requires_dwarf_qualified_name(&rust_str_type_64(
             "&str",
             SourceLanguage::Rust,
+        )));
+        assert!(requires_dwarf_qualified_name(&rust_vec_type(
+            "Vec<i32, alloc::alloc::Global>",
+            SourceLanguage::Rust,
+            8,
+            true,
+            true,
+        )));
+        assert!(!requires_dwarf_qualified_name(&rust_vec_type(
+            "alloc::vec::Vec<i32, alloc::alloc::Global>",
+            SourceLanguage::Rust,
+            8,
+            true,
+            true,
         )));
     }
 }
