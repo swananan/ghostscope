@@ -1,6 +1,7 @@
 # Rust releases whose target DWARF layouts GhostScope checks explicitly.
 # Keep this list small: each entry adds both a DWARF planning check and a
 # standard host e2e run against a binary produced by that exact toolchain.
+1.35.0
 1.49.0
 1.88.0
 1.93.0
