@@ -81,4 +81,16 @@ pub enum ValueCapturePlan {
         capacity: TypeProjection,
         element_stride: u64,
     },
+    /// Read hash-table metadata and capture a bounded prefix of control bytes
+    /// plus their corresponding physical entries. The source-language adapter
+    /// provides occupancy semantics; all paths, widths, and entry layout are
+    /// derived from DWARF.
+    IndirectHashTable {
+        control: TypeProjection,
+        data: Option<TypeProjection>,
+        length: TypeProjection,
+        bucket_mask: TypeProjection,
+        entry_stride: u64,
+        bucket_order: ghostscope_protocol::HashTableBucketOrder,
+    },
 }

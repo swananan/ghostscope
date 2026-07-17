@@ -14,6 +14,50 @@ pub const INDIRECT_SEQUENCE_HEADER_SIZE: usize = std::mem::size_of::<u64>() * 2;
 /// Offset of the captured element count in an indirect sequence header.
 pub const INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET: usize = std::mem::size_of::<u64>();
 
+/// Number of bytes used by a bounded hash-table payload. The header stores the
+/// logical item count, table capacity, captured bucket count, and byte offset
+/// of the bucket payload. Captured control bytes and any unused reserved
+/// control headroom sit between the header and the bucket payload.
+pub const HASH_TABLE_HEADER_SIZE: usize = std::mem::size_of::<u64>() * 4;
+
+/// Offset of the runtime table capacity in a bounded hash-table header.
+pub const HASH_TABLE_CAPACITY_OFFSET: usize = std::mem::size_of::<u64>();
+
+/// Offset of the captured bucket count in a bounded hash-table header.
+pub const HASH_TABLE_CAPTURED_BUCKETS_OFFSET: usize = std::mem::size_of::<u64>() * 2;
+
+/// Offset of the bucket payload offset in a bounded hash-table header.
+pub const HASH_TABLE_BUCKET_DATA_OFFSET: usize = std::mem::size_of::<u64>() * 3;
+
+/// Physical order of captured buckets relative to their control bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HashTableBucketOrder {
+    /// Bucket `i` is stored at increasing offsets from a dedicated data pointer.
+    Forward,
+    /// Bucket `i` is stored immediately before the control pointer, so a
+    /// contiguous capture appears in reverse control-index order.
+    Reverse,
+}
+
+/// One source-language value projected from a DWARF-described hash entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HashTableFieldPresentation {
+    pub offset: u64,
+    pub field_type: Box<TypeInfo>,
+}
+
+/// Source-language interpretation of one physical hash-table entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum HashTableEntryPresentation {
+    Map {
+        key: HashTableFieldPresentation,
+        value: HashTableFieldPresentation,
+    },
+    Set {
+        value: HashTableFieldPresentation,
+    },
+}
+
 /// User-space presentation selected for a captured value.
 ///
 /// `Dwarf` preserves the existing physical-layout formatter. Other variants
@@ -55,5 +99,13 @@ pub enum ValuePresentation {
         strong_field: String,
         weak_field: String,
         implicit_weak: u64,
+    },
+    /// A bounded sparse-table capture containing control bytes and physical
+    /// entries. Entry stride and projected key/value fields come from DWARF;
+    /// only hashbrown's occupied-control-bit semantics are language-specific.
+    HashTable {
+        entry_stride: u64,
+        bucket_order: HashTableBucketOrder,
+        entry: HashTableEntryPresentation,
     },
 }

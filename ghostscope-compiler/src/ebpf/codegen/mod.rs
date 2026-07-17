@@ -124,6 +124,22 @@ enum ComplexArgSource<'ctx> {
         max_elements: usize,
         max_len: usize,
     },
+    /// Bounded capture of a sparse hash-table prefix. Control bytes and bucket
+    /// bytes are stored separately in one semantic payload.
+    IndirectHashTable {
+        descriptor: RuntimeAddress<'ctx>,
+        control_offset: u64,
+        control_access_size: ghostscope_dwarf::MemoryAccessSize,
+        data: Option<(u64, ghostscope_dwarf::MemoryAccessSize)>,
+        length_offset: u64,
+        length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        bucket_mask_offset: u64,
+        bucket_mask_access_size: ghostscope_dwarf::MemoryAccessSize,
+        entry_stride: u64,
+        bucket_order: ghostscope_dwarf::HashTableBucketOrder,
+        max_buckets: usize,
+        max_len: usize,
+    },
     /// Assemble a synthetic struct from independently projected memory reads.
     ProjectedView {
         descriptor: RuntimeAddress<'ctx>,

@@ -2,6 +2,8 @@
 //!
 //! Converts PrintComplexVariable/PrintComplexFormat payloads into formatted text in user space.
 
+use std::borrow::Cow;
+
 use crate::trace_context::TraceContext;
 use crate::trace_event::{
     VariableStatus, VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET,
@@ -9,8 +11,10 @@ use crate::trace_event::{
 };
 use crate::type_info::TypeInfo;
 use crate::{
-    ValuePresentation, INDIRECT_BYTES_LENGTH_PREFIX_SIZE, INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET,
-    INDIRECT_SEQUENCE_HEADER_SIZE,
+    HashTableBucketOrder, HashTableEntryPresentation, HashTableFieldPresentation,
+    ValuePresentation, HASH_TABLE_BUCKET_DATA_OFFSET, HASH_TABLE_CAPACITY_OFFSET,
+    HASH_TABLE_CAPTURED_BUCKETS_OFFSET, HASH_TABLE_HEADER_SIZE, INDIRECT_BYTES_LENGTH_PREFIX_SIZE,
+    INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET, INDIRECT_SEQUENCE_HEADER_SIZE,
 };
 
 // Removed legacy simple variable wrapper; use complex paths only.
@@ -23,6 +27,12 @@ pub struct ParsedComplexVariable {
     pub access_path: String,
     pub status: u8, // 0 OK; non-zero means error payload in data
     pub data: Vec<u8>,
+}
+
+struct ParsedHashTablePayload<'a> {
+    original_count: u64,
+    controls: &'a [u8],
+    buckets: &'a [u8],
 }
 
 /// Format printer for converting PrintComplexFormat data to formatted strings
@@ -515,7 +525,7 @@ impl FormatPrinter {
                                             match Self::format_spec_payload_bytes(v, trace_context)
                                             {
                                                 Ok(bytes) => {
-                                                    result.push_str(&render_bytes(bytes));
+                                                    result.push_str(&render_bytes(bytes.as_ref()));
                                                 }
                                                 Err(error) => result.push_str(error),
                                             }
@@ -793,6 +803,11 @@ impl FormatPrinter {
                 weak_field,
                 *implicit_weak,
             ),
+            ValuePresentation::HashTable {
+                entry_stride,
+                bucket_order,
+                entry,
+            } => Self::format_hash_table_payload(data, *entry_stride, *bucket_order, entry),
         }
     }
 
@@ -973,15 +988,29 @@ impl FormatPrinter {
     fn format_spec_payload_bytes<'a>(
         variable: &'a ParsedComplexVariable,
         trace_context: &TraceContext,
-    ) -> Result<&'a [u8], &'static str> {
+    ) -> Result<Cow<'a, [u8]>, &'static str> {
         if variable.status == VariableStatus::ZeroLength as u8 {
-            return Ok(&[]);
+            return Ok(Cow::Borrowed(&[]));
         }
 
         let presentation = trace_context.get_value_presentation(variable.type_index);
+        if let ValuePresentation::HashTable {
+            entry_stride,
+            bucket_order,
+            ..
+        } = presentation
+        {
+            return Self::hash_table_occupied_bucket_bytes(
+                &variable.data,
+                *entry_stride,
+                *bucket_order,
+            )
+            .map(Cow::Owned)
+            .ok_or("<INVALID_SEMANTIC_PAYLOAD>");
+        }
         match Self::presentation_payload_bytes(&variable.data, presentation) {
-            Some(payload) => Ok(payload),
-            None if Self::is_semantic_truncation(variable, trace_context) => Ok(&[]),
+            Some(payload) => Ok(Cow::Borrowed(payload)),
+            None if Self::is_semantic_truncation(variable, trace_context) => Ok(Cow::Borrowed(&[])),
             None => Err("<INVALID_SEMANTIC_PAYLOAD>"),
         }
     }
@@ -1004,6 +1033,9 @@ impl FormatPrinter {
             ValuePresentation::Sequence { element_stride, .. } => {
                 let (_, _, payload) = Self::parse_sequence_payload(data, *element_stride)?;
                 Some(payload)
+            }
+            ValuePresentation::HashTable { entry_stride, .. } => {
+                Some(Self::parse_hash_table_payload(data, *entry_stride)?.buckets)
             }
             ValuePresentation::SingleField { .. }
             | ValuePresentation::SignedStateStruct { .. }
@@ -1071,6 +1103,171 @@ impl FormatPrinter {
         }
         output.push('"');
         output
+    }
+
+    fn payload_u64(data: &[u8], offset: usize) -> Option<u64> {
+        let end = offset.checked_add(std::mem::size_of::<u64>())?;
+        Some(u64::from_le_bytes(data.get(offset..end)?.try_into().ok()?))
+    }
+
+    fn parse_hash_table_payload(
+        data: &[u8],
+        entry_stride: u64,
+    ) -> Option<ParsedHashTablePayload<'_>> {
+        let original_count = Self::payload_u64(data, 0)?;
+        let capacity = Self::payload_u64(data, HASH_TABLE_CAPACITY_OFFSET)?;
+        let captured_buckets = Self::payload_u64(data, HASH_TABLE_CAPTURED_BUCKETS_OFFSET)?;
+        let bucket_offset = Self::payload_u64(data, HASH_TABLE_BUCKET_DATA_OFFSET)?;
+        if original_count > capacity || captured_buckets > capacity {
+            return None;
+        }
+
+        let captured_buckets = usize::try_from(captured_buckets).ok()?;
+        let control_end = HASH_TABLE_HEADER_SIZE.checked_add(captured_buckets)?;
+        let bucket_offset = usize::try_from(bucket_offset).ok()?;
+        // The eBPF layout fixes the bucket offset after the maximum reserved
+        // control region so the verifier sees constant destinations. A small
+        // runtime table can therefore leave unused control headroom here.
+        if bucket_offset < control_end {
+            return None;
+        }
+        let stride = usize::try_from(entry_stride).ok()?;
+        let bucket_len = captured_buckets.checked_mul(stride)?;
+        let bucket_end = bucket_offset.checked_add(bucket_len)?;
+        let controls = data.get(HASH_TABLE_HEADER_SIZE..control_end)?;
+        let buckets = data.get(bucket_offset..bucket_end)?;
+        let occupied = controls
+            .iter()
+            .filter(|control| (**control & 0x80) == 0)
+            .count();
+        let occupied = u64::try_from(occupied).ok()?;
+        if occupied > original_count
+            || (u64::try_from(captured_buckets).ok()? == capacity && occupied != original_count)
+        {
+            return None;
+        }
+
+        Some(ParsedHashTablePayload {
+            original_count,
+            controls,
+            buckets,
+        })
+    }
+
+    fn hash_table_bucket<'a>(
+        payload: &ParsedHashTablePayload<'a>,
+        entry_stride: u64,
+        bucket_order: HashTableBucketOrder,
+        control_index: usize,
+    ) -> Option<&'a [u8]> {
+        let stride = usize::try_from(entry_stride).ok()?;
+        let bucket_index = match bucket_order {
+            HashTableBucketOrder::Forward => control_index,
+            HashTableBucketOrder::Reverse => {
+                payload.controls.len().checked_sub(control_index + 1)?
+            }
+        };
+        let start = bucket_index.checked_mul(stride)?;
+        let end = start.checked_add(stride)?;
+        payload.buckets.get(start..end)
+    }
+
+    fn hash_table_occupied_bucket_bytes(
+        data: &[u8],
+        entry_stride: u64,
+        bucket_order: HashTableBucketOrder,
+    ) -> Option<Vec<u8>> {
+        let payload = Self::parse_hash_table_payload(data, entry_stride)?;
+        let stride = usize::try_from(entry_stride).ok()?;
+        let output_capacity = payload.controls.len().checked_mul(stride)?;
+        let mut entries = Vec::with_capacity(output_capacity);
+        for (control_index, control) in payload.controls.iter().enumerate() {
+            if (*control & 0x80) == 0 {
+                entries.extend_from_slice(Self::hash_table_bucket(
+                    &payload,
+                    entry_stride,
+                    bucket_order,
+                    control_index,
+                )?);
+            }
+        }
+        Some(entries)
+    }
+
+    fn format_hash_table_field(
+        entry_data: &[u8],
+        entry_stride: u64,
+        field: &HashTableFieldPresentation,
+    ) -> Option<String> {
+        let field_end = field.offset.checked_add(field.field_type.size())?;
+        if field_end > entry_stride {
+            return None;
+        }
+        let start = usize::try_from(field.offset).ok()?;
+        let end = usize::try_from(field_end).ok()?;
+        Some(Self::format_data_with_type_info_impl(
+            entry_data.get(start..end)?,
+            &field.field_type,
+            1,
+            32,
+        ))
+    }
+
+    fn format_hash_table_payload(
+        data: &[u8],
+        entry_stride: u64,
+        bucket_order: HashTableBucketOrder,
+        entry: &HashTableEntryPresentation,
+    ) -> String {
+        let Some(payload) = Self::parse_hash_table_payload(data, entry_stride) else {
+            return "<INVALID_HASH_TABLE_PAYLOAD>".to_string();
+        };
+        let type_name = match entry {
+            HashTableEntryPresentation::Map { .. } => "HashMap",
+            HashTableEntryPresentation::Set { .. } => "HashSet",
+        };
+        let mut result = format!("{type_name}(size={}) {{", payload.original_count);
+        let mut output_index = 0usize;
+        for (control_index, control) in payload.controls.iter().enumerate() {
+            if (*control & 0x80) != 0 {
+                continue;
+            }
+            let Some(entry_data) =
+                Self::hash_table_bucket(&payload, entry_stride, bucket_order, control_index)
+            else {
+                return "<INVALID_HASH_TABLE_PAYLOAD>".to_string();
+            };
+            if output_index > 0 {
+                result.push_str(", ");
+            }
+            match entry {
+                HashTableEntryPresentation::Map { key, value } => {
+                    let Some(key) = Self::format_hash_table_field(entry_data, entry_stride, key)
+                    else {
+                        return "<INVALID_HASH_TABLE_ENTRY_LAYOUT>".to_string();
+                    };
+                    let Some(value) =
+                        Self::format_hash_table_field(entry_data, entry_stride, value)
+                    else {
+                        return "<INVALID_HASH_TABLE_ENTRY_LAYOUT>".to_string();
+                    };
+                    result.push_str(&key);
+                    result.push_str(": ");
+                    result.push_str(&value);
+                }
+                HashTableEntryPresentation::Set { value } => {
+                    let Some(value) =
+                        Self::format_hash_table_field(entry_data, entry_stride, value)
+                    else {
+                        return "<INVALID_HASH_TABLE_ENTRY_LAYOUT>".to_string();
+                    };
+                    result.push_str(&value);
+                }
+            }
+            output_index += 1;
+        }
+        result.push('}');
+        result
     }
 
     fn parse_sequence_payload(data: &[u8], element_stride: u64) -> Option<(u64, u64, &[u8])> {
@@ -1819,6 +2016,253 @@ mod tests {
         data.extend_from_slice(&captured_count.to_le_bytes());
         data.extend_from_slice(captured);
         data
+    }
+
+    fn hash_table_payload(
+        original_count: u64,
+        capacity: u64,
+        controls: &[u8],
+        buckets: &[u8],
+    ) -> Vec<u8> {
+        hash_table_payload_with_control_headroom(original_count, capacity, controls, buckets, 0)
+    }
+
+    fn hash_table_payload_with_control_headroom(
+        original_count: u64,
+        capacity: u64,
+        controls: &[u8],
+        buckets: &[u8],
+        unused_control_bytes: usize,
+    ) -> Vec<u8> {
+        let bucket_offset = HASH_TABLE_HEADER_SIZE + controls.len() + unused_control_bytes;
+        let mut data = original_count.to_le_bytes().to_vec();
+        data.extend_from_slice(&capacity.to_le_bytes());
+        data.extend_from_slice(&(controls.len() as u64).to_le_bytes());
+        data.extend_from_slice(&(bucket_offset as u64).to_le_bytes());
+        data.extend_from_slice(controls);
+        data.resize(bucket_offset, 0);
+        data.extend_from_slice(buckets);
+        data
+    }
+
+    fn signed_i32_type() -> TypeInfo {
+        TypeInfo::BaseType {
+            name: "i32".to_string(),
+            size: 4,
+            encoding: gimli::constants::DW_ATE_signed.0 as u16,
+        }
+    }
+
+    fn unsigned_u16_type() -> TypeInfo {
+        TypeInfo::BaseType {
+            name: "u16".to_string(),
+            size: 2,
+            encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+        }
+    }
+
+    #[test]
+    fn test_hash_table_presentation_filters_controls_and_projects_fields() {
+        let controls = [0xff, 0x12, 0x80, 0x01];
+        let mut buckets = vec![0u8; 4 * 8];
+        buckets[8..12].copy_from_slice(&(-7_i32).to_le_bytes());
+        buckets[12..14].copy_from_slice(&13_u16.to_le_bytes());
+        buckets[24..28].copy_from_slice(&29_i32.to_le_bytes());
+        buckets[28..30].copy_from_slice(&17_u16.to_le_bytes());
+        let data = hash_table_payload(2, 4, &controls, &buckets);
+        let presentation = ValuePresentation::HashTable {
+            entry_stride: 8,
+            bucket_order: HashTableBucketOrder::Forward,
+            entry: HashTableEntryPresentation::Map {
+                key: HashTableFieldPresentation {
+                    offset: 0,
+                    field_type: Box::new(signed_i32_type()),
+                },
+                value: HashTableFieldPresentation {
+                    offset: 4,
+                    field_type: Box::new(unsigned_u16_type()),
+                },
+            },
+        };
+
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(
+                &data,
+                &TypeInfo::UnknownType {
+                    name: "HashMap".to_string(),
+                },
+                &presentation,
+            ),
+            "HashMap(size=2) {-7: 13, 29: 17}"
+        );
+    }
+
+    #[test]
+    fn test_hash_table_presentation_handles_reverse_and_zst_buckets() {
+        let controls = [0x01, 0xff, 0x02, 0x80];
+        let mut reverse_buckets = vec![0u8; 4 * 4];
+        reverse_buckets[12..16].copy_from_slice(&5_i32.to_le_bytes());
+        reverse_buckets[4..8].copy_from_slice(&(-9_i32).to_le_bytes());
+        let reverse = hash_table_payload(2, 4, &controls, &reverse_buckets);
+        let set = ValuePresentation::HashTable {
+            entry_stride: 4,
+            bucket_order: HashTableBucketOrder::Reverse,
+            entry: HashTableEntryPresentation::Set {
+                value: HashTableFieldPresentation {
+                    offset: 0,
+                    field_type: Box::new(signed_i32_type()),
+                },
+            },
+        };
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(
+                &reverse,
+                &TypeInfo::UnknownType {
+                    name: "HashSet".to_string(),
+                },
+                &set,
+            ),
+            "HashSet(size=2) {5, -9}"
+        );
+
+        let zst = hash_table_payload(1, 1, &[0x00], &[]);
+        let unit_set = ValuePresentation::HashTable {
+            entry_stride: 0,
+            bucket_order: HashTableBucketOrder::Reverse,
+            entry: HashTableEntryPresentation::Set {
+                value: HashTableFieldPresentation {
+                    offset: 0,
+                    field_type: Box::new(TypeInfo::BaseType {
+                        name: "()".to_string(),
+                        size: 0,
+                        encoding: 0,
+                    }),
+                },
+            },
+        };
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(
+                &zst,
+                &TypeInfo::UnknownType {
+                    name: "HashSet".to_string(),
+                },
+                &unit_set,
+            ),
+            "HashSet(size=1) {()}"
+        );
+    }
+
+    #[test]
+    fn test_hash_table_raw_specs_skip_unoccupied_buckets() {
+        let controls = [0x01, 0xff, 0x02, 0x80];
+        let buckets = vec![0xde, 0xad, 0x42, 0x00, 0xbe, 0xef, 0x41, 0x00];
+        let data = hash_table_payload(2, 4, &controls, &buckets);
+
+        let presentation = ValuePresentation::HashTable {
+            entry_stride: 2,
+            bucket_order: HashTableBucketOrder::Reverse,
+            entry: HashTableEntryPresentation::Set {
+                value: HashTableFieldPresentation {
+                    offset: 0,
+                    field_type: Box::new(unsigned_u16_type()),
+                },
+            },
+        };
+        let mut trace_context = TraceContext::new();
+        let format_index = trace_context.add_string("{:x}|{:s}".to_string()).unwrap();
+        let type_index = trace_context
+            .add_type_with_presentation(
+                TypeInfo::UnknownType {
+                    name: "HashSet".to_string(),
+                },
+                presentation,
+            )
+            .unwrap();
+        let name_index = trace_context.add_variable_name("set".to_string()).unwrap();
+        let variable = ParsedComplexVariable {
+            var_name_index: name_index,
+            type_index,
+            access_path: String::new(),
+            status: VariableStatus::Ok as u8,
+            data,
+        };
+
+        assert_eq!(
+            FormatPrinter::format_complex_print_data(
+                format_index,
+                &[variable.clone(), variable],
+                &trace_context,
+            ),
+            "41 00 42 00|A"
+        );
+
+        let huge_count_format = trace_context.add_string("{:x}".to_string()).unwrap();
+        let huge_count = ParsedComplexVariable {
+            var_name_index: name_index,
+            type_index,
+            access_path: String::new(),
+            status: VariableStatus::Truncated as u8,
+            data: hash_table_payload(u64::MAX, u64::MAX, &[0x01], &[0x34, 0x12]),
+        };
+        assert_eq!(
+            FormatPrinter::format_complex_print_data(
+                huge_count_format,
+                &[huge_count],
+                &trace_context,
+            ),
+            "34 12 <truncated>"
+        );
+    }
+
+    #[test]
+    fn test_hash_table_payload_validates_complete_occupancy_and_keeps_partial_capture() {
+        let presentation = ValuePresentation::HashTable {
+            entry_stride: 4,
+            bucket_order: HashTableBucketOrder::Forward,
+            entry: HashTableEntryPresentation::Set {
+                value: HashTableFieldPresentation {
+                    offset: 0,
+                    field_type: Box::new(signed_i32_type()),
+                },
+            },
+        };
+        let mut buckets = vec![0_u8; 8];
+        buckets[..4].copy_from_slice(&5_i32.to_le_bytes());
+
+        let invalid_complete = hash_table_payload(2, 2, &[0x01, 0xff], &buckets);
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(
+                &invalid_complete,
+                &TypeInfo::UnknownType {
+                    name: "HashSet".to_string(),
+                },
+                &presentation,
+            ),
+            "<INVALID_HASH_TABLE_PAYLOAD>"
+        );
+
+        let partial = hash_table_payload_with_control_headroom(2, 4, &[0x01, 0xff], &buckets, 6);
+        let mut trace_context = TraceContext::new();
+        let type_index = trace_context
+            .add_type_with_presentation(
+                TypeInfo::UnknownType {
+                    name: "HashSet".to_string(),
+                },
+                presentation,
+            )
+            .unwrap();
+        let name_index = trace_context.add_variable_name("set".to_string()).unwrap();
+        assert_eq!(
+            FormatPrinter::format_complex_variable_with_status(
+                name_index,
+                type_index,
+                "",
+                &partial,
+                VariableStatus::Truncated as u8,
+                &trace_context,
+            ),
+            "set = HashSet(size=2) {5} <truncated>"
+        );
     }
 
     #[test]

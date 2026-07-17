@@ -15,8 +15,10 @@ pub mod type_info;
 
 pub use type_kind::{consts, TypeKind};
 pub use value_presentation::{
-    ValuePresentation, INDIRECT_BYTES_LENGTH_PREFIX_SIZE, INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET,
-    INDIRECT_SEQUENCE_HEADER_SIZE,
+    HashTableBucketOrder, HashTableEntryPresentation, HashTableFieldPresentation,
+    ValuePresentation, HASH_TABLE_BUCKET_DATA_OFFSET, HASH_TABLE_CAPACITY_OFFSET,
+    HASH_TABLE_CAPTURED_BUCKETS_OFFSET, HASH_TABLE_HEADER_SIZE, INDIRECT_BYTES_LENGTH_PREFIX_SIZE,
+    INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET, INDIRECT_SEQUENCE_HEADER_SIZE,
 };
 
 pub use trace_event::{

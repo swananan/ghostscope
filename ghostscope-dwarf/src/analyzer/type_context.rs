@@ -410,6 +410,98 @@ impl DwarfAnalyzer {
                     },
                 }));
             }
+            crate::language::ValueLayout::HashTable(layout) => {
+                let table = self.project_resolved_member_path(
+                    current,
+                    &layout.table_path,
+                    type_module_path,
+                )?;
+                let Some(table_type_id) = table.resolved_type.identity.layout_dwarf_id() else {
+                    return Ok(None);
+                };
+                let Some(entry_type) = self.template_type_parameter(table_type_id, 0)? else {
+                    return Ok(None);
+                };
+                if matches!(
+                    strip_type_aliases(&entry_type.summary),
+                    TypeInfo::UnknownType { .. } | TypeInfo::OptimizedOut { .. }
+                ) {
+                    return Ok(None);
+                }
+                let Some(entry_type_id) = entry_type.identity.layout_dwarf_id() else {
+                    return Ok(None);
+                };
+                let entry_stride = entry_type.summary.size();
+                let field = |index| {
+                    self.tuple_member_layout(entry_type_id, &entry_type.summary, index)
+                        .ok()
+                        .map(|field| crate::HashTableFieldPresentation {
+                            offset: field.offset,
+                            field_type: Box::new(field.member_type),
+                        })
+                };
+                let entry = match layout.kind {
+                    crate::language::HashTableKind::Map => {
+                        let (Some(key), Some(value)) = (field(0), field(1)) else {
+                            return Ok(None);
+                        };
+                        crate::HashTableEntryPresentation::Map { key, value }
+                    }
+                    crate::language::HashTableKind::Set => {
+                        let Some(value) = field(0) else {
+                            return Ok(None);
+                        };
+                        crate::HashTableEntryPresentation::Set { value }
+                    }
+                };
+
+                let control = self.project_resolved_member_path(
+                    current,
+                    &layout.control_path,
+                    type_module_path,
+                )?;
+                let data = match layout.data_path {
+                    Some(path) => {
+                        Some(self.project_resolved_member_path(current, &path, type_module_path)?)
+                    }
+                    None => None,
+                };
+                if let Some(data) = &data {
+                    let TypeInfo::PointerType { target_type, .. } =
+                        strip_type_aliases(&data.resolved_type.summary)
+                    else {
+                        return Ok(None);
+                    };
+                    if strip_type_aliases(target_type) != strip_type_aliases(&entry_type.summary) {
+                        return Ok(None);
+                    }
+                }
+                let length = self.project_resolved_member_path(
+                    current,
+                    &layout.length_path,
+                    type_module_path,
+                )?;
+                let bucket_mask = self.project_resolved_member_path(
+                    current,
+                    &layout.bucket_mask_path,
+                    type_module_path,
+                )?;
+                return Ok(Some(ValueReadPlan {
+                    presentation: crate::ValuePresentation::HashTable {
+                        entry_stride,
+                        bucket_order: layout.bucket_order,
+                        entry,
+                    },
+                    capture: ValueCapturePlan::IndirectHashTable {
+                        control,
+                        data,
+                        length,
+                        bucket_mask,
+                        entry_stride,
+                        bucket_order: layout.bucket_order,
+                    },
+                }));
+            }
             crate::language::ValueLayout::IndirectSequence(layout) => layout,
         };
         let data =
