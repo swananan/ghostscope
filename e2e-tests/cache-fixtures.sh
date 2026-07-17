@@ -33,6 +33,19 @@ fixture_cache_paths() {
         if [[ -f "$rust_binary" ]]; then
             printf '%s\n' "$rust_binary"
         fi
+
+        # The target-compiler matrix stores one standalone Rust binary below
+        # bin/<toolchain>. These are built with host rustup toolchains after
+        # the fixed fixture-compiler image has produced the regular fixtures.
+        local rust_compat_dir="e2e-tests/tests/fixtures/rust_compat_program/bin"
+        if [[ -d "$rust_compat_dir" ]]; then
+            find "$rust_compat_dir" \
+                -mindepth 2 \
+                -maxdepth 2 \
+                -type f \
+                -perm -111 \
+                -print
+        fi
     ) | LC_ALL=C sort -u
 }
 

@@ -22,8 +22,9 @@ pub use pc_context::{
     AddressSpaceInfo, FunctionParameter, InlineFrame, PcContext, PcLineInfo, PcRange,
 };
 pub use type_context::{
-    CompilationUnitMetadata, ProducerInfo, ResolvedType, SemanticType, SourceLanguage,
-    SyntheticTypeKind, TypeIdentity, TypeOrigin, TypeProjection, TypeProjectionLayout,
+    CompilationUnitMetadata, ProducerInfo, ResolvedType, RustcVersion, SemanticType,
+    SourceLanguage, SyntheticTypeKind, TypeIdentity, TypeOrigin, TypeProjection,
+    TypeProjectionLayout,
 };
 pub use type_layout::{
     indexable_element_layout, is_aggregate_type, is_pointer_or_array_type, member_layout,
