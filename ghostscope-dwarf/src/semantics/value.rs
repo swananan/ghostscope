@@ -44,6 +44,23 @@ pub struct ProjectedViewField {
     pub value: ProjectedValueRead,
 }
 
+/// One initialized-slot array embedded in a Rust B-Tree leaf-node layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BTreeArrayCapture {
+    pub offset: u64,
+    pub slot_stride: u64,
+}
+
+/// Child-pointer array embedded in the DWARF-described internal-node layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BTreeEdgesCapture {
+    pub offset_from_leaf: u64,
+    pub slot_stride: u64,
+    pub pointer_offset: u64,
+    pub pointer_size: u64,
+    pub edge_count: u64,
+}
+
 /// Physical capture strategy used by a semantic value adapter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueCapturePlan {
@@ -92,5 +109,19 @@ pub enum ValueCapturePlan {
         bucket_mask: TypeProjection,
         entry_stride: u64,
         bucket_order: ghostscope_protocol::HashTableBucketOrder,
+    },
+    /// Capture a bounded breadth-first snapshot of a Rust B-Tree. Root and
+    /// node metadata are projections of concrete DIEs; array capacities,
+    /// strides, embedded pointer offsets, and widths are likewise DWARF
+    /// derived.
+    IndirectBTree {
+        root_pointer: TypeProjection,
+        root_height: TypeProjection,
+        length: TypeProjection,
+        node_length: TypeProjection,
+        keys: BTreeArrayCapture,
+        values: Option<BTreeArrayCapture>,
+        edges: BTreeEdgesCapture,
+        node_capacity: u64,
     },
 }

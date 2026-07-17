@@ -215,6 +215,54 @@ fn hash_table_capture_limits(cap: usize, entry_stride: u64) -> Result<(usize, us
     Ok((max_buckets, max_len, data_len))
 }
 
+fn btree_capture_limits(
+    cap: usize,
+    node_capacity: u64,
+    key_stride: u64,
+    value_stride: Option<u64>,
+) -> Result<(usize, usize, usize)> {
+    // Nodes are emitted as fixed control-flow blocks so kernels without
+    // bounded-loop support can verify the program. Cap the unrolled code size.
+    const MAX_CAPTURE_NODES: usize = 16;
+
+    let capacity = usize::try_from(node_capacity).map_err(|_| {
+        CodeGenError::DwarfError(format!(
+            "B-Tree node capacity {node_capacity} does not fit this host"
+        ))
+    })?;
+    let key_stride = usize::try_from(key_stride).map_err(|_| {
+        CodeGenError::DwarfError("B-Tree key slot stride does not fit this host".to_string())
+    })?;
+    let value_stride = value_stride
+        .map(|stride| {
+            usize::try_from(stride).map_err(|_| {
+                CodeGenError::DwarfError(
+                    "B-Tree value slot stride does not fit this host".to_string(),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let slot_bytes = key_stride
+        .checked_add(value_stride)
+        .and_then(|stride| stride.checked_mul(capacity))
+        .and_then(|bytes| bytes.checked_add(ghostscope_protocol::BTREE_NODE_HEADER_SIZE))
+        .ok_or_else(|| CodeGenError::DwarfError("B-Tree node payload overflow".to_string()))?;
+    if slot_bytes == 0 {
+        return Err(CodeGenError::DwarfError(
+            "B-Tree node payload has no metadata".to_string(),
+        ));
+    }
+    let max_nodes = (cap / slot_bytes).min(MAX_CAPTURE_NODES);
+    let max_len = max_nodes
+        .checked_mul(slot_bytes)
+        .ok_or_else(|| CodeGenError::DwarfError("B-Tree payload size overflow".to_string()))?;
+    let data_len = ghostscope_protocol::BTREE_HEADER_SIZE
+        .checked_add(max_len)
+        .ok_or_else(|| CodeGenError::DwarfError("B-Tree payload size overflow".to_string()))?;
+    Ok((max_nodes, max_len, data_len))
+}
+
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(super) const UNKNOWN_CHAR_ARRAY_READ_FALLBACK: usize = 256;
 
@@ -437,6 +485,66 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         entry_stride,
                         bucket_order,
                         max_buckets,
+                        max_len,
+                    },
+                )
+            }
+            ghostscope_dwarf::ValueCapturePlan::IndirectBTree {
+                root_pointer,
+                root_height,
+                length,
+                node_length,
+                keys,
+                values,
+                edges,
+                node_capacity,
+            } => {
+                let (root_pointer_offset, root_pointer_access_size) =
+                    metadata_member(&root_pointer, "B-Tree root pointer")?;
+                let (root_height_offset, root_height_access_size) =
+                    metadata_member(&root_height, "B-Tree root height")?;
+                let (length_offset, length_access_size) =
+                    metadata_member(&length, "B-Tree length")?;
+                let (node_length_offset, node_length_access_size) =
+                    metadata_member(&node_length, "B-Tree node length")?;
+                let pointer_access_size =
+                    exact_memory_access_size(edges.pointer_size, "B-Tree edge pointer")?;
+                let values_source = values.map(|values| BTreeArraySource {
+                    offset: values.offset,
+                    slot_stride: values.slot_stride,
+                });
+                let (max_nodes, max_len, data_len) = btree_capture_limits(
+                    cap,
+                    node_capacity,
+                    keys.slot_stride,
+                    values_source.map(|values| values.slot_stride),
+                )?;
+                (
+                    data_len,
+                    ComplexArgSource::IndirectBTree {
+                        descriptor,
+                        root_pointer_offset,
+                        root_pointer_access_size,
+                        root_height_offset,
+                        root_height_access_size,
+                        length_offset,
+                        length_access_size,
+                        node_length_offset,
+                        node_length_access_size,
+                        keys: BTreeArraySource {
+                            offset: keys.offset,
+                            slot_stride: keys.slot_stride,
+                        },
+                        values: values_source,
+                        edges: BTreeEdgesSource {
+                            offset_from_leaf: edges.offset_from_leaf,
+                            slot_stride: edges.slot_stride,
+                            pointer_offset: edges.pointer_offset,
+                            pointer_access_size,
+                            edge_count: edges.edge_count,
+                        },
+                        node_capacity,
+                        max_nodes,
                         max_len,
                     },
                 )
@@ -1320,6 +1428,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             | ComplexArgSource::IndirectSequence { .. }
             | ComplexArgSource::IndirectRingSequence { .. }
             | ComplexArgSource::IndirectHashTable { .. }
+            | ComplexArgSource::IndirectBTree { .. }
             | ComplexArgSource::ProjectedView { .. } => {
                 // Use ComplexFormat with "{}"; generate_print_complex_format_instruction handles MemDump
                 let fmt_idx = self.trace_context.add_string("{}".to_string())?;
@@ -1719,6 +1828,25 @@ mod semantic_value_tests {
         let error = metadata_access_size(&projected, "data").unwrap_err();
 
         assert!(error.to_string().contains("unsupported DWARF size 3"));
+    }
+
+    #[test]
+    fn btree_capture_limits_reserve_complete_fixed_node_records() {
+        let header = ghostscope_protocol::BTREE_HEADER_SIZE;
+        assert_eq!(
+            btree_capture_limits(108, 2, 4, Some(2)).unwrap(),
+            (3, 108, header + 108)
+        );
+        assert_eq!(
+            btree_capture_limits(107, 2, 4, Some(2)).unwrap(),
+            (2, 72, header + 72)
+        );
+
+        let zst_record_size = ghostscope_protocol::BTREE_NODE_HEADER_SIZE;
+        assert_eq!(
+            btree_capture_limits(zst_record_size * 20, 11, 0, Some(0)).unwrap(),
+            (16, zst_record_size * 16, header + zst_record_size * 16,)
+        );
     }
 
     #[test]

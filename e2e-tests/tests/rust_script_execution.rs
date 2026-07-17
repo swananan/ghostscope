@@ -1172,6 +1172,157 @@ async fn test_rust_hash_collection_plans_follow_dwarf_raw_table_layout() -> anyh
 }
 
 #[tokio::test]
+async fn test_rust_btree_collection_plans_follow_dwarf_node_layout() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let context = analyzer
+        .lookup_function_addresses("observe_btree_collections")
+        .into_iter()
+        .find_map(|address| analyzer.resolve_pc(&address).ok())
+        .ok_or_else(|| anyhow::anyhow!("expected observe_btree_collections context"))?;
+
+    for (parameter, is_map) in [("map", true), ("set", false)] {
+        let parameter_plan = analyzer
+            .plan_variable_by_name(&context, parameter)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter plan"))?;
+        let parameter_type = analyzer
+            .resolved_type_for_plan(&parameter_plan)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter type"))?;
+        let value_plan = analyzer
+            .value_read_plan(&parameter_type, Some(&binary_path))?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} semantic plan"))?;
+        let ghostscope_dwarf::ValuePresentation::BTree {
+            node_capacity,
+            entry,
+        } = value_plan.presentation
+        else {
+            anyhow::bail!("expected {parameter} B-Tree presentation")
+        };
+        assert_eq!(node_capacity, 11);
+        match entry {
+            ghostscope_dwarf::BTreeEntryPresentation::Map { key, value } => {
+                assert!(is_map);
+                assert_eq!(key.slot_stride, 4);
+                assert_eq!(key.value_offset, 0);
+                assert_eq!(key.field_type.type_name(), "i32");
+                assert_eq!(value.slot_stride, 2);
+                assert_eq!(value.value_offset, 0);
+                assert_eq!(value.field_type.type_name(), "u16");
+            }
+            ghostscope_dwarf::BTreeEntryPresentation::Set { value } => {
+                assert!(!is_map);
+                assert_eq!(value.slot_stride, 4);
+                assert_eq!(value.value_offset, 0);
+                assert_eq!(value.field_type.type_name(), "i32");
+            }
+        }
+
+        let ghostscope_dwarf::ValueCapturePlan::IndirectBTree {
+            root_pointer,
+            root_height,
+            length,
+            node_length,
+            keys,
+            values,
+            edges,
+            node_capacity: capture_capacity,
+        } = value_plan.capture
+        else {
+            anyhow::bail!("expected {parameter} bounded B-Tree capture")
+        };
+        assert!(matches!(
+            root_pointer.layout,
+            ghostscope_dwarf::TypeProjectionLayout::Member { .. }
+        ));
+        assert!(matches!(
+            ghostscope_dwarf::strip_type_aliases(&root_pointer.resolved_type.summary),
+            ghostscope_dwarf::TypeInfo::PointerType { size: 8, .. }
+        ));
+        for scalar in [&root_height, &length] {
+            assert!(matches!(
+                scalar.layout,
+                ghostscope_dwarf::TypeProjectionLayout::Member { .. }
+            ));
+            assert!(matches!(
+                ghostscope_dwarf::strip_type_aliases(&scalar.resolved_type.summary),
+                ghostscope_dwarf::TypeInfo::BaseType { size: 8, .. }
+            ));
+        }
+        assert!(matches!(
+            ghostscope_dwarf::strip_type_aliases(&node_length.resolved_type.summary),
+            ghostscope_dwarf::TypeInfo::BaseType { size: 2, .. }
+        ));
+        assert_eq!(capture_capacity, node_capacity);
+        assert_eq!(keys.slot_stride, 4);
+        assert_eq!(values.is_some(), is_map);
+        if let Some(values) = values {
+            assert_eq!(values.slot_stride, 2);
+        }
+        assert_eq!(edges.edge_count, node_capacity + 1);
+        assert_eq!(edges.slot_stride, 8);
+        assert_eq!(edges.pointer_size, 8);
+        assert!(edges.pointer_offset < edges.slot_stride);
+    }
+
+    for (parameter, expected_map) in [("unit_map", true), ("unit_set", false)] {
+        let parameter_plan = analyzer
+            .plan_variable_by_name(&context, parameter)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter plan"))?;
+        let parameter_type = analyzer
+            .resolved_type_for_plan(&parameter_plan)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter type"))?;
+        let presentation = analyzer
+            .value_read_plan(&parameter_type, Some(&binary_path))?
+            .map(|plan| plan.presentation)
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} semantic plan"))?;
+        let ghostscope_dwarf::ValuePresentation::BTree { entry, .. } = presentation else {
+            anyhow::bail!("expected {parameter} B-Tree presentation")
+        };
+        let (is_map, field_strides) = match entry {
+            ghostscope_dwarf::BTreeEntryPresentation::Map { key, value } => {
+                (true, vec![key.slot_stride, value.slot_stride])
+            }
+            ghostscope_dwarf::BTreeEntryPresentation::Set { value } => {
+                (false, vec![value.slot_stride])
+            }
+        };
+        assert_eq!(is_map, expected_map);
+        assert!(field_strides.into_iter().all(|stride| stride == 0));
+    }
+
+    let user_context = analyzer
+        .lookup_function_addresses("observe_user_btree_collections")
+        .into_iter()
+        .find_map(|address| analyzer.resolve_pc(&address).ok())
+        .ok_or_else(|| anyhow::anyhow!("expected user B-Tree collection context"))?;
+    for parameter in ["map", "set"] {
+        let parameter_plan = analyzer
+            .plan_variable_by_name(&user_context, parameter)?
+            .ok_or_else(|| anyhow::anyhow!("expected user {parameter} plan"))?;
+        let parameter_pointer = analyzer
+            .resolved_type_for_plan(&parameter_plan)?
+            .ok_or_else(|| anyhow::anyhow!("expected user {parameter} type"))?;
+        let parameter_type = analyzer
+            .project_resolved_type(
+                &parameter_pointer,
+                &ghostscope_dwarf::VariableAccessSegment::Dereference,
+                Some(&binary_path),
+            )?
+            .resolved_type;
+        assert!(
+            analyzer
+                .value_read_plan(&parameter_type, Some(&binary_path))?
+                .is_none(),
+            "user-defined {parameter} must retain DWARF presentation"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_str_values() -> anyhow::Result<()> {
     init();
 
@@ -1694,6 +1845,164 @@ mem_dump_cap = 9
     assert!(line.contains("HashMap(size=2)"), "{line}");
     assert!(line.contains("<truncated>"), "{line}");
     assert!(!line.contains("<INVALID_"), "{line}");
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_btree_map_and_set_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_btree_collections {
+    print "RBTREE_MAP:{}", map;
+    print "RBTREE_SET:{}", set;
+    print "RBTREE_EMPTY_MAP:{}", empty_map;
+    print "RBTREE_EMPTY_SET:{}", empty_set;
+    print "RBTREE_UNIT_MAP:{}", unit_map;
+    print "RBTREE_UNIT_SET:{}", unit_set;
+    print "RBTREE_RAW:{:x}", map;
+}
+"#;
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_config_content(
+            r#"
+[ebpf]
+mem_dump_cap = 90
+"#,
+        )
+        .attach_to(&target)
+        .timeout_secs(9)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.contains("RBTREE_MAP:BTreeMap(size=2) {-7: 13, 29: 17}"),
+        "Expected Rust BTreeMap output: {stdout}"
+    );
+    assert!(
+        stdout.contains("RBTREE_SET:BTreeSet(size=2) {-9, 5}"),
+        "Expected Rust BTreeSet output: {stdout}"
+    );
+    assert!(
+        stdout.contains("RBTREE_EMPTY_MAP:BTreeMap(size=0) {}"),
+        "Expected empty Rust BTreeMap output: {stdout}"
+    );
+    assert!(
+        stdout.contains("RBTREE_EMPTY_SET:BTreeSet(size=0) {}"),
+        "Expected empty Rust BTreeSet output: {stdout}"
+    );
+    assert!(
+        stdout.contains("RBTREE_UNIT_MAP:BTreeMap(size=1) {(): ()}"),
+        "Expected ZST Rust BTreeMap output: {stdout}"
+    );
+    assert!(
+        stdout.contains("RBTREE_UNIT_SET:BTreeSet(size=1) {()}"),
+        "Expected ZST Rust BTreeSet output: {stdout}"
+    );
+    assert!(
+        stdout.contains("RBTREE_RAW:f9 ff ff ff 0d 00 1d 00 00 00 11 00"),
+        "Expected logical raw BTreeMap bytes: {stdout}"
+    );
+    assert!(!stdout.contains("<INVALID_"), "Invalid payload: {stdout}");
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_internal_btree_nodes_in_order() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_internal_btree_collections {
+    print "RBTREE_INTERNAL_MAP:{}", map;
+    print "RBTREE_INTERNAL_SET:{}", set;
+}
+"#;
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_config_content(
+            r#"
+[ebpf]
+mem_dump_cap = 450
+"#,
+        )
+        .attach_to(&target)
+        .timeout_secs(9)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    let expected_map = (0_i32..20)
+        .map(|key| format!("{key}: {}", key * 3 + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let expected_set = (0_i32..20)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(
+        stdout.contains(&format!(
+            "RBTREE_INTERNAL_MAP:BTreeMap(size=20) {{{expected_map}}}"
+        )),
+        "Expected complete internal Rust BTreeMap output: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "RBTREE_INTERNAL_SET:BTreeSet(size=20) {{{expected_set}}}"
+        )),
+        "Expected complete internal Rust BTreeSet output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("<truncated>"),
+        "Unexpected truncation: {stdout}"
+    );
+    assert!(!stdout.contains("<INVALID_"), "Invalid payload: {stdout}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_deep_btree_keeps_valid_truncated_prefix() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_deep_btree_collections {
+    print "RBTREE_DEEP_MAP:{}", map;
+    print "RBTREE_DEEP_SET:{}", set;
+}
+"#;
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    for marker in ["RBTREE_DEEP_MAP:BTreeMap", "RBTREE_DEEP_SET:BTreeSet"] {
+        let line = stdout
+            .lines()
+            .find(|line| line.contains(marker))
+            .ok_or_else(|| anyhow::anyhow!("missing {marker} output: {stdout}"))?;
+        assert!(line.contains("size=160"), "{line}");
+        assert!(line.contains("<truncated>"), "{line}");
+        assert!(!line.contains("<INVALID_"), "{line}");
+    }
     assert!(
         !stdout.contains("ExprError"),
         "Unexpected ExprError: {stdout}"

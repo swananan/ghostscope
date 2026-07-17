@@ -43,17 +43,17 @@ pub use core::{
 // Re-export semantic contract types.
 pub use semantics::{
     indexable_element_layout, is_aggregate_type, is_pointer_or_array_type, member_layout,
-    strip_type_aliases, AddressOrigin, AddressSpaceInfo, CfaRulePlan, CompactUnwindRow,
-    CompactUnwindStats, CompactUnwindTable, CompilationUnitMetadata, FunctionParameter,
-    IndexableElementLayout, InlineFrame, LvalueAddressPlan, MemberLayout, PcContext, PcLineInfo,
-    PcRange, PlannedAddress, PlannedAddressKind, PlannedValue, ProducerInfo, ProjectedValueRead,
-    ProjectedValueStep, ProjectedViewField, RegisterRecoveryPlan, ResolvedType, RingSequenceLength,
-    RuntimeComputedExpr, RuntimeComputedKind, SemanticType, SourceLanguage, SyntheticTypeKind,
-    TypeIdentity, TypeLayoutError, TypeOrigin, TypeProjection, TypeProjectionLayout,
-    UnwindDiagnostic, UnwindDiagnosticKind, ValueCapturePlan, ValueReadPlan, VariableAccessPath,
-    VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
-    VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
-    VisibleVariable, VisibleVariablesResult,
+    strip_type_aliases, AddressOrigin, AddressSpaceInfo, BTreeArrayCapture, BTreeEdgesCapture,
+    CfaRulePlan, CompactUnwindRow, CompactUnwindStats, CompactUnwindTable, CompilationUnitMetadata,
+    FunctionParameter, IndexableElementLayout, InlineFrame, LvalueAddressPlan, MemberLayout,
+    PcContext, PcLineInfo, PcRange, PlannedAddress, PlannedAddressKind, PlannedValue, ProducerInfo,
+    ProjectedValueRead, ProjectedValueStep, ProjectedViewField, RegisterRecoveryPlan, ResolvedType,
+    RingSequenceLength, RuntimeComputedExpr, RuntimeComputedKind, SemanticType, SourceLanguage,
+    SyntheticTypeKind, TypeIdentity, TypeLayoutError, TypeOrigin, TypeProjection,
+    TypeProjectionLayout, UnwindDiagnostic, UnwindDiagnosticKind, ValueCapturePlan, ValueReadPlan,
+    VariableAccessPath, VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan,
+    VariableMaterialization, VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic,
+    VariableReadPlan, VisibleVariable, VisibleVariablesResult,
 };
 
 pub use semantics::{
@@ -68,8 +68,9 @@ pub use semantics::is_pointer_or_array_type as is_c_pointer_or_array_type;
 
 // Re-export type definitions from protocol (avoiding circular dependencies)
 pub use ghostscope_protocol::{
-    EnumVariant, HashTableBucketOrder, HashTableEntryPresentation, HashTableFieldPresentation,
-    StructMember, TypeCache, TypeInfo, TypeKind, TypeQualifier, ValuePresentation,
+    BTreeEntryPresentation, BTreeFieldPresentation, EnumVariant, HashTableBucketOrder,
+    HashTableEntryPresentation, HashTableFieldPresentation, StructMember, TypeCache, TypeInfo,
+    TypeKind, TypeQualifier, ValuePresentation,
 };
 
 // Re-export gimli types that external users need

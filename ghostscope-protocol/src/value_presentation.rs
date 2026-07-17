@@ -29,6 +29,26 @@ pub const HASH_TABLE_CAPTURED_BUCKETS_OFFSET: usize = std::mem::size_of::<u64>()
 /// Offset of the bucket payload offset in a bounded hash-table header.
 pub const HASH_TABLE_BUCKET_DATA_OFFSET: usize = std::mem::size_of::<u64>() * 3;
 
+/// Number of bytes in a bounded B-Tree payload header. It stores the logical
+/// item count, reserved node-slot count, and captured item count.
+pub const BTREE_HEADER_SIZE: usize = std::mem::size_of::<u64>() * 3;
+
+/// Offset of the reserved node-slot count in a B-Tree payload header.
+pub const BTREE_NODE_SLOT_COUNT_OFFSET: usize = std::mem::size_of::<u64>();
+
+/// Offset of the captured item count in a B-Tree payload header.
+pub const BTREE_CAPTURED_ITEM_COUNT_OFFSET: usize = std::mem::size_of::<u64>() * 2;
+
+/// Fixed metadata at the start of each captured B-Tree node slot. It stores
+/// the node address, node height, and initialized key count.
+pub const BTREE_NODE_HEADER_SIZE: usize = std::mem::size_of::<u64>() * 3;
+
+/// Offset of a node's height in its B-Tree payload slot.
+pub const BTREE_NODE_HEIGHT_OFFSET: usize = std::mem::size_of::<u64>();
+
+/// Offset of a node's initialized key count in its B-Tree payload slot.
+pub const BTREE_NODE_LENGTH_OFFSET: usize = std::mem::size_of::<u64>() * 2;
+
 /// Physical order of captured buckets relative to their control bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HashTableBucketOrder {
@@ -55,6 +75,27 @@ pub enum HashTableEntryPresentation {
     },
     Set {
         value: HashTableFieldPresentation,
+    },
+}
+
+/// One logical B-Tree value embedded in a physical initialized-slot wrapper.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BTreeFieldPresentation {
+    pub slot_stride: u64,
+    pub value_offset: u64,
+    pub field_type: Box<TypeInfo>,
+}
+
+/// Source-language interpretation of keys and values captured from B-Tree
+/// node arrays.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BTreeEntryPresentation {
+    Map {
+        key: BTreeFieldPresentation,
+        value: BTreeFieldPresentation,
+    },
+    Set {
+        value: BTreeFieldPresentation,
     },
 }
 
@@ -107,5 +148,12 @@ pub enum ValuePresentation {
         entry_stride: u64,
         bucket_order: HashTableBucketOrder,
         entry: HashTableEntryPresentation,
+    },
+    /// A bounded breadth-first snapshot of Rust B-Tree nodes. Node capacity,
+    /// physical slot strides, embedded value offsets, and value types all come
+    /// from DWARF. User space reconstructs source order from the node slots.
+    BTree {
+        node_capacity: u64,
+        entry: BTreeEntryPresentation,
     },
 }

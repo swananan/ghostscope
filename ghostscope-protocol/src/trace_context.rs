@@ -387,6 +387,47 @@ mod tests {
     }
 
     #[test]
+    fn test_btree_presentation_round_trips_with_slot_layouts() {
+        let mut ctx = TraceContext::new();
+        let presentation = ValuePresentation::BTree {
+            node_capacity: 11,
+            entry: crate::BTreeEntryPresentation::Map {
+                key: crate::BTreeFieldPresentation {
+                    slot_stride: 4,
+                    value_offset: 0,
+                    field_type: Box::new(TypeInfo::BaseType {
+                        name: "i32".to_string(),
+                        size: 4,
+                        encoding: gimli::constants::DW_ATE_signed.0 as u16,
+                    }),
+                },
+                value: crate::BTreeFieldPresentation {
+                    slot_stride: 2,
+                    value_offset: 0,
+                    field_type: Box::new(TypeInfo::BaseType {
+                        name: "u16".to_string(),
+                        size: 2,
+                        encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+                    }),
+                },
+            },
+        };
+        let index = ctx
+            .add_type_with_presentation(
+                TypeInfo::UnknownType {
+                    name: "BTreeMap<i32, u16>".to_string(),
+                },
+                presentation.clone(),
+            )
+            .unwrap();
+
+        let json = serde_json::to_string(&ctx).unwrap();
+        let decoded: TraceContext = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.get_value_presentation(index), &presentation);
+    }
+
+    #[test]
     fn test_single_field_presentation_round_trips() {
         let mut ctx = TraceContext::new();
         let presentation = ValuePresentation::SingleField {
