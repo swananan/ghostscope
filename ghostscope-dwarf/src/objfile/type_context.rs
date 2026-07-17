@@ -338,6 +338,17 @@ impl LoadedObjfile {
             .map(|loc| loc.map(|loc| type_id_from_loc(current.module, loc)))
     }
 
+    pub(crate) fn type_summary(&self, current: TypeId) -> Result<Option<crate::TypeInfo>> {
+        let normalized = {
+            let type_name_index = self
+                .type_name_index
+                .read()
+                .expect("type name index lock poisoned");
+            normalize_type_loc(self.dwarf(), &type_name_index, type_loc(current)?)?
+        };
+        Ok(normalized.and_then(|loc| self.detailed_shallow_type(loc.cu_off, loc.die_off)))
+    }
+
     pub(crate) fn qualified_type_name(&self, current: TypeId) -> Result<Option<String>> {
         qualified_type_name_from_dwarf(self.dwarf(), type_loc(current)?)
     }

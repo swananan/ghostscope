@@ -1,10 +1,10 @@
 use super::DwarfAnalyzer;
 use crate::{
     indexable_element_layout, member_layout, semantics::PlanError, strip_type_aliases,
-    CompilationUnitMetadata, CuId, MemberLayout, ModuleId, PcContext, ResolvedType, Result,
-    SemanticType, StructMember, TypeId, TypeIdentity, TypeInfo, TypeLayoutError, TypeOrigin,
-    TypeProjection, TypeProjectionLayout, ValueCapturePlan, ValueReadPlan, VariableAccessSegment,
-    VariableReadPlan,
+    CompilationUnitMetadata, CuId, MemberLayout, ModuleId, PcContext, ProjectedValueRead,
+    ProjectedValueStep, ProjectedViewField, ResolvedType, Result, SemanticType, StructMember,
+    TypeId, TypeIdentity, TypeInfo, TypeLayoutError, TypeOrigin, TypeProjection,
+    TypeProjectionLayout, ValueCapturePlan, ValueReadPlan, VariableAccessSegment, VariableReadPlan,
 };
 use std::path::Path;
 
@@ -52,6 +52,34 @@ impl DwarfAnalyzer {
             .get(module_path)
             .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?
             .qualified_type_name(type_id)
+    }
+
+    fn type_summary(&self, type_id: TypeId) -> Result<Option<TypeInfo>> {
+        let module_path = self.module_path_for_id(type_id.module).ok_or_else(|| {
+            anyhow::anyhow!("Semantic module id {:?} is not loaded", type_id.module)
+        })?;
+        self.modules
+            .get(module_path)
+            .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?
+            .type_summary(type_id)
+    }
+
+    fn hydrate_projected_type(&self, mut resolved: ResolvedType) -> Result<ResolvedType> {
+        // Pointer summaries intentionally stop recursive DWARF expansion with
+        // UnknownType. An exact projected TypeId lets us complete that one DIE
+        // on demand without name lookup or recursive layout guessing.
+        if matches!(
+            strip_type_aliases(&resolved.summary),
+            TypeInfo::UnknownType { .. }
+        ) {
+            if let Some(type_id) = resolved.identity.layout_dwarf_id() {
+                if let Some(summary) = self.type_summary(type_id)? {
+                    resolved.summary = summary;
+                    resolved.origin = self.type_origin(type_id)?;
+                }
+            }
+        }
+        Ok(resolved)
     }
 
     fn template_type_parameter(
@@ -156,7 +184,8 @@ impl DwarfAnalyzer {
         segment: &VariableAccessSegment,
         type_module_path: Option<&Path>,
     ) -> Result<TypeProjection> {
-        if let Some(projection) = current.project_structural(segment) {
+        if let Some(mut projection) = current.project_structural(segment) {
+            projection.resolved_type = self.hydrate_projected_type(projection.resolved_type)?;
             return Ok(projection);
         }
 
@@ -235,7 +264,8 @@ impl DwarfAnalyzer {
 
         Ok(TypeProjection {
             layout,
-            resolved_type: ResolvedType::new(summary, identity, origin),
+            resolved_type: self
+                .hydrate_projected_type(ResolvedType::new(summary, identity, origin))?,
         })
     }
 
@@ -314,17 +344,7 @@ impl DwarfAnalyzer {
                         bit_size: None,
                     });
                 }
-                let presentation = match layout.presentation {
-                    crate::language::ProjectedStructPresentation::SignedState {
-                        state_field,
-                        non_negative_label,
-                        negative_label,
-                    } => crate::ValuePresentation::SignedStateStruct {
-                        state_field: state_field.to_string(),
-                        non_negative_label: non_negative_label.to_string(),
-                        negative_label: negative_label.to_string(),
-                    },
-                };
+                let presentation = projected_struct_presentation(layout.presentation);
                 let output_type = TypeInfo::StructType {
                     name: layout.type_name.to_string(),
                     size: root_size,
@@ -333,6 +353,61 @@ impl DwarfAnalyzer {
                 return Ok(Some(ValueReadPlan {
                     presentation,
                     capture: ValueCapturePlan::InlineView { output_type },
+                }));
+            }
+            crate::language::ValueLayout::CompositeStruct(layout) => {
+                let mut members = Vec::with_capacity(layout.fields.len());
+                let mut fields = Vec::with_capacity(layout.fields.len());
+                let mut output_size = 0u64;
+                for field in layout.fields {
+                    if members
+                        .iter()
+                        .any(|member: &StructMember| member.name == field.name)
+                    {
+                        return Err(anyhow::anyhow!(
+                            "duplicate semantic struct field '{}'",
+                            field.name
+                        ));
+                    }
+                    let Some(value) = self.project_resolved_value_path(
+                        current,
+                        &field.value_path,
+                        type_module_path,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    if !projected_value_satisfies(field.requirement, &value) {
+                        return Ok(None);
+                    }
+                    let member_type = value.resolved_type.summary.clone();
+                    let output_offset = output_size;
+                    output_size = output_size
+                        .checked_add(member_type.size())
+                        .ok_or_else(|| anyhow::anyhow!("semantic struct size overflow"))?;
+                    members.push(StructMember {
+                        name: field.name.to_string(),
+                        member_type,
+                        offset: output_offset,
+                        bit_offset: None,
+                        bit_size: None,
+                    });
+                    fields.push(ProjectedViewField {
+                        output_offset,
+                        value,
+                    });
+                }
+                let output_type = TypeInfo::StructType {
+                    name: layout.type_name.to_string(),
+                    size: output_size,
+                    members,
+                };
+                return Ok(Some(ValueReadPlan {
+                    presentation: projected_struct_presentation(layout.presentation),
+                    capture: ValueCapturePlan::ProjectedView {
+                        output_type,
+                        fields,
+                    },
                 }));
             }
             crate::language::ValueLayout::IndirectSequence(layout) => layout,
@@ -498,6 +573,134 @@ impl DwarfAnalyzer {
         })
     }
 
+    fn project_resolved_value_path(
+        &self,
+        current: &ResolvedType,
+        path: &[crate::language::ProjectedPathSegment],
+        type_module_path: Option<&Path>,
+    ) -> Result<Option<ProjectedValueRead>> {
+        let mut resolved_type = current.clone();
+        let mut steps = Vec::with_capacity(path.len());
+
+        for segment in path {
+            match segment {
+                crate::language::ProjectedPathSegment::Member(field) => {
+                    let Some(projected) = self.project_semantic_member(
+                        &resolved_type,
+                        Some(field),
+                        type_module_path,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    let TypeProjectionLayout::Member { offset } = projected.layout else {
+                        return Err(anyhow::anyhow!(
+                            "semantic value path produced a non-member projection"
+                        ));
+                    };
+                    steps.push(ProjectedValueStep::Member { offset });
+                    resolved_type = projected.resolved_type;
+                }
+                crate::language::ProjectedPathSegment::SoleMember => {
+                    let Some(projected) =
+                        self.project_semantic_member(&resolved_type, None, type_module_path)?
+                    else {
+                        return Ok(None);
+                    };
+                    let TypeProjectionLayout::Member { offset } = projected.layout else {
+                        return Err(anyhow::anyhow!(
+                            "semantic value path produced a non-member projection"
+                        ));
+                    };
+                    steps.push(ProjectedValueStep::Member { offset });
+                    resolved_type = projected.resolved_type;
+                }
+                crate::language::ProjectedPathSegment::Dereference => {
+                    let TypeInfo::PointerType {
+                        size: pointer_size, ..
+                    } = strip_type_aliases(&resolved_type.summary)
+                    else {
+                        return Ok(None);
+                    };
+                    if !matches!(*pointer_size, 4 | 8) {
+                        return Ok(None);
+                    }
+                    let projected = self.project_resolved_type(
+                        &resolved_type,
+                        &VariableAccessSegment::Dereference,
+                        type_module_path,
+                    )?;
+                    if projected.layout != TypeProjectionLayout::Dereference {
+                        return Err(anyhow::anyhow!(
+                            "semantic value path produced a non-dereference projection"
+                        ));
+                    }
+                    steps.push(ProjectedValueStep::Dereference {
+                        pointer_size: *pointer_size,
+                    });
+                    resolved_type = projected.resolved_type;
+                }
+            }
+        }
+
+        Ok(Some(ProjectedValueRead {
+            steps,
+            resolved_type,
+        }))
+    }
+
+    fn project_semantic_member(
+        &self,
+        current: &ResolvedType,
+        expected_name: Option<&str>,
+        type_module_path: Option<&Path>,
+    ) -> Result<Option<TypeProjection>> {
+        let TypeInfo::StructType { size, members, .. } = strip_type_aliases(&current.summary)
+        else {
+            return Ok(None);
+        };
+        let member = match expected_name {
+            Some(expected_name) => {
+                let mut matching = members.iter().filter(|member| member.name == expected_name);
+                let Some(member) = matching.next() else {
+                    return Ok(None);
+                };
+                if matching.next().is_some() {
+                    return Ok(None);
+                }
+                member
+            }
+            None => {
+                let [member] = members.as_slice() else {
+                    return Ok(None);
+                };
+                member
+            }
+        };
+        let Some(member_end) = member.offset.checked_add(member.member_type.size()) else {
+            return Ok(None);
+        };
+        if member.bit_offset.is_some() || member.bit_size.is_some() || member_end > *size {
+            return Ok(None);
+        }
+
+        let projected = self.project_resolved_type(
+            current,
+            &VariableAccessSegment::Field(member.name.clone()),
+            type_module_path,
+        )?;
+        let Some(projected_end) = member
+            .offset
+            .checked_add(projected.resolved_type.summary.size())
+        else {
+            return Ok(None);
+        };
+        if projected_end > *size {
+            return Ok(None);
+        }
+        Ok(Some(projected))
+    }
+
     fn project_type_id(
         &self,
         current: TypeId,
@@ -587,5 +790,123 @@ impl DwarfAnalyzer {
             .type_origin(current)?
             .ok_or(PlanError::TupleIndexMissingTypeIdentity { index: *index })?;
         crate::language::resolve_access_segment(&origin, segment)
+    }
+}
+
+fn projected_struct_presentation(
+    presentation: crate::language::ProjectedStructPresentation,
+) -> crate::ValuePresentation {
+    match presentation {
+        crate::language::ProjectedStructPresentation::SignedState {
+            state_field,
+            non_negative_label,
+            negative_label,
+        } => crate::ValuePresentation::SignedStateStruct {
+            state_field: state_field.to_string(),
+            non_negative_label: non_negative_label.to_string(),
+            negative_label: negative_label.to_string(),
+        },
+    }
+}
+
+fn projected_value_satisfies(
+    requirement: crate::language::ProjectedValueRequirement,
+    value: &ProjectedValueRead,
+) -> bool {
+    let value_type = strip_type_aliases(&value.resolved_type.summary);
+    match requirement {
+        crate::language::ProjectedValueRequirement::KnownSizedOrZst => match value_type {
+            TypeInfo::UnknownType { .. }
+            | TypeInfo::OptimizedOut { .. }
+            | TypeInfo::ArrayType {
+                total_size: None, ..
+            } => false,
+            TypeInfo::BaseType { name, size: 0, .. } => name == "()",
+            TypeInfo::StructType { size: 0, .. }
+            | TypeInfo::UnionType { size: 0, .. }
+            | TypeInfo::ArrayType {
+                total_size: Some(0),
+                ..
+            } => true,
+            type_info => type_info.size() > 0,
+        },
+        crate::language::ProjectedValueRequirement::SignedPointerSizedInteger => {
+            let TypeInfo::BaseType { size, encoding, .. } = value_type else {
+                return false;
+            };
+            let signed = *encoding == gimli::DW_ATE_signed.0 as u16
+                || *encoding == gimli::DW_ATE_signed_char.0 as u16;
+            let pointer_size = value.steps.iter().rev().find_map(|step| match step {
+                ProjectedValueStep::Dereference { pointer_size } => Some(*pointer_size),
+                ProjectedValueStep::Member { .. } => None,
+            });
+            signed && matches!(*size, 4 | 8) && pointer_size == Some(*size)
+        }
+    }
+}
+
+#[cfg(test)]
+mod projected_value_tests {
+    use super::*;
+
+    fn projected_value(summary: TypeInfo, pointer_size: Option<u64>) -> ProjectedValueRead {
+        let steps = pointer_size
+            .map(|pointer_size| ProjectedValueStep::Dereference { pointer_size })
+            .into_iter()
+            .collect();
+        ProjectedValueRead {
+            steps,
+            resolved_type: ResolvedType::new(summary, TypeIdentity::Unknown, None),
+        }
+    }
+
+    #[test]
+    fn known_sized_requirement_distinguishes_zst_from_unknown_layout() {
+        let requirement = crate::language::ProjectedValueRequirement::KnownSizedOrZst;
+        let unit = projected_value(
+            TypeInfo::BaseType {
+                name: "()".to_string(),
+                size: 0,
+                encoding: gimli::DW_ATE_unsigned.0 as u16,
+            },
+            Some(8),
+        );
+        let unknown = projected_value(
+            TypeInfo::UnknownType {
+                name: "T".to_string(),
+            },
+            Some(8),
+        );
+
+        assert!(projected_value_satisfies(requirement, &unit));
+        assert!(!projected_value_satisfies(requirement, &unknown));
+    }
+
+    #[test]
+    fn signed_state_requirement_uses_dwarf_encoding_and_pointer_width() {
+        let requirement = crate::language::ProjectedValueRequirement::SignedPointerSizedInteger;
+        let signed = |size, pointer_size| {
+            projected_value(
+                TypeInfo::BaseType {
+                    name: "isize".to_string(),
+                    size,
+                    encoding: gimli::DW_ATE_signed.0 as u16,
+                },
+                pointer_size,
+            )
+        };
+        assert!(projected_value_satisfies(requirement, &signed(8, Some(8))));
+        assert!(!projected_value_satisfies(requirement, &signed(4, Some(8))));
+        assert!(!projected_value_satisfies(requirement, &signed(8, None)));
+
+        let unsigned = projected_value(
+            TypeInfo::BaseType {
+                name: "usize".to_string(),
+                size: 8,
+                encoding: gimli::DW_ATE_unsigned.0 as u16,
+            },
+            Some(8),
+        );
+        assert!(!projected_value_satisfies(requirement, &unsigned));
     }
 }

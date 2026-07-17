@@ -21,6 +21,29 @@ pub enum RingSequenceLength {
     End(TypeProjection),
 }
 
+/// One DWARF-derived address operation used to locate a projected value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectedValueStep {
+    /// Add a concrete member offset to the current address.
+    Member { offset: u64 },
+    /// Read a pointer of the exact DWARF width from the current address.
+    Dereference { pointer_size: u64 },
+}
+
+/// Runtime path and final semantic type for one projected value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedValueRead {
+    pub steps: Vec<ProjectedValueStep>,
+    pub resolved_type: crate::ResolvedType,
+}
+
+/// One field assembled into a synthetic projected-view payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedViewField {
+    pub output_offset: u64,
+    pub value: ProjectedValueRead,
+}
+
 /// Physical capture strategy used by a semantic value adapter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueCapturePlan {
@@ -30,6 +53,12 @@ pub enum ValueCapturePlan {
     /// Read the physical root value in place, but register and format it using
     /// a DWARF-derived semantic view of selected embedded fields.
     InlineView { output_type: crate::TypeInfo },
+    /// Assemble a synthetic struct from independently projected values. Every
+    /// member offset, pointer width, and final type is derived from DWARF.
+    ProjectedView {
+        output_type: crate::TypeInfo,
+        fields: Vec<ProjectedViewField>,
+    },
     /// Read a pointer and length from an aggregate, then capture a bounded byte
     /// sequence from the pointer.
     IndirectBytes {

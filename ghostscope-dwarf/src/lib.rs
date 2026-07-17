@@ -46,13 +46,14 @@ pub use semantics::{
     strip_type_aliases, AddressOrigin, AddressSpaceInfo, CfaRulePlan, CompactUnwindRow,
     CompactUnwindStats, CompactUnwindTable, CompilationUnitMetadata, FunctionParameter,
     IndexableElementLayout, InlineFrame, LvalueAddressPlan, MemberLayout, PcContext, PcLineInfo,
-    PcRange, PlannedAddress, PlannedAddressKind, PlannedValue, ProducerInfo, RegisterRecoveryPlan,
-    ResolvedType, RingSequenceLength, RuntimeComputedExpr, RuntimeComputedKind, SemanticType,
-    SourceLanguage, SyntheticTypeKind, TypeIdentity, TypeLayoutError, TypeOrigin, TypeProjection,
-    TypeProjectionLayout, UnwindDiagnostic, UnwindDiagnosticKind, ValueCapturePlan, ValueReadPlan,
-    VariableAccessPath, VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan,
-    VariableMaterialization, VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic,
-    VariableReadPlan, VisibleVariable, VisibleVariablesResult,
+    PcRange, PlannedAddress, PlannedAddressKind, PlannedValue, ProducerInfo, ProjectedValueRead,
+    ProjectedValueStep, ProjectedViewField, RegisterRecoveryPlan, ResolvedType, RingSequenceLength,
+    RuntimeComputedExpr, RuntimeComputedKind, SemanticType, SourceLanguage, SyntheticTypeKind,
+    TypeIdentity, TypeLayoutError, TypeOrigin, TypeProjection, TypeProjectionLayout,
+    UnwindDiagnostic, UnwindDiagnosticKind, ValueCapturePlan, ValueReadPlan, VariableAccessPath,
+    VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
+    VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
+    VisibleVariable, VisibleVariablesResult,
 };
 
 pub use semantics::{

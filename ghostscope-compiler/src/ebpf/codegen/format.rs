@@ -86,6 +86,9 @@ fn complex_format_static_payload_len(arg: &ComplexArg<'_>) -> Option<usize> {
         ComplexArgSource::MemDump { len, .. } => {
             Some(std::cmp::max(*len, VARIABLE_READ_ERROR_PAYLOAD_LEN))
         }
+        ComplexArgSource::ProjectedView { .. } => {
+            Some(std::cmp::max(arg.data_len, VARIABLE_READ_ERROR_PAYLOAD_LEN))
+        }
         ComplexArgSource::MemDumpDynamic { .. } => None,
         ComplexArgSource::IndirectBytes { .. } => None,
         ComplexArgSource::IndirectSequence { .. } => None,
@@ -1126,6 +1129,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         address: &RuntimeAddress<'ctx>,
         len: usize,
     ) -> Result<()> {
+        self.emit_complex_format_memdump_at(status_ptr, var_data_ptr, var_data_ptr, address, len)
+    }
+
+    fn emit_complex_format_memdump_at(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        payload_ptr: PointerValue<'ctx>,
+        dst_ptr: PointerValue<'ctx>,
+        address: &RuntimeAddress<'ctx>,
+        len: usize,
+    ) -> Result<()> {
         // Branchy emitters must leave the builder at their continuation block so
         // the caller can append the next formatted argument.
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
@@ -1134,7 +1148,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let dst_ptr = self
             .builder
-            .build_pointer_cast(var_data_ptr, ptr_ty, "md_dst_ptr")
+            .build_pointer_cast(dst_ptr, ptr_ty, "md_dst_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let base_src_ptr = self
             .builder
@@ -1228,12 +1242,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .const_int(VariableStatus::ReadError as u64, false),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        // SAFETY: var_data_ptr points at the read-error payload.
+        // SAFETY: payload_ptr points at the read-error payload.
         let errno_ptr_i8 = unsafe {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
-                    var_data_ptr,
+                    payload_ptr,
                     &[self
                         .context
                         .i32_type()
@@ -1259,7 +1273,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.builder
                 .build_gep(
                     self.context.i8_type(),
-                    var_data_ptr,
+                    payload_ptr,
                     &[self
                         .context
                         .i32_type()
@@ -1637,6 +1651,155 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
             .into_int_value();
         Ok((result, address))
+    }
+
+    fn emit_complex_format_projected_view(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        var_data_ptr: PointerValue<'ctx>,
+        descriptor: &RuntimeAddress<'ctx>,
+        fields: &[ProjectedViewFieldSource],
+        reserved_len: usize,
+    ) -> Result<()> {
+        let function = self.current_function("compile projected semantic view")?;
+        let finish_block = self
+            .context
+            .append_basic_block(function, "projected_view_finish");
+
+        if fields.is_empty() {
+            self.builder
+                .build_unconditional_branch(finish_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder.position_at_end(finish_block);
+            return Ok(());
+        }
+
+        for (field_index, field) in fields.iter().enumerate() {
+            let mut address = *descriptor;
+            for (step_index, step) in field.steps.iter().enumerate() {
+                match step {
+                    ProjectedViewStep::Member { offset } => {
+                        if *offset != 0 {
+                            let value = self
+                                .builder
+                                .build_int_add(
+                                    address.value,
+                                    self.context.i64_type().const_int(*offset, false),
+                                    &format!("projected_view_{field_index}_{step_index}_member"),
+                                )
+                                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                            address = address.with_value(value);
+                        }
+                    }
+                    ProjectedViewStep::Dereference { pointer_size } => {
+                        let read = self.generate_memory_read_with_diagnostics(
+                            address,
+                            *pointer_size,
+                            Some(status_ptr),
+                            &format!("projected_view_{field_index}_{step_index}_pointer"),
+                        )?;
+                        let ok = self
+                            .builder
+                            .build_not(
+                                read.combined_fail,
+                                &format!("projected_view_{field_index}_{step_index}_ok"),
+                            )
+                            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                        let ok_block = self.context.append_basic_block(
+                            function,
+                            &format!("projected_view_{field_index}_{step_index}_pointer_ok"),
+                        );
+                        let error_block = self.context.append_basic_block(
+                            function,
+                            &format!("projected_view_{field_index}_{step_index}_pointer_error"),
+                        );
+                        self.builder
+                            .build_conditional_branch(ok, ok_block, error_block)
+                            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+                        self.builder.position_at_end(error_block);
+                        self.emit_complex_format_read_error_payload(
+                            var_data_ptr,
+                            reserved_len,
+                            read.helper_result,
+                            address.value,
+                        )?;
+                        self.builder
+                            .build_unconditional_branch(finish_block)
+                            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+                        self.builder.position_at_end(ok_block);
+                        address =
+                            RuntimeAddress::available(read.value.into_int_value(), self.context);
+                    }
+                }
+            }
+
+            if field.value_len > 0 {
+                // SAFETY: output_offset and value_len were validated against
+                // the statically reserved projected-view payload.
+                let field_ptr = unsafe {
+                    self.builder
+                        .build_gep(
+                            self.context.i8_type(),
+                            var_data_ptr,
+                            &[self
+                                .context
+                                .i32_type()
+                                .const_int(field.output_offset as u64, false)],
+                            &format!("projected_view_{field_index}_output"),
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                };
+                self.emit_complex_format_memdump_at(
+                    status_ptr,
+                    var_data_ptr,
+                    field_ptr,
+                    &address,
+                    field.value_len,
+                )?;
+            }
+
+            if field_index + 1 == fields.len() {
+                self.builder
+                    .build_unconditional_branch(finish_block)
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                continue;
+            }
+            if field.value_len == 0 {
+                continue;
+            }
+
+            let status = self
+                .builder
+                .build_load(
+                    self.context.i8_type(),
+                    status_ptr,
+                    &format!("projected_view_{field_index}_status"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                .into_int_value();
+            let ok = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    status,
+                    self.context.i8_type().const_zero(),
+                    &format!("projected_view_{field_index}_read_ok"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let next_block = self.context.append_basic_block(
+                function,
+                &format!("projected_view_{}_next", field_index + 1),
+            );
+            self.builder
+                .build_conditional_branch(ok, next_block, finish_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder.position_at_end(next_block);
+        }
+
+        self.builder.position_at_end(finish_block);
+        Ok(())
     }
 
     fn emit_complex_format_indirect(
@@ -2794,6 +2957,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     },
                 )
             }
+            ComplexArgSource::ProjectedView { descriptor, fields } => self
+                .emit_complex_format_projected_view(
+                    status_ptr,
+                    var_data_ptr,
+                    descriptor,
+                    fields,
+                    reserved_len,
+                ),
             ComplexArgSource::ComputedInt { value, byte_len } => {
                 self.emit_complex_format_computed_int(var_data_ptr, *value, *byte_len)
             }
@@ -3008,6 +3179,70 @@ mod complex_format_layout_tests {
         ebpf.module.print_to_string().to_string()
     }
 
+    fn projected_view_emitter_ir() -> String {
+        let context = Context::create();
+        let options = crate::CompileOptions::default();
+        let ebpf = EbpfContext::new(&context, "projected_view", Some(0), &options);
+        let mut ebpf = ebpf.expect("create eBPF context");
+        let function_type = context.i64_type().fn_type(&[], false);
+        let function = ebpf
+            .module
+            .add_function("emit_projected_view", function_type, None);
+        let entry = context.append_basic_block(function, "entry");
+        ebpf.builder.position_at_end(entry);
+        let status_ptr = ebpf
+            .builder
+            .build_alloca(context.i8_type(), "status")
+            .expect("allocate status");
+        let reserved_len = VARIABLE_READ_ERROR_PAYLOAD_LEN;
+        let data_ptr = ebpf
+            .builder
+            .build_alloca(context.i8_type().array_type(reserved_len as u32), "payload")
+            .expect("allocate payload");
+        ebpf.builder
+            .build_store(status_ptr, context.i8_type().const_zero())
+            .expect("initialize status");
+        let descriptor =
+            RuntimeAddress::available(context.i64_type().const_int(0x1000, false), &context);
+        let fields = vec![
+            ProjectedViewFieldSource {
+                output_offset: 0,
+                value_len: 4,
+                steps: vec![
+                    ProjectedViewStep::Member { offset: 8 },
+                    ProjectedViewStep::Dereference {
+                        pointer_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                    },
+                ],
+            },
+            ProjectedViewFieldSource {
+                output_offset: 4,
+                value_len: 8,
+                steps: vec![
+                    ProjectedViewStep::Member { offset: 16 },
+                    ProjectedViewStep::Dereference {
+                        pointer_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                    },
+                ],
+            },
+        ];
+
+        ebpf.emit_complex_format_projected_view(
+            status_ptr,
+            data_ptr,
+            &descriptor,
+            &fields,
+            reserved_len,
+        )
+        .expect("emit projected view");
+        ebpf.builder
+            .build_return(Some(&context.i64_type().const_zero()))
+            .expect("return from test function");
+        ebpf.module.verify().expect("verify generated LLVM IR");
+
+        ebpf.module.print_to_string().to_string()
+    }
+
     #[test]
     fn complex_format_layout_records_per_arg_lengths() {
         let context = Context::create();
@@ -3151,6 +3386,18 @@ mod complex_format_layout_tests {
         });
 
         assert!(llvm_ir.contains("indirect_metadata_error_payload"));
+        assert!(llvm_ir.contains("indirect_errno_ptr_i8"));
+        assert!(llvm_ir.contains("indirect_addr_ptr_i8"));
+    }
+
+    #[test]
+    fn projected_view_emitter_stops_after_each_failed_read() {
+        let llvm_ir = projected_view_emitter_ir();
+
+        assert!(llvm_ir.contains("projected_view_0_1_pointer_error"));
+        assert!(llvm_ir.contains("projected_view_1_1_pointer_error"));
+        assert!(llvm_ir.contains("projected_view_0_read_ok"));
+        assert!(llvm_ir.contains("projected_view_finish"));
         assert!(llvm_ir.contains("indirect_errno_ptr_i8"));
         assert!(llvm_ir.contains("indirect_addr_ptr_i8"));
     }
