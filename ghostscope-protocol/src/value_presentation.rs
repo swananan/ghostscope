@@ -48,4 +48,12 @@ pub enum ValuePresentation {
         non_negative_label: String,
         negative_label: String,
     },
+    /// A reference-counted struct whose summary exposes strong and weak
+    /// counters. `implicit_weak` removes implementation-owned weak entries
+    /// from both the summary and the rendered weak field.
+    ReferenceCountedStruct {
+        strong_field: String,
+        weak_field: String,
+        implicit_weak: u64,
+    },
 }

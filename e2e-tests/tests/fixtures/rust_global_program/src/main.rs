@@ -7,6 +7,8 @@ use std::{
     ffi::OsString,
     marker::{PhantomData, PhantomPinned},
     num::{NonZeroI32, NonZeroU128, NonZeroU32},
+    rc::Rc,
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -106,6 +108,14 @@ pub mod user_types {
         pub value: NonNull<T>,
         pub borrow: BorrowRefMut,
         pub marker: std::marker::PhantomData<T>,
+    }
+
+    pub struct Rc<T> {
+        pub value: T,
+    }
+
+    pub struct Arc<T> {
+        pub value: T,
     }
 }
 
@@ -235,6 +245,8 @@ pub static mut GLOBAL_ENUM: GlobalState = GlobalState::Idle;
 pub static mut GLOBAL_ENUM_BITS: i32 = 0;
 
 pub mod math {
+    use std::{rc::Rc, sync::Arc};
+
     #[inline(never)]
     pub fn do_stuff(x: i32) -> i32 {
         // Simple function for DWARF function indexing
@@ -306,6 +318,32 @@ pub mod math {
         std::hint::black_box(value.value.pointer);
         std::hint::black_box(value.borrow.borrow);
         1
+    }
+
+    #[inline(never)]
+    pub fn observe_rc_arc(
+        rc: Rc<(i32, u16)>,
+        arc: Arc<(i32, u16)>,
+        rc_unit: Rc<()>,
+        arc_unit: Arc<()>,
+    ) -> i64 {
+        let rc_value = std::hint::black_box(rc.0 as i64);
+        let arc_value = std::hint::black_box(arc.0 as i64);
+        std::hint::black_box(Rc::strong_count(&rc));
+        std::hint::black_box(Rc::weak_count(&rc));
+        std::hint::black_box(Arc::strong_count(&arc));
+        std::hint::black_box(Arc::weak_count(&arc));
+        std::hint::black_box((rc_unit, arc_unit));
+        rc_value + arc_value
+    }
+
+    #[inline(never)]
+    pub fn observe_user_rc_arc(
+        rc: &crate::user_types::Rc<i32>,
+        arc: &crate::user_types::Arc<i32>,
+    ) -> i64 {
+        std::hint::black_box((rc.value, arc.value));
+        rc.value as i64 + arc.value as i64
     }
 }
 
@@ -485,6 +523,22 @@ fn main() {
             },
         };
         acc += math::observe_user_ref(&user_ref) as i64;
+        let rc = Rc::new((-7_i32, 13_u16));
+        let rc_peer = Rc::clone(&rc);
+        let rc_weak = Rc::downgrade(&rc);
+        let arc = Arc::new((29_i32, 17_u16));
+        let arc_peer = Arc::clone(&arc);
+        let arc_weak = Arc::downgrade(&arc);
+        acc += math::observe_rc_arc(
+            Rc::clone(&rc),
+            Arc::clone(&arc),
+            Rc::new(()),
+            Arc::new(()),
+        );
+        std::hint::black_box((rc_peer, rc_weak, arc_peer, arc_weak));
+        let user_rc = user_types::Rc { value: 37_i32 };
+        let user_arc = user_types::Arc { value: 41_i32 };
+        acc += math::observe_user_rc_arc(&user_rc, &user_arc);
         acc += touch_globals() as i64;
         thread::sleep(Duration::from_millis(1000));
     }

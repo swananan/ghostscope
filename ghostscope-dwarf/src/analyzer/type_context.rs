@@ -615,6 +615,40 @@ impl DwarfAnalyzer {
                     steps.push(ProjectedValueStep::Member { offset });
                     resolved_type = projected.resolved_type;
                 }
+                crate::language::ProjectedPathSegment::UnwrapScalar => {
+                    let mut depth = 0usize;
+                    loop {
+                        match strip_type_aliases(&resolved_type.summary) {
+                            TypeInfo::BaseType { .. } | TypeInfo::PointerType { .. } => break,
+                            TypeInfo::StructType { .. } => {
+                                // rust-gdb follows the first field until GDB
+                                // reports a scalar. Requiring a sole member
+                                // avoids guessing through unrelated structs.
+                                if depth == 16 {
+                                    return Ok(None);
+                                }
+                                let Some(projected) = self.project_semantic_member(
+                                    &resolved_type,
+                                    None,
+                                    type_module_path,
+                                )?
+                                else {
+                                    return Ok(None);
+                                };
+                                let TypeProjectionLayout::Member { offset } = projected.layout
+                                else {
+                                    return Err(anyhow::anyhow!(
+                                        "semantic scalar wrapper produced a non-member projection"
+                                    ));
+                                };
+                                steps.push(ProjectedValueStep::Member { offset });
+                                resolved_type = projected.resolved_type;
+                                depth += 1;
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                }
                 crate::language::ProjectedPathSegment::Dereference => {
                     let TypeInfo::PointerType {
                         size: pointer_size, ..
@@ -806,6 +840,15 @@ fn projected_struct_presentation(
             non_negative_label: non_negative_label.to_string(),
             negative_label: negative_label.to_string(),
         },
+        crate::language::ProjectedStructPresentation::ReferenceCounted {
+            strong_field,
+            weak_field,
+            implicit_weak,
+        } => crate::ValuePresentation::ReferenceCountedStruct {
+            strong_field: strong_field.to_string(),
+            weak_field: weak_field.to_string(),
+            implicit_weak,
+        },
     }
 }
 
@@ -841,6 +884,18 @@ fn projected_value_satisfies(
                 ProjectedValueStep::Member { .. } => None,
             });
             signed && matches!(*size, 4 | 8) && pointer_size == Some(*size)
+        }
+        crate::language::ProjectedValueRequirement::UnsignedPointerSizedInteger => {
+            let TypeInfo::BaseType { size, encoding, .. } = value_type else {
+                return false;
+            };
+            let unsigned = *encoding == gimli::DW_ATE_unsigned.0 as u16
+                || *encoding == gimli::DW_ATE_unsigned_char.0 as u16;
+            let pointer_size = value.steps.iter().rev().find_map(|step| match step {
+                ProjectedValueStep::Dereference { pointer_size } => Some(*pointer_size),
+                ProjectedValueStep::Member { .. } => None,
+            });
+            unsigned && matches!(*size, 4 | 8) && pointer_size == Some(*size)
         }
     }
 }
@@ -908,5 +963,39 @@ mod projected_value_tests {
             Some(8),
         );
         assert!(!projected_value_satisfies(requirement, &unsigned));
+    }
+
+    #[test]
+    fn unsigned_counter_requirement_uses_dwarf_encoding_and_pointer_width() {
+        let requirement = crate::language::ProjectedValueRequirement::UnsignedPointerSizedInteger;
+        let unsigned = |size, pointer_size| {
+            projected_value(
+                TypeInfo::BaseType {
+                    name: "usize".to_string(),
+                    size,
+                    encoding: gimli::DW_ATE_unsigned.0 as u16,
+                },
+                pointer_size,
+            )
+        };
+        assert!(projected_value_satisfies(
+            requirement,
+            &unsigned(8, Some(8))
+        ));
+        assert!(!projected_value_satisfies(
+            requirement,
+            &unsigned(4, Some(8))
+        ));
+        assert!(!projected_value_satisfies(requirement, &unsigned(8, None)));
+
+        let signed = projected_value(
+            TypeInfo::BaseType {
+                name: "isize".to_string(),
+                size: 8,
+                encoding: gimli::DW_ATE_signed.0 as u16,
+            },
+            Some(8),
+        );
+        assert!(!projected_value_satisfies(requirement, &signed));
     }
 }

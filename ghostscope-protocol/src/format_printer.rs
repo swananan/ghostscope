@@ -782,6 +782,17 @@ impl FormatPrinter {
                 non_negative_label,
                 negative_label,
             ),
+            ValuePresentation::ReferenceCountedStruct {
+                strong_field,
+                weak_field,
+                implicit_weak,
+            } => Self::format_reference_counted_struct(
+                data,
+                type_info,
+                strong_field,
+                weak_field,
+                *implicit_weak,
+            ),
         }
     }
 
@@ -816,6 +827,118 @@ impl FormatPrinter {
             return "<INVALID_SIGNED_STATE_STRUCT>".to_string();
         };
         format!("{summary}{fields}")
+    }
+
+    fn format_reference_counted_struct(
+        data: &[u8],
+        type_info: &TypeInfo,
+        strong_field: &str,
+        weak_field: &str,
+        implicit_weak: u64,
+    ) -> String {
+        let TypeInfo::StructType { name, members, .. } = type_info else {
+            return "<INVALID_REFERENCE_COUNTED_STRUCT>".to_string();
+        };
+        let Some(strong_member) = members.iter().find(|member| member.name == strong_field) else {
+            return "<INVALID_REFERENCE_COUNTED_STRUCT>".to_string();
+        };
+        let Some(weak_member) = members.iter().find(|member| member.name == weak_field) else {
+            return "<INVALID_REFERENCE_COUNTED_STRUCT>".to_string();
+        };
+
+        let strong = Self::decode_unsigned_member(data, strong_member);
+        let weak = Self::decode_unsigned_member(data, weak_member)
+            .and_then(|weak| weak.checked_sub(u128::from(implicit_weak)));
+
+        // Keep the protocol payload raw. Adjust a user-space copy so the
+        // existing DWARF struct formatter shows the public weak count too.
+        let mut adjusted_data = data.to_vec();
+        if let Some(weak) = weak {
+            let offset = usize::try_from(weak_member.offset).ok();
+            if let Some(field_data) = offset.and_then(|offset| adjusted_data.get_mut(offset..)) {
+                let _ = Self::encode_unsigned_integer(field_data, &weak_member.member_type, weak);
+            }
+        }
+
+        let strong = strong
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<unavailable>".to_string());
+        let weak = weak
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<unavailable>".to_string());
+        let summary = format!("{name}({strong_field}={strong}, {weak_field}={weak})");
+        let fields = Self::format_data_with_type_info(&adjusted_data, type_info);
+        let Some(fields) = fields.strip_prefix(name) else {
+            return "<INVALID_REFERENCE_COUNTED_STRUCT>".to_string();
+        };
+        format!("{summary}{fields}")
+    }
+
+    fn decode_unsigned_member(data: &[u8], member: &crate::StructMember) -> Option<u128> {
+        let offset = usize::try_from(member.offset).ok()?;
+        Self::decode_unsigned_integer(data.get(offset..)?, &member.member_type)
+    }
+
+    fn decode_unsigned_integer(data: &[u8], type_info: &TypeInfo) -> Option<u128> {
+        let type_info = match type_info {
+            TypeInfo::TypedefType {
+                underlying_type, ..
+            }
+            | TypeInfo::QualifiedType {
+                underlying_type, ..
+            } => return Self::decode_unsigned_integer(data, underlying_type),
+            type_info => type_info,
+        };
+        let TypeInfo::BaseType { size, encoding, .. } = type_info else {
+            return None;
+        };
+        if *encoding != gimli::constants::DW_ATE_unsigned.0 as u16
+            && *encoding != gimli::constants::DW_ATE_unsigned_char.0 as u16
+        {
+            return None;
+        }
+
+        match *size {
+            1 => Some(u8::from_le_bytes(data.get(..1)?.try_into().ok()?) as u128),
+            2 => Some(u16::from_le_bytes(data.get(..2)?.try_into().ok()?) as u128),
+            4 => Some(u32::from_le_bytes(data.get(..4)?.try_into().ok()?) as u128),
+            8 => Some(u64::from_le_bytes(data.get(..8)?.try_into().ok()?) as u128),
+            16 => Some(u128::from_le_bytes(data.get(..16)?.try_into().ok()?)),
+            _ => None,
+        }
+    }
+
+    fn encode_unsigned_integer(data: &mut [u8], type_info: &TypeInfo, value: u128) -> bool {
+        let type_info = match type_info {
+            TypeInfo::TypedefType {
+                underlying_type, ..
+            }
+            | TypeInfo::QualifiedType {
+                underlying_type, ..
+            } => return Self::encode_unsigned_integer(data, underlying_type, value),
+            type_info => type_info,
+        };
+        let TypeInfo::BaseType { size, encoding, .. } = type_info else {
+            return false;
+        };
+        if *encoding != gimli::constants::DW_ATE_unsigned.0 as u16
+            && *encoding != gimli::constants::DW_ATE_unsigned_char.0 as u16
+        {
+            return false;
+        }
+
+        let bytes = value.to_le_bytes();
+        let Ok(size) = usize::try_from(*size) else {
+            return false;
+        };
+        let Some(target) = data.get_mut(..size) else {
+            return false;
+        };
+        let Some(source) = bytes.get(..size) else {
+            return false;
+        };
+        target.copy_from_slice(source);
+        true
     }
 
     fn decode_signed_integer(data: &[u8], type_info: &TypeInfo) -> Option<i128> {
@@ -882,9 +1005,9 @@ impl FormatPrinter {
                 let (_, _, payload) = Self::parse_sequence_payload(data, *element_stride)?;
                 Some(payload)
             }
-            ValuePresentation::SingleField { .. } | ValuePresentation::SignedStateStruct { .. } => {
-                Some(data)
-            }
+            ValuePresentation::SingleField { .. }
+            | ValuePresentation::SignedStateStruct { .. }
+            | ValuePresentation::ReferenceCountedStruct { .. } => Some(data),
         }
     }
 
@@ -1837,6 +1960,65 @@ mod tests {
         assert_eq!(
             FormatPrinter::presentation_payload_bytes(&shared, &presentation),
             Some(shared.as_slice())
+        );
+    }
+
+    #[test]
+    fn test_reference_counted_presentation_removes_implicit_weak_count() {
+        let usize_type = TypeInfo::BaseType {
+            name: "usize".to_string(),
+            size: 8,
+            encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+        };
+        let type_info = TypeInfo::StructType {
+            name: "Rc".to_string(),
+            size: 20,
+            members: vec![
+                crate::StructMember {
+                    name: "value".to_string(),
+                    member_type: TypeInfo::BaseType {
+                        name: "i32".to_string(),
+                        size: 4,
+                        encoding: gimli::constants::DW_ATE_signed.0 as u16,
+                    },
+                    offset: 0,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+                crate::StructMember {
+                    name: "strong".to_string(),
+                    member_type: usize_type.clone(),
+                    offset: 4,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+                crate::StructMember {
+                    name: "weak".to_string(),
+                    member_type: usize_type,
+                    offset: 12,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+            ],
+        };
+        let presentation = ValuePresentation::ReferenceCountedStruct {
+            strong_field: "strong".to_string(),
+            weak_field: "weak".to_string(),
+            implicit_weak: 1,
+        };
+        let mut data = [0_u8; 20];
+        data[..4].copy_from_slice(&(-7_i32).to_le_bytes());
+        data[4..12].copy_from_slice(&3_u64.to_le_bytes());
+        data[12..].copy_from_slice(&2_u64.to_le_bytes());
+
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(&data, &type_info, &presentation),
+            "Rc(strong=3, weak=1) { value: -7, strong: 3, weak: 1 }"
+        );
+        assert_eq!(u64::from_le_bytes(data[12..].try_into().unwrap()), 2);
+        assert_eq!(
+            FormatPrinter::presentation_payload_bytes(&data, &presentation),
+            Some(data.as_slice())
         );
     }
 

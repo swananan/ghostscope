@@ -896,6 +896,145 @@ async fn test_rust_ref_value_plan_builds_dwarf_projected_view() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn test_rust_rc_arc_value_plans_follow_dwarf_projected_views() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let context = analyzer
+        .lookup_function_addresses("observe_rc_arc")
+        .into_iter()
+        .find_map(|address| analyzer.resolve_pc(&address).ok())
+        .ok_or_else(|| anyhow::anyhow!("expected observe_rc_arc context"))?;
+
+    for (parameter, expected_name) in [("rc", "Rc"), ("arc", "Arc")] {
+        let parameter_plan = analyzer
+            .plan_variable_by_name(&context, parameter)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter plan"))?;
+        let parameter_type = analyzer
+            .resolved_type_for_plan(&parameter_plan)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter type"))?;
+        let value_plan = analyzer
+            .value_read_plan(&parameter_type, Some(&binary_path))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("expected {parameter} semantic plan for {parameter_type:#?}")
+            })?;
+        assert_eq!(
+            value_plan.presentation,
+            ghostscope_dwarf::ValuePresentation::ReferenceCountedStruct {
+                strong_field: "strong".to_string(),
+                weak_field: "weak".to_string(),
+                implicit_weak: 1,
+            }
+        );
+        let ghostscope_dwarf::ValueCapturePlan::ProjectedView {
+            output_type,
+            fields,
+        } = value_plan.capture
+        else {
+            anyhow::bail!("expected projected semantic view for {parameter}")
+        };
+        let ghostscope_dwarf::TypeInfo::StructType {
+            name,
+            size,
+            members,
+        } = output_type
+        else {
+            anyhow::bail!("expected projected {expected_name} struct")
+        };
+        assert_eq!(name, expected_name);
+        let [value_member, strong_member, weak_member] = members.as_slice() else {
+            anyhow::bail!("expected value and reference-count members")
+        };
+        assert_eq!(value_member.name, "value");
+        assert_eq!(strong_member.name, "strong");
+        assert_eq!(weak_member.name, "weak");
+        assert_eq!(value_member.offset, 0);
+        assert_eq!(strong_member.offset, value_member.member_type.size());
+        assert_eq!(
+            weak_member.offset,
+            strong_member.offset + strong_member.member_type.size()
+        );
+        assert_eq!(size, weak_member.offset + weak_member.member_type.size());
+        assert!(matches!(
+            ghostscope_dwarf::strip_type_aliases(&value_member.member_type),
+            ghostscope_dwarf::TypeInfo::StructType { name, size: 8, .. }
+                if name == "(i32, u16)"
+        ));
+        for member in [strong_member, weak_member] {
+            assert!(matches!(
+                ghostscope_dwarf::strip_type_aliases(&member.member_type),
+                ghostscope_dwarf::TypeInfo::BaseType { size, encoding, .. }
+                    if matches!(*size, 4 | 8)
+                        && *encoding
+                            == ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16
+            ));
+        }
+        assert_eq!(fields.len(), 3);
+        for field in &fields {
+            assert!(field.value.steps.iter().any(|step| matches!(
+                step,
+                ghostscope_dwarf::ProjectedValueStep::Dereference {
+                    pointer_size: 4 | 8
+                }
+            )));
+        }
+    }
+
+    for parameter in ["rc_unit", "arc_unit"] {
+        let parameter_plan = analyzer
+            .plan_variable_by_name(&context, parameter)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter plan"))?;
+        let parameter_type = analyzer
+            .resolved_type_for_plan(&parameter_plan)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter type"))?;
+        let output_type = analyzer
+            .value_read_plan(&parameter_type, Some(&binary_path))?
+            .and_then(|plan| match plan.capture {
+                ghostscope_dwarf::ValueCapturePlan::ProjectedView { output_type, .. } => {
+                    Some(output_type)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} projected view"))?;
+        let ghostscope_dwarf::TypeInfo::StructType { members, .. } = output_type else {
+            anyhow::bail!("expected {parameter} struct view")
+        };
+        assert_eq!(members[0].member_type.size(), 0);
+        assert_eq!(members[1].offset, 0);
+    }
+
+    let user_context = analyzer
+        .lookup_function_addresses("observe_user_rc_arc")
+        .into_iter()
+        .find_map(|address| analyzer.resolve_pc(&address).ok())
+        .ok_or_else(|| anyhow::anyhow!("expected observe_user_rc_arc context"))?;
+    for parameter in ["rc", "arc"] {
+        let parameter_plan = analyzer
+            .plan_variable_by_name(&user_context, parameter)?
+            .ok_or_else(|| anyhow::anyhow!("expected user {parameter} plan"))?;
+        let parameter_pointer = analyzer
+            .resolved_type_for_plan(&parameter_plan)?
+            .ok_or_else(|| anyhow::anyhow!("expected user {parameter} type"))?;
+        let parameter_type = analyzer
+            .project_resolved_type(
+                &parameter_pointer,
+                &ghostscope_dwarf::VariableAccessSegment::Dereference,
+                Some(&binary_path),
+            )?
+            .resolved_type;
+        assert!(
+            analyzer
+                .value_read_plan(&parameter_type, Some(&binary_path))?
+                .is_none(),
+            "user-defined {parameter} must retain DWARF presentation"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_str_values() -> anyhow::Result<()> {
     init();
 
@@ -1261,6 +1400,62 @@ trace observe_ref_guards {
             .lines()
             .any(|line| line.contains("Ref(borrow=1) { *value: (), borrow: 1 }")),
         "Expected zero-sized Rust Ref output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_rc_and_arc_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_rc_arc {
+    print "RRCARC:{}:{}:{}:{}", rc, arc, rc_unit, arc_unit;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("Rc(strong=3, weak=1)")
+                && line.contains("__0: -7")
+                && line.contains("__1: 13")
+                && line.contains("strong: 3")
+                && line.contains("weak: 1")
+        }),
+        "Expected Rust Rc output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("Arc(strong=3, weak=1)")
+                && line.contains("__0: 29")
+                && line.contains("__1: 17")
+                && line.contains("strong: 3")
+                && line.contains("weak: 1")
+        }),
+        "Expected Rust Arc output: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("Rc(strong=1, weak=0) { value: (), strong: 1, weak: 0 }")),
+        "Expected zero-sized Rust Rc output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("Arc(strong=1, weak=0) { value: (), strong: 1, weak: 0 }")
+        }),
+        "Expected zero-sized Rust Arc output: {stdout}"
     );
     assert!(
         !stdout.contains("ExprError"),
