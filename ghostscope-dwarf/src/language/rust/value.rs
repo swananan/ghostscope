@@ -10,6 +10,7 @@ pub(crate) struct IndirectSequenceLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndirectSequenceKind {
     Utf8String,
+    PointerTarget,
     TypeParameter { index: usize },
 }
 
@@ -50,6 +51,13 @@ pub(super) fn resolve_value_layout(
             field_path(&["length"]),
             IndirectSequenceKind::Utf8String,
         )
+    } else if is_slice_name(name) {
+        validate_indirect_sequence_layout(
+            &current.summary,
+            field_path(&["data_ptr"]),
+            field_path(&["length"]),
+            IndirectSequenceKind::PointerTarget,
+        )
     // rustc commonly stores only `String` in DW_AT_name and represents
     // `alloc::string` with enclosing namespace DIEs. GDB presents the
     // reconstructed qualified name to its Rust printer. Trust the equivalent
@@ -62,6 +70,26 @@ pub(super) fn resolve_value_layout(
     } else {
         None
     }
+}
+
+fn is_slice_name(name: &str) -> bool {
+    // Rust 1.30's GDB support stripped an explicit `'static` lifetime before
+    // applying the same &[T]/&mut [T] classification used by current rust-gdb.
+    let Some(referenced) = name
+        .strip_prefix("&'static ")
+        .or_else(|| name.strip_prefix('&'))
+    else {
+        return false;
+    };
+    let referenced = referenced.strip_prefix("mut ").unwrap_or(referenced);
+    let Some(element) = referenced
+        .strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+    else {
+        return false;
+    };
+
+    !element.is_empty()
 }
 
 fn is_short_vec_name(name: &str) -> bool {
@@ -406,6 +434,22 @@ mod tests {
         })
     }
 
+    fn rust_slice_type_64(name: &str, language: SourceLanguage) -> ResolvedType {
+        let mut current = rust_str_type_64(name, language);
+        let TypeInfo::StructType { members, .. } = &mut current.summary else {
+            unreachable!("test slice is a struct")
+        };
+        let TypeInfo::PointerType { target_type, .. } = &mut members[0].member_type else {
+            unreachable!("test slice data_ptr is a pointer")
+        };
+        *target_type = Box::new(TypeInfo::BaseType {
+            name: "i32".to_string(),
+            size: 4,
+            encoding: gimli::DW_ATE_signed.0 as u16,
+        });
+        current
+    }
+
     fn member(name: &str, member_type: TypeInfo, offset: u64) -> StructMember {
         StructMember {
             name: name.to_string(),
@@ -551,6 +595,35 @@ mod tests {
                 "name={name}"
             );
         }
+    }
+
+    #[test]
+    fn recognizes_rust_slice_layout_and_supported_names() {
+        for name in [
+            "&[i32]",
+            "&mut [i32]",
+            "&'static [i32]",
+            "&'static mut [i32]",
+        ] {
+            let current = rust_slice_type_64(name, SourceLanguage::Rust);
+
+            assert_eq!(
+                resolve_value_layout(&current, None),
+                Some(IndirectSequenceLayout {
+                    data_path: field_path(&["data_ptr"]),
+                    length_path: field_path(&["length"]),
+                    kind: IndirectSequenceKind::PointerTarget,
+                }),
+                "name={name}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_classify_non_slice_reference_name() {
+        let current = rust_slice_type_64("&[i32", SourceLanguage::Rust);
+
+        assert_eq!(resolve_value_layout(&current, None), None);
     }
 
     #[test]

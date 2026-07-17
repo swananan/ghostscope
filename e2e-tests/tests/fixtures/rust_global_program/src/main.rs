@@ -20,6 +20,9 @@ pub static mut G_VEC_U8: Vec<u8> = Vec::new();
 pub static mut G_VEC_I32: Vec<i32> = Vec::new();
 pub static mut G_EMPTY_VEC: Vec<i32> = Vec::new();
 pub static mut G_VEC_UNIT: Vec<()> = Vec::new();
+pub static mut G_SLICE_I32: &[i32] = &[];
+pub static mut G_MUT_SLICE_U16: &mut [u16] = &mut [];
+pub static mut G_EMPTY_SLICE: &[i32] = &[];
 
 pub mod user_types {
     pub struct String {
@@ -245,6 +248,9 @@ fn touch_globals() -> i32 {
             + G_VEC_I32.len() as i64
             + G_EMPTY_VEC.len() as i64
             + G_VEC_UNIT.len() as i64
+            + G_SLICE_I32.len() as i64
+            + G_MUT_SLICE_U16.len() as i64
+            + G_EMPTY_SLICE.len() as i64
             + G_USER_VEC.len as i64
             + GLOBAL_PAIRS[0].0 as i64
             + union_value as i64
@@ -267,6 +273,8 @@ fn main() {
         G_VEC_U8 = vec![1, 2, 3, 255];
         G_VEC_I32 = vec![10, -20, 30, 40];
         G_VEC_UNIT = vec![(); 3];
+        G_SLICE_I32 = Box::leak(vec![7, -8, 9].into_boxed_slice());
+        G_MUT_SLICE_U16 = Box::leak(vec![1000, 2000, 65535].into_boxed_slice());
     }
 
     let mut acc: i64 = 0;

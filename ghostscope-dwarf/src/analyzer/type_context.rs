@@ -267,6 +267,32 @@ impl DwarfAnalyzer {
                 crate::ValuePresentation::Utf8String,
                 ValueCapturePlan::IndirectBytes { data, length },
             ),
+            crate::language::IndirectSequenceKind::PointerTarget => {
+                let TypeInfo::PointerType { target_type, .. } =
+                    strip_type_aliases(&data.resolved_type.summary)
+                else {
+                    return Ok(None);
+                };
+                let element_type = target_type.as_ref().clone();
+                if matches!(
+                    strip_type_aliases(&element_type),
+                    TypeInfo::UnknownType { .. } | TypeInfo::OptimizedOut { .. }
+                ) {
+                    return Ok(None);
+                }
+                let element_stride = element_type.size();
+                (
+                    crate::ValuePresentation::Sequence {
+                        element_type: Box::new(element_type),
+                        element_stride,
+                    },
+                    ValueCapturePlan::IndirectSequence {
+                        data,
+                        length,
+                        element_stride,
+                    },
+                )
+            }
             crate::language::IndirectSequenceKind::TypeParameter { index } => {
                 let Some(type_id) = current.identity.layout_dwarf_id() else {
                     return Ok(None);
