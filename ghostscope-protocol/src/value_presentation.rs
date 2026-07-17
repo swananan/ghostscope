@@ -35,4 +35,10 @@ pub enum ValuePresentation {
     /// An arbitrary byte string using the same length-prefixed payload as
     /// `Utf8String`. Invalid UTF-8 bytes are rendered with `\xNN` escapes.
     ByteString,
+    /// A projected DWARF value rendered as one named field of a semantic
+    /// wrapper. The payload is the raw bytes of `type_info`.
+    SingleField {
+        type_name: String,
+        field_name: String,
+    },
 }

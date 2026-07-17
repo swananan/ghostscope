@@ -347,6 +347,29 @@ mod tests {
     }
 
     #[test]
+    fn test_single_field_presentation_round_trips() {
+        let mut ctx = TraceContext::new();
+        let presentation = ValuePresentation::SingleField {
+            type_name: "Cell".to_string(),
+            field_name: "value".to_string(),
+        };
+        let index = ctx
+            .add_type_with_presentation(
+                TypeInfo::BaseType {
+                    name: "u32".to_string(),
+                    size: 4,
+                    encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+                },
+                presentation.clone(),
+            )
+            .unwrap();
+
+        let json = serde_json::to_string(&ctx).unwrap();
+        let decoded: TraceContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.get_value_presentation(index), &presentation);
+    }
+
+    #[test]
     fn test_deserialized_legacy_context_defaults_to_dwarf_presentation() {
         let json = r#"{
             "strings": [],

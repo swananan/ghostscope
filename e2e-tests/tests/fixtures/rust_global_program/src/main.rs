@@ -2,6 +2,7 @@
 #![allow(static_mut_refs)]
 
 use std::{
+    cell::Cell,
     collections::VecDeque,
     ffi::OsString,
     marker::{PhantomData, PhantomPinned},
@@ -33,6 +34,9 @@ pub static G_NONZERO_U32: NonZeroU32 = NonZeroU32::new(7).unwrap();
 pub static G_NONZERO_I32: NonZeroI32 = NonZeroI32::new(-9).unwrap();
 pub static G_NONZERO_U128: NonZeroU128 =
     NonZeroU128::new(340_282_366_920_938_463_463_374_607_431_768_211_454).unwrap();
+pub static mut G_CELL_U32: Cell<u32> = Cell::new(41);
+pub static mut G_CELL_PAIR: Cell<(i32, u16)> = Cell::new((-4, 12));
+pub static mut G_CELL_UNIT: Cell<()> = Cell::new(());
 
 pub mod user_types {
     pub struct String {
@@ -70,6 +74,10 @@ pub mod user_types {
     pub struct NonZero<T>(pub NonZeroInner<T>);
 
     pub struct NonZeroInner<T>(pub T);
+
+    pub struct Cell<T>(pub UnsafeCell<T>);
+
+    pub struct UnsafeCell<T>(pub T);
 }
 
 pub static mut G_USER_STRING: user_types::String = user_types::String {
@@ -93,6 +101,9 @@ pub static mut G_USER_VEC: user_types::Vec<i32> = user_types::Vec {
 
 pub static G_USER_NONZERO: user_types::NonZero<u32> =
     user_types::NonZero(user_types::NonZeroInner(11));
+
+pub static mut G_USER_CELL: user_types::Cell<u32> =
+    user_types::Cell(user_types::UnsafeCell(13));
 
 #[repr(C)]
 pub struct Config {
@@ -296,6 +307,7 @@ fn touch_globals() -> i32 {
             GlobalState::TupleState { left, right } => left + if right { 1 } else { 0 },
         };
         GLOBAL_ENUM_BITS = enum_contrib;
+        G_CELL_UNIT.get();
 
         let total = CONFIG.a as i64
             + G_MESSAGE.len() as i64
@@ -319,7 +331,10 @@ fn touch_globals() -> i32 {
             + G_NONZERO_U32.get() as i64
             + G_NONZERO_I32.get() as i64
             + G_NONZERO_U128.get() as i64
+            + G_CELL_U32.get() as i64
+            + G_CELL_PAIR.get().0 as i64
             + G_USER_NONZERO.0.0 as i64
+            + G_USER_CELL.0.0 as i64
             + G_USER_VEC.len as i64
             + GLOBAL_PAIRS[0].0 as i64
             + union_value as i64

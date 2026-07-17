@@ -764,6 +764,13 @@ impl FormatPrinter {
                 element_stride,
             } => Self::format_sequence_payload(data, element_type, *element_stride),
             ValuePresentation::ByteString => Self::format_byte_string_payload(data),
+            ValuePresentation::SingleField {
+                type_name,
+                field_name,
+            } => {
+                let value = Self::format_data_with_type_info(data, type_info);
+                format!("{type_name} {{ {field_name}: {value} }}")
+            }
         }
     }
 
@@ -802,6 +809,7 @@ impl FormatPrinter {
                 let (_, _, payload) = Self::parse_sequence_payload(data, *element_stride)?;
                 Some(payload)
             }
+            ValuePresentation::SingleField { .. } => Some(data),
         }
     }
 
@@ -937,6 +945,7 @@ impl FormatPrinter {
         }
 
         match type_info {
+            TypeInfo::BaseType { name, size: 0, .. } if name == "()" => "()".to_string(),
             TypeInfo::BaseType { size, encoding, .. } => {
                 Self::format_base_type_data(data, *size, *encoding)
             }
@@ -1017,6 +1026,9 @@ impl FormatPrinter {
                 // Allow deeper nested structures now; cutoff managed by max_depth param
                 if current_depth > max_depth {
                     return format!("<STRUCT_{name}>");
+                }
+                if members.is_empty() && type_info.size() == 0 && name == "()" {
+                    return "()".to_string();
                 }
 
                 let mut result = format!("{name} {{ ");
@@ -1656,6 +1668,39 @@ mod tests {
                 &ValuePresentation::ByteString,
             ),
             "\"a\\xffb\""
+        );
+    }
+
+    #[test]
+    fn test_single_field_presentation_wraps_dwarf_value() {
+        let value_type = TypeInfo::BaseType {
+            name: "u32".to_string(),
+            size: 4,
+            encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+        };
+        let presentation = ValuePresentation::SingleField {
+            type_name: "Cell".to_string(),
+            field_name: "value".to_string(),
+        };
+        let data = 42_u32.to_le_bytes();
+
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(&data, &value_type, &presentation),
+            "Cell { value: 42 }"
+        );
+        assert_eq!(
+            FormatPrinter::presentation_payload_bytes(&data, &presentation),
+            Some(data.as_slice())
+        );
+
+        let unit_type = TypeInfo::BaseType {
+            name: "()".to_string(),
+            size: 0,
+            encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+        };
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(&[], &unit_type, &presentation),
+            "Cell { value: () }"
         );
     }
 
