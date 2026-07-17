@@ -18,7 +18,9 @@ pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
     current.origin.as_ref().is_some_and(|origin| {
         origin.language == SourceLanguage::Rust
             && matches!(strip_type_aliases(&current.summary), TypeInfo::StructType { name, .. }
-                if name == "String" || is_short_vec_name(name))
+                if name == "String"
+                    || is_short_vec_name(name)
+                    || is_short_box_str_name(name))
     })
 }
 
@@ -58,6 +60,17 @@ pub(super) fn resolve_value_layout(
             field_path(&["length"]),
             IndirectSequenceKind::PointerTarget,
         )
+    } else if is_std_box_str(name, dwarf_qualified_name) {
+        // Rust 1.96 and older rust-gdb scripts had no Box<str> provider. The
+        // current provider has no version fallback and reads data_ptr/length.
+        // Accept the pre-allocator generic spelling when DWARF emits it, but
+        // derive every physical detail from the concrete DIE.
+        validate_indirect_sequence_layout(
+            &current.summary,
+            field_path(&["data_ptr"]),
+            field_path(&["length"]),
+            IndirectSequenceKind::Utf8String,
+        )
     // rustc commonly stores only `String` in DW_AT_name and represents
     // `alloc::string` with enclosing namespace DIEs. GDB presents the
     // reconstructed qualified name to its Rust printer. Trust the equivalent
@@ -94,6 +107,44 @@ fn is_slice_name(name: &str) -> bool {
 
 fn is_short_vec_name(name: &str) -> bool {
     name.starts_with("Vec<") && name.ends_with('>')
+}
+
+fn is_short_box_str_name(name: &str) -> bool {
+    box_str_arguments(name, "Box<").is_some()
+}
+
+fn is_std_box_str(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_box_str_name(name)
+        || (is_short_box_str_name(name) && dwarf_qualified_name.is_some_and(is_std_box_str_name))
+}
+
+fn is_std_box_str_name(name: &str) -> bool {
+    let Some(path) = name.strip_prefix("alloc::") else {
+        return false;
+    };
+    let Some((module, _)) = path
+        .split_once("::Box<")
+        .filter(|(_, arguments)| box_str_arguments(arguments, "").is_some())
+    else {
+        return false;
+    };
+
+    !module.is_empty()
+        && module.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+}
+
+fn box_str_arguments<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    let arguments = name.strip_prefix(prefix)?.strip_suffix('>')?;
+    (arguments == "str"
+        || arguments
+            .strip_prefix("str,")
+            .is_some_and(|allocator| !allocator.is_empty()))
+    .then_some(arguments)
 }
 
 fn is_std_string(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
@@ -627,6 +678,44 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_std_box_str_with_current_and_legacy_type_names() {
+        for name in [
+            "alloc::boxed::Box<str, alloc::alloc::Global>",
+            "alloc::boxed::Box<str>",
+        ] {
+            let current = rust_str_type_64(name, SourceLanguage::Rust);
+
+            assert_eq!(
+                resolve_value_layout(&current, None),
+                Some(IndirectSequenceLayout {
+                    data_path: field_path(&["data_ptr"]),
+                    length_path: field_path(&["length"]),
+                    kind: IndirectSequenceKind::Utf8String,
+                }),
+                "name={name}"
+            );
+        }
+
+        let current = rust_str_type_64("Box<str, alloc::alloc::Global>", SourceLanguage::Rust);
+        assert!(resolve_value_layout(
+            &current,
+            Some("alloc::boxed::Box<str, alloc::alloc::Global>"),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn does_not_classify_box_str_from_another_namespace() {
+        let current = rust_str_type_64("Box<str, alloc::alloc::Global>", SourceLanguage::Rust);
+
+        assert_eq!(
+            resolve_value_layout(&current, Some("app::Box<str, alloc::alloc::Global>"),),
+            None
+        );
+        assert_eq!(resolve_value_layout(&current, None), None);
+    }
+
+    #[test]
     fn recognizes_32_bit_layout_from_dwarf() {
         let current = rust_str_type(RustStrLayout {
             name: "&str",
@@ -879,6 +968,14 @@ mod tests {
             8,
             true,
             true,
+        )));
+        assert!(requires_dwarf_qualified_name(&rust_str_type_64(
+            "Box<str, alloc::alloc::Global>",
+            SourceLanguage::Rust,
+        )));
+        assert!(!requires_dwarf_qualified_name(&rust_str_type_64(
+            "alloc::boxed::Box<str, alloc::alloc::Global>",
+            SourceLanguage::Rust,
         )));
     }
 }
