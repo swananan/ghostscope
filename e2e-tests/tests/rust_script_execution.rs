@@ -274,6 +274,108 @@ async fn test_rust_vec_value_plan_uses_dwarf_type_parameter_and_namespace() -> a
 }
 
 #[tokio::test]
+async fn test_rust_vec_deque_value_plan_uses_dwarf_ring_layout() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let (_, read_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_VEC_DEQUE_I32",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_VEC_DEQUE_I32 read plan"))?;
+    let resolved_type = analyzer
+        .resolved_type_for_plan(&read_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected standard VecDeque type"))?;
+    let value_plan = analyzer
+        .value_read_plan(&resolved_type, Some(&binary_path))?
+        .ok_or_else(|| anyhow::anyhow!("expected standard VecDeque value plan"))?;
+
+    match &value_plan.presentation {
+        ghostscope_dwarf::ValuePresentation::Sequence {
+            element_type,
+            element_stride,
+        } => {
+            assert_eq!(*element_stride, 4);
+            assert!(matches!(
+                element_type.as_ref(),
+                ghostscope_dwarf::TypeInfo::BaseType {
+                    name,
+                    size: 4,
+                    encoding,
+                } if name == "i32"
+                    && *encoding == ghostscope_dwarf::constants::DW_ATE_signed.0 as u16
+            ));
+        }
+        presentation => anyhow::bail!("unexpected VecDeque presentation: {presentation:?}"),
+    }
+
+    let ghostscope_dwarf::ValueCapturePlan::IndirectRingSequence {
+        data,
+        start,
+        length,
+        capacity,
+        element_stride,
+    } = value_plan.capture
+    else {
+        anyhow::bail!("expected indirect ring capture for VecDeque<i32>")
+    };
+    assert_eq!(element_stride, 4);
+    let length = match *length {
+        ghostscope_dwarf::RingSequenceLength::Explicit(length) => length,
+        ghostscope_dwarf::RingSequenceLength::End(_) => {
+            anyhow::bail!("current VecDeque should expose an explicit length")
+        }
+    };
+    assert!(matches!(
+        data.resolved_type.summary,
+        ghostscope_dwarf::TypeInfo::PointerType { size: 8, .. }
+    ));
+    for projection in [&start, &length, &capacity] {
+        assert!(matches!(
+            projection.layout,
+            ghostscope_dwarf::TypeProjectionLayout::Member { .. }
+        ));
+        assert!(matches!(
+            projection.resolved_type.summary,
+            ghostscope_dwarf::TypeInfo::BaseType { size: 8, .. }
+        ));
+    }
+
+    let (_, zst_read_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_VEC_DEQUE_UNIT",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_VEC_DEQUE_UNIT read plan"))?;
+    let zst_type = analyzer
+        .resolved_type_for_plan(&zst_read_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected VecDeque<()> type"))?;
+    let zst_value_plan = analyzer
+        .value_read_plan(&zst_type, Some(&binary_path))?
+        .ok_or_else(|| anyhow::anyhow!("expected VecDeque<()> value plan"))?;
+    assert!(matches!(
+        zst_value_plan.presentation,
+        ghostscope_dwarf::ValuePresentation::Sequence {
+            element_stride: 0,
+            ..
+        }
+    ));
+    assert!(matches!(
+        zst_value_plan.capture,
+        ghostscope_dwarf::ValueCapturePlan::IndirectSequence {
+            element_stride: 0,
+            ..
+        }
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_slice_value_plan_uses_dwarf_pointer_target() -> anyhow::Result<()> {
     init();
 
@@ -445,6 +547,85 @@ trace do_stuff {
             .lines()
             .any(|line| line.contains("RVEC_RAW:01 02 03 ff")),
         "Expected raw Rust Vec output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_vec_deque_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_vec_deque {
+    print "RDEQUE:{}:{}:{}", wrapped, contiguous, empty;
+}
+trace do_stuff {
+    print "RDEQUE_ZST:{}", G_VEC_DEQUE_UNIT;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RDEQUE:[10, 20, 30, 40]:[7, 8, 9]:[]")),
+        "Expected Rust VecDeque output: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RDEQUE_ZST:[(), (), ()]")),
+        "Expected Rust VecDeque ZST output: stderr={stderr} stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_vec_deque_respects_element_aligned_cap() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_vec_deque {
+    print "RDEQUE_CAP:{}", wrapped;
+}
+"#;
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_config_content(
+            r#"
+[ebpf]
+mem_dump_cap = 9
+"#,
+        )
+        .attach_to(&target)
+        .timeout_secs(9)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RDEQUE_CAP:[10, 20] <truncated>")),
+        "Expected capped Rust VecDeque output: {stdout}"
     );
     assert!(
         !stdout.contains("ExprError"),

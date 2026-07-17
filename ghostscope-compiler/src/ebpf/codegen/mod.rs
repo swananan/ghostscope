@@ -41,6 +41,18 @@ struct PrintVarRuntimeMeta {
     data_len_limit: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RingSequenceLengthSource {
+    Explicit {
+        offset: u64,
+        access_size: ghostscope_dwarf::MemoryAccessSize,
+    },
+    End {
+        offset: u64,
+        access_size: ghostscope_dwarf::MemoryAccessSize,
+    },
+}
+
 /// Source for complex formatted argument data
 #[derive(Debug, Clone)]
 enum ComplexArgSource<'ctx> {
@@ -77,6 +89,20 @@ enum ComplexArgSource<'ctx> {
         data_access_size: ghostscope_dwarf::MemoryAccessSize,
         length_offset: u64,
         length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        element_stride: u64,
+        max_elements: usize,
+        max_len: usize,
+    },
+    /// Bounded capture of a logical sequence split across a ring buffer.
+    IndirectRingSequence {
+        descriptor: RuntimeAddress<'ctx>,
+        data_offset: u64,
+        data_access_size: ghostscope_dwarf::MemoryAccessSize,
+        start_offset: u64,
+        start_access_size: ghostscope_dwarf::MemoryAccessSize,
+        length: RingSequenceLengthSource,
+        capacity_offset: u64,
+        capacity_access_size: ghostscope_dwarf::MemoryAccessSize,
         element_stride: u64,
         max_elements: usize,
         max_len: usize,
