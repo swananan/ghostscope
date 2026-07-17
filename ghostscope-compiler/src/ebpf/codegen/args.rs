@@ -198,13 +198,23 @@ fn sequence_capture_limits(cap: usize, element_stride: u64) -> Result<(usize, us
     Ok((max_elements, max_len, data_len))
 }
 
-fn hash_table_capture_limits(cap: usize, entry_stride: u64) -> Result<(usize, usize, usize)> {
+fn hash_table_capture_limits(
+    cap: usize,
+    entry_stride: u64,
+    occupancy: ghostscope_dwarf::HashTableOccupancy,
+) -> Result<(usize, usize, usize)> {
     let stride = usize::try_from(entry_stride).map_err(|_| {
         CodeGenError::DwarfError(format!(
             "hash-table entry DWARF size {entry_stride} does not fit this host"
         ))
     })?;
-    let bytes_per_bucket = stride.checked_add(1).ok_or_else(|| {
+    let occupancy_width = occupancy
+        .byte_width()
+        .and_then(|width| usize::try_from(width).ok())
+        .ok_or_else(|| {
+            CodeGenError::DwarfError("invalid hash-table occupancy width".to_string())
+        })?;
+    let bytes_per_bucket = stride.checked_add(occupancy_width).ok_or_else(|| {
         CodeGenError::DwarfError("hash-table bucket capture size overflow".to_string())
     })?;
     let max_buckets = cap / bytes_per_bucket;
@@ -443,26 +453,49 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
             ghostscope_dwarf::ValueCapturePlan::IndirectHashTable {
                 control,
-                data,
                 length,
                 bucket_mask,
                 entry_stride,
+                occupancy,
+                buckets,
                 bucket_order,
             } => {
                 let (control_offset, control_access_size) =
                     metadata_member(&control, "hash-table control")?;
-                let data = data
-                    .as_ref()
-                    .map(|data| metadata_member(data, "hash-table data"))
-                    .transpose()?;
+                let buckets = match buckets {
+                    ghostscope_dwarf::HashTableBucketSource::Forward { data } => {
+                        let (data_offset, data_access_size) =
+                            metadata_member(&data, "hash-table data")?;
+                        HashTableBucketSource::Forward {
+                            data_offset,
+                            data_access_size,
+                        }
+                    }
+                    ghostscope_dwarf::HashTableBucketSource::ReverseFromControl => {
+                        HashTableBucketSource::ReverseFromControl
+                    }
+                    ghostscope_dwarf::HashTableBucketSource::LegacyAfterControl {
+                        entry_alignment,
+                        pointer_tag_mask,
+                    } => HashTableBucketSource::LegacyAfterControl {
+                        entry_alignment,
+                        pointer_tag_mask,
+                    },
+                };
                 let (length_offset, length_access_size) =
                     metadata_member(&length, "hash-table length")?;
                 let (bucket_mask_offset, bucket_mask_access_size) =
                     metadata_member(&bucket_mask, "hash-table bucket mask")?;
                 let layout_matches = matches!(
-                    (bucket_order, data.is_some()),
-                    (ghostscope_dwarf::HashTableBucketOrder::Forward, true)
-                        | (ghostscope_dwarf::HashTableBucketOrder::Reverse, false)
+                    (bucket_order, buckets),
+                    (
+                        ghostscope_dwarf::HashTableBucketOrder::Forward,
+                        HashTableBucketSource::Forward { .. }
+                            | HashTableBucketSource::LegacyAfterControl { .. }
+                    ) | (
+                        ghostscope_dwarf::HashTableBucketOrder::Reverse,
+                        HashTableBucketSource::ReverseFromControl
+                    )
                 );
                 if !layout_matches {
                     return Err(CodeGenError::DwarfError(
@@ -470,19 +503,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     ));
                 }
                 let (max_buckets, max_len, data_len) =
-                    hash_table_capture_limits(cap, entry_stride)?;
+                    hash_table_capture_limits(cap, entry_stride, occupancy)?;
                 (
                     data_len,
                     ComplexArgSource::IndirectHashTable {
                         descriptor,
                         control_offset,
                         control_access_size,
-                        data,
                         length_offset,
                         length_access_size,
                         bucket_mask_offset,
                         bucket_mask_access_size,
                         entry_stride,
+                        occupancy,
+                        buckets,
                         bucket_order,
                         max_buckets,
                         max_len,

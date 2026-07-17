@@ -352,6 +352,7 @@ mod tests {
         let presentation = ValuePresentation::HashTable {
             entry_stride: 8,
             bucket_order: crate::HashTableBucketOrder::Reverse,
+            occupancy: crate::HashTableOccupancy::NonZeroWord { word_size: 8 },
             entry: crate::HashTableEntryPresentation::Map {
                 key: crate::HashTableFieldPresentation {
                     offset: 0,
@@ -384,6 +385,33 @@ mod tests {
         let decoded: TraceContext = serde_json::from_str(&json).unwrap();
 
         assert_eq!(decoded.get_value_presentation(index), &presentation);
+    }
+
+    #[test]
+    fn test_legacy_hash_table_presentation_defaults_to_control_bytes() {
+        let presentation = ValuePresentation::HashTable {
+            entry_stride: 0,
+            bucket_order: crate::HashTableBucketOrder::Reverse,
+            occupancy: crate::HashTableOccupancy::ControlByteHighBitClear,
+            entry: crate::HashTableEntryPresentation::Set {
+                value: crate::HashTableFieldPresentation {
+                    offset: 0,
+                    field_type: Box::new(TypeInfo::BaseType {
+                        name: "()".to_string(),
+                        size: 0,
+                        encoding: 0,
+                    }),
+                },
+            },
+        };
+        let mut json = serde_json::to_value(&presentation).unwrap();
+        json.get_mut("HashTable")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("occupancy");
+
+        let decoded: ValuePresentation = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, presentation);
     }
 
     #[test]

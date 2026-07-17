@@ -16,7 +16,7 @@ pub mod type_info;
 pub use type_kind::{consts, TypeKind};
 pub use value_presentation::{
     BTreeEntryPresentation, BTreeFieldPresentation, HashTableBucketOrder,
-    HashTableEntryPresentation, HashTableFieldPresentation, ValuePresentation,
+    HashTableEntryPresentation, HashTableFieldPresentation, HashTableOccupancy, ValuePresentation,
     BTREE_CAPTURED_ITEM_COUNT_OFFSET, BTREE_HEADER_SIZE, BTREE_NODE_HEADER_SIZE,
     BTREE_NODE_HEIGHT_OFFSET, BTREE_NODE_LENGTH_OFFSET, BTREE_NODE_SLOT_COUNT_OFFSET,
     HASH_TABLE_BUCKET_DATA_OFFSET, HASH_TABLE_CAPACITY_OFFSET, HASH_TABLE_CAPTURED_BUCKETS_OFFSET,

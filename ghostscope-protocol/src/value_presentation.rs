@@ -16,8 +16,8 @@ pub const INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET: usize = std::mem::size_of::<u
 
 /// Number of bytes used by a bounded hash-table payload. The header stores the
 /// logical item count, table capacity, captured bucket count, and byte offset
-/// of the bucket payload. Captured control bytes and any unused reserved
-/// control headroom sit between the header and the bucket payload.
+/// of the bucket payload. Captured occupancy bytes and any unused reserved
+/// occupancy headroom sit between the header and the bucket payload.
 pub const HASH_TABLE_HEADER_SIZE: usize = std::mem::size_of::<u64>() * 4;
 
 /// Offset of the runtime table capacity in a bounded hash-table header.
@@ -49,7 +49,7 @@ pub const BTREE_NODE_HEIGHT_OFFSET: usize = std::mem::size_of::<u64>();
 /// Offset of a node's initialized key count in its B-Tree payload slot.
 pub const BTREE_NODE_LENGTH_OFFSET: usize = std::mem::size_of::<u64>() * 2;
 
-/// Physical order of captured buckets relative to their control bytes.
+/// Physical order of captured buckets relative to their occupancy metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HashTableBucketOrder {
     /// Bucket `i` is stored at increasing offsets from a dedicated data pointer.
@@ -57,6 +57,26 @@ pub enum HashTableBucketOrder {
     /// Bucket `i` is stored immediately before the control pointer, so a
     /// contiguous capture appears in reverse control-index order.
     Reverse,
+}
+
+/// Physical occupancy metadata stored for each captured hash-table bucket.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HashTableOccupancy {
+    /// One hashbrown control byte; its high bit is clear for occupied buckets.
+    #[default]
+    ControlByteHighBitClear,
+    /// One fixed-width hash word; zero marks an empty bucket.
+    NonZeroWord { word_size: u64 },
+}
+
+impl HashTableOccupancy {
+    /// Number of payload bytes that describe one bucket's occupancy.
+    pub fn byte_width(self) -> Option<u64> {
+        match self {
+            Self::ControlByteHighBitClear => Some(1),
+            Self::NonZeroWord { word_size } => (word_size > 0).then_some(word_size),
+        }
+    }
 }
 
 /// One source-language value projected from a DWARF-described hash entry.
@@ -141,12 +161,14 @@ pub enum ValuePresentation {
         weak_field: String,
         implicit_weak: u64,
     },
-    /// A bounded sparse-table capture containing control bytes and physical
-    /// entries. Entry stride and projected key/value fields come from DWARF;
-    /// only hashbrown's occupied-control-bit semantics are language-specific.
+    /// A bounded sparse-table capture containing occupancy metadata and
+    /// physical entries. Entry stride and projected key/value fields come from
+    /// DWARF; the source-language adapter selects the occupancy semantics.
     HashTable {
         entry_stride: u64,
         bucket_order: HashTableBucketOrder,
+        #[serde(default)]
+        occupancy: HashTableOccupancy,
         entry: HashTableEntryPresentation,
     },
     /// A bounded breadth-first snapshot of Rust B-Tree nodes. Node capacity,

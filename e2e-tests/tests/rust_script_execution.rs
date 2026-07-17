@@ -1059,6 +1059,7 @@ async fn test_rust_hash_collection_plans_follow_dwarf_raw_table_layout() -> anyh
         let ghostscope_dwarf::ValuePresentation::HashTable {
             entry_stride,
             bucket_order,
+            occupancy,
             entry,
         } = value_plan.presentation
         else {
@@ -1067,6 +1068,10 @@ async fn test_rust_hash_collection_plans_follow_dwarf_raw_table_layout() -> anyh
         assert_eq!(
             bucket_order,
             ghostscope_dwarf::HashTableBucketOrder::Reverse
+        );
+        assert_eq!(
+            occupancy,
+            ghostscope_dwarf::HashTableOccupancy::ControlByteHighBitClear
         );
         match entry {
             ghostscope_dwarf::HashTableEntryPresentation::Map { key, value } => {
@@ -1086,10 +1091,11 @@ async fn test_rust_hash_collection_plans_follow_dwarf_raw_table_layout() -> anyh
         }
         let ghostscope_dwarf::ValueCapturePlan::IndirectHashTable {
             control,
-            data,
             length,
             bucket_mask,
             entry_stride: capture_stride,
+            occupancy: capture_occupancy,
+            buckets,
             bucket_order: capture_order,
         } = value_plan.capture
         else {
@@ -1099,7 +1105,10 @@ async fn test_rust_hash_collection_plans_follow_dwarf_raw_table_layout() -> anyh
             ghostscope_dwarf::strip_type_aliases(&control.resolved_type.summary),
             ghostscope_dwarf::TypeInfo::PointerType { size: 4 | 8, .. }
         ));
-        assert!(data.is_none());
+        assert!(matches!(
+            buckets,
+            ghostscope_dwarf::HashTableBucketSource::ReverseFromControl
+        ));
         assert!(matches!(
             ghostscope_dwarf::strip_type_aliases(&length.resolved_type.summary),
             ghostscope_dwarf::TypeInfo::BaseType { size: 4 | 8, .. }
@@ -1109,6 +1118,7 @@ async fn test_rust_hash_collection_plans_follow_dwarf_raw_table_layout() -> anyh
             ghostscope_dwarf::TypeInfo::BaseType { size: 4 | 8, .. }
         ));
         assert_eq!(capture_stride, entry_stride);
+        assert_eq!(capture_occupancy, occupancy);
         assert_eq!(capture_order, bucket_order);
     }
 

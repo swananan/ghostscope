@@ -106,6 +106,16 @@ impl DwarfAnalyzer {
         )))
     }
 
+    fn type_alignment(&self, type_id: TypeId) -> Result<Option<u64>> {
+        let module_path = self.module_path_for_id(type_id.module).ok_or_else(|| {
+            anyhow::anyhow!("Semantic module id {:?} is not loaded", type_id.module)
+        })?;
+        self.modules
+            .get(module_path)
+            .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?
+            .type_alignment(type_id)
+    }
+
     /// Combine the plan's protocol-compatible type summary with its DWARF origin.
     pub fn semantic_type_for_plan(&self, plan: &VariableReadPlan) -> Result<Option<SemanticType>> {
         let Some(summary) = plan.dwarf_type.clone() else {
@@ -414,15 +424,17 @@ impl DwarfAnalyzer {
                 return self.rust_btree_value_read_plan(current, layout, type_module_path);
             }
             crate::language::ValueLayout::HashTable(layout) => {
-                let table = self.project_resolved_member_path(
+                let entry_type_owner = self.project_resolved_member_path(
                     current,
-                    &layout.table_path,
+                    &layout.entry_type_path,
                     type_module_path,
                 )?;
-                let Some(table_type_id) = table.resolved_type.identity.layout_dwarf_id() else {
+                let Some(entry_owner_type_id) =
+                    entry_type_owner.resolved_type.identity.layout_dwarf_id()
+                else {
                     return Ok(None);
                 };
-                let Some(entry_type) = self.template_type_parameter(table_type_id, 0)? else {
+                let Some(entry_type) = self.template_type_parameter(entry_owner_type_id, 0)? else {
                     return Ok(None);
                 };
                 if matches!(
@@ -463,22 +475,49 @@ impl DwarfAnalyzer {
                     &layout.control_path,
                     type_module_path,
                 )?;
-                let data = match layout.data_path {
-                    Some(path) => {
-                        Some(self.project_resolved_member_path(current, &path, type_module_path)?)
+                let buckets = match layout.buckets {
+                    crate::language::HashTableBucketLayout::Forward { data_path } => {
+                        let data = self.project_resolved_member_path(
+                            current,
+                            &data_path,
+                            type_module_path,
+                        )?;
+                        let TypeInfo::PointerType { target_type, .. } =
+                            strip_type_aliases(&data.resolved_type.summary)
+                        else {
+                            return Ok(None);
+                        };
+                        if strip_type_aliases(target_type)
+                            != strip_type_aliases(&entry_type.summary)
+                        {
+                            return Ok(None);
+                        }
+                        crate::HashTableBucketSource::Forward { data }
                     }
-                    None => None,
+                    crate::language::HashTableBucketLayout::ReverseFromControl => {
+                        crate::HashTableBucketSource::ReverseFromControl
+                    }
+                    crate::language::HashTableBucketLayout::LegacyAfterControl {
+                        pointer_tag_mask,
+                    } => {
+                        // Rust's allocation uses the pair type's alignment, not
+                        // its size. Read the concrete alignment attribute so
+                        // differently aligned keys and ZSTs remain data-driven.
+                        let Some(entry_alignment) = self.type_alignment(entry_type_id)? else {
+                            return Ok(None);
+                        };
+                        if entry_alignment == 0
+                            || !entry_alignment.is_power_of_two()
+                            || (entry_stride > 0 && entry_alignment > entry_stride)
+                        {
+                            return Ok(None);
+                        }
+                        crate::HashTableBucketSource::LegacyAfterControl {
+                            entry_alignment,
+                            pointer_tag_mask,
+                        }
+                    }
                 };
-                if let Some(data) = &data {
-                    let TypeInfo::PointerType { target_type, .. } =
-                        strip_type_aliases(&data.resolved_type.summary)
-                    else {
-                        return Ok(None);
-                    };
-                    if strip_type_aliases(target_type) != strip_type_aliases(&entry_type.summary) {
-                        return Ok(None);
-                    }
-                }
                 let length = self.project_resolved_member_path(
                     current,
                     &layout.length_path,
@@ -493,14 +532,16 @@ impl DwarfAnalyzer {
                     presentation: crate::ValuePresentation::HashTable {
                         entry_stride,
                         bucket_order: layout.bucket_order,
+                        occupancy: layout.occupancy,
                         entry,
                     },
                     capture: ValueCapturePlan::IndirectHashTable {
                         control,
-                        data,
                         length,
                         bucket_mask,
                         entry_stride,
+                        occupancy: layout.occupancy,
+                        buckets,
                         bucket_order: layout.bucket_order,
                     },
                 }));

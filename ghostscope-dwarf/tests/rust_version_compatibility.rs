@@ -5,7 +5,7 @@ use ghostscope_dwarf::{
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DEFAULT_TOOLCHAINS: &[&str] = &["1.49.0", "1.88.0", "1.93.0", "nightly-2026-05-30"];
+const DEFAULT_TOOLCHAINS: &[&str] = &["1.35.0", "1.49.0", "1.88.0", "1.93.0", "nightly-2026-05-30"];
 
 #[derive(Clone, Copy)]
 enum ExpectedAdapter {
@@ -24,6 +24,31 @@ enum ExpectedAdapter {
     NonZero,
     NativeDwarf,
 }
+
+const ALL_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
+    ("string", ExpectedAdapter::Utf8Bytes),
+    ("os_string", ExpectedAdapter::OsBytes),
+    ("text", ExpectedAdapter::Utf8Bytes),
+    ("boxed_text", ExpectedAdapter::Utf8Bytes),
+    ("slice", ExpectedAdapter::Sequence),
+    ("vector", ExpectedAdapter::Sequence),
+    ("deque", ExpectedAdapter::RingSequence),
+    ("btree_map", ExpectedAdapter::BTreeMap),
+    ("btree_set", ExpectedAdapter::BTreeSet),
+    ("hash_map", ExpectedAdapter::HashMap),
+    ("hash_set", ExpectedAdapter::HashSet),
+    ("rc", ExpectedAdapter::ReferenceCounted),
+    ("arc", ExpectedAdapter::ReferenceCounted),
+    ("cell", ExpectedAdapter::Cell),
+    ("ref_cell", ExpectedAdapter::RefCell),
+    ("nonzero", ExpectedAdapter::NonZero),
+    ("enum_value", ExpectedAdapter::NativeDwarf),
+];
+
+const RUST_135_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
+    ("hash_map", ExpectedAdapter::HashMap),
+    ("hash_set", ExpectedAdapter::HashSet),
+];
 
 fn configured_toolchains() -> Vec<String> {
     std::env::var("GHOSTSCOPE_RUST_COMPAT_TOOLCHAINS")
@@ -86,7 +111,7 @@ fn compile_fixture(toolchain: &str, output: &Path) -> anyhow::Result<()> {
         .arg("-C")
         .arg("opt-level=0")
         .arg("-C")
-        .arg("link-dead-code=yes")
+        .arg("link-dead-code")
         .arg(&source)
         .arg("-o")
         .arg(output)
@@ -181,7 +206,7 @@ async fn assert_parameter_adapter(
     parameter: &str,
     expected: ExpectedAdapter,
     toolchain: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<ValueReadPlan>> {
     let context = analyzer
         .lookup_function_addresses(function)
         .into_iter()
@@ -198,7 +223,7 @@ async fn assert_parameter_adapter(
         adapter_matches(plan.as_ref(), expected),
         "{toolchain}: unexpected adapter for {function}::{parameter}: {plan:#?}"
     );
-    Ok(())
+    Ok(plan)
 }
 
 fn assert_target_rustc_version(analyzer: &DwarfAnalyzer, toolchain: &str) -> anyhow::Result<()> {
@@ -250,26 +275,16 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
         let analyzer = DwarfAnalyzer::from_exec_path(&binary).await?;
         assert_target_rustc_version(&analyzer, &toolchain)?;
 
-        for (parameter, expected) in [
-            ("string", ExpectedAdapter::Utf8Bytes),
-            ("os_string", ExpectedAdapter::OsBytes),
-            ("text", ExpectedAdapter::Utf8Bytes),
-            ("boxed_text", ExpectedAdapter::Utf8Bytes),
-            ("slice", ExpectedAdapter::Sequence),
-            ("vector", ExpectedAdapter::Sequence),
-            ("deque", ExpectedAdapter::RingSequence),
-            ("btree_map", ExpectedAdapter::BTreeMap),
-            ("btree_set", ExpectedAdapter::BTreeSet),
-            ("hash_map", ExpectedAdapter::HashMap),
-            ("hash_set", ExpectedAdapter::HashSet),
-            ("rc", ExpectedAdapter::ReferenceCounted),
-            ("arc", ExpectedAdapter::ReferenceCounted),
-            ("cell", ExpectedAdapter::Cell),
-            ("ref_cell", ExpectedAdapter::RefCell),
-            ("nonzero", ExpectedAdapter::NonZero),
-            ("enum_value", ExpectedAdapter::NativeDwarf),
-        ] {
-            assert_parameter_adapter(
+        // Current rust-gdb keeps a dedicated Rust 1.35 HashMap provider. Pin
+        // that layout without implying the same version floor for unrelated
+        // adapters, whose compatibility matrices are covered from Rust 1.49.
+        let adapters = if toolchain == "1.35.0" {
+            RUST_135_ADAPTERS
+        } else {
+            ALL_ADAPTERS
+        };
+        for &(parameter, expected) in adapters {
+            let plan = assert_parameter_adapter(
                 &analyzer,
                 &binary,
                 "observe_values",
@@ -278,25 +293,49 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
                 &toolchain,
             )
             .await?;
+            if toolchain == "1.35.0" && matches!(parameter, "hash_map" | "hash_set") {
+                let plan = plan.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("1.35.0: missing legacy plan for {parameter}")
+                })?;
+                let ValuePresentation::HashTable { occupancy, .. } = plan.presentation else {
+                    anyhow::bail!("1.35.0: unexpected presentation for {parameter}")
+                };
+                let ValueCapturePlan::IndirectHashTable { buckets, .. } = &plan.capture else {
+                    anyhow::bail!("1.35.0: unexpected capture for {parameter}")
+                };
+                assert_eq!(
+                    occupancy,
+                    ghostscope_dwarf::HashTableOccupancy::NonZeroWord { word_size: 8 }
+                );
+                assert!(matches!(
+                    buckets,
+                    ghostscope_dwarf::HashTableBucketSource::LegacyAfterControl {
+                        entry_alignment: 4,
+                        pointer_tag_mask: 1,
+                    }
+                ));
+            }
         }
-        assert_parameter_adapter(
-            &analyzer,
-            &binary,
-            "observe_ref",
-            "value",
-            ExpectedAdapter::RefGuard,
-            &toolchain,
-        )
-        .await?;
-        assert_parameter_adapter(
-            &analyzer,
-            &binary,
-            "observe_ref_mut",
-            "value",
-            ExpectedAdapter::RefGuard,
-            &toolchain,
-        )
-        .await?;
+        if toolchain != "1.35.0" {
+            assert_parameter_adapter(
+                &analyzer,
+                &binary,
+                "observe_ref",
+                "value",
+                ExpectedAdapter::RefGuard,
+                &toolchain,
+            )
+            .await?;
+            assert_parameter_adapter(
+                &analyzer,
+                &binary,
+                "observe_ref_mut",
+                "value",
+                ExpectedAdapter::RefGuard,
+                &toolchain,
+            )
+            .await?;
+        }
         tested += 1;
     }
 
