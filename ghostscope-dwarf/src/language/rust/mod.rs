@@ -2,8 +2,9 @@ mod access;
 mod value;
 
 pub(crate) use value::{
-    IndirectSequenceAddressing, IndirectSequenceKind, ProjectedStructPresentation,
-    ProjectedValuePresentation, RingSequenceLengthKind, ValueLayout,
+    IndirectSequenceAddressing, IndirectSequenceKind, ProjectedPathSegment,
+    ProjectedStructPresentation, ProjectedValuePresentation, ProjectedValueRequirement,
+    RingSequenceLengthKind, ValueLayout,
 };
 
 pub(super) fn resolve_tuple_index(index: u32) -> crate::VariableAccessSegment {

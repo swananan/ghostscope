@@ -5,6 +5,10 @@ fn metadata_access_size(
     role: &str,
 ) -> Result<ghostscope_dwarf::MemoryAccessSize> {
     let size = projection.resolved_type.summary.size();
+    exact_memory_access_size(size, &format!("indirect value {role} member"))
+}
+
+fn exact_memory_access_size(size: u64, role: &str) -> Result<ghostscope_dwarf::MemoryAccessSize> {
     // Keep this exact; `from_size` falls back to U64 for unknown widths.
     match size {
         1 => Ok(ghostscope_dwarf::MemoryAccessSize::U8),
@@ -12,7 +16,7 @@ fn metadata_access_size(
         4 => Ok(ghostscope_dwarf::MemoryAccessSize::U32),
         8 => Ok(ghostscope_dwarf::MemoryAccessSize::U64),
         _ => Err(CodeGenError::DwarfError(format!(
-            "indirect value {role} member has unsupported DWARF size {size}"
+            "{role} has unsupported DWARF size {size}"
         ))),
     }
 }
@@ -78,6 +82,102 @@ fn inline_view_data_len(
         ));
     }
     Ok(output_size)
+}
+
+fn projected_view_source(
+    output_type: &ghostscope_dwarf::TypeInfo,
+    fields: &[ghostscope_dwarf::ProjectedViewField],
+) -> Result<(usize, Vec<ProjectedViewFieldSource>)> {
+    let ghostscope_dwarf::TypeInfo::StructType { size, members, .. } = output_type else {
+        return Err(CodeGenError::DwarfError(
+            "projected semantic view must be a struct".to_string(),
+        ));
+    };
+    if members.len() != fields.len() {
+        return Err(CodeGenError::DwarfError(
+            "projected semantic fields do not match the output type".to_string(),
+        ));
+    }
+
+    let data_len = usize::try_from(*size).map_err(|_| {
+        CodeGenError::DwarfError("projected semantic view size does not fit this host".to_string())
+    })?;
+    if data_len > u16::MAX as usize {
+        return Err(CodeGenError::DwarfError(format!(
+            "projected semantic view size {data_len} exceeds the protocol limit"
+        )));
+    }
+    let mut sources = Vec::with_capacity(fields.len());
+    let mut ranges = Vec::with_capacity(fields.len());
+    for (member, field) in members.iter().zip(fields) {
+        if member.offset != field.output_offset
+            || member.member_type != field.value.resolved_type.summary
+        {
+            return Err(CodeGenError::DwarfError(format!(
+                "projected semantic field '{}' does not match its output member",
+                member.name
+            )));
+        }
+        let output_offset = usize::try_from(field.output_offset).map_err(|_| {
+            CodeGenError::DwarfError(format!(
+                "projected semantic field '{}' offset does not fit this host",
+                member.name
+            ))
+        })?;
+        let value_len = usize::try_from(member.member_type.size()).map_err(|_| {
+            CodeGenError::DwarfError(format!(
+                "projected semantic field '{}' size does not fit this host",
+                member.name
+            ))
+        })?;
+        let end = output_offset.checked_add(value_len).ok_or_else(|| {
+            CodeGenError::DwarfError(format!(
+                "projected semantic field '{}' end overflow",
+                member.name
+            ))
+        })?;
+        if end > data_len || (value_len == 0 && !is_known_zero_sized_type(&member.member_type)) {
+            return Err(CodeGenError::DwarfError(format!(
+                "projected semantic field '{}' exceeds its output layout",
+                member.name
+            )));
+        }
+        if value_len > 0
+            && ranges
+                .iter()
+                .any(|(start, range_end)| output_offset < *range_end && *start < end)
+        {
+            return Err(CodeGenError::DwarfError(format!(
+                "projected semantic field '{}' overlaps another output member",
+                member.name
+            )));
+        }
+        ranges.push((output_offset, end));
+
+        let mut steps = Vec::with_capacity(field.value.steps.len());
+        for step in &field.value.steps {
+            steps.push(match step {
+                ghostscope_dwarf::ProjectedValueStep::Member { offset } => {
+                    ProjectedViewStep::Member { offset: *offset }
+                }
+                ghostscope_dwarf::ProjectedValueStep::Dereference { pointer_size } => {
+                    ProjectedViewStep::Dereference {
+                        pointer_size: exact_memory_access_size(
+                            *pointer_size,
+                            "projected semantic pointer",
+                        )?,
+                    }
+                }
+            });
+        }
+        sources.push(ProjectedViewFieldSource {
+            output_offset,
+            value_len,
+            steps,
+        });
+    }
+
+    Ok((data_len, sources))
 }
 
 fn sequence_capture_limits(cap: usize, element_stride: u64) -> Result<(usize, usize, usize)> {
@@ -178,6 +278,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         },
                     )
                 }
+            }
+            ghostscope_dwarf::ValueCapturePlan::ProjectedView {
+                output_type: view_type,
+                fields,
+            } => {
+                let (data_len, fields) = projected_view_source(&view_type, &fields)?;
+                output_type = view_type;
+                (
+                    data_len,
+                    ComplexArgSource::ProjectedView { descriptor, fields },
+                )
             }
             ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } => {
                 let (data_offset, data_access_size) = metadata_member(&data, "data")?;
@@ -500,6 +611,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     byte_len: data_len,
                                 },
                             });
+                        }
+                        ghostscope_dwarf::ValueCapturePlan::ProjectedView { .. } => {
+                            return Err(CodeGenError::DwarfError(format!(
+                                "direct semantic view for '{}' requires an address-backed root",
+                                materialized.name
+                            )));
                         }
                         _ => {}
                     }
@@ -1136,7 +1253,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             | ComplexArgSource::MemDumpDynamic { .. }
             | ComplexArgSource::IndirectBytes { .. }
             | ComplexArgSource::IndirectSequence { .. }
-            | ComplexArgSource::IndirectRingSequence { .. } => {
+            | ComplexArgSource::IndirectRingSequence { .. }
+            | ComplexArgSource::ProjectedView { .. } => {
                 // Use ComplexFormat with "{}"; generate_print_complex_format_instruction handles MemDump
                 let fmt_idx = self.trace_context.add_string("{}".to_string())?;
                 self.generate_print_complex_format_instruction(fmt_idx, &[arg])?;
@@ -1497,8 +1615,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 mod semantic_value_tests {
     use super::*;
     use ghostscope_dwarf::{
-        MemoryAccessSize, ResolvedType, TypeIdentity, TypeInfo, TypeProjection,
-        TypeProjectionLayout,
+        MemoryAccessSize, ProjectedValueRead, ProjectedValueStep, ProjectedViewField, ResolvedType,
+        StructMember, TypeIdentity, TypeInfo, TypeProjection, TypeProjectionLayout,
     };
 
     fn projection(size: u64) -> TypeProjection {
@@ -1590,5 +1708,164 @@ mod semantic_value_tests {
         assert!(error
             .to_string()
             .contains("does not match DWARF root size 16"));
+    }
+
+    fn projected_field(
+        output_offset: u64,
+        summary: TypeInfo,
+        steps: Vec<ProjectedValueStep>,
+    ) -> ProjectedViewField {
+        ProjectedViewField {
+            output_offset,
+            value: ProjectedValueRead {
+                steps,
+                resolved_type: ResolvedType::new(summary, TypeIdentity::Unknown, None),
+            },
+        }
+    }
+
+    fn output_member(name: &str, member_type: TypeInfo, offset: u64) -> StructMember {
+        StructMember {
+            name: name.to_string(),
+            member_type,
+            offset,
+            bit_offset: None,
+            bit_size: None,
+        }
+    }
+
+    #[test]
+    fn projected_view_uses_exact_output_and_pointer_layouts() {
+        let value_type = TypeInfo::BaseType {
+            name: "i32".to_string(),
+            size: 4,
+            encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+        };
+        let borrow_type = TypeInfo::BaseType {
+            name: "isize".to_string(),
+            size: 8,
+            encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+        };
+        let output_type = TypeInfo::StructType {
+            name: "Ref".to_string(),
+            size: 12,
+            members: vec![
+                output_member("*value", value_type.clone(), 0),
+                output_member("borrow", borrow_type.clone(), 4),
+            ],
+        };
+        let fields = vec![
+            projected_field(
+                0,
+                value_type,
+                vec![
+                    ProjectedValueStep::Member { offset: 8 },
+                    ProjectedValueStep::Dereference { pointer_size: 8 },
+                ],
+            ),
+            projected_field(
+                4,
+                borrow_type,
+                vec![ProjectedValueStep::Dereference { pointer_size: 8 }],
+            ),
+        ];
+
+        let (data_len, sources) = projected_view_source(&output_type, &fields).unwrap();
+        assert_eq!(data_len, 12);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].output_offset, 0);
+        assert_eq!(sources[0].value_len, 4);
+        assert!(matches!(
+            sources[0].steps.as_slice(),
+            [
+                ProjectedViewStep::Member { offset: 8 },
+                ProjectedViewStep::Dereference {
+                    pointer_size: MemoryAccessSize::U64
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn projected_view_accepts_packed_zero_sized_fields() {
+        let unit = TypeInfo::BaseType {
+            name: "()".to_string(),
+            size: 0,
+            encoding: ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16,
+        };
+        let borrow = TypeInfo::BaseType {
+            name: "isize".to_string(),
+            size: 8,
+            encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+        };
+        let output_type = TypeInfo::StructType {
+            name: "Ref".to_string(),
+            size: 8,
+            members: vec![
+                output_member("*value", unit.clone(), 0),
+                output_member("borrow", borrow.clone(), 0),
+            ],
+        };
+        let fields = vec![
+            projected_field(
+                0,
+                unit,
+                vec![ProjectedValueStep::Dereference { pointer_size: 8 }],
+            ),
+            projected_field(
+                0,
+                borrow,
+                vec![ProjectedValueStep::Dereference { pointer_size: 8 }],
+            ),
+        ];
+
+        let (data_len, sources) = projected_view_source(&output_type, &fields).unwrap();
+        assert_eq!(data_len, 8);
+        assert_eq!(sources[0].value_len, 0);
+        assert_eq!(sources[1].output_offset, 0);
+    }
+
+    #[test]
+    fn projected_view_rejects_invalid_protocol_and_field_layouts() {
+        let oversized = TypeInfo::StructType {
+            name: "Oversized".to_string(),
+            size: u16::MAX as u64 + 1,
+            members: Vec::new(),
+        };
+        let error = projected_view_source(&oversized, &[]).unwrap_err();
+        assert!(error.to_string().contains("exceeds the protocol limit"));
+
+        let value_type = TypeInfo::BaseType {
+            name: "i32".to_string(),
+            size: 4,
+            encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
+        };
+        let overlapping = TypeInfo::StructType {
+            name: "Overlap".to_string(),
+            size: 6,
+            members: vec![
+                output_member("left", value_type.clone(), 0),
+                output_member("right", value_type.clone(), 2),
+            ],
+        };
+        let fields = vec![
+            projected_field(0, value_type.clone(), Vec::new()),
+            projected_field(2, value_type.clone(), Vec::new()),
+        ];
+        let error = projected_view_source(&overlapping, &fields).unwrap_err();
+        assert!(error.to_string().contains("overlaps another output member"));
+
+        let output = TypeInfo::StructType {
+            name: "Pointer".to_string(),
+            size: 4,
+            members: vec![output_member("value", value_type.clone(), 0)],
+        };
+        let fields = vec![projected_field(
+            0,
+            value_type,
+            vec![ProjectedValueStep::Dereference { pointer_size: 3 }],
+        )];
+        let error = projected_view_source(&output, &fields).unwrap_err();
+        assert!(error.to_string().contains("unsupported DWARF size 3"));
     }
 }

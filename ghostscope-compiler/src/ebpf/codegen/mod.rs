@@ -53,6 +53,23 @@ enum RingSequenceLengthSource {
     },
 }
 
+#[derive(Debug, Clone)]
+enum ProjectedViewStep {
+    Member {
+        offset: u64,
+    },
+    Dereference {
+        pointer_size: ghostscope_dwarf::MemoryAccessSize,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedViewFieldSource {
+    output_offset: usize,
+    value_len: usize,
+    steps: Vec<ProjectedViewStep>,
+}
+
 /// Source for complex formatted argument data
 #[derive(Debug, Clone)]
 enum ComplexArgSource<'ctx> {
@@ -106,6 +123,11 @@ enum ComplexArgSource<'ctx> {
         element_stride: u64,
         max_elements: usize,
         max_len: usize,
+    },
+    /// Assemble a synthetic struct from independently projected memory reads.
+    ProjectedView {
+        descriptor: RuntimeAddress<'ctx>,
+        fields: Vec<ProjectedViewFieldSource>,
     },
     ImmediateBytes {
         bytes: Vec<u8>,

@@ -88,6 +88,25 @@ pub mod user_types {
         pub value: UnsafeCell<T>,
         pub borrow: Cell<isize>,
     }
+
+    pub struct BorrowRef {
+        pub borrow: *const Cell<isize>,
+    }
+
+    pub struct BorrowRefMut {
+        pub borrow: *const Cell<isize>,
+    }
+
+    pub struct Ref<T> {
+        pub value: NonNull<T>,
+        pub borrow: BorrowRef,
+    }
+
+    pub struct RefMut<T> {
+        pub value: NonNull<T>,
+        pub borrow: BorrowRefMut,
+        pub marker: std::marker::PhantomData<T>,
+    }
 }
 
 pub static mut G_USER_STRING: user_types::String = user_types::String {
@@ -267,6 +286,27 @@ pub mod math {
         std::hint::black_box(owned.into_inner());
         1
     }
+
+    #[inline(never)]
+    pub fn observe_ref_guards(
+        shared: &std::cell::Ref<'_, i32>,
+        mutable: &std::cell::RefMut<'_, i32>,
+        pair: &std::cell::Ref<'_, (i32, u16)>,
+        unit: &std::cell::Ref<'_, ()>,
+    ) -> i64 {
+        let shared = std::hint::black_box(**shared as i64);
+        let mutable = std::hint::black_box(**mutable as i64);
+        let pair = std::hint::black_box((**pair).0 as i64);
+        std::hint::black_box(**unit);
+        shared + mutable + pair
+    }
+
+    #[inline(never)]
+    pub fn observe_user_ref(value: &crate::user_types::Ref<i32>) -> usize {
+        std::hint::black_box(value.value.pointer);
+        std::hint::black_box(value.borrow.borrow);
+        1
+    }
 }
 
 fn wrapped_vec_deque() -> VecDeque<i32> {
@@ -430,8 +470,21 @@ fn main() {
                 &G_REF_CELL_UNIT,
                 RefCell::new(-12_i16),
             ) as i64;
+            let pair = G_REF_CELL_PAIR.borrow();
+            let unit = G_REF_CELL_UNIT.borrow();
+            acc += math::observe_ref_guards(&shared_one, &mutable, &pair, &unit);
+            acc += pair.0 as i64;
             acc += *shared_one as i64 + *shared_two as i64 + *mutable as i64;
         }
+        let user_ref = user_types::Ref {
+            value: user_types::NonNull {
+                pointer: std::ptr::null_mut(),
+            },
+            borrow: user_types::BorrowRef {
+                borrow: std::ptr::null(),
+            },
+        };
+        acc += math::observe_user_ref(&user_ref) as i64;
         acc += touch_globals() as i64;
         thread::sleep(Duration::from_millis(1000));
     }

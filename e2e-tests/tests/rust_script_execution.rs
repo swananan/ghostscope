@@ -744,6 +744,158 @@ async fn test_rust_ref_cell_value_plan_builds_dwarf_inline_view() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn test_rust_ref_value_plan_builds_dwarf_projected_view() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let ref_context = analyzer
+        .lookup_function_addresses("observe_ref_guards")
+        .into_iter()
+        .find_map(|address| analyzer.resolve_pc(&address).ok())
+        .ok_or_else(|| anyhow::anyhow!("expected observe_ref_guards context"))?;
+
+    for (parameter, expected_value) in [("shared", "i32"), ("mutable", "i32")] {
+        let parameter_plan = analyzer
+            .plan_variable_by_name(&ref_context, parameter)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter plan"))?;
+        let parameter_type = analyzer
+            .resolved_type_for_plan(&parameter_plan)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter type"))?;
+        let guard_type = analyzer
+            .project_resolved_type(
+                &parameter_type,
+                &ghostscope_dwarf::VariableAccessSegment::Dereference,
+                Some(&binary_path),
+            )?
+            .resolved_type;
+        let value_plan = analyzer
+            .value_read_plan(&guard_type, Some(&binary_path))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("expected {parameter} semantic plan for {guard_type:#?}")
+            })?;
+        assert_eq!(
+            value_plan.presentation,
+            ghostscope_dwarf::ValuePresentation::SignedStateStruct {
+                state_field: "borrow".to_string(),
+                non_negative_label: "borrow".to_string(),
+                negative_label: "borrow_mut".to_string(),
+            }
+        );
+        let ghostscope_dwarf::ValueCapturePlan::ProjectedView {
+            output_type,
+            fields,
+        } = value_plan.capture
+        else {
+            anyhow::bail!("expected projected semantic view for {parameter}")
+        };
+        let ghostscope_dwarf::TypeInfo::StructType {
+            name,
+            size,
+            members,
+        } = output_type
+        else {
+            anyhow::bail!("expected projected Ref struct")
+        };
+        assert_eq!(name, "Ref");
+        let [value_member, borrow_member] = members.as_slice() else {
+            anyhow::bail!("expected projected value and borrow members")
+        };
+        assert_eq!(value_member.name, "*value");
+        assert_eq!(borrow_member.name, "borrow");
+        assert_eq!(value_member.offset, 0);
+        assert_eq!(borrow_member.offset, value_member.member_type.size());
+        assert_eq!(
+            size,
+            borrow_member.offset + borrow_member.member_type.size()
+        );
+        assert!(matches!(
+            ghostscope_dwarf::strip_type_aliases(&value_member.member_type),
+            ghostscope_dwarf::TypeInfo::BaseType { name, size: 4, .. }
+                if name == expected_value
+        ));
+        assert!(matches!(
+            ghostscope_dwarf::strip_type_aliases(&borrow_member.member_type),
+            ghostscope_dwarf::TypeInfo::BaseType { size, encoding, .. }
+                if matches!(*size, 4 | 8)
+                    && *encoding == ghostscope_dwarf::constants::DW_ATE_signed.0 as u16
+        ));
+        let [value_field, borrow_field] = fields.as_slice() else {
+            anyhow::bail!("expected projected value and borrow reads")
+        };
+        assert_eq!(value_field.output_offset, value_member.offset);
+        assert_eq!(borrow_field.output_offset, borrow_member.offset);
+        assert!(matches!(
+            value_field.value.steps.last(),
+            Some(ghostscope_dwarf::ProjectedValueStep::Dereference {
+                pointer_size: 4 | 8
+            })
+        ));
+        assert!(borrow_field.value.steps.iter().any(|step| matches!(
+            step,
+            ghostscope_dwarf::ProjectedValueStep::Dereference {
+                pointer_size: 4 | 8
+            }
+        )));
+    }
+
+    let unit_plan = analyzer
+        .plan_variable_by_name(&ref_context, "unit")?
+        .ok_or_else(|| anyhow::anyhow!("expected unit parameter plan"))?;
+    let unit_pointer = analyzer
+        .resolved_type_for_plan(&unit_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected unit parameter type"))?;
+    let unit_type = analyzer
+        .project_resolved_type(
+            &unit_pointer,
+            &ghostscope_dwarf::VariableAccessSegment::Dereference,
+            Some(&binary_path),
+        )?
+        .resolved_type;
+    let unit_view = analyzer
+        .value_read_plan(&unit_type, Some(&binary_path))?
+        .and_then(|plan| match plan.capture {
+            ghostscope_dwarf::ValueCapturePlan::ProjectedView { output_type, .. } => {
+                Some(output_type)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("expected unit Ref projected view"))?;
+    let ghostscope_dwarf::TypeInfo::StructType { members, .. } = unit_view else {
+        anyhow::bail!("expected unit Ref struct")
+    };
+    assert_eq!(members[0].member_type.size(), 0);
+    assert_eq!(members[1].offset, 0);
+
+    let user_context = analyzer
+        .lookup_function_addresses("observe_user_ref")
+        .into_iter()
+        .find_map(|address| analyzer.resolve_pc(&address).ok())
+        .ok_or_else(|| anyhow::anyhow!("expected observe_user_ref context"))?;
+    let user_plan = analyzer
+        .plan_variable_by_name(&user_context, "value")?
+        .ok_or_else(|| anyhow::anyhow!("expected user Ref parameter plan"))?;
+    let user_pointer = analyzer
+        .resolved_type_for_plan(&user_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected user Ref parameter type"))?;
+    let user_type = analyzer
+        .project_resolved_type(
+            &user_pointer,
+            &ghostscope_dwarf::VariableAccessSegment::Dereference,
+            Some(&binary_path),
+        )?
+        .resolved_type;
+    assert!(
+        analyzer
+            .value_read_plan(&user_type, Some(&binary_path))?
+            .is_none(),
+        "user-defined Ref must retain DWARF presentation"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_str_values() -> anyhow::Result<()> {
     init();
 
@@ -1061,6 +1213,54 @@ trace observe_ref_cell_states {
             )
         }),
         "Expected Rust RefCell argument output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_ref_and_ref_mut_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_ref_guards {
+    print "RREF:{}:{}:{}:{}", *shared, *mutable, *pair, *unit;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("Ref(borrow=2) { *value: 23, borrow: 2 }")),
+        "Expected shared Rust Ref output: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| { line.contains("Ref(borrow_mut=1) { *value: 31, borrow: -1 }") }),
+        "Expected Rust RefMut output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("Ref(borrow=1)") && line.contains("__0: -6") && line.contains("__1: 14")
+        }),
+        "Expected aggregate Rust Ref output: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("Ref(borrow=1) { *value: (), borrow: 1 }")),
+        "Expected zero-sized Rust Ref output: {stdout}"
     );
     assert!(
         !stdout.contains("ExprError"),

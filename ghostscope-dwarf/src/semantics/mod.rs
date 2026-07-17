@@ -36,7 +36,10 @@ pub use unwind_plan::{
     CfaRulePlan, CompactUnwindRow, CompactUnwindStats, CompactUnwindTable, RegisterRecoveryPlan,
     UnwindDiagnostic, UnwindDiagnosticKind,
 };
-pub use value::{RingSequenceLength, ValueCapturePlan, ValueReadPlan};
+pub use value::{
+    ProjectedValueRead, ProjectedValueStep, ProjectedViewField, RingSequenceLength,
+    ValueCapturePlan, ValueReadPlan,
+};
 pub(crate) use variable_plan::PlanError;
 pub use variable_plan::{
     AddressOrigin, LvalueAddressPlan, PlannedAddress, PlannedAddressKind, PlannedValue,
