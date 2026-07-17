@@ -46,6 +46,13 @@ const ALL_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
 ];
 
 const RUST_135_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
+    ("string", ExpectedAdapter::Utf8Bytes),
+    ("os_string", ExpectedAdapter::OsBytes),
+    ("text", ExpectedAdapter::Utf8Bytes),
+    // Box<str> gained a dedicated rust-gdb provider later. Pinning it here
+    // applies that provider's semantics to Rust 1.35's concrete fat-pointer
+    // DIE rather than implying it was in the bundled 1.35 script.
+    ("boxed_text", ExpectedAdapter::Utf8Bytes),
     ("btree_map", ExpectedAdapter::BTreeMap),
     ("btree_set", ExpectedAdapter::BTreeSet),
     ("hash_map", ExpectedAdapter::HashMap),
@@ -348,9 +355,9 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
         let analyzer = DwarfAnalyzer::from_exec_path(&binary).await?;
         assert_target_rustc_version(&analyzer, &toolchain)?;
 
-        // Pin only the Rust 1.35 layouts audited against that release's
-        // bundled rust-gdb provider. The remaining adapters keep a Rust 1.49
-        // floor until their older DWARF shapes have been audited.
+        // Pin only the Rust 1.35 layouts audited against rust-gdb semantics.
+        // The remaining adapters keep a Rust 1.49 floor until their older
+        // DWARF shapes have been audited.
         let adapters = if toolchain == "1.35.0" {
             RUST_135_ADAPTERS
         } else {

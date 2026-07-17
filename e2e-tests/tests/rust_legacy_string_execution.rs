@@ -1,4 +1,4 @@
-//! Runtime coverage for Rust 1.35's pre-hashbrown HashMap layout.
+//! Runtime coverage for Rust 1.35 string-family layouts.
 
 mod common;
 
@@ -14,14 +14,14 @@ const REQUIRE_TOOLCHAIN_ENV: &str = "GHOSTSCOPE_REQUIRE_RUST_135_E2E";
 
 fn compile_fixture(rustc: &Path, output_dir: &Path) -> anyhow::Result<PathBuf> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/rust_legacy_hash_program/main.rs");
-    let binary = output_dir.join("rust_legacy_hash_program");
+        .join("tests/fixtures/rust_legacy_string_program/main.rs");
+    let binary = output_dir.join("rust_legacy_string_program");
     compile_standalone_fixture(rustc, TOOLCHAIN, &source, &binary)?;
     Ok(binary)
 }
 
 #[tokio::test]
-async fn test_rust_135_hash_map_and_hash_set_values() -> anyhow::Result<()> {
+async fn test_rust_135_string_family_values() -> anyhow::Result<()> {
     init();
 
     let Some(rustc) = rustc_for_toolchain(TOOLCHAIN) else {
@@ -42,57 +42,42 @@ async fn test_rust_135_hash_map_and_hash_set_values() -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(750)).await;
 
     let script = r#"
-trace observe_legacy_hash_collections {
-    print "R135_MAP:{}", map;
-    print "R135_SET:{}", set;
-    print "R135_EMPTY_MAP:{}", empty_map;
-    print "R135_EMPTY_SET:{}", empty_set;
-    print "R135_UNIT_MAP:{}", unit_map;
-    print "R135_UNIT_SET:{}", unit_set;
+trace observe_legacy_strings {
+    print "R135_STRING:{}", owned;
+    print "R135_STRING_RAW:{:s}:{:x}", owned, owned;
+    print "R135_OS:{}:{}", valid_os, invalid_os;
+    print "R135_STR:{}", text;
+    print "R135_BOX_STR:{}", boxed;
+    print "R135_EMPTY:{}:{}:{}:{}", empty_owned, empty_os, empty_text, empty_boxed;
 }
 "#;
-    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+    let result = common::runner::GhostscopeRunner::new()
         .with_script(script)
-        // Rust 1.35 starts at 32 buckets and uses a randomized hash seed. Read
-        // the complete table so the asserted entries cannot fall outside a
-        // truncated prefix.
         .with_config_content(
             r#"
 [ebpf]
-mem_dump_cap = 2048
+mem_dump_cap = 64
 "#,
         )
         .attach_to(&target)
         .timeout_secs(9)
         .enable_sysmon_for_target(false)
         .run()
-        .await?;
+        .await;
     target.terminate().await?;
 
+    let (exit_code, stdout, stderr) = result?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
-    let map_line = stdout
-        .lines()
-        .find(|line| line.contains("R135_MAP:"))
-        .ok_or_else(|| anyhow::anyhow!("missing Rust 1.35 HashMap output: {stdout}"))?;
-    assert!(map_line.contains("HashMap(size=2)"), "{map_line}");
-    assert!(map_line.contains("-7: 13"), "{map_line}");
-    assert!(map_line.contains("29: 17"), "{map_line}");
-
-    let set_line = stdout
-        .lines()
-        .find(|line| line.contains("R135_SET:"))
-        .ok_or_else(|| anyhow::anyhow!("missing Rust 1.35 HashSet output: {stdout}"))?;
-    assert!(set_line.contains("HashSet(size=2)"), "{set_line}");
-    assert!(
-        set_line.contains("{-9, 5}") || set_line.contains("{5, -9}"),
-        "{set_line}"
-    );
-
     for expected in [
-        "R135_EMPTY_MAP:HashMap(size=0) {}",
-        "R135_EMPTY_SET:HashSet(size=0) {}",
-        "R135_UNIT_MAP:HashMap(size=1) {(): ()}",
-        "R135_UNIT_SET:HashSet(size=1) {()}",
+        r#"R135_STRING:"legacy = string""#,
+        concat!(
+            "R135_STRING_RAW:legacy = string:",
+            "6c 65 67 61 63 79 20 3d 20 73 74 72 69 6e 67"
+        ),
+        r#"R135_OS:"os from 1.35":"os\xffx""#,
+        r#"R135_STR:"legacy\0str""#,
+        r#"R135_BOX_STR:"boxed from 1.35""#,
+        r#"R135_EMPTY:"":"":"":"""#,
     ] {
         assert!(stdout.contains(expected), "missing '{expected}': {stdout}");
     }
