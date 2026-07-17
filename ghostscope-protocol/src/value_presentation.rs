@@ -41,4 +41,11 @@ pub enum ValuePresentation {
         type_name: String,
         field_name: String,
     },
+    /// A projected struct whose signed state field selects one of two summary
+    /// labels. The payload is the raw inline byte layout of `type_info`.
+    SignedStateStruct {
+        state_field: String,
+        non_negative_label: String,
+        negative_label: String,
+    },
 }

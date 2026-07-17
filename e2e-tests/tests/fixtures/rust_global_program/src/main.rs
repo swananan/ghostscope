@@ -2,7 +2,7 @@
 #![allow(static_mut_refs)]
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::VecDeque,
     ffi::OsString,
     marker::{PhantomData, PhantomPinned},
@@ -37,6 +37,11 @@ pub static G_NONZERO_U128: NonZeroU128 =
 pub static mut G_CELL_U32: Cell<u32> = Cell::new(41);
 pub static mut G_CELL_PAIR: Cell<(i32, u16)> = Cell::new((-4, 12));
 pub static mut G_CELL_UNIT: Cell<()> = Cell::new(());
+pub static mut G_REF_CELL_IDLE: RefCell<i32> = RefCell::new(17);
+pub static mut G_REF_CELL_SHARED: RefCell<i32> = RefCell::new(23);
+pub static mut G_REF_CELL_MUT: RefCell<i32> = RefCell::new(31);
+pub static mut G_REF_CELL_PAIR: RefCell<(i32, u16)> = RefCell::new((-6, 14));
+pub static mut G_REF_CELL_UNIT: RefCell<()> = RefCell::new(());
 
 pub mod user_types {
     pub struct String {
@@ -78,6 +83,11 @@ pub mod user_types {
     pub struct Cell<T>(pub UnsafeCell<T>);
 
     pub struct UnsafeCell<T>(pub T);
+
+    pub struct RefCell<T> {
+        pub value: UnsafeCell<T>,
+        pub borrow: Cell<isize>,
+    }
 }
 
 pub static mut G_USER_STRING: user_types::String = user_types::String {
@@ -104,6 +114,11 @@ pub static G_USER_NONZERO: user_types::NonZero<u32> =
 
 pub static mut G_USER_CELL: user_types::Cell<u32> =
     user_types::Cell(user_types::UnsafeCell(13));
+
+pub static mut G_USER_REF_CELL: user_types::RefCell<u32> = user_types::RefCell {
+    value: user_types::UnsafeCell(19),
+    borrow: user_types::Cell(user_types::UnsafeCell(0)),
+};
 
 #[repr(C)]
 pub struct Config {
@@ -234,6 +249,24 @@ pub mod math {
     pub fn observe_nonzero(value: std::num::NonZeroU32) -> u32 {
         value.get()
     }
+
+    #[inline(never)]
+    pub fn observe_ref_cell_states(
+        idle: &std::cell::RefCell<i32>,
+        shared: &std::cell::RefCell<i32>,
+        mutable: &std::cell::RefCell<i32>,
+        pair: &std::cell::RefCell<(i32, u16)>,
+        unit: &std::cell::RefCell<()>,
+        owned: std::cell::RefCell<i16>,
+    ) -> usize {
+        std::hint::black_box(idle.as_ptr());
+        std::hint::black_box(shared.as_ptr());
+        std::hint::black_box(mutable.as_ptr());
+        std::hint::black_box(pair.as_ptr());
+        std::hint::black_box(unit.as_ptr());
+        std::hint::black_box(owned.into_inner());
+        1
+    }
 }
 
 fn wrapped_vec_deque() -> VecDeque<i32> {
@@ -333,8 +366,13 @@ fn touch_globals() -> i32 {
             + G_NONZERO_U128.get() as i64
             + G_CELL_U32.get() as i64
             + G_CELL_PAIR.get().0 as i64
+            + *G_REF_CELL_IDLE.get_mut() as i64
+            + *G_REF_CELL_SHARED.get_mut() as i64
+            + *G_REF_CELL_MUT.get_mut() as i64
+            + G_REF_CELL_PAIR.get_mut().0 as i64
             + G_USER_NONZERO.0.0 as i64
             + G_USER_CELL.0.0 as i64
+            + G_USER_REF_CELL.value.0 as i64
             + G_USER_VEC.len as i64
             + GLOBAL_PAIRS[0].0 as i64
             + union_value as i64
@@ -378,6 +416,22 @@ fn main() {
             VecDeque::new(),
         ) as i64;
         acc += math::observe_nonzero(NonZeroU32::new(23).unwrap()) as i64;
+        // SAFETY: The fixture is single-threaded. The guards deliberately stay
+        // live across the probe so its borrow-state presentation is observable.
+        unsafe {
+            let shared_one = G_REF_CELL_SHARED.borrow();
+            let shared_two = G_REF_CELL_SHARED.borrow();
+            let mutable = G_REF_CELL_MUT.borrow_mut();
+            acc += math::observe_ref_cell_states(
+                &G_REF_CELL_IDLE,
+                &G_REF_CELL_SHARED,
+                &G_REF_CELL_MUT,
+                &G_REF_CELL_PAIR,
+                &G_REF_CELL_UNIT,
+                RefCell::new(-12_i16),
+            ) as i64;
+            acc += *shared_one as i64 + *shared_two as i64 + *mutable as i64;
+        }
         acc += touch_globals() as i64;
         thread::sleep(Duration::from_millis(1000));
     }

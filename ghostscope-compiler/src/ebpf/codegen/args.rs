@@ -57,6 +57,29 @@ fn is_known_zero_sized_type(type_info: &ghostscope_dwarf::TypeInfo) -> bool {
     }
 }
 
+fn inline_view_data_len(
+    physical_type: &ghostscope_dwarf::TypeInfo,
+    output_type: &ghostscope_dwarf::TypeInfo,
+) -> Result<usize> {
+    let physical_size = usize::try_from(physical_type.size()).map_err(|_| {
+        CodeGenError::DwarfError("inline semantic root size does not fit this host".to_string())
+    })?;
+    let output_size = usize::try_from(output_type.size()).map_err(|_| {
+        CodeGenError::DwarfError("inline semantic view size does not fit this host".to_string())
+    })?;
+    if output_size != physical_size {
+        return Err(CodeGenError::DwarfError(format!(
+            "inline semantic view size {output_size} does not match DWARF root size {physical_size}"
+        )));
+    }
+    if output_size == 0 && !is_known_zero_sized_type(output_type) {
+        return Err(CodeGenError::DwarfError(
+            "inline semantic view has an unknown zero-byte layout".to_string(),
+        ));
+    }
+    Ok(output_size)
+}
+
 fn sequence_capture_limits(cap: usize, element_stride: u64) -> Result<(usize, usize, usize)> {
     let stride = usize::try_from(element_stride).map_err(|_| {
         CodeGenError::DwarfError(format!(
@@ -134,6 +157,23 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         data_len,
                         ComplexArgSource::MemDump {
                             address,
+                            len: data_len,
+                        },
+                    )
+                }
+            }
+            ghostscope_dwarf::ValueCapturePlan::InlineView {
+                output_type: view_type,
+            } => {
+                let data_len = inline_view_data_len(&output_type, &view_type)?;
+                output_type = view_type;
+                if data_len == 0 {
+                    (0, ComplexArgSource::ImmediateBytes { bytes: Vec::new() })
+                } else {
+                    (
+                        data_len,
+                        ComplexArgSource::MemDump {
+                            address: descriptor,
                             len: data_len,
                         },
                     )
@@ -346,6 +386,28 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         });
                     }
                 }
+                if let Some(ghostscope_dwarf::ValueReadPlan {
+                    presentation,
+                    capture:
+                        ghostscope_dwarf::ValueCapturePlan::InlineView { output_type },
+                }) = semantic_plan.as_ref()
+                {
+                    let data_len = inline_view_data_len(&dwarf_type, output_type)?;
+                    if data_len == 0 {
+                        return Ok(ComplexArg {
+                            var_name_index: self
+                                .trace_context
+                                .add_variable_name(display_name)?,
+                            type_index: self.trace_context.add_type_with_presentation(
+                                output_type.clone(),
+                                presentation.clone(),
+                            )?,
+                            access_path: Vec::new(),
+                            data_len: 0,
+                            source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
+                        });
+                    }
+                }
                 let value =
                     self.variable_materialization_to_llvm_value(&materialized, pc_address, None)?;
                 let value = match value {
@@ -361,52 +423,86 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         )))
                     }
                 };
-                if let Some(ghostscope_dwarf::ValueReadPlan {
-                    presentation,
-                    capture: ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value: projected },
-                }) = semantic_plan
-                {
-                    let offset = projected_member_offset(&projected, "projected value")?;
-                    let projected_type = projected.resolved_type.summary;
-                    let data_len = Self::compute_read_size_for_type(&projected_type);
-                    let container_len = Self::compute_read_size_for_type(&dwarf_type);
-                    let projected_end = usize::try_from(offset)
-                        .ok()
-                        .and_then(|offset| offset.checked_add(data_len));
-                    if data_len == 0
-                        || data_len > 8
-                        || projected_end.is_none_or(|end| end > container_len || end > 8)
-                    {
-                        return Err(CodeGenError::DwarfError(format!(
-                            "direct semantic projection for '{}' does not fit one eBPF register",
-                            materialized.name
-                        )));
+                if let Some(semantic_plan) = semantic_plan {
+                    match semantic_plan.capture {
+                        ghostscope_dwarf::ValueCapturePlan::ProjectedValue {
+                            value: projected,
+                        } => {
+                            let offset =
+                                projected_member_offset(&projected, "projected value")?;
+                            let projected_type = projected.resolved_type.summary;
+                            let data_len = Self::compute_read_size_for_type(&projected_type);
+                            let container_len = Self::compute_read_size_for_type(&dwarf_type);
+                            let projected_end = usize::try_from(offset)
+                                .ok()
+                                .and_then(|offset| offset.checked_add(data_len));
+                            if data_len == 0
+                                || data_len > 8
+                                || projected_end
+                                    .is_none_or(|end| end > container_len || end > 8)
+                            {
+                                return Err(CodeGenError::DwarfError(format!(
+                                    "direct semantic projection for '{}' does not fit one eBPF register",
+                                    materialized.name
+                                )));
+                            }
+                            let value = if offset == 0 {
+                                value
+                            } else {
+                                let shift = value.get_type().const_int(offset * 8, false);
+                                self.builder
+                                    .build_right_shift(
+                                        value,
+                                        shift,
+                                        false,
+                                        "semantic_projected_direct_value",
+                                    )
+                                    .map_err(|error| {
+                                        CodeGenError::Builder(error.to_string())
+                                    })?
+                            };
+                            return Ok(ComplexArg {
+                                var_name_index: self
+                                    .trace_context
+                                    .add_variable_name(display_name)?,
+                                type_index: self.trace_context.add_type_with_presentation(
+                                    projected_type,
+                                    semantic_plan.presentation,
+                                )?,
+                                access_path: Vec::new(),
+                                data_len,
+                                source: ComplexArgSource::ComputedInt {
+                                    value,
+                                    byte_len: data_len,
+                                },
+                            });
+                        }
+                        ghostscope_dwarf::ValueCapturePlan::InlineView { output_type } => {
+                            let data_len = inline_view_data_len(&dwarf_type, &output_type)?;
+                            if data_len == 0 || data_len > 8 {
+                                return Err(CodeGenError::DwarfError(format!(
+                                    "direct semantic view for '{}' does not fit one eBPF register",
+                                    materialized.name
+                                )));
+                            }
+                            return Ok(ComplexArg {
+                                var_name_index: self
+                                    .trace_context
+                                    .add_variable_name(display_name)?,
+                                type_index: self.trace_context.add_type_with_presentation(
+                                    output_type,
+                                    semantic_plan.presentation,
+                                )?,
+                                access_path: Vec::new(),
+                                data_len,
+                                source: ComplexArgSource::ComputedInt {
+                                    value,
+                                    byte_len: data_len,
+                                },
+                            });
+                        }
+                        _ => {}
                     }
-                    let value = if offset == 0 {
-                        value
-                    } else {
-                        let shift = value.get_type().const_int(offset * 8, false);
-                        self.builder
-                            .build_right_shift(
-                                value,
-                                shift,
-                                false,
-                                "semantic_projected_direct_value",
-                            )
-                            .map_err(|error| CodeGenError::Builder(error.to_string()))?
-                    };
-                    return Ok(ComplexArg {
-                        var_name_index: self.trace_context.add_variable_name(display_name)?,
-                        type_index: self
-                            .trace_context
-                            .add_type_with_presentation(projected_type, presentation)?,
-                        access_path: Vec::new(),
-                        data_len,
-                        source: ComplexArgSource::ComputedInt {
-                            value,
-                            byte_len: data_len,
-                        },
-                    });
                 }
                 let data_len = Self::compute_read_size_for_type(&dwarf_type).clamp(1, 8);
                 Ok(ComplexArg {
@@ -1469,5 +1565,30 @@ mod semantic_value_tests {
 
         assert!(is_known_zero_sized_type(&unit));
         assert!(!is_known_zero_sized_type(&unknown));
+    }
+
+    #[test]
+    fn inline_view_requires_the_exact_dwarf_root_size() {
+        let physical = TypeInfo::StructType {
+            name: "Physical".to_string(),
+            size: 16,
+            members: Vec::new(),
+        };
+        let view = TypeInfo::StructType {
+            name: "Semantic".to_string(),
+            size: 16,
+            members: Vec::new(),
+        };
+        assert_eq!(inline_view_data_len(&physical, &view).unwrap(), 16);
+
+        let undersized = TypeInfo::StructType {
+            name: "Semantic".to_string(),
+            size: 8,
+            members: Vec::new(),
+        };
+        let error = inline_view_data_len(&physical, &undersized).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match DWARF root size 16"));
     }
 }

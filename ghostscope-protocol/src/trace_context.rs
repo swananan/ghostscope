@@ -370,6 +370,30 @@ mod tests {
     }
 
     #[test]
+    fn test_signed_state_struct_presentation_round_trips() {
+        let mut ctx = TraceContext::new();
+        let presentation = ValuePresentation::SignedStateStruct {
+            state_field: "borrow".to_string(),
+            non_negative_label: "borrow".to_string(),
+            negative_label: "borrow_mut".to_string(),
+        };
+        let index = ctx
+            .add_type_with_presentation(
+                TypeInfo::StructType {
+                    name: "RefCell".to_string(),
+                    size: 8,
+                    members: Vec::new(),
+                },
+                presentation.clone(),
+            )
+            .unwrap();
+
+        let json = serde_json::to_string(&ctx).unwrap();
+        let decoded: TraceContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.get_value_presentation(index), &presentation);
+    }
+
+    #[test]
     fn test_deserialized_legacy_context_defaults_to_dwarf_presentation() {
         let json = r#"{
             "strings": [],

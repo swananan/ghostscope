@@ -771,6 +771,79 @@ impl FormatPrinter {
                 let value = Self::format_data_with_type_info(data, type_info);
                 format!("{type_name} {{ {field_name}: {value} }}")
             }
+            ValuePresentation::SignedStateStruct {
+                state_field,
+                non_negative_label,
+                negative_label,
+            } => Self::format_signed_state_struct(
+                data,
+                type_info,
+                state_field,
+                non_negative_label,
+                negative_label,
+            ),
+        }
+    }
+
+    fn format_signed_state_struct(
+        data: &[u8],
+        type_info: &TypeInfo,
+        state_field: &str,
+        non_negative_label: &str,
+        negative_label: &str,
+    ) -> String {
+        let TypeInfo::StructType { name, members, .. } = type_info else {
+            return "<INVALID_SIGNED_STATE_STRUCT>".to_string();
+        };
+        let Some(member) = members.iter().find(|member| member.name == state_field) else {
+            return "<INVALID_SIGNED_STATE_STRUCT>".to_string();
+        };
+        let state = usize::try_from(member.offset)
+            .ok()
+            .and_then(|offset| data.get(offset..))
+            .and_then(|data| Self::decode_signed_integer(data, &member.member_type));
+        let summary = match state {
+            Some(state) if state >= 0 => {
+                format!("{name}({non_negative_label}={state})")
+            }
+            Some(state) => {
+                format!("{name}({negative_label}={})", state.unsigned_abs())
+            }
+            None => format!("{name}({state_field}=<unavailable>)"),
+        };
+        let fields = Self::format_data_with_type_info(data, type_info);
+        let Some(fields) = fields.strip_prefix(name) else {
+            return "<INVALID_SIGNED_STATE_STRUCT>".to_string();
+        };
+        format!("{summary}{fields}")
+    }
+
+    fn decode_signed_integer(data: &[u8], type_info: &TypeInfo) -> Option<i128> {
+        let type_info = match type_info {
+            TypeInfo::TypedefType {
+                underlying_type, ..
+            }
+            | TypeInfo::QualifiedType {
+                underlying_type, ..
+            } => return Self::decode_signed_integer(data, underlying_type),
+            type_info => type_info,
+        };
+        let TypeInfo::BaseType { size, encoding, .. } = type_info else {
+            return None;
+        };
+        if *encoding != gimli::constants::DW_ATE_signed.0 as u16
+            && *encoding != gimli::constants::DW_ATE_signed_char.0 as u16
+        {
+            return None;
+        }
+
+        match *size {
+            1 => Some(i8::from_le_bytes(data.get(..1)?.try_into().ok()?) as i128),
+            2 => Some(i16::from_le_bytes(data.get(..2)?.try_into().ok()?) as i128),
+            4 => Some(i32::from_le_bytes(data.get(..4)?.try_into().ok()?) as i128),
+            8 => Some(i64::from_le_bytes(data.get(..8)?.try_into().ok()?) as i128),
+            16 => Some(i128::from_le_bytes(data.get(..16)?.try_into().ok()?)),
+            _ => None,
         }
     }
 
@@ -809,7 +882,9 @@ impl FormatPrinter {
                 let (_, _, payload) = Self::parse_sequence_payload(data, *element_stride)?;
                 Some(payload)
             }
-            ValuePresentation::SingleField { .. } => Some(data),
+            ValuePresentation::SingleField { .. } | ValuePresentation::SignedStateStruct { .. } => {
+                Some(data)
+            }
         }
     }
 
@@ -1701,6 +1776,123 @@ mod tests {
         assert_eq!(
             FormatPrinter::format_data_with_presentation(&[], &unit_type, &presentation),
             "Cell { value: () }"
+        );
+    }
+
+    #[test]
+    fn test_signed_state_struct_presentation_formats_borrow_states() {
+        let type_info = TypeInfo::StructType {
+            name: "RefCell".to_string(),
+            size: 16,
+            members: vec![
+                crate::StructMember {
+                    name: "value".to_string(),
+                    member_type: TypeInfo::BaseType {
+                        name: "i32".to_string(),
+                        size: 4,
+                        encoding: gimli::constants::DW_ATE_signed.0 as u16,
+                    },
+                    offset: 0,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+                crate::StructMember {
+                    name: "borrow".to_string(),
+                    member_type: TypeInfo::BaseType {
+                        name: "isize".to_string(),
+                        size: 8,
+                        encoding: gimli::constants::DW_ATE_signed.0 as u16,
+                    },
+                    offset: 8,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+            ],
+        };
+        let presentation = ValuePresentation::SignedStateStruct {
+            state_field: "borrow".to_string(),
+            non_negative_label: "borrow".to_string(),
+            negative_label: "borrow_mut".to_string(),
+        };
+        let mut shared = [0_u8; 16];
+        shared[..4].copy_from_slice(&17_i32.to_le_bytes());
+        shared[8..].copy_from_slice(&2_i64.to_le_bytes());
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(&shared, &type_info, &presentation),
+            "RefCell(borrow=2) { value: 17, borrow: 2 }"
+        );
+
+        let mut mutable = shared;
+        mutable[8..].copy_from_slice(&(-1_i64).to_le_bytes());
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(&mutable, &type_info, &presentation),
+            "RefCell(borrow_mut=1) { value: 17, borrow: -1 }"
+        );
+
+        mutable[8..].copy_from_slice(&i64::MIN.to_le_bytes());
+        assert!(
+            FormatPrinter::format_data_with_presentation(&mutable, &type_info, &presentation)
+                .starts_with("RefCell(borrow_mut=9223372036854775808)")
+        );
+        assert_eq!(
+            FormatPrinter::presentation_payload_bytes(&shared, &presentation),
+            Some(shared.as_slice())
+        );
+    }
+
+    #[test]
+    fn test_signed_state_struct_presentation_handles_truncated_state() {
+        let type_info = TypeInfo::StructType {
+            name: "RefCell".to_string(),
+            size: 16,
+            members: vec![
+                crate::StructMember {
+                    name: "value".to_string(),
+                    member_type: TypeInfo::BaseType {
+                        name: "i32".to_string(),
+                        size: 4,
+                        encoding: gimli::constants::DW_ATE_signed.0 as u16,
+                    },
+                    offset: 0,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+                crate::StructMember {
+                    name: "borrow".to_string(),
+                    member_type: TypeInfo::BaseType {
+                        name: "isize".to_string(),
+                        size: 8,
+                        encoding: gimli::constants::DW_ATE_signed.0 as u16,
+                    },
+                    offset: 8,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+            ],
+        };
+        let presentation = ValuePresentation::SignedStateStruct {
+            state_field: "borrow".to_string(),
+            non_negative_label: "borrow".to_string(),
+            negative_label: "borrow_mut".to_string(),
+        };
+        let mut trace_context = TraceContext::new();
+        let type_index = trace_context
+            .add_type_with_presentation(type_info, presentation)
+            .unwrap();
+        let name_index = trace_context.add_variable_name("cell".to_string()).unwrap();
+        let value = 17_i32.to_le_bytes();
+
+        assert_eq!(
+            FormatPrinter::format_complex_variable_with_status(
+                name_index,
+                type_index,
+                "",
+                &value,
+                VariableStatus::Truncated as u8,
+                &trace_context,
+            ),
+            "cell = RefCell(borrow=<unavailable>) { value: 17, borrow: <OUT_OF_BOUNDS> } \
+             <truncated>"
         );
     }
 
