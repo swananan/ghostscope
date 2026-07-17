@@ -627,6 +627,123 @@ async fn test_rust_cell_value_plan_projects_dwarf_value() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
+async fn test_rust_ref_cell_value_plan_builds_dwarf_inline_view() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let (_, read_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_REF_CELL_IDLE",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_REF_CELL_IDLE read plan"))?;
+    let resolved_type = analyzer
+        .resolved_type_for_plan(&read_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected RefCell<i32> type"))?;
+    let root_size = resolved_type.summary.size();
+    let value_plan = analyzer
+        .value_read_plan(&resolved_type, Some(&binary_path))?
+        .ok_or_else(|| anyhow::anyhow!("expected RefCell<i32> value plan"))?;
+
+    assert_eq!(
+        value_plan.presentation,
+        ghostscope_dwarf::ValuePresentation::SignedStateStruct {
+            state_field: "borrow".to_string(),
+            non_negative_label: "borrow".to_string(),
+            negative_label: "borrow_mut".to_string(),
+        }
+    );
+    let ghostscope_dwarf::ValueCapturePlan::InlineView { output_type } = value_plan.capture else {
+        anyhow::bail!("expected inline semantic view for RefCell<i32>")
+    };
+    let ghostscope_dwarf::TypeInfo::StructType {
+        name,
+        size,
+        members,
+    } = output_type
+    else {
+        anyhow::bail!("expected RefCell struct view")
+    };
+    assert_eq!(name, "RefCell");
+    assert_eq!(size, root_size);
+    let [value, borrow] = members.as_slice() else {
+        anyhow::bail!("expected value and borrow fields")
+    };
+    assert_eq!(value.name, "value");
+    assert_eq!(borrow.name, "borrow");
+    assert!(matches!(
+        ghostscope_dwarf::strip_type_aliases(&value.member_type),
+        ghostscope_dwarf::TypeInfo::BaseType {
+            name,
+            size: 4,
+            encoding,
+        } if name == "i32"
+            && *encoding == ghostscope_dwarf::constants::DW_ATE_signed.0 as u16
+    ));
+    assert!(matches!(
+        ghostscope_dwarf::strip_type_aliases(&borrow.member_type),
+        ghostscope_dwarf::TypeInfo::BaseType { size, encoding, .. }
+            if matches!(*size, 4 | 8)
+                && *encoding == ghostscope_dwarf::constants::DW_ATE_signed.0 as u16
+    ));
+    let value_end = value.offset + value.member_type.size();
+    let borrow_end = borrow.offset + borrow.member_type.size();
+    assert!(value_end <= root_size);
+    assert!(borrow_end <= root_size);
+    assert!(value_end <= borrow.offset || borrow_end <= value.offset);
+
+    let (_, unit_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_REF_CELL_UNIT",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_REF_CELL_UNIT read plan"))?;
+    let unit_type = analyzer
+        .resolved_type_for_plan(&unit_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected RefCell<()> type"))?;
+    let unit_view = analyzer
+        .value_read_plan(&unit_type, Some(&binary_path))?
+        .and_then(|plan| match plan.capture {
+            ghostscope_dwarf::ValueCapturePlan::InlineView { output_type } => Some(output_type),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("expected RefCell<()> inline view"))?;
+    let ghostscope_dwarf::TypeInfo::StructType { members, .. } = unit_view else {
+        anyhow::bail!("expected RefCell<()> struct view")
+    };
+    assert!(matches!(
+        ghostscope_dwarf::strip_type_aliases(&members[0].member_type),
+        ghostscope_dwarf::TypeInfo::BaseType {
+            name,
+            size: 0,
+            ..
+        } if name == "()"
+    ));
+
+    let (_, user_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_USER_REF_CELL",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_USER_REF_CELL read plan"))?;
+    let user_type = analyzer
+        .resolved_type_for_plan(&user_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected user RefCell type"))?;
+    assert!(
+        analyzer
+            .value_read_plan(&user_type, Some(&binary_path))?
+            .is_none(),
+        "user-defined RefCell must retain DWARF presentation"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_str_values() -> anyhow::Result<()> {
     init();
 
@@ -863,6 +980,87 @@ trace do_stuff {
             .lines()
             .any(|line| line.contains("RCELL_RAW:29 00 00 00")),
         "Expected raw Rust Cell payload: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_ref_cell_values_and_borrow_states() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_ref_cell_states {
+    print "RREFCELL:{}:{}:{}:{}:{}", G_REF_CELL_IDLE,
+        G_REF_CELL_SHARED, G_REF_CELL_MUT, G_REF_CELL_PAIR, G_REF_CELL_UNIT;
+    print "RREFCELL_RAW:{:x}", G_REF_CELL_SHARED;
+    print "RREFCELL_ARG:{}", owned;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RefCell(borrow=0) { value: 17, borrow: 0 }")),
+        "Expected idle Rust RefCell output: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RefCell(borrow=2) { value: 23, borrow: 2 }")),
+        "Expected shared Rust RefCell output: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| { line.contains("RefCell(borrow_mut=1) { value: 31, borrow: -1 }") }),
+        "Expected mutably borrowed Rust RefCell output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RREFCELL:") && line.contains("__0: -6") && line.contains("__1: 14")
+        }),
+        "Expected aggregate Rust RefCell output: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RefCell(borrow=0) { value: (), borrow: 0 }")),
+        "Expected zero-sized Rust RefCell output: {stdout}"
+    );
+    let raw_line = stdout
+        .lines()
+        .find(|line| line.contains("RREFCELL_RAW:"))
+        .ok_or_else(|| anyhow::anyhow!("missing raw RefCell output: {stdout}"))?;
+    let (_, raw_payload) = raw_line
+        .split_once("RREFCELL_RAW:")
+        .ok_or_else(|| anyhow::anyhow!("invalid raw RefCell output: {raw_line}"))?;
+    assert!(
+        raw_payload.contains("00"),
+        "raw payload was empty: {raw_line}"
+    );
+    assert!(
+        !raw_payload.contains("RefCell"),
+        "raw specifier used semantic formatting: {raw_line}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains(
+                "RREFCELL_ARG:RefCell(borrow=0) \
+                           { value: -12, borrow: 0 }",
+            )
+        }),
+        "Expected Rust RefCell argument output: {stdout}"
     );
     assert!(
         !stdout.contains("ExprError"),

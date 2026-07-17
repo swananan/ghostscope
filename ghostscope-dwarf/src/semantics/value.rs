@@ -27,6 +27,9 @@ pub enum ValueCapturePlan {
     /// Read an embedded value at a DWARF-derived member projection and present
     /// it using the projected type rather than the physical wrapper type.
     ProjectedValue { value: TypeProjection },
+    /// Read the physical root value in place, but register and format it using
+    /// a DWARF-derived semantic view of selected embedded fields.
+    InlineView { output_type: crate::TypeInfo },
     /// Read a pointer and length from an aggregate, then capture a bounded byte
     /// sequence from the pointer.
     IndirectBytes {

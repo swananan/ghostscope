@@ -2,8 +2,9 @@ use super::DwarfAnalyzer;
 use crate::{
     indexable_element_layout, member_layout, semantics::PlanError, strip_type_aliases,
     CompilationUnitMetadata, CuId, MemberLayout, ModuleId, PcContext, ResolvedType, Result,
-    SemanticType, TypeId, TypeIdentity, TypeInfo, TypeLayoutError, TypeOrigin, TypeProjection,
-    TypeProjectionLayout, ValueCapturePlan, ValueReadPlan, VariableAccessSegment, VariableReadPlan,
+    SemanticType, StructMember, TypeId, TypeIdentity, TypeInfo, TypeLayoutError, TypeOrigin,
+    TypeProjection, TypeProjectionLayout, ValueCapturePlan, ValueReadPlan, VariableAccessSegment,
+    VariableReadPlan,
 };
 use std::path::Path;
 
@@ -279,6 +280,59 @@ impl DwarfAnalyzer {
                 return Ok(Some(ValueReadPlan {
                     presentation,
                     capture: ValueCapturePlan::ProjectedValue { value },
+                }));
+            }
+            crate::language::ValueLayout::ProjectedStruct(layout) => {
+                let root_size = current.summary.size();
+                let mut members = Vec::with_capacity(layout.fields.len());
+                for field in layout.fields {
+                    let projected = self.project_resolved_member_path(
+                        current,
+                        &field.value_path,
+                        type_module_path,
+                    )?;
+                    let TypeProjectionLayout::Member { offset } = projected.layout else {
+                        return Err(anyhow::anyhow!(
+                            "semantic struct field produced a non-member projection"
+                        ));
+                    };
+                    let member_type = projected.resolved_type.summary;
+                    let member_end = offset
+                        .checked_add(member_type.size())
+                        .ok_or_else(|| anyhow::anyhow!("semantic struct field end overflow"))?;
+                    if member_end > root_size {
+                        return Err(anyhow::anyhow!(
+                            "semantic struct field '{}' exceeds its DWARF root",
+                            field.name
+                        ));
+                    }
+                    members.push(StructMember {
+                        name: field.name.to_string(),
+                        member_type,
+                        offset,
+                        bit_offset: None,
+                        bit_size: None,
+                    });
+                }
+                let presentation = match layout.presentation {
+                    crate::language::ProjectedStructPresentation::SignedState {
+                        state_field,
+                        non_negative_label,
+                        negative_label,
+                    } => crate::ValuePresentation::SignedStateStruct {
+                        state_field: state_field.to_string(),
+                        non_negative_label: non_negative_label.to_string(),
+                        negative_label: negative_label.to_string(),
+                    },
+                };
+                let output_type = TypeInfo::StructType {
+                    name: layout.type_name.to_string(),
+                    size: root_size,
+                    members,
+                };
+                return Ok(Some(ValueReadPlan {
+                    presentation,
+                    capture: ValueCapturePlan::InlineView { output_type },
                 }));
             }
             crate::language::ValueLayout::IndirectSequence(layout) => layout,

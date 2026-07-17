@@ -1,4 +1,4 @@
-use crate::{strip_type_aliases, ResolvedType, SourceLanguage, TypeInfo};
+use crate::{strip_type_aliases, ResolvedType, SourceLanguage, StructMember, TypeInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ValueLayout {
@@ -7,6 +7,7 @@ pub(crate) enum ValueLayout {
         value_path: Vec<String>,
         presentation: ProjectedValuePresentation,
     },
+    ProjectedStruct(ProjectedStructLayout),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +16,28 @@ pub(crate) enum ProjectedValuePresentation {
     SingleField {
         type_name: &'static str,
         field_name: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectedStructLayout {
+    pub(crate) type_name: &'static str,
+    pub(crate) fields: Vec<ProjectedStructField>,
+    pub(crate) presentation: ProjectedStructPresentation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectedStructField {
+    pub(crate) name: &'static str,
+    pub(crate) value_path: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectedStructPresentation {
+    SignedState {
+        state_field: &'static str,
+        non_negative_label: &'static str,
+        negative_label: &'static str,
     },
 }
 
@@ -96,7 +119,8 @@ pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
                     || is_short_vec_deque_name(name)
                     || is_short_box_str_name(name)
                     || is_short_nonzero_name(name)
-                    || is_short_cell_name(name))
+                    || is_short_cell_name(name)
+                    || is_short_ref_cell_name(name))
     })
 }
 
@@ -111,6 +135,10 @@ pub(super) fn resolve_value_layout(
     let TypeInfo::StructType { name, .. } = strip_type_aliases(&current.summary) else {
         return None;
     };
+
+    if is_std_ref_cell(name, dwarf_qualified_name) {
+        return rust_ref_cell_layout(&current.summary).map(ValueLayout::ProjectedStruct);
+    }
 
     if is_std_cell(name, dwarf_qualified_name) {
         return rust_cell_value_path(&current.summary).map(|value_path| {
@@ -230,6 +258,12 @@ fn is_short_cell_name(name: &str) -> bool {
         .is_some_and(|arguments| !arguments.is_empty())
 }
 
+fn is_short_ref_cell_name(name: &str) -> bool {
+    name.strip_prefix("RefCell<")
+        .and_then(|arguments| arguments.strip_suffix('>'))
+        .is_some_and(|arguments| !arguments.is_empty())
+}
+
 fn is_std_cell(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
     is_std_cell_name(name)
         || (is_short_cell_name(name) && dwarf_qualified_name.is_some_and(is_std_cell_name))
@@ -240,6 +274,30 @@ fn is_std_cell_name(name: &str) -> bool {
         return false;
     };
     let Some((module, arguments)) = path.split_once("::Cell<") else {
+        return false;
+    };
+
+    !module.is_empty()
+        && module.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+        && !arguments.is_empty()
+        && arguments.ends_with('>')
+}
+
+fn is_std_ref_cell(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_ref_cell_name(name)
+        || (is_short_ref_cell_name(name) && dwarf_qualified_name.is_some_and(is_std_ref_cell_name))
+}
+
+fn is_std_ref_cell_name(name: &str) -> bool {
+    let Some(path) = name.strip_prefix("core::") else {
+        return false;
+    };
+    let Some((module, arguments)) = path.split_once("::RefCell<") else {
         return false;
     };
 
@@ -501,6 +559,73 @@ fn rust_cell_value_path(root: &TypeInfo) -> Option<Vec<String>> {
     .then_some(value_path)
 }
 
+fn rust_ref_cell_layout(root: &TypeInfo) -> Option<ProjectedStructLayout> {
+    // Rust 1.46 through the current 1.98 nightly rust-gdb provider reads
+    // `value.value` and `borrow.value.value` without a version fallback. The
+    // outer names establish those semantic roles; all inner names, offsets,
+    // widths, and projected types below come from the concrete DWARF DIEs.
+    let TypeInfo::StructType { members, .. } = strip_type_aliases(root) else {
+        return None;
+    };
+    let value_outer = unique_named_member(members, "value")?;
+    let borrow_outer = unique_named_member(members, "borrow")?;
+
+    let value_inner = sole_struct_member(&value_outer.member_type)?;
+    let value_path = vec![value_outer.name.clone(), value_inner.name.clone()];
+
+    let borrow_cell_inner = sole_struct_member(&borrow_outer.member_type)?;
+    let borrow_inner = sole_struct_member(&borrow_cell_inner.member_type)?;
+    let borrow_path = vec![
+        borrow_outer.name.clone(),
+        borrow_cell_inner.name.clone(),
+        borrow_inner.name.clone(),
+    ];
+
+    let value = resolve_member_path_allowing_zst(root, &value_path)?;
+    let borrow = resolve_member_path(root, &borrow_path)?;
+    let TypeInfo::BaseType { size, encoding, .. } = strip_type_aliases(borrow.member_type) else {
+        return None;
+    };
+    let signed_state = *encoding == gimli::DW_ATE_signed.0 as u16
+        || *encoding == gimli::DW_ATE_signed_char.0 as u16;
+    let supported_width = matches!(*size, 1 | 2 | 4 | 8 | 16);
+    let value_size = value.member_type.size();
+    let value_end = value.offset.checked_add(value_size)?;
+    let borrow_end = borrow.offset.checked_add(*size)?;
+    let fields_overlap = value_size > 0 && value.offset < borrow_end && borrow.offset < value_end;
+
+    if matches!(
+        strip_type_aliases(value.member_type),
+        TypeInfo::UnknownType { .. } | TypeInfo::OptimizedOut { .. }
+    ) || !signed_state
+        || !supported_width
+        || value_end > root.size()
+        || borrow_end > root.size()
+        || fields_overlap
+    {
+        return None;
+    }
+
+    Some(ProjectedStructLayout {
+        type_name: "RefCell",
+        fields: vec![
+            ProjectedStructField {
+                name: "value",
+                value_path,
+            },
+            ProjectedStructField {
+                name: "borrow",
+                value_path: borrow_path,
+            },
+        ],
+        presentation: ProjectedStructPresentation::SignedState {
+            state_field: "borrow",
+            non_negative_label: "borrow",
+            negative_label: "borrow_mut",
+        },
+    })
+}
+
 fn rust_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
     // rust-gdb uses `buf.ptr` through Rust 1.81 and `buf.inner.ptr` from
     // Rust 1.82 onward. Keep both paths and validate whichever DWARF exposes.
@@ -743,6 +868,22 @@ fn validate_ring_sequence_layout(
 
 fn field_path(fields: &[&str]) -> Vec<String> {
     fields.iter().map(|field| (*field).to_string()).collect()
+}
+
+fn unique_named_member<'a>(members: &'a [StructMember], name: &str) -> Option<&'a StructMember> {
+    let mut matching = members.iter().filter(|member| member.name == name);
+    let member = matching.next()?;
+    matching.next().is_none().then_some(member)
+}
+
+fn sole_struct_member(type_info: &TypeInfo) -> Option<&StructMember> {
+    let TypeInfo::StructType { members, .. } = strip_type_aliases(type_info) else {
+        return None;
+    };
+    let [member] = members.as_slice() else {
+        return None;
+    };
+    Some(member)
 }
 
 struct ResolvedMemberPath<'a> {
@@ -1040,6 +1181,46 @@ mod tests {
                 module: ModuleId(0),
                 cu: CuId(0),
                 language,
+                producer: None,
+                dwarf_version: 5,
+            }),
+        )
+    }
+
+    struct RefCellTestLayout<'a> {
+        name: &'a str,
+        root_size: u64,
+        value_offset: u64,
+        borrow_offset: u64,
+        borrow_size: u64,
+        language: SourceLanguage,
+    }
+
+    fn rust_ref_cell_type(layout: RefCellTestLayout<'_>, value_type: TypeInfo) -> ResolvedType {
+        let value = single_member_struct("UnsafeCell<T>", "value_inner_from_dwarf", value_type);
+        let borrow = single_member_struct(
+            "Cell<BorrowFlag>",
+            "borrow_cell_inner_from_dwarf",
+            single_member_struct(
+                "UnsafeCell<BorrowFlag>",
+                "borrow_inner_from_dwarf",
+                signed_type("isize", layout.borrow_size),
+            ),
+        );
+        ResolvedType::new(
+            TypeInfo::StructType {
+                name: layout.name.to_string(),
+                size: layout.root_size,
+                members: vec![
+                    member("borrow", borrow, layout.borrow_offset),
+                    member("value", value, layout.value_offset),
+                ],
+            },
+            TypeIdentity::Unknown,
+            Some(TypeOrigin {
+                module: ModuleId(0),
+                cu: CuId(0),
+                language: layout.language,
                 producer: None,
                 dwarf_version: 5,
             }),
@@ -1915,6 +2096,155 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_ref_cell_with_dwarf_derived_fields_and_widths() {
+        let value_type = TypeInfo::StructType {
+            name: "(i32, u16)".to_string(),
+            size: 8,
+            members: vec![
+                member("__0", signed_type("i32", 4), 0),
+                member("__1", unsigned_type("u16", 2), 4),
+            ],
+        };
+        let current = rust_ref_cell_type(
+            RefCellTestLayout {
+                name: "RefCell<(i32, u16)>",
+                root_size: 16,
+                value_offset: 0,
+                borrow_offset: 8,
+                borrow_size: 8,
+                language: SourceLanguage::Rust,
+            },
+            value_type,
+        );
+
+        assert_eq!(
+            resolve_value_layout(&current, Some("core::cell::RefCell<(i32, u16)>")),
+            Some(ValueLayout::ProjectedStruct(ProjectedStructLayout {
+                type_name: "RefCell",
+                fields: vec![
+                    ProjectedStructField {
+                        name: "value",
+                        value_path: field_path(&["value", "value_inner_from_dwarf"]),
+                    },
+                    ProjectedStructField {
+                        name: "borrow",
+                        value_path: field_path(&[
+                            "borrow",
+                            "borrow_cell_inner_from_dwarf",
+                            "borrow_inner_from_dwarf",
+                        ]),
+                    },
+                ],
+                presentation: ProjectedStructPresentation::SignedState {
+                    state_field: "borrow",
+                    non_negative_label: "borrow",
+                    negative_label: "borrow_mut",
+                },
+            }))
+        );
+
+        let narrow = rust_ref_cell_type(
+            RefCellTestLayout {
+                name: "core::cell::RefCell<u16>",
+                root_size: 8,
+                value_offset: 0,
+                borrow_offset: 4,
+                borrow_size: 4,
+                language: SourceLanguage::Rust,
+            },
+            unsigned_type("u16", 2),
+        );
+        assert!(resolve_value_layout(&narrow, None).is_some());
+
+        let zst = rust_ref_cell_type(
+            RefCellTestLayout {
+                name: "core::cell::RefCell<()>",
+                root_size: 8,
+                value_offset: 0,
+                borrow_offset: 0,
+                borrow_size: 8,
+                language: SourceLanguage::Rust,
+            },
+            TypeInfo::BaseType {
+                name: "()".to_string(),
+                size: 0,
+                encoding: gimli::DW_ATE_unsigned.0 as u16,
+            },
+        );
+        assert!(resolve_value_layout(&zst, None).is_some());
+    }
+
+    #[test]
+    fn rejects_ref_cell_lookalikes_and_invalid_layouts() {
+        let current = rust_ref_cell_type(
+            RefCellTestLayout {
+                name: "RefCell<u32>",
+                root_size: 16,
+                value_offset: 0,
+                borrow_offset: 8,
+                borrow_size: 8,
+                language: SourceLanguage::Rust,
+            },
+            unsigned_type("u32", 4),
+        );
+        assert_eq!(
+            resolve_value_layout(&current, Some("app::RefCell<u32>")),
+            None
+        );
+        assert_eq!(resolve_value_layout(&current, None), None);
+
+        let mut unsigned_borrow = current.clone();
+        let TypeInfo::StructType { members, .. } = &mut unsigned_borrow.summary else {
+            unreachable!("test RefCell is a struct")
+        };
+        let TypeInfo::StructType {
+            members: cell_members,
+            ..
+        } = &mut members[0].member_type
+        else {
+            unreachable!("test borrow field is a struct")
+        };
+        let TypeInfo::StructType {
+            members: inner_members,
+            ..
+        } = &mut cell_members[0].member_type
+        else {
+            unreachable!("test borrow wrapper is a struct")
+        };
+        inner_members[0].member_type = unsigned_type("usize", 8);
+        assert_eq!(
+            resolve_value_layout(&unsigned_borrow, Some("core::cell::RefCell<u32>")),
+            None
+        );
+
+        let overlapping = rust_ref_cell_type(
+            RefCellTestLayout {
+                name: "core::cell::RefCell<u64>",
+                root_size: 16,
+                value_offset: 0,
+                borrow_offset: 4,
+                borrow_size: 8,
+                language: SourceLanguage::Rust,
+            },
+            unsigned_type("u64", 8),
+        );
+        assert_eq!(resolve_value_layout(&overlapping, None), None);
+
+        let non_rust = rust_ref_cell_type(
+            RefCellTestLayout {
+                name: "core::cell::RefCell<u32>",
+                root_size: 16,
+                value_offset: 0,
+                borrow_offset: 8,
+                borrow_size: 8,
+                language: SourceLanguage::C,
+            },
+            unsigned_type("u32", 4),
+        );
+        assert_eq!(resolve_value_layout(&non_rust, None), None);
+    }
+
+    #[test]
     fn qualified_name_lookup_is_limited_to_ambiguous_rust_std_types() {
         assert!(requires_dwarf_qualified_name(&rust_string_type(
             "String",
@@ -2031,6 +2361,28 @@ mod tests {
             "value",
             unsigned_type("u32", 4),
             SourceLanguage::Rust,
+        )));
+        assert!(requires_dwarf_qualified_name(&rust_ref_cell_type(
+            RefCellTestLayout {
+                name: "RefCell<u32>",
+                root_size: 16,
+                value_offset: 0,
+                borrow_offset: 8,
+                borrow_size: 8,
+                language: SourceLanguage::Rust,
+            },
+            unsigned_type("u32", 4),
+        )));
+        assert!(!requires_dwarf_qualified_name(&rust_ref_cell_type(
+            RefCellTestLayout {
+                name: "core::cell::RefCell<u32>",
+                root_size: 16,
+                value_offset: 0,
+                borrow_offset: 8,
+                borrow_size: 8,
+                language: SourceLanguage::Rust,
+            },
+            unsigned_type("u32", 4),
         )));
     }
 }

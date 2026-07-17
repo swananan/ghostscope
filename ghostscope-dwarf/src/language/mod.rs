@@ -5,8 +5,8 @@ mod rust;
 use crate::{semantics::PlanError, SourceLanguage, TypeOrigin, VariableAccessSegment};
 
 pub(crate) use rust::{
-    IndirectSequenceAddressing, IndirectSequenceKind, ProjectedValuePresentation,
-    RingSequenceLengthKind, ValueLayout,
+    IndirectSequenceAddressing, IndirectSequenceKind, ProjectedStructPresentation,
+    ProjectedValuePresentation, RingSequenceLengthKind, ValueLayout,
 };
 
 pub(crate) fn resolve_value_layout(
