@@ -40,6 +40,11 @@ pub(crate) enum ProjectedStructPresentation {
         non_negative_label: &'static str,
         negative_label: &'static str,
     },
+    ReferenceCounted {
+        strong_field: &'static str,
+        weak_field: &'static str,
+        implicit_weak: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +65,7 @@ pub(crate) struct CompositeStructField {
 pub(crate) enum ProjectedPathSegment {
     Member(String),
     SoleMember,
+    UnwrapScalar,
     Dereference,
 }
 
@@ -67,6 +73,7 @@ pub(crate) enum ProjectedPathSegment {
 pub(crate) enum ProjectedValueRequirement {
     KnownSizedOrZst,
     SignedPointerSizedInteger,
+    UnsignedPointerSizedInteger,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +157,9 @@ pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
                     || is_short_cell_name(name)
                     || is_short_ref_cell_name(name)
                     || is_short_ref_name(name)
-                    || is_short_ref_mut_name(name))
+                    || is_short_ref_mut_name(name)
+                    || is_short_rc_name(name)
+                    || is_short_arc_name(name))
     })
 }
 
@@ -165,6 +174,16 @@ pub(super) fn resolve_value_layout(
     let TypeInfo::StructType { name, .. } = strip_type_aliases(&current.summary) else {
         return None;
     };
+
+    if is_std_rc(name, dwarf_qualified_name) {
+        return rust_reference_counted_layout(&current.summary, "Rc", "value")
+            .map(ValueLayout::CompositeStruct);
+    }
+
+    if is_std_arc(name, dwarf_qualified_name) {
+        return rust_reference_counted_layout(&current.summary, "Arc", "data")
+            .map(ValueLayout::CompositeStruct);
+    }
 
     if is_std_ref(name, dwarf_qualified_name) || is_std_ref_mut(name, dwarf_qualified_name) {
         return rust_ref_layout(&current.summary).map(ValueLayout::CompositeStruct);
@@ -310,6 +329,21 @@ fn is_short_ref_mut_name(name: &str) -> bool {
         .is_some_and(|arguments| !arguments.is_empty())
 }
 
+fn is_short_rc_name(name: &str) -> bool {
+    is_short_generic_name(name, "Rc")
+}
+
+fn is_short_arc_name(name: &str) -> bool {
+    is_short_generic_name(name, "Arc")
+}
+
+fn is_short_generic_name(name: &str, type_name: &str) -> bool {
+    let prefix = format!("{type_name}<");
+    name.strip_prefix(&prefix)
+        .and_then(|arguments| arguments.strip_suffix('>'))
+        .is_some_and(|arguments| !arguments.is_empty())
+}
+
 fn is_std_cell(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
     is_std_cell_name(name)
         || (is_short_cell_name(name) && dwarf_qualified_name.is_some_and(is_std_cell_name))
@@ -376,8 +410,46 @@ fn is_std_ref_mut_name(name: &str) -> bool {
     is_std_core_generic_name(name, "RefMut")
 }
 
+fn is_std_rc(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_rc_name(name)
+        || (is_short_rc_name(name) && dwarf_qualified_name.is_some_and(is_std_rc_name))
+}
+
+fn is_std_rc_name(name: &str) -> bool {
+    is_std_alloc_generic_name(name, "Rc")
+}
+
+fn is_std_arc(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_arc_name(name)
+        || (is_short_arc_name(name) && dwarf_qualified_name.is_some_and(is_std_arc_name))
+}
+
+fn is_std_arc_name(name: &str) -> bool {
+    is_std_alloc_generic_name(name, "Arc")
+}
+
 fn is_std_core_generic_name(name: &str, type_name: &str) -> bool {
     let Some(path) = name.strip_prefix("core::") else {
+        return false;
+    };
+    let marker = format!("::{type_name}<");
+    let Some((module, arguments)) = path.split_once(&marker) else {
+        return false;
+    };
+
+    !module.is_empty()
+        && module.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+        && !arguments.is_empty()
+        && arguments.ends_with('>')
+}
+
+fn is_std_alloc_generic_name(name: &str, type_name: &str) -> bool {
+    let Some(path) = name.strip_prefix("alloc::") else {
         return false;
     };
     let marker = format!("::{type_name}<");
@@ -796,6 +868,97 @@ fn rust_ref_layout(root: &TypeInfo) -> Option<CompositeStructLayout> {
     })
 }
 
+fn rust_reference_counted_layout(
+    root: &TypeInfo,
+    type_name: &'static str,
+    value_member: &'static str,
+) -> Option<CompositeStructLayout> {
+    // Rust 1.46, 1.60, 1.70, 1.81, 1.88, 1.93, and 1.95 use the same
+    // rust-gdb provider paths for Rc and Arc. Rust 1.98 replaces the fixed
+    // AtomicUsize path with scalar-wrapper unwrapping because Atomic<usize>
+    // gained an alignment wrapper. Actual DWARF also renamed RcBox to RcInner
+    // between 1.81 and 1.88. None of those private names or depths are needed
+    // here: named semantic members select values, while every wrapper offset
+    // and final scalar width comes from the concrete DIE.
+    //
+    // The July 2026 1.98 nightly adds a separate rust-gdb path for Rc<str>.
+    // Its pointer carries data and length fields, so scalar_wrapper_target
+    // deliberately rejects it. Supporting that DST requires a mixed indirect
+    // sequence plus counter payload rather than pretending it is sized.
+    let TypeInfo::StructType {
+        size: root_size,
+        members,
+        ..
+    } = strip_type_aliases(root)
+    else {
+        return None;
+    };
+    let ptr_outer = unique_named_member(members, "ptr")?;
+    member_range(ptr_outer, *root_size)?;
+    let TypeInfo::StructType {
+        size: ptr_wrapper_size,
+        members: ptr_members,
+        ..
+    } = strip_type_aliases(&ptr_outer.member_type)
+    else {
+        return None;
+    };
+    let pointer = unique_named_member(ptr_members, "pointer")?;
+    member_range(pointer, *ptr_wrapper_size)?;
+    let TypeInfo::PointerType {
+        size: pointer_size, ..
+    } = strip_type_aliases(scalar_wrapper_target(&pointer.member_type)?)
+    else {
+        return None;
+    };
+    if !matches!(*pointer_size, 4 | 8) {
+        return None;
+    }
+
+    let inner_path = vec![
+        ProjectedPathSegment::Member(ptr_outer.name.clone()),
+        ProjectedPathSegment::Member(pointer.name.clone()),
+        ProjectedPathSegment::UnwrapScalar,
+        ProjectedPathSegment::Dereference,
+    ];
+    let mut value_path = inner_path.clone();
+    value_path.push(ProjectedPathSegment::Member(value_member.to_string()));
+    let mut strong_path = inner_path.clone();
+    strong_path.push(ProjectedPathSegment::Member("strong".to_string()));
+    strong_path.push(ProjectedPathSegment::UnwrapScalar);
+    let mut weak_path = inner_path;
+    weak_path.push(ProjectedPathSegment::Member("weak".to_string()));
+    weak_path.push(ProjectedPathSegment::UnwrapScalar);
+
+    Some(CompositeStructLayout {
+        type_name,
+        fields: vec![
+            CompositeStructField {
+                name: "value",
+                value_path,
+                requirement: ProjectedValueRequirement::KnownSizedOrZst,
+            },
+            CompositeStructField {
+                name: "strong",
+                value_path: strong_path,
+                requirement: ProjectedValueRequirement::UnsignedPointerSizedInteger,
+            },
+            CompositeStructField {
+                name: "weak",
+                value_path: weak_path,
+                requirement: ProjectedValueRequirement::UnsignedPointerSizedInteger,
+            },
+        ],
+        // Rc/Arc allocations hold one implicit weak entry while strong
+        // owners exist. rust-gdb subtracts it from the public weak count.
+        presentation: ProjectedStructPresentation::ReferenceCounted {
+            strong_field: "strong",
+            weak_field: "weak",
+            implicit_weak: 1,
+        },
+    })
+}
+
 fn rust_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
     // rust-gdb uses `buf.ptr` through Rust 1.81 and `buf.inner.ptr` from
     // Rust 1.82 onward. Keep both paths and validate whichever DWARF exposes.
@@ -1054,6 +1217,22 @@ fn sole_struct_member(type_info: &TypeInfo) -> Option<&StructMember> {
         return None;
     };
     Some(member)
+}
+
+fn scalar_wrapper_target(type_info: &TypeInfo) -> Option<&TypeInfo> {
+    let mut current = type_info;
+    for _ in 0..16 {
+        match strip_type_aliases(current) {
+            TypeInfo::BaseType { .. } | TypeInfo::PointerType { .. } => return Some(current),
+            TypeInfo::StructType { size, .. } => {
+                let member = sole_struct_member(current)?;
+                member_range(member, *size)?;
+                current = &member.member_type;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn member_range(member: &StructMember, container_size: u64) -> Option<(u64, u64)> {
@@ -1465,6 +1644,56 @@ mod tests {
                 module: ModuleId(0),
                 cu: CuId(0),
                 language: layout.language,
+                producer: None,
+                dwarf_version: 5,
+            }),
+        )
+    }
+
+    fn rust_reference_counted_type(
+        name: &str,
+        pointer_size: u64,
+        nested_pointer_wrapper: bool,
+        language: SourceLanguage,
+    ) -> ResolvedType {
+        let raw_pointer = TypeInfo::PointerType {
+            target_type: Box::new(TypeInfo::UnknownType {
+                name: "RcOrArcInner<T>".to_string(),
+            }),
+            size: pointer_size,
+        };
+        let pointer = if nested_pointer_wrapper {
+            single_member_struct("NonZero<*mut T>", "scalar_from_dwarf", raw_pointer)
+        } else {
+            raw_pointer
+        };
+        let ptr = TypeInfo::StructType {
+            name: "NonNull<Inner<T>>".to_string(),
+            size: pointer_size,
+            members: vec![member("pointer", pointer, 0)],
+        };
+        ResolvedType::new(
+            TypeInfo::StructType {
+                name: name.to_string(),
+                size: pointer_size,
+                members: vec![
+                    member("ptr", ptr, 0),
+                    member(
+                        "phantom",
+                        TypeInfo::StructType {
+                            name: "PhantomData<T>".to_string(),
+                            size: 0,
+                            members: Vec::new(),
+                        },
+                        pointer_size,
+                    ),
+                ],
+            },
+            TypeIdentity::Unknown,
+            Some(TypeOrigin {
+                module: ModuleId(0),
+                cu: CuId(0),
+                language,
                 producer: None,
                 dwarf_version: 5,
             }),
@@ -2489,6 +2718,105 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_rc_and_arc_with_dwarf_derived_pointer_wrappers() {
+        let expected = |type_name, value_member: &str| {
+            let inner_path = vec![
+                ProjectedPathSegment::Member("ptr".to_string()),
+                ProjectedPathSegment::Member("pointer".to_string()),
+                ProjectedPathSegment::UnwrapScalar,
+                ProjectedPathSegment::Dereference,
+            ];
+            let mut value_path = inner_path.clone();
+            value_path.push(ProjectedPathSegment::Member(value_member.to_string()));
+            let mut strong_path = inner_path.clone();
+            strong_path.push(ProjectedPathSegment::Member("strong".to_string()));
+            strong_path.push(ProjectedPathSegment::UnwrapScalar);
+            let mut weak_path = inner_path;
+            weak_path.push(ProjectedPathSegment::Member("weak".to_string()));
+            weak_path.push(ProjectedPathSegment::UnwrapScalar);
+            ValueLayout::CompositeStruct(CompositeStructLayout {
+                type_name,
+                fields: vec![
+                    CompositeStructField {
+                        name: "value",
+                        value_path,
+                        requirement: ProjectedValueRequirement::KnownSizedOrZst,
+                    },
+                    CompositeStructField {
+                        name: "strong",
+                        value_path: strong_path,
+                        requirement: ProjectedValueRequirement::UnsignedPointerSizedInteger,
+                    },
+                    CompositeStructField {
+                        name: "weak",
+                        value_path: weak_path,
+                        requirement: ProjectedValueRequirement::UnsignedPointerSizedInteger,
+                    },
+                ],
+                presentation: ProjectedStructPresentation::ReferenceCounted {
+                    strong_field: "strong",
+                    weak_field: "weak",
+                    implicit_weak: 1,
+                },
+            })
+        };
+
+        let rc = rust_reference_counted_type("Rc<(i32, u16)>", 8, true, SourceLanguage::Rust);
+        assert_eq!(
+            resolve_value_layout(&rc, Some("alloc::rc::Rc<(i32, u16)>")),
+            Some(expected("Rc", "value"))
+        );
+
+        let arc = rust_reference_counted_type(
+            "alloc::sync::Arc<(i32, u16)>",
+            4,
+            false,
+            SourceLanguage::Rust,
+        );
+        assert_eq!(
+            resolve_value_layout(&arc, None),
+            Some(expected("Arc", "data"))
+        );
+    }
+
+    #[test]
+    fn rejects_rc_arc_lookalikes_and_non_scalar_pointers() {
+        let lookalike = rust_reference_counted_type("Rc<i32>", 8, false, SourceLanguage::Rust);
+        assert_eq!(resolve_value_layout(&lookalike, Some("app::Rc<i32>")), None);
+        assert_eq!(resolve_value_layout(&lookalike, None), None);
+
+        let narrow =
+            rust_reference_counted_type("alloc::rc::Rc<i32>", 2, false, SourceLanguage::Rust);
+        assert_eq!(resolve_value_layout(&narrow, None), None);
+
+        let mut fat =
+            rust_reference_counted_type("alloc::sync::Arc<str>", 8, false, SourceLanguage::Rust);
+        let TypeInfo::StructType { members, .. } = &mut fat.summary else {
+            unreachable!("test Arc is a struct")
+        };
+        let TypeInfo::StructType {
+            members: ptr_members,
+            ..
+        } = &mut members[0].member_type
+        else {
+            unreachable!("test Arc ptr is a wrapper")
+        };
+        ptr_members[0].member_type = TypeInfo::StructType {
+            name: "fat pointer".to_string(),
+            size: 16,
+            members: vec![
+                member("data", unsigned_type("usize", 8), 0),
+                member("length", unsigned_type("usize", 8), 8),
+            ],
+        };
+        assert_eq!(resolve_value_layout(&fat, None), None);
+
+        let non_rust =
+            rust_reference_counted_type("alloc::rc::Rc<i32>", 8, false, SourceLanguage::C);
+        assert_eq!(resolve_value_layout(&non_rust, None), None);
+    }
+
+    #[test]
     fn recognizes_ref_guards_with_dwarf_derived_wrapper_members() {
         let current = rust_ref_type(
             RefTestLayout {
@@ -2794,5 +3122,14 @@ mod tests {
             },
             signed_type("i32", 4),
         )));
+        assert!(requires_dwarf_qualified_name(&rust_reference_counted_type(
+            "Rc<i32>",
+            8,
+            false,
+            SourceLanguage::Rust
+        )));
+        assert!(!requires_dwarf_qualified_name(
+            &rust_reference_counted_type("alloc::sync::Arc<i32>", 8, false, SourceLanguage::Rust,)
+        ));
     }
 }
