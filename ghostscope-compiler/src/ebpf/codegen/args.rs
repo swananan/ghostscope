@@ -12,7 +12,7 @@ fn metadata_access_size(
         4 => Ok(ghostscope_dwarf::MemoryAccessSize::U32),
         8 => Ok(ghostscope_dwarf::MemoryAccessSize::U64),
         _ => Err(CodeGenError::DwarfError(format!(
-            "indirect byte {role} member has unsupported DWARF size {size}"
+            "indirect value {role} member has unsupported DWARF size {size}"
         ))),
     }
 }
@@ -40,14 +40,23 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         descriptor: RuntimeAddress<'ctx>,
         plan: ghostscope_dwarf::ValueReadPlan,
     ) -> Result<ComplexArg<'ctx>> {
-        let ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } = plan.capture;
+        let (data, length, element_stride) = match plan.capture {
+            ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } => {
+                (data, length, None)
+            }
+            ghostscope_dwarf::ValueCapturePlan::IndirectSequence {
+                data,
+                length,
+                element_stride,
+            } => (data, length, Some(element_stride)),
+        };
         let data_access_size = metadata_access_size(&data, "data")?;
         let length_access_size = metadata_access_size(&length, "length")?;
         let data_offset = match data.layout {
             ghostscope_dwarf::TypeProjectionLayout::Member { offset } => offset,
             layout => {
                 return Err(CodeGenError::DwarfError(format!(
-                    "indirect byte data projection must be a member, got {layout:?}"
+                    "indirect value data projection must be a member, got {layout:?}"
                 )))
             }
         };
@@ -55,13 +64,58 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             ghostscope_dwarf::TypeProjectionLayout::Member { offset } => offset,
             layout => {
                 return Err(CodeGenError::DwarfError(format!(
-                    "indirect byte length projection must be a member, got {layout:?}"
+                    "indirect value length projection must be a member, got {layout:?}"
                 )))
             }
         };
-        let max_len = self.compile_options.mem_dump_cap as usize;
-        let data_len =
-            ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE.saturating_add(max_len);
+        let cap = self.compile_options.mem_dump_cap as usize;
+        let (data_len, source) = match element_stride {
+            None => {
+                let data_len =
+                    ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE.saturating_add(cap);
+                (
+                    data_len,
+                    ComplexArgSource::IndirectBytes {
+                        descriptor,
+                        data_offset,
+                        data_access_size,
+                        length_offset,
+                        length_access_size,
+                        max_len: cap,
+                    },
+                )
+            }
+            Some(element_stride) => {
+                let stride = usize::try_from(element_stride).map_err(|_| {
+                    CodeGenError::DwarfError(format!(
+                        "sequence element DWARF size {element_stride} does not fit this host"
+                    ))
+                })?;
+                let (max_elements, max_len) = if stride == 0 {
+                    // A byte cap cannot bound a ZST payload, so use the same
+                    // configured value as its logical element-count cap.
+                    (cap, 0)
+                } else {
+                    let max_elements = cap / stride;
+                    (max_elements, max_elements * stride)
+                };
+                let data_len =
+                    ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE.saturating_add(max_len);
+                (
+                    data_len,
+                    ComplexArgSource::IndirectSequence {
+                        descriptor,
+                        data_offset,
+                        data_access_size,
+                        length_offset,
+                        length_access_size,
+                        element_stride,
+                        max_elements,
+                        max_len,
+                    },
+                )
+            }
+        };
 
         Ok(ComplexArg {
             var_name_index: self.trace_context.add_variable_name(display_name)?,
@@ -70,14 +124,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .add_type_with_presentation(dwarf_type, plan.presentation)?,
             access_path: Vec::new(),
             data_len,
-            source: ComplexArgSource::IndirectBytes {
-                descriptor,
-                data_offset,
-                data_access_size,
-                length_offset,
-                length_access_size,
-                max_len,
-            },
+            source,
         })
     }
 
@@ -810,7 +857,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
             ComplexArgSource::MemDump { .. }
             | ComplexArgSource::MemDumpDynamic { .. }
-            | ComplexArgSource::IndirectBytes { .. } => {
+            | ComplexArgSource::IndirectBytes { .. }
+            | ComplexArgSource::IndirectSequence { .. } => {
                 // Use ComplexFormat with "{}"; generate_print_complex_format_instruction handles MemDump
                 let fmt_idx = self.trace_context.add_string("{}".to_string())?;
                 self.generate_print_complex_format_instruction(fmt_idx, &[arg])?;

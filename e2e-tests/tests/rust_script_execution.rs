@@ -136,7 +136,10 @@ async fn test_rust_tuple_projection_plan_preserves_semantic_identity() -> anyhow
         value_plan.presentation,
         ghostscope_dwarf::ValuePresentation::Utf8String
     );
-    let ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } = value_plan.capture;
+    let ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } = value_plan.capture
+    else {
+        anyhow::bail!("expected indirect byte capture for Rust &str")
+    };
     assert_eq!(
         data.layout,
         ghostscope_dwarf::TypeProjectionLayout::Member { offset: 0 }
@@ -189,6 +192,82 @@ async fn test_rust_string_value_plan_uses_type_namespace() -> anyhow::Result<()>
             .value_read_plan(&user_type, Some(&binary_path))?
             .is_none(),
         "user-defined String must retain DWARF presentation"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_vec_value_plan_uses_dwarf_type_parameter_and_namespace() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let (_, std_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_VEC_I32",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_VEC_I32 read plan"))?;
+    let std_type = analyzer
+        .resolved_type_for_plan(&std_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected standard Vec type"))?;
+    let value_plan = analyzer
+        .value_read_plan(&std_type, Some(&binary_path))?
+        .ok_or_else(|| anyhow::anyhow!("expected standard Vec value plan"))?;
+
+    match &value_plan.presentation {
+        ghostscope_dwarf::ValuePresentation::Sequence {
+            element_type,
+            element_stride,
+        } => {
+            assert_eq!(*element_stride, 4);
+            assert!(matches!(
+                element_type.as_ref(),
+                ghostscope_dwarf::TypeInfo::BaseType {
+                    name,
+                    size: 4,
+                    encoding,
+                } if name == "i32"
+                    && *encoding == ghostscope_dwarf::constants::DW_ATE_signed.0 as u16
+            ));
+        }
+        presentation => anyhow::bail!("unexpected Vec presentation: {presentation:?}"),
+    }
+    let ghostscope_dwarf::ValueCapturePlan::IndirectSequence {
+        data,
+        length,
+        element_stride,
+    } = value_plan.capture
+    else {
+        anyhow::bail!("expected indirect sequence capture for Vec<i32>")
+    };
+    assert_eq!(element_stride, 4);
+    assert!(matches!(
+        data.layout,
+        ghostscope_dwarf::TypeProjectionLayout::Member { .. }
+    ));
+    assert!(matches!(
+        length.layout,
+        ghostscope_dwarf::TypeProjectionLayout::Member { .. }
+    ));
+
+    let (_, user_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_USER_VEC",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_USER_VEC read plan"))?;
+    let user_type = analyzer
+        .resolved_type_for_plan(&user_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected user Vec type"))?;
+    assert!(
+        analyzer
+            .value_read_plan(&user_type, Some(&binary_path))?
+            .is_none(),
+        "user-defined Vec must retain DWARF presentation"
     );
 
     Ok(())
@@ -270,6 +349,83 @@ trace do_stuff {
             .lines()
             .any(|line| line.contains(r#"RSTRING_SEPARATOR:"left = right""#)),
         "Expected Rust String separator output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_vec_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    print "RVEC:{}:{}:{}:{}", G_VEC_U8, G_VEC_I32, G_EMPTY_VEC, G_VEC_UNIT;
+    print "RVEC_RAW:{:x}", G_VEC_U8;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| { line.contains("RVEC:[1, 2, 3, 255]:[10, -20, 30, 40]:[]:[(), (), ()]") }),
+        "Expected Rust Vec output: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RVEC_RAW:01 02 03 ff")),
+        "Expected raw Rust Vec output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_vec_respects_element_aligned_cap() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    print "RVEC_CAP:{}", G_VEC_I32;
+}
+"#;
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_config_content(
+            r#"
+[ebpf]
+mem_dump_cap = 9
+"#,
+        )
+        .attach_to(&target)
+        .timeout_secs(9)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RVEC_CAP:[10, -20] <truncated>")),
+        "Expected element-aligned capped Rust Vec output: {stdout}"
     );
     assert!(
         !stdout.contains("ExprError"),

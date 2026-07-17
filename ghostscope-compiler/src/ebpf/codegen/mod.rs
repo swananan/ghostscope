@@ -69,6 +69,18 @@ enum ComplexArgSource<'ctx> {
         length_access_size: ghostscope_dwarf::MemoryAccessSize,
         max_len: usize,
     },
+    /// Bounded capture of complete elements through a pointer-and-count
+    /// descriptor.
+    IndirectSequence {
+        descriptor: RuntimeAddress<'ctx>,
+        data_offset: u64,
+        data_access_size: ghostscope_dwarf::MemoryAccessSize,
+        length_offset: u64,
+        length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        element_stride: u64,
+        max_elements: usize,
+        max_len: usize,
+    },
     ImmediateBytes {
         bytes: Vec<u8>,
     },

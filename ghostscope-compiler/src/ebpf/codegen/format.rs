@@ -20,12 +20,31 @@ struct ComplexFormatArgPointers<'ctx> {
 }
 
 #[derive(Clone, Copy)]
-struct IndirectBytesCaptureConfig {
+enum IndirectCaptureShape {
+    Bytes,
+    Sequence {
+        element_stride: u64,
+        max_elements: usize,
+    },
+}
+
+impl IndirectCaptureShape {
+    fn prefix_len(self) -> usize {
+        match self {
+            Self::Bytes => ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE,
+            Self::Sequence { .. } => ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IndirectCaptureConfig {
     data_offset: u64,
     data_access_size: ghostscope_dwarf::MemoryAccessSize,
     length_offset: u64,
     length_access_size: ghostscope_dwarf::MemoryAccessSize,
     max_len: usize,
+    shape: IndirectCaptureShape,
 }
 
 fn complex_format_arg_header_len(arg: &ComplexArg<'_>) -> usize {
@@ -46,13 +65,12 @@ fn complex_format_static_payload_len(arg: &ComplexArg<'_>) -> Option<usize> {
         }
         ComplexArgSource::MemDumpDynamic { .. } => None,
         ComplexArgSource::IndirectBytes { .. } => None,
+        ComplexArgSource::IndirectSequence { .. } => None,
     }
 }
 
-fn indirect_bytes_capture_capacity(reserved_len: usize, max_len: usize) -> usize {
-    reserved_len
-        .saturating_sub(ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE)
-        .min(max_len)
+fn indirect_capture_capacity(reserved_len: usize, max_len: usize, prefix_len: usize) -> usize {
+    reserved_len.saturating_sub(prefix_len).min(max_len)
 }
 
 fn plan_complex_format_layout(
@@ -84,6 +102,9 @@ fn plan_complex_format_layout(
             dynamic_max_lens.push(
                 ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE.saturating_add(*max_len),
             );
+        } else if let ComplexArgSource::IndirectSequence { max_len, .. } = &arg.source {
+            dynamic_max_lens
+                .push(ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE.saturating_add(*max_len));
         }
 
         arg_payload_plans.push((header_len, static_payload_len));
@@ -1535,15 +1556,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
-    fn emit_complex_format_indirect_bytes(
+    fn emit_complex_format_indirect(
         &mut self,
         status_ptr: PointerValue<'ctx>,
         var_data_ptr: PointerValue<'ctx>,
         descriptor: &RuntimeAddress<'ctx>,
         reserved_len: usize,
-        capture: IndirectBytesCaptureConfig,
+        capture: IndirectCaptureConfig,
     ) -> Result<()> {
-        let prefix_len = ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE;
+        let prefix_len = capture.shape.prefix_len();
         if reserved_len < prefix_len {
             self.builder
                 .build_store(
@@ -1609,7 +1630,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "indirect_metadata_ok",
             )
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-        let function = self.current_function("compile indirect byte capture")?;
+        let function = self.current_function("compile indirect value capture")?;
         let metadata_ok_block = self
             .context
             .append_basic_block(function, "indirect_metadata_ok");
@@ -1693,6 +1714,33 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_store(length_prefix_ptr, original_len)
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        if matches!(capture.shape, IndirectCaptureShape::Sequence { .. }) {
+            // SAFETY: sequence payloads reserve the complete two-u64 header.
+            let captured_count_ptr_i8 = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        var_data_ptr,
+                        &[i32_type.const_int(
+                            ghostscope_protocol::INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET as u64,
+                            false,
+                        )],
+                        "indirect_captured_count_ptr_i8",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            };
+            let captured_count_ptr = self
+                .builder
+                .build_pointer_cast(
+                    captured_count_ptr_i8,
+                    ptr_type,
+                    "indirect_captured_count_ptr",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder
+                .build_store(captured_count_ptr, i64_type.const_zero())
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        }
         let is_empty = self
             .builder
             .build_int_compare(
@@ -1725,8 +1773,87 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
 
         self.builder.position_at_end(nonempty_block);
-        let capture_capacity = indirect_bytes_capture_capacity(reserved_len, capture.max_len);
-        if capture_capacity == 0 {
+        let capture_capacity = indirect_capture_capacity(reserved_len, capture.max_len, prefix_len);
+        let (unit_size, max_units) = match capture.shape {
+            IndirectCaptureShape::Bytes => (1usize, capture_capacity),
+            IndirectCaptureShape::Sequence {
+                element_stride,
+                max_elements,
+            } => {
+                let stride = usize::try_from(element_stride).map_err(|_| {
+                    CodeGenError::DwarfError(format!(
+                        "sequence element DWARF size {element_stride} does not fit this host"
+                    ))
+                })?;
+                let payload_elements = if stride == 0 {
+                    max_elements
+                } else {
+                    capture_capacity / stride
+                };
+                (stride, max_elements.min(payload_elements))
+            }
+        };
+        let capture_limit = i64_type.const_int(max_units as u64, false);
+        let is_truncated = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::UGT,
+                original_len,
+                capture_limit,
+                "indirect_is_truncated",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let captured_units = self
+            .builder
+            .build_select(
+                is_truncated,
+                capture_limit,
+                original_len,
+                "indirect_captured_units",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+
+        if matches!(capture.shape, IndirectCaptureShape::Sequence { .. }) {
+            // SAFETY: sequence payloads reserve the complete two-u64 header.
+            let captured_count_ptr_i8 = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        var_data_ptr,
+                        &[i32_type.const_int(
+                            ghostscope_protocol::INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET as u64,
+                            false,
+                        )],
+                        "indirect_captured_count_ptr_i8_nonempty",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            };
+            let captured_count_ptr = self
+                .builder
+                .build_pointer_cast(
+                    captured_count_ptr_i8,
+                    ptr_type,
+                    "indirect_captured_count_ptr_nonempty",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder
+                .build_store(captured_count_ptr, captured_units)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        }
+
+        if max_units == 0 || unit_size == 0 {
+            let truncated_block = self
+                .context
+                .append_basic_block(function, "indirect_no_read_truncated");
+            let complete_block = self
+                .context
+                .append_basic_block(function, "indirect_no_read_complete");
+            self.builder
+                .build_conditional_branch(is_truncated, truncated_block, complete_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+            self.builder.position_at_end(truncated_block);
             self.builder
                 .build_store(
                     status_ptr,
@@ -1740,6 +1867,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.builder
                 .build_unconditional_branch(continue_block)
                 .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+            self.builder.position_at_end(complete_block);
+            self.mark_any_success()?;
+            self.builder
+                .build_unconditional_branch(continue_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
             self.builder.position_at_end(continue_block);
             return Ok(());
         }
@@ -1774,26 +1908,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
 
         self.builder.position_at_end(read_block);
-        let capture_limit = i64_type.const_int(capture_capacity as u64, false);
-        let is_truncated = self
-            .builder
-            .build_int_compare(
-                inkwell::IntPredicate::UGT,
-                original_len,
-                capture_limit,
-                "indirect_is_truncated",
-            )
-            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
         let read_len = self
             .builder
-            .build_select(
-                is_truncated,
-                capture_limit,
-                original_len,
-                "indirect_read_len",
+            .build_int_mul(
+                captured_units,
+                i64_type.const_int(unit_size as u64, false),
+                "indirect_read_len_bytes",
             )
-            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
-            .into_int_value();
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
         let read_len = self
             .builder
             .build_int_truncate(read_len, i32_type, "indirect_read_len_i32")
@@ -1822,7 +1944,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 BPF_FUNC_probe_read_user as u64,
                 &[destination.into(), read_len.into(), source.into()],
                 i64_type.into(),
-                "probe_read_user_indirect_bytes",
+                "probe_read_user_indirect",
             )?
             .into_int_value();
         let read_ok = self
@@ -2105,17 +2227,44 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 length_offset,
                 length_access_size,
                 max_len,
-            } => self.emit_complex_format_indirect_bytes(
+            } => self.emit_complex_format_indirect(
                 status_ptr,
                 var_data_ptr,
                 descriptor,
                 reserved_len,
-                IndirectBytesCaptureConfig {
+                IndirectCaptureConfig {
                     data_offset: *data_offset,
                     data_access_size: *data_access_size,
                     length_offset: *length_offset,
                     length_access_size: *length_access_size,
                     max_len: *max_len,
+                    shape: IndirectCaptureShape::Bytes,
+                },
+            ),
+            ComplexArgSource::IndirectSequence {
+                descriptor,
+                data_offset,
+                data_access_size,
+                length_offset,
+                length_access_size,
+                element_stride,
+                max_elements,
+                max_len,
+            } => self.emit_complex_format_indirect(
+                status_ptr,
+                var_data_ptr,
+                descriptor,
+                reserved_len,
+                IndirectCaptureConfig {
+                    data_offset: *data_offset,
+                    data_access_size: *data_access_size,
+                    length_offset: *length_offset,
+                    length_access_size: *length_access_size,
+                    max_len: *max_len,
+                    shape: IndirectCaptureShape::Sequence {
+                        element_stride: *element_stride,
+                        max_elements: *max_elements,
+                    },
                 },
             ),
             ComplexArgSource::ComputedInt { value, byte_len } => {
@@ -2236,7 +2385,31 @@ mod complex_format_layout_tests {
         }
     }
 
-    fn indirect_emitter_ir(capture: IndirectBytesCaptureConfig) -> String {
+    fn indirect_sequence_arg<'ctx>(
+        context: &'ctx Context,
+        element_stride: u64,
+        max_elements: usize,
+        max_len: usize,
+    ) -> ComplexArg<'ctx> {
+        ComplexArg {
+            var_name_index: 0,
+            type_index: 0,
+            access_path: Vec::new(),
+            data_len: ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE + max_len,
+            source: ComplexArgSource::IndirectSequence {
+                descriptor: RuntimeAddress::available(context.i64_type().const_zero(), context),
+                data_offset: 0,
+                data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                length_offset: 8,
+                length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                element_stride,
+                max_elements,
+                max_len,
+            },
+        }
+    }
+
+    fn indirect_emitter_ir(capture: IndirectCaptureConfig) -> String {
         let context = Context::create();
         let options = crate::CompileOptions::default();
         let ebpf = EbpfContext::new(&context, "indirect", Some(0), &options);
@@ -2244,21 +2417,18 @@ mod complex_format_layout_tests {
         let function_type = context.i64_type().fn_type(&[], false);
         let function = ebpf
             .module
-            .add_function("emit_indirect_bytes", function_type, None);
+            .add_function("emit_indirect", function_type, None);
         let entry = context.append_basic_block(function, "entry");
         ebpf.builder.position_at_end(entry);
         let status_ptr = ebpf
             .builder
             .build_alloca(context.i8_type(), "status")
             .expect("allocate status");
+        let reserved_len = VARIABLE_READ_ERROR_PAYLOAD_LEN
+            .max(capture.shape.prefix_len().saturating_add(capture.max_len));
         let data_ptr = ebpf
             .builder
-            .build_alloca(
-                context
-                    .i8_type()
-                    .array_type(VARIABLE_READ_ERROR_PAYLOAD_LEN as u32),
-                "payload",
-            )
+            .build_alloca(context.i8_type().array_type(reserved_len as u32), "payload")
             .expect("allocate payload");
         ebpf.builder
             .build_store(status_ptr, context.i8_type().const_zero())
@@ -2266,14 +2436,8 @@ mod complex_format_layout_tests {
         let descriptor_value = context.i64_type().const_int(0x1000, false);
         let descriptor = RuntimeAddress::available(descriptor_value, &context);
 
-        ebpf.emit_complex_format_indirect_bytes(
-            status_ptr,
-            data_ptr,
-            &descriptor,
-            VARIABLE_READ_ERROR_PAYLOAD_LEN,
-            capture,
-        )
-        .expect("emit indirect byte capture");
+        ebpf.emit_complex_format_indirect(status_ptr, data_ptr, &descriptor, reserved_len, capture)
+            .expect("emit indirect capture");
         ebpf.builder
             .build_return(Some(&context.i64_type().const_zero()))
             .expect("return from test function");
@@ -2356,6 +2520,19 @@ mod complex_format_layout_tests {
     }
 
     #[test]
+    fn complex_format_layout_includes_indirect_sequence_header() {
+        let context = Context::create();
+        let args = vec![indirect_sequence_arg(&context, 4, 3, 12)];
+
+        let layout = plan_complex_format_layout(4096, 0, &args);
+
+        assert_eq!(
+            layout.args[0].reserved_len,
+            ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE + 12
+        );
+    }
+
+    #[test]
     fn indirect_bytes_capture_respects_caps_below_error_headroom() {
         let context = Context::create();
 
@@ -2369,7 +2546,11 @@ mod complex_format_layout_tests {
                 ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE + max_len
             );
             assert_eq!(
-                indirect_bytes_capture_capacity(reserved_len, max_len),
+                indirect_capture_capacity(
+                    reserved_len,
+                    max_len,
+                    ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE,
+                ),
                 max_len
             );
         }
@@ -2377,12 +2558,13 @@ mod complex_format_layout_tests {
 
     #[test]
     fn indirect_bytes_emitter_writes_standard_read_error_payload() {
-        let llvm_ir = indirect_emitter_ir(IndirectBytesCaptureConfig {
+        let llvm_ir = indirect_emitter_ir(IndirectCaptureConfig {
             data_offset: 0,
             data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
             length_offset: 8,
             length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
             max_len: 4,
+            shape: IndirectCaptureShape::Bytes,
         });
 
         assert!(llvm_ir.contains("indirect_metadata_error_payload"));
@@ -2392,12 +2574,13 @@ mod complex_format_layout_tests {
 
     #[test]
     fn indirect_bytes_emitter_uses_dwarf_metadata_widths() {
-        let llvm_ir = indirect_emitter_ir(IndirectBytesCaptureConfig {
+        let llvm_ir = indirect_emitter_ir(IndirectCaptureConfig {
             data_offset: 0,
             data_access_size: ghostscope_dwarf::MemoryAccessSize::U32,
             length_offset: 4,
             length_access_size: ghostscope_dwarf::MemoryAccessSize::U32,
             max_len: 4,
+            shape: IndirectCaptureShape::Bytes,
         });
         let metadata_loads = llvm_ir
             .lines()
@@ -2418,5 +2601,42 @@ mod complex_format_layout_tests {
 
         assert_eq!(metadata_loads, 2, "{llvm_ir}");
         assert_eq!(metadata_extensions, 2, "{llvm_ir}");
+    }
+
+    #[test]
+    fn indirect_sequence_emitter_records_count_and_scales_by_dwarf_stride() {
+        let llvm_ir = indirect_emitter_ir(IndirectCaptureConfig {
+            data_offset: 0,
+            data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            length_offset: 8,
+            length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            max_len: 8,
+            shape: IndirectCaptureShape::Sequence {
+                element_stride: 4,
+                max_elements: 2,
+            },
+        });
+
+        assert!(llvm_ir.contains("indirect_captured_count_ptr_i8_nonempty"));
+        assert!(llvm_ir.contains("indirect_read_len_bytes"));
+        assert!(llvm_ir.contains("mul i64"));
+    }
+
+    #[test]
+    fn zero_sized_sequence_emitter_does_not_read_element_memory() {
+        let llvm_ir = indirect_emitter_ir(IndirectCaptureConfig {
+            data_offset: 0,
+            data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            length_offset: 8,
+            length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            max_len: 0,
+            shape: IndirectCaptureShape::Sequence {
+                element_stride: 0,
+                max_elements: 4,
+            },
+        });
+
+        assert!(llvm_ir.contains("indirect_no_read_complete"));
+        assert!(!llvm_ir.contains("probe_read_user_indirect"));
     }
 }

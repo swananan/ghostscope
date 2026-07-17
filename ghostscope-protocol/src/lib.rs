@@ -14,7 +14,10 @@ pub mod trace_event;
 pub mod type_info;
 
 pub use type_kind::{consts, TypeKind};
-pub use value_presentation::{ValuePresentation, INDIRECT_BYTES_LENGTH_PREFIX_SIZE};
+pub use value_presentation::{
+    ValuePresentation, INDIRECT_BYTES_LENGTH_PREFIX_SIZE, INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET,
+    INDIRECT_SEQUENCE_HEADER_SIZE,
+};
 
 pub use trace_event::{
     EndInstructionData, ExprErrorData, InstructionHeader, InstructionType,
