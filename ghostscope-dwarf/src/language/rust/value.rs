@@ -1,5 +1,6 @@
 use crate::{
-    strip_type_aliases, HashTableBucketOrder, ResolvedType, SourceLanguage, StructMember, TypeInfo,
+    strip_type_aliases, HashTableBucketOrder, HashTableOccupancy, ResolvedType, SourceLanguage,
+    StructMember, TypeInfo,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,13 +32,21 @@ pub(crate) enum BTreeKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HashTableLayout {
-    pub(crate) table_path: Vec<String>,
+    pub(crate) entry_type_path: Vec<String>,
     pub(crate) control_path: Vec<String>,
-    pub(crate) data_path: Option<Vec<String>>,
     pub(crate) length_path: Vec<String>,
     pub(crate) bucket_mask_path: Vec<String>,
+    pub(crate) occupancy: HashTableOccupancy,
+    pub(crate) buckets: HashTableBucketLayout,
     pub(crate) bucket_order: HashTableBucketOrder,
     pub(crate) kind: HashTableKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HashTableBucketLayout {
+    Forward { data_path: Vec<String> },
+    ReverseFromControl,
+    LegacyAfterControl { pointer_tag_mask: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1110,8 +1119,9 @@ fn rust_hash_table_layout(root: &TypeInfo, kind: HashTableKind) -> Option<HashTa
     // are semantic compatibility branches only. Every selected member offset,
     // pointer width, entry type, and entry field layout is resolved from DWARF.
     // rust-gdb also retains a separate provider for Rust 1.35's pre-hashbrown
-    // table. That layout interleaves tagged hash words and alignment-dependent
-    // pair storage, so it intentionally falls back to physical DWARF here.
+    // table. That layout stores pointer-sized hash words followed by aligned
+    // pair storage in one allocation; validate it only after all hashbrown
+    // paths fail.
     const MAP_PATHS: &[(&[&str], &[&str])] = &[
         (&["base", "table"], &["base", "table", "table"]),
         (&["base", "table"], &["base", "table"]),
@@ -1143,7 +1153,7 @@ fn rust_hash_table_layout(root: &TypeInfo, kind: HashTableKind) -> Option<HashTa
             return Some(layout);
         }
     }
-    None
+    validate_legacy_hash_table_layout(root, kind)
 }
 
 fn rust_btree_layout(root: &TypeInfo, kind: BTreeKind) -> Option<BTreeLayout> {
@@ -1273,7 +1283,7 @@ fn validate_hash_table_layout(
     let bucket_mask_path = unsigned_metadata_path(root, bucket_mask_path, *pointer_size)?;
 
     let has_data = unique_named_member(metadata_members, "data").is_some();
-    let (data_path, bucket_order) = if has_data {
+    let (buckets, bucket_order) = if has_data {
         let mut data_path = metadata_path;
         data_path.push("data".to_string());
         let data_path = wrapped_pointer_path(root, data_path)?;
@@ -1288,9 +1298,15 @@ fn validate_hash_table_layout(
         if data_pointer_size != pointer_size {
             return None;
         }
-        (Some(data_path), HashTableBucketOrder::Forward)
+        (
+            HashTableBucketLayout::Forward { data_path },
+            HashTableBucketOrder::Forward,
+        )
     } else {
-        (None, HashTableBucketOrder::Reverse)
+        (
+            HashTableBucketLayout::ReverseFromControl,
+            HashTableBucketOrder::Reverse,
+        )
     };
 
     let mut ranges = Vec::with_capacity(4);
@@ -1302,7 +1318,110 @@ fn validate_hash_table_layout(
         }
         ranges.push((member.offset, end));
     }
-    if let Some(path) = &data_path {
+    if let HashTableBucketLayout::Forward { data_path } = &buckets {
+        let member = resolve_member_path(root, data_path)?;
+        let end = member.offset.checked_add(member.member_type.size())?;
+        if end > root.size() {
+            return None;
+        }
+        ranges.push((member.offset, end));
+    }
+    for (index, left) in ranges.iter().enumerate() {
+        if ranges[index + 1..]
+            .iter()
+            .any(|right| ranges_overlap(*left, *right))
+        {
+            return None;
+        }
+    }
+
+    Some(HashTableLayout {
+        entry_type_path: table_path,
+        control_path,
+        length_path,
+        bucket_mask_path,
+        occupancy: HashTableOccupancy::ControlByteHighBitClear,
+        buckets,
+        bucket_order,
+        kind,
+    })
+}
+
+fn validate_legacy_hash_table_layout(
+    root: &TypeInfo,
+    kind: HashTableKind,
+) -> Option<HashTableLayout> {
+    let table_path = match kind {
+        HashTableKind::Map => field_path(&["table"]),
+        HashTableKind::Set => field_path(&["map", "table"]),
+    };
+    let table = resolve_member_path(root, &table_path)?;
+    let TypeInfo::StructType {
+        size: table_size,
+        members,
+        ..
+    } = strip_type_aliases(table.member_type)
+    else {
+        return None;
+    };
+    if members.len() != 4 {
+        return None;
+    }
+    let capacity_mask = unique_named_member(members, "capacity_mask")?;
+    let size = unique_named_member(members, "size")?;
+    let hashes = unique_named_member(members, "hashes")?;
+    let marker = unique_named_member(members, "marker")?;
+    for member in [capacity_mask, size, hashes, marker] {
+        member_range(member, *table_size)?;
+    }
+    if !matches!(
+        strip_type_aliases(&marker.member_type),
+        TypeInfo::StructType { size: 0, .. }
+    ) {
+        return None;
+    }
+
+    let tagged_hash = sole_struct_member(&hashes.member_type)?;
+    member_range(tagged_hash, hashes.member_type.size())?;
+    let mut control_path = table_path.clone();
+    control_path.push(hashes.name.clone());
+    control_path.push(tagged_hash.name.clone());
+    let control_path = wrapped_pointer_path(root, control_path)?;
+    let control = resolve_member_path(root, &control_path)?;
+    let TypeInfo::PointerType {
+        target_type,
+        size: pointer_size,
+    } = strip_type_aliases(control.member_type)
+    else {
+        return None;
+    };
+    let TypeInfo::BaseType {
+        size: word_size,
+        encoding,
+        ..
+    } = strip_type_aliases(target_type)
+    else {
+        return None;
+    };
+    if !matches!(*pointer_size, 4 | 8)
+        || word_size != pointer_size
+        || *encoding != gimli::DW_ATE_unsigned.0 as u16
+    {
+        return None;
+    }
+
+    let mut length_path = table_path.clone();
+    length_path.push(size.name.clone());
+    let length_path = unsigned_metadata_path(root, length_path, *pointer_size)?;
+    let mut bucket_mask_path = table_path.clone();
+    bucket_mask_path.push(capacity_mask.name.clone());
+    let bucket_mask_path = unsigned_metadata_path(root, bucket_mask_path, *pointer_size)?;
+    let mut entry_type_path = table_path;
+    entry_type_path.push(marker.name.clone());
+
+    let paths = [&control_path, &length_path, &bucket_mask_path];
+    let mut ranges = Vec::with_capacity(paths.len());
+    for path in paths {
         let member = resolve_member_path(root, path)?;
         let end = member.offset.checked_add(member.member_type.size())?;
         if end > root.size() {
@@ -1320,12 +1439,20 @@ fn validate_hash_table_layout(
     }
 
     Some(HashTableLayout {
-        table_path,
+        entry_type_path,
         control_path,
-        data_path,
         length_path,
         bucket_mask_path,
-        bucket_order,
+        occupancy: HashTableOccupancy::NonZeroWord {
+            word_size: *word_size,
+        },
+        // TaggedHashUintPtr reserves its low pointer bit in Rust 1.35. This is
+        // the one implementation semantic unavailable in DWARF; widths,
+        // offsets, entry layout, and alignment remain DWARF-derived.
+        buckets: HashTableBucketLayout::LegacyAfterControl {
+            pointer_tag_mask: 1,
+        },
+        bucket_order: HashTableBucketOrder::Forward,
         kind,
     })
 }
@@ -2182,6 +2309,102 @@ mod tests {
                 language,
                 producer: None,
                 dwarf_version: 5,
+            }),
+        )
+    }
+
+    fn rust_135_hash_collection_type(
+        name: &str,
+        kind: HashTableKind,
+        pointer_size: u64,
+        language: SourceLanguage,
+    ) -> ResolvedType {
+        let hash_word = unsigned_type("usize", pointer_size);
+        let raw_pointer = TypeInfo::PointerType {
+            target_type: Box::new(hash_word),
+            size: pointer_size,
+        };
+        let unique = TypeInfo::StructType {
+            name: "core::ptr::Unique<usize>".to_string(),
+            size: pointer_size,
+            members: vec![
+                member("pointer", raw_pointer, 0),
+                member(
+                    "_marker",
+                    TypeInfo::StructType {
+                        name: "PhantomData<usize>".to_string(),
+                        size: 0,
+                        members: Vec::new(),
+                    },
+                    0,
+                ),
+            ],
+        };
+        let hashes = TypeInfo::StructType {
+            name: "TaggedHashUintPtr".to_string(),
+            size: pointer_size,
+            members: vec![member("__0", unique, 0)],
+        };
+        let marker = TypeInfo::StructType {
+            name: "PhantomData<(K, V)>".to_string(),
+            size: 0,
+            members: Vec::new(),
+        };
+        let raw_table = TypeInfo::StructType {
+            name: "RawTable<K, V>".to_string(),
+            size: pointer_size * 3,
+            members: vec![
+                member("capacity_mask", unsigned_type("usize", pointer_size), 0),
+                member("size", unsigned_type("usize", pointer_size), pointer_size),
+                member("hashes", hashes, pointer_size * 2),
+                member("marker", marker, 0),
+            ],
+        };
+        let map = TypeInfo::StructType {
+            name: match kind {
+                HashTableKind::Map => name.to_string(),
+                HashTableKind::Set => "std::collections::hash::map::HashMap<K, ()>".to_string(),
+            },
+            size: pointer_size * 5,
+            members: vec![
+                member(
+                    "hash_builder",
+                    TypeInfo::StructType {
+                        name: "RandomState".to_string(),
+                        size: pointer_size * 2,
+                        members: Vec::new(),
+                    },
+                    0,
+                ),
+                member("table", raw_table, pointer_size * 2),
+                member(
+                    "resize_policy",
+                    TypeInfo::StructType {
+                        name: "DefaultResizePolicy".to_string(),
+                        size: 0,
+                        members: Vec::new(),
+                    },
+                    0,
+                ),
+            ],
+        };
+        let root = match kind {
+            HashTableKind::Map => map,
+            HashTableKind::Set => TypeInfo::StructType {
+                name: name.to_string(),
+                size: map.size(),
+                members: vec![member("map", map, 0)],
+            },
+        };
+        ResolvedType::new(
+            root,
+            TypeIdentity::Unknown,
+            Some(TypeOrigin {
+                module: ModuleId(0),
+                cu: CuId(0),
+                language,
+                producer: None,
+                dwarf_version: 4,
             }),
         )
     }
@@ -3271,11 +3494,12 @@ mod tests {
                 Some("std::collections::hash::map::HashMap<i32, u16>"),
             ),
             Some(ValueLayout::HashTable(HashTableLayout {
-                table_path: field_path(&["base", "table"]),
+                entry_type_path: field_path(&["base", "table"]),
                 control_path: field_path(&["base", "table", "table", "ctrl", "pointer",]),
-                data_path: None,
                 length_path: field_path(&["base", "table", "table", "items"]),
                 bucket_mask_path: field_path(&["base", "table", "table", "bucket_mask",]),
+                occupancy: HashTableOccupancy::ControlByteHighBitClear,
+                buckets: HashTableBucketLayout::ReverseFromControl,
                 bucket_order: HashTableBucketOrder::Reverse,
                 kind: HashTableKind::Map,
             }))
@@ -3294,14 +3518,20 @@ mod tests {
         else {
             panic!("expected legacy HashMap layout")
         };
-        assert_eq!(legacy_map.table_path, field_path(&["base", "table"]));
+        assert_eq!(legacy_map.entry_type_path, field_path(&["base", "table"]));
         assert_eq!(
             legacy_map.control_path,
             field_path(&["base", "table", "ctrl", "pointer"])
         );
         assert_eq!(
-            legacy_map.data_path,
-            Some(field_path(&["base", "table", "data", "pointer"]))
+            legacy_map.buckets,
+            HashTableBucketLayout::Forward {
+                data_path: field_path(&["base", "table", "data", "pointer"]),
+            }
+        );
+        assert_eq!(
+            legacy_map.occupancy,
+            HashTableOccupancy::ControlByteHighBitClear
         );
         assert_eq!(legacy_map.bucket_order, HashTableBucketOrder::Forward);
 
@@ -3319,7 +3549,7 @@ mod tests {
             panic!("expected current HashSet layout")
         };
         assert_eq!(
-            current_set.table_path,
+            current_set.entry_type_path,
             field_path(&["base", "map", "table"])
         );
         assert_eq!(current_set.kind, HashTableKind::Set);
@@ -3339,8 +3569,53 @@ mod tests {
         ) else {
             panic!("expected legacy HashSet layout")
         };
-        assert_eq!(legacy_set.table_path, field_path(&["map", "base", "table"]));
+        assert_eq!(
+            legacy_set.entry_type_path,
+            field_path(&["map", "base", "table"])
+        );
         assert_eq!(legacy_set.bucket_order, HashTableBucketOrder::Forward);
+    }
+
+    #[test]
+    fn recognizes_rust_135_hash_collections_from_legacy_table_metadata() {
+        for (name, qualified_name, kind, table_path) in [
+            (
+                "HashMap<i32, u16>",
+                "std::collections::hash::map::HashMap<i32, u16>",
+                HashTableKind::Map,
+                field_path(&["table"]),
+            ),
+            (
+                "HashSet<i32>",
+                "std::collections::hash::set::HashSet<i32>",
+                HashTableKind::Set,
+                field_path(&["map", "table"]),
+            ),
+        ] {
+            let value = rust_135_hash_collection_type(name, kind, 8, SourceLanguage::Rust);
+            let Some(ValueLayout::HashTable(layout)) =
+                resolve_value_layout(&value, Some(qualified_name))
+            else {
+                panic!("expected Rust 1.35 hash-table layout for {name}")
+            };
+            let mut control_path = table_path.clone();
+            control_path.extend(field_path(&["hashes", "__0", "pointer"]));
+            let mut marker_path = table_path.clone();
+            marker_path.push("marker".to_string());
+            assert_eq!(layout.entry_type_path, marker_path);
+            assert_eq!(layout.control_path, control_path);
+            assert_eq!(
+                layout.occupancy,
+                HashTableOccupancy::NonZeroWord { word_size: 8 }
+            );
+            assert_eq!(
+                layout.buckets,
+                HashTableBucketLayout::LegacyAfterControl {
+                    pointer_tag_mask: 1,
+                }
+            );
+            assert_eq!(layout.bucket_order, HashTableBucketOrder::Forward);
+        }
     }
 
     #[test]
@@ -3408,6 +3683,52 @@ mod tests {
             SourceLanguage::C,
         );
         assert_eq!(resolve_value_layout(&non_rust, None), None);
+
+        let legacy = rust_135_hash_collection_type(
+            "HashMap<i32, u16>",
+            HashTableKind::Map,
+            8,
+            SourceLanguage::Rust,
+        );
+        assert_eq!(
+            resolve_value_layout(&legacy, Some("app::HashMap<i32, u16>")),
+            None
+        );
+
+        let mut invalid_legacy = legacy;
+        let TypeInfo::StructType { members, .. } = &mut invalid_legacy.summary else {
+            unreachable!("test legacy HashMap is a struct")
+        };
+        let TypeInfo::StructType {
+            members: table_members,
+            ..
+        } = &mut members
+            .iter_mut()
+            .find(|member| member.name == "table")
+            .expect("legacy table member")
+            .member_type
+        else {
+            unreachable!("test legacy table is a struct")
+        };
+        let TypeInfo::StructType {
+            members: tagged_members,
+            ..
+        } = &mut table_members
+            .iter_mut()
+            .find(|member| member.name == "hashes")
+            .expect("legacy hashes member")
+            .member_type
+        else {
+            unreachable!("test tagged hash pointer is a struct")
+        };
+        tagged_members.push(member("unexpected", unsigned_type("usize", 8), 0));
+        assert_eq!(
+            resolve_value_layout(
+                &invalid_legacy,
+                Some("std::collections::hash::map::HashMap<i32, u16>"),
+            ),
+            None
+        );
     }
 
     #[test]

@@ -74,12 +74,13 @@ struct IndirectCaptureConfig {
 struct HashTableCaptureConfig {
     control_offset: u64,
     control_access_size: ghostscope_dwarf::MemoryAccessSize,
-    data: Option<(u64, ghostscope_dwarf::MemoryAccessSize)>,
     length_offset: u64,
     length_access_size: ghostscope_dwarf::MemoryAccessSize,
     bucket_mask_offset: u64,
     bucket_mask_access_size: ghostscope_dwarf::MemoryAccessSize,
     entry_stride: u64,
+    occupancy: ghostscope_dwarf::HashTableOccupancy,
+    buckets: HashTableBucketSource,
     bucket_order: ghostscope_dwarf::HashTableBucketOrder,
     max_buckets: usize,
 }
@@ -105,6 +106,7 @@ struct BTreeBulkRead<'ctx, 'name> {
     destination_offset: usize,
     source_address: IntValue<'ctx>,
     length: IntValue<'ctx>,
+    max_len: usize,
     name: &'name str,
 }
 
@@ -1847,6 +1849,123 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
+    fn clamp_probe_read_length(
+        &mut self,
+        length: IntValue<'ctx>,
+        max_len: usize,
+        name: &str,
+    ) -> Result<IntValue<'ctx>> {
+        let max_len = u32::try_from(max_len).map_err(|_| {
+            CodeGenError::DwarfError(
+                "dynamic capture exceeds the eBPF helper length width".to_string(),
+            )
+        })?;
+        let i32_type = self.context.i32_type();
+        if length.get_type() != i32_type {
+            return Err(CodeGenError::LLVMError(format!(
+                "probe read length must be i32, got {} bits",
+                length.get_type().get_bit_width()
+            )));
+        }
+
+        if max_len == u32::MAX {
+            return Ok(length);
+        }
+        if max_len == 0 {
+            return Ok(i32_type.const_zero());
+        }
+
+        // The eBPF verifier does not reliably preserve an i64 upper bound
+        // through an ALU32 truncation. Repeat the semantic clamp in i32 first.
+        let limit = i32_type.const_int(max_len as u64, false);
+        let exceeds_limit = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::UGT,
+                length,
+                limit,
+                &format!("{name}_exceeds_limit"),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let semantic_bound = self
+            .builder
+            .build_select(
+                exceeds_limit,
+                limit,
+                length,
+                &format!("{name}_semantic_bound"),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+
+        // LLVM can lower min(length, limit) by comparing a temporary register
+        // and then copying the original, unbounded register into the helper
+        // argument. Older kernel verifiers do not propagate the temporary's
+        // range to that sibling copy. Hide the semantic range from generic
+        // optimization, then establish it again with verifier-visible ALU32
+        // operations. The mask is an identity for every value at or below the
+        // semantic limit; the second clamp narrows a non-all-ones mask exactly.
+        let passthrough_type = i32_type.fn_type(&[i32_type.into(), i32_type.into()], false);
+        let passthrough_name = "llvm.bpf.passthrough.i32.i32";
+        let passthrough = self
+            .module
+            .get_function(passthrough_name)
+            .unwrap_or_else(|| {
+                self.module
+                    .add_function(passthrough_name, passthrough_type, None)
+            });
+        let sequence = self.next_bpf_passthrough_sequence;
+        self.next_bpf_passthrough_sequence = sequence.checked_add(1).ok_or_else(|| {
+            CodeGenError::LLVMError("BPF passthrough sequence exhausted".to_string())
+        })?;
+        let opaque_bound = self
+            .builder
+            .build_call(
+                passthrough,
+                &[
+                    i32_type.const_int(sequence as u64, false).into(),
+                    semantic_bound.into(),
+                ],
+                &format!("{name}_opaque_bound"),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .ok_or_else(|| CodeGenError::LLVMError("BPF passthrough returned void".to_string()))?
+            .into_int_value();
+        let verifier_mask = u32::MAX >> max_len.leading_zeros();
+        let masked_bound = self
+            .builder
+            .build_and(
+                opaque_bound,
+                i32_type.const_int(verifier_mask as u64, false),
+                &format!("{name}_verifier_masked"),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        if verifier_mask == max_len {
+            return Ok(masked_bound);
+        }
+
+        let masked_exceeds_limit = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::UGT,
+                masked_bound,
+                limit,
+                &format!("{name}_masked_exceeds_limit"),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.builder
+            .build_select(
+                masked_exceeds_limit,
+                limit,
+                masked_bound,
+                &format!("{name}_bounded"),
+            )
+            .map(|value| value.into_int_value())
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))
+    }
+
     fn emit_complex_format_indirect(
         &mut self,
         status_ptr: PointerValue<'ctx>,
@@ -2384,9 +2503,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .builder
             .build_pointer_cast(byte_payload_ptr, ptr_type, "indirect_destination")
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-        let (read_result, read_error_address, read_ok) = if let (Some(start), Some(capacity)) =
-            (ring_start, ring_capacity)
-        {
+        let read_outcome;
+        if let (Some(start), Some(capacity)) = (ring_start, ring_capacity) {
             let available_before_wrap = self
                 .builder
                 .build_int_sub(capacity, start, "indirect_ring_available_before_wrap")
@@ -2427,17 +2545,27 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .builder
                 .build_int_truncate(first_len, i32_type, "indirect_ring_first_len_i32")
                 .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let first_len_i32 = self.clamp_probe_read_length(
+                first_len_i32,
+                capture_capacity,
+                "indirect_ring_first_len",
+            )?;
+            let first_payload_len = self
+                .builder
+                .build_int_z_extend(first_len_i32, i64_type, "indirect_ring_first_payload_len")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
             let first_source = self
                 .builder
                 .build_int_to_ptr(first_address, ptr_type, "indirect_ring_first_source")
                 .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-            // SAFETY: first_len is bounded by the reserved sequence payload.
+            // SAFETY: first_payload_len is the verifier-bounded helper length,
+            // so it cannot exceed the reserved sequence payload.
             let second_payload_ptr = unsafe {
                 self.builder
                     .build_gep(
                         self.context.i8_type(),
                         byte_payload_ptr,
-                        &[first_len],
+                        &[first_payload_len],
                         "indirect_ring_second_payload",
                     )
                     .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
@@ -2537,6 +2665,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .builder
                 .build_int_truncate(bounded_second_len, i32_type, "indirect_ring_second_len_i32")
                 .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let second_len_i32 = self.clamp_probe_read_length(
+                second_len_i32,
+                capture_capacity,
+                "indirect_ring_second_len_i32",
+            )?;
             let second_source = self
                 .builder
                 .build_int_to_ptr(data_address, ptr_type, "indirect_ring_second_source")
@@ -2605,7 +2738,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     "indirect_ring_read_ok",
                 )
                 .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-            (read_result, read_error_address, read_ok)
+            read_outcome = (read_result, read_error_address, read_ok);
         } else {
             let read_len = self
                 .builder
@@ -2619,6 +2752,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .builder
                 .build_int_truncate(read_len, i32_type, "indirect_read_len_i32")
                 .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let read_len =
+                self.clamp_probe_read_length(read_len, capture_capacity, "indirect_read_len")?;
             let source = self
                 .builder
                 .build_int_to_ptr(data_address, ptr_type, "indirect_source")
@@ -2640,8 +2775,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     "indirect_read_ok",
                 )
                 .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-            (read_result, data_address, read_ok)
-        };
+            read_outcome = (read_result, data_address, read_ok);
+        }
+        let (read_result, read_error_address, read_ok) = read_outcome;
         let read_ok_block = self
             .context
             .append_basic_block(function, "indirect_read_ok");
@@ -2768,7 +2904,53 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 capture.entry_stride
             ))
         })?;
-        let bytes_per_bucket = stride.checked_add(1).ok_or_else(|| {
+        let occupancy_width = capture
+            .occupancy
+            .byte_width()
+            .and_then(|width| usize::try_from(width).ok())
+            .ok_or_else(|| {
+                CodeGenError::DwarfError("invalid hash-table occupancy width".to_string())
+            })?;
+        let layout_matches = matches!(
+            (capture.bucket_order, capture.occupancy, capture.buckets),
+            (
+                ghostscope_dwarf::HashTableBucketOrder::Forward,
+                ghostscope_dwarf::HashTableOccupancy::ControlByteHighBitClear,
+                HashTableBucketSource::Forward { .. }
+            ) | (
+                ghostscope_dwarf::HashTableBucketOrder::Reverse,
+                ghostscope_dwarf::HashTableOccupancy::ControlByteHighBitClear,
+                HashTableBucketSource::ReverseFromControl
+            ) | (
+                ghostscope_dwarf::HashTableBucketOrder::Forward,
+                ghostscope_dwarf::HashTableOccupancy::NonZeroWord { .. },
+                HashTableBucketSource::LegacyAfterControl { .. }
+            )
+        );
+        if !layout_matches {
+            return Err(CodeGenError::DwarfError(
+                "hash-table occupancy and bucket source do not match".to_string(),
+            ));
+        }
+        if let HashTableBucketSource::LegacyAfterControl {
+            entry_alignment,
+            pointer_tag_mask,
+        } = capture.buckets
+        {
+            let valid_alignment = entry_alignment.is_power_of_two()
+                && (capture.entry_stride == 0 || entry_alignment <= capture.entry_stride);
+            let valid_tag = occupancy_width.is_power_of_two()
+                && pointer_tag_mask & !(occupancy_width as u64 - 1) == 0;
+            if !valid_alignment
+                || !valid_tag
+                || occupancy_width != capture.control_access_size.bytes()
+            {
+                return Err(CodeGenError::DwarfError(
+                    "invalid legacy hash-table storage layout".to_string(),
+                ));
+            }
+        }
+        let bytes_per_bucket = stride.checked_add(occupancy_width).ok_or_else(|| {
             CodeGenError::DwarfError("hash-table bucket capture size overflow".to_string())
         })?;
         let reservation_buckets = reserved_len
@@ -2776,13 +2958,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .checked_div(bytes_per_bucket)
             .unwrap_or(0);
         let max_buckets = capture.max_buckets.min(reservation_buckets);
-        let bucket_payload_offset = header_len.checked_add(max_buckets).ok_or_else(|| {
+        let max_control_bytes = max_buckets.checked_mul(occupancy_width).ok_or_else(|| {
+            CodeGenError::DwarfError("hash-table control payload overflow".to_string())
+        })?;
+        let bucket_payload_offset = header_len.checked_add(max_control_bytes).ok_or_else(|| {
             CodeGenError::DwarfError("hash-table bucket offset overflow".to_string())
         })?;
         let max_bucket_bytes = max_buckets.checked_mul(stride).ok_or_else(|| {
             CodeGenError::DwarfError("hash-table bucket payload overflow".to_string())
         })?;
-        if max_buckets > u32::MAX as usize || max_bucket_bytes > u32::MAX as usize {
+        if max_control_bytes > u32::MAX as usize || max_bucket_bytes > u32::MAX as usize {
             return Err(CodeGenError::DwarfError(
                 "hash-table capture exceeds the eBPF helper length width".to_string(),
             ));
@@ -2801,13 +2986,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let length_member = member_address(capture.length_offset, "hash_table_length_member")?;
         let bucket_mask_member =
             member_address(capture.bucket_mask_offset, "hash_table_bucket_mask_member")?;
-        let data_member = capture
-            .data
-            .map(|(offset, access_size)| {
-                member_address(offset, "hash_table_data_member")
-                    .map(|address| (address, access_size))
-            })
-            .transpose()?;
+        let data_member = match capture.buckets {
+            HashTableBucketSource::Forward {
+                data_offset,
+                data_access_size,
+            } => Some((
+                member_address(data_offset, "hash_table_data_member")?,
+                data_access_size,
+            )),
+            HashTableBucketSource::ReverseFromControl
+            | HashTableBucketSource::LegacyAfterControl { .. } => None,
+        };
         let control_read = self.generate_memory_read_with_diagnostics(
             descriptor.with_value(control_member),
             capture.control_access_size,
@@ -2927,7 +3116,22 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
 
         self.builder.position_at_end(metadata_ok_block);
-        let control_address = control_read.value.into_int_value();
+        let raw_control_address = control_read.value.into_int_value();
+        let control_address = match capture.buckets {
+            HashTableBucketSource::LegacyAfterControl {
+                pointer_tag_mask, ..
+            } => self
+                .builder
+                .build_and(
+                    raw_control_address,
+                    i64_type.const_int(!pointer_tag_mask, false),
+                    "hash_table_legacy_control_address",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?,
+            HashTableBucketSource::Forward { .. } | HashTableBucketSource::ReverseFromControl => {
+                raw_control_address
+            }
+        };
         let original_count = length_read.value.into_int_value();
         let bucket_mask = bucket_mask_read.value.into_int_value();
         let capacity = self
@@ -2947,6 +3151,19 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "hash_table_capacity_nonzero",
             )
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let count_zero = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                original_count,
+                i64_type.const_zero(),
+                "hash_table_count_zero",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let capacity_valid = self
+            .builder
+            .build_or(capacity_nonzero, count_zero, "hash_table_capacity_valid")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
         let length_valid = self
             .builder
             .build_int_compare(
@@ -2956,10 +3173,34 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "hash_table_length_valid",
             )
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-        let metadata_valid = self
+        let mut metadata_valid = self
             .builder
-            .build_and(capacity_nonzero, length_valid, "hash_table_metadata_valid")
+            .build_and(capacity_valid, length_valid, "hash_table_metadata_valid")
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        if let HashTableBucketSource::LegacyAfterControl {
+            entry_alignment, ..
+        } = capture.buckets
+        {
+            let alignment_padding = entry_alignment - 1;
+            let max_capacity = (u64::MAX - alignment_padding) / occupancy_width as u64;
+            let capacity_fits = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::ULE,
+                    capacity,
+                    i64_type.const_int(max_capacity, false),
+                    "hash_table_legacy_capacity_fits",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            metadata_valid = self
+                .builder
+                .build_and(
+                    metadata_valid,
+                    capacity_fits,
+                    "hash_table_legacy_metadata_valid",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        }
         let valid_block = self
             .context
             .append_basic_block(function, "hash_table_metadata_valid");
@@ -3132,7 +3373,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
 
         self.builder.position_at_end(control_read_block);
-        // SAFETY: the hash-table header and max_buckets control bytes are
+        // SAFETY: the hash-table header and maximum occupancy bytes are
         // included in the reservation validated above.
         let control_destination_i8 = unsafe {
             self.builder
@@ -3152,10 +3393,23 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "hash_table_control_destination",
             )
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let control_length_i64 = self
+            .builder
+            .build_int_mul(
+                captured_buckets,
+                i64_type.const_int(occupancy_width as u64, false),
+                "hash_table_control_length_i64",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
         let control_length = self
             .builder
-            .build_int_truncate(captured_buckets, i32_type, "hash_table_control_length")
+            .build_int_truncate(control_length_i64, i32_type, "hash_table_control_length")
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let control_length = self.clamp_probe_read_length(
+            control_length,
+            max_control_bytes,
+            "hash_table_control_length",
+        )?;
         let control_source = self
             .builder
             .build_int_to_ptr(control_address, ptr_type, "hash_table_control_source")
@@ -3245,15 +3499,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .builder
                 .build_int_truncate(bucket_length_i64, i32_type, "hash_table_bucket_length")
                 .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-            let bucket_source_address = match capture.bucket_order {
-                ghostscope_dwarf::HashTableBucketOrder::Forward => {
-                    data_address.ok_or_else(|| {
-                        CodeGenError::DwarfError(
-                            "forward hash-table capture is missing a data pointer".to_string(),
-                        )
-                    })?
-                }
-                ghostscope_dwarf::HashTableBucketOrder::Reverse => self
+            let bucket_length = self.clamp_probe_read_length(
+                bucket_length,
+                max_bucket_bytes,
+                "hash_table_bucket_length",
+            )?;
+            let bucket_source_address = match capture.buckets {
+                HashTableBucketSource::Forward { .. } => data_address.ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "forward hash-table capture is missing a data pointer".to_string(),
+                    )
+                })?,
+                HashTableBucketSource::ReverseFromControl => self
                     .builder
                     .build_int_sub(
                         control_address,
@@ -3261,6 +3518,41 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         "hash_table_reverse_bucket_source",
                     )
                     .map_err(|error| CodeGenError::LLVMError(error.to_string()))?,
+                HashTableBucketSource::LegacyAfterControl {
+                    entry_alignment, ..
+                } => {
+                    let hash_words_len = self
+                        .builder
+                        .build_int_mul(
+                            capacity,
+                            i64_type.const_int(occupancy_width as u64, false),
+                            "hash_table_legacy_hash_words_length",
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                    let padded_hash_words_len = self
+                        .builder
+                        .build_int_add(
+                            hash_words_len,
+                            i64_type.const_int(entry_alignment - 1, false),
+                            "hash_table_legacy_hash_words_padded_length",
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                    let aligned_hash_words_len = self
+                        .builder
+                        .build_and(
+                            padded_hash_words_len,
+                            i64_type.const_int(!(entry_alignment - 1), false),
+                            "hash_table_legacy_hash_words_aligned_length",
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                    self.builder
+                        .build_int_add(
+                            control_address,
+                            aligned_hash_words_len,
+                            "hash_table_legacy_bucket_source",
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                }
             };
             let bucket_source = self
                 .builder
@@ -3424,6 +3716,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             destination_offset,
             source_address,
             length,
+            max_len,
             name,
         } = read;
         let i32_type = self.context.i32_type();
@@ -3442,6 +3735,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .builder
             .build_int_truncate(length, i32_type, &format!("{name}_length"))
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let length = self.clamp_probe_read_length(length, max_len, &format!("{name}_length"))?;
         let result = self
             .create_bpf_helper_call(
                 BPF_FUNC_probe_read_user as u64,
@@ -3893,6 +4187,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 + ghostscope_protocol::BTREE_NODE_HEADER_SIZE,
                             source_address: source,
                             length,
+                            max_len: key_bytes,
                             name: &format!("btree_node_{slot}_keys"),
                         },
                     )?;
@@ -3923,6 +4218,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             destination_offset: record_offset + values_offset,
                             source_address: source,
                             length,
+                            max_len: value_bytes,
                             name: &format!("btree_node_{slot}_values"),
                         },
                     )?;
@@ -4508,12 +4804,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 descriptor,
                 control_offset,
                 control_access_size,
-                data,
                 length_offset,
                 length_access_size,
                 bucket_mask_offset,
                 bucket_mask_access_size,
                 entry_stride,
+                occupancy,
+                buckets,
                 bucket_order,
                 max_buckets,
                 max_len: _,
@@ -4525,12 +4822,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 HashTableCaptureConfig {
                     control_offset: *control_offset,
                     control_access_size: *control_access_size,
-                    data: *data,
                     length_offset: *length_offset,
                     length_access_size: *length_access_size,
                     bucket_mask_offset: *bucket_mask_offset,
                     bucket_mask_access_size: *bucket_mask_access_size,
                     entry_stride: *entry_stride,
+                    occupancy: *occupancy,
+                    buckets: *buckets,
                     bucket_order: *bucket_order,
                     max_buckets: *max_buckets,
                 },
@@ -4654,6 +4952,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 mod complex_format_layout_tests {
     use super::*;
     use inkwell::context::Context;
+    use inkwell::targets::{CodeModel, FileType, RelocMode};
+    use inkwell::targets::{Target, TargetTriple};
+    use inkwell::OptimizationLevel;
 
     fn immediate_arg<'ctx>(bytes: &[u8], access_path: Vec<u8>) -> ComplexArg<'ctx> {
         ComplexArg {
@@ -4767,12 +5068,13 @@ mod complex_format_layout_tests {
                 descriptor: RuntimeAddress::available(context.i64_type().const_zero(), context),
                 control_offset: 0,
                 control_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
-                data: None,
                 length_offset: 8,
                 length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
                 bucket_mask_offset: 16,
                 bucket_mask_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
                 entry_stride,
+                occupancy: ghostscope_dwarf::HashTableOccupancy::ControlByteHighBitClear,
+                buckets: HashTableBucketSource::ReverseFromControl,
                 bucket_order: ghostscope_dwarf::HashTableBucketOrder::Reverse,
                 max_buckets,
                 max_len,
@@ -4820,6 +5122,64 @@ mod complex_format_layout_tests {
         ebpf.module.verify().expect("verify generated LLVM IR");
 
         ebpf.module.print_to_string().to_string()
+    }
+
+    fn clamped_probe_read_assembly(max_len: usize) -> String {
+        let context = Context::create();
+        let options = crate::CompileOptions::default();
+        let mut ebpf = EbpfContext::new(&context, "probe_read_bound", Some(0), &options)
+            .expect("create eBPF context");
+        let i32_type = context.i32_type();
+        let i64_type = context.i64_type();
+        let ptr_type = context.ptr_type(AddressSpace::default());
+        let function_type = i64_type.fn_type(&[i32_type.into()], false);
+        let function = ebpf
+            .module
+            .add_function("probe_read_bound", function_type, None);
+        let entry = context.append_basic_block(function, "entry");
+        ebpf.builder.position_at_end(entry);
+        let length = function
+            .get_nth_param(0)
+            .expect("length argument")
+            .into_int_value();
+        let length = ebpf
+            .clamp_probe_read_length(length, max_len, "test_probe_read_len")
+            .expect("clamp probe read length");
+        let result = ebpf
+            .create_bpf_helper_call(
+                BPF_FUNC_probe_read_user as u64,
+                &[
+                    ptr_type.const_null().into(),
+                    length.into(),
+                    ptr_type.const_null().into(),
+                ],
+                i64_type.into(),
+                "test_probe_read",
+            )
+            .expect("emit probe read")
+            .into_int_value();
+        ebpf.builder
+            .build_return(Some(&result))
+            .expect("return probe read result");
+        ebpf.module.verify().expect("verify generated LLVM IR");
+
+        Target::initialize_bpf(&Default::default());
+        let triple = TargetTriple::create("bpf-pc-linux");
+        let target = Target::from_triple(&triple).expect("get BPF target");
+        let target_machine = target
+            .create_target_machine(
+                &triple,
+                "generic",
+                "+alu32",
+                OptimizationLevel::Default,
+                RelocMode::PIC,
+                CodeModel::Small,
+            )
+            .expect("create BPF target machine");
+        let assembly = target_machine
+            .write_to_memory_buffer(&ebpf.module, FileType::Assembly)
+            .expect("emit BPF assembly");
+        String::from_utf8(assembly.as_slice().to_vec()).expect("BPF assembly is UTF-8")
     }
 
     fn hash_table_emitter_ir(capture: HashTableCaptureConfig, max_len: usize) -> String {
@@ -5092,12 +5452,13 @@ mod complex_format_layout_tests {
             HashTableCaptureConfig {
                 control_offset: 0,
                 control_access_size: ghostscope_dwarf::MemoryAccessSize::U32,
-                data: None,
                 length_offset: 4,
                 length_access_size: ghostscope_dwarf::MemoryAccessSize::U32,
                 bucket_mask_offset: 8,
                 bucket_mask_access_size: ghostscope_dwarf::MemoryAccessSize::U32,
                 entry_stride: 8,
+                occupancy: ghostscope_dwarf::HashTableOccupancy::ControlByteHighBitClear,
+                buckets: HashTableBucketSource::ReverseFromControl,
                 bucket_order: ghostscope_dwarf::HashTableBucketOrder::Reverse,
                 max_buckets: 4,
             },
@@ -5108,17 +5469,25 @@ mod complex_format_layout_tests {
         assert!(reverse_ir.contains("hash_table_reverse_bucket_source"));
         assert!(reverse_ir.contains("hash_table_captured_buckets_header"));
         assert!(reverse_ir.contains("hash_table_metadata_error_payload"));
+        assert!(reverse_ir.contains("hash_table_control_length_exceeds_limit"));
+        assert!(reverse_ir.contains("hash_table_control_length_bounded"));
+        assert!(reverse_ir.contains("hash_table_bucket_length_exceeds_limit"));
+        assert!(reverse_ir.contains("hash_table_bucket_length_bounded"));
 
         let forward_ir = hash_table_emitter_ir(
             HashTableCaptureConfig {
                 control_offset: 0,
                 control_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
-                data: Some((8, ghostscope_dwarf::MemoryAccessSize::U64)),
                 length_offset: 16,
                 length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
                 bucket_mask_offset: 24,
                 bucket_mask_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
                 entry_stride: 4,
+                occupancy: ghostscope_dwarf::HashTableOccupancy::ControlByteHighBitClear,
+                buckets: HashTableBucketSource::Forward {
+                    data_offset: 8,
+                    data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                },
                 bucket_order: ghostscope_dwarf::HashTableBucketOrder::Forward,
                 max_buckets: 4,
             },
@@ -5126,6 +5495,30 @@ mod complex_format_layout_tests {
         );
         assert!(forward_ir.contains("hash_table_data_metadata"));
         assert!(!forward_ir.contains("hash_table_reverse_bucket_source"));
+
+        let legacy_ir = hash_table_emitter_ir(
+            HashTableCaptureConfig {
+                control_offset: 16,
+                control_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                length_offset: 8,
+                length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                bucket_mask_offset: 0,
+                bucket_mask_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                entry_stride: 8,
+                occupancy: ghostscope_dwarf::HashTableOccupancy::NonZeroWord { word_size: 8 },
+                buckets: HashTableBucketSource::LegacyAfterControl {
+                    entry_alignment: 4,
+                    pointer_tag_mask: 1,
+                },
+                bucket_order: ghostscope_dwarf::HashTableBucketOrder::Forward,
+                max_buckets: 4,
+            },
+            64,
+        );
+        assert!(legacy_ir.contains("hash_table_legacy_control_address"));
+        assert!(legacy_ir.contains("hash_table_legacy_hash_words_aligned_length"));
+        assert!(legacy_ir.contains("hash_table_legacy_bucket_source"));
+        assert!(!legacy_ir.contains("hash_table_data_metadata"));
     }
 
     #[test]
@@ -5165,6 +5558,8 @@ mod complex_format_layout_tests {
         assert!(llvm_ir.contains("btree_length_metadata"));
         assert!(llvm_ir.contains("btree_root_pointer_metadata"));
         assert!(llvm_ir.contains("btree_node_0_length"));
+        assert!(llvm_ir.contains("btree_node_0_keys_length_verifier_masked"));
+        assert!(llvm_ir.contains("btree_node_0_values_length_verifier_masked"));
         assert!(llvm_ir.contains("probe_read_user_btree_node_0_keys"));
         assert!(llvm_ir.contains("probe_read_user_btree_node_0_values"));
         assert!(llvm_ir.contains("btree_node_0_edge_0"));
@@ -5269,7 +5664,27 @@ mod complex_format_layout_tests {
 
         assert!(llvm_ir.contains("indirect_captured_count_ptr_i8_nonempty"));
         assert!(llvm_ir.contains("indirect_read_len_bytes"));
+        assert!(llvm_ir.contains("indirect_read_len_exceeds_limit"));
+        assert!(llvm_ir.contains("indirect_read_len_verifier_masked"));
+        assert!(llvm_ir.contains("indirect_read_len_masked_exceeds_limit"));
+        assert!(llvm_ir.contains("indirect_read_len_bounded"));
         assert!(llvm_ir.contains("mul i64"));
+    }
+
+    #[test]
+    fn probe_read_length_keeps_a_verifier_visible_bound_after_optimization() {
+        let assembly = clamped_probe_read_assembly(64);
+        let mask = assembly.find("&= 127").expect("verifier mask in assembly");
+        let exact_bound = assembly[mask..]
+            .find("> 64")
+            .map(|offset| mask + offset)
+            .expect("exact upper-bound comparison in assembly");
+        let probe_read = assembly[exact_bound..]
+            .find("call 112")
+            .map(|offset| exact_bound + offset)
+            .expect("probe read helper in assembly");
+
+        assert!(mask < exact_bound && exact_bound < probe_read, "{assembly}");
     }
 
     #[test]
@@ -5315,6 +5730,11 @@ mod complex_format_layout_tests {
         assert!(llvm_ir.contains("indirect_ring_metadata_valid"));
         assert!(llvm_ir.contains("indirect_ring_first_address"));
         assert!(llvm_ir.contains("indirect_ring_second_payload"));
+        assert!(llvm_ir.contains("indirect_ring_first_payload_len = zext i32"));
+        assert!(llvm_ir.contains("indirect_ring_first_len_exceeds_limit"));
+        assert!(llvm_ir.contains("indirect_ring_first_len_bounded"));
+        assert!(llvm_ir.contains("indirect_ring_second_len_i32_exceeds_limit"));
+        assert!(llvm_ir.contains("indirect_ring_second_len_i32_bounded"));
         assert!(llvm_ir.contains("probe_read_user_indirect_ring_first"));
         assert!(llvm_ir.contains("probe_read_user_indirect_ring_second"));
     }

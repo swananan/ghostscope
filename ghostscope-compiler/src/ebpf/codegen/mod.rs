@@ -85,6 +85,19 @@ struct BTreeEdgesSource {
     edge_count: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum HashTableBucketSource {
+    Forward {
+        data_offset: u64,
+        data_access_size: ghostscope_dwarf::MemoryAccessSize,
+    },
+    ReverseFromControl,
+    LegacyAfterControl {
+        entry_alignment: u64,
+        pointer_tag_mask: u64,
+    },
+}
+
 /// Source for complex formatted argument data
 #[derive(Debug, Clone)]
 enum ComplexArgSource<'ctx> {
@@ -139,18 +152,19 @@ enum ComplexArgSource<'ctx> {
         max_elements: usize,
         max_len: usize,
     },
-    /// Bounded capture of a sparse hash-table prefix. Control bytes and bucket
-    /// bytes are stored separately in one semantic payload.
+    /// Bounded capture of a sparse hash-table prefix. Occupancy metadata and
+    /// bucket bytes are stored separately in one semantic payload.
     IndirectHashTable {
         descriptor: RuntimeAddress<'ctx>,
         control_offset: u64,
         control_access_size: ghostscope_dwarf::MemoryAccessSize,
-        data: Option<(u64, ghostscope_dwarf::MemoryAccessSize)>,
         length_offset: u64,
         length_access_size: ghostscope_dwarf::MemoryAccessSize,
         bucket_mask_offset: u64,
         bucket_mask_access_size: ghostscope_dwarf::MemoryAccessSize,
         entry_stride: u64,
+        occupancy: ghostscope_dwarf::HashTableOccupancy,
+        buckets: HashTableBucketSource,
         bucket_order: ghostscope_dwarf::HashTableBucketOrder,
         max_buckets: usize,
         max_len: usize,

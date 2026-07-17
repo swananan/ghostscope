@@ -61,6 +61,21 @@ pub struct BTreeEdgesCapture {
     pub edge_count: u64,
 }
 
+/// Runtime source of physical hash-table bucket bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HashTableBucketSource {
+    /// Buckets start at a dedicated pointer projected from the descriptor.
+    Forward { data: TypeProjection },
+    /// Buckets are stored immediately before the control-byte pointer.
+    ReverseFromControl,
+    /// Rust 1.35 stores pairs after aligned pointer-sized hash words in one
+    /// allocation. The low pointer bit is an implementation tag.
+    LegacyAfterControl {
+        entry_alignment: u64,
+        pointer_tag_mask: u64,
+    },
+}
+
 /// Physical capture strategy used by a semantic value adapter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueCapturePlan {
@@ -98,16 +113,17 @@ pub enum ValueCapturePlan {
         capacity: TypeProjection,
         element_stride: u64,
     },
-    /// Read hash-table metadata and capture a bounded prefix of control bytes
+    /// Read hash-table metadata and capture a bounded prefix of occupancy bytes
     /// plus their corresponding physical entries. The source-language adapter
     /// provides occupancy semantics; all paths, widths, and entry layout are
     /// derived from DWARF.
     IndirectHashTable {
         control: TypeProjection,
-        data: Option<TypeProjection>,
         length: TypeProjection,
         bucket_mask: TypeProjection,
         entry_stride: u64,
+        occupancy: ghostscope_protocol::HashTableOccupancy,
+        buckets: HashTableBucketSource,
         bucket_order: ghostscope_protocol::HashTableBucketOrder,
     },
     /// Capture a bounded breadth-first snapshot of a Rust B-Tree. Root and

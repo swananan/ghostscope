@@ -12,7 +12,7 @@ use crate::trace_event::{
 use crate::type_info::TypeInfo;
 use crate::{
     BTreeEntryPresentation, BTreeFieldPresentation, HashTableBucketOrder,
-    HashTableEntryPresentation, HashTableFieldPresentation, ValuePresentation,
+    HashTableEntryPresentation, HashTableFieldPresentation, HashTableOccupancy, ValuePresentation,
     BTREE_CAPTURED_ITEM_COUNT_OFFSET, BTREE_HEADER_SIZE, BTREE_NODE_HEADER_SIZE,
     BTREE_NODE_HEIGHT_OFFSET, BTREE_NODE_LENGTH_OFFSET, BTREE_NODE_SLOT_COUNT_OFFSET,
     HASH_TABLE_BUCKET_DATA_OFFSET, HASH_TABLE_CAPACITY_OFFSET, HASH_TABLE_CAPTURED_BUCKETS_OFFSET,
@@ -34,7 +34,8 @@ pub struct ParsedComplexVariable {
 
 struct ParsedHashTablePayload<'a> {
     original_count: u64,
-    controls: &'a [u8],
+    captured_buckets: usize,
+    occupancy: &'a [u8],
     buckets: &'a [u8],
 }
 
@@ -828,8 +829,15 @@ impl FormatPrinter {
             ValuePresentation::HashTable {
                 entry_stride,
                 bucket_order,
+                occupancy,
                 entry,
-            } => Self::format_hash_table_payload(data, *entry_stride, *bucket_order, entry),
+            } => Self::format_hash_table_payload(
+                data,
+                *entry_stride,
+                *bucket_order,
+                *occupancy,
+                entry,
+            ),
             ValuePresentation::BTree {
                 node_capacity,
                 entry,
@@ -1023,6 +1031,7 @@ impl FormatPrinter {
         if let ValuePresentation::HashTable {
             entry_stride,
             bucket_order,
+            occupancy,
             ..
         } = presentation
         {
@@ -1030,6 +1039,7 @@ impl FormatPrinter {
                 &variable.data,
                 *entry_stride,
                 *bucket_order,
+                *occupancy,
             )
             .map(Cow::Owned)
             .ok_or("<INVALID_SEMANTIC_PAYLOAD>");
@@ -1073,9 +1083,11 @@ impl FormatPrinter {
                 let (_, _, payload) = Self::parse_sequence_payload(data, *element_stride)?;
                 Some(payload)
             }
-            ValuePresentation::HashTable { entry_stride, .. } => {
-                Some(Self::parse_hash_table_payload(data, *entry_stride)?.buckets)
-            }
+            ValuePresentation::HashTable {
+                entry_stride,
+                occupancy,
+                ..
+            } => Some(Self::parse_hash_table_payload(data, *entry_stride, *occupancy)?.buckets),
             ValuePresentation::BTree {
                 node_capacity,
                 entry,
@@ -1159,6 +1171,7 @@ impl FormatPrinter {
     fn parse_hash_table_payload(
         data: &[u8],
         entry_stride: u64,
+        occupancy: HashTableOccupancy,
     ) -> Option<ParsedHashTablePayload<'_>> {
         let original_count = Self::payload_u64(data, 0)?;
         let capacity = Self::payload_u64(data, HASH_TABLE_CAPACITY_OFFSET)?;
@@ -1169,24 +1182,27 @@ impl FormatPrinter {
         }
 
         let captured_buckets = usize::try_from(captured_buckets).ok()?;
-        let control_end = HASH_TABLE_HEADER_SIZE.checked_add(captured_buckets)?;
+        let occupancy_width = usize::try_from(occupancy.byte_width()?).ok()?;
+        let occupancy_len = captured_buckets.checked_mul(occupancy_width)?;
+        let occupancy_end = HASH_TABLE_HEADER_SIZE.checked_add(occupancy_len)?;
         let bucket_offset = usize::try_from(bucket_offset).ok()?;
         // The eBPF layout fixes the bucket offset after the maximum reserved
-        // control region so the verifier sees constant destinations. A small
-        // runtime table can therefore leave unused control headroom here.
-        if bucket_offset < control_end {
+        // occupancy region so the verifier sees constant destinations. A small
+        // runtime table can therefore leave unused occupancy headroom here.
+        if bucket_offset < occupancy_end {
             return None;
         }
         let stride = usize::try_from(entry_stride).ok()?;
         let bucket_len = captured_buckets.checked_mul(stride)?;
         let bucket_end = bucket_offset.checked_add(bucket_len)?;
-        let controls = data.get(HASH_TABLE_HEADER_SIZE..control_end)?;
+        let occupancy_bytes = data.get(HASH_TABLE_HEADER_SIZE..occupancy_end)?;
         let buckets = data.get(bucket_offset..bucket_end)?;
-        let occupied = controls
-            .iter()
-            .filter(|control| (**control & 0x80) == 0)
-            .count();
-        let occupied = u64::try_from(occupied).ok()?;
+        let mut occupied = 0_u64;
+        for bucket_index in 0..captured_buckets {
+            if Self::hash_table_bucket_occupied(occupancy_bytes, occupancy, bucket_index)? {
+                occupied = occupied.checked_add(1)?;
+            }
+        }
         if occupied > original_count
             || (u64::try_from(captured_buckets).ok()? == capacity && occupied != original_count)
         {
@@ -1195,9 +1211,27 @@ impl FormatPrinter {
 
         Some(ParsedHashTablePayload {
             original_count,
-            controls,
+            captured_buckets,
+            occupancy: occupancy_bytes,
             buckets,
         })
+    }
+
+    fn hash_table_bucket_occupied(
+        occupancy_bytes: &[u8],
+        occupancy: HashTableOccupancy,
+        bucket_index: usize,
+    ) -> Option<bool> {
+        let width = usize::try_from(occupancy.byte_width()?).ok()?;
+        let start = bucket_index.checked_mul(width)?;
+        let end = start.checked_add(width)?;
+        let bytes = occupancy_bytes.get(start..end)?;
+        match occupancy {
+            HashTableOccupancy::ControlByteHighBitClear => {
+                Some(bytes.first().copied()? & 0x80 == 0)
+            }
+            HashTableOccupancy::NonZeroWord { .. } => Some(bytes.iter().any(|byte| *byte != 0)),
+        }
     }
 
     fn hash_table_bucket<'a>(
@@ -1210,7 +1244,7 @@ impl FormatPrinter {
         let bucket_index = match bucket_order {
             HashTableBucketOrder::Forward => control_index,
             HashTableBucketOrder::Reverse => {
-                payload.controls.len().checked_sub(control_index + 1)?
+                payload.captured_buckets.checked_sub(control_index + 1)?
             }
         };
         let start = bucket_index.checked_mul(stride)?;
@@ -1222,13 +1256,14 @@ impl FormatPrinter {
         data: &[u8],
         entry_stride: u64,
         bucket_order: HashTableBucketOrder,
+        occupancy: HashTableOccupancy,
     ) -> Option<Vec<u8>> {
-        let payload = Self::parse_hash_table_payload(data, entry_stride)?;
+        let payload = Self::parse_hash_table_payload(data, entry_stride, occupancy)?;
         let stride = usize::try_from(entry_stride).ok()?;
-        let output_capacity = payload.controls.len().checked_mul(stride)?;
+        let output_capacity = payload.captured_buckets.checked_mul(stride)?;
         let mut entries = Vec::with_capacity(output_capacity);
-        for (control_index, control) in payload.controls.iter().enumerate() {
-            if (*control & 0x80) == 0 {
+        for control_index in 0..payload.captured_buckets {
+            if Self::hash_table_bucket_occupied(payload.occupancy, occupancy, control_index)? {
                 entries.extend_from_slice(Self::hash_table_bucket(
                     &payload,
                     entry_stride,
@@ -1263,9 +1298,10 @@ impl FormatPrinter {
         data: &[u8],
         entry_stride: u64,
         bucket_order: HashTableBucketOrder,
+        occupancy: HashTableOccupancy,
         entry: &HashTableEntryPresentation,
     ) -> String {
-        let Some(payload) = Self::parse_hash_table_payload(data, entry_stride) else {
+        let Some(payload) = Self::parse_hash_table_payload(data, entry_stride, occupancy) else {
             return "<INVALID_HASH_TABLE_PAYLOAD>".to_string();
         };
         let type_name = match entry {
@@ -1274,8 +1310,13 @@ impl FormatPrinter {
         };
         let mut result = format!("{type_name}(size={}) {{", payload.original_count);
         let mut output_index = 0usize;
-        for (control_index, control) in payload.controls.iter().enumerate() {
-            if (*control & 0x80) != 0 {
+        for control_index in 0..payload.captured_buckets {
+            let Some(occupied) =
+                Self::hash_table_bucket_occupied(payload.occupancy, occupancy, control_index)
+            else {
+                return "<INVALID_HASH_TABLE_PAYLOAD>".to_string();
+            };
+            if !occupied {
                 continue;
             }
             let Some(entry_data) =
@@ -2356,12 +2397,30 @@ mod tests {
         buckets: &[u8],
         unused_control_bytes: usize,
     ) -> Vec<u8> {
-        let bucket_offset = HASH_TABLE_HEADER_SIZE + controls.len() + unused_control_bytes;
+        hash_table_payload_with_occupancy_headroom(
+            original_count,
+            capacity,
+            controls.len(),
+            controls,
+            buckets,
+            unused_control_bytes,
+        )
+    }
+
+    fn hash_table_payload_with_occupancy_headroom(
+        original_count: u64,
+        capacity: u64,
+        captured_buckets: usize,
+        occupancy: &[u8],
+        buckets: &[u8],
+        unused_occupancy_bytes: usize,
+    ) -> Vec<u8> {
+        let bucket_offset = HASH_TABLE_HEADER_SIZE + occupancy.len() + unused_occupancy_bytes;
         let mut data = original_count.to_le_bytes().to_vec();
         data.extend_from_slice(&capacity.to_le_bytes());
-        data.extend_from_slice(&(controls.len() as u64).to_le_bytes());
+        data.extend_from_slice(&(captured_buckets as u64).to_le_bytes());
         data.extend_from_slice(&(bucket_offset as u64).to_le_bytes());
-        data.extend_from_slice(controls);
+        data.extend_from_slice(occupancy);
         data.resize(bucket_offset, 0);
         data.extend_from_slice(buckets);
         data
@@ -2485,6 +2544,7 @@ mod tests {
         let presentation = ValuePresentation::HashTable {
             entry_stride: 8,
             bucket_order: HashTableBucketOrder::Forward,
+            occupancy: HashTableOccupancy::ControlByteHighBitClear,
             entry: HashTableEntryPresentation::Map {
                 key: HashTableFieldPresentation {
                     offset: 0,
@@ -2510,6 +2570,73 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_hash_table_presentation_uses_nonzero_hash_words() {
+        let mut occupancy = Vec::new();
+        for hash in [0_u64, 0x12, 0, 0x01] {
+            occupancy.extend_from_slice(&hash.to_le_bytes());
+        }
+        let mut buckets = vec![0_u8; 4 * 8];
+        buckets[8..12].copy_from_slice(&65_i32.to_le_bytes());
+        buckets[12..14].copy_from_slice(&13_u16.to_le_bytes());
+        buckets[24..28].copy_from_slice(&29_i32.to_le_bytes());
+        buckets[28..30].copy_from_slice(&17_u16.to_le_bytes());
+        let data = hash_table_payload_with_occupancy_headroom(2, 4, 4, &occupancy, &buckets, 0);
+        let presentation = ValuePresentation::HashTable {
+            entry_stride: 8,
+            bucket_order: HashTableBucketOrder::Forward,
+            occupancy: HashTableOccupancy::NonZeroWord { word_size: 8 },
+            entry: HashTableEntryPresentation::Map {
+                key: HashTableFieldPresentation {
+                    offset: 0,
+                    field_type: Box::new(signed_i32_type()),
+                },
+                value: HashTableFieldPresentation {
+                    offset: 4,
+                    field_type: Box::new(unsigned_u16_type()),
+                },
+            },
+        };
+
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(
+                &data,
+                &TypeInfo::UnknownType {
+                    name: "HashMap".to_string(),
+                },
+                &presentation,
+            ),
+            "HashMap(size=2) {65: 13, 29: 17}"
+        );
+
+        let mut trace_context = TraceContext::new();
+        let format_index = trace_context.add_string("{:x}|{:s}".to_string()).unwrap();
+        let type_index = trace_context
+            .add_type_with_presentation(
+                TypeInfo::UnknownType {
+                    name: "HashMap".to_string(),
+                },
+                presentation,
+            )
+            .unwrap();
+        let name_index = trace_context.add_variable_name("map".to_string()).unwrap();
+        let variable = ParsedComplexVariable {
+            var_name_index: name_index,
+            type_index,
+            access_path: String::new(),
+            status: VariableStatus::Ok as u8,
+            data,
+        };
+        assert_eq!(
+            FormatPrinter::format_complex_print_data(
+                format_index,
+                &[variable.clone(), variable],
+                &trace_context,
+            ),
+            "41 00 00 00 0d 00 00 00 1d 00 00 00 11 00 00 00|A"
+        );
+    }
+
+    #[test]
     fn test_hash_table_presentation_handles_reverse_and_zst_buckets() {
         let controls = [0x01, 0xff, 0x02, 0x80];
         let mut reverse_buckets = vec![0u8; 4 * 4];
@@ -2519,6 +2646,7 @@ mod tests {
         let set = ValuePresentation::HashTable {
             entry_stride: 4,
             bucket_order: HashTableBucketOrder::Reverse,
+            occupancy: HashTableOccupancy::ControlByteHighBitClear,
             entry: HashTableEntryPresentation::Set {
                 value: HashTableFieldPresentation {
                     offset: 0,
@@ -2541,6 +2669,7 @@ mod tests {
         let unit_set = ValuePresentation::HashTable {
             entry_stride: 0,
             bucket_order: HashTableBucketOrder::Reverse,
+            occupancy: HashTableOccupancy::ControlByteHighBitClear,
             entry: HashTableEntryPresentation::Set {
                 value: HashTableFieldPresentation {
                     offset: 0,
@@ -2573,6 +2702,7 @@ mod tests {
         let presentation = ValuePresentation::HashTable {
             entry_stride: 2,
             bucket_order: HashTableBucketOrder::Reverse,
+            occupancy: HashTableOccupancy::ControlByteHighBitClear,
             entry: HashTableEntryPresentation::Set {
                 value: HashTableFieldPresentation {
                     offset: 0,
@@ -2631,6 +2761,7 @@ mod tests {
         let presentation = ValuePresentation::HashTable {
             entry_stride: 4,
             bucket_order: HashTableBucketOrder::Forward,
+            occupancy: HashTableOccupancy::ControlByteHighBitClear,
             entry: HashTableEntryPresentation::Set {
                 value: HashTableFieldPresentation {
                     offset: 0,

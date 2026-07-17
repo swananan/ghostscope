@@ -4,8 +4,8 @@ use super::{variables::complete_aggregate_declaration_entry, LoadedObjfile};
 use crate::{
     core::Result,
     semantics::{
-        resolve_name_with_origins, resolve_type_ref_with_origins, CompilationUnitMetadata,
-        ProducerInfo, SourceLanguage, TypeLoc, VariableAccessSegment,
+        resolve_attr_with_unit_origins, resolve_name_with_origins, resolve_type_ref_with_origins,
+        CompilationUnitMetadata, ProducerInfo, SourceLanguage, TypeLoc, VariableAccessSegment,
     },
     CuId, ModuleId, TypeId,
 };
@@ -294,6 +294,23 @@ fn template_type_parameter_loc(
     Ok(None)
 }
 
+fn type_alignment_from_dwarf(
+    dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+    type_name_index: &crate::index::TypeNameIndex,
+    loc: TypeLoc,
+) -> Result<Option<u64>> {
+    let Some(loc) = normalize_type_loc(dwarf, type_name_index, loc)? else {
+        return Ok(None);
+    };
+    let header = dwarf.unit_header(loc.cu_off)?;
+    let unit = dwarf.unit(header)?;
+    let entry = unit.entry(loc.die_off)?;
+    Ok(
+        resolve_attr_with_unit_origins(&entry, &unit, gimli::DW_AT_alignment)?
+            .and_then(crate::core::attr_u64),
+    )
+}
+
 fn projected_type_loc(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
     type_name_index: &crate::index::TypeNameIndex,
@@ -377,6 +394,14 @@ impl LoadedObjfile {
             type_id_from_loc(current.module, parameter_loc),
             summary,
         )))
+    }
+
+    pub(crate) fn type_alignment(&self, current: TypeId) -> Result<Option<u64>> {
+        let type_name_index = self
+            .type_name_index
+            .read()
+            .expect("type name index lock poisoned");
+        type_alignment_from_dwarf(self.dwarf(), &type_name_index, type_loc(current)?)
     }
 
     pub(crate) fn aggregate_type_id_by_name(&self, module: ModuleId, name: &str) -> Option<TypeId> {

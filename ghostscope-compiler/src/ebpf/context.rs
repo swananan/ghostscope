@@ -147,6 +147,9 @@ pub struct EbpfContext<'ctx, 'dw> {
     pub(super) tls_scratch_alloca: Option<inkwell::values::PointerValue<'ctx>>,
     // Per-invocation event accumulation offset (u32) stored on stack (entry block)
     pub event_offset_alloca: Option<inkwell::values::PointerValue<'ctx>>,
+    // Sequence numbers keep verifier-oriented llvm.bpf.passthrough calls
+    // distinct while LLVM optimizes the generated module.
+    pub(super) next_bpf_passthrough_sequence: u32,
     // Compile-time upper bound for bytes that may already be reserved in the current trace event.
     // This is maintained across structured control flow so later instructions can budget against
     // the worst-case path without double-counting sibling branches.
@@ -274,6 +277,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             pm_key_alloca: None,
             tls_scratch_alloca: None,
             event_offset_alloca: None,
+            next_bpf_passthrough_sequence: 0,
             compile_time_event_bytes_upper_bound: 0,
             compile_options: compile_options.clone(),
 
