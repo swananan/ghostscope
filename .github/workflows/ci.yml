@@ -102,12 +102,12 @@ jobs:
 
       - name: Install Rust compatibility toolchains
         run: |
-          rustup toolchain install \
-            --profile minimal \
-            1.35.0 \
-            1.49.0 \
-            1.93.0 \
-            nightly-2026-05-30
+          mapfile -t toolchains < <(
+            sed -e 's/[[:space:]]*#.*$//' \
+              -e '/^[[:space:]]*$/d' \
+              e2e-tests/rust-compat-toolchains.txt
+          )
+          rustup toolchain install --profile minimal "${toolchains[@]}"
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -143,8 +143,6 @@ jobs:
         run: cargo test --all-features
         env:
           GHOSTSCOPE_REQUIRE_RUST_COMPAT_TOOLCHAINS: 1
-          GHOSTSCOPE_RUST_COMPAT_TOOLCHAINS: >-
-            1.35.0,1.49.0,1.88.0,1.93.0,nightly-2026-05-30
           RUST_BACKTRACE: 1
 
   e2e:
@@ -176,9 +174,6 @@ jobs:
               e2e-tests/rust-compat-toolchains.txt
           )
           rustup toolchain install --profile minimal "${toolchains[@]}"
-
-      - name: Install Rust 1.35 e2e toolchain
-        run: rustup toolchain install --profile minimal 1.35.0
 
       - name: Cache cargo registry
         uses: actions/cache@v4

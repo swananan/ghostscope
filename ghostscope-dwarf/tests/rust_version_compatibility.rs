@@ -5,7 +5,7 @@ use ghostscope_dwarf::{
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DEFAULT_TOOLCHAINS: &[&str] = &["1.35.0", "1.49.0", "1.88.0", "1.93.0", "nightly-2026-05-30"];
+const DEFAULT_TOOLCHAINS: &str = include_str!("../../e2e-tests/rust-compat-toolchains.txt");
 
 #[derive(Clone, Copy)]
 enum ExpectedAdapter {
@@ -53,6 +53,9 @@ const RUST_135_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
     // applies that provider's semantics to Rust 1.35's concrete fat-pointer
     // DIE rather than implying it was in the bundled 1.35 script.
     ("boxed_text", ExpectedAdapter::Utf8Bytes),
+    ("slice", ExpectedAdapter::Sequence),
+    ("vector", ExpectedAdapter::Sequence),
+    ("deque", ExpectedAdapter::RingSequence),
     ("btree_map", ExpectedAdapter::BTreeMap),
     ("btree_set", ExpectedAdapter::BTreeSet),
     ("hash_map", ExpectedAdapter::HashMap),
@@ -73,8 +76,10 @@ fn configured_toolchains() -> Vec<String> {
         .filter(|toolchains: &Vec<_>| !toolchains.is_empty())
         .unwrap_or_else(|| {
             DEFAULT_TOOLCHAINS
-                .iter()
-                .map(|toolchain| (*toolchain).to_string())
+                .lines()
+                .map(|line| line.split('#').next().unwrap_or_default().trim())
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
                 .collect()
         })
 }
@@ -279,6 +284,61 @@ fn assert_rust_135_btree_plan(parameter: &str, plan: &ValueReadPlan) -> anyhow::
     Ok(())
 }
 
+fn assert_rust_135_sequence_plan(parameter: &str, plan: &ValueReadPlan) -> anyhow::Result<()> {
+    let ValuePresentation::Sequence { element_stride, .. } = &plan.presentation else {
+        anyhow::bail!("1.35.0: unexpected presentation for {parameter}")
+    };
+    assert_eq!(*element_stride, 4);
+
+    match (parameter, &plan.capture) {
+        (
+            "slice",
+            ValueCapturePlan::IndirectSequence {
+                data,
+                length,
+                element_stride,
+            },
+        ) => {
+            assert_eq!(member_offset(data)?, 0);
+            assert_eq!(member_offset(length)?, 8);
+            assert_eq!(*element_stride, 4);
+        }
+        (
+            "vector",
+            ValueCapturePlan::IndirectSequence {
+                data,
+                length,
+                element_stride,
+            },
+        ) => {
+            assert_eq!(member_offset(data)?, 0);
+            assert_eq!(member_offset(length)?, 16);
+            assert_eq!(*element_stride, 4);
+        }
+        (
+            "deque",
+            ValueCapturePlan::IndirectRingSequence {
+                data,
+                start,
+                length,
+                capacity,
+                element_stride,
+            },
+        ) => {
+            let ghostscope_dwarf::RingSequenceLength::End(end) = length.as_ref() else {
+                anyhow::bail!("1.35.0: VecDeque must derive length from tail/head")
+            };
+            assert_eq!(member_offset(data)?, 16);
+            assert_eq!(member_offset(start)?, 0);
+            assert_eq!(member_offset(end)?, 8);
+            assert_eq!(member_offset(capacity)?, 24);
+            assert_eq!(*element_stride, 4);
+        }
+        _ => anyhow::bail!("1.35.0: unexpected sequence capture for {parameter}"),
+    }
+    Ok(())
+}
+
 async fn assert_parameter_adapter(
     analyzer: &DwarfAnalyzer,
     binary: &Path,
@@ -373,6 +433,14 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
                 &toolchain,
             )
             .await?;
+            if toolchain == "1.35.0" && matches!(parameter, "slice" | "vector" | "deque") {
+                assert_rust_135_sequence_plan(
+                    parameter,
+                    plan.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("1.35.0: missing sequence plan for {parameter}")
+                    })?,
+                )?;
+            }
             if toolchain == "1.35.0" && matches!(parameter, "btree_map" | "btree_set") {
                 assert_rust_135_btree_plan(
                     parameter,
