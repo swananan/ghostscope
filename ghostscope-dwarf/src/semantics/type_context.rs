@@ -3,6 +3,7 @@
 use super::type_layout::{indexable_element_layout, strip_type_aliases};
 use crate::core::{CuId, ModuleId, TypeId};
 use crate::{TypeInfo, VariableAccessSegment};
+use std::fmt;
 
 /// Normalized source-language family for semantic dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,6 +50,80 @@ impl ProducerInfo {
     pub fn new(raw: impl Into<String>) -> Self {
         Self { raw: raw.into() }
     }
+
+    /// Extract the numeric release from rustc's LLVM producer string.
+    ///
+    /// rustc currently emits strings such as
+    /// `clang LLVM (rustc version 1.88.0 (...))`. The channel, commit, and
+    /// date remain available in [`Self::raw`]; adapters need only the numeric
+    /// release as an advisory candidate-ordering hint.
+    pub fn rustc_version(&self) -> Option<RustcVersion> {
+        const MARKER: &str = "rustc version ";
+
+        let marker = self.raw.find(MARKER)?;
+        if marker > 0 {
+            let preceding = self.raw.as_bytes()[marker - 1];
+            if preceding.is_ascii_alphanumeric() || preceding == b'_' {
+                return None;
+            }
+        }
+
+        let value = &self.raw[marker + MARKER.len()..];
+        let token = value
+            .split(|character: char| character.is_ascii_whitespace() || character == ')')
+            .next()?;
+        RustcVersion::parse(token)
+    }
+}
+
+/// Numeric release component parsed from a rustc producer string.
+///
+/// Prerelease and build suffixes intentionally do not participate in ordering.
+/// The complete producer remains available through [`ProducerInfo::raw`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RustcVersion {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+
+impl RustcVersion {
+    pub const fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    /// Parse a rustc release token, accepting suffixes such as `-nightly`.
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut components = value.splitn(3, '.');
+        let major = components.next()?.parse().ok()?;
+        let minor = components.next()?.parse().ok()?;
+        let patch_and_suffix = components.next()?;
+        let patch_length = patch_and_suffix
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        if patch_length == 0 {
+            return None;
+        }
+
+        let patch = patch_and_suffix[..patch_length].parse().ok()?;
+        let suffix = &patch_and_suffix[patch_length..];
+        if !suffix.is_empty() && !suffix.starts_with(['-', '+']) {
+            return None;
+        }
+
+        Some(Self::new(major, minor, patch))
+    }
+}
+
+impl fmt::Display for RustcVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
 }
 
 /// Metadata that controls language-aware interpretation for one compilation unit.
@@ -61,6 +136,16 @@ pub struct CompilationUnitMetadata {
     pub dwarf_version: u16,
 }
 
+impl CompilationUnitMetadata {
+    /// Return the target CU's rustc release when its producer exposes one.
+    pub fn rustc_version(&self) -> Option<RustcVersion> {
+        if self.language != SourceLanguage::Rust {
+            return None;
+        }
+        self.producer.as_ref()?.rustc_version()
+    }
+}
+
 /// Stable origin for a type DIE.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TypeOrigin {
@@ -69,6 +154,16 @@ pub struct TypeOrigin {
     pub language: SourceLanguage,
     pub producer: Option<ProducerInfo>,
     pub dwarf_version: u16,
+}
+
+impl TypeOrigin {
+    /// Return the target type's rustc release when its CU exposes one.
+    pub fn rustc_version(&self) -> Option<RustcVersion> {
+        if self.language != SourceLanguage::Rust {
+            return None;
+        }
+        self.producer.as_ref()?.rustc_version()
+    }
 }
 
 impl From<CompilationUnitMetadata> for TypeOrigin {
@@ -288,7 +383,8 @@ pub struct TypeProjection {
 #[cfg(test)]
 mod tests {
     use super::{
-        ResolvedType, SourceLanguage, SyntheticTypeKind, TypeIdentity, TypeProjectionLayout,
+        CompilationUnitMetadata, ProducerInfo, ResolvedType, RustcVersion, SourceLanguage,
+        SyntheticTypeKind, TypeIdentity, TypeProjectionLayout,
     };
     use crate::{CuId, DieRef, ModuleId, TypeId, TypeInfo, VariableAccessSegment};
 
@@ -328,6 +424,51 @@ mod tests {
             SourceLanguage::Other(0x8abc)
         );
         assert_eq!(SourceLanguage::from_dwarf(None), SourceLanguage::Unknown);
+    }
+
+    #[test]
+    fn parses_rustc_versions_from_llvm_producers() {
+        let stable = ProducerInfo::new("clang LLVM (rustc version 1.88.0 (6b00bc388 2025-06-23))");
+        let nightly =
+            ProducerInfo::new("clang LLVM (rustc version 1.98.0-nightly (abc123 2026-05-30))");
+
+        assert_eq!(stable.rustc_version(), Some(RustcVersion::new(1, 88, 0)));
+        assert_eq!(nightly.rustc_version(), Some(RustcVersion::new(1, 98, 0)));
+        assert_eq!(
+            RustcVersion::parse("1.93.0-beta.1"),
+            Some(RustcVersion::new(1, 93, 0))
+        );
+    }
+
+    #[test]
+    fn rejects_non_rustc_and_malformed_producers() {
+        for producer in [
+            "clang version 18.1.8",
+            "myrustc version 1.88.0",
+            "my_rustc version 1.88.0",
+            "rustc version 1.88",
+            "rustc version 1.88.x",
+            "rustc version 1.88.0.1",
+        ] {
+            assert_eq!(ProducerInfo::new(producer).rustc_version(), None);
+        }
+    }
+
+    #[test]
+    fn exposes_rustc_versions_only_for_rust_compilation_units() {
+        let metadata = |language| CompilationUnitMetadata {
+            module: ModuleId(1),
+            cu: CuId(2),
+            language,
+            producer: Some(ProducerInfo::new("rustc version 1.88.0")),
+            dwarf_version: 5,
+        };
+
+        assert_eq!(
+            metadata(SourceLanguage::Rust).rustc_version(),
+            Some(RustcVersion::new(1, 88, 0))
+        );
+        assert_eq!(metadata(SourceLanguage::C).rustc_version(), None);
     }
 
     #[test]

@@ -54,6 +54,7 @@ test_*
 # Keep fixture compiler entrypoint tracked
 !e2e-tests/compile-fixtures.sh
 !e2e-tests/cache-fixtures.sh
+!e2e-tests/compile-rust-compat-fixtures.sh
 # Keep other C files in test fixtures but exclude random C files in root
 /*.c
 e2e-tests/tests/fixtures/complex_types_program/complex_types_program
@@ -69,6 +70,7 @@ e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program
 e2e-tests/tests/fixtures/member_pointer_program/member_pointer_program_o*
 e2e-tests/tests/fixtures/partitioned_ranges_program/partitioned_ranges_program
 e2e-tests/tests/fixtures/rust_global_program/target/
+e2e-tests/tests/fixtures/rust_compat_program/bin/
 e2e-tests/tests/fixtures/scalar_types_program/scalar_types_program
 e2e-tests/tests/fixtures/sample_program/sample_lib.o
 e2e-tests/tests/fixtures/sample_program/sample_program

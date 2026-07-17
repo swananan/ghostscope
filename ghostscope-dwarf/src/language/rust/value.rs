@@ -210,6 +210,15 @@ pub(super) fn resolve_value_layout(
         return None;
     }
 
+    // rust-gdb does not select printers from the target CU's rustc version.
+    // Its wrapper adds the invoking toolchain's `lib/rustlib/etc` directory,
+    // while the target only requests the generic loader through
+    // `.debug_gdb_scripts`. GhostScope may use `origin.rustc_version()` to
+    // prioritize candidates, but never as proof of a private layout: every
+    // branch below must validate type identity, member paths, offsets, and
+    // widths from the target's DWARF. Any semantic fact DWARF cannot express
+    // must be documented at the special case that relies on it.
+
     let TypeInfo::StructType { name, .. } = strip_type_aliases(&current.summary) else {
         return None;
     };
@@ -917,9 +926,10 @@ fn rust_ref_layout(root: &TypeInfo) -> Option<CompositeStructLayout> {
     // The rust-gdb providers in Rust 1.46, 1.60, 1.70, 1.81, 1.88, 1.93,
     // 1.95, and 1.98 use one provider for Ref and RefMut. It dereferences
     // `value` and reads `borrow.borrow.value.value`, with no version fallback.
-    // DWARF inspected from Rust 1.81 through 1.98 emits `value` as a NonNull
-    // wrapper rather than a raw pointer. Follow each concrete DWARF member and
-    // keep every pointer read explicit instead of assuming wrapper offsets.
+    // Rust 1.49 DWARF emits `value` as a raw pointer, while DWARF inspected
+    // from Rust 1.81 through 1.98 emits a one-member NonNull wrapper. Follow
+    // the concrete DIE in either case and keep every pointer read explicit
+    // instead of assuming wrapper offsets.
     let TypeInfo::StructType {
         size: root_size,
         members,
@@ -936,21 +946,22 @@ fn rust_ref_layout(root: &TypeInfo) -> Option<CompositeStructLayout> {
         return None;
     }
 
-    let value_wrapper_size = value_outer.member_type.size();
-    let value_pointer = sole_struct_member(&value_outer.member_type)?;
-    member_range(value_pointer, value_wrapper_size)?;
-    let TypeInfo::PointerType {
-        size: value_pointer_size,
-        ..
-    } = strip_type_aliases(&value_pointer.member_type)
-    else {
-        return None;
+    let mut value_path = vec![ProjectedPathSegment::Member(value_outer.name.clone())];
+    let value_pointer_size = match strip_type_aliases(&value_outer.member_type) {
+        TypeInfo::PointerType { size, .. } => *size,
+        TypeInfo::StructType { size, .. } => {
+            let value_pointer = sole_struct_member(&value_outer.member_type)?;
+            member_range(value_pointer, *size)?;
+            let TypeInfo::PointerType { size, .. } = strip_type_aliases(&value_pointer.member_type)
+            else {
+                return None;
+            };
+            value_path.push(ProjectedPathSegment::Member(value_pointer.name.clone()));
+            *size
+        }
+        _ => return None,
     };
-    let value_path = vec![
-        ProjectedPathSegment::Member(value_outer.name.clone()),
-        ProjectedPathSegment::Member(value_pointer.name.clone()),
-        ProjectedPathSegment::Dereference,
-    ];
+    value_path.push(ProjectedPathSegment::Dereference);
 
     let borrow_wrapper_size = borrow_outer.member_type.size();
     let borrow_pointer = sole_struct_member(&borrow_outer.member_type)?;
@@ -971,7 +982,7 @@ fn rust_ref_layout(root: &TypeInfo) -> Option<CompositeStructLayout> {
     ];
 
     let supported_pointer_width =
-        matches!(*value_pointer_size, 4 | 8) && value_pointer_size == borrow_pointer_size;
+        matches!(value_pointer_size, 4 | 8) && value_pointer_size == *borrow_pointer_size;
     if !supported_pointer_width {
         return None;
     }
@@ -3573,7 +3584,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_ref_guards_with_dwarf_derived_wrapper_members() {
+    fn recognizes_ref_guards_with_dwarf_derived_pointer_layouts() {
         let current = rust_ref_type(
             RefTestLayout {
                 name: "Ref<(i32, u16)>",
@@ -3624,6 +3635,37 @@ mod tests {
                     negative_label: "borrow_mut",
                 },
             }))
+        );
+
+        let mut legacy = current.clone();
+        let TypeInfo::StructType { members, .. } = &mut legacy.summary else {
+            unreachable!("test Ref is a struct")
+        };
+        let value = members
+            .iter_mut()
+            .find(|member| member.name == "value")
+            .expect("test Ref has a value member");
+        let pointer_type = {
+            let TypeInfo::StructType { members, .. } = &value.member_type else {
+                unreachable!("current test Ref value is a pointer wrapper")
+            };
+            let [pointer] = members.as_slice() else {
+                unreachable!("current test Ref value wrapper has one member")
+            };
+            pointer.member_type.clone()
+        };
+        value.member_type = pointer_type;
+        let Some(ValueLayout::CompositeStruct(legacy_layout)) =
+            resolve_value_layout(&legacy, Some("core::cell::Ref<(i32, u16)>"))
+        else {
+            panic!("legacy raw-pointer Ref layout should be recognized")
+        };
+        assert_eq!(
+            legacy_layout.fields[0].value_path,
+            vec![
+                ProjectedPathSegment::Member("value".to_string()),
+                ProjectedPathSegment::Dereference,
+            ]
         );
 
         let ref_mut = rust_ref_type(

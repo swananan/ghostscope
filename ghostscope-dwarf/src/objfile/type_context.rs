@@ -733,6 +733,10 @@ mod tests {
         assert_eq!(metadata.language, SourceLanguage::Rust);
         assert_eq!(metadata.dwarf_version, 5);
         assert_eq!(
+            metadata.rustc_version(),
+            Some(crate::RustcVersion::new(1, 88, 0))
+        );
+        assert_eq!(
             metadata
                 .producer
                 .as_ref()

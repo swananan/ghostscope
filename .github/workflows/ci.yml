@@ -100,6 +100,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.88.0
 
+      - name: Install Rust compatibility toolchains
+        run: |
+          rustup toolchain install \
+            --profile minimal \
+            1.49.0 \
+            1.93.0 \
+            nightly-2026-05-30
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -133,6 +141,9 @@ jobs:
       - name: Run workspace tests
         run: cargo test --all-features
         env:
+          GHOSTSCOPE_REQUIRE_RUST_COMPAT_TOOLCHAINS: 1
+          GHOSTSCOPE_RUST_COMPAT_TOOLCHAINS: >-
+            1.49.0,1.88.0,1.93.0,nightly-2026-05-30
           RUST_BACKTRACE: 1
 
   e2e:
@@ -155,6 +166,15 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Install Rust e2e compatibility toolchains
+        run: |
+          mapfile -t toolchains < <(
+            sed -e 's/[[:space:]]*#.*$//' \
+              -e '/^[[:space:]]*$/d' \
+              e2e-tests/rust-compat-toolchains.txt
+          )
+          rustup toolchain install --profile minimal "${toolchains[@]}"
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -185,7 +205,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: e2e-tests/.fixture-cache/fixture-binaries.tar
-          key: ${{ runner.os }}-${{ github.job }}-fixtures-${{ env.FIXTURE_COMPILER_CACHE_REV }}-${{ hashFiles('e2e-tests/cache-fixtures.sh', 'e2e-tests/compile-fixtures.sh', 'e2e-tests/tests/fixtures/**/*.c', 'e2e-tests/tests/fixtures/**/*.h', 'e2e-tests/tests/fixtures/**/*.cpp', 'e2e-tests/tests/fixtures/**/*.rs', 'e2e-tests/tests/fixtures/**/Makefile', 'e2e-tests/tests/fixtures/**/Cargo.toml', 'e2e-tests/tests/fixtures/**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ github.job }}-fixtures-${{ env.FIXTURE_COMPILER_CACHE_REV }}-${{ hashFiles('e2e-tests/cache-fixtures.sh', 'e2e-tests/compile-fixtures.sh', 'e2e-tests/compile-rust-compat-fixtures.sh', 'e2e-tests/rust-compat-toolchains.txt', 'e2e-tests/tests/fixtures/**/*.c', 'e2e-tests/tests/fixtures/**/*.h', 'e2e-tests/tests/fixtures/**/*.cpp', 'e2e-tests/tests/fixtures/**/*.rs', 'e2e-tests/tests/fixtures/**/Makefile', 'e2e-tests/tests/fixtures/**/Cargo.toml', 'e2e-tests/tests/fixtures/**/Cargo.lock') }}
 
       - name: Restore fixture archive
         if: steps.fixture-cache.outputs.cache-hit == 'true'
@@ -200,13 +220,21 @@ jobs:
             "$FIXTURE_COMPILER_IMAGE" \
             bash ./compile-fixtures.sh
           sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}/e2e-tests/tests/fixtures"
-          bash ./e2e-tests/cache-fixtures.sh pack
+
+      - name: Compile Rust target-compiler matrix fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: bash ./e2e-tests/compile-rust-compat-fixtures.sh
+
+      - name: Pack fixture archive
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: bash ./e2e-tests/cache-fixtures.sh pack
 
       - name: Build GhostScope CLI and dwarf-tool
         run: cargo build -p ghostscope -p dwarf-tool --all-features
 
       - name: Run e2e
         env:
+          GHOSTSCOPE_REQUIRE_RUST_E2E_TOOLCHAINS: 1
           GHOSTSCOPE_PRESERVE_PRECOMPILED_FIXTURES: 1
           RUST_BACKTRACE: 1
         run: sudo -E "$(which cargo)" test -p ghostscope-e2e-tests --tests --all-features -- --nocapture
