@@ -555,6 +555,36 @@ trace observe_boxed_str {
 }
 
 #[tokio::test]
+async fn test_rust_script_print_os_string_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_os_string {
+    print "ROS:{}:{}:{}", value, invalid, empty;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("ROS:\"os from rust\":\"os\\xffx\":\"\"")),
+        "Expected Rust OsString output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_str_respects_mem_dump_cap() -> anyhow::Result<()> {
     init();
 

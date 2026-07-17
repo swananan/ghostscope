@@ -267,6 +267,10 @@ impl DwarfAnalyzer {
                 crate::ValuePresentation::Utf8String,
                 ValueCapturePlan::IndirectBytes { data, length },
             ),
+            crate::language::IndirectSequenceKind::ByteString => (
+                crate::ValuePresentation::ByteString,
+                ValueCapturePlan::IndirectBytes { data, length },
+            ),
             crate::language::IndirectSequenceKind::PointerTarget => {
                 let TypeInfo::PointerType { target_type, .. } =
                     strip_type_aliases(&data.resolved_type.summary)

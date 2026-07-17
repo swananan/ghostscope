@@ -2,11 +2,14 @@
 #![allow(static_mut_refs)]
 
 use std::{
+    ffi::OsString,
     marker::{PhantomData, PhantomPinned},
     num::NonZeroU32,
     thread,
     time::Duration,
 };
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 
 pub static mut G_COUNTER: i32 = 0;
 pub static G_MESSAGE: &str = "hello from rust";
@@ -183,6 +186,15 @@ pub mod math {
     pub fn observe_boxed_str(value: Box<str>, empty: Box<str>) -> usize {
         value.len() + empty.len()
     }
+
+    #[inline(never)]
+    pub fn observe_os_string(
+        value: std::ffi::OsString,
+        invalid: std::ffi::OsString,
+        empty: std::ffi::OsString,
+    ) -> usize {
+        value.len() + invalid.len() + empty.len()
+    }
 }
 
 fn touch_globals() -> i32 {
@@ -286,6 +298,11 @@ fn main() {
     for _ in 0..50000 {
         acc += math::do_stuff(3) as i64;
         acc += math::observe_boxed_str("boxed from rust".into(), "".into()) as i64;
+        acc += math::observe_os_string(
+            OsString::from("os from rust"),
+            OsString::from_vec(vec![b'o', b's', 0xff, b'x']),
+            OsString::new(),
+        ) as i64;
         acc += touch_globals() as i64;
         thread::sleep(Duration::from_millis(1000));
     }

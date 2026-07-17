@@ -763,6 +763,7 @@ impl FormatPrinter {
                 element_type,
                 element_stride,
             } => Self::format_sequence_payload(data, element_type, *element_stride),
+            ValuePresentation::ByteString => Self::format_byte_string_payload(data),
         }
     }
 
@@ -788,7 +789,7 @@ impl FormatPrinter {
     ) -> Option<&'a [u8]> {
         match presentation {
             ValuePresentation::Dwarf => Some(data),
-            ValuePresentation::Utf8String => {
+            ValuePresentation::Utf8String | ValuePresentation::ByteString => {
                 let prefix = data.get(..INDIRECT_BYTES_LENGTH_PREFIX_SIZE)?;
                 let original_len = u64::from_le_bytes(prefix.try_into().ok()?);
                 let payload = &data[INDIRECT_BYTES_LENGTH_PREFIX_SIZE..];
@@ -826,6 +827,44 @@ impl FormatPrinter {
                 format!("<INVALID_UTF8:{escaped}>")
             }
         }
+    }
+
+    fn format_byte_string_payload(data: &[u8]) -> String {
+        let Some(captured) = Self::presentation_payload_bytes(data, &ValuePresentation::ByteString)
+        else {
+            return "<INVALID_BYTE_STRING_PAYLOAD>".to_string();
+        };
+
+        let mut output = String::from("\"");
+        let mut remaining = captured;
+        while !remaining.is_empty() {
+            match std::str::from_utf8(remaining) {
+                Ok(valid) => {
+                    for character in valid.chars() {
+                        output.extend(character.escape_debug());
+                    }
+                    break;
+                }
+                Err(error) => {
+                    let valid_len = error.valid_up_to();
+                    let valid = std::str::from_utf8(&remaining[..valid_len])
+                        .expect("UTF-8 error valid_up_to identifies valid bytes");
+                    for character in valid.chars() {
+                        output.extend(character.escape_debug());
+                    }
+
+                    let invalid_len = error
+                        .error_len()
+                        .unwrap_or_else(|| remaining.len().saturating_sub(valid_len));
+                    for byte in &remaining[valid_len..valid_len + invalid_len] {
+                        output.push_str(&format!("\\x{byte:02x}"));
+                    }
+                    remaining = &remaining[valid_len + invalid_len..];
+                }
+            }
+        }
+        output.push('"');
+        output
     }
 
     fn parse_sequence_payload(data: &[u8], element_stride: u64) -> Option<(u64, u64, &[u8])> {
@@ -1590,6 +1629,50 @@ mod tests {
     }
 
     #[test]
+    fn test_byte_string_presentation_preserves_utf8_and_escapes_invalid_bytes() {
+        let valid = indirect_bytes_payload(4, "aé\0".as_bytes());
+        let invalid = indirect_bytes_payload(3, b"a\xffb");
+
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(
+                &valid,
+                &rust_str_type(),
+                &ValuePresentation::ByteString,
+            ),
+            "\"aé\\0\""
+        );
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(
+                &invalid,
+                &rust_str_type(),
+                &ValuePresentation::ByteString,
+            ),
+            "\"a\\xffb\""
+        );
+    }
+
+    #[test]
+    fn test_byte_string_presentation_retains_truncation_status() {
+        let mut trace_context = TraceContext::new();
+        let type_idx = trace_context
+            .add_type_with_presentation(rust_str_type(), ValuePresentation::ByteString)
+            .unwrap();
+        let name_idx = trace_context.add_variable_name("path".to_string()).unwrap();
+
+        assert_eq!(
+            FormatPrinter::format_complex_variable_with_status(
+                name_idx,
+                type_idx,
+                "",
+                &indirect_bytes_payload(4, b"a\xff"),
+                VariableStatus::Truncated as u8,
+                &trace_context,
+            ),
+            "path = \"a\\xff\" <truncated>"
+        );
+    }
+
+    #[test]
     fn test_utf8_string_presentation_preserves_embedded_wrapper_separator() {
         let mut trace_context = TraceContext::new();
         let format_idx = trace_context.add_string("{}".to_string()).unwrap();
@@ -1638,6 +1721,32 @@ mod tests {
                 &trace_context,
             ),
             "abc|61 62 63"
+        );
+    }
+
+    #[test]
+    fn test_raw_specs_decode_byte_string_payload() {
+        let mut trace_context = TraceContext::new();
+        let format_idx = trace_context.add_string("{:s}|{:x}".to_string()).unwrap();
+        let type_idx = trace_context
+            .add_type_with_presentation(rust_str_type(), ValuePresentation::ByteString)
+            .unwrap();
+        let name_idx = trace_context.add_variable_name("path".to_string()).unwrap();
+        let variable = ParsedComplexVariable {
+            var_name_index: name_idx,
+            type_index: type_idx,
+            access_path: String::new(),
+            status: VariableStatus::Ok as u8,
+            data: indirect_bytes_payload(3, b"a\xffb"),
+        };
+
+        assert_eq!(
+            FormatPrinter::format_complex_print_data(
+                format_idx,
+                &[variable.clone(), variable],
+                &trace_context,
+            ),
+            "a\\xffb|61 ff 62"
         );
     }
 
