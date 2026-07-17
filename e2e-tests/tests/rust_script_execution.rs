@@ -435,6 +435,85 @@ async fn test_rust_slice_value_plan_uses_dwarf_pointer_target() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn test_rust_nonzero_value_plan_projects_dwarf_scalar() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let (_, read_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_NONZERO_U32",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_NONZERO_U32 read plan"))?;
+    let resolved_type = analyzer
+        .resolved_type_for_plan(&read_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected NonZeroU32 type"))?;
+    let value_plan = analyzer
+        .value_read_plan(&resolved_type, Some(&binary_path))?
+        .ok_or_else(|| anyhow::anyhow!("expected NonZeroU32 value plan"))?;
+
+    assert_eq!(
+        value_plan.presentation,
+        ghostscope_dwarf::ValuePresentation::Dwarf
+    );
+    let ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value } = value_plan.capture else {
+        anyhow::bail!("expected projected value capture for NonZeroU32")
+    };
+    assert_eq!(
+        value.layout,
+        ghostscope_dwarf::TypeProjectionLayout::Member { offset: 0 }
+    );
+    assert!(matches!(
+        value.resolved_type.summary,
+        ghostscope_dwarf::TypeInfo::BaseType {
+            ref name,
+            size: 4,
+            encoding,
+        } if name == "u32"
+            && encoding == ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16
+    ));
+
+    let parameter_plan = analyzer
+        .lookup_function_addresses("observe_nonzero")
+        .into_iter()
+        .find_map(|address| {
+            let context = analyzer.resolve_pc(&address).ok()?;
+            analyzer.plan_variable_by_name(&context, "value").ok()?
+        })
+        .ok_or_else(|| anyhow::anyhow!("expected observe_nonzero value plan"))?;
+    let parameter_type = analyzer
+        .resolved_type_for_plan(&parameter_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected NonZeroU32 parameter type"))?;
+    assert!(matches!(
+        analyzer
+            .value_read_plan(&parameter_type, Some(&binary_path))?
+            .map(|plan| plan.capture),
+        Some(ghostscope_dwarf::ValueCapturePlan::ProjectedValue { .. })
+    ));
+
+    let (_, user_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_USER_NONZERO",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_USER_NONZERO read plan"))?;
+    let user_type = analyzer
+        .resolved_type_for_plan(&user_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected user NonZero type"))?;
+    assert!(
+        analyzer
+            .value_read_plan(&user_type, Some(&binary_path))?
+            .is_none(),
+        "user-defined NonZero must retain DWARF presentation"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_str_values() -> anyhow::Result<()> {
     init();
 
@@ -586,6 +665,42 @@ trace do_stuff {
             .lines()
             .any(|line| line.contains("RDEQUE_ZST:[(), (), ()]")),
         "Expected Rust VecDeque ZST output: stderr={stderr} stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_nonzero_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    print "RNONZERO:{}:{}:{}", G_NONZERO_U32, G_NONZERO_I32, G_NONZERO_U128;
+}
+trace observe_nonzero {
+    print "RNONZERO_ARG:{}", value;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    let expected_global = concat!("RNONZERO:7:-9:", "340282366920938463463374607431768211454");
+    assert!(
+        stdout.lines().any(|line| line.contains(expected_global)),
+        "Expected Rust NonZero global output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains("RNONZERO_ARG:23")),
+        "Expected Rust NonZero argument output: {stdout}"
     );
     assert!(
         !stdout.contains("ExprError"),

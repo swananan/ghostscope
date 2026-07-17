@@ -1,6 +1,12 @@
 use crate::{strip_type_aliases, ResolvedType, SourceLanguage, TypeInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ValueLayout {
+    IndirectSequence(IndirectSequenceLayout),
+    ProjectedValue { value_path: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndirectSequenceLayout {
     pub(crate) data_path: Vec<String>,
     pub(crate) addressing: IndirectSequenceAddressing,
@@ -76,14 +82,15 @@ pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
                     || name == "OsString"
                     || is_short_vec_name(name)
                     || is_short_vec_deque_name(name)
-                    || is_short_box_str_name(name))
+                    || is_short_box_str_name(name)
+                    || is_short_nonzero_name(name))
     })
 }
 
 pub(super) fn resolve_value_layout(
     current: &ResolvedType,
     dwarf_qualified_name: Option<&str>,
-) -> Option<IndirectSequenceLayout> {
+) -> Option<ValueLayout> {
     if current.origin.as_ref()?.language != SourceLanguage::Rust {
         return None;
     }
@@ -92,6 +99,11 @@ pub(super) fn resolve_value_layout(
         return None;
     };
 
+    if is_std_nonzero(name, dwarf_qualified_name) {
+        return rust_nonzero_value_path(&current.summary)
+            .map(|value_path| ValueLayout::ProjectedValue { value_path });
+    }
+
     // rustc's bundled GDB printers have treated slice-like DWARF values as
     // `data_ptr` plus `length` since Rust 1.0, without field-name compatibility
     // branches. Older printers also removed explicit `'static` lifetimes before
@@ -99,7 +111,7 @@ pub(super) fn resolve_value_layout(
     // ABI guarantees, so retain the language and structural checks around them.
     // See rust-lang/rust's `src/etc/gdb_rust_pretty_printing.py` and
     // `src/etc/gdb_providers.py`.
-    if matches!(
+    let sequence = if matches!(
         name.as_str(),
         "&str" | "&mut str" | "&'static str" | "&'static mut str"
     ) {
@@ -142,7 +154,9 @@ pub(super) fn resolve_value_layout(
         rust_vec_deque_layout(&current.summary)
     } else {
         None
-    }
+    };
+
+    sequence.map(ValueLayout::IndirectSequence)
 }
 
 fn is_slice_name(name: &str) -> bool {
@@ -175,6 +189,60 @@ fn is_short_vec_deque_name(name: &str) -> bool {
 
 fn is_short_box_str_name(name: &str) -> bool {
     box_str_arguments(name, "Box<").is_some()
+}
+
+fn is_short_nonzero_name(name: &str) -> bool {
+    is_generic_nonzero_name(name) || is_legacy_nonzero_name(name)
+}
+
+fn is_generic_nonzero_name(name: &str) -> bool {
+    name.strip_prefix("NonZero<")
+        .and_then(|arguments| arguments.strip_suffix('>'))
+        .is_some_and(|arguments| !arguments.is_empty())
+}
+
+fn is_legacy_nonzero_name(name: &str) -> bool {
+    matches!(
+        name,
+        "NonZeroI8"
+            | "NonZeroI16"
+            | "NonZeroI32"
+            | "NonZeroI64"
+            | "NonZeroI128"
+            | "NonZeroIsize"
+            | "NonZeroU8"
+            | "NonZeroU16"
+            | "NonZeroU32"
+            | "NonZeroU64"
+            | "NonZeroU128"
+            | "NonZeroUsize"
+    )
+}
+
+fn is_std_nonzero(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_nonzero_name(name)
+        || (is_short_nonzero_name(name) && dwarf_qualified_name.is_some_and(is_std_nonzero_name))
+}
+
+fn is_std_nonzero_name(name: &str) -> bool {
+    let Some(path) = name.strip_prefix("core::") else {
+        return false;
+    };
+    let Some((module, type_name)) = path.rsplit_once("::") else {
+        return false;
+    };
+
+    let valid_module = !module.is_empty()
+        && module.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        });
+    valid_module
+        && (is_generic_nonzero_name(type_name)
+            || ((module == "num" || module.starts_with("num::"))
+                && is_legacy_nonzero_name(type_name)))
 }
 
 fn is_std_box_str(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
@@ -302,6 +370,44 @@ fn is_std_vec_deque_name(name: &str) -> bool {
         })
         && !arguments.is_empty()
         && arguments.ends_with('>')
+}
+
+fn rust_nonzero_value_path(root: &TypeInfo) -> Option<Vec<String>> {
+    // Rust 1.65-1.78 rust-gdb follows one sole member for legacy names such as
+    // NonZeroU32. Rust 1.79 through the current 1.98 nightly follows a second
+    // sole member for generic NonZero<T>. Neither printer depends on field
+    // names, so derive the path, offsets, and widths from the concrete DIE.
+    let TypeInfo::StructType { members, .. } = strip_type_aliases(root) else {
+        return None;
+    };
+    let [outer] = members.as_slice() else {
+        return None;
+    };
+    let mut value_path = vec![outer.name.clone()];
+    if let TypeInfo::StructType {
+        members: inner_members,
+        ..
+    } = strip_type_aliases(&outer.member_type)
+    {
+        let [inner] = inner_members.as_slice() else {
+            return None;
+        };
+        value_path.push(inner.name.clone());
+    };
+    let value = resolve_member_path(root, &value_path)?;
+    let TypeInfo::BaseType { size, encoding, .. } = strip_type_aliases(value.member_type) else {
+        return None;
+    };
+    let integer_encoding = matches!(
+        *encoding,
+        encoding if encoding == gimli::DW_ATE_signed.0 as u16
+            || encoding == gimli::DW_ATE_signed_char.0 as u16
+            || encoding == gimli::DW_ATE_unsigned.0 as u16
+            || encoding == gimli::DW_ATE_unsigned_char.0 as u16
+    );
+    let value_end = value.offset.checked_add(*size)?;
+
+    (*size > 0 && integer_encoding && value_end <= root.size()).then_some(value_path)
 }
 
 fn rust_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
@@ -754,6 +860,76 @@ mod tests {
         }
     }
 
+    fn indirect_contiguous(
+        data_path: Vec<String>,
+        length_path: Vec<String>,
+        kind: IndirectSequenceKind,
+    ) -> ValueLayout {
+        ValueLayout::IndirectSequence(IndirectSequenceLayout::contiguous(
+            data_path,
+            length_path,
+            kind,
+        ))
+    }
+
+    fn indirect_ring(
+        data_path: Vec<String>,
+        start_path: Vec<String>,
+        length_path: Vec<String>,
+        length_kind: RingSequenceLengthKind,
+        capacity_path: Vec<String>,
+        kind: IndirectSequenceKind,
+    ) -> ValueLayout {
+        ValueLayout::IndirectSequence(IndirectSequenceLayout::ring(
+            data_path,
+            start_path,
+            length_path,
+            length_kind,
+            capacity_path,
+            kind,
+        ))
+    }
+
+    fn rust_nonzero_type(
+        name: &str,
+        outer_field: &str,
+        inner_field: &str,
+        value_type: TypeInfo,
+        language: SourceLanguage,
+    ) -> ResolvedType {
+        let inner = single_member_struct("NonZeroInner", inner_field, value_type);
+        ResolvedType::new(
+            single_member_struct(name, outer_field, inner),
+            TypeIdentity::Unknown,
+            Some(TypeOrigin {
+                module: ModuleId(0),
+                cu: CuId(0),
+                language,
+                producer: None,
+                dwarf_version: 5,
+            }),
+        )
+    }
+
+    fn rust_legacy_nonzero_type(
+        name: &str,
+        field: &str,
+        value_type: TypeInfo,
+        language: SourceLanguage,
+    ) -> ResolvedType {
+        ResolvedType::new(
+            single_member_struct(name, field, value_type),
+            TypeIdentity::Unknown,
+            Some(TypeOrigin {
+                module: ModuleId(0),
+                cu: CuId(0),
+                language,
+                producer: None,
+                dwarf_version: 4,
+            }),
+        )
+    }
+
     fn rust_string_type(
         name: &str,
         language: SourceLanguage,
@@ -965,7 +1141,7 @@ mod tests {
 
         assert_eq!(
             resolve_value_layout(&current, None),
-            Some(IndirectSequenceLayout::contiguous(
+            Some(indirect_contiguous(
                 field_path(&["data_ptr"]),
                 field_path(&["length"]),
                 IndirectSequenceKind::Utf8String,
@@ -997,7 +1173,7 @@ mod tests {
 
             assert_eq!(
                 resolve_value_layout(&current, None),
-                Some(IndirectSequenceLayout::contiguous(
+                Some(indirect_contiguous(
                     field_path(&["data_ptr"]),
                     field_path(&["length"]),
                     IndirectSequenceKind::PointerTarget,
@@ -1024,7 +1200,7 @@ mod tests {
 
             assert_eq!(
                 resolve_value_layout(&current, None),
-                Some(IndirectSequenceLayout::contiguous(
+                Some(indirect_contiguous(
                     field_path(&["data_ptr"]),
                     field_path(&["length"]),
                     IndirectSequenceKind::Utf8String,
@@ -1097,7 +1273,7 @@ mod tests {
 
             assert_eq!(
                 resolve_value_layout(&current, None),
-                Some(IndirectSequenceLayout::contiguous(
+                Some(indirect_contiguous(
                     field_path(data_fields),
                     field_path(length_fields),
                     IndirectSequenceKind::ByteString,
@@ -1192,12 +1368,15 @@ mod tests {
 
         assert_eq!(
             layout,
-            IndirectSequenceLayout::contiguous(
+            indirect_contiguous(
                 field_path(&["vec", "buf", "inner", "ptr", "pointer", "pointer"]),
                 field_path(&["vec", "len"]),
                 IndirectSequenceKind::Utf8String,
             )
         );
+        let ValueLayout::IndirectSequence(layout) = layout else {
+            panic!("String must use indirect sequence layout")
+        };
         assert_eq!(
             resolve_member_path(&current.summary, &layout.data_path)
                 .expect("data member")
@@ -1227,7 +1406,7 @@ mod tests {
 
         assert_eq!(
             resolve_value_layout(&current, None),
-            Some(IndirectSequenceLayout::contiguous(
+            Some(indirect_contiguous(
                 field_path(&["vec", "buf", "inner", "ptr", "pointer"]),
                 field_path(&["vec", "len"]),
                 IndirectSequenceKind::Utf8String,
@@ -1247,7 +1426,7 @@ mod tests {
 
         assert_eq!(
             resolve_value_layout(&current, None),
-            Some(IndirectSequenceLayout::contiguous(
+            Some(indirect_contiguous(
                 field_path(&["vec", "buf", "ptr", "pointer", "pointer"]),
                 field_path(&["vec", "len"]),
                 IndirectSequenceKind::Utf8String,
@@ -1296,7 +1475,7 @@ mod tests {
 
         assert_eq!(
             resolve_value_layout(&current, Some("alloc::vec::Vec<i32, alloc::alloc::Global>")),
-            Some(IndirectSequenceLayout::contiguous(
+            Some(indirect_contiguous(
                 field_path(&["buf", "inner", "ptr", "pointer", "pointer"]),
                 field_path(&["len"]),
                 IndirectSequenceKind::TypeParameter { index: 0 },
@@ -1316,7 +1495,7 @@ mod tests {
 
         assert_eq!(
             resolve_value_layout(&current, None),
-            Some(IndirectSequenceLayout::contiguous(
+            Some(indirect_contiguous(
                 field_path(&["buf", "ptr", "pointer", "pointer"]),
                 field_path(&["len"]),
                 IndirectSequenceKind::TypeParameter { index: 0 },
@@ -1339,7 +1518,7 @@ mod tests {
                 &current,
                 Some("alloc::collections::vec_deque::VecDeque<i32, alloc::alloc::Global>"),
             ),
-            Some(IndirectSequenceLayout::ring(
+            Some(indirect_ring(
                 field_path(&["buf", "inner", "ptr", "pointer", "pointer"]),
                 field_path(&["head", "__0"]),
                 field_path(&["len"]),
@@ -1359,7 +1538,7 @@ mod tests {
         });
         assert_eq!(
             resolve_value_layout(&pre_raw_vec_inner, None),
-            Some(IndirectSequenceLayout::ring(
+            Some(indirect_ring(
                 field_path(&["buf", "ptr", "pointer", "pointer"]),
                 field_path(&["head"]),
                 field_path(&["len"]),
@@ -1379,7 +1558,7 @@ mod tests {
         });
         assert_eq!(
             resolve_value_layout(&legacy, None),
-            Some(IndirectSequenceLayout::ring(
+            Some(indirect_ring(
                 field_path(&["buf", "ptr", "pointer", "pointer"]),
                 field_path(&["tail"]),
                 field_path(&["head"]),
@@ -1419,6 +1598,106 @@ mod tests {
 
         assert_eq!(resolve_value_layout(&current, Some("app::Vec<i32>")), None);
         assert_eq!(resolve_value_layout(&current, None), None);
+    }
+
+    #[test]
+    fn recognizes_nonzero_by_namespace_and_unique_member_structure() {
+        let current = rust_nonzero_type(
+            "NonZero<u32>",
+            "outer_from_dwarf",
+            "inner_from_dwarf",
+            unsigned_type("u32", 4),
+            SourceLanguage::Rust,
+        );
+
+        assert_eq!(
+            resolve_value_layout(&current, Some("core::num::nonzero::NonZero<u32>"),),
+            Some(ValueLayout::ProjectedValue {
+                value_path: field_path(&["outer_from_dwarf", "inner_from_dwarf"]),
+            })
+        );
+
+        let legacy = rust_legacy_nonzero_type(
+            "NonZeroU32",
+            "legacy_field_from_dwarf",
+            unsigned_type("u32", 4),
+            SourceLanguage::Rust,
+        );
+        assert_eq!(
+            resolve_value_layout(&legacy, Some("core::num::nonzero::NonZeroU32"),),
+            Some(ValueLayout::ProjectedValue {
+                value_path: field_path(&["legacy_field_from_dwarf"]),
+            })
+        );
+
+        let fully_qualified_legacy = rust_legacy_nonzero_type(
+            "core::num::NonZeroI64",
+            "__0",
+            TypeInfo::BaseType {
+                name: "i64".to_string(),
+                size: 8,
+                encoding: gimli::DW_ATE_signed.0 as u16,
+            },
+            SourceLanguage::Rust,
+        );
+        assert!(resolve_value_layout(&fully_qualified_legacy, None).is_some());
+
+        let fully_qualified = rust_nonzero_type(
+            "core::num::nonzero::NonZero<i128>",
+            "__0",
+            "__0",
+            TypeInfo::BaseType {
+                name: "i128".to_string(),
+                size: 16,
+                encoding: gimli::DW_ATE_signed.0 as u16,
+            },
+            SourceLanguage::Rust,
+        );
+        assert!(resolve_value_layout(&fully_qualified, None).is_some());
+    }
+
+    #[test]
+    fn rejects_nonzero_lookalikes_and_invalid_layouts() {
+        let current = rust_nonzero_type(
+            "NonZero<u32>",
+            "__0",
+            "__0",
+            unsigned_type("u32", 4),
+            SourceLanguage::Rust,
+        );
+        assert_eq!(
+            resolve_value_layout(&current, Some("app::NonZero<u32>")),
+            None
+        );
+        assert_eq!(resolve_value_layout(&current, None), None);
+
+        let legacy = rust_legacy_nonzero_type(
+            "NonZeroU32",
+            "__0",
+            unsigned_type("u32", 4),
+            SourceLanguage::Rust,
+        );
+        assert_eq!(resolve_value_layout(&legacy, Some("app::NonZeroU32")), None);
+        assert_eq!(resolve_value_layout(&legacy, None), None);
+
+        let mut invalid = current.clone();
+        let TypeInfo::StructType { members, .. } = &mut invalid.summary else {
+            unreachable!("test NonZero is a struct")
+        };
+        members.push(member("extra", unsigned_type("u32", 4), 0));
+        assert_eq!(
+            resolve_value_layout(&invalid, Some("core::num::nonzero::NonZero<u32>"),),
+            None
+        );
+
+        let non_rust = rust_nonzero_type(
+            "core::num::nonzero::NonZero<u32>",
+            "__0",
+            "__0",
+            unsigned_type("u32", 4),
+            SourceLanguage::C,
+        );
+        assert_eq!(resolve_value_layout(&non_rust, None), None);
     }
 
     #[test]
@@ -1498,6 +1777,32 @@ mod tests {
             8,
             true,
             None,
+        )));
+        assert!(requires_dwarf_qualified_name(&rust_nonzero_type(
+            "NonZero<u32>",
+            "__0",
+            "__0",
+            unsigned_type("u32", 4),
+            SourceLanguage::Rust,
+        )));
+        assert!(!requires_dwarf_qualified_name(&rust_nonzero_type(
+            "core::num::nonzero::NonZero<u32>",
+            "__0",
+            "__0",
+            unsigned_type("u32", 4),
+            SourceLanguage::Rust,
+        )));
+        assert!(requires_dwarf_qualified_name(&rust_legacy_nonzero_type(
+            "NonZeroU32",
+            "__0",
+            unsigned_type("u32", 4),
+            SourceLanguage::Rust,
+        )));
+        assert!(!requires_dwarf_qualified_name(&rust_legacy_nonzero_type(
+            "core::num::NonZeroU32",
+            "__0",
+            unsigned_type("u32", 4),
+            SourceLanguage::Rust,
         )));
     }
 }

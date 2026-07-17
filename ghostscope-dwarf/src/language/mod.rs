@@ -5,14 +5,13 @@ mod rust;
 use crate::{semantics::PlanError, SourceLanguage, TypeOrigin, VariableAccessSegment};
 
 pub(crate) use rust::{
-    IndirectSequenceAddressing, IndirectSequenceKind, IndirectSequenceLayout,
-    RingSequenceLengthKind,
+    IndirectSequenceAddressing, IndirectSequenceKind, RingSequenceLengthKind, ValueLayout,
 };
 
 pub(crate) fn resolve_value_layout(
     current: &crate::ResolvedType,
     dwarf_qualified_name: Option<&str>,
-) -> Option<IndirectSequenceLayout> {
+) -> Option<ValueLayout> {
     rust::resolve_value_layout(current, dwarf_qualified_name)
 }
 

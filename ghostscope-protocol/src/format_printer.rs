@@ -1273,6 +1273,10 @@ impl FormatPrinter {
                         "<INVALID_I64>".to_string()
                     }
                 }
+                16 => match data.get(..16).and_then(|bytes| bytes.try_into().ok()) {
+                    Some(bytes) => i128::from_le_bytes(bytes).to_string(),
+                    None => "<INVALID_I128>".to_string(),
+                },
                 _ => format!("<UNSUPPORTED_SIGNED_SIZE_{size}>"),
             }
         } else if encoding == gimli::constants::DW_ATE_unsigned.0 as u16
@@ -1312,6 +1316,10 @@ impl FormatPrinter {
                         "<INVALID_U64>".to_string()
                     }
                 }
+                16 => match data.get(..16).and_then(|bytes| bytes.try_into().ok()) {
+                    Some(bytes) => u128::from_le_bytes(bytes).to_string(),
+                    None => "<INVALID_U128>".to_string(),
+                },
                 _ => format!("<UNSUPPORTED_UNSIGNED_SIZE_{size}>"),
             }
         } else {
@@ -2014,6 +2022,31 @@ mod tests {
                 &trace_context,
             ),
             "values = <truncated>"
+        );
+    }
+
+    #[test]
+    fn formats_128_bit_dwarf_integers() {
+        let signed = TypeInfo::BaseType {
+            name: "i128".to_string(),
+            size: 16,
+            encoding: gimli::constants::DW_ATE_signed.0 as u16,
+        };
+        let unsigned = TypeInfo::BaseType {
+            name: "u128".to_string(),
+            size: 16,
+            encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+        };
+        let signed_value = -170_141_183_460_469_231_731_687_303_715_884_105_727_i128;
+        let unsigned_value = 340_282_366_920_938_463_463_374_607_431_768_211_454_u128;
+
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&signed_value.to_le_bytes(), &signed),
+            signed_value.to_string()
+        );
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&unsigned_value.to_le_bytes(), &unsigned),
+            unsigned_value.to_string()
         );
     }
 

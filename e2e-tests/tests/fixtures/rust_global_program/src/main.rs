@@ -5,7 +5,7 @@ use std::{
     collections::VecDeque,
     ffi::OsString,
     marker::{PhantomData, PhantomPinned},
-    num::NonZeroU32,
+    num::{NonZeroI32, NonZeroU128, NonZeroU32},
     thread,
     time::Duration,
 };
@@ -29,6 +29,10 @@ pub static mut G_VEC_DEQUE_UNIT: VecDeque<()> = VecDeque::new();
 pub static mut G_SLICE_I32: &[i32] = &[];
 pub static mut G_MUT_SLICE_U16: &mut [u16] = &mut [];
 pub static mut G_EMPTY_SLICE: &[i32] = &[];
+pub static G_NONZERO_U32: NonZeroU32 = NonZeroU32::new(7).unwrap();
+pub static G_NONZERO_I32: NonZeroI32 = NonZeroI32::new(-9).unwrap();
+pub static G_NONZERO_U128: NonZeroU128 =
+    NonZeroU128::new(340_282_366_920_938_463_463_374_607_431_768_211_454).unwrap();
 
 pub mod user_types {
     pub struct String {
@@ -62,6 +66,10 @@ pub mod user_types {
     pub struct NonNull<T> {
         pub pointer: *mut T,
     }
+
+    pub struct NonZero<T>(pub NonZeroInner<T>);
+
+    pub struct NonZeroInner<T>(pub T);
 }
 
 pub static mut G_USER_STRING: user_types::String = user_types::String {
@@ -82,6 +90,9 @@ pub static mut G_USER_VEC: user_types::Vec<i32> = user_types::Vec {
     },
     len: 0,
 };
+
+pub static G_USER_NONZERO: user_types::NonZero<u32> =
+    user_types::NonZero(user_types::NonZeroInner(11));
 
 #[repr(C)]
 pub struct Config {
@@ -207,6 +218,11 @@ pub mod math {
     ) -> usize {
         wrapped.len() + contiguous.len() + empty.len()
     }
+
+    #[inline(never)]
+    pub fn observe_nonzero(value: std::num::NonZeroU32) -> u32 {
+        value.get()
+    }
 }
 
 fn wrapped_vec_deque() -> VecDeque<i32> {
@@ -300,6 +316,10 @@ fn touch_globals() -> i32 {
             + G_SLICE_I32.len() as i64
             + G_MUT_SLICE_U16.len() as i64
             + G_EMPTY_SLICE.len() as i64
+            + G_NONZERO_U32.get() as i64
+            + G_NONZERO_I32.get() as i64
+            + G_NONZERO_U128.get() as i64
+            + G_USER_NONZERO.0.0 as i64
             + G_USER_VEC.len as i64
             + GLOBAL_PAIRS[0].0 as i64
             + union_value as i64
@@ -342,6 +362,7 @@ fn main() {
             VecDeque::from([7_u16, 8, 9]),
             VecDeque::new(),
         ) as i64;
+        acc += math::observe_nonzero(NonZeroU32::new(23).unwrap()) as i64;
         acc += touch_globals() as i64;
         thread::sleep(Duration::from_millis(1000));
     }

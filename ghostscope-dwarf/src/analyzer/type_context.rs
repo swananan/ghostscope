@@ -257,6 +257,17 @@ impl DwarfAnalyzer {
         else {
             return Ok(None);
         };
+        let layout = match layout {
+            crate::language::ValueLayout::ProjectedValue { value_path } => {
+                let value =
+                    self.project_resolved_member_path(current, &value_path, type_module_path)?;
+                return Ok(Some(ValueReadPlan {
+                    presentation: crate::ValuePresentation::Dwarf,
+                    capture: ValueCapturePlan::ProjectedValue { value },
+                }));
+            }
+            crate::language::ValueLayout::IndirectSequence(layout) => layout,
+        };
         let data =
             self.project_resolved_member_path(current, &layout.data_path, type_module_path)?;
 

@@ -2,8 +2,7 @@ mod access;
 mod value;
 
 pub(crate) use value::{
-    IndirectSequenceAddressing, IndirectSequenceKind, IndirectSequenceLayout,
-    RingSequenceLengthKind,
+    IndirectSequenceAddressing, IndirectSequenceKind, RingSequenceLengthKind, ValueLayout,
 };
 
 pub(super) fn resolve_tuple_index(index: u32) -> crate::VariableAccessSegment {
@@ -13,7 +12,7 @@ pub(super) fn resolve_tuple_index(index: u32) -> crate::VariableAccessSegment {
 pub(super) fn resolve_value_layout(
     current: &crate::ResolvedType,
     dwarf_qualified_name: Option<&str>,
-) -> Option<IndirectSequenceLayout> {
+) -> Option<ValueLayout> {
     value::resolve_value_layout(current, dwarf_qualified_name)
 }
 
