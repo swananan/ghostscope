@@ -1035,6 +1035,143 @@ async fn test_rust_rc_arc_value_plans_follow_dwarf_projected_views() -> anyhow::
 }
 
 #[tokio::test]
+async fn test_rust_hash_collection_plans_follow_dwarf_raw_table_layout() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let context = analyzer
+        .lookup_function_addresses("observe_hash_collections")
+        .into_iter()
+        .find_map(|address| analyzer.resolve_pc(&address).ok())
+        .ok_or_else(|| anyhow::anyhow!("expected observe_hash_collections context"))?;
+
+    for (parameter, is_map) in [("map", true), ("set", false)] {
+        let parameter_plan = analyzer
+            .plan_variable_by_name(&context, parameter)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter plan"))?;
+        let parameter_type = analyzer
+            .resolved_type_for_plan(&parameter_plan)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter type"))?;
+        let value_plan = analyzer
+            .value_read_plan(&parameter_type, Some(&binary_path))?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} semantic plan"))?;
+        let ghostscope_dwarf::ValuePresentation::HashTable {
+            entry_stride,
+            bucket_order,
+            entry,
+        } = value_plan.presentation
+        else {
+            anyhow::bail!("expected {parameter} hash-table presentation")
+        };
+        assert_eq!(
+            bucket_order,
+            ghostscope_dwarf::HashTableBucketOrder::Reverse
+        );
+        match entry {
+            ghostscope_dwarf::HashTableEntryPresentation::Map { key, value } => {
+                assert!(is_map);
+                assert_eq!(entry_stride, 8);
+                assert_eq!(key.offset, 0);
+                assert_eq!(key.field_type.type_name(), "i32");
+                assert_eq!(value.offset, 4);
+                assert_eq!(value.field_type.type_name(), "u16");
+            }
+            ghostscope_dwarf::HashTableEntryPresentation::Set { value } => {
+                assert!(!is_map);
+                assert_eq!(entry_stride, 4);
+                assert_eq!(value.offset, 0);
+                assert_eq!(value.field_type.type_name(), "i32");
+            }
+        }
+        let ghostscope_dwarf::ValueCapturePlan::IndirectHashTable {
+            control,
+            data,
+            length,
+            bucket_mask,
+            entry_stride: capture_stride,
+            bucket_order: capture_order,
+        } = value_plan.capture
+        else {
+            anyhow::bail!("expected {parameter} bounded hash-table capture")
+        };
+        assert!(matches!(
+            ghostscope_dwarf::strip_type_aliases(&control.resolved_type.summary),
+            ghostscope_dwarf::TypeInfo::PointerType { size: 4 | 8, .. }
+        ));
+        assert!(data.is_none());
+        assert!(matches!(
+            ghostscope_dwarf::strip_type_aliases(&length.resolved_type.summary),
+            ghostscope_dwarf::TypeInfo::BaseType { size: 4 | 8, .. }
+        ));
+        assert!(matches!(
+            ghostscope_dwarf::strip_type_aliases(&bucket_mask.resolved_type.summary),
+            ghostscope_dwarf::TypeInfo::BaseType { size: 4 | 8, .. }
+        ));
+        assert_eq!(capture_stride, entry_stride);
+        assert_eq!(capture_order, bucket_order);
+    }
+
+    for (parameter, expected_map) in [("unit_map", true), ("unit_set", false)] {
+        let parameter_plan = analyzer
+            .plan_variable_by_name(&context, parameter)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter plan"))?;
+        let parameter_type = analyzer
+            .resolved_type_for_plan(&parameter_plan)?
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} parameter type"))?;
+        let presentation = analyzer
+            .value_read_plan(&parameter_type, Some(&binary_path))?
+            .map(|plan| plan.presentation)
+            .ok_or_else(|| anyhow::anyhow!("expected {parameter} semantic plan"))?;
+        let ghostscope_dwarf::ValuePresentation::HashTable {
+            entry_stride,
+            entry,
+            ..
+        } = presentation
+        else {
+            anyhow::bail!("expected {parameter} hash-table presentation")
+        };
+        assert_eq!(entry_stride, 0);
+        assert_eq!(
+            matches!(
+                entry,
+                ghostscope_dwarf::HashTableEntryPresentation::Map { .. }
+            ),
+            expected_map
+        );
+    }
+
+    let user_context = analyzer
+        .lookup_function_addresses("observe_user_hash_collections")
+        .into_iter()
+        .find_map(|address| analyzer.resolve_pc(&address).ok())
+        .ok_or_else(|| anyhow::anyhow!("expected user hash collection context"))?;
+    for parameter in ["map", "set"] {
+        let parameter_plan = analyzer
+            .plan_variable_by_name(&user_context, parameter)?
+            .ok_or_else(|| anyhow::anyhow!("expected user {parameter} plan"))?;
+        let parameter_pointer = analyzer
+            .resolved_type_for_plan(&parameter_plan)?
+            .ok_or_else(|| anyhow::anyhow!("expected user {parameter} type"))?;
+        let parameter_type = analyzer
+            .project_resolved_type(
+                &parameter_pointer,
+                &ghostscope_dwarf::VariableAccessSegment::Dereference,
+                Some(&binary_path),
+            )?
+            .resolved_type;
+        assert!(
+            analyzer
+                .value_read_plan(&parameter_type, Some(&binary_path))?
+                .is_none(),
+            "user-defined {parameter} must retain DWARF presentation"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_str_values() -> anyhow::Result<()> {
     init();
 
@@ -1457,6 +1594,106 @@ trace observe_rc_arc {
         }),
         "Expected zero-sized Rust Arc output: {stdout}"
     );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_hash_map_and_hash_set_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_hash_collections {
+    print "RHASH_MAP:{}", map;
+    print "RHASH_SET:{}", set;
+    print "RHASH_EMPTY_MAP:{}", empty_map;
+    print "RHASH_EMPTY_SET:{}", empty_set;
+    print "RHASH_UNIT_MAP:{}", unit_map;
+    print "RHASH_UNIT_SET:{}", unit_set;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    let map_line = stdout
+        .lines()
+        .find(|line| line.contains("RHASH_MAP:"))
+        .ok_or_else(|| anyhow::anyhow!("missing Rust HashMap output: {stdout}"))?;
+    assert!(map_line.contains("HashMap(size=2)"), "{map_line}");
+    assert!(map_line.contains("-7: 13"), "{map_line}");
+    assert!(map_line.contains("29: 17"), "{map_line}");
+    let set_line = stdout
+        .lines()
+        .find(|line| line.contains("RHASH_SET:"))
+        .ok_or_else(|| anyhow::anyhow!("missing Rust HashSet output: {stdout}"))?;
+    assert!(set_line.contains("HashSet(size=2)"), "{set_line}");
+    assert!(set_line.contains("-9"), "{set_line}");
+    assert!(set_line.contains('5'), "{set_line}");
+    assert!(
+        stdout.contains("RHASH_EMPTY_MAP:HashMap(size=0) {}"),
+        "Expected empty Rust HashMap output: {stdout}"
+    );
+    assert!(
+        stdout.contains("RHASH_EMPTY_SET:HashSet(size=0) {}"),
+        "Expected empty Rust HashSet output: {stdout}"
+    );
+    assert!(
+        stdout.contains("RHASH_UNIT_MAP:HashMap(size=1) {(): ()}"),
+        "Expected ZST Rust HashMap output: {stdout}"
+    );
+    assert!(
+        stdout.contains("RHASH_UNIT_SET:HashSet(size=1) {()}"),
+        "Expected ZST Rust HashSet output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_hash_map_respects_bucket_aligned_cap() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_hash_collections {
+    print "RHASH_CAP:{}", map;
+}
+"#;
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_config_content(
+            r#"
+[ebpf]
+mem_dump_cap = 9
+"#,
+        )
+        .attach_to(&target)
+        .timeout_secs(9)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("RHASH_CAP:"))
+        .ok_or_else(|| anyhow::anyhow!("missing capped Rust HashMap output: {stdout}"))?;
+    assert!(line.contains("HashMap(size=2)"), "{line}");
+    assert!(line.contains("<truncated>"), "{line}");
+    assert!(!line.contains("<INVALID_"), "{line}");
     assert!(
         !stdout.contains("ExprError"),
         "Unexpected ExprError: {stdout}"

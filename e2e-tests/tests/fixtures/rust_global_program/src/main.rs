@@ -3,7 +3,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     marker::{PhantomData, PhantomPinned},
     num::{NonZeroI32, NonZeroU128, NonZeroU32},
@@ -115,6 +115,15 @@ pub mod user_types {
     }
 
     pub struct Arc<T> {
+        pub value: T,
+    }
+
+    pub struct HashMap<K, V> {
+        pub key: K,
+        pub value: V,
+    }
+
+    pub struct HashSet<T> {
         pub value: T,
     }
 }
@@ -245,7 +254,11 @@ pub static mut GLOBAL_ENUM: GlobalState = GlobalState::Idle;
 pub static mut GLOBAL_ENUM_BITS: i32 = 0;
 
 pub mod math {
-    use std::{rc::Rc, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        rc::Rc,
+        sync::Arc,
+    };
 
     #[inline(never)]
     pub fn do_stuff(x: i32) -> i32 {
@@ -344,6 +357,40 @@ pub mod math {
     ) -> i64 {
         std::hint::black_box((rc.value, arc.value));
         rc.value as i64 + arc.value as i64
+    }
+
+    #[inline(never)]
+    pub fn observe_hash_collections(
+        map: HashMap<i32, u16>,
+        set: HashSet<i32>,
+        empty_map: HashMap<i32, u16>,
+        empty_set: HashSet<i32>,
+        unit_map: HashMap<(), ()>,
+        unit_set: HashSet<()>,
+    ) -> usize {
+        std::hint::black_box((
+            &map,
+            &set,
+            &empty_map,
+            &empty_set,
+            &unit_map,
+            &unit_set,
+        ));
+        map.len()
+            + set.len()
+            + empty_map.len()
+            + empty_set.len()
+            + unit_map.len()
+            + unit_set.len()
+    }
+
+    #[inline(never)]
+    pub fn observe_user_hash_collections(
+        map: &crate::user_types::HashMap<i32, u16>,
+        set: &crate::user_types::HashSet<i32>,
+    ) -> i64 {
+        std::hint::black_box((map.key, map.value, set.value));
+        map.key as i64 + map.value as i64 + set.value as i64
     }
 }
 
@@ -539,6 +586,22 @@ fn main() {
         let user_rc = user_types::Rc { value: 37_i32 };
         let user_arc = user_types::Arc { value: 41_i32 };
         acc += math::observe_user_rc_arc(&user_rc, &user_arc);
+        let map = HashMap::from([(-7_i32, 13_u16), (29_i32, 17_u16)]);
+        let set = HashSet::from([-9_i32, 5_i32]);
+        acc += math::observe_hash_collections(
+            map,
+            set,
+            HashMap::new(),
+            HashSet::new(),
+            HashMap::from([((), ())]),
+            HashSet::from([()]),
+        ) as i64;
+        let user_map = user_types::HashMap {
+            key: 43_i32,
+            value: 47_u16,
+        };
+        let user_set = user_types::HashSet { value: 53_i32 };
+        acc += math::observe_user_hash_collections(&user_map, &user_set);
         acc += touch_globals() as i64;
         thread::sleep(Duration::from_millis(1000));
     }

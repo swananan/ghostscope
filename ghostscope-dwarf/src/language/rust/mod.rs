@@ -2,7 +2,7 @@ mod access;
 mod value;
 
 pub(crate) use value::{
-    IndirectSequenceAddressing, IndirectSequenceKind, ProjectedPathSegment,
+    HashTableKind, IndirectSequenceAddressing, IndirectSequenceKind, ProjectedPathSegment,
     ProjectedStructPresentation, ProjectedValuePresentation, ProjectedValueRequirement,
     RingSequenceLengthKind, ValueLayout,
 };

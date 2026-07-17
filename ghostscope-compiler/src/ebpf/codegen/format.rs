@@ -70,6 +70,20 @@ struct IndirectCaptureConfig {
     shape: IndirectCaptureShape,
 }
 
+#[derive(Clone, Copy)]
+struct HashTableCaptureConfig {
+    control_offset: u64,
+    control_access_size: ghostscope_dwarf::MemoryAccessSize,
+    data: Option<(u64, ghostscope_dwarf::MemoryAccessSize)>,
+    length_offset: u64,
+    length_access_size: ghostscope_dwarf::MemoryAccessSize,
+    bucket_mask_offset: u64,
+    bucket_mask_access_size: ghostscope_dwarf::MemoryAccessSize,
+    entry_stride: u64,
+    bucket_order: ghostscope_dwarf::HashTableBucketOrder,
+    max_buckets: usize,
+}
+
 fn complex_format_arg_header_len(arg: &ComplexArg<'_>) -> usize {
     PRINT_COMPLEX_FORMAT_ARG_FIXED_HEADER_LEN + arg.access_path.len()
 }
@@ -93,6 +107,7 @@ fn complex_format_static_payload_len(arg: &ComplexArg<'_>) -> Option<usize> {
         ComplexArgSource::IndirectBytes { .. } => None,
         ComplexArgSource::IndirectSequence { .. } => None,
         ComplexArgSource::IndirectRingSequence { .. } => None,
+        ComplexArgSource::IndirectHashTable { .. } => None,
     }
 }
 
@@ -148,6 +163,9 @@ fn plan_complex_format_layout(
                 ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE
                     .saturating_add(max_len.saturating_mul(2)),
             );
+        } else if let ComplexArgSource::IndirectHashTable { max_len, .. } = &arg.source {
+            dynamic_max_lens
+                .push(ghostscope_protocol::HASH_TABLE_HEADER_SIZE.saturating_add(*max_len));
         }
 
         arg_payload_plans.push((header_len, static_payload_len));
@@ -2663,6 +2681,649 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
+    fn store_complex_payload_u64(
+        &self,
+        data_ptr: PointerValue<'ctx>,
+        offset: usize,
+        value: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<()> {
+        // SAFETY: callers validate that the fixed header field is reserved.
+        let field_ptr_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    data_ptr,
+                    &[self.context.i32_type().const_int(offset as u64, false)],
+                    &format!("{name}_ptr_i8"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+        };
+        let field_ptr = self
+            .builder
+            .build_pointer_cast(
+                field_ptr_i8,
+                self.context.ptr_type(AddressSpace::default()),
+                &format!("{name}_ptr"),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.builder
+            .build_store(field_ptr, value)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        Ok(())
+    }
+
+    fn emit_complex_format_hash_table(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        var_data_ptr: PointerValue<'ctx>,
+        descriptor: &RuntimeAddress<'ctx>,
+        reserved_len: usize,
+        capture: HashTableCaptureConfig,
+    ) -> Result<()> {
+        let header_len = ghostscope_protocol::HASH_TABLE_HEADER_SIZE;
+        if reserved_len < header_len {
+            self.builder
+                .build_store(
+                    status_ptr,
+                    self.context
+                        .i8_type()
+                        .const_int(VariableStatus::Truncated as u64, false),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.mark_any_fail()?;
+            return Ok(());
+        }
+
+        let stride = usize::try_from(capture.entry_stride).map_err(|_| {
+            CodeGenError::DwarfError(format!(
+                "hash-table entry DWARF size {} does not fit this host",
+                capture.entry_stride
+            ))
+        })?;
+        let bytes_per_bucket = stride.checked_add(1).ok_or_else(|| {
+            CodeGenError::DwarfError("hash-table bucket capture size overflow".to_string())
+        })?;
+        let reservation_buckets = reserved_len
+            .saturating_sub(header_len)
+            .checked_div(bytes_per_bucket)
+            .unwrap_or(0);
+        let max_buckets = capture.max_buckets.min(reservation_buckets);
+        let bucket_payload_offset = header_len.checked_add(max_buckets).ok_or_else(|| {
+            CodeGenError::DwarfError("hash-table bucket offset overflow".to_string())
+        })?;
+        let max_bucket_bytes = max_buckets.checked_mul(stride).ok_or_else(|| {
+            CodeGenError::DwarfError("hash-table bucket payload overflow".to_string())
+        })?;
+        if max_buckets > u32::MAX as usize || max_bucket_bytes > u32::MAX as usize {
+            return Err(CodeGenError::DwarfError(
+                "hash-table capture exceeds the eBPF helper length width".to_string(),
+            ));
+        }
+
+        let i8_type = self.context.i8_type();
+        let i32_type = self.context.i32_type();
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let member_address = |offset: u64, name: &str| {
+            self.builder
+                .build_int_add(descriptor.value, i64_type.const_int(offset, false), name)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))
+        };
+        let control_member = member_address(capture.control_offset, "hash_table_control_member")?;
+        let length_member = member_address(capture.length_offset, "hash_table_length_member")?;
+        let bucket_mask_member =
+            member_address(capture.bucket_mask_offset, "hash_table_bucket_mask_member")?;
+        let data_member = capture
+            .data
+            .map(|(offset, access_size)| {
+                member_address(offset, "hash_table_data_member")
+                    .map(|address| (address, access_size))
+            })
+            .transpose()?;
+        let control_read = self.generate_memory_read_with_diagnostics(
+            descriptor.with_value(control_member),
+            capture.control_access_size,
+            Some(status_ptr),
+            "hash_table_control_metadata",
+        )?;
+        let length_read = self.generate_memory_read_with_diagnostics(
+            descriptor.with_value(length_member),
+            capture.length_access_size,
+            Some(status_ptr),
+            "hash_table_length_metadata",
+        )?;
+        let bucket_mask_read = self.generate_memory_read_with_diagnostics(
+            descriptor.with_value(bucket_mask_member),
+            capture.bucket_mask_access_size,
+            Some(status_ptr),
+            "hash_table_bucket_mask_metadata",
+        )?;
+        let data_read = if let Some((address, access_size)) = data_member {
+            let read = self.generate_memory_read_with_diagnostics(
+                descriptor.with_value(address),
+                access_size,
+                Some(status_ptr),
+                "hash_table_data_metadata",
+            )?;
+            Some((address, read))
+        } else {
+            None
+        };
+
+        let current_status = self
+            .builder
+            .build_load(i8_type, status_ptr, "hash_table_metadata_status")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+        let metadata_ok = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                current_status,
+                i8_type.const_zero(),
+                "hash_table_metadata_ok",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let function = self.current_function("compile hash-table value capture")?;
+        let metadata_ok_block = self
+            .context
+            .append_basic_block(function, "hash_table_metadata_ok");
+        let metadata_error_block = self
+            .context
+            .append_basic_block(function, "hash_table_metadata_error");
+        let continue_block = self
+            .context
+            .append_basic_block(function, "hash_table_continue");
+        self.builder
+            .build_conditional_branch(metadata_ok, metadata_ok_block, metadata_error_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(metadata_error_block);
+        let metadata_read_error = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                current_status,
+                i8_type.const_int(VariableStatus::ReadError as u64, false),
+                "hash_table_metadata_read_error",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let metadata_payload_block = self
+            .context
+            .append_basic_block(function, "hash_table_metadata_error_payload");
+        self.builder
+            .build_conditional_branch(metadata_read_error, metadata_payload_block, continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(metadata_payload_block);
+        let (mut helper_result, mut error_address) =
+            (bucket_mask_read.helper_result, bucket_mask_member);
+        if let Some((data_member, data_read)) = &data_read {
+            (helper_result, error_address) = self.select_indirect_metadata_failure(
+                data_read,
+                *data_member,
+                helper_result,
+                error_address,
+                "hash_table_data",
+            )?;
+        }
+        (helper_result, error_address) = self.select_indirect_metadata_failure(
+            &bucket_mask_read,
+            bucket_mask_member,
+            helper_result,
+            error_address,
+            "hash_table_bucket_mask",
+        )?;
+        (helper_result, error_address) = self.select_indirect_metadata_failure(
+            &length_read,
+            length_member,
+            helper_result,
+            error_address,
+            "hash_table_length",
+        )?;
+        (helper_result, error_address) = self.select_indirect_metadata_failure(
+            &control_read,
+            control_member,
+            helper_result,
+            error_address,
+            "hash_table_control",
+        )?;
+        self.emit_complex_format_read_error_payload(
+            var_data_ptr,
+            reserved_len,
+            helper_result,
+            error_address,
+        )?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(metadata_ok_block);
+        let control_address = control_read.value.into_int_value();
+        let original_count = length_read.value.into_int_value();
+        let bucket_mask = bucket_mask_read.value.into_int_value();
+        let capacity = self
+            .builder
+            .build_int_add(
+                bucket_mask,
+                i64_type.const_int(1, false),
+                "hash_table_capacity",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let capacity_nonzero = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                capacity,
+                i64_type.const_zero(),
+                "hash_table_capacity_nonzero",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let length_valid = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::ULE,
+                original_count,
+                capacity,
+                "hash_table_length_valid",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let metadata_valid = self
+            .builder
+            .build_and(capacity_nonzero, length_valid, "hash_table_metadata_valid")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let valid_block = self
+            .context
+            .append_basic_block(function, "hash_table_metadata_valid");
+        let invalid_block = self
+            .context
+            .append_basic_block(function, "hash_table_metadata_invalid");
+        self.builder
+            .build_conditional_branch(metadata_valid, valid_block, invalid_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(invalid_block);
+        self.builder
+            .build_store(
+                status_ptr,
+                i8_type.const_int(VariableStatus::AccessError as u64, false),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(valid_block);
+        self.store_complex_payload_u64(var_data_ptr, 0, original_count, "hash_table_item_count")?;
+        self.store_complex_payload_u64(
+            var_data_ptr,
+            ghostscope_protocol::HASH_TABLE_CAPACITY_OFFSET,
+            capacity,
+            "hash_table_capacity_header",
+        )?;
+        self.store_complex_payload_u64(
+            var_data_ptr,
+            ghostscope_protocol::HASH_TABLE_CAPTURED_BUCKETS_OFFSET,
+            i64_type.const_zero(),
+            "hash_table_captured_buckets_empty",
+        )?;
+        self.store_complex_payload_u64(
+            var_data_ptr,
+            ghostscope_protocol::HASH_TABLE_BUCKET_DATA_OFFSET,
+            i64_type.const_int(bucket_payload_offset as u64, false),
+            "hash_table_bucket_payload_offset",
+        )?;
+        let is_empty = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                original_count,
+                i64_type.const_zero(),
+                "hash_table_is_empty",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let empty_block = self
+            .context
+            .append_basic_block(function, "hash_table_empty");
+        let nonempty_block = self
+            .context
+            .append_basic_block(function, "hash_table_nonempty");
+        self.builder
+            .build_conditional_branch(is_empty, empty_block, nonempty_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(empty_block);
+        self.builder
+            .build_store(
+                status_ptr,
+                i8_type.const_int(VariableStatus::ZeroLength as u64, false),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.mark_any_success()?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(nonempty_block);
+        if max_buckets == 0 {
+            self.builder
+                .build_store(
+                    status_ptr,
+                    i8_type.const_int(VariableStatus::Truncated as u64, false),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.mark_any_success()?;
+            self.mark_any_fail()?;
+            self.builder
+                .build_unconditional_branch(continue_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder.position_at_end(continue_block);
+            return Ok(());
+        }
+
+        let capture_limit = i64_type.const_int(max_buckets as u64, false);
+        let capacity_exceeds_limit = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::UGT,
+                capacity,
+                capture_limit,
+                "hash_table_capacity_exceeds_limit",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let captured_buckets = self
+            .builder
+            .build_select(
+                capacity_exceeds_limit,
+                capture_limit,
+                capacity,
+                "hash_table_captured_buckets",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+        self.store_complex_payload_u64(
+            var_data_ptr,
+            ghostscope_protocol::HASH_TABLE_CAPTURED_BUCKETS_OFFSET,
+            captured_buckets,
+            "hash_table_captured_buckets_header",
+        )?;
+
+        let data_address = data_read
+            .as_ref()
+            .map(|(_, read)| read.value.into_int_value());
+        let control_null = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                control_address,
+                i64_type.const_zero(),
+                "hash_table_control_null",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let pointer_null = if stride > 0 {
+            if let Some(data_address) = data_address {
+                let data_null = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::EQ,
+                        data_address,
+                        i64_type.const_zero(),
+                        "hash_table_data_null",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                self.builder
+                    .build_or(control_null, data_null, "hash_table_pointer_null")
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            } else {
+                control_null
+            }
+        } else {
+            control_null
+        };
+        let null_block = self
+            .context
+            .append_basic_block(function, "hash_table_null_pointer");
+        let control_read_block = self
+            .context
+            .append_basic_block(function, "hash_table_read_controls");
+        self.builder
+            .build_conditional_branch(pointer_null, null_block, control_read_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(null_block);
+        self.builder
+            .build_store(
+                status_ptr,
+                i8_type.const_int(VariableStatus::NullDeref as u64, false),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(control_read_block);
+        // SAFETY: the hash-table header and max_buckets control bytes are
+        // included in the reservation validated above.
+        let control_destination_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    i8_type,
+                    var_data_ptr,
+                    &[i32_type.const_int(header_len as u64, false)],
+                    "hash_table_control_destination_i8",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+        };
+        let control_destination = self
+            .builder
+            .build_pointer_cast(
+                control_destination_i8,
+                ptr_type,
+                "hash_table_control_destination",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let control_length = self
+            .builder
+            .build_int_truncate(captured_buckets, i32_type, "hash_table_control_length")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let control_source = self
+            .builder
+            .build_int_to_ptr(control_address, ptr_type, "hash_table_control_source")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let control_result = self
+            .create_bpf_helper_call(
+                BPF_FUNC_probe_read_user as u64,
+                &[
+                    control_destination.into(),
+                    control_length.into(),
+                    control_source.into(),
+                ],
+                i64_type.into(),
+                "probe_read_user_hash_table_controls",
+            )?
+            .into_int_value();
+        let control_ok = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                control_result,
+                i64_type.const_zero(),
+                "hash_table_control_read_ok",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let control_ok_block = self
+            .context
+            .append_basic_block(function, "hash_table_control_read_ok");
+        let control_error_block = self
+            .context
+            .append_basic_block(function, "hash_table_control_read_error");
+        self.builder
+            .build_conditional_branch(control_ok, control_ok_block, control_error_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(control_error_block);
+        self.builder
+            .build_store(
+                status_ptr,
+                i8_type.const_int(VariableStatus::ReadError as u64, false),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.emit_complex_format_read_error_payload(
+            var_data_ptr,
+            reserved_len,
+            control_result,
+            control_address,
+        )?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(control_ok_block);
+        let finish_read_block = if stride == 0 {
+            control_ok_block
+        } else {
+            // SAFETY: bucket_payload_offset and max_bucket_bytes were derived
+            // from the same reservation, so this fixed destination is in bounds.
+            let bucket_destination_i8 = unsafe {
+                self.builder
+                    .build_gep(
+                        i8_type,
+                        var_data_ptr,
+                        &[i32_type.const_int(bucket_payload_offset as u64, false)],
+                        "hash_table_bucket_destination_i8",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            };
+            let bucket_destination = self
+                .builder
+                .build_pointer_cast(
+                    bucket_destination_i8,
+                    ptr_type,
+                    "hash_table_bucket_destination",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let bucket_length_i64 = self
+                .builder
+                .build_int_mul(
+                    captured_buckets,
+                    i64_type.const_int(stride as u64, false),
+                    "hash_table_bucket_length_i64",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let bucket_length = self
+                .builder
+                .build_int_truncate(bucket_length_i64, i32_type, "hash_table_bucket_length")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let bucket_source_address = match capture.bucket_order {
+                ghostscope_dwarf::HashTableBucketOrder::Forward => {
+                    data_address.ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "forward hash-table capture is missing a data pointer".to_string(),
+                        )
+                    })?
+                }
+                ghostscope_dwarf::HashTableBucketOrder::Reverse => self
+                    .builder
+                    .build_int_sub(
+                        control_address,
+                        bucket_length_i64,
+                        "hash_table_reverse_bucket_source",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?,
+            };
+            let bucket_source = self
+                .builder
+                .build_int_to_ptr(bucket_source_address, ptr_type, "hash_table_bucket_source")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let bucket_result = self
+                .create_bpf_helper_call(
+                    BPF_FUNC_probe_read_user as u64,
+                    &[
+                        bucket_destination.into(),
+                        bucket_length.into(),
+                        bucket_source.into(),
+                    ],
+                    i64_type.into(),
+                    "probe_read_user_hash_table_buckets",
+                )?
+                .into_int_value();
+            let bucket_ok = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    bucket_result,
+                    i64_type.const_zero(),
+                    "hash_table_bucket_read_ok",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let bucket_ok_block = self
+                .context
+                .append_basic_block(function, "hash_table_bucket_read_ok");
+            let bucket_error_block = self
+                .context
+                .append_basic_block(function, "hash_table_bucket_read_error");
+            self.builder
+                .build_conditional_branch(bucket_ok, bucket_ok_block, bucket_error_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+            self.builder.position_at_end(bucket_error_block);
+            self.builder
+                .build_store(
+                    status_ptr,
+                    i8_type.const_int(VariableStatus::ReadError as u64, false),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.emit_complex_format_read_error_payload(
+                var_data_ptr,
+                reserved_len,
+                bucket_result,
+                bucket_source_address,
+            )?;
+            self.mark_any_fail()?;
+            self.builder
+                .build_unconditional_branch(continue_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            bucket_ok_block
+        };
+
+        self.builder.position_at_end(finish_read_block);
+        let truncated_block = self
+            .context
+            .append_basic_block(function, "hash_table_truncated");
+        let complete_block = self
+            .context
+            .append_basic_block(function, "hash_table_complete");
+        self.builder
+            .build_conditional_branch(capacity_exceeds_limit, truncated_block, complete_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(truncated_block);
+        self.builder
+            .build_store(
+                status_ptr,
+                i8_type.const_int(VariableStatus::Truncated as u64, false),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.mark_any_success()?;
+        self.mark_any_fail()?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(complete_block);
+        self.mark_any_success()?;
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(continue_block);
+        Ok(())
+    }
+
     fn emit_complex_format_runtime_read(
         &mut self,
         status_ptr: PointerValue<'ctx>,
@@ -2957,6 +3618,37 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     },
                 )
             }
+            ComplexArgSource::IndirectHashTable {
+                descriptor,
+                control_offset,
+                control_access_size,
+                data,
+                length_offset,
+                length_access_size,
+                bucket_mask_offset,
+                bucket_mask_access_size,
+                entry_stride,
+                bucket_order,
+                max_buckets,
+                max_len: _,
+            } => self.emit_complex_format_hash_table(
+                status_ptr,
+                var_data_ptr,
+                descriptor,
+                reserved_len,
+                HashTableCaptureConfig {
+                    control_offset: *control_offset,
+                    control_access_size: *control_access_size,
+                    data: *data,
+                    length_offset: *length_offset,
+                    length_access_size: *length_access_size,
+                    bucket_mask_offset: *bucket_mask_offset,
+                    bucket_mask_access_size: *bucket_mask_access_size,
+                    entry_stride: *entry_stride,
+                    bucket_order: *bucket_order,
+                    max_buckets: *max_buckets,
+                },
+            ),
             ComplexArgSource::ProjectedView { descriptor, fields } => self
                 .emit_complex_format_projected_view(
                     status_ptr,
@@ -3137,6 +3829,34 @@ mod complex_format_layout_tests {
         }
     }
 
+    fn indirect_hash_table_arg<'ctx>(
+        context: &'ctx Context,
+        entry_stride: u64,
+        max_buckets: usize,
+        max_len: usize,
+    ) -> ComplexArg<'ctx> {
+        ComplexArg {
+            var_name_index: 0,
+            type_index: 0,
+            access_path: Vec::new(),
+            data_len: ghostscope_protocol::HASH_TABLE_HEADER_SIZE + max_len,
+            source: ComplexArgSource::IndirectHashTable {
+                descriptor: RuntimeAddress::available(context.i64_type().const_zero(), context),
+                control_offset: 0,
+                control_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                data: None,
+                length_offset: 8,
+                length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                bucket_mask_offset: 16,
+                bucket_mask_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                entry_stride,
+                bucket_order: ghostscope_dwarf::HashTableBucketOrder::Reverse,
+                max_buckets,
+                max_len,
+            },
+        }
+    }
+
     fn indirect_emitter_ir(capture: IndirectCaptureConfig) -> String {
         let context = Context::create();
         let options = crate::CompileOptions::default();
@@ -3171,6 +3891,48 @@ mod complex_format_layout_tests {
 
         ebpf.emit_complex_format_indirect(status_ptr, data_ptr, &descriptor, reserved_len, capture)
             .expect("emit indirect capture");
+        ebpf.builder
+            .build_return(Some(&context.i64_type().const_zero()))
+            .expect("return from test function");
+        ebpf.module.verify().expect("verify generated LLVM IR");
+
+        ebpf.module.print_to_string().to_string()
+    }
+
+    fn hash_table_emitter_ir(capture: HashTableCaptureConfig, max_len: usize) -> String {
+        let context = Context::create();
+        let options = crate::CompileOptions::default();
+        let ebpf = EbpfContext::new(&context, "hash_table", Some(0), &options);
+        let mut ebpf = ebpf.expect("create eBPF context");
+        let function_type = context.i64_type().fn_type(&[], false);
+        let function = ebpf
+            .module
+            .add_function("emit_hash_table", function_type, None);
+        let entry = context.append_basic_block(function, "entry");
+        ebpf.builder.position_at_end(entry);
+        let status_ptr = ebpf
+            .builder
+            .build_alloca(context.i8_type(), "status")
+            .expect("allocate status");
+        let reserved_len = ghostscope_protocol::HASH_TABLE_HEADER_SIZE + max_len;
+        let data_ptr = ebpf
+            .builder
+            .build_alloca(context.i8_type().array_type(reserved_len as u32), "payload")
+            .expect("allocate payload");
+        ebpf.builder
+            .build_store(status_ptr, context.i8_type().const_zero())
+            .expect("initialize status");
+        let descriptor =
+            RuntimeAddress::available(context.i64_type().const_int(0x1000, false), &context);
+
+        ebpf.emit_complex_format_hash_table(
+            status_ptr,
+            data_ptr,
+            &descriptor,
+            reserved_len,
+            capture,
+        )
+        .expect("emit hash-table capture");
         ebpf.builder
             .build_return(Some(&context.i64_type().const_zero()))
             .expect("return from test function");
@@ -3352,6 +4114,61 @@ mod complex_format_layout_tests {
             ),
             12
         );
+    }
+
+    #[test]
+    fn complex_format_layout_includes_hash_table_header_and_bucket_regions() {
+        let context = Context::create();
+        let args = vec![indirect_hash_table_arg(&context, 8, 7, 63)];
+
+        let layout = plan_complex_format_layout(4096, 0, &args);
+
+        assert_eq!(
+            layout.args[0].reserved_len,
+            ghostscope_protocol::HASH_TABLE_HEADER_SIZE + 63
+        );
+    }
+
+    #[test]
+    fn hash_table_emitter_uses_dwarf_metadata_and_storage_order() {
+        let reverse_ir = hash_table_emitter_ir(
+            HashTableCaptureConfig {
+                control_offset: 0,
+                control_access_size: ghostscope_dwarf::MemoryAccessSize::U32,
+                data: None,
+                length_offset: 4,
+                length_access_size: ghostscope_dwarf::MemoryAccessSize::U32,
+                bucket_mask_offset: 8,
+                bucket_mask_access_size: ghostscope_dwarf::MemoryAccessSize::U32,
+                entry_stride: 8,
+                bucket_order: ghostscope_dwarf::HashTableBucketOrder::Reverse,
+                max_buckets: 4,
+            },
+            36,
+        );
+        assert!(reverse_ir.contains("probe_read_user_hash_table_controls"));
+        assert!(reverse_ir.contains("probe_read_user_hash_table_buckets"));
+        assert!(reverse_ir.contains("hash_table_reverse_bucket_source"));
+        assert!(reverse_ir.contains("hash_table_captured_buckets_header"));
+        assert!(reverse_ir.contains("hash_table_metadata_error_payload"));
+
+        let forward_ir = hash_table_emitter_ir(
+            HashTableCaptureConfig {
+                control_offset: 0,
+                control_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                data: Some((8, ghostscope_dwarf::MemoryAccessSize::U64)),
+                length_offset: 16,
+                length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                bucket_mask_offset: 24,
+                bucket_mask_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                entry_stride: 4,
+                bucket_order: ghostscope_dwarf::HashTableBucketOrder::Forward,
+                max_buckets: 4,
+            },
+            20,
+        );
+        assert!(forward_ir.contains("hash_table_data_metadata"));
+        assert!(!forward_ir.contains("hash_table_reverse_bucket_source"));
     }
 
     #[test]

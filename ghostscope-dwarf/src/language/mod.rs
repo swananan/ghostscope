@@ -5,7 +5,7 @@ mod rust;
 use crate::{semantics::PlanError, SourceLanguage, TypeOrigin, VariableAccessSegment};
 
 pub(crate) use rust::{
-    IndirectSequenceAddressing, IndirectSequenceKind, ProjectedPathSegment,
+    HashTableKind, IndirectSequenceAddressing, IndirectSequenceKind, ProjectedPathSegment,
     ProjectedStructPresentation, ProjectedValuePresentation, ProjectedValueRequirement,
     RingSequenceLengthKind, ValueLayout,
 };

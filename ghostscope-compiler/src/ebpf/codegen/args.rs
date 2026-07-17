@@ -198,6 +198,23 @@ fn sequence_capture_limits(cap: usize, element_stride: u64) -> Result<(usize, us
     Ok((max_elements, max_len, data_len))
 }
 
+fn hash_table_capture_limits(cap: usize, entry_stride: u64) -> Result<(usize, usize, usize)> {
+    let stride = usize::try_from(entry_stride).map_err(|_| {
+        CodeGenError::DwarfError(format!(
+            "hash-table entry DWARF size {entry_stride} does not fit this host"
+        ))
+    })?;
+    let bytes_per_bucket = stride.checked_add(1).ok_or_else(|| {
+        CodeGenError::DwarfError("hash-table bucket capture size overflow".to_string())
+    })?;
+    let max_buckets = cap / bytes_per_bucket;
+    let max_len = max_buckets
+        .checked_mul(bytes_per_bucket)
+        .ok_or_else(|| CodeGenError::DwarfError("hash-table payload size overflow".to_string()))?;
+    let data_len = ghostscope_protocol::HASH_TABLE_HEADER_SIZE.saturating_add(max_len);
+    Ok((max_buckets, max_len, data_len))
+}
+
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(super) const UNKNOWN_CHAR_ARRAY_READ_FALLBACK: usize = 256;
 
@@ -372,6 +389,54 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         capacity_access_size,
                         element_stride,
                         max_elements,
+                        max_len,
+                    },
+                )
+            }
+            ghostscope_dwarf::ValueCapturePlan::IndirectHashTable {
+                control,
+                data,
+                length,
+                bucket_mask,
+                entry_stride,
+                bucket_order,
+            } => {
+                let (control_offset, control_access_size) =
+                    metadata_member(&control, "hash-table control")?;
+                let data = data
+                    .as_ref()
+                    .map(|data| metadata_member(data, "hash-table data"))
+                    .transpose()?;
+                let (length_offset, length_access_size) =
+                    metadata_member(&length, "hash-table length")?;
+                let (bucket_mask_offset, bucket_mask_access_size) =
+                    metadata_member(&bucket_mask, "hash-table bucket mask")?;
+                let layout_matches = matches!(
+                    (bucket_order, data.is_some()),
+                    (ghostscope_dwarf::HashTableBucketOrder::Forward, true)
+                        | (ghostscope_dwarf::HashTableBucketOrder::Reverse, false)
+                );
+                if !layout_matches {
+                    return Err(CodeGenError::DwarfError(
+                        "hash-table bucket order does not match its data source".to_string(),
+                    ));
+                }
+                let (max_buckets, max_len, data_len) =
+                    hash_table_capture_limits(cap, entry_stride)?;
+                (
+                    data_len,
+                    ComplexArgSource::IndirectHashTable {
+                        descriptor,
+                        control_offset,
+                        control_access_size,
+                        data,
+                        length_offset,
+                        length_access_size,
+                        bucket_mask_offset,
+                        bucket_mask_access_size,
+                        entry_stride,
+                        bucket_order,
+                        max_buckets,
                         max_len,
                     },
                 )
@@ -1254,6 +1319,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             | ComplexArgSource::IndirectBytes { .. }
             | ComplexArgSource::IndirectSequence { .. }
             | ComplexArgSource::IndirectRingSequence { .. }
+            | ComplexArgSource::IndirectHashTable { .. }
             | ComplexArgSource::ProjectedView { .. } => {
                 // Use ComplexFormat with "{}"; generate_print_complex_format_instruction handles MemDump
                 let fmt_idx = self.trace_context.add_string("{}".to_string())?;

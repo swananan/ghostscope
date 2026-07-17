@@ -1,4 +1,6 @@
-use crate::{strip_type_aliases, ResolvedType, SourceLanguage, StructMember, TypeInfo};
+use crate::{
+    strip_type_aliases, HashTableBucketOrder, ResolvedType, SourceLanguage, StructMember, TypeInfo,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ValueLayout {
@@ -9,6 +11,24 @@ pub(crate) enum ValueLayout {
     },
     ProjectedStruct(ProjectedStructLayout),
     CompositeStruct(CompositeStructLayout),
+    HashTable(HashTableLayout),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HashTableLayout {
+    pub(crate) table_path: Vec<String>,
+    pub(crate) control_path: Vec<String>,
+    pub(crate) data_path: Option<Vec<String>>,
+    pub(crate) length_path: Vec<String>,
+    pub(crate) bucket_mask_path: Vec<String>,
+    pub(crate) bucket_order: HashTableBucketOrder,
+    pub(crate) kind: HashTableKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HashTableKind {
+    Map,
+    Set,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,7 +179,9 @@ pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
                     || is_short_ref_name(name)
                     || is_short_ref_mut_name(name)
                     || is_short_rc_name(name)
-                    || is_short_arc_name(name))
+                    || is_short_arc_name(name)
+                    || is_short_hash_map_name(name)
+                    || is_short_hash_set_name(name))
     })
 }
 
@@ -174,6 +196,16 @@ pub(super) fn resolve_value_layout(
     let TypeInfo::StructType { name, .. } = strip_type_aliases(&current.summary) else {
         return None;
     };
+
+    if is_std_hash_map(name, dwarf_qualified_name) {
+        return rust_hash_table_layout(&current.summary, HashTableKind::Map)
+            .map(ValueLayout::HashTable);
+    }
+
+    if is_std_hash_set(name, dwarf_qualified_name) {
+        return rust_hash_table_layout(&current.summary, HashTableKind::Set)
+            .map(ValueLayout::HashTable);
+    }
 
     if is_std_rc(name, dwarf_qualified_name) {
         return rust_reference_counted_layout(&current.summary, "Rc", "value")
@@ -337,6 +369,14 @@ fn is_short_arc_name(name: &str) -> bool {
     is_short_generic_name(name, "Arc")
 }
 
+fn is_short_hash_map_name(name: &str) -> bool {
+    is_short_generic_name(name, "HashMap")
+}
+
+fn is_short_hash_set_name(name: &str) -> bool {
+    is_short_generic_name(name, "HashSet")
+}
+
 fn is_short_generic_name(name: &str, type_name: &str) -> bool {
     let prefix = format!("{type_name}<");
     name.strip_prefix(&prefix)
@@ -426,6 +466,44 @@ fn is_std_arc(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
 
 fn is_std_arc_name(name: &str) -> bool {
     is_std_alloc_generic_name(name, "Arc")
+}
+
+fn is_std_hash_map(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_hash_map_name(name)
+        || (is_short_hash_map_name(name) && dwarf_qualified_name.is_some_and(is_std_hash_map_name))
+}
+
+fn is_std_hash_map_name(name: &str) -> bool {
+    is_std_collections_generic_name(name, "HashMap")
+}
+
+fn is_std_hash_set(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_hash_set_name(name)
+        || (is_short_hash_set_name(name) && dwarf_qualified_name.is_some_and(is_std_hash_set_name))
+}
+
+fn is_std_hash_set_name(name: &str) -> bool {
+    is_std_collections_generic_name(name, "HashSet")
+}
+
+fn is_std_collections_generic_name(name: &str, type_name: &str) -> bool {
+    let Some(path) = name.strip_prefix("std::collections::") else {
+        return false;
+    };
+    let marker = format!("::{type_name}<");
+    let Some((module, arguments)) = path.split_once(&marker) else {
+        return false;
+    };
+
+    !module.is_empty()
+        && module.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+        && !arguments.is_empty()
+        && arguments.ends_with('>')
 }
 
 fn is_std_core_generic_name(name: &str, type_name: &str) -> bool {
@@ -956,6 +1034,159 @@ fn rust_reference_counted_layout(
             weak_field: "weak",
             implicit_weak: 1,
         },
+    })
+}
+
+fn rust_hash_table_layout(root: &TypeInfo, kind: HashTableKind) -> Option<HashTableLayout> {
+    // Rust 1.36-1.51 expose RawTable's metadata directly; Rust 1.52 moved it
+    // under RawTable.table. HashSet wrapped std::HashMap through Rust 1.47 and
+    // now wraps hashbrown::HashSet. rust-gdb keeps all four path combinations.
+    // hashbrown also removed its dedicated `data` pointer: current tables place
+    // entries immediately before `ctrl`, in reverse control-index order. These
+    // are semantic compatibility branches only. Every selected member offset,
+    // pointer width, entry type, and entry field layout is resolved from DWARF.
+    // rust-gdb also retains a separate provider for Rust 1.35's pre-hashbrown
+    // table. That layout interleaves tagged hash words and alignment-dependent
+    // pair storage, so it intentionally falls back to physical DWARF here.
+    const MAP_PATHS: &[(&[&str], &[&str])] = &[
+        (&["base", "table"], &["base", "table", "table"]),
+        (&["base", "table"], &["base", "table"]),
+    ];
+    const SET_PATHS: &[(&[&str], &[&str])] = &[
+        (
+            &["base", "map", "table"],
+            &["base", "map", "table", "table"],
+        ),
+        (&["base", "map", "table"], &["base", "map", "table"]),
+        (
+            &["map", "base", "table"],
+            &["map", "base", "table", "table"],
+        ),
+        (&["map", "base", "table"], &["map", "base", "table"]),
+    ];
+
+    let paths = match kind {
+        HashTableKind::Map => MAP_PATHS,
+        HashTableKind::Set => SET_PATHS,
+    };
+    for (table_fields, metadata_fields) in paths {
+        if let Some(layout) = validate_hash_table_layout(
+            root,
+            field_path(table_fields),
+            field_path(metadata_fields),
+            kind,
+        ) {
+            return Some(layout);
+        }
+    }
+    None
+}
+
+fn validate_hash_table_layout(
+    root: &TypeInfo,
+    table_path: Vec<String>,
+    metadata_path: Vec<String>,
+    kind: HashTableKind,
+) -> Option<HashTableLayout> {
+    let table = resolve_member_path(root, &table_path)?;
+    if !matches!(
+        strip_type_aliases(table.member_type),
+        TypeInfo::StructType { .. }
+    ) {
+        return None;
+    }
+    let metadata = resolve_member_path(root, &metadata_path)?;
+    let TypeInfo::StructType {
+        members: metadata_members,
+        ..
+    } = strip_type_aliases(metadata.member_type)
+    else {
+        return None;
+    };
+
+    let mut control_path = metadata_path.clone();
+    control_path.push("ctrl".to_string());
+    let control_path = wrapped_pointer_path(root, control_path)?;
+    let control = resolve_member_path(root, &control_path)?;
+    let TypeInfo::PointerType {
+        target_type,
+        size: pointer_size,
+    } = strip_type_aliases(control.member_type)
+    else {
+        return None;
+    };
+    let byte_control = matches!(
+        strip_type_aliases(target_type),
+        TypeInfo::BaseType { size: 1, encoding, .. }
+            if *encoding == gimli::DW_ATE_unsigned.0 as u16
+                || *encoding == gimli::DW_ATE_unsigned_char.0 as u16
+    );
+    if *pointer_size == 0 || !byte_control {
+        return None;
+    }
+
+    let mut length_path = metadata_path.clone();
+    length_path.push("items".to_string());
+    let length_path = unsigned_metadata_path(root, length_path, *pointer_size)?;
+    let mut bucket_mask_path = metadata_path.clone();
+    bucket_mask_path.push("bucket_mask".to_string());
+    let bucket_mask_path = unsigned_metadata_path(root, bucket_mask_path, *pointer_size)?;
+
+    let has_data = unique_named_member(metadata_members, "data").is_some();
+    let (data_path, bucket_order) = if has_data {
+        let mut data_path = metadata_path;
+        data_path.push("data".to_string());
+        let data_path = wrapped_pointer_path(root, data_path)?;
+        let data = resolve_member_path(root, &data_path)?;
+        let TypeInfo::PointerType {
+            size: data_pointer_size,
+            ..
+        } = strip_type_aliases(data.member_type)
+        else {
+            return None;
+        };
+        if data_pointer_size != pointer_size {
+            return None;
+        }
+        (Some(data_path), HashTableBucketOrder::Forward)
+    } else {
+        (None, HashTableBucketOrder::Reverse)
+    };
+
+    let mut ranges = Vec::with_capacity(4);
+    for path in [&control_path, &length_path, &bucket_mask_path] {
+        let member = resolve_member_path(root, path)?;
+        let end = member.offset.checked_add(member.member_type.size())?;
+        if end > root.size() {
+            return None;
+        }
+        ranges.push((member.offset, end));
+    }
+    if let Some(path) = &data_path {
+        let member = resolve_member_path(root, path)?;
+        let end = member.offset.checked_add(member.member_type.size())?;
+        if end > root.size() {
+            return None;
+        }
+        ranges.push((member.offset, end));
+    }
+    for (index, left) in ranges.iter().enumerate() {
+        if ranges[index + 1..]
+            .iter()
+            .any(|right| ranges_overlap(*left, *right))
+        {
+            return None;
+        }
+    }
+
+    Some(HashTableLayout {
+        table_path,
+        control_path,
+        data_path,
+        length_path,
+        bucket_mask_path,
+        bucket_order,
+        kind,
     })
 }
 
@@ -1689,6 +1920,121 @@ mod tests {
                     ),
                 ],
             },
+            TypeIdentity::Unknown,
+            Some(TypeOrigin {
+                module: ModuleId(0),
+                cu: CuId(0),
+                language,
+                producer: None,
+                dwarf_version: 5,
+            }),
+        )
+    }
+
+    fn hash_table_metadata(pointer_size: u64, dedicated_data: bool) -> TypeInfo {
+        let control_pointer = TypeInfo::PointerType {
+            target_type: Box::new(unsigned_type("u8", 1)),
+            size: pointer_size,
+        };
+        let control = single_member_struct("NonNull<u8>", "pointer", control_pointer);
+        let mut members = vec![
+            member("bucket_mask", unsigned_type("usize", pointer_size), 0),
+            member("ctrl", control, pointer_size),
+            member(
+                "growth_left",
+                unsigned_type("usize", pointer_size),
+                pointer_size * 2,
+            ),
+            member(
+                "items",
+                unsigned_type("usize", pointer_size),
+                pointer_size * 3,
+            ),
+        ];
+        if dedicated_data {
+            let entry_pointer = TypeInfo::PointerType {
+                target_type: Box::new(TypeInfo::UnknownType {
+                    name: "(K, V)".to_string(),
+                }),
+                size: pointer_size,
+            };
+            members.push(member(
+                "data",
+                single_member_struct("NonNull<(K, V)>", "pointer", entry_pointer),
+                pointer_size * 4,
+            ));
+        }
+        TypeInfo::StructType {
+            name: "hashbrown::raw::RawTableInner".to_string(),
+            size: pointer_size * if dedicated_data { 5 } else { 4 },
+            members,
+        }
+    }
+
+    fn rust_hash_collection_type(
+        name: &str,
+        kind: HashTableKind,
+        pointer_size: u64,
+        nested_metadata: bool,
+        dedicated_data: bool,
+        legacy_set_wrapper: bool,
+        language: SourceLanguage,
+    ) -> ResolvedType {
+        let metadata = hash_table_metadata(pointer_size, dedicated_data);
+        let raw_table = if nested_metadata {
+            TypeInfo::StructType {
+                name: "hashbrown::raw::RawTable<(K, V)>".to_string(),
+                size: metadata.size(),
+                members: vec![member("table", metadata, 0)],
+            }
+        } else {
+            TypeInfo::StructType {
+                name: "hashbrown::raw::RawTable<(K, V)>".to_string(),
+                size: metadata.size(),
+                members: match metadata {
+                    TypeInfo::StructType { members, .. } => members,
+                    _ => unreachable!("hash metadata is a struct"),
+                },
+            }
+        };
+        let hashbrown_map = TypeInfo::StructType {
+            name: "hashbrown::map::HashMap<K, V>".to_string(),
+            size: raw_table.size(),
+            members: vec![member("table", raw_table, 0)],
+        };
+        let root = match (kind, legacy_set_wrapper) {
+            (HashTableKind::Map, _) => TypeInfo::StructType {
+                name: name.to_string(),
+                size: hashbrown_map.size(),
+                members: vec![member("base", hashbrown_map, 0)],
+            },
+            (HashTableKind::Set, false) => {
+                let hashbrown_set = TypeInfo::StructType {
+                    name: "hashbrown::set::HashSet<T>".to_string(),
+                    size: hashbrown_map.size(),
+                    members: vec![member("map", hashbrown_map, 0)],
+                };
+                TypeInfo::StructType {
+                    name: name.to_string(),
+                    size: hashbrown_set.size(),
+                    members: vec![member("base", hashbrown_set, 0)],
+                }
+            }
+            (HashTableKind::Set, true) => {
+                let std_map = TypeInfo::StructType {
+                    name: "std::collections::hash::map::HashMap<T, ()>".to_string(),
+                    size: hashbrown_map.size(),
+                    members: vec![member("base", hashbrown_map, 0)],
+                };
+                TypeInfo::StructType {
+                    name: name.to_string(),
+                    size: std_map.size(),
+                    members: vec![member("map", std_map, 0)],
+                }
+            }
+        };
+        ResolvedType::new(
+            root,
             TypeIdentity::Unknown,
             Some(TypeOrigin {
                 module: ModuleId(0),
@@ -2718,6 +3064,162 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_hash_collections_across_rust_raw_table_layouts() {
+        let current_map = rust_hash_collection_type(
+            "HashMap<i32, u16>",
+            HashTableKind::Map,
+            8,
+            true,
+            false,
+            false,
+            SourceLanguage::Rust,
+        );
+        assert_eq!(
+            resolve_value_layout(
+                &current_map,
+                Some("std::collections::hash::map::HashMap<i32, u16>"),
+            ),
+            Some(ValueLayout::HashTable(HashTableLayout {
+                table_path: field_path(&["base", "table"]),
+                control_path: field_path(&["base", "table", "table", "ctrl", "pointer",]),
+                data_path: None,
+                length_path: field_path(&["base", "table", "table", "items"]),
+                bucket_mask_path: field_path(&["base", "table", "table", "bucket_mask",]),
+                bucket_order: HashTableBucketOrder::Reverse,
+                kind: HashTableKind::Map,
+            }))
+        );
+
+        let legacy_map = rust_hash_collection_type(
+            "std::collections::hash::map::HashMap<i32, u16>",
+            HashTableKind::Map,
+            4,
+            false,
+            true,
+            false,
+            SourceLanguage::Rust,
+        );
+        let Some(ValueLayout::HashTable(legacy_map)) = resolve_value_layout(&legacy_map, None)
+        else {
+            panic!("expected legacy HashMap layout")
+        };
+        assert_eq!(legacy_map.table_path, field_path(&["base", "table"]));
+        assert_eq!(
+            legacy_map.control_path,
+            field_path(&["base", "table", "ctrl", "pointer"])
+        );
+        assert_eq!(
+            legacy_map.data_path,
+            Some(field_path(&["base", "table", "data", "pointer"]))
+        );
+        assert_eq!(legacy_map.bucket_order, HashTableBucketOrder::Forward);
+
+        let current_set = rust_hash_collection_type(
+            "std::collections::hash::set::HashSet<i32>",
+            HashTableKind::Set,
+            8,
+            true,
+            false,
+            false,
+            SourceLanguage::Rust,
+        );
+        let Some(ValueLayout::HashTable(current_set)) = resolve_value_layout(&current_set, None)
+        else {
+            panic!("expected current HashSet layout")
+        };
+        assert_eq!(
+            current_set.table_path,
+            field_path(&["base", "map", "table"])
+        );
+        assert_eq!(current_set.kind, HashTableKind::Set);
+
+        let legacy_set = rust_hash_collection_type(
+            "HashSet<i32>",
+            HashTableKind::Set,
+            8,
+            false,
+            true,
+            true,
+            SourceLanguage::Rust,
+        );
+        let Some(ValueLayout::HashTable(legacy_set)) = resolve_value_layout(
+            &legacy_set,
+            Some("std::collections::hash::set::HashSet<i32>"),
+        ) else {
+            panic!("expected legacy HashSet layout")
+        };
+        assert_eq!(legacy_set.table_path, field_path(&["map", "base", "table"]));
+        assert_eq!(legacy_set.bucket_order, HashTableBucketOrder::Forward);
+    }
+
+    #[test]
+    fn rejects_hash_collection_lookalikes_and_invalid_metadata() {
+        let current = rust_hash_collection_type(
+            "HashMap<i32, u16>",
+            HashTableKind::Map,
+            8,
+            true,
+            false,
+            false,
+            SourceLanguage::Rust,
+        );
+        assert_eq!(
+            resolve_value_layout(&current, Some("app::HashMap<i32, u16>")),
+            None
+        );
+        assert_eq!(resolve_value_layout(&current, None), None);
+
+        let mut invalid_width = current.clone();
+        let TypeInfo::StructType { members, .. } = &mut invalid_width.summary else {
+            unreachable!("test HashMap is a struct")
+        };
+        let TypeInfo::StructType {
+            members: map_members,
+            ..
+        } = &mut members[0].member_type
+        else {
+            unreachable!("test base is a hashbrown map")
+        };
+        let TypeInfo::StructType {
+            members: table_members,
+            ..
+        } = &mut map_members[0].member_type
+        else {
+            unreachable!("test table is a RawTable")
+        };
+        let TypeInfo::StructType {
+            members: metadata_members,
+            ..
+        } = &mut table_members[0].member_type
+        else {
+            unreachable!("test table metadata is a struct")
+        };
+        metadata_members
+            .iter_mut()
+            .find(|member| member.name == "items")
+            .expect("items member")
+            .member_type = unsigned_type("u32", 4);
+        assert_eq!(
+            resolve_value_layout(
+                &invalid_width,
+                Some("std::collections::hash::map::HashMap<i32, u16>"),
+            ),
+            None
+        );
+
+        let non_rust = rust_hash_collection_type(
+            "std::collections::hash::map::HashMap<i32, u16>",
+            HashTableKind::Map,
+            8,
+            true,
+            false,
+            false,
+            SourceLanguage::C,
+        );
+        assert_eq!(resolve_value_layout(&non_rust, None), None);
+    }
+
+    #[test]
     fn recognizes_rc_and_arc_with_dwarf_derived_pointer_wrappers() {
         let expected = |type_name, value_member: &str| {
             let inner_path = vec![
@@ -3034,6 +3536,24 @@ mod tests {
             true,
             None,
         )));
+        assert!(requires_dwarf_qualified_name(&rust_hash_collection_type(
+            "HashMap<i32, u16>",
+            HashTableKind::Map,
+            8,
+            true,
+            false,
+            false,
+            SourceLanguage::Rust,
+        )));
+        assert!(!requires_dwarf_qualified_name(&rust_hash_collection_type(
+            "std::collections::hash::map::HashMap<i32, u16>",
+            HashTableKind::Map,
+            8,
+            true,
+            false,
+            false,
+            SourceLanguage::Rust,
+        ),));
         assert!(requires_dwarf_qualified_name(&rust_nonzero_type(
             "NonZero<u32>",
             "__0",
