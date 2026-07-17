@@ -1268,6 +1268,7 @@ lazy_static! {
 
 // Re-export the shared runner for convenience in tests
 pub mod runner;
+pub mod rust_toolchain;
 pub mod sandbox;
 pub mod targets;
 pub mod termination;

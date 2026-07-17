@@ -5,57 +5,10 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::init;
+use common::{init, rust_toolchain::rustc_for_toolchain};
 
 const TOOLCHAIN: &str = "1.35.0";
 const REQUIRE_TOOLCHAIN_ENV: &str = "GHOSTSCOPE_REQUIRE_RUST_135_E2E";
-
-fn rustc_for_toolchain() -> Option<PathBuf> {
-    if let Ok(output) = Command::new("rustup")
-        .args(["which", "--toolchain", TOOLCHAIN, "rustc"])
-        .output()
-    {
-        if output.status.success() {
-            let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-            if path.is_file() {
-                return Some(path);
-            }
-        }
-    }
-
-    let mut rustup_homes = Vec::new();
-    if let Some(home) = std::env::var_os("RUSTUP_HOME") {
-        rustup_homes.push(PathBuf::from(home));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        rustup_homes.push(PathBuf::from(home).join(".rustup"));
-    }
-    if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
-        if let Some(home) = Path::new(&cargo_home).parent() {
-            rustup_homes.push(home.join(".rustup"));
-        }
-    }
-    if let Some(user) = std::env::var_os("SUDO_USER") {
-        let user = user.to_string_lossy();
-        if !user.is_empty() && !user.contains('/') {
-            rustup_homes.push(PathBuf::from("/home").join(user.as_ref()).join(".rustup"));
-        }
-    }
-
-    rustup_homes.into_iter().find_map(|rustup_home| {
-        std::fs::read_dir(rustup_home.join("toolchains"))
-            .ok()?
-            .filter_map(Result::ok)
-            .find_map(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                let rustc = entry.path().join("bin/rustc");
-                (name == TOOLCHAIN || name.starts_with(&format!("{TOOLCHAIN}-")))
-                    .then_some(rustc)
-                    .filter(|path| path.is_file())
-            })
-    })
-}
 
 fn compile_fixture(rustc: &Path, output_dir: &Path) -> anyhow::Result<PathBuf> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -84,7 +37,7 @@ fn compile_fixture(rustc: &Path, output_dir: &Path) -> anyhow::Result<PathBuf> {
 async fn test_rust_135_hash_map_and_hash_set_values() -> anyhow::Result<()> {
     init();
 
-    let Some(rustc) = rustc_for_toolchain() else {
+    let Some(rustc) = rustc_for_toolchain(TOOLCHAIN) else {
         anyhow::ensure!(
             std::env::var_os(REQUIRE_TOOLCHAIN_ENV).is_none(),
             "required Rust toolchain {TOOLCHAIN} is not installed"

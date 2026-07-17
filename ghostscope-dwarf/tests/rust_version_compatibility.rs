@@ -46,6 +46,8 @@ const ALL_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
 ];
 
 const RUST_135_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
+    ("btree_map", ExpectedAdapter::BTreeMap),
+    ("btree_set", ExpectedAdapter::BTreeSet),
     ("hash_map", ExpectedAdapter::HashMap),
     ("hash_set", ExpectedAdapter::HashSet),
 ];
@@ -199,6 +201,77 @@ fn adapter_matches(plan: Option<&ValueReadPlan>, expected: ExpectedAdapter) -> b
     }
 }
 
+fn member_offset(projection: &ghostscope_dwarf::TypeProjection) -> anyhow::Result<u64> {
+    let ghostscope_dwarf::TypeProjectionLayout::Member { offset } = projection.layout else {
+        anyhow::bail!("expected member projection, got {:?}", projection.layout)
+    };
+    Ok(offset)
+}
+
+fn assert_rust_135_btree_plan(parameter: &str, plan: &ValueReadPlan) -> anyhow::Result<()> {
+    let ValuePresentation::BTree {
+        node_capacity,
+        entry,
+    } = &plan.presentation
+    else {
+        anyhow::bail!("1.35.0: unexpected presentation for {parameter}")
+    };
+    assert_eq!(*node_capacity, 11);
+    match (parameter, entry) {
+        ("btree_map", BTreeEntryPresentation::Map { key, value }) => {
+            assert_eq!((key.slot_stride, key.value_offset), (4, 0));
+            assert_eq!((value.slot_stride, value.value_offset), (2, 0));
+        }
+        ("btree_set", BTreeEntryPresentation::Set { value }) => {
+            assert_eq!((value.slot_stride, value.value_offset), (4, 0));
+        }
+        _ => anyhow::bail!("1.35.0: unexpected B-Tree entry for {parameter}"),
+    }
+
+    let ValueCapturePlan::IndirectBTree {
+        root_pointer,
+        root_height,
+        length,
+        node_length,
+        keys,
+        values,
+        edges,
+        node_capacity: capture_capacity,
+    } = &plan.capture
+    else {
+        anyhow::bail!("1.35.0: unexpected capture for {parameter}")
+    };
+    assert_eq!(member_offset(root_pointer)?, 0);
+    assert_eq!(member_offset(root_height)?, 8);
+    assert_eq!(member_offset(length)?, 16);
+    assert_eq!(member_offset(node_length)?, 10);
+    assert_eq!((keys.offset, keys.slot_stride), (12, 4));
+    match (parameter, values) {
+        ("btree_map", Some(values)) => {
+            assert_eq!((values.offset, values.slot_stride), (56, 2));
+        }
+        ("btree_set", None) => {}
+        _ => anyhow::bail!("1.35.0: unexpected B-Tree values for {parameter}"),
+    }
+    let expected_edges_offset = match parameter {
+        "btree_map" => 80,
+        "btree_set" => 56,
+        _ => unreachable!("validated B-Tree parameter"),
+    };
+    assert_eq!(
+        (
+            edges.offset_from_leaf,
+            edges.slot_stride,
+            edges.pointer_offset,
+            edges.pointer_size,
+            edges.edge_count,
+        ),
+        (expected_edges_offset, 8, 0, 8, 12)
+    );
+    assert_eq!(*capture_capacity, 11);
+    Ok(())
+}
+
 async fn assert_parameter_adapter(
     analyzer: &DwarfAnalyzer,
     binary: &Path,
@@ -275,9 +348,9 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
         let analyzer = DwarfAnalyzer::from_exec_path(&binary).await?;
         assert_target_rustc_version(&analyzer, &toolchain)?;
 
-        // Current rust-gdb keeps a dedicated Rust 1.35 HashMap provider. Pin
-        // that layout without implying the same version floor for unrelated
-        // adapters, whose compatibility matrices are covered from Rust 1.49.
+        // Pin only the Rust 1.35 layouts audited against that release's
+        // bundled rust-gdb provider. The remaining adapters keep a Rust 1.49
+        // floor until their older DWARF shapes have been audited.
         let adapters = if toolchain == "1.35.0" {
             RUST_135_ADAPTERS
         } else {
@@ -293,6 +366,14 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
                 &toolchain,
             )
             .await?;
+            if toolchain == "1.35.0" && matches!(parameter, "btree_map" | "btree_set") {
+                assert_rust_135_btree_plan(
+                    parameter,
+                    plan.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("1.35.0: missing legacy plan for {parameter}")
+                    })?,
+                )?;
+            }
             if toolchain == "1.35.0" && matches!(parameter, "hash_map" | "hash_set") {
                 let plan = plan.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("1.35.0: missing legacy plan for {parameter}")

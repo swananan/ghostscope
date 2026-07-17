@@ -1157,11 +1157,10 @@ fn rust_hash_table_layout(root: &TypeInfo, kind: HashTableKind) -> Option<HashTa
 }
 
 fn rust_btree_layout(root: &TypeInfo, kind: BTreeKind) -> Option<BTreeLayout> {
-    // rust-gdb has used `length` and an Option-wrapped `root` for BTreeMap
-    // since the provider was introduced. BTreeSet delegates to its `map`
-    // member. The root's concrete NodeRef/Root and node wrappers changed over
-    // time, so the analyzer resolves those DIEs separately instead of
-    // encoding their shape in this source-language classifier.
+    // rust-gdb reads `length` and `root` from BTreeMap, while BTreeSet
+    // delegates to its `map` member. Rust 1.35 stored Root directly and newer
+    // releases wrap Root/NodeRef in Option, so the analyzer resolves those
+    // concrete DIEs instead of encoding either shape in this classifier.
     let map_path = match kind {
         BTreeKind::Map => Vec::new(),
         BTreeKind::Set => field_path(&["map"]),
