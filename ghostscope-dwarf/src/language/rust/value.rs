@@ -10,6 +10,7 @@ pub(crate) struct IndirectSequenceLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndirectSequenceKind {
     Utf8String,
+    ByteString,
     PointerTarget,
     TypeParameter { index: usize },
 }
@@ -19,6 +20,7 @@ pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
         origin.language == SourceLanguage::Rust
             && matches!(strip_type_aliases(&current.summary), TypeInfo::StructType { name, .. }
                 if name == "String"
+                    || name == "OsString"
                     || is_short_vec_name(name)
                     || is_short_box_str_name(name))
     })
@@ -78,6 +80,8 @@ pub(super) fn resolve_value_layout(
     // below remain responsible only for version-specific physical layout.
     } else if is_std_string(name, dwarf_qualified_name) {
         rust_string_layout(&current.summary)
+    } else if is_std_os_string(name, dwarf_qualified_name) {
+        rust_os_string_layout(&current.summary)
     } else if is_std_vec(name, dwarf_qualified_name) {
         rust_vec_layout(&current.summary)
     } else {
@@ -169,6 +173,28 @@ fn is_std_string_name(name: &str) -> bool {
         })
 }
 
+fn is_std_os_string(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_os_string_name(name)
+        || (name == "OsString" && dwarf_qualified_name.is_some_and(is_std_os_string_name))
+}
+
+fn is_std_os_string_name(name: &str) -> bool {
+    let Some(path) = name.strip_prefix("std::ffi::") else {
+        return false;
+    };
+    let Some(module) = path.strip_suffix("::OsString") else {
+        return false;
+    };
+
+    !module.is_empty()
+        && module.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+}
+
 fn is_std_vec(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
     is_std_vec_name(name)
         || (is_short_vec_name(name) && dwarf_qualified_name.is_some_and(is_std_vec_name))
@@ -203,52 +229,13 @@ fn rust_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
 
     let length_path = field_path(&["vec", "len"]);
     for fields in DATA_PATHS {
-        let mut data_path = field_path(fields);
-        let Some(pointer_or_wrapper) = resolve_member_path(root, &data_path) else {
-            continue;
-        };
-
-        if matches!(
-            strip_type_aliases(pointer_or_wrapper.member_type),
-            TypeInfo::PointerType { .. }
+        if let Some(layout) = validate_wrapped_pointer_layout(
+            root,
+            field_path(fields),
+            length_path.clone(),
+            IndirectSequenceKind::Utf8String,
         ) {
-            if let Some(layout) = validate_indirect_sequence_layout(
-                root,
-                data_path,
-                length_path.clone(),
-                IndirectSequenceKind::Utf8String,
-            ) {
-                return Some(layout);
-            }
-            continue;
-        }
-
-        // This mirrors rust-gdb's `unwrap_unique_or_non_null`: Rust versions
-        // with a NonNull wrapper expose the raw pointer as its first field.
-        let TypeInfo::StructType { members, .. } =
-            strip_type_aliases(pointer_or_wrapper.member_type)
-        else {
-            continue;
-        };
-        let Some(first) = members.first() else {
-            continue;
-        };
-        data_path.push(first.name.clone());
-        let Some(raw_pointer) = resolve_member_path(root, &data_path) else {
-            continue;
-        };
-        if matches!(
-            strip_type_aliases(raw_pointer.member_type),
-            TypeInfo::PointerType { .. }
-        ) {
-            if let Some(layout) = validate_indirect_sequence_layout(
-                root,
-                data_path,
-                length_path.clone(),
-                IndirectSequenceKind::Utf8String,
-            ) {
-                return Some(layout);
-            }
+            return Some(layout);
         }
     }
 
@@ -267,57 +254,94 @@ fn rust_vec_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
 
     let length_path = field_path(&["len"]);
     for fields in DATA_PATHS {
-        let mut data_path = field_path(fields);
-        let Some(pointer_or_wrapper) = resolve_member_path(root, &data_path) else {
-            continue;
-        };
-
-        if matches!(
-            strip_type_aliases(pointer_or_wrapper.member_type),
-            TypeInfo::PointerType { .. }
+        if let Some(layout) = validate_wrapped_pointer_layout(
+            root,
+            field_path(fields),
+            length_path.clone(),
+            IndirectSequenceKind::TypeParameter { index: 0 },
         ) {
-            if let Some(layout) = validate_indirect_sequence_layout(
-                root,
-                data_path,
-                length_path.clone(),
-                IndirectSequenceKind::TypeParameter { index: 0 },
-            ) {
-                return Some(layout);
-            }
-            continue;
-        }
-
-        // Unique and NonNull wrappers changed shape in Rust 1.32 and 1.60.
-        // Follow the first DWARF member, matching rust-gdb's compatibility
-        // helper, and validate that the resulting field is a real pointer.
-        let TypeInfo::StructType { members, .. } =
-            strip_type_aliases(pointer_or_wrapper.member_type)
-        else {
-            continue;
-        };
-        let Some(first) = members.first() else {
-            continue;
-        };
-        data_path.push(first.name.clone());
-        let Some(raw_pointer) = resolve_member_path(root, &data_path) else {
-            continue;
-        };
-        if matches!(
-            strip_type_aliases(raw_pointer.member_type),
-            TypeInfo::PointerType { .. }
-        ) {
-            if let Some(layout) = validate_indirect_sequence_layout(
-                root,
-                data_path,
-                length_path.clone(),
-                IndirectSequenceKind::TypeParameter { index: 0 },
-            ) {
-                return Some(layout);
-            }
+            return Some(layout);
         }
     }
 
     None
+}
+
+fn rust_os_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
+    // Rust 1.82 moved RawVec's pointer under `inner`. Windows used the tuple
+    // field `__0` for Wtf8Buf through 1.96 and now names that field `bytes`.
+    // Unix exposes the Vec directly. These paths mirror rust-gdb; every
+    // selected member offset and width is still read from DWARF.
+    const PATHS: &[(&[&str], &[&str])] = &[
+        (
+            &["inner", "inner", "buf", "inner", "ptr", "pointer"],
+            &["inner", "inner", "len"],
+        ),
+        (
+            &["inner", "inner", "buf", "ptr", "pointer"],
+            &["inner", "inner", "len"],
+        ),
+        (
+            &["inner", "inner", "bytes", "buf", "inner", "ptr", "pointer"],
+            &["inner", "inner", "bytes", "len"],
+        ),
+        (
+            &["inner", "inner", "bytes", "buf", "ptr", "pointer"],
+            &["inner", "inner", "bytes", "len"],
+        ),
+        (
+            &["inner", "inner", "__0", "buf", "inner", "ptr", "pointer"],
+            &["inner", "inner", "__0", "len"],
+        ),
+        (
+            &["inner", "inner", "__0", "buf", "ptr", "pointer"],
+            &["inner", "inner", "__0", "len"],
+        ),
+    ];
+
+    for (data_fields, length_fields) in PATHS {
+        if let Some(layout) = validate_wrapped_pointer_layout(
+            root,
+            field_path(data_fields),
+            field_path(length_fields),
+            IndirectSequenceKind::ByteString,
+        ) {
+            return Some(layout);
+        }
+    }
+
+    None
+}
+
+fn validate_wrapped_pointer_layout(
+    root: &TypeInfo,
+    mut data_path: Vec<String>,
+    length_path: Vec<String>,
+    kind: IndirectSequenceKind,
+) -> Option<IndirectSequenceLayout> {
+    let pointer_or_wrapper = resolve_member_path(root, &data_path)?;
+    if !matches!(
+        strip_type_aliases(pointer_or_wrapper.member_type),
+        TypeInfo::PointerType { .. }
+    ) {
+        // Unique and NonNull changed shape in Rust 1.32 and 1.60. Follow the
+        // first DWARF member, matching rust-gdb's compatibility helper.
+        let TypeInfo::StructType { members, .. } =
+            strip_type_aliases(pointer_or_wrapper.member_type)
+        else {
+            return None;
+        };
+        data_path.push(members.first()?.name.clone());
+        let raw_pointer = resolve_member_path(root, &data_path)?;
+        if !matches!(
+            strip_type_aliases(raw_pointer.member_type),
+            TypeInfo::PointerType { .. }
+        ) {
+            return None;
+        }
+    }
+
+    validate_indirect_sequence_layout(root, data_path, length_path, kind)
 }
 
 fn field_path(fields: &[&str]) -> Vec<String> {
@@ -397,7 +421,10 @@ fn validate_indirect_sequence_layout(
     let members_overlap = data.offset < length_end && length.offset < data_end;
     if *pointer_size == 0
         || *pointer_size != *length_size
-        || (kind == IndirectSequenceKind::Utf8String && !utf8_byte_pointer)
+        || (matches!(
+            kind,
+            IndirectSequenceKind::Utf8String | IndirectSequenceKind::ByteString
+        ) && !utf8_byte_pointer)
         || !unsigned_length
         || data_end > aggregate_size
         || length_end > aggregate_size
@@ -508,6 +535,14 @@ mod tests {
             offset,
             bit_offset: None,
             bit_size: None,
+        }
+    }
+
+    fn single_member_struct(name: &str, field: &str, inner: TypeInfo) -> TypeInfo {
+        TypeInfo::StructType {
+            name: name.to_string(),
+            size: inner.size(),
+            members: vec![member(field, inner, 0)],
         }
     }
 
@@ -622,6 +657,30 @@ mod tests {
         ResolvedType::new(vec_type, TypeIdentity::Unknown, string.origin)
     }
 
+    fn rust_os_string_type(
+        name: &str,
+        pointer_size: u64,
+        uses_raw_vec_inner: bool,
+        windows_vec_field: Option<&str>,
+    ) -> ResolvedType {
+        let vec = rust_vec_type(
+            "alloc::vec::Vec<u8, alloc::alloc::Global>",
+            SourceLanguage::Rust,
+            pointer_size,
+            true,
+            uses_raw_vec_inner,
+        );
+        let origin = vec.origin;
+        let platform_buffer = match windows_vec_field {
+            Some(field) => single_member_struct("Wtf8Buf", field, vec.summary),
+            None => vec.summary,
+        };
+        let buffer = single_member_struct("Buf", "inner", platform_buffer);
+        let os_string = single_member_struct(name, "inner", buffer);
+
+        ResolvedType::new(os_string, TypeIdentity::Unknown, origin)
+    }
+
     #[test]
     fn recognizes_rust_str_layout() {
         let current = rust_str_type_64("&str", SourceLanguage::Rust);
@@ -712,6 +771,70 @@ mod tests {
             resolve_value_layout(&current, Some("app::Box<str, alloc::alloc::Global>"),),
             None
         );
+        assert_eq!(resolve_value_layout(&current, None), None);
+    }
+
+    #[test]
+    fn recognizes_unix_and_windows_os_string_layouts_across_versions() {
+        type LayoutCase<'a> = (bool, Option<&'a str>, &'a [&'a str], &'a [&'a str]);
+
+        let cases: &[LayoutCase<'_>] = &[
+            (
+                true,
+                None,
+                &[
+                    "inner", "inner", "buf", "inner", "ptr", "pointer", "pointer",
+                ],
+                &["inner", "inner", "len"],
+            ),
+            (
+                false,
+                None,
+                &["inner", "inner", "buf", "ptr", "pointer", "pointer"],
+                &["inner", "inner", "len"],
+            ),
+            (
+                true,
+                Some("bytes"),
+                &[
+                    "inner", "inner", "bytes", "buf", "inner", "ptr", "pointer", "pointer",
+                ],
+                &["inner", "inner", "bytes", "len"],
+            ),
+            (
+                false,
+                Some("__0"),
+                &["inner", "inner", "__0", "buf", "ptr", "pointer", "pointer"],
+                &["inner", "inner", "__0", "len"],
+            ),
+        ];
+
+        for (uses_raw_vec_inner, windows_field, data_fields, length_fields) in cases {
+            let current = rust_os_string_type(
+                "std::ffi::os_str::OsString",
+                8,
+                *uses_raw_vec_inner,
+                *windows_field,
+            );
+
+            assert_eq!(
+                resolve_value_layout(&current, None),
+                Some(IndirectSequenceLayout {
+                    data_path: field_path(data_fields),
+                    length_path: field_path(length_fields),
+                    kind: IndirectSequenceKind::ByteString,
+                }),
+                "raw_vec_inner={uses_raw_vec_inner} windows_field={windows_field:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_standard_namespace_for_short_os_string_name() {
+        let current = rust_os_string_type("OsString", 8, true, None);
+
+        assert!(resolve_value_layout(&current, Some("std::ffi::os_str::OsString"),).is_some());
+        assert_eq!(resolve_value_layout(&current, Some("app::OsString")), None);
         assert_eq!(resolve_value_layout(&current, None), None);
     }
 
@@ -976,6 +1099,15 @@ mod tests {
         assert!(!requires_dwarf_qualified_name(&rust_str_type_64(
             "alloc::boxed::Box<str, alloc::alloc::Global>",
             SourceLanguage::Rust,
+        )));
+        assert!(requires_dwarf_qualified_name(&rust_os_string_type(
+            "OsString", 8, true, None,
+        )));
+        assert!(!requires_dwarf_qualified_name(&rust_os_string_type(
+            "std::ffi::os_str::OsString",
+            8,
+            true,
+            None,
         )));
     }
 }

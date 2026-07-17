@@ -32,4 +32,7 @@ pub enum ValuePresentation {
         element_type: Box<TypeInfo>,
         element_stride: u64,
     },
+    /// An arbitrary byte string using the same length-prefixed payload as
+    /// `Utf8String`. Invalid UTF-8 bytes are rendered with `\xNN` escapes.
+    ByteString,
 }
