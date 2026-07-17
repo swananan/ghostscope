@@ -713,24 +713,17 @@ impl DwarfAnalyzer {
             self.project_resolved_member_path(current, &layout.root_path, type_module_path)?;
         let length =
             self.project_resolved_member_path(current, &layout.length_path, type_module_path)?;
-        let Some(root_inner) = self.rust_option_payload_type(&root.resolved_type)? else {
+        let Some(root_value) = self.rust_btree_root_value(&root.resolved_type)? else {
             return Ok(None);
         };
-        // rust-gdb casts Option<Root>/Option<NodeRef> to its payload. Both old
-        // Root (through Rust 1.49) and current NodeRef are pointer-niche
-        // options; require the concrete DIE sizes to agree before doing the
-        // same projection.
-        if root_inner.summary.size() != root.resolved_type.summary.size() {
-            return Ok(None);
-        }
         let root_offset = member_projection_offset(&root)?;
         let root_height_inner = self.project_resolved_member_path(
-            &root_inner,
+            &root_value,
             &["height".to_string()],
             type_module_path,
         )?;
         let root_node_inner = self.project_resolved_member_path(
-            &root_inner,
+            &root_value,
             &["node".to_string()],
             type_module_path,
         )?;
@@ -868,14 +861,8 @@ impl DwarfAnalyzer {
 
         let parent =
             self.project_resolved_member_path(&leaf, &["parent".to_string()], type_module_path)?;
-        let Some(parent_inner) = self.rust_option_payload_type(&parent.resolved_type)? else {
-            return Ok(None);
-        };
-        if parent_inner.summary.size() != parent.resolved_type.summary.size() {
-            return Ok(None);
-        }
         let Some(parent_pointer) =
-            self.project_rust_pointer_wrapper(&parent_inner, type_module_path)?
+            self.rust_btree_parent_pointer(&parent.resolved_type, type_module_path)?
         else {
             return Ok(None);
         };
@@ -974,6 +961,50 @@ impl DwarfAnalyzer {
                 node_capacity,
             },
         }))
+    }
+
+    fn rust_btree_root_value(&self, root: &ResolvedType) -> Result<Option<ResolvedType>> {
+        // Rust 1.35's bundled rust-gdb provider reads `map["root"]`
+        // directly. Newer providers unwrap an Option niche first. Select the
+        // representation from the concrete DIE rather than the compiler
+        // version; every member is projected and validated below.
+        if member_path_exists(&root.summary, &["node"])
+            && member_path_exists(&root.summary, &["height"])
+        {
+            return Ok(Some(root.clone()));
+        }
+
+        let Some(payload) = self.rust_option_payload_type(root)? else {
+            return Ok(None);
+        };
+        if payload.summary.size() != root.summary.size()
+            || !member_path_exists(&payload.summary, &["node"])
+            || !member_path_exists(&payload.summary, &["height"])
+        {
+            return Ok(None);
+        }
+        Ok(Some(payload))
+    }
+
+    fn rust_btree_parent_pointer(
+        &self,
+        parent: &ResolvedType,
+        type_module_path: Option<&Path>,
+    ) -> Result<Option<TypeProjection>> {
+        // Rust 1.35 stores a nullable raw parent pointer. Newer B-Tree nodes
+        // use a pointer-niche Option. The pointer target and width remain
+        // concrete DWARF checks in both cases.
+        if pointer_width(&parent.summary).is_some() {
+            return self.project_rust_pointer_wrapper(parent, type_module_path);
+        }
+
+        let Some(payload) = self.rust_option_payload_type(parent)? else {
+            return Ok(None);
+        };
+        if payload.summary.size() != parent.summary.size() {
+            return Ok(None);
+        }
+        self.project_rust_pointer_wrapper(&payload, type_module_path)
     }
 
     fn rust_option_payload_type(&self, option: &ResolvedType) -> Result<Option<ResolvedType>> {
