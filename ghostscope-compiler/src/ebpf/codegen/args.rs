@@ -22,15 +22,20 @@ fn metadata_member(
     role: &str,
 ) -> Result<(u64, ghostscope_dwarf::MemoryAccessSize)> {
     let access_size = metadata_access_size(projection, role)?;
-    let offset = match &projection.layout {
-        ghostscope_dwarf::TypeProjectionLayout::Member { offset } => *offset,
-        layout => {
-            return Err(CodeGenError::DwarfError(format!(
-                "indirect value {role} projection must be a member, got {layout:?}"
-            )))
-        }
-    };
+    let offset = projected_member_offset(projection, role)?;
     Ok((offset, access_size))
+}
+
+fn projected_member_offset(
+    projection: &ghostscope_dwarf::TypeProjection,
+    role: &str,
+) -> Result<u64> {
+    match &projection.layout {
+        ghostscope_dwarf::TypeProjectionLayout::Member { offset } => Ok(*offset),
+        layout => Err(CodeGenError::DwarfError(format!(
+            "semantic value {role} projection must be a member, got {layout:?}"
+        ))),
+    }
 }
 
 fn sequence_capture_limits(cap: usize, element_stride: u64) -> Result<(usize, usize, usize)> {
@@ -75,7 +80,41 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         plan: ghostscope_dwarf::ValueReadPlan,
     ) -> Result<ComplexArg<'ctx>> {
         let cap = self.compile_options.mem_dump_cap as usize;
-        let (data_len, source) = match plan.capture {
+        let ghostscope_dwarf::ValueReadPlan {
+            presentation,
+            capture,
+        } = plan;
+        let mut output_type = dwarf_type;
+        let (data_len, source) = match capture {
+            ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value } => {
+                let offset = projected_member_offset(&value, "projected value")?;
+                output_type = value.resolved_type.summary;
+                let data_len = Self::compute_read_size_for_type(&output_type);
+                if data_len == 0 {
+                    return Err(CodeGenError::TypeSizeNotAvailable(display_name));
+                }
+                let address = if offset == 0 {
+                    descriptor
+                } else {
+                    let offset_value = self.context.i64_type().const_int(offset, false);
+                    let address = self
+                        .builder
+                        .build_int_add(
+                            descriptor.value,
+                            offset_value,
+                            "semantic_projected_value_address",
+                        )
+                        .map_err(|error| CodeGenError::Builder(error.to_string()))?;
+                    descriptor.with_value(address)
+                };
+                (
+                    data_len,
+                    ComplexArgSource::MemDump {
+                        address,
+                        len: data_len,
+                    },
+                )
+            }
             ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } => {
                 let (data_offset, data_access_size) = metadata_member(&data, "data")?;
                 let (length_offset, length_access_size) = metadata_member(&length, "length")?;
@@ -168,7 +207,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             var_name_index: self.trace_context.add_variable_name(display_name)?,
             type_index: self
                 .trace_context
-                .add_type_with_presentation(dwarf_type, plan.presentation)?,
+                .add_type_with_presentation(output_type, presentation)?,
             access_path: Vec::new(),
             data_len,
             source,
@@ -274,6 +313,53 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         )))
                     }
                 };
+                if let Some(ghostscope_dwarf::ValueReadPlan {
+                    presentation,
+                    capture: ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value: projected },
+                }) = semantic_plan
+                {
+                    let offset = projected_member_offset(&projected, "projected value")?;
+                    let projected_type = projected.resolved_type.summary;
+                    let data_len = Self::compute_read_size_for_type(&projected_type);
+                    let container_len = Self::compute_read_size_for_type(&dwarf_type);
+                    let projected_end = usize::try_from(offset)
+                        .ok()
+                        .and_then(|offset| offset.checked_add(data_len));
+                    if data_len == 0
+                        || data_len > 8
+                        || projected_end.is_none_or(|end| end > container_len || end > 8)
+                    {
+                        return Err(CodeGenError::DwarfError(format!(
+                            "direct semantic projection for '{}' does not fit one eBPF register",
+                            materialized.name
+                        )));
+                    }
+                    let value = if offset == 0 {
+                        value
+                    } else {
+                        let shift = value.get_type().const_int(offset * 8, false);
+                        self.builder
+                            .build_right_shift(
+                                value,
+                                shift,
+                                false,
+                                "semantic_projected_direct_value",
+                            )
+                            .map_err(|error| CodeGenError::Builder(error.to_string()))?
+                    };
+                    return Ok(ComplexArg {
+                        var_name_index: self.trace_context.add_variable_name(display_name)?,
+                        type_index: self
+                            .trace_context
+                            .add_type_with_presentation(projected_type, presentation)?,
+                        access_path: Vec::new(),
+                        data_len,
+                        source: ComplexArgSource::ComputedInt {
+                            value,
+                            byte_len: data_len,
+                        },
+                    });
+                }
                 let data_len = Self::compute_read_size_for_type(&dwarf_type).clamp(1, 8);
                 Ok(ComplexArg {
                     var_name_index: self.trace_context.add_variable_name(display_name)?,
@@ -1305,5 +1391,20 @@ mod semantic_value_tests {
         let error = metadata_access_size(&projected, "data").unwrap_err();
 
         assert!(error.to_string().contains("unsupported DWARF size 3"));
+    }
+
+    #[test]
+    fn reads_projected_value_offset_without_assuming_field_names() {
+        let mut projected = projection(4);
+        projected.layout = TypeProjectionLayout::Member { offset: 12 };
+
+        assert_eq!(
+            projected_member_offset(&projected, "projected value").unwrap(),
+            12
+        );
+
+        projected.layout = TypeProjectionLayout::Dereference;
+        let error = projected_member_offset(&projected, "projected value").unwrap_err();
+        assert!(error.to_string().contains("must be a member"));
     }
 }

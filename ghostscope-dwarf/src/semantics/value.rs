@@ -24,6 +24,9 @@ pub enum RingSequenceLength {
 /// Physical capture strategy used by a semantic value adapter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueCapturePlan {
+    /// Read an embedded value at a DWARF-derived member projection and present
+    /// it using the projected type rather than the physical wrapper type.
+    ProjectedValue { value: TypeProjection },
     /// Read a pointer and length from an aggregate, then capture a bounded byte
     /// sequence from the pointer.
     IndirectBytes {
