@@ -3,7 +3,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     ffi::OsString,
     marker::{PhantomData, PhantomPinned},
     num::{NonZeroI32, NonZeroU128, NonZeroU32},
@@ -124,6 +124,15 @@ pub mod user_types {
     }
 
     pub struct HashSet<T> {
+        pub value: T,
+    }
+
+    pub struct BTreeMap<K, V> {
+        pub key: K,
+        pub value: V,
+    }
+
+    pub struct BTreeSet<T> {
         pub value: T,
     }
 }
@@ -255,7 +264,7 @@ pub static mut GLOBAL_ENUM_BITS: i32 = 0;
 
 pub mod math {
     use std::{
-        collections::{HashMap, HashSet},
+        collections::{BTreeMap, BTreeSet, HashMap, HashSet},
         rc::Rc,
         sync::Arc,
     };
@@ -388,6 +397,58 @@ pub mod math {
     pub fn observe_user_hash_collections(
         map: &crate::user_types::HashMap<i32, u16>,
         set: &crate::user_types::HashSet<i32>,
+    ) -> i64 {
+        std::hint::black_box((map.key, map.value, set.value));
+        map.key as i64 + map.value as i64 + set.value as i64
+    }
+
+    #[inline(never)]
+    pub fn observe_btree_collections(
+        map: BTreeMap<i32, u16>,
+        set: BTreeSet<i32>,
+        empty_map: BTreeMap<i32, u16>,
+        empty_set: BTreeSet<i32>,
+        unit_map: BTreeMap<(), ()>,
+        unit_set: BTreeSet<()>,
+    ) -> usize {
+        std::hint::black_box((
+            &map,
+            &set,
+            &empty_map,
+            &empty_set,
+            &unit_map,
+            &unit_set,
+        ));
+        map.len()
+            + set.len()
+            + empty_map.len()
+            + empty_set.len()
+            + unit_map.len()
+            + unit_set.len()
+    }
+
+    #[inline(never)]
+    pub fn observe_deep_btree_collections(
+        map: BTreeMap<i32, u16>,
+        set: BTreeSet<i32>,
+    ) -> usize {
+        std::hint::black_box((&map, &set));
+        map.len() + set.len()
+    }
+
+    #[inline(never)]
+    pub fn observe_internal_btree_collections(
+        map: BTreeMap<i32, u16>,
+        set: BTreeSet<i32>,
+    ) -> usize {
+        std::hint::black_box((&map, &set));
+        map.len() + set.len()
+    }
+
+    #[inline(never)]
+    pub fn observe_user_btree_collections(
+        map: &crate::user_types::BTreeMap<i32, u16>,
+        set: &crate::user_types::BTreeSet<i32>,
     ) -> i64 {
         std::hint::black_box((map.key, map.value, set.value));
         map.key as i64 + map.value as i64 + set.value as i64
@@ -602,6 +663,33 @@ fn main() {
         };
         let user_set = user_types::HashSet { value: 53_i32 };
         acc += math::observe_user_hash_collections(&user_map, &user_set);
+        acc += math::observe_btree_collections(
+            BTreeMap::from([(-7_i32, 13_u16), (29_i32, 17_u16)]),
+            BTreeSet::from([-9_i32, 5_i32]),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::from([((), ())]),
+            BTreeSet::from([()]),
+        ) as i64;
+        let internal_map = (0_i32..20)
+            .map(|key| (key, (key * 3 + 1) as u16))
+            .collect();
+        let internal_set = (0_i32..20).collect();
+        acc += math::observe_internal_btree_collections(internal_map, internal_set) as i64;
+        let deep_map = (0_i32..160)
+            .map(|key| (key, (key * 3 + 1) as u16))
+            .collect();
+        let deep_set = (0_i32..160).collect();
+        acc += math::observe_deep_btree_collections(deep_map, deep_set) as i64;
+        let user_btree_map = user_types::BTreeMap {
+            key: 59_i32,
+            value: 61_u16,
+        };
+        let user_btree_set = user_types::BTreeSet { value: 67_i32 };
+        acc += math::observe_user_btree_collections(
+            &user_btree_map,
+            &user_btree_set,
+        );
         acc += touch_globals() as i64;
         thread::sleep(Duration::from_millis(1000));
     }

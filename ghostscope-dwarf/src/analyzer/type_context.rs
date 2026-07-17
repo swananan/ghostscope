@@ -410,6 +410,9 @@ impl DwarfAnalyzer {
                     },
                 }));
             }
+            crate::language::ValueLayout::BTree(layout) => {
+                return self.rust_btree_value_read_plan(current, layout, type_module_path);
+            }
             crate::language::ValueLayout::HashTable(layout) => {
                 let table = self.project_resolved_member_path(
                     current,
@@ -628,6 +631,495 @@ impl DwarfAnalyzer {
             presentation,
             capture,
         }))
+    }
+
+    fn rust_btree_value_read_plan(
+        &self,
+        current: &ResolvedType,
+        layout: crate::language::BTreeLayout,
+        type_module_path: Option<&Path>,
+    ) -> Result<Option<ValueReadPlan>> {
+        let map = self.project_resolved_member_path(current, &layout.map_path, type_module_path)?;
+        let Some(map_type_id) = map.resolved_type.identity.layout_dwarf_id() else {
+            return Ok(None);
+        };
+        let Some(key_type) = self.template_type_parameter(map_type_id, 0)? else {
+            return Ok(None);
+        };
+        if matches!(
+            strip_type_aliases(&key_type.summary),
+            TypeInfo::UnknownType { .. }
+        ) {
+            return Ok(None);
+        }
+        let value_type = match layout.kind {
+            crate::language::BTreeKind::Map => {
+                let Some(value_type) = self.template_type_parameter(map_type_id, 1)? else {
+                    return Ok(None);
+                };
+                if matches!(
+                    strip_type_aliases(&value_type.summary),
+                    TypeInfo::UnknownType { .. }
+                ) {
+                    return Ok(None);
+                }
+                Some(value_type)
+            }
+            crate::language::BTreeKind::Set => None,
+        };
+
+        let root =
+            self.project_resolved_member_path(current, &layout.root_path, type_module_path)?;
+        let length =
+            self.project_resolved_member_path(current, &layout.length_path, type_module_path)?;
+        let Some(root_inner) = self.rust_option_payload_type(&root.resolved_type)? else {
+            return Ok(None);
+        };
+        // rust-gdb casts Option<Root>/Option<NodeRef> to its payload. Both old
+        // Root (through Rust 1.49) and current NodeRef are pointer-niche
+        // options; require the concrete DIE sizes to agree before doing the
+        // same projection.
+        if root_inner.summary.size() != root.resolved_type.summary.size() {
+            return Ok(None);
+        }
+        let root_offset = member_projection_offset(&root)?;
+        let root_height_inner = self.project_resolved_member_path(
+            &root_inner,
+            &["height".to_string()],
+            type_module_path,
+        )?;
+        let root_node_inner = self.project_resolved_member_path(
+            &root_inner,
+            &["node".to_string()],
+            type_module_path,
+        )?;
+        let Some(root_pointer_inner) =
+            self.project_rust_pointer_wrapper(&root_node_inner.resolved_type, type_module_path)?
+        else {
+            return Ok(None);
+        };
+        let root_height = rebase_member_projection(root_offset, root_height_inner)?;
+        let root_node_offset = member_projection_offset(&root_node_inner)?;
+        let root_pointer = rebase_member_projection(
+            root_offset
+                .checked_add(root_node_offset)
+                .ok_or_else(|| anyhow::anyhow!("B-Tree root node offset overflow"))?,
+            root_pointer_inner,
+        )?;
+        let Some(pointer_size) = pointer_width(&root_pointer.resolved_type.summary) else {
+            return Ok(None);
+        };
+        if !matches!(pointer_size, 4 | 8)
+            || !is_unsigned_scalar_of_size(&root_height.resolved_type.summary, pointer_size)
+            || !is_unsigned_scalar_of_size(&length.resolved_type.summary, pointer_size)
+        {
+            return Ok(None);
+        }
+
+        let leaf = self.project_resolved_type(
+            &root_pointer.resolved_type,
+            &VariableAccessSegment::Dereference,
+            type_module_path,
+        )?;
+        let leaf = leaf.resolved_type;
+        if !matches!(
+            strip_type_aliases(&leaf.summary),
+            TypeInfo::StructType { .. }
+        ) {
+            return Ok(None);
+        }
+        let node_length =
+            self.project_resolved_member_path(&leaf, &["len".to_string()], type_module_path)?;
+        if !is_unsigned_scalar(&node_length.resolved_type.summary) {
+            return Ok(None);
+        }
+
+        let keys =
+            self.project_resolved_member_path(&leaf, &["keys".to_string()], type_module_path)?;
+        let Some((node_capacity, key_stride, key_element)) =
+            self.btree_array_element(&keys.resolved_type, type_module_path)?
+        else {
+            return Ok(None);
+        };
+        let keys_offset = member_projection_offset(&keys)?;
+        if !embedded_array_fits(leaf.summary.size(), keys_offset, node_capacity, key_stride) {
+            return Ok(None);
+        }
+        let Some(key_value) =
+            self.project_rust_maybe_uninit_value(&key_element, &key_type, type_module_path)?
+        else {
+            return Ok(None);
+        };
+        let key_value_offset = member_projection_offset(&key_value)?;
+        if !embedded_value_fits(key_stride, key_value_offset, &key_type.summary) {
+            return Ok(None);
+        }
+
+        let (entry, values_capture) = match layout.kind {
+            crate::language::BTreeKind::Map => {
+                let Some(value_type) = value_type.as_ref() else {
+                    return Ok(None);
+                };
+                let vals = self.project_resolved_member_path(
+                    &leaf,
+                    &["vals".to_string()],
+                    type_module_path,
+                )?;
+                let Some((value_capacity, value_stride, value_element)) =
+                    self.btree_array_element(&vals.resolved_type, type_module_path)?
+                else {
+                    return Ok(None);
+                };
+                if value_capacity != node_capacity {
+                    return Ok(None);
+                }
+                let values_offset = member_projection_offset(&vals)?;
+                if !embedded_array_fits(
+                    leaf.summary.size(),
+                    values_offset,
+                    value_capacity,
+                    value_stride,
+                ) {
+                    return Ok(None);
+                }
+                let Some(projected_value) = self.project_rust_maybe_uninit_value(
+                    &value_element,
+                    value_type,
+                    type_module_path,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let value_offset = member_projection_offset(&projected_value)?;
+                if !embedded_value_fits(value_stride, value_offset, &value_type.summary) {
+                    return Ok(None);
+                }
+                (
+                    crate::BTreeEntryPresentation::Map {
+                        key: crate::BTreeFieldPresentation {
+                            slot_stride: key_stride,
+                            value_offset: key_value_offset,
+                            field_type: Box::new(key_type.summary.clone()),
+                        },
+                        value: crate::BTreeFieldPresentation {
+                            slot_stride: value_stride,
+                            value_offset,
+                            field_type: Box::new(value_type.summary.clone()),
+                        },
+                    },
+                    Some(crate::BTreeArrayCapture {
+                        offset: values_offset,
+                        slot_stride: value_stride,
+                    }),
+                )
+            }
+            crate::language::BTreeKind::Set => (
+                crate::BTreeEntryPresentation::Set {
+                    value: crate::BTreeFieldPresentation {
+                        slot_stride: key_stride,
+                        value_offset: key_value_offset,
+                        field_type: Box::new(key_type.summary.clone()),
+                    },
+                },
+                None,
+            ),
+        };
+
+        let parent =
+            self.project_resolved_member_path(&leaf, &["parent".to_string()], type_module_path)?;
+        let Some(parent_inner) = self.rust_option_payload_type(&parent.resolved_type)? else {
+            return Ok(None);
+        };
+        if parent_inner.summary.size() != parent.resolved_type.summary.size() {
+            return Ok(None);
+        }
+        let Some(parent_pointer) =
+            self.project_rust_pointer_wrapper(&parent_inner, type_module_path)?
+        else {
+            return Ok(None);
+        };
+        if pointer_width(&parent_pointer.resolved_type.summary) != Some(pointer_size) {
+            return Ok(None);
+        }
+        let internal = self.project_resolved_type(
+            &parent_pointer.resolved_type,
+            &VariableAccessSegment::Dereference,
+            type_module_path,
+        )?;
+        let internal = internal.resolved_type;
+        let internal_leaf =
+            self.project_resolved_member_path(&internal, &["data".to_string()], type_module_path)?;
+        if !same_layout_type(&internal_leaf.resolved_type, &leaf) {
+            return Ok(None);
+        }
+        let internal_leaf_offset = member_projection_offset(&internal_leaf)?;
+        let edges =
+            self.project_resolved_member_path(&internal, &["edges".to_string()], type_module_path)?;
+        let Some((edge_count, edge_stride, edge_element)) =
+            self.btree_array_element(&edges.resolved_type, type_module_path)?
+        else {
+            return Ok(None);
+        };
+        if edge_count != node_capacity.checked_add(1).unwrap_or(u64::MAX) {
+            return Ok(None);
+        }
+        let edges_offset = member_projection_offset(&edges)?;
+        if !embedded_array_fits(
+            internal.summary.size(),
+            edges_offset,
+            edge_count,
+            edge_stride,
+        ) {
+            return Ok(None);
+        }
+        let Some(edge_value) =
+            self.project_rust_maybe_uninit_storage(&edge_element, type_module_path)?
+        else {
+            return Ok(None);
+        };
+        let edge_storage_offset = member_projection_offset(&edge_value)?;
+        let Some(edge_pointer_inner) =
+            self.project_rust_pointer_wrapper(&edge_value.resolved_type, type_module_path)?
+        else {
+            return Ok(None);
+        };
+        if pointer_width(&edge_pointer_inner.resolved_type.summary) != Some(pointer_size) {
+            return Ok(None);
+        }
+        let edge_target = self.project_resolved_type(
+            &edge_pointer_inner.resolved_type,
+            &VariableAccessSegment::Dereference,
+            type_module_path,
+        )?;
+        if !same_layout_type(&edge_target.resolved_type, &leaf) {
+            return Ok(None);
+        }
+        let edge_pointer_offset = edge_storage_offset
+            .checked_add(member_projection_offset(&edge_pointer_inner)?)
+            .ok_or_else(|| anyhow::anyhow!("B-Tree edge pointer offset overflow"))?;
+        if !embedded_value_fits(
+            edge_stride,
+            edge_pointer_offset,
+            &edge_pointer_inner.resolved_type.summary,
+        ) {
+            return Ok(None);
+        }
+        let Some(offset_from_leaf) = edges_offset.checked_sub(internal_leaf_offset) else {
+            return Ok(None);
+        };
+
+        Ok(Some(ValueReadPlan {
+            presentation: crate::ValuePresentation::BTree {
+                node_capacity,
+                entry,
+            },
+            capture: ValueCapturePlan::IndirectBTree {
+                root_pointer,
+                root_height,
+                length,
+                node_length,
+                keys: crate::BTreeArrayCapture {
+                    offset: keys_offset,
+                    slot_stride: key_stride,
+                },
+                values: values_capture,
+                edges: crate::BTreeEdgesCapture {
+                    offset_from_leaf,
+                    slot_stride: edge_stride,
+                    pointer_offset: edge_pointer_offset,
+                    pointer_size,
+                    edge_count,
+                },
+                node_capacity,
+            },
+        }))
+    }
+
+    fn rust_option_payload_type(&self, option: &ResolvedType) -> Result<Option<ResolvedType>> {
+        let Some(type_id) = option.identity.layout_dwarf_id() else {
+            return Ok(None);
+        };
+        if let Some(payload) = self.template_type_parameter(type_id, 0)? {
+            return Ok(Some(payload));
+        }
+        let TypeInfo::StructType { name, .. } = strip_type_aliases(&option.summary) else {
+            return Ok(None);
+        };
+        let Some(payload_name) = rust_single_generic_argument(name, "Option") else {
+            return Ok(None);
+        };
+        self.resolved_named_type_in_module(type_id, payload_name)
+    }
+
+    fn resolved_named_type_in_module(
+        &self,
+        anchor: TypeId,
+        qualified_name: &str,
+    ) -> Result<Option<ResolvedType>> {
+        let module_path = self.module_path_for_id(anchor.module).ok_or_else(|| {
+            anyhow::anyhow!("Semantic module id {:?} is not loaded", anchor.module)
+        })?;
+        let module_data = self
+            .modules
+            .get(module_path)
+            .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?;
+        let short_name = rust_short_qualified_type_name(qualified_name);
+        for candidate in [qualified_name, short_name] {
+            let Some(type_id) = module_data.aggregate_type_id_by_name(anchor.module, candidate)
+            else {
+                continue;
+            };
+            if qualified_name.contains("::") {
+                let Some(actual_name) = self.qualified_type_name(type_id)? else {
+                    continue;
+                };
+                if actual_name != qualified_name {
+                    continue;
+                }
+            }
+            let Some(summary) = self.type_summary(type_id)? else {
+                continue;
+            };
+            return Ok(Some(ResolvedType::new(
+                summary,
+                TypeIdentity::Dwarf(type_id),
+                self.type_origin(type_id)?,
+            )));
+        }
+        Ok(None)
+    }
+
+    fn btree_array_element(
+        &self,
+        array: &ResolvedType,
+        type_module_path: Option<&Path>,
+    ) -> Result<Option<(u64, u64, ResolvedType)>> {
+        let TypeInfo::ArrayType {
+            element_count: Some(element_count),
+            total_size,
+            ..
+        } = strip_type_aliases(&array.summary)
+        else {
+            return Ok(None);
+        };
+        if *element_count == 0 {
+            return Ok(None);
+        }
+        let element = self.project_resolved_type(
+            array,
+            &VariableAccessSegment::ArrayIndex(0),
+            type_module_path,
+        )?;
+        let element = element.resolved_type;
+        if matches!(
+            strip_type_aliases(&element.summary),
+            TypeInfo::UnknownType { .. }
+        ) {
+            return Ok(None);
+        }
+        let stride = element.summary.size();
+        let Some(inferred_size) = stride.checked_mul(*element_count) else {
+            return Ok(None);
+        };
+        // Rust array DIEs carry a subrange count but do not always carry a
+        // byte size, notably for arrays of zero-sized MaybeUninit values.
+        // A concrete element DIE still gives us an exact DWARF-derived stride.
+        if total_size.is_some_and(|total_size| total_size != inferred_size) {
+            return Ok(None);
+        }
+        Ok(Some((*element_count, stride, element)))
+    }
+
+    fn project_rust_maybe_uninit_value(
+        &self,
+        wrapper: &ResolvedType,
+        expected: &ResolvedType,
+        type_module_path: Option<&Path>,
+    ) -> Result<Option<TypeProjection>> {
+        // Rust 1.49 through 1.93 exposes MaybeUninit storage as
+        // `value.value`; current nightly adds a tuple `__0` wrapper. Keep both
+        // paths, but accept one only when its concrete DIE matches `expected`.
+        for path in [&["value", "value", "__0"][..], &["value", "value"][..]] {
+            if !member_path_exists(&wrapper.summary, path) {
+                continue;
+            }
+            let path = path
+                .iter()
+                .map(|field| (*field).to_string())
+                .collect::<Vec<_>>();
+            let projected = self.project_resolved_member_path(wrapper, &path, type_module_path)?;
+            if same_layout_type(&projected.resolved_type, expected) {
+                return Ok(Some(projected));
+            }
+        }
+        Ok(None)
+    }
+
+    fn project_rust_maybe_uninit_storage(
+        &self,
+        wrapper: &ResolvedType,
+        type_module_path: Option<&Path>,
+    ) -> Result<Option<TypeProjection>> {
+        // Edges use the same version-dependent MaybeUninit wrappers as keys
+        // and values, then undergo separate pointer and target validation.
+        for path in [&["value", "value", "__0"][..], &["value", "value"][..]] {
+            if !member_path_exists(&wrapper.summary, path) {
+                continue;
+            }
+            let path = path
+                .iter()
+                .map(|field| (*field).to_string())
+                .collect::<Vec<_>>();
+            return self
+                .project_resolved_member_path(wrapper, &path, type_module_path)
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    fn project_rust_pointer_wrapper(
+        &self,
+        wrapper: &ResolvedType,
+        type_module_path: Option<&Path>,
+    ) -> Result<Option<TypeProjection>> {
+        let mut resolved_type = wrapper.clone();
+        let mut offset = 0u64;
+        for _ in 0..16 {
+            if matches!(
+                strip_type_aliases(&resolved_type.summary),
+                TypeInfo::PointerType { .. }
+            ) {
+                return Ok(Some(TypeProjection {
+                    layout: TypeProjectionLayout::Member { offset },
+                    resolved_type,
+                }));
+            }
+            let TypeInfo::StructType { size, members, .. } =
+                strip_type_aliases(&resolved_type.summary)
+            else {
+                return Ok(None);
+            };
+            // Rust 1.49's BoxedNode/Unique chain uses `ptr`; current NonNull
+            // uses `pointer`, and newer transparent wrappers may add `__0`.
+            // Every hop is still resolved and range-checked against its DIE.
+            let member = ["ptr", "pointer", "__0"]
+                .iter()
+                .find_map(|name| unique_valid_member(members, name, *size))
+                .or_else(|| unique_non_zst_member(members, *size));
+            let Some(member) = member else {
+                return Ok(None);
+            };
+            let projected = self.project_resolved_type(
+                &resolved_type,
+                &VariableAccessSegment::Field(member.name.clone()),
+                type_module_path,
+            )?;
+            offset = offset
+                .checked_add(member.offset)
+                .ok_or_else(|| anyhow::anyhow!("Rust pointer wrapper offset overflow"))?;
+            resolved_type = projected.resolved_type;
+        }
+        Ok(None)
     }
 
     fn project_resolved_member_path(
@@ -917,6 +1409,136 @@ impl DwarfAnalyzer {
             .ok_or(PlanError::TupleIndexMissingTypeIdentity { index: *index })?;
         crate::language::resolve_access_segment(&origin, segment)
     }
+}
+
+fn member_projection_offset(projection: &TypeProjection) -> Result<u64> {
+    match projection.layout {
+        TypeProjectionLayout::Member { offset } => Ok(offset),
+        ref layout => Err(anyhow::anyhow!(
+            "semantic layout expected a member projection, got {layout:?}"
+        )),
+    }
+}
+
+fn rust_single_generic_argument<'a>(name: &'a str, type_name: &str) -> Option<&'a str> {
+    let generic_start = name.find('<')?;
+    let base = name[..generic_start].rsplit("::").next()?;
+    if base != type_name || !name.ends_with('>') {
+        return None;
+    }
+    let argument = &name[generic_start + 1..name.len() - 1];
+    (!argument.is_empty()).then_some(argument)
+}
+
+fn rust_short_qualified_type_name(name: &str) -> &str {
+    let generic_start = name.find('<').unwrap_or(name.len());
+    let prefix = &name[..generic_start];
+    let start = prefix.rfind("::").map_or(0, |index| index + 2);
+    &name[start..]
+}
+
+fn rebase_member_projection(base: u64, mut projection: TypeProjection) -> Result<TypeProjection> {
+    let offset = base
+        .checked_add(member_projection_offset(&projection)?)
+        .ok_or_else(|| anyhow::anyhow!("semantic member projection offset overflow"))?;
+    projection.layout = TypeProjectionLayout::Member { offset };
+    Ok(projection)
+}
+
+fn pointer_width(type_info: &TypeInfo) -> Option<u64> {
+    match strip_type_aliases(type_info) {
+        TypeInfo::PointerType { size, .. } => Some(*size),
+        _ => None,
+    }
+}
+
+fn is_unsigned_scalar(type_info: &TypeInfo) -> bool {
+    matches!(
+        strip_type_aliases(type_info),
+        TypeInfo::BaseType { encoding, .. }
+            if *encoding == gimli::DW_ATE_unsigned.0 as u16
+                || *encoding == gimli::DW_ATE_unsigned_char.0 as u16
+    )
+}
+
+fn is_unsigned_scalar_of_size(type_info: &TypeInfo, expected_size: u64) -> bool {
+    is_unsigned_scalar(type_info) && type_info.size() == expected_size
+}
+
+fn embedded_value_fits(stride: u64, offset: u64, value_type: &TypeInfo) -> bool {
+    offset
+        .checked_add(value_type.size())
+        .is_some_and(|end| end <= stride || (stride == 0 && end == 0))
+}
+
+fn embedded_array_fits(container_size: u64, offset: u64, element_count: u64, stride: u64) -> bool {
+    element_count
+        .checked_mul(stride)
+        .and_then(|size| offset.checked_add(size))
+        .is_some_and(|end| end <= container_size)
+}
+
+fn same_layout_type(left: &ResolvedType, right: &ResolvedType) -> bool {
+    let matching_identity = match (
+        left.identity.layout_dwarf_id(),
+        right.identity.layout_dwarf_id(),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    };
+    matching_identity || strip_type_aliases(&left.summary) == strip_type_aliases(&right.summary)
+}
+
+fn member_path_exists(mut current: &TypeInfo, path: &[&str]) -> bool {
+    for field in path {
+        let members = match strip_type_aliases(current) {
+            TypeInfo::StructType { members, .. } | TypeInfo::UnionType { members, .. } => members,
+            _ => return false,
+        };
+        let mut matches = members.iter().filter(|member| member.name == *field);
+        let Some(member) = matches.next() else {
+            return false;
+        };
+        if matches.next().is_some() {
+            return false;
+        }
+        current = &member.member_type;
+    }
+    true
+}
+
+fn unique_valid_member<'a>(
+    members: &'a [StructMember],
+    name: &str,
+    container_size: u64,
+) -> Option<&'a StructMember> {
+    let mut matching = members.iter().filter(|member| member.name == name);
+    let member = matching.next()?;
+    if matching.next().is_some()
+        || member.bit_offset.is_some()
+        || member.bit_size.is_some()
+        || member
+            .offset
+            .checked_add(member.member_type.size())
+            .is_none_or(|end| end > container_size)
+    {
+        return None;
+    }
+    Some(member)
+}
+
+fn unique_non_zst_member(members: &[StructMember], container_size: u64) -> Option<&StructMember> {
+    let mut matching = members.iter().filter(|member| {
+        member.member_type.size() > 0
+            && member.bit_offset.is_none()
+            && member.bit_size.is_none()
+            && member
+                .offset
+                .checked_add(member.member_type.size())
+                .is_some_and(|end| end <= container_size)
+    });
+    let member = matching.next()?;
+    matching.next().is_none().then_some(member)
 }
 
 fn projected_struct_presentation(

@@ -37,8 +37,8 @@ pub use unwind_plan::{
     UnwindDiagnostic, UnwindDiagnosticKind,
 };
 pub use value::{
-    ProjectedValueRead, ProjectedValueStep, ProjectedViewField, RingSequenceLength,
-    ValueCapturePlan, ValueReadPlan,
+    BTreeArrayCapture, BTreeEdgesCapture, ProjectedValueRead, ProjectedValueStep,
+    ProjectedViewField, RingSequenceLength, ValueCapturePlan, ValueReadPlan,
 };
 pub(crate) use variable_plan::PlanError;
 pub use variable_plan::{

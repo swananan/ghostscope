@@ -341,29 +341,4 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))
         }
     }
-
-    pub(super) fn build_entry_alloca<T>(&self, ty: T, name: &str) -> Result<PointerValue<'ctx>>
-    where
-        T: inkwell::types::BasicType<'ctx>,
-    {
-        let current_block = self.builder.get_insert_block().ok_or_else(|| {
-            CodeGenError::LLVMError("no current block for bt stack allocation".to_string())
-        })?;
-        let current_fn = self.current_function("allocate bt scratch")?;
-        let entry_block = current_fn.get_first_basic_block().ok_or_else(|| {
-            CodeGenError::LLVMError("no entry block for bt stack allocation".to_string())
-        })?;
-
-        if let Some(first_instruction) = entry_block.get_first_instruction() {
-            self.builder.position_before(&first_instruction);
-        } else {
-            self.builder.position_at_end(entry_block);
-        }
-        let alloca = self
-            .builder
-            .build_alloca(ty, name)
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        self.builder.position_at_end(current_block);
-        Ok(alloca)
-    }
 }

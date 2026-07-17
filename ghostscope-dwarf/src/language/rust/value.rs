@@ -12,6 +12,21 @@ pub(crate) enum ValueLayout {
     ProjectedStruct(ProjectedStructLayout),
     CompositeStruct(CompositeStructLayout),
     HashTable(HashTableLayout),
+    BTree(BTreeLayout),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BTreeLayout {
+    pub(crate) map_path: Vec<String>,
+    pub(crate) root_path: Vec<String>,
+    pub(crate) length_path: Vec<String>,
+    pub(crate) kind: BTreeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BTreeKind {
+    Map,
+    Set,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,7 +196,9 @@ pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
                     || is_short_rc_name(name)
                     || is_short_arc_name(name)
                     || is_short_hash_map_name(name)
-                    || is_short_hash_set_name(name))
+                    || is_short_hash_set_name(name)
+                    || is_short_btree_map_name(name)
+                    || is_short_btree_set_name(name))
     })
 }
 
@@ -196,6 +213,14 @@ pub(super) fn resolve_value_layout(
     let TypeInfo::StructType { name, .. } = strip_type_aliases(&current.summary) else {
         return None;
     };
+
+    if is_std_btree_map(name, dwarf_qualified_name) {
+        return rust_btree_layout(&current.summary, BTreeKind::Map).map(ValueLayout::BTree);
+    }
+
+    if is_std_btree_set(name, dwarf_qualified_name) {
+        return rust_btree_layout(&current.summary, BTreeKind::Set).map(ValueLayout::BTree);
+    }
 
     if is_std_hash_map(name, dwarf_qualified_name) {
         return rust_hash_table_layout(&current.summary, HashTableKind::Map)
@@ -377,6 +402,14 @@ fn is_short_hash_set_name(name: &str) -> bool {
     is_short_generic_name(name, "HashSet")
 }
 
+fn is_short_btree_map_name(name: &str) -> bool {
+    is_short_generic_name(name, "BTreeMap")
+}
+
+fn is_short_btree_set_name(name: &str) -> bool {
+    is_short_generic_name(name, "BTreeSet")
+}
+
 fn is_short_generic_name(name: &str, type_name: &str) -> bool {
     let prefix = format!("{type_name}<");
     name.strip_prefix(&prefix)
@@ -484,6 +517,26 @@ fn is_std_hash_set(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
 
 fn is_std_hash_set_name(name: &str) -> bool {
     is_std_collections_generic_name(name, "HashSet")
+}
+
+fn is_std_btree_map(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_btree_map_name(name)
+        || (is_short_btree_map_name(name)
+            && dwarf_qualified_name.is_some_and(is_std_btree_map_name))
+}
+
+fn is_std_btree_map_name(name: &str) -> bool {
+    is_std_alloc_generic_name(name, "BTreeMap")
+}
+
+fn is_std_btree_set(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_btree_set_name(name)
+        || (is_short_btree_set_name(name)
+            && dwarf_qualified_name.is_some_and(is_std_btree_set_name))
+}
+
+fn is_std_btree_set_name(name: &str) -> bool {
+    is_std_alloc_generic_name(name, "BTreeSet")
 }
 
 fn is_std_collections_generic_name(name: &str, type_name: &str) -> bool {
@@ -1080,6 +1133,82 @@ fn rust_hash_table_layout(root: &TypeInfo, kind: HashTableKind) -> Option<HashTa
         }
     }
     None
+}
+
+fn rust_btree_layout(root: &TypeInfo, kind: BTreeKind) -> Option<BTreeLayout> {
+    // rust-gdb has used `length` and an Option-wrapped `root` for BTreeMap
+    // since the provider was introduced. BTreeSet delegates to its `map`
+    // member. The root's concrete NodeRef/Root and node wrappers changed over
+    // time, so the analyzer resolves those DIEs separately instead of
+    // encoding their shape in this source-language classifier.
+    let map_path = match kind {
+        BTreeKind::Map => Vec::new(),
+        BTreeKind::Set => field_path(&["map"]),
+    };
+    let map = if map_path.is_empty() {
+        root
+    } else {
+        resolve_member_path(root, &map_path)?.member_type
+    };
+    let TypeInfo::StructType {
+        size: map_size,
+        members,
+        ..
+    } = strip_type_aliases(map)
+    else {
+        return None;
+    };
+    let root_member = unique_named_member(members, "root")?;
+    let length_member = unique_named_member(members, "length")?;
+    member_range(root_member, *map_size)?;
+    member_range(length_member, *map_size)?;
+    if ranges_overlap(
+        (
+            root_member.offset,
+            root_member
+                .offset
+                .checked_add(root_member.member_type.size())?,
+        ),
+        (
+            length_member.offset,
+            length_member
+                .offset
+                .checked_add(length_member.member_type.size())?,
+        ),
+    ) {
+        return None;
+    }
+    let TypeInfo::StructType {
+        size: root_size, ..
+    } = strip_type_aliases(&root_member.member_type)
+    else {
+        return None;
+    };
+    let TypeInfo::BaseType {
+        size: length_size,
+        encoding,
+        ..
+    } = strip_type_aliases(&length_member.member_type)
+    else {
+        return None;
+    };
+    if *root_size == 0
+        || !matches!(*length_size, 4 | 8)
+        || *encoding != gimli::DW_ATE_unsigned.0 as u16
+    {
+        return None;
+    }
+
+    let mut root_path = map_path.clone();
+    root_path.push(root_member.name.clone());
+    let mut length_path = map_path.clone();
+    length_path.push(length_member.name.clone());
+    Some(BTreeLayout {
+        map_path,
+        root_path,
+        length_path,
+        kind,
+    })
 }
 
 fn validate_hash_table_layout(
@@ -2032,6 +2161,57 @@ mod tests {
                     members: vec![member("map", std_map, 0)],
                 }
             }
+        };
+        ResolvedType::new(
+            root,
+            TypeIdentity::Unknown,
+            Some(TypeOrigin {
+                module: ModuleId(0),
+                cu: CuId(0),
+                language,
+                producer: None,
+                dwarf_version: 5,
+            }),
+        )
+    }
+
+    fn rust_btree_collection_type(
+        name: &str,
+        kind: BTreeKind,
+        pointer_size: u64,
+        language: SourceLanguage,
+    ) -> ResolvedType {
+        let root = TypeInfo::StructType {
+            name: "Option<NodeRef<K, V>>".to_string(),
+            size: pointer_size * 2,
+            members: Vec::new(),
+        };
+        let map = TypeInfo::StructType {
+            name: "alloc::collections::btree::map::BTreeMap<K, V>".to_string(),
+            size: pointer_size * 3,
+            members: vec![
+                member("root", root, 0),
+                member(
+                    "length",
+                    unsigned_type("usize", pointer_size),
+                    pointer_size * 2,
+                ),
+            ],
+        };
+        let root = match kind {
+            BTreeKind::Map => match map {
+                TypeInfo::StructType { size, members, .. } => TypeInfo::StructType {
+                    name: name.to_string(),
+                    size,
+                    members,
+                },
+                _ => unreachable!("test BTreeMap is a struct"),
+            },
+            BTreeKind::Set => TypeInfo::StructType {
+                name: name.to_string(),
+                size: map.size(),
+                members: vec![member("map", map, 0)],
+            },
         };
         ResolvedType::new(
             root,
@@ -3214,6 +3394,80 @@ mod tests {
             true,
             false,
             false,
+            SourceLanguage::C,
+        );
+        assert_eq!(resolve_value_layout(&non_rust, None), None);
+    }
+
+    #[test]
+    fn recognizes_btree_collections_by_namespace_and_map_metadata() {
+        let map = rust_btree_collection_type(
+            "BTreeMap<i32, u16>",
+            BTreeKind::Map,
+            8,
+            SourceLanguage::Rust,
+        );
+        assert_eq!(
+            resolve_value_layout(
+                &map,
+                Some("alloc::collections::btree::map::BTreeMap<i32, u16>"),
+            ),
+            Some(ValueLayout::BTree(BTreeLayout {
+                map_path: Vec::new(),
+                root_path: field_path(&["root"]),
+                length_path: field_path(&["length"]),
+                kind: BTreeKind::Map,
+            }))
+        );
+
+        let set = rust_btree_collection_type(
+            "alloc::collections::btree::set::BTreeSet<i32>",
+            BTreeKind::Set,
+            4,
+            SourceLanguage::Rust,
+        );
+        assert_eq!(
+            resolve_value_layout(&set, None),
+            Some(ValueLayout::BTree(BTreeLayout {
+                map_path: field_path(&["map"]),
+                root_path: field_path(&["map", "root"]),
+                length_path: field_path(&["map", "length"]),
+                kind: BTreeKind::Set,
+            }))
+        );
+    }
+
+    #[test]
+    fn rejects_btree_collection_lookalikes_and_invalid_metadata() {
+        let map = rust_btree_collection_type(
+            "BTreeMap<i32, u16>",
+            BTreeKind::Map,
+            8,
+            SourceLanguage::Rust,
+        );
+        assert_eq!(
+            resolve_value_layout(&map, Some("app::BTreeMap<i32, u16>")),
+            None
+        );
+        assert_eq!(resolve_value_layout(&map, None), None);
+
+        let mut missing_length = map.clone();
+        let TypeInfo::StructType { members, .. } = &mut missing_length.summary else {
+            unreachable!("test BTreeMap is a struct")
+        };
+        members.retain(|member| member.name != "length");
+        assert_eq!(
+            resolve_value_layout(
+                &missing_length,
+                Some("alloc::collections::btree::map::BTreeMap<i32, u16>"),
+            ),
+            None
+        );
+
+        let non_rust = rust_btree_collection_type(
+            "alloc::collections::btree::map::BTreeMap<i32, u16>",
+            BTreeKind::Map,
+            8,
             SourceLanguage::C,
         );
         assert_eq!(resolve_value_layout(&non_rust, None), None);

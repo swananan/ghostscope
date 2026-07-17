@@ -70,6 +70,21 @@ struct ProjectedViewFieldSource {
     steps: Vec<ProjectedViewStep>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BTreeArraySource {
+    offset: u64,
+    slot_stride: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BTreeEdgesSource {
+    offset_from_leaf: u64,
+    slot_stride: u64,
+    pointer_offset: u64,
+    pointer_access_size: ghostscope_dwarf::MemoryAccessSize,
+    edge_count: u64,
+}
+
 /// Source for complex formatted argument data
 #[derive(Debug, Clone)]
 enum ComplexArgSource<'ctx> {
@@ -138,6 +153,24 @@ enum ComplexArgSource<'ctx> {
         entry_stride: u64,
         bucket_order: ghostscope_dwarf::HashTableBucketOrder,
         max_buckets: usize,
+        max_len: usize,
+    },
+    /// Bounded breadth-first capture of Rust B-Tree nodes.
+    IndirectBTree {
+        descriptor: RuntimeAddress<'ctx>,
+        root_pointer_offset: u64,
+        root_pointer_access_size: ghostscope_dwarf::MemoryAccessSize,
+        root_height_offset: u64,
+        root_height_access_size: ghostscope_dwarf::MemoryAccessSize,
+        length_offset: u64,
+        length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        node_length_offset: u64,
+        node_length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        keys: BTreeArraySource,
+        values: Option<BTreeArraySource>,
+        edges: BTreeEdgesSource,
+        node_capacity: u64,
+        max_nodes: usize,
         max_len: usize,
     },
     /// Assemble a synthetic struct from independently projected memory reads.
@@ -253,6 +286,33 @@ fn allocate_dynamic_payload_reservations(max_lens: &[usize], available: usize) -
     }
 
     reservations
+}
+
+impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
+    fn build_entry_alloca<T>(&self, ty: T, name: &str) -> Result<PointerValue<'ctx>>
+    where
+        T: inkwell::types::BasicType<'ctx>,
+    {
+        let current_block = self.builder.get_insert_block().ok_or_else(|| {
+            CodeGenError::LLVMError("no current block for stack allocation".to_string())
+        })?;
+        let function = self.current_function("allocate stack scratch")?;
+        let entry_block = function.get_first_basic_block().ok_or_else(|| {
+            CodeGenError::LLVMError("no entry block for stack allocation".to_string())
+        })?;
+
+        if let Some(first_instruction) = entry_block.get_first_instruction() {
+            self.builder.position_before(&first_instruction);
+        } else {
+            self.builder.position_at_end(entry_block);
+        }
+        let alloca = self
+            .builder
+            .build_alloca(ty, name)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.builder.position_at_end(current_block);
+        Ok(alloca)
+    }
 }
 
 mod args;
