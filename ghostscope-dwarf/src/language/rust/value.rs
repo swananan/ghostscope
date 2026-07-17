@@ -3,7 +3,19 @@ use crate::{strip_type_aliases, ResolvedType, SourceLanguage, TypeInfo};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ValueLayout {
     IndirectSequence(IndirectSequenceLayout),
-    ProjectedValue { value_path: Vec<String> },
+    ProjectedValue {
+        value_path: Vec<String>,
+        presentation: ProjectedValuePresentation,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectedValuePresentation {
+    Transparent,
+    SingleField {
+        type_name: &'static str,
+        field_name: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +95,8 @@ pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
                     || is_short_vec_name(name)
                     || is_short_vec_deque_name(name)
                     || is_short_box_str_name(name)
-                    || is_short_nonzero_name(name))
+                    || is_short_nonzero_name(name)
+                    || is_short_cell_name(name))
     })
 }
 
@@ -99,9 +112,25 @@ pub(super) fn resolve_value_layout(
         return None;
     };
 
+    if is_std_cell(name, dwarf_qualified_name) {
+        return rust_cell_value_path(&current.summary).map(|value_path| {
+            ValueLayout::ProjectedValue {
+                value_path,
+                presentation: ProjectedValuePresentation::SingleField {
+                    type_name: "Cell",
+                    field_name: "value",
+                },
+            }
+        });
+    }
+
     if is_std_nonzero(name, dwarf_qualified_name) {
-        return rust_nonzero_value_path(&current.summary)
-            .map(|value_path| ValueLayout::ProjectedValue { value_path });
+        return rust_nonzero_value_path(&current.summary).map(|value_path| {
+            ValueLayout::ProjectedValue {
+                value_path,
+                presentation: ProjectedValuePresentation::Transparent,
+            }
+        });
     }
 
     // rustc's bundled GDB printers have treated slice-like DWARF values as
@@ -193,6 +222,36 @@ fn is_short_box_str_name(name: &str) -> bool {
 
 fn is_short_nonzero_name(name: &str) -> bool {
     is_generic_nonzero_name(name) || is_legacy_nonzero_name(name)
+}
+
+fn is_short_cell_name(name: &str) -> bool {
+    name.strip_prefix("Cell<")
+        .and_then(|arguments| arguments.strip_suffix('>'))
+        .is_some_and(|arguments| !arguments.is_empty())
+}
+
+fn is_std_cell(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_cell_name(name)
+        || (is_short_cell_name(name) && dwarf_qualified_name.is_some_and(is_std_cell_name))
+}
+
+fn is_std_cell_name(name: &str) -> bool {
+    let Some(path) = name.strip_prefix("core::") else {
+        return false;
+    };
+    let Some((module, arguments)) = path.split_once("::Cell<") else {
+        return false;
+    };
+
+    !module.is_empty()
+        && module.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+        && !arguments.is_empty()
+        && arguments.ends_with('>')
 }
 
 fn is_generic_nonzero_name(name: &str) -> bool {
@@ -408,6 +467,38 @@ fn rust_nonzero_value_path(root: &TypeInfo) -> Option<Vec<String>> {
     let value_end = value.offset.checked_add(*size)?;
 
     (*size > 0 && integer_encoding && value_end <= root.size()).then_some(value_path)
+}
+
+fn rust_cell_value_path(root: &TypeInfo) -> Option<Vec<String>> {
+    // Rust 1.46 through the current 1.98 nightly rust-gdb provider reads two
+    // nested `value` members. The provider has no version-specific fallback,
+    // so validate the same unique-member shape but derive names, offsets, and
+    // the projected type exclusively from the concrete DWARF DIEs.
+    let TypeInfo::StructType { members, .. } = strip_type_aliases(root) else {
+        return None;
+    };
+    let [outer] = members.as_slice() else {
+        return None;
+    };
+    let TypeInfo::StructType {
+        members: inner_members,
+        ..
+    } = strip_type_aliases(&outer.member_type)
+    else {
+        return None;
+    };
+    let [inner] = inner_members.as_slice() else {
+        return None;
+    };
+    let value_path = vec![outer.name.clone(), inner.name.clone()];
+    let value = resolve_member_path_allowing_zst(root, &value_path)?;
+    let value_end = value.offset.checked_add(value.member_type.size())?;
+
+    (!matches!(
+        strip_type_aliases(value.member_type),
+        TypeInfo::UnknownType { .. } | TypeInfo::OptimizedOut { .. }
+    ) && value_end <= root.size())
+    .then_some(value_path)
 }
 
 fn rust_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
@@ -660,6 +751,21 @@ struct ResolvedMemberPath<'a> {
 }
 
 fn resolve_member_path<'a>(root: &'a TypeInfo, path: &[String]) -> Option<ResolvedMemberPath<'a>> {
+    resolve_member_path_impl(root, path, false)
+}
+
+fn resolve_member_path_allowing_zst<'a>(
+    root: &'a TypeInfo,
+    path: &[String],
+) -> Option<ResolvedMemberPath<'a>> {
+    resolve_member_path_impl(root, path, true)
+}
+
+fn resolve_member_path_impl<'a>(
+    root: &'a TypeInfo,
+    path: &[String],
+    allow_zero_sized: bool,
+) -> Option<ResolvedMemberPath<'a>> {
     let mut current = root;
     let mut offset = 0u64;
 
@@ -670,7 +776,7 @@ fn resolve_member_path<'a>(root: &'a TypeInfo, path: &[String]) -> Option<Resolv
         let member = members.iter().find(|member| member.name == *field)?;
         let member_size = member.member_type.size();
         let member_end = member.offset.checked_add(member_size)?;
-        if member_size == 0
+        if (!allow_zero_sized && member_size == 0)
             || member.bit_offset.is_some()
             || member.bit_size.is_some()
             || member_end > *size
@@ -860,6 +966,14 @@ mod tests {
         }
     }
 
+    fn signed_type(name: &str, size: u64) -> TypeInfo {
+        TypeInfo::BaseType {
+            name: name.to_string(),
+            size,
+            encoding: gimli::DW_ATE_signed.0 as u16,
+        }
+    }
+
     fn indirect_contiguous(
         data_path: Vec<String>,
         length_path: Vec<String>,
@@ -900,6 +1014,27 @@ mod tests {
         let inner = single_member_struct("NonZeroInner", inner_field, value_type);
         ResolvedType::new(
             single_member_struct(name, outer_field, inner),
+            TypeIdentity::Unknown,
+            Some(TypeOrigin {
+                module: ModuleId(0),
+                cu: CuId(0),
+                language,
+                producer: None,
+                dwarf_version: 5,
+            }),
+        )
+    }
+
+    fn rust_cell_type(
+        name: &str,
+        outer_field: &str,
+        inner_field: &str,
+        value_type: TypeInfo,
+        language: SourceLanguage,
+    ) -> ResolvedType {
+        let unsafe_cell = single_member_struct("UnsafeCell", inner_field, value_type);
+        ResolvedType::new(
+            single_member_struct(name, outer_field, unsafe_cell),
             TypeIdentity::Unknown,
             Some(TypeOrigin {
                 module: ModuleId(0),
@@ -1614,6 +1749,7 @@ mod tests {
             resolve_value_layout(&current, Some("core::num::nonzero::NonZero<u32>"),),
             Some(ValueLayout::ProjectedValue {
                 value_path: field_path(&["outer_from_dwarf", "inner_from_dwarf"]),
+                presentation: ProjectedValuePresentation::Transparent,
             })
         );
 
@@ -1627,6 +1763,7 @@ mod tests {
             resolve_value_layout(&legacy, Some("core::num::nonzero::NonZeroU32"),),
             Some(ValueLayout::ProjectedValue {
                 value_path: field_path(&["legacy_field_from_dwarf"]),
+                presentation: ProjectedValuePresentation::Transparent,
             })
         );
 
@@ -1694,6 +1831,83 @@ mod tests {
             "core::num::nonzero::NonZero<u32>",
             "__0",
             "__0",
+            unsigned_type("u32", 4),
+            SourceLanguage::C,
+        );
+        assert_eq!(resolve_value_layout(&non_rust, None), None);
+    }
+
+    #[test]
+    fn recognizes_cell_by_namespace_and_dwarf_member_structure() {
+        let current = rust_cell_type(
+            "Cell<(i32, u16)>",
+            "outer_from_dwarf",
+            "inner_from_dwarf",
+            TypeInfo::StructType {
+                name: "(i32, u16)".to_string(),
+                size: 8,
+                members: vec![
+                    member("__0", signed_type("i32", 4), 0),
+                    member("__1", unsigned_type("u16", 2), 4),
+                ],
+            },
+            SourceLanguage::Rust,
+        );
+
+        assert_eq!(
+            resolve_value_layout(&current, Some("core::cell::Cell<(i32, u16)>")),
+            Some(ValueLayout::ProjectedValue {
+                value_path: field_path(&["outer_from_dwarf", "inner_from_dwarf"]),
+                presentation: ProjectedValuePresentation::SingleField {
+                    type_name: "Cell",
+                    field_name: "value",
+                },
+            })
+        );
+
+        let fully_qualified = rust_cell_type(
+            "core::cell::Cell<u32>",
+            "value",
+            "value",
+            unsigned_type("u32", 4),
+            SourceLanguage::Rust,
+        );
+        assert!(resolve_value_layout(&fully_qualified, None).is_some());
+    }
+
+    #[test]
+    fn rejects_cell_lookalikes_and_invalid_layouts() {
+        let current = rust_cell_type(
+            "Cell<u32>",
+            "value",
+            "value",
+            unsigned_type("u32", 4),
+            SourceLanguage::Rust,
+        );
+        assert_eq!(resolve_value_layout(&current, Some("app::Cell<u32>")), None);
+        assert_eq!(resolve_value_layout(&current, None), None);
+
+        let mut invalid = current.clone();
+        let TypeInfo::StructType { members, .. } = &mut invalid.summary else {
+            unreachable!("test Cell is a struct")
+        };
+        let TypeInfo::StructType {
+            members: inner_members,
+            ..
+        } = &mut members[0].member_type
+        else {
+            unreachable!("test Cell contains a struct")
+        };
+        inner_members.push(member("extra", unsigned_type("u32", 4), 0));
+        assert_eq!(
+            resolve_value_layout(&invalid, Some("core::cell::Cell<u32>")),
+            None
+        );
+
+        let non_rust = rust_cell_type(
+            "core::cell::Cell<u32>",
+            "value",
+            "value",
             unsigned_type("u32", 4),
             SourceLanguage::C,
         );
@@ -1801,6 +2015,20 @@ mod tests {
         assert!(!requires_dwarf_qualified_name(&rust_legacy_nonzero_type(
             "core::num::NonZeroU32",
             "__0",
+            unsigned_type("u32", 4),
+            SourceLanguage::Rust,
+        )));
+        assert!(requires_dwarf_qualified_name(&rust_cell_type(
+            "Cell<u32>",
+            "value",
+            "value",
+            unsigned_type("u32", 4),
+            SourceLanguage::Rust,
+        )));
+        assert!(!requires_dwarf_qualified_name(&rust_cell_type(
+            "core::cell::Cell<u32>",
+            "value",
+            "value",
             unsigned_type("u32", 4),
             SourceLanguage::Rust,
         )));

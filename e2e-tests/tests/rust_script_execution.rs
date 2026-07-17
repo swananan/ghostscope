@@ -514,6 +514,119 @@ async fn test_rust_nonzero_value_plan_projects_dwarf_scalar() -> anyhow::Result<
 }
 
 #[tokio::test]
+async fn test_rust_cell_value_plan_projects_dwarf_value() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let (_, read_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_CELL_U32",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_CELL_U32 read plan"))?;
+    let resolved_type = analyzer
+        .resolved_type_for_plan(&read_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected Cell<u32> type"))?;
+    let value_plan = analyzer
+        .value_read_plan(&resolved_type, Some(&binary_path))?
+        .ok_or_else(|| anyhow::anyhow!("expected Cell<u32> value plan"))?;
+
+    assert_eq!(
+        value_plan.presentation,
+        ghostscope_dwarf::ValuePresentation::SingleField {
+            type_name: "Cell".to_string(),
+            field_name: "value".to_string(),
+        }
+    );
+    let ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value } = value_plan.capture else {
+        anyhow::bail!("expected projected value capture for Cell<u32>")
+    };
+    assert_eq!(
+        value.layout,
+        ghostscope_dwarf::TypeProjectionLayout::Member { offset: 0 }
+    );
+    assert!(matches!(
+        value.resolved_type.summary,
+        ghostscope_dwarf::TypeInfo::BaseType {
+            ref name,
+            size: 4,
+            encoding,
+        } if name == "u32"
+            && encoding == ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16
+    ));
+
+    let (_, pair_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_CELL_PAIR",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_CELL_PAIR read plan"))?;
+    let pair_type = analyzer
+        .resolved_type_for_plan(&pair_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected Cell<(i32, u16)> type"))?;
+    let pair_value = analyzer
+        .value_read_plan(&pair_type, Some(&binary_path))?
+        .and_then(|plan| match plan.capture {
+            ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value } => Some(value),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("expected projected pair capture"))?;
+    assert!(matches!(
+        pair_value.resolved_type.summary,
+        ghostscope_dwarf::TypeInfo::StructType { ref members, .. }
+            if members.len() == 2
+    ));
+
+    let (_, unit_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_CELL_UNIT",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_CELL_UNIT read plan"))?;
+    let unit_type = analyzer
+        .resolved_type_for_plan(&unit_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected Cell<()> type"))?;
+    let unit_value = analyzer
+        .value_read_plan(&unit_type, Some(&binary_path))?
+        .and_then(|plan| match plan.capture {
+            ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value } => Some(value),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("expected projected unit capture"))?;
+    assert!(matches!(
+        unit_value.resolved_type.summary,
+        ghostscope_dwarf::TypeInfo::BaseType {
+            ref name,
+            size: 0,
+            ..
+        } if name == "()"
+    ));
+
+    let (_, user_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "G_USER_CELL",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected G_USER_CELL read plan"))?;
+    let user_type = analyzer
+        .resolved_type_for_plan(&user_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected user Cell type"))?;
+    assert!(
+        analyzer
+            .value_read_plan(&user_type, Some(&binary_path))?
+            .is_none(),
+        "user-defined Cell must retain DWARF presentation"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_str_values() -> anyhow::Result<()> {
     init();
 
@@ -701,6 +814,55 @@ trace observe_nonzero {
     assert!(
         stdout.lines().any(|line| line.contains("RNONZERO_ARG:23")),
         "Expected Rust NonZero argument output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_cell_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    print "RCELL:{}:{}:{}", G_CELL_U32, G_CELL_PAIR, G_CELL_UNIT;
+    print "RCELL_RAW:{:x}", G_CELL_U32;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RCELL:Cell { value: 41 }:Cell { value:")),
+        "Expected Rust Cell wrapper output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RCELL:") && line.contains("__0: -4") && line.contains("__1: 12")
+        }),
+        "Expected Rust Cell aggregate output: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains(":Cell { value: () }")),
+        "Expected Rust Cell unit output: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RCELL_RAW:29 00 00 00")),
+        "Expected raw Rust Cell payload: {stdout}"
     );
     assert!(
         !stdout.contains("ExprError"),

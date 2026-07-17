@@ -38,6 +38,25 @@ fn projected_member_offset(
     }
 }
 
+fn is_known_zero_sized_type(type_info: &ghostscope_dwarf::TypeInfo) -> bool {
+    match type_info {
+        ghostscope_dwarf::TypeInfo::BaseType { name, size: 0, .. } if name == "()" => true,
+        ghostscope_dwarf::TypeInfo::StructType { size: 0, .. }
+        | ghostscope_dwarf::TypeInfo::UnionType { size: 0, .. }
+        | ghostscope_dwarf::TypeInfo::ArrayType {
+            total_size: Some(0),
+            ..
+        } => true,
+        ghostscope_dwarf::TypeInfo::TypedefType {
+            underlying_type, ..
+        }
+        | ghostscope_dwarf::TypeInfo::QualifiedType {
+            underlying_type, ..
+        } => is_known_zero_sized_type(underlying_type),
+        _ => false,
+    }
+}
+
 fn sequence_capture_limits(cap: usize, element_stride: u64) -> Result<(usize, usize, usize)> {
     let stride = usize::try_from(element_stride).map_err(|_| {
         CodeGenError::DwarfError(format!(
@@ -91,29 +110,34 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 output_type = value.resolved_type.summary;
                 let data_len = Self::compute_read_size_for_type(&output_type);
                 if data_len == 0 {
-                    return Err(CodeGenError::TypeSizeNotAvailable(display_name));
-                }
-                let address = if offset == 0 {
-                    descriptor
+                    if is_known_zero_sized_type(&output_type) {
+                        (0, ComplexArgSource::ImmediateBytes { bytes: Vec::new() })
+                    } else {
+                        return Err(CodeGenError::TypeSizeNotAvailable(display_name));
+                    }
                 } else {
-                    let offset_value = self.context.i64_type().const_int(offset, false);
-                    let address = self
-                        .builder
-                        .build_int_add(
-                            descriptor.value,
-                            offset_value,
-                            "semantic_projected_value_address",
-                        )
-                        .map_err(|error| CodeGenError::Builder(error.to_string()))?;
-                    descriptor.with_value(address)
-                };
-                (
-                    data_len,
-                    ComplexArgSource::MemDump {
-                        address,
-                        len: data_len,
-                    },
-                )
+                    let address = if offset == 0 {
+                        descriptor
+                    } else {
+                        let offset_value = self.context.i64_type().const_int(offset, false);
+                        let address = self
+                            .builder
+                            .build_int_add(
+                                descriptor.value,
+                                offset_value,
+                                "semantic_projected_value_address",
+                            )
+                            .map_err(|error| CodeGenError::Builder(error.to_string()))?;
+                        descriptor.with_value(address)
+                    };
+                    (
+                        data_len,
+                        ComplexArgSource::MemDump {
+                            address,
+                            len: data_len,
+                        },
+                    )
+                }
             }
             ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } => {
                 let (data_offset, data_access_size) = metadata_member(&data, "data")?;
@@ -293,13 +317,37 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 })
             }
             ghostscope_dwarf::VariableMaterialization::DirectValue { .. } => {
-                let value =
-                    self.variable_materialization_to_llvm_value(&materialized, pc_address, None)?;
                 let dwarf_type = materialized.dwarf_type.clone().ok_or_else(|| {
                     CodeGenError::DwarfError(
                         "Expression has no DWARF type information".to_string(),
                     )
                 })?;
+                if let Some(ghostscope_dwarf::ValueReadPlan {
+                    presentation,
+                    capture:
+                        ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value: projected },
+                }) = semantic_plan.as_ref()
+                {
+                    let projected_type = &projected.resolved_type.summary;
+                    if Self::compute_read_size_for_type(projected_type) == 0
+                        && is_known_zero_sized_type(projected_type)
+                    {
+                        return Ok(ComplexArg {
+                            var_name_index: self
+                                .trace_context
+                                .add_variable_name(display_name)?,
+                            type_index: self.trace_context.add_type_with_presentation(
+                                projected_type.clone(),
+                                presentation.clone(),
+                            )?,
+                            access_path: Vec::new(),
+                            data_len: 0,
+                            source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
+                        });
+                    }
+                }
+                let value =
+                    self.variable_materialization_to_llvm_value(&materialized, pc_address, None)?;
                 let value = match value {
                     BasicValueEnum::IntValue(value) => value,
                     BasicValueEnum::PointerValue(value) => self
@@ -1406,5 +1454,20 @@ mod semantic_value_tests {
         projected.layout = TypeProjectionLayout::Dereference;
         let error = projected_member_offset(&projected, "projected value").unwrap_err();
         assert!(error.to_string().contains("must be a member"));
+    }
+
+    #[test]
+    fn distinguishes_known_zero_sized_types_from_unknown_layouts() {
+        let unit = TypeInfo::BaseType {
+            name: "()".to_string(),
+            size: 0,
+            encoding: ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16,
+        };
+        let unknown = TypeInfo::UnknownType {
+            name: "T".to_string(),
+        };
+
+        assert!(is_known_zero_sized_type(&unit));
+        assert!(!is_known_zero_sized_type(&unknown));
     }
 }
