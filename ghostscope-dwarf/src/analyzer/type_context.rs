@@ -574,7 +574,8 @@ impl DwarfAnalyzer {
             crate::language::IndirectSequenceKind::Utf8String => {
                 (crate::ValuePresentation::Utf8String, None)
             }
-            crate::language::IndirectSequenceKind::ByteString => {
+            crate::language::IndirectSequenceKind::ByteString
+            | crate::language::IndirectSequenceKind::OpaqueByteString => {
                 (crate::ValuePresentation::ByteString, None)
             }
             crate::language::IndirectSequenceKind::PointerTarget => {

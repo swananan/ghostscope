@@ -4,6 +4,7 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::num::NonZeroI32;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -16,6 +17,8 @@ pub enum CompatEnum {
 pub fn observe_values(
     string: String,
     os_string: OsString,
+    path: &Path,
+    path_buf: PathBuf,
     text: &str,
     boxed_text: Box<str>,
     slice: &[i32],
@@ -40,6 +43,8 @@ pub fn observe_values(
     };
     string.len()
         + os_string.len()
+        + path.as_os_str().len()
+        + path_buf.as_os_str().len()
         + text.len()
         + boxed_text.len()
         + slice.len()
@@ -85,9 +90,12 @@ fn main() {
     hash_set.insert(23);
 
     let slice = [29, 31];
+    let path = PathBuf::from("borrowed/path");
     let value = observe_values(
         String::from("string"),
         OsString::from("os-string"),
+        path.as_path(),
+        PathBuf::from("owned/path"),
         "text",
         String::from("boxed-text").into_boxed_str(),
         &slice,

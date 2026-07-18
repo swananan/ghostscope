@@ -28,6 +28,7 @@ enum ExpectedAdapter {
 const ALL_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
     ("string", ExpectedAdapter::Utf8Bytes),
     ("os_string", ExpectedAdapter::OsBytes),
+    ("path_buf", ExpectedAdapter::OsBytes),
     ("text", ExpectedAdapter::Utf8Bytes),
     ("boxed_text", ExpectedAdapter::Utf8Bytes),
     ("slice", ExpectedAdapter::Sequence),
@@ -48,6 +49,7 @@ const ALL_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
 const RUST_135_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
     ("string", ExpectedAdapter::Utf8Bytes),
     ("os_string", ExpectedAdapter::OsBytes),
+    ("path_buf", ExpectedAdapter::OsBytes),
     ("text", ExpectedAdapter::Utf8Bytes),
     // Box<str> gained a dedicated rust-gdb provider later. Pinning it here
     // applies that provider's semantics to Rust 1.35's concrete fat-pointer
@@ -533,6 +535,20 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
             )
             .await?;
         }
+        let path_expected = if matches!(toolchain.as_str(), "1.35.0" | "1.49.0") {
+            ExpectedAdapter::NativeDwarf
+        } else {
+            ExpectedAdapter::OsBytes
+        };
+        assert_parameter_adapter(
+            &analyzer,
+            &binary,
+            "observe_values",
+            "path",
+            path_expected,
+            &toolchain,
+        )
+        .await?;
         for (parameter, type_name) in [("rc_text", "Rc"), ("arc_text", "Arc")] {
             let plan = assert_parameter_adapter(
                 &analyzer,

@@ -190,6 +190,7 @@ impl IndirectSequenceLayout {
 pub(crate) enum IndirectSequenceKind {
     Utf8String,
     ByteString,
+    OpaqueByteString,
     PointerTarget,
     TypeParameter { index: usize },
 }
@@ -200,6 +201,7 @@ pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
             && matches!(strip_type_aliases(&current.summary), TypeInfo::StructType { name, .. }
                 if name == "String"
                     || name == "OsString"
+                    || name == "PathBuf"
                     || is_short_vec_name(name)
                     || is_short_vec_deque_name(name)
                     || is_short_box_str_name(name)
@@ -308,7 +310,18 @@ pub(super) fn resolve_value_layout(
     // ABI guarantees, so retain the language and structural checks around them.
     // See rust-lang/rust's `src/etc/gdb_rust_pretty_printing.py` and
     // `src/etc/gdb_providers.py`.
-    let sequence = if matches!(
+    let sequence = if is_std_path_ref_name(name) {
+        // Rust's LLDB provider renders Path as its underlying platform bytes.
+        // GDB classifies the same identity but does not currently register a
+        // provider. Only current DWARF with explicit fat-pointer metadata can
+        // satisfy this validator; older Path* DIEs remain native DWARF.
+        validate_indirect_sequence_layout(
+            &current.summary,
+            field_path(&["data_ptr"]),
+            field_path(&["length"]),
+            IndirectSequenceKind::OpaqueByteString,
+        )
+    } else if matches!(
         name.as_str(),
         "&str" | "&mut str" | "&'static str" | "&'static mut str"
     ) {
@@ -345,6 +358,8 @@ pub(super) fn resolve_value_layout(
         rust_string_layout(&current.summary)
     } else if is_std_os_string(name, dwarf_qualified_name) {
         rust_os_string_layout(&current.summary)
+    } else if is_std_path_buf(name, dwarf_qualified_name) {
+        rust_path_buf_layout(&current.summary)
     } else if is_std_vec(name, dwarf_qualified_name) {
         rust_vec_layout(&current.summary)
     } else if is_std_vec_deque(name, dwarf_qualified_name) {
@@ -758,6 +773,56 @@ fn is_std_os_string_name(name: &str) -> bool {
         return false;
     };
     let Some(module) = path.strip_suffix("::OsString") else {
+        return false;
+    };
+
+    !module.is_empty()
+        && module.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+}
+
+fn is_std_path_ref_name(name: &str) -> bool {
+    let Some(referenced) = name
+        .strip_prefix("&'static ")
+        .or_else(|| name.strip_prefix('&'))
+    else {
+        return false;
+    };
+    let referenced = referenced.strip_prefix("mut ").unwrap_or(referenced);
+    is_std_path_name(referenced)
+}
+
+fn is_std_path_name(name: &str) -> bool {
+    let Some(path) = name.strip_prefix("std::") else {
+        return false;
+    };
+    let Some(module) = path.strip_suffix("::Path") else {
+        return false;
+    };
+
+    !module.is_empty()
+        && module.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+}
+
+fn is_std_path_buf(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
+    is_std_path_buf_name(name)
+        || (name == "PathBuf" && dwarf_qualified_name.is_some_and(is_std_path_buf_name))
+}
+
+fn is_std_path_buf_name(name: &str) -> bool {
+    let Some(path) = name.strip_prefix("std::") else {
+        return false;
+    };
+    let Some(module) = path.strip_suffix("::PathBuf") else {
         return false;
     };
 
@@ -1639,6 +1704,20 @@ fn rust_vec_deque_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
 }
 
 fn rust_os_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
+    rust_os_string_layout_with_prefix(root, &[])
+}
+
+fn rust_path_buf_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
+    // Rust's LLDB provider delegates PathBuf to its embedded OsString. Reuse
+    // that official semantic path while deriving every wrapper and offset from
+    // the concrete DWARF instead of assuming PathBuf's Rust layout.
+    rust_os_string_layout_with_prefix(root, &["inner"])
+}
+
+fn rust_os_string_layout_with_prefix(
+    root: &TypeInfo,
+    prefix: &[&str],
+) -> Option<IndirectSequenceLayout> {
     // Rust 1.82 moved RawVec's pointer under `inner`. Windows used the tuple
     // field `__0` for Wtf8Buf through 1.96 and now names that field `bytes`.
     // Unix exposes the Vec directly. These paths mirror rust-gdb; every
@@ -1673,8 +1752,8 @@ fn rust_os_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
     for (data_fields, length_fields) in PATHS {
         if let Some(layout) = validate_wrapped_pointer_layout(
             root,
-            field_path(data_fields),
-            field_path(length_fields),
+            prefixed_field_path(prefix, data_fields),
+            prefixed_field_path(prefix, length_fields),
             IndirectSequenceKind::ByteString,
         ) {
             return Some(layout);
@@ -1794,6 +1873,14 @@ fn validate_ring_sequence_layout(
 
 fn field_path(fields: &[&str]) -> Vec<String> {
     fields.iter().map(|field| (*field).to_string()).collect()
+}
+
+fn prefixed_field_path(prefix: &[&str], fields: &[&str]) -> Vec<String> {
+    prefix
+        .iter()
+        .chain(fields)
+        .map(|field| (*field).to_string())
+        .collect()
 }
 
 fn unique_named_member<'a>(members: &'a [StructMember], name: &str) -> Option<&'a StructMember> {
@@ -2017,6 +2104,20 @@ mod tests {
             length_size: 8,
             language,
         })
+    }
+
+    fn rust_path_ref_type_64(name: &str, language: SourceLanguage) -> ResolvedType {
+        let mut current = rust_str_type_64(name, language);
+        let TypeInfo::StructType { members, .. } = &mut current.summary else {
+            unreachable!("test Path reference is a struct")
+        };
+        let TypeInfo::PointerType { target_type, .. } = &mut members[0].member_type else {
+            unreachable!("test Path data_ptr is a pointer")
+        };
+        *target_type = Box::new(TypeInfo::UnknownType {
+            name: "Path".to_string(),
+        });
+        current
     }
 
     fn rust_slice_type_64(name: &str, language: SourceLanguage) -> ResolvedType {
@@ -2775,6 +2876,19 @@ mod tests {
         ResolvedType::new(os_string, TypeIdentity::Unknown, origin)
     }
 
+    fn rust_path_buf_type(name: &str, pointer_size: u64, uses_raw_vec_inner: bool) -> ResolvedType {
+        let os_string = rust_os_string_type(
+            "std::ffi::os_str::OsString",
+            pointer_size,
+            uses_raw_vec_inner,
+            None,
+        );
+        let origin = os_string.origin;
+        let path_buf = single_member_struct(name, "inner", os_string.summary);
+
+        ResolvedType::new(path_buf, TypeIdentity::Unknown, origin)
+    }
+
     struct VecDequeTestLayout<'a> {
         name: &'a str,
         pointer_size: u64,
@@ -3008,6 +3122,64 @@ mod tests {
         assert!(resolve_value_layout(&current, Some("std::ffi::os_str::OsString"),).is_some());
         assert_eq!(resolve_value_layout(&current, Some("app::OsString")), None);
         assert_eq!(resolve_value_layout(&current, None), None);
+    }
+
+    #[test]
+    fn recognizes_path_and_path_buf_byte_layouts_from_dwarf() {
+        for name in [
+            "&std::path::Path",
+            "&mut std::path::Path",
+            "&'static std::path::Path",
+            "&'static mut std::path::Path",
+        ] {
+            let current = rust_path_ref_type_64(name, SourceLanguage::Rust);
+            assert_eq!(
+                resolve_value_layout(&current, None),
+                Some(indirect_contiguous(
+                    field_path(&["data_ptr"]),
+                    field_path(&["length"]),
+                    IndirectSequenceKind::OpaqueByteString,
+                )),
+                "name={name}"
+            );
+        }
+
+        for pointer_size in [4, 8] {
+            for uses_raw_vec_inner in [false, true] {
+                let current = rust_path_buf_type("PathBuf", pointer_size, uses_raw_vec_inner);
+                let data_fields = if uses_raw_vec_inner {
+                    &[
+                        "inner", "inner", "inner", "buf", "inner", "ptr", "pointer", "pointer",
+                    ][..]
+                } else {
+                    &[
+                        "inner", "inner", "inner", "buf", "ptr", "pointer", "pointer",
+                    ][..]
+                };
+                assert_eq!(
+                    resolve_value_layout(&current, Some("std::path::PathBuf")),
+                    Some(indirect_contiguous(
+                        field_path(data_fields),
+                        field_path(&["inner", "inner", "inner", "len"]),
+                        IndirectSequenceKind::ByteString,
+                    )),
+                    "pointer_size={pointer_size} raw_vec_inner={uses_raw_vec_inner}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_path_and_path_buf_lookalikes() {
+        let path = rust_path_ref_type_64("&app::Path", SourceLanguage::Rust);
+        assert_eq!(resolve_value_layout(&path, None), None);
+
+        let path_buf = rust_path_buf_type("PathBuf", 8, true);
+        assert_eq!(resolve_value_layout(&path_buf, Some("app::PathBuf")), None);
+        assert_eq!(resolve_value_layout(&path_buf, None), None);
+
+        let non_rust = rust_path_ref_type_64("&std::path::Path", SourceLanguage::C);
+        assert_eq!(resolve_value_layout(&non_rust, None), None);
     }
 
     #[test]
