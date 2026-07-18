@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -26,6 +27,12 @@ pub fn observe_matrix_rc(rc: Rc<i32>) -> usize {
     *rc as usize
 }
 
+#[no_mangle]
+#[inline(never)]
+pub fn observe_matrix_dst(rc: Rc<str>, arc: Arc<str>) -> usize {
+    rc.len() + arc.len()
+}
+
 fn main() {
     loop {
         let mut btree_map = BTreeMap::new();
@@ -41,6 +48,7 @@ fn main() {
             hash_map,
         );
         result += observe_matrix_rc(Rc::new(11));
+        result += observe_matrix_dst(Rc::from("matrix-rc"), Arc::from("matrix-arc"));
         RESULT.store(result, Ordering::Relaxed);
         thread::sleep(Duration::from_millis(25));
     }

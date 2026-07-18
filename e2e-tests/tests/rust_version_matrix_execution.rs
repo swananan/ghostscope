@@ -12,6 +12,7 @@ use common::{
     },
 };
 use ghostscope_dwarf::{DwarfAnalyzer, RustcVersion, SourceLanguage};
+use regex::Regex;
 
 const REQUIRE_TOOLCHAINS_ENV: &str = "GHOSTSCOPE_REQUIRE_RUST_E2E_TOOLCHAINS";
 const PRESERVE_FIXTURES_ENV: &str = "GHOSTSCOPE_PRESERVE_PRECOMPILED_FIXTURES";
@@ -20,6 +21,10 @@ const COMMON_SCRIPT: &str = r#"
 trace observe_matrix_values {
     print "RUST_MATRIX_VALUES:{}:{}:{}:{}", string, vector, btree_map,
         hash_map;
+}
+
+trace observe_matrix_dst {
+    print "RUST_MATRIX_DST:{}:{}", rc, arc;
 }
 "#;
 
@@ -87,6 +92,18 @@ fn assert_common_output(toolchain: &str, stdout: &str) -> anyhow::Result<()> {
             "{toolchain}: missing {expected:?} in {values}"
         );
     }
+
+    let dst = marker_line(stdout, "RUST_MATRIX_DST", toolchain)?;
+    let expected = Regex::new(concat!(
+        r"Rc\(strong=1, weak=0\) \{ ptr: 0x[0-9a-f]+ \([^)]*\), ",
+        r"strong: 1, weak: 0 \}:",
+        r"Arc\(strong=1, weak=0\) \{ ptr: 0x[0-9a-f]+ \([^)]*\), ",
+        r"strong: 1, weak: 0 \}",
+    ))?;
+    anyhow::ensure!(
+        expected.is_match(dst),
+        "{toolchain}: unexpected Rc<str>/Arc<str> output: {dst}"
+    );
     Ok(())
 }
 

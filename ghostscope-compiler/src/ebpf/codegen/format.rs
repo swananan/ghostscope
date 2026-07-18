@@ -1798,13 +1798,24 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         )
                         .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
                 };
-                self.emit_complex_format_memdump_at(
-                    status_ptr,
-                    var_data_ptr,
-                    field_ptr,
-                    &address,
-                    field.value_len,
-                )?;
+                match field.capture {
+                    ghostscope_dwarf::ProjectedViewFieldCapture::Value => {
+                        self.emit_complex_format_memdump_at(
+                            status_ptr,
+                            var_data_ptr,
+                            field_ptr,
+                            &address,
+                            field.value_len,
+                        )?;
+                    }
+                    ghostscope_dwarf::ProjectedViewFieldCapture::Address => {
+                        self.emit_complex_format_computed_int(
+                            field_ptr,
+                            address.value,
+                            field.value_len,
+                        )?;
+                    }
+                }
             }
 
             if field_index + 1 == fields.len() {
@@ -5293,6 +5304,7 @@ mod complex_format_layout_tests {
                         pointer_size: ghostscope_dwarf::MemoryAccessSize::U64,
                     },
                 ],
+                capture: ghostscope_dwarf::ProjectedViewFieldCapture::Value,
             },
             ProjectedViewFieldSource {
                 output_offset: 4,
@@ -5303,6 +5315,7 @@ mod complex_format_layout_tests {
                         pointer_size: ghostscope_dwarf::MemoryAccessSize::U64,
                     },
                 ],
+                capture: ghostscope_dwarf::ProjectedViewFieldCapture::Address,
             },
         ];
 
@@ -5611,6 +5624,19 @@ mod complex_format_layout_tests {
         assert!(llvm_ir.contains("projected_view_0_1_pointer_error"));
         assert!(llvm_ir.contains("projected_view_1_1_pointer_error"));
         assert!(llvm_ir.contains("projected_view_0_read_ok"));
+        assert_eq!(
+            llvm_ir
+                .lines()
+                .filter(|line| {
+                    line.contains("call i64") && line.contains("%probe_read_user_memdump")
+                })
+                .count(),
+            1
+        );
+        assert!(llvm_ir.lines().any(|line| {
+            line.contains("store i64") && line.contains("%projected_view_1_output")
+        }));
+        assert!(!llvm_ir.contains("projected_view_1_read_ok"));
         assert!(llvm_ir.contains("projected_view_finish"));
         assert!(llvm_ir.contains("indirect_errno_ptr_i8"));
         assert!(llvm_ir.contains("indirect_addr_ptr_i8"));

@@ -110,9 +110,26 @@ fn projected_view_source(
     let mut sources = Vec::with_capacity(fields.len());
     let mut ranges = Vec::with_capacity(fields.len());
     for (member, field) in members.iter().zip(fields) {
-        if member.offset != field.output_offset
-            || member.member_type != field.value.resolved_type.summary
-        {
+        let type_matches = match field.capture {
+            ghostscope_dwarf::ProjectedViewFieldCapture::Value => {
+                member.member_type == field.value.resolved_type.summary
+            }
+            ghostscope_dwarf::ProjectedViewFieldCapture::Address => {
+                let pointer_size = field.value.steps.iter().rev().find_map(|step| match step {
+                    ghostscope_dwarf::ProjectedValueStep::Dereference { pointer_size } => {
+                        Some(*pointer_size)
+                    }
+                    ghostscope_dwarf::ProjectedValueStep::Member { .. } => None,
+                });
+                matches!(
+                    &member.member_type,
+                    ghostscope_dwarf::TypeInfo::PointerType { target_type, size }
+                        if target_type.as_ref() == &field.value.resolved_type.summary
+                            && pointer_size == Some(*size)
+                )
+            }
+        };
+        if member.offset != field.output_offset || !type_matches {
             return Err(CodeGenError::DwarfError(format!(
                 "projected semantic field '{}' does not match its output member",
                 member.name
@@ -174,6 +191,7 @@ fn projected_view_source(
             output_offset,
             value_len,
             steps,
+            capture: field.capture,
         });
     }
 
@@ -1949,6 +1967,7 @@ mod semantic_value_tests {
                 steps,
                 resolved_type: ResolvedType::new(summary, TypeIdentity::Unknown, None),
             },
+            capture: ghostscope_dwarf::ProjectedViewFieldCapture::Value,
         }
     }
 
@@ -2012,6 +2031,47 @@ mod semantic_value_tests {
                 }
             ]
         ));
+    }
+
+    #[test]
+    fn projected_view_accepts_a_dwarf_sized_address_field() {
+        let target = TypeInfo::ArrayType {
+            element_type: Box::new(TypeInfo::BaseType {
+                name: "u8".to_string(),
+                size: 1,
+                encoding: ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16,
+            }),
+            element_count: None,
+            total_size: None,
+        };
+        let pointer = TypeInfo::PointerType {
+            target_type: Box::new(target.clone()),
+            size: 8,
+        };
+        let output_type = TypeInfo::StructType {
+            name: "Rc".to_string(),
+            size: 8,
+            members: vec![output_member("ptr", pointer, 0)],
+        };
+        let fields = vec![ProjectedViewField {
+            output_offset: 0,
+            value: ProjectedValueRead {
+                steps: vec![
+                    ProjectedValueStep::Dereference { pointer_size: 8 },
+                    ProjectedValueStep::Member { offset: 16 },
+                ],
+                resolved_type: ResolvedType::new(target, TypeIdentity::Unknown, None),
+            },
+            capture: ghostscope_dwarf::ProjectedViewFieldCapture::Address,
+        }];
+
+        let (data_len, sources) = projected_view_source(&output_type, &fields).unwrap();
+        assert_eq!(data_len, 8);
+        assert_eq!(sources[0].value_len, 8);
+        assert_eq!(
+            sources[0].capture,
+            ghostscope_dwarf::ProjectedViewFieldCapture::Address
+        );
     }
 
     #[test]

@@ -2,9 +2,10 @@ use super::DwarfAnalyzer;
 use crate::{
     indexable_element_layout, member_layout, semantics::PlanError, strip_type_aliases,
     CompilationUnitMetadata, CuId, MemberLayout, ModuleId, PcContext, ProjectedValueRead,
-    ProjectedValueStep, ProjectedViewField, ResolvedType, Result, SemanticType, StructMember,
-    TypeId, TypeIdentity, TypeInfo, TypeLayoutError, TypeOrigin, TypeProjection,
-    TypeProjectionLayout, ValueCapturePlan, ValueReadPlan, VariableAccessSegment, VariableReadPlan,
+    ProjectedValueStep, ProjectedViewField, ProjectedViewFieldCapture, ResolvedType, Result,
+    SemanticType, StructMember, TypeId, TypeIdentity, TypeInfo, TypeLayoutError, TypeOrigin,
+    TypeProjection, TypeProjectionLayout, ValueCapturePlan, ValueReadPlan, VariableAccessSegment,
+    VariableReadPlan,
 };
 use std::path::Path;
 
@@ -379,18 +380,35 @@ impl DwarfAnalyzer {
                             field.name
                         ));
                     }
-                    let Some(value) = self.project_resolved_value_path(
+                    let value = self.project_resolved_value_path(
                         current,
                         &field.value_path,
                         type_module_path,
-                    )?
-                    else {
+                        matches!(
+                            field.capture,
+                            crate::language::CompositeStructFieldCapture::Address
+                        ),
+                    )?;
+                    let Some(value) = value else {
                         return Ok(None);
                     };
-                    if !projected_value_satisfies(field.requirement, &value) {
-                        return Ok(None);
-                    }
-                    let member_type = value.resolved_type.summary.clone();
+                    let (member_type, capture) = match field.capture {
+                        crate::language::CompositeStructFieldCapture::Value(requirement) => {
+                            if !projected_value_satisfies(requirement, &value) {
+                                return Ok(None);
+                            }
+                            (
+                                value.resolved_type.summary.clone(),
+                                ProjectedViewFieldCapture::Value,
+                            )
+                        }
+                        crate::language::CompositeStructFieldCapture::Address => {
+                            let Some(member_type) = projected_address_type(&value) else {
+                                return Ok(None);
+                            };
+                            (member_type, ProjectedViewFieldCapture::Address)
+                        }
+                    };
                     let output_offset = output_size;
                     output_size = output_size
                         .checked_add(member_type.size())
@@ -405,6 +423,7 @@ impl DwarfAnalyzer {
                     fields.push(ProjectedViewField {
                         output_offset,
                         value,
+                        capture,
                     });
                 }
                 let output_type = TypeInfo::StructType {
@@ -1234,19 +1253,21 @@ impl DwarfAnalyzer {
         current: &ResolvedType,
         path: &[crate::language::ProjectedPathSegment],
         type_module_path: Option<&Path>,
+        capture_address: bool,
     ) -> Result<Option<ProjectedValueRead>> {
         let mut resolved_type = current.clone();
         let mut steps = Vec::with_capacity(path.len());
 
-        for segment in path {
+        for (index, segment) in path.iter().enumerate() {
             match segment {
                 crate::language::ProjectedPathSegment::Member(field) => {
-                    let Some(projected) = self.project_semantic_member(
+                    let projected = self.project_semantic_member(
                         &resolved_type,
                         Some(field),
                         type_module_path,
-                    )?
-                    else {
+                        capture_address && index + 1 == path.len(),
+                    )?;
+                    let Some(projected) = projected else {
                         return Ok(None);
                     };
                     let TypeProjectionLayout::Member { offset } = projected.layout else {
@@ -1258,8 +1279,12 @@ impl DwarfAnalyzer {
                     resolved_type = projected.resolved_type;
                 }
                 crate::language::ProjectedPathSegment::SoleMember => {
-                    let Some(projected) =
-                        self.project_semantic_member(&resolved_type, None, type_module_path)?
+                    let Some(projected) = self.project_semantic_member(
+                        &resolved_type,
+                        None,
+                        type_module_path,
+                        false,
+                    )?
                     else {
                         return Ok(None);
                     };
@@ -1287,6 +1312,7 @@ impl DwarfAnalyzer {
                                     &resolved_type,
                                     None,
                                     type_module_path,
+                                    false,
                                 )?
                                 else {
                                     return Ok(None);
@@ -1344,6 +1370,7 @@ impl DwarfAnalyzer {
         current: &ResolvedType,
         expected_name: Option<&str>,
         type_module_path: Option<&Path>,
+        allow_trailing_address: bool,
     ) -> Result<Option<TypeProjection>> {
         let TypeInfo::StructType { size, members, .. } = strip_type_aliases(&current.summary)
         else {
@@ -1370,7 +1397,16 @@ impl DwarfAnalyzer {
         let Some(member_end) = member.offset.checked_add(member.member_type.size()) else {
             return Ok(None);
         };
-        if member.bit_offset.is_some() || member.bit_size.is_some() || member_end > *size {
+        // rustc can describe a trailing DST such as `RcInner<str>::value` as a
+        // one-byte type at an offset equal to the aggregate's static size. An
+        // address capture needs only that DWARF member offset, so permit this
+        // exact terminal shape. Value captures still reject the apparent
+        // out-of-bounds read, as do members starting anywhere else.
+        let is_trailing_address = allow_trailing_address && member.offset == *size;
+        if member.bit_offset.is_some()
+            || member.bit_size.is_some()
+            || (member_end > *size && !is_trailing_address)
+        {
             return Ok(None);
         }
 
@@ -1385,7 +1421,7 @@ impl DwarfAnalyzer {
         else {
             return Ok(None);
         };
-        if projected_end > *size {
+        if projected_end > *size && !is_trailing_address {
             return Ok(None);
         }
         Ok(Some(projected))
@@ -1638,6 +1674,23 @@ fn projected_struct_presentation(
     }
 }
 
+fn projected_address_type(value: &ProjectedValueRead) -> Option<TypeInfo> {
+    if matches!(
+        strip_type_aliases(&value.resolved_type.summary),
+        TypeInfo::UnknownType { .. } | TypeInfo::OptimizedOut { .. }
+    ) {
+        return None;
+    }
+    let pointer_size = value.steps.iter().rev().find_map(|step| match step {
+        ProjectedValueStep::Dereference { pointer_size } => Some(*pointer_size),
+        ProjectedValueStep::Member { .. } => None,
+    })?;
+    matches!(pointer_size, 4 | 8).then(|| TypeInfo::PointerType {
+        target_type: Box::new(value.resolved_type.summary.clone()),
+        size: pointer_size,
+    })
+}
+
 fn projected_value_satisfies(
     requirement: crate::language::ProjectedValueRequirement,
     value: &ProjectedValueRead,
@@ -1721,6 +1774,31 @@ mod projected_value_tests {
 
         assert!(projected_value_satisfies(requirement, &unit));
         assert!(!projected_value_satisfies(requirement, &unknown));
+    }
+
+    #[test]
+    fn projected_address_uses_the_dwarf_pointer_width() {
+        let target = TypeInfo::ArrayType {
+            element_type: Box::new(TypeInfo::BaseType {
+                name: "u8".to_string(),
+                size: 1,
+                encoding: gimli::DW_ATE_unsigned.0 as u16,
+            }),
+            element_count: None,
+            total_size: None,
+        };
+        let value = projected_value(target.clone(), Some(8));
+        assert_eq!(
+            projected_address_type(&value),
+            Some(TypeInfo::PointerType {
+                target_type: Box::new(target),
+                size: 8,
+            })
+        );
+        assert_eq!(
+            projected_address_type(&projected_value(value.resolved_type.summary, None)),
+            None
+        );
     }
 
     #[test]
