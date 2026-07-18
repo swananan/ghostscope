@@ -102,7 +102,13 @@ pub(crate) struct CompositeStructLayout {
 pub(crate) struct CompositeStructField {
     pub(crate) name: &'static str,
     pub(crate) value_path: Vec<ProjectedPathSegment>,
-    pub(crate) requirement: ProjectedValueRequirement,
+    pub(crate) capture: CompositeStructFieldCapture,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompositeStructFieldCapture {
+    Value(ProjectedValueRequirement),
+    Address,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,12 +257,18 @@ pub(super) fn resolve_value_layout(
     }
 
     if is_std_rc(name, dwarf_qualified_name) {
-        return rust_reference_counted_layout(&current.summary, "Rc", "value")
+        let pointee_is_str = has_first_generic_argument(name, "Rc", "str")
+            || dwarf_qualified_name
+                .is_some_and(|name| has_first_generic_argument(name, "Rc", "str"));
+        return rust_reference_counted_layout(&current.summary, "Rc", "value", pointee_is_str)
             .map(ValueLayout::CompositeStruct);
     }
 
     if is_std_arc(name, dwarf_qualified_name) {
-        return rust_reference_counted_layout(&current.summary, "Arc", "data")
+        let pointee_is_str = has_first_generic_argument(name, "Arc", "str")
+            || dwarf_qualified_name
+                .is_some_and(|name| has_first_generic_argument(name, "Arc", "str"));
+        return rust_reference_counted_layout(&current.summary, "Arc", "data", pointee_is_str)
             .map(ValueLayout::CompositeStruct);
     }
 
@@ -433,6 +445,19 @@ fn is_short_generic_name(name: &str, type_name: &str) -> bool {
     name.strip_prefix(&prefix)
         .and_then(|arguments| arguments.strip_suffix('>'))
         .is_some_and(|arguments| !arguments.is_empty())
+}
+
+fn has_first_generic_argument(name: &str, type_name: &str, expected: &str) -> bool {
+    let short_prefix = format!("{type_name}<");
+    let qualified_marker = format!("::{type_name}<");
+    let arguments = name.strip_prefix(&short_prefix).or_else(|| {
+        name.split_once(&qualified_marker)
+            .map(|(_, arguments)| arguments)
+    });
+    arguments
+        .and_then(|arguments| arguments.strip_suffix('>'))
+        .and_then(|arguments| arguments.split(',').next())
+        .is_some_and(|argument| argument.trim() == expected)
 }
 
 fn is_std_cell(name: &str, dwarf_qualified_name: Option<&str>) -> bool {
@@ -1003,12 +1028,16 @@ fn rust_ref_layout(root: &TypeInfo) -> Option<CompositeStructLayout> {
             CompositeStructField {
                 name: "*value",
                 value_path,
-                requirement: ProjectedValueRequirement::KnownSizedOrZst,
+                capture: CompositeStructFieldCapture::Value(
+                    ProjectedValueRequirement::KnownSizedOrZst,
+                ),
             },
             CompositeStructField {
                 name: "borrow",
                 value_path: borrow_path,
-                requirement: ProjectedValueRequirement::SignedPointerSizedInteger,
+                capture: CompositeStructFieldCapture::Value(
+                    ProjectedValueRequirement::SignedPointerSizedInteger,
+                ),
             },
         ],
         presentation: ProjectedStructPresentation::SignedState {
@@ -1023,6 +1052,7 @@ fn rust_reference_counted_layout(
     root: &TypeInfo,
     type_name: &'static str,
     value_member: &'static str,
+    pointee_is_str: bool,
 ) -> Option<CompositeStructLayout> {
     // Rust 1.46, 1.60, 1.70, 1.81, 1.88, 1.93, and 1.95 use the same
     // rust-gdb provider paths for Rc and Arc. Rust 1.98 replaces the fixed
@@ -1032,10 +1062,12 @@ fn rust_reference_counted_layout(
     // here: named semantic members select values, while every wrapper offset
     // and final scalar width comes from the concrete DIE.
     //
-    // The July 2026 1.98 nightly adds a separate rust-gdb path for Rc<str>.
-    // Its pointer carries data and length fields, so scalar_wrapper_target
-    // deliberately rejects it. Supporting that DST requires a mixed indirect
-    // sequence plus counter payload rather than pretending it is sized.
+    // A sized pointee uses a thin pointer. Slice-like DSTs use rustc's
+    // synthetic data_ptr/length aggregate in newer DWARF, while older rustc
+    // versions may expose only the allocation pointer. We never infer or read
+    // the omitted metadata here: an unsized pointee is represented by its
+    // DWARF-projected address. This keeps Rc and Arc on one capture path and
+    // avoids treating the first byte of str as a complete value.
     let TypeInfo::StructType {
         size: root_size,
         members,
@@ -1056,22 +1088,30 @@ fn rust_reference_counted_layout(
     };
     let pointer = unique_named_member(ptr_members, "pointer")?;
     member_range(pointer, *ptr_wrapper_size)?;
-    let TypeInfo::PointerType {
-        size: pointer_size, ..
-    } = strip_type_aliases(scalar_wrapper_target(&pointer.member_type)?)
-    else {
-        return None;
-    };
-    if !matches!(*pointer_size, 4 | 8) {
-        return None;
-    }
-
-    let inner_path = vec![
+    let mut inner_path = vec![
         ProjectedPathSegment::Member(ptr_outer.name.clone()),
         ProjectedPathSegment::Member(pointer.name.clone()),
-        ProjectedPathSegment::UnwrapScalar,
-        ProjectedPathSegment::Dereference,
     ];
+    let address_only = if let Some(raw_pointer) = scalar_wrapper_target(&pointer.member_type) {
+        let TypeInfo::PointerType {
+            target_type,
+            size: pointer_size,
+        } = strip_type_aliases(raw_pointer)
+        else {
+            return None;
+        };
+        if !matches!(*pointer_size, 4 | 8) {
+            return None;
+        }
+        inner_path.push(ProjectedPathSegment::UnwrapScalar);
+        pointee_is_str || reference_counted_target_is_unsized(target_type, value_member)
+    } else {
+        let data_ptr = slice_wide_pointer_data_member(pointer)?;
+        inner_path.push(ProjectedPathSegment::Member(data_ptr.name.clone()));
+        true
+    };
+    inner_path.push(ProjectedPathSegment::Dereference);
+
     let mut value_path = inner_path.clone();
     value_path.push(ProjectedPathSegment::Member(value_member.to_string()));
     let mut strong_path = inner_path.clone();
@@ -1085,19 +1125,27 @@ fn rust_reference_counted_layout(
         type_name,
         fields: vec![
             CompositeStructField {
-                name: "value",
+                name: if address_only { "ptr" } else { "value" },
                 value_path,
-                requirement: ProjectedValueRequirement::KnownSizedOrZst,
+                capture: if address_only {
+                    CompositeStructFieldCapture::Address
+                } else {
+                    CompositeStructFieldCapture::Value(ProjectedValueRequirement::KnownSizedOrZst)
+                },
             },
             CompositeStructField {
                 name: "strong",
                 value_path: strong_path,
-                requirement: ProjectedValueRequirement::UnsignedPointerSizedInteger,
+                capture: CompositeStructFieldCapture::Value(
+                    ProjectedValueRequirement::UnsignedPointerSizedInteger,
+                ),
             },
             CompositeStructField {
                 name: "weak",
                 value_path: weak_path,
-                requirement: ProjectedValueRequirement::UnsignedPointerSizedInteger,
+                capture: CompositeStructFieldCapture::Value(
+                    ProjectedValueRequirement::UnsignedPointerSizedInteger,
+                ),
             },
         ],
         // Rc/Arc allocations hold one implicit weak entry while strong
@@ -1108,6 +1156,54 @@ fn rust_reference_counted_layout(
             implicit_weak: 1,
         },
     })
+}
+
+fn reference_counted_target_is_unsized(target: &TypeInfo, value_member: &str) -> bool {
+    let TypeInfo::StructType { members, .. } = strip_type_aliases(target) else {
+        return false;
+    };
+    let Some(value) = unique_named_member(members, value_member) else {
+        return false;
+    };
+    matches!(
+        strip_type_aliases(&value.member_type),
+        TypeInfo::ArrayType {
+            total_size: None,
+            ..
+        }
+    )
+}
+
+fn slice_wide_pointer_data_member(pointer: &StructMember) -> Option<&StructMember> {
+    let TypeInfo::StructType { size, members, .. } = strip_type_aliases(&pointer.member_type)
+    else {
+        return None;
+    };
+    let data = unique_named_member(members, "data_ptr")?;
+    let length = unique_named_member(members, "length")?;
+    let data_range = member_range(data, *size)?;
+    let length_range = member_range(length, *size)?;
+    if ranges_overlap(data_range, length_range) {
+        return None;
+    }
+    let TypeInfo::PointerType {
+        size: pointer_size, ..
+    } = strip_type_aliases(&data.member_type)
+    else {
+        return None;
+    };
+    let TypeInfo::BaseType {
+        size: length_size,
+        encoding,
+        ..
+    } = strip_type_aliases(&length.member_type)
+    else {
+        return None;
+    };
+    (matches!(*pointer_size, 4 | 8)
+        && pointer_size == length_size
+        && *encoding == gimli::DW_ATE_unsigned.0 as u16)
+        .then_some(data)
 }
 
 fn rust_hash_table_layout(root: &TypeInfo, kind: HashTableKind) -> Option<HashTableLayout> {
@@ -2185,6 +2281,80 @@ mod tests {
                         pointer_size,
                     ),
                 ],
+            },
+            TypeIdentity::Unknown,
+            Some(TypeOrigin {
+                module: ModuleId(0),
+                cu: CuId(0),
+                language,
+                producer: None,
+                dwarf_version: 5,
+            }),
+        )
+    }
+
+    fn rust_reference_counted_dst_type(
+        name: &str,
+        type_name: &str,
+        value_member: &str,
+        pointer_size: u64,
+        explicit_metadata: bool,
+        language: SourceLanguage,
+    ) -> ResolvedType {
+        let counter = || {
+            single_member_struct(
+                "Cell<usize>",
+                "value",
+                single_member_struct(
+                    "UnsafeCell<usize>",
+                    "value",
+                    unsigned_type("usize", pointer_size),
+                ),
+            )
+        };
+        let inner = TypeInfo::StructType {
+            name: format!("{type_name}Inner<str>"),
+            size: pointer_size * 2,
+            members: vec![
+                member("strong", counter(), 0),
+                member("weak", counter(), pointer_size),
+                member(
+                    value_member,
+                    TypeInfo::ArrayType {
+                        element_type: Box::new(unsigned_type("u8", 1)),
+                        element_count: None,
+                        total_size: None,
+                    },
+                    pointer_size * 2,
+                ),
+            ],
+        };
+        let raw_pointer = TypeInfo::PointerType {
+            target_type: Box::new(inner),
+            size: pointer_size,
+        };
+        let pointer = if explicit_metadata {
+            TypeInfo::StructType {
+                name: format!("*const {type_name}Inner<str>"),
+                size: pointer_size * 2,
+                members: vec![
+                    member("data_ptr", raw_pointer, 0),
+                    member("length", unsigned_type("usize", pointer_size), pointer_size),
+                ],
+            }
+        } else {
+            raw_pointer
+        };
+        let ptr = TypeInfo::StructType {
+            name: format!("NonNull<{type_name}Inner<str>>"),
+            size: pointer.size(),
+            members: vec![member("pointer", pointer, 0)],
+        };
+        ResolvedType::new(
+            TypeInfo::StructType {
+                name: name.to_string(),
+                size: ptr.size(),
+                members: vec![member("ptr", ptr, 0)],
             },
             TypeIdentity::Unknown,
             Some(TypeOrigin {
@@ -3827,17 +3997,23 @@ mod tests {
                     CompositeStructField {
                         name: "value",
                         value_path,
-                        requirement: ProjectedValueRequirement::KnownSizedOrZst,
+                        capture: CompositeStructFieldCapture::Value(
+                            ProjectedValueRequirement::KnownSizedOrZst,
+                        ),
                     },
                     CompositeStructField {
                         name: "strong",
                         value_path: strong_path,
-                        requirement: ProjectedValueRequirement::UnsignedPointerSizedInteger,
+                        capture: CompositeStructFieldCapture::Value(
+                            ProjectedValueRequirement::UnsignedPointerSizedInteger,
+                        ),
                     },
                     CompositeStructField {
                         name: "weak",
                         value_path: weak_path,
-                        requirement: ProjectedValueRequirement::UnsignedPointerSizedInteger,
+                        capture: CompositeStructFieldCapture::Value(
+                            ProjectedValueRequirement::UnsignedPointerSizedInteger,
+                        ),
                     },
                 ],
                 presentation: ProjectedStructPresentation::ReferenceCounted {
@@ -3864,6 +4040,120 @@ mod tests {
             resolve_value_layout(&arc, None),
             Some(expected("Arc", "data"))
         );
+    }
+
+    #[test]
+    fn recognizes_rc_and_arc_dst_addresses_from_thin_and_wide_dwarf_pointers() {
+        let expected = |type_name, value_member: &str, explicit_metadata| {
+            let mut inner_path = vec![
+                ProjectedPathSegment::Member("ptr".to_string()),
+                ProjectedPathSegment::Member("pointer".to_string()),
+            ];
+            inner_path.push(if explicit_metadata {
+                ProjectedPathSegment::Member("data_ptr".to_string())
+            } else {
+                ProjectedPathSegment::UnwrapScalar
+            });
+            inner_path.push(ProjectedPathSegment::Dereference);
+            let mut value_path = inner_path.clone();
+            value_path.push(ProjectedPathSegment::Member(value_member.to_string()));
+            let mut strong_path = inner_path.clone();
+            strong_path.push(ProjectedPathSegment::Member("strong".to_string()));
+            strong_path.push(ProjectedPathSegment::UnwrapScalar);
+            let mut weak_path = inner_path;
+            weak_path.push(ProjectedPathSegment::Member("weak".to_string()));
+            weak_path.push(ProjectedPathSegment::UnwrapScalar);
+            ValueLayout::CompositeStruct(CompositeStructLayout {
+                type_name,
+                fields: vec![
+                    CompositeStructField {
+                        name: "ptr",
+                        value_path,
+                        capture: CompositeStructFieldCapture::Address,
+                    },
+                    CompositeStructField {
+                        name: "strong",
+                        value_path: strong_path,
+                        capture: CompositeStructFieldCapture::Value(
+                            ProjectedValueRequirement::UnsignedPointerSizedInteger,
+                        ),
+                    },
+                    CompositeStructField {
+                        name: "weak",
+                        value_path: weak_path,
+                        capture: CompositeStructFieldCapture::Value(
+                            ProjectedValueRequirement::UnsignedPointerSizedInteger,
+                        ),
+                    },
+                ],
+                presentation: ProjectedStructPresentation::ReferenceCounted {
+                    strong_field: "strong",
+                    weak_field: "weak",
+                    implicit_weak: 1,
+                },
+            })
+        };
+
+        for pointer_size in [4, 8] {
+            for (type_name, value_member, qualified_name) in [
+                ("Rc", "value", "alloc::rc::Rc<str>"),
+                ("Arc", "data", "alloc::sync::Arc<str>"),
+            ] {
+                for explicit_metadata in [false, true] {
+                    let current = rust_reference_counted_dst_type(
+                        &format!("{type_name}<str>"),
+                        type_name,
+                        value_member,
+                        pointer_size,
+                        explicit_metadata,
+                        SourceLanguage::Rust,
+                    );
+                    assert_eq!(
+                        resolve_value_layout(&current, Some(qualified_name)),
+                        Some(expected(type_name, value_member, explicit_metadata))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recognizes_slice_dst_and_rejects_reference_counted_lookalikes() {
+        let lookalike = rust_reference_counted_dst_type(
+            "Rc<str>",
+            "Rc",
+            "value",
+            8,
+            true,
+            SourceLanguage::Rust,
+        );
+        assert_eq!(resolve_value_layout(&lookalike, Some("app::Rc<str>")), None);
+
+        let slice = rust_reference_counted_dst_type(
+            "alloc::rc::Rc<[u8]>",
+            "Rc",
+            "value",
+            8,
+            true,
+            SourceLanguage::Rust,
+        );
+        assert!(matches!(
+            resolve_value_layout(&slice, None),
+            Some(ValueLayout::CompositeStruct(CompositeStructLayout {
+                fields,
+                ..
+            })) if fields[0].capture == CompositeStructFieldCapture::Address
+        ));
+
+        let non_rust = rust_reference_counted_dst_type(
+            "alloc::rc::Rc<str>",
+            "Rc",
+            "value",
+            8,
+            true,
+            SourceLanguage::C,
+        );
+        assert_eq!(resolve_value_layout(&non_rust, None), None);
     }
 
     #[test]
@@ -3935,7 +4225,9 @@ mod tests {
                             ProjectedPathSegment::Member("value_pointer_from_dwarf".to_string(),),
                             ProjectedPathSegment::Dereference,
                         ],
-                        requirement: ProjectedValueRequirement::KnownSizedOrZst,
+                        capture: CompositeStructFieldCapture::Value(
+                            ProjectedValueRequirement::KnownSizedOrZst,
+                        ),
                     },
                     CompositeStructField {
                         name: "borrow",
@@ -3946,7 +4238,9 @@ mod tests {
                             ProjectedPathSegment::SoleMember,
                             ProjectedPathSegment::SoleMember,
                         ],
-                        requirement: ProjectedValueRequirement::SignedPointerSizedInteger,
+                        capture: CompositeStructFieldCapture::Value(
+                            ProjectedValueRequirement::SignedPointerSizedInteger,
+                        ),
                     },
                 ],
                 presentation: ProjectedStructPresentation::SignedState {

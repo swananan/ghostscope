@@ -1107,6 +1107,10 @@ impl FormatPrinter {
             return "<INVALID_UTF8_STRING_PAYLOAD>".to_string();
         };
 
+        Self::format_utf8_bytes(captured)
+    }
+
+    fn format_utf8_bytes(captured: &[u8]) -> String {
         match std::str::from_utf8(captured) {
             Ok(value) => format!("{value:?}"),
             Err(error) if error.error_len().is_none() => {
@@ -3159,6 +3163,67 @@ mod tests {
         assert_eq!(
             FormatPrinter::presentation_payload_bytes(&data, &presentation),
             Some(data.as_slice())
+        );
+    }
+
+    #[test]
+    fn test_reference_counted_presentation_formats_a_dst_pointer() {
+        let usize_type = TypeInfo::BaseType {
+            name: "usize".to_string(),
+            size: 8,
+            encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+        };
+        let type_info = TypeInfo::StructType {
+            name: "Arc".to_string(),
+            size: 24,
+            members: vec![
+                crate::StructMember {
+                    name: "ptr".to_string(),
+                    member_type: TypeInfo::PointerType {
+                        target_type: Box::new(TypeInfo::ArrayType {
+                            element_type: Box::new(TypeInfo::BaseType {
+                                name: "u8".to_string(),
+                                size: 1,
+                                encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+                            }),
+                            element_count: None,
+                            total_size: None,
+                        }),
+                        size: 8,
+                    },
+                    offset: 0,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+                crate::StructMember {
+                    name: "strong".to_string(),
+                    member_type: usize_type.clone(),
+                    offset: 8,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+                crate::StructMember {
+                    name: "weak".to_string(),
+                    member_type: usize_type,
+                    offset: 16,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+            ],
+        };
+        let presentation = ValuePresentation::ReferenceCountedStruct {
+            strong_field: "strong".to_string(),
+            weak_field: "weak".to_string(),
+            implicit_weak: 1,
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x1234_u64.to_le_bytes());
+        data.extend_from_slice(&2_u64.to_le_bytes());
+        data.extend_from_slice(&1_u64.to_le_bytes());
+
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(&data, &type_info, &presentation),
+            "Arc(strong=2, weak=0) { ptr: 0x1234 (u8[]*), strong: 2, weak: 0 }"
         );
     }
 

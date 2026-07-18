@@ -2,9 +2,10 @@ mod access;
 mod value;
 
 pub(crate) use value::{
-    BTreeKind, BTreeLayout, HashTableBucketLayout, HashTableKind, IndirectSequenceAddressing,
-    IndirectSequenceKind, ProjectedPathSegment, ProjectedStructPresentation,
-    ProjectedValuePresentation, ProjectedValueRequirement, RingSequenceLengthKind, ValueLayout,
+    BTreeKind, BTreeLayout, CompositeStructFieldCapture, HashTableBucketLayout, HashTableKind,
+    IndirectSequenceAddressing, IndirectSequenceKind, ProjectedPathSegment,
+    ProjectedStructPresentation, ProjectedValuePresentation, ProjectedValueRequirement,
+    RingSequenceLengthKind, ValueLayout,
 };
 
 pub(super) fn resolve_tuple_index(index: u32) -> crate::VariableAccessSegment {

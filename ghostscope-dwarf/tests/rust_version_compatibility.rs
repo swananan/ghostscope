@@ -1,6 +1,6 @@
 use ghostscope_dwarf::{
-    BTreeEntryPresentation, DwarfAnalyzer, HashTableEntryPresentation, RustcVersion,
-    SourceLanguage, ValueCapturePlan, ValuePresentation, ValueReadPlan,
+    BTreeEntryPresentation, DwarfAnalyzer, HashTableEntryPresentation, ProjectedViewFieldCapture,
+    RustcVersion, SourceLanguage, ValueCapturePlan, ValuePresentation, ValueReadPlan,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -220,6 +220,46 @@ fn member_offset(projection: &ghostscope_dwarf::TypeProjection) -> anyhow::Resul
     Ok(offset)
 }
 
+fn assert_reference_counted_dst_plan(
+    toolchain: &str,
+    type_name: &str,
+    plan: &ValueReadPlan,
+) -> anyhow::Result<()> {
+    let ValuePresentation::ReferenceCountedStruct { implicit_weak, .. } = &plan.presentation else {
+        anyhow::bail!("{toolchain}: unexpected {type_name}<str> presentation")
+    };
+    assert_eq!(*implicit_weak, 1);
+
+    let ValueCapturePlan::ProjectedView {
+        output_type,
+        fields,
+    } = &plan.capture
+    else {
+        anyhow::bail!("{toolchain}: unexpected {type_name}<str> capture")
+    };
+    let ghostscope_dwarf::TypeInfo::StructType { name, members, .. } = output_type else {
+        anyhow::bail!("{toolchain}: {type_name}<str> output is not a struct")
+    };
+    assert_eq!(name, type_name);
+    assert_eq!(
+        members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        ["ptr", "strong", "weak"]
+    );
+    assert!(matches!(
+        members[0].member_type,
+        ghostscope_dwarf::TypeInfo::PointerType { size: 8, .. }
+    ));
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0].capture, ProjectedViewFieldCapture::Address);
+    assert!(fields[1..]
+        .iter()
+        .all(|field| field.capture == ProjectedViewFieldCapture::Value));
+    Ok(())
+}
+
 fn assert_rust_135_btree_plan(parameter: &str, plan: &ValueReadPlan) -> anyhow::Result<()> {
     let ValuePresentation::BTree {
         node_capacity,
@@ -361,7 +401,8 @@ async fn assert_parameter_adapter(
     let plan = analyzer.value_read_plan(&parameter_type, Some(binary))?;
     anyhow::ensure!(
         adapter_matches(plan.as_ref(), expected),
-        "{toolchain}: unexpected adapter for {function}::{parameter}: {plan:#?}"
+        "{toolchain}: unexpected adapter for {function}::{parameter}: {plan:#?}\n\
+         resolved type: {parameter_type:#?}"
     );
     Ok(plan)
 }
@@ -491,6 +532,23 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
                 &toolchain,
             )
             .await?;
+        }
+        for (parameter, type_name) in [("rc_text", "Rc"), ("arc_text", "Arc")] {
+            let plan = assert_parameter_adapter(
+                &analyzer,
+                &binary,
+                "observe_values",
+                parameter,
+                ExpectedAdapter::ReferenceCounted,
+                &toolchain,
+            )
+            .await?;
+            assert_reference_counted_dst_plan(
+                &toolchain,
+                type_name,
+                plan.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing {type_name}<str> plan"))?,
+            )?;
         }
         tested += 1;
     }

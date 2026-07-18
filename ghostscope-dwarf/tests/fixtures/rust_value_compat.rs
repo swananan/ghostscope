@@ -26,7 +26,9 @@ pub fn observe_values(
     hash_map: HashMap<i32, u16>,
     hash_set: HashSet<i32>,
     rc: Rc<i32>,
+    rc_text: Rc<str>,
     arc: Arc<i32>,
+    arc_text: Arc<str>,
     cell: Cell<i32>,
     ref_cell: RefCell<i32>,
     nonzero: NonZeroI32,
@@ -48,7 +50,9 @@ pub fn observe_values(
         + hash_map.len()
         + hash_set.len()
         + *rc as usize
+        + rc_text.len()
         + *arc as usize
+        + arc_text.len()
         + cell.get() as usize
         + *ref_cell.borrow() as usize
         + nonzero.get() as usize
@@ -94,7 +98,9 @@ fn main() {
         hash_map,
         hash_set,
         Rc::new(37),
+        Rc::from("rc-text"),
         Arc::new(41),
+        Arc::from("arc-text"),
         Cell::new(43),
         RefCell::new(47),
         NonZeroI32::new(53).unwrap(),

@@ -68,6 +68,7 @@ struct ProjectedViewFieldSource {
     output_offset: usize,
     value_len: usize,
     steps: Vec<ProjectedViewStep>,
+    capture: ghostscope_dwarf::ProjectedViewFieldCapture,
 }
 
 #[derive(Debug, Clone, Copy)]

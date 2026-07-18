@@ -42,6 +42,16 @@ pub struct ProjectedValueRead {
 pub struct ProjectedViewField {
     pub output_offset: u64,
     pub value: ProjectedValueRead,
+    pub capture: ProjectedViewFieldCapture,
+}
+
+/// How a projected-view field materializes its final runtime address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectedViewFieldCapture {
+    /// Read the value stored at the projected address.
+    Value,
+    /// Store the projected address itself as a pointer value.
+    Address,
 }
 
 /// One initialized-slot array embedded in a Rust B-Tree leaf-node layout.
