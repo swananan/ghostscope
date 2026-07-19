@@ -44,7 +44,10 @@ pub fn strip_type_aliases(mut ty: &TypeInfo) -> &TypeInfo {
 pub fn is_aggregate_type(ty: &TypeInfo) -> bool {
     matches!(
         strip_type_aliases(ty),
-        TypeInfo::StructType { .. } | TypeInfo::UnionType { .. } | TypeInfo::ArrayType { .. }
+        TypeInfo::StructType { .. }
+            | TypeInfo::UnionType { .. }
+            | TypeInfo::ArrayType { .. }
+            | TypeInfo::VariantType { .. }
     )
 }
 

@@ -119,6 +119,8 @@ impl From<&TypeInfo> for TypeKind {
             TypeInfo::FunctionType { .. } => TypeKind::Pointer,
             TypeInfo::UnknownType { .. } => TypeKind::U8, // Default to byte for unknown types
             TypeInfo::OptimizedOut { .. } => TypeKind::OptimizedOut,
+            TypeInfo::VariantType { .. } => TypeKind::Struct,
+            TypeInfo::ScopedEnumType { base_type, .. } => TypeKind::from(base_type.as_ref()),
         }
     }
 }

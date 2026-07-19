@@ -47,6 +47,7 @@ fn is_known_zero_sized_type(type_info: &ghostscope_dwarf::TypeInfo) -> bool {
         ghostscope_dwarf::TypeInfo::BaseType { name, size: 0, .. } if name == "()" => true,
         ghostscope_dwarf::TypeInfo::StructType { size: 0, .. }
         | ghostscope_dwarf::TypeInfo::UnionType { size: 0, .. }
+        | ghostscope_dwarf::TypeInfo::VariantType { size: 0, .. }
         | ghostscope_dwarf::TypeInfo::ArrayType {
             total_size: Some(0),
             ..
@@ -1571,6 +1572,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 | ghostscope_dwarf::TypeInfo::ArrayType { .. }
                 | ghostscope_dwarf::TypeInfo::StructType { .. }
                 | ghostscope_dwarf::TypeInfo::UnionType { .. }
+                | ghostscope_dwarf::TypeInfo::VariantType { .. }
         )
     }
 
@@ -1806,6 +1808,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             | ghostscope_dwarf::TypeInfo::ArrayType { .. }
                             | ghostscope_dwarf::TypeInfo::StructType { .. }
                             | ghostscope_dwarf::TypeInfo::UnionType { .. }
+                            | ghostscope_dwarf::TypeInfo::VariantType { .. }
                     )
                 }),
             // Constant offset on top of an alias-eligible expression

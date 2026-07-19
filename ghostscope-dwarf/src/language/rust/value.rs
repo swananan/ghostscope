@@ -1359,11 +1359,9 @@ fn rust_btree_layout(root: &TypeInfo, kind: BTreeKind) -> Option<BTreeLayout> {
     ) {
         return None;
     }
-    let TypeInfo::StructType {
-        size: root_size, ..
-    } = strip_type_aliases(&root_member.member_type)
-    else {
-        return None;
+    let root_size = match strip_type_aliases(&root_member.member_type) {
+        TypeInfo::StructType { size, .. } | TypeInfo::VariantType { size, .. } => *size,
+        _ => return None,
     };
     let TypeInfo::BaseType {
         size: length_size,
@@ -1373,7 +1371,7 @@ fn rust_btree_layout(root: &TypeInfo, kind: BTreeKind) -> Option<BTreeLayout> {
     else {
         return None;
     };
-    if *root_size == 0
+    if root_size == 0
         || !matches!(*length_size, 4 | 8)
         || *encoding != gimli::DW_ATE_unsigned.0 as u16
     {
