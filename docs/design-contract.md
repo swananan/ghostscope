@@ -23,9 +23,11 @@ does not permit known unsupported paths to return plausible but unproven data.
   traced. Embedded DWARF is read from that module. For separate debug files,
   available `.gnu_debuglink` CRC and Build ID evidence is checked strictly by
   default.
-- C has the strongest end-to-end coverage. C++ and Rust currently use a more
-  limited, DWARF-layout-oriented model. Language coverage is documented in
-  [limitations](limitations.md).
+- C has the strongest end-to-end coverage. C++ remains primarily
+  DWARF-layout-oriented, while Rust adds targeted standard-library semantic
+  adapters selected from validated target DWARF. See
+  [Source Language Support](scripting.md#source-language-support) for current
+  coverage and [limitations](limitations.md) for its boundaries.
 - The kernel must provide the required eBPF, uprobe, and event transport
   facilities, and GhostScope must have permission to use them.
 

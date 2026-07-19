@@ -114,13 +114,102 @@ GhostScope 的脚本语法本身与源语言无关，但实际效果取决于被
 | --- | --- | --- |
 | C | 最好 | 这是当前的主要优化目标。局部变量、全局变量、x86_64 可执行文件中的 static 线程局部变量、指针、数组、结构体、枚举和 C 字符串这类 C 风格布局，与现有 DWARF 读取和脚本运算最匹配。 |
 | C++ | 有限 | `trace ...` 里的函数名匹配，以及全局/静态变量查找，支持自动 demangle（符号名自动反混淆）。除名字解析外，C++ 语言特性目前大多还没有建模，实际更接近“按 DWARF 布局访问”，适合简单、接近 C 的数据布局和标量字段。 |
-| Rust | 有限 | `trace ...` 里的函数名匹配，以及全局/静态变量查找，支持自动 demangle（符号名自动反混淆）。当 Rust DWARF 类型身份可用时，tuple 和 tuple struct 支持 `value.0` 这类数字成员访问；其他大多数 Rust 语言特性仍未建模。 |
+| Rust | 定向支持 | 见 [Rust 值详情](#rust-值展示)。 |
 
 实践建议：
 - 需要较高成功率的复杂 DWARF 表达式时，优先选择 C 目标。
 - GhostScope 能识别 `DW_OP_form_tls_address`，这个操作既会用于 static TLS，也会用于 dynamic TLS。运行时地址解析目前只支持 x86_64 可执行文件 static TLS；dynamic/shared-library TLS 尚未建模。
-- C++ 目前仍主要按 DWARF 布局访问。Rust tuple 成员是第一个语言语义投影，但更广泛的 Rust 语义仍未建模。
-- 在 C++ 和 Rust 上，先从 demangle 后的函数名/全局名入手，再逐步验证简单字段；若名字解析有歧义，优先退回到按源码行号或地址下探。
+- C++ 目前仍主要按 DWARF 布局访问。
+- Rust 支持根据每个目标类型的源语言、类型身份和经过验证的 DWARF 布局
+  决定。从 `DW_AT_producer` 解析出的 rustc 版本只作为提示性元数据；
+  它本身不能证明任何私有布局。
+- 若名字解析有歧义，优先退回到按源码行号或地址下探。
+
+### Rust 值展示
+
+Rust 值支持不会给 DSL 增加 Rust 专用语法。DSL 解析表达式后，DWARF 层
+可以为根类型选择一个有界的语义读取计划。如果具体类型的身份或布局未通过
+验证，GhostScope 会保留原生 DWARF 展示，而不会猜测 Rust ABI。
+
+GhostScope 自身使用 Rust 1.88 构建，但这不会限制被追踪目标使用的 rustc
+版本。CI 会使用[兼容性矩阵](../../e2e-tests/rust-compat-toolchains.txt)中的
+版本构建有代表性的目标二进制。该矩阵记录的是已审计的 DWARF 布局，而不是
+版本 gate：覆盖范围取决于具体 adapter，并非每个类型族都在每个列出的版本
+上验证过；不匹配的旧布局会退回原生 DWARF 展示。
+
+目前支持以下类型族：
+
+- UTF-8 字符串：`&str`、`&mut str`、`String` 和 `Box<str>`；
+- 平台原生字节串：`OsString`、`PathBuf`，以及布局验证通过的 `&Path`；
+- 序列：`Vec<T>`、`&[T]`、`&mut [T]` 和 `VecDeque<T>`；
+- 透明包装和状态包装：`NonZero*`、`Cell<T>` 和 `RefCell<T>`；
+- 借用守卫：`Ref<T>` 和 `RefMut<T>`；
+- 引用计数：`Rc<T>` 和 `Arc<T>`；
+- 集合：`HashMap`、`HashSet`、`BTreeMap` 和 `BTreeSet`；
+- tuple 和 tuple struct 投影，例如 `value.0`。
+
+`Rc<str>` 和 `Arc<str>` 会显示目标地址以及对外可见的 strong/weak 计数。
+GhostScope 不会通过这些所有者读取动态大小字符串的内容。
+
+语义值沿用现有格式占位符：
+
+```ghostscope
+trace do_stuff {
+    print "text={} ascii={:s} bytes={:x}", text, text, text;
+    print "items={}", values;
+}
+```
+
+- `{}` 使用选中的语义展示。
+- 当语义值支持无长度的 `{:s}` 或 `{:x}` 时，格式化器使用逻辑采集结果，
+  不会暴露内部协议元数据。
+- `{:s.16}`、`{:x.*}` 和 `{:s.n$}` 等带长度形式仍保留通用的显式内存
+  读取语义。
+- `ebpf.mem_dump_cap` 限制每个间接参数，默认值为 256 字节。若语义值的
+  逻辑长度超过已采集的前缀，输出会标记 `<truncated>`。
+
+例如，当 `mem_dump_cap = 3` 时，内容为 `"hello from rust"` 的 `&str`
+会显示为：
+
+```text
+"hel" <truncated>
+```
+
+如果目标 DWARF 暴露了已知成员，也可以显式读取：
+
+```ghostscope
+trace do_stuff {
+    print "manual={:s.*}", text.length, text.data_ptr;
+    print "manual_hex={:x.*}", text.length, text.data_ptr;
+}
+```
+
+这种显式写法依赖目标的物理成员路径；语义形式会先验证并隐藏这些路径。
+
+#### 嵌套 Rust 值
+
+内联 DWARF 结构格式化会递归执行，最大深度为 32。外层适配器采集 Rust
+值后，其中的内联值也遵循这一规则：
+
+```text
+Outer { inner: Pair }     内联 Pair 使用递归 DWARF 格式化
+Vec<Pair>                 Vec 采集元素，Pair 按结构格式化
+Rc<Pair>                  Rc 投影 Pair 和计数，Pair 内联格式化
+Cell<(i32, u16)>          Cell 投影并格式化内联 tuple 值
+```
+
+语义适配器目前只根据根表达式类型选择一次，不会再次递归采集嵌套语义容器：
+
+```text
+Rc<Vec<i32>>              不会递归采集内部 Vec 的元素
+Cell<String>              不会递归采集内部 String 的字节
+Vec<String>               String 元素保留物理 DWARF 展示
+HashMap<String, Vec<i32>> key 和 value 不会运行嵌套适配器
+```
+
+已知的嵌套字段仍可在 DSL 中显式访问。该限制只影响整个根值的自动语义展示。
+要支持递归语义采集，需要限制深度、字节数、元素数和解引用次数，并提供循环
+检测、确定性的事件空间预留，以及每个子值独立的读取错误和截断状态。
 
 ## 变量
 
@@ -893,7 +982,8 @@ trace foo {
 4. **字符串操作有限**：支持 C 字符串等值（==/!=）与内置函数 `strncmp`/`starts_with`；不支持字符串连接或一般性字符串处理
 5. **整数运算限定**：支持整数算术与位运算；不支持浮点运算
 6. **无动态内存**：不能分配内存
-7. **源语言支持不均衡**：C 支持最好；C++ 和 Rust 目前主要依赖自动 demangle 和基于 DWARF 布局的访问，大多数语言特性尚未支持
+7. **源语言支持与具体类型和 DWARF 布局有关**：详见
+   [源语言支持现状](#源语言支持现状)
 
 ## 最佳实践
 

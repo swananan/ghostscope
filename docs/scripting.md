@@ -120,13 +120,112 @@ GhostScope's script syntax is source-language agnostic, but real-world support d
 | --- | --- | --- |
 | C | Best | This is the primary target. Plain locals, globals, x86_64 executable static thread-local variables, pointers, arrays, structs, enums, and C strings map most directly to the current DWARF readers and script operators. |
 | C++ | Limited | Automatic demangling is supported for function names in `trace ...` patterns and for global/static variable lookup. Beyond name resolution, most C++-specific language features are not modeled yet, so the best results come from simple, C-like layouts and scalar fields. |
-| Rust | Limited | Automatic demangling is supported for function names in `trace ...` patterns and for global/static variable lookup. Numeric tuple fields such as `value.0` are supported for tuples and tuple structs when Rust DWARF type identity is available. Most other Rust-specific features are not modeled yet. |
+| Rust | Targeted | See [Rust value details](#rust-value-presentation). |
 
 Practical guidance:
 - Prefer C targets when you need the highest success rate for complex DWARF expressions.
 - GhostScope recognizes `DW_OP_form_tls_address`, which is used for both static and dynamic TLS. Runtime address resolution currently supports only x86_64 executable static TLS; dynamic/shared-library TLS is not modeled yet.
-- C++ remains primarily DWARF-layout aware. Rust tuple fields are the first language-aware projection, but broader Rust semantics are not modeled yet.
-- In C++ and Rust, start from demangled function/global names, then probe simple fields first. If name lookup is ambiguous, fall back to line- or address-based trace patterns.
+- C++ remains primarily DWARF-layout aware.
+- Rust support is determined from each target type's language, identity, and
+  validated DWARF layout. A rustc release parsed from `DW_AT_producer` is only
+  advisory metadata; it never establishes a private layout by itself.
+- If name lookup is ambiguous, fall back to line- or address-based trace
+  patterns.
+
+### Rust Value Presentation
+
+Rust value support does not add Rust-specific syntax to the DSL. After the DSL
+resolves an expression, the DWARF layer may select a bounded semantic read plan
+for its root type. If the concrete type identity or layout does not validate,
+GhostScope keeps the native DWARF presentation instead of guessing an ABI.
+
+GhostScope's own Rust 1.88 build toolchain does not constrain the rustc used to
+build a traced target. CI compiles representative target binaries with the
+releases in the [compatibility matrix](../e2e-tests/rust-compat-toolchains.txt).
+That matrix records audited DWARF layouts rather than version gates: coverage is
+adapter-specific, so not every value family is validated on every listed
+release, and unmatched older layouts fall back to native DWARF presentation.
+
+The currently supported value families are:
+
+- UTF-8 strings: `&str`, `&mut str`, `String`, and `Box<str>`;
+- platform byte strings: `OsString`, `PathBuf`, and supported `&Path` layouts;
+- sequences: `Vec<T>`, `&[T]`, `&mut [T]`, and `VecDeque<T>`;
+- transparent and state wrappers: `NonZero*`, `Cell<T>`, and `RefCell<T>`;
+- borrow guards: `Ref<T>` and `RefMut<T>`;
+- reference counting: `Rc<T>` and `Arc<T>`;
+- collections: `HashMap`, `HashSet`, `BTreeMap`, and `BTreeSet`; and
+- tuple and tuple-struct projections such as `value.0`.
+
+`Rc<str>` and `Arc<str>` are displayed as their target address plus public
+strong and weak counts. GhostScope does not read the dynamically sized string
+contents through these owners.
+
+Semantic values use the existing format placeholders:
+
+```ghostscope
+trace do_stuff {
+    print "text={} ascii={:s} bytes={:x}", text, text, text;
+    print "items={}", values;
+}
+```
+
+- `{}` uses the selected semantic presentation.
+- When a semantic value supports no-length `{:s}` or `{:x}`, the formatter uses
+  its logical captured payload rather than exposing internal protocol metadata.
+- Length forms such as `{:s.16}`, `{:x.*}`, and `{:s.n$}` retain their generic
+  explicit memory-read behavior.
+- `ebpf.mem_dump_cap` bounds each indirect argument and defaults to 256 bytes.
+  A semantic value whose logical length exceeds the captured prefix is marked
+  `<truncated>`.
+
+For example, with `mem_dump_cap = 3`, an `&str` containing
+`"hello from rust"` is rendered as:
+
+```text
+"hel" <truncated>
+```
+
+The value can also be read explicitly when its target DWARF exposes known
+members:
+
+```ghostscope
+trace do_stuff {
+    print "manual={:s.*}", text.length, text.data_ptr;
+    print "manual_hex={:x.*}", text.length, text.data_ptr;
+}
+```
+
+This explicit form depends on the target's physical member paths. The semantic
+form validates and hides those paths.
+
+#### Nested Rust Values
+
+Inline DWARF structure formatting is recursive, with a maximum depth of 32.
+This also applies to inline Rust values after an outer adapter captures them:
+
+```text
+Outer { inner: Pair }     inline Pair uses recursive DWARF formatting
+Vec<Pair>                 Vec captures elements; Pair formats structurally
+Rc<Pair>                  Rc projects Pair and counters; Pair formats inline
+Cell<(i32, u16)>          Cell projects and formats the inline tuple value
+```
+
+Semantic adapter selection currently occurs once for the root expression type.
+Nested semantic containers are not recursively recaptured:
+
+```text
+Rc<Vec<i32>>              inner Vec elements are not captured recursively
+Cell<String>              inner String bytes are not captured recursively
+Vec<String>               String elements retain physical DWARF formatting
+HashMap<String, Vec<i32>> keys and values do not run nested adapters
+```
+
+Known nested fields remain accessible explicitly through the DSL. The
+limitation applies to automatic whole-value presentation. Recursive semantic
+capture requires bounded depth, byte, element, and dereference budgets; cycle
+detection; deterministic event reservation; and per-child read-error and
+truncation status.
 
 ## Variables
 
@@ -854,7 +953,8 @@ trace foo {
 4. Limited string operations (CString equality and built‑ins only)
 5. Integer-only arithmetic/bitwise operators; floating-point arithmetic is not supported
 6. No dynamic memory allocation in eBPF
-7. Uneven source-language coverage: C works best; C++ and Rust currently rely mostly on automatic demangling plus DWARF-layout-based access, with most language-specific features unsupported
+7. Source-language coverage remains type- and DWARF-layout-specific; see
+   [Source Language Support](#source-language-support)
 
 ## Best Practices
 
