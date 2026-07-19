@@ -19,14 +19,16 @@ use crate::{
 use gimli::Reader;
 // Alias gimli constants to upper-case identifiers to satisfy naming lints without allow attributes
 use gimli::constants::{
-    DW_AT_byte_size as DW_AT_BYTE_SIZE, DW_AT_encoding as DW_AT_ENCODING, DW_AT_name as DW_AT_NAME,
-    DW_AT_type as DW_AT_TYPE, DW_TAG_array_type as DW_TAG_ARRAY_TYPE,
-    DW_TAG_base_type as DW_TAG_BASE_TYPE, DW_TAG_class_type as DW_TAG_CLASS_TYPE,
-    DW_TAG_const_type as DW_TAG_CONST_TYPE, DW_TAG_enumeration_type as DW_TAG_ENUMERATION_TYPE,
-    DW_TAG_pointer_type as DW_TAG_POINTER_TYPE, DW_TAG_restrict_type as DW_TAG_RESTRICT_TYPE,
-    DW_TAG_structure_type as DW_TAG_STRUCTURE_TYPE,
+    DW_AT_byte_size as DW_AT_BYTE_SIZE, DW_AT_discr as DW_AT_DISCR,
+    DW_AT_discr_list as DW_AT_DISCR_LIST, DW_AT_discr_value as DW_AT_DISCR_VALUE,
+    DW_AT_encoding as DW_AT_ENCODING, DW_AT_name as DW_AT_NAME, DW_AT_type as DW_AT_TYPE,
+    DW_TAG_array_type as DW_TAG_ARRAY_TYPE, DW_TAG_base_type as DW_TAG_BASE_TYPE,
+    DW_TAG_class_type as DW_TAG_CLASS_TYPE, DW_TAG_const_type as DW_TAG_CONST_TYPE,
+    DW_TAG_enumeration_type as DW_TAG_ENUMERATION_TYPE, DW_TAG_pointer_type as DW_TAG_POINTER_TYPE,
+    DW_TAG_restrict_type as DW_TAG_RESTRICT_TYPE, DW_TAG_structure_type as DW_TAG_STRUCTURE_TYPE,
     DW_TAG_subroutine_type as DW_TAG_SUBROUTINE_TYPE, DW_TAG_typedef as DW_TAG_TYPEDEF,
-    DW_TAG_union_type as DW_TAG_UNION_TYPE, DW_TAG_volatile_type as DW_TAG_VOLATILE_TYPE,
+    DW_TAG_union_type as DW_TAG_UNION_TYPE, DW_TAG_variant as DW_TAG_VARIANT,
+    DW_TAG_variant_part as DW_TAG_VARIANT_PART, DW_TAG_volatile_type as DW_TAG_VOLATILE_TYPE,
 };
 use std::collections::HashSet;
 // no tracing imports needed here
@@ -73,6 +75,319 @@ impl DetailedParser {
     /// Create new detailed parser
     pub fn new() -> Self {
         Self {}
+    }
+
+    fn parse_member_at_offset(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        offset: gimli::UnitOffset,
+        fallback_name: &str,
+    ) -> Option<crate::StructMember> {
+        let entry = unit.entry(offset).ok()?;
+        let name = entry
+            .attr(DW_AT_NAME)
+            .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
+            .and_then(|value| value.to_string_lossy().ok().map(|value| value.into_owned()))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| fallback_name.to_string());
+        let member_type = resolve_type_ref_in_same_unit_with_origins(dwarf, &entry, unit)
+            .ok()
+            .flatten()
+            .and_then(|type_offset| Self::resolve_type_shallow_at_offset(dwarf, unit, type_offset))
+            .unwrap_or_else(|| TypeInfo::UnknownType {
+                name: "unknown".to_string(),
+            });
+
+        let mut member_offset = 0;
+        if let Some(location) = entry.attr(gimli::DW_AT_data_member_location) {
+            match location.value() {
+                gimli::AttributeValue::Exprloc(expression) => {
+                    if let Some(value) = expr_errors::downgrade_optional_to_none(
+                        DwarfExprMode::ConstOffset,
+                        crate::dwarf_expr::const_eval::eval_const_offset(
+                            &expression,
+                            unit.encoding(),
+                        ),
+                        "variant member type display",
+                    ) {
+                        member_offset = value;
+                    }
+                }
+                value => {
+                    if let Some(value) = attr_u64(value) {
+                        member_offset = value;
+                    }
+                }
+            }
+        }
+
+        let raw_bit_offset = entry
+            .attr(gimli::DW_AT_bit_offset)
+            .and_then(|attr| attr_u64(attr.value()));
+        let data_bit_offset = entry
+            .attr(gimli::DW_AT_data_bit_offset)
+            .and_then(|attr| attr_u64(attr.value()));
+        let bit_size = entry
+            .attr(gimli::DW_AT_bit_size)
+            .and_then(|attr| attr_u64(attr.value()))
+            .and_then(|value| u8::try_from(value).ok());
+        let mut bit_offset = None;
+
+        if let Some(data_bit_offset) = data_bit_offset {
+            bit_offset = u8::try_from(data_bit_offset % 8).ok();
+            member_offset = data_bit_offset / 8;
+        } else if let Some(raw_bit_offset) = raw_bit_offset {
+            bit_offset = if let Some(bit_size) = bit_size {
+                let storage_bits = member_type.size().saturating_mul(8);
+                let bit_size = u64::from(bit_size);
+                if storage_bits > 0 && raw_bit_offset + bit_size <= storage_bits {
+                    u8::try_from(storage_bits - raw_bit_offset - bit_size).ok()
+                } else {
+                    u8::try_from(raw_bit_offset).ok()
+                }
+            } else {
+                u8::try_from(raw_bit_offset).ok()
+            };
+        }
+
+        let member_type = if let Some(bit_size) = bit_size {
+            TypeInfo::BitfieldType {
+                underlying_type: Box::new(member_type),
+                bit_offset: bit_offset.unwrap_or(0),
+                bit_size,
+            }
+        } else {
+            member_type
+        };
+
+        Some(crate::StructMember {
+            name,
+            member_type,
+            offset: member_offset,
+            bit_offset,
+            bit_size,
+        })
+    }
+
+    fn discriminant_is_unsigned(type_info: &TypeInfo) -> bool {
+        match type_info {
+            TypeInfo::BaseType { encoding, .. } => {
+                *encoding == gimli::constants::DW_ATE_unsigned.0 as u16
+                    || *encoding == gimli::constants::DW_ATE_unsigned_char.0 as u16
+            }
+            TypeInfo::EnumType { base_type, .. }
+            | TypeInfo::ScopedEnumType { base_type, .. }
+            | TypeInfo::TypedefType {
+                underlying_type: base_type,
+                ..
+            }
+            | TypeInfo::QualifiedType {
+                underlying_type: base_type,
+                ..
+            }
+            | TypeInfo::BitfieldType {
+                underlying_type: base_type,
+                ..
+            } => Self::discriminant_is_unsigned(base_type),
+            _ => false,
+        }
+    }
+
+    fn parse_discriminant_attribute<R: gimli::Reader>(
+        attribute: &gimli::Attribute<R>,
+        unsigned: bool,
+        byte_size: u64,
+    ) -> Option<crate::DiscriminantValue> {
+        use gimli::AttributeValue;
+
+        if unsigned {
+            let value = match attribute.value() {
+                AttributeValue::Udata(value) => value,
+                AttributeValue::Sdata(value) => u64::try_from(value).ok()?,
+                AttributeValue::Data1(value) => u64::from(value),
+                AttributeValue::Data2(value) => u64::from(value),
+                AttributeValue::Data4(value) => u64::from(value),
+                AttributeValue::Data8(value) => value,
+                _ => return None,
+            };
+            Some(crate::DiscriminantValue::Unsigned(value))
+        } else {
+            // Rust 1.35 emits `#[repr(i8)]` value -1 as nonnegative 255 in
+            // `DW_FORM_sdata`. Keep negative Sdata values as semantic values,
+            // but interpret every nonnegative form as raw bits of the enum's
+            // DWARF byte size before matching it against a signed variant.
+            let value = match attribute.value() {
+                AttributeValue::Sdata(value) if value < 0 => value,
+                AttributeValue::Sdata(value) => {
+                    Self::sign_extend_discriminant(value as u64, byte_size)
+                }
+                AttributeValue::Udata(value) | AttributeValue::Data8(value) => {
+                    Self::sign_extend_discriminant(value, byte_size)
+                }
+                AttributeValue::Data1(value) => {
+                    Self::sign_extend_discriminant(u64::from(value), byte_size)
+                }
+                AttributeValue::Data2(value) => {
+                    Self::sign_extend_discriminant(u64::from(value), byte_size)
+                }
+                AttributeValue::Data4(value) => {
+                    Self::sign_extend_discriminant(u64::from(value), byte_size)
+                }
+                _ => return None,
+            };
+            Some(crate::DiscriminantValue::Signed(value))
+        }
+    }
+
+    fn sign_extend_discriminant(value: u64, byte_size: u64) -> i64 {
+        let bit_size = byte_size.saturating_mul(8);
+        if bit_size > 0 && bit_size < 64 {
+            let shift = 64 - bit_size;
+            ((value << shift) as i64) >> shift
+        } else {
+            value as i64
+        }
+    }
+
+    fn parse_discriminant_list<R: gimli::Reader>(
+        mut data: R,
+        unsigned: bool,
+    ) -> Option<Vec<crate::DiscriminantRange>> {
+        let mut ranges = Vec::new();
+        while !data.is_empty() {
+            let marker = data.read_u8().ok()?;
+            let is_range = if marker == gimli::constants::DW_DSC_range.0 {
+                true
+            } else if marker == gimli::constants::DW_DSC_label.0 {
+                false
+            } else {
+                return None;
+            };
+
+            let start = if unsigned {
+                crate::DiscriminantValue::Unsigned(data.read_uleb128().ok()?)
+            } else {
+                crate::DiscriminantValue::Signed(data.read_sleb128().ok()?)
+            };
+            let end = if is_range {
+                if unsigned {
+                    crate::DiscriminantValue::Unsigned(data.read_uleb128().ok()?)
+                } else {
+                    crate::DiscriminantValue::Signed(data.read_sleb128().ok()?)
+                }
+            } else {
+                start
+            };
+            ranges.push(crate::DiscriminantRange { start, end });
+        }
+        Some(ranges)
+    }
+
+    fn parse_variant_at_offset(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        offset: gimli::UnitOffset,
+        unsigned: bool,
+        byte_size: u64,
+    ) -> Option<crate::VariantCase> {
+        let entry = unit.entry(offset).ok()?;
+        let exact_value = entry.attr(DW_AT_DISCR_VALUE).and_then(|attribute| {
+            Self::parse_discriminant_attribute(attribute, unsigned, byte_size)
+        });
+        let selector = if let Some(value) = exact_value {
+            crate::VariantSelector::Ranges(vec![crate::DiscriminantRange {
+                start: value,
+                end: value,
+            }])
+        } else if let Some(attribute) = entry.attr(DW_AT_DISCR_LIST) {
+            match attribute.value() {
+                gimli::AttributeValue::Block(data) if !data.is_empty() => {
+                    crate::VariantSelector::Ranges(
+                        Self::parse_discriminant_list(data, unsigned).unwrap_or_default(),
+                    )
+                }
+                _ => crate::VariantSelector::Default,
+            }
+        } else {
+            crate::VariantSelector::Default
+        };
+
+        let mut members = Vec::new();
+        let mut variant_parts = Vec::new();
+        let mut tree = unit.entries_tree(Some(offset)).ok()?;
+        let root = tree.root().ok()?;
+        let mut children = root.children();
+        while let Ok(Some(child)) = children.next() {
+            let child_entry = child.entry();
+            if child_entry.tag() == gimli::DW_TAG_member {
+                let fallback_name = format!("member_{}", members.len());
+                if let Some(member) =
+                    Self::parse_member_at_offset(dwarf, unit, child_entry.offset(), &fallback_name)
+                {
+                    members.push(member);
+                }
+            } else if child_entry.tag() == DW_TAG_VARIANT_PART {
+                if let Some(part) =
+                    Self::parse_variant_part_at_offset(dwarf, unit, child_entry.offset())
+                {
+                    variant_parts.push(part);
+                }
+            }
+        }
+
+        Some(crate::VariantCase {
+            selector,
+            members,
+            variant_parts,
+        })
+    }
+
+    /// Parse the standard DWARF variant graph using the same model as GDB:
+    /// `DW_AT_discr` identifies the physical member, explicit values and
+    /// lists select branches, and a branch without either attribute is the
+    /// default. No Rust layout or discriminant offset is inferred here.
+    fn parse_variant_part_at_offset(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        offset: gimli::UnitOffset,
+    ) -> Option<crate::VariantPart> {
+        let entry = unit.entry(offset).ok()?;
+        let discriminant = match entry.attr_value(DW_AT_DISCR) {
+            Some(gimli::AttributeValue::UnitRef(discriminant_offset)) => {
+                Self::parse_member_at_offset(dwarf, unit, discriminant_offset, "<discriminant>")
+            }
+            _ => None,
+        };
+        let unsigned = discriminant
+            .as_ref()
+            .is_some_and(|member| Self::discriminant_is_unsigned(&member.member_type));
+        let byte_size = discriminant
+            .as_ref()
+            .map_or(0, |member| member.member_type.size());
+
+        let mut variants = Vec::new();
+        let mut tree = unit.entries_tree(Some(offset)).ok()?;
+        let root = tree.root().ok()?;
+        let mut children = root.children();
+        while let Ok(Some(child)) = children.next() {
+            let child_entry = child.entry();
+            if child_entry.tag() == DW_TAG_VARIANT {
+                if let Some(variant) = Self::parse_variant_at_offset(
+                    dwarf,
+                    unit,
+                    child_entry.offset(),
+                    unsigned,
+                    byte_size,
+                ) {
+                    variants.push(variant);
+                }
+            }
+        }
+
+        Some(crate::VariantPart {
+            discriminant,
+            variants,
+        })
     }
 
     // Full type resolution intentionally removed; only shallow type resolution is supported.
@@ -299,6 +614,7 @@ impl DetailedParser {
                     }
                     // Collect only direct member DIEs
                     let mut members: Vec<crate::StructMember> = Vec::new();
+                    let mut variant_parts: Vec<crate::VariantPart> = Vec::new();
                     if let Ok(mut tree) = unit.entries_tree(Some(entry.offset())) {
                         if let Ok(root) = tree.root() {
                             let mut children = root.children();
@@ -412,6 +728,12 @@ impl DetailedParser {
                                         bit_offset,
                                         bit_size,
                                     });
+                                } else if ce.tag() == DW_TAG_VARIANT_PART {
+                                    if let Some(part) =
+                                        Self::parse_variant_part_at_offset(dwarf, unit, ce.offset())
+                                    {
+                                        variant_parts.push(part);
+                                    }
                                 }
                             }
                         }
@@ -456,11 +778,20 @@ impl DetailedParser {
                             }
                         }
                     }
-                    return Some(TypeInfo::StructType {
-                        name,
-                        size: byte_size,
-                        members,
-                    });
+                    return if variant_parts.is_empty() {
+                        Some(TypeInfo::StructType {
+                            name,
+                            size: byte_size,
+                            members,
+                        })
+                    } else {
+                        Some(TypeInfo::VariantType {
+                            name,
+                            size: byte_size,
+                            members,
+                            variant_parts,
+                        })
+                    };
                 }
                 DW_TAG_UNION_TYPE => {
                     let name = alias_name.clone().unwrap_or_else(|| {
@@ -549,8 +880,19 @@ impl DetailedParser {
                             }
                         }
                     }
-                    // Collect enum variants (one level)
+                    let scoped = entry
+                        .attr(gimli::DW_AT_enum_class)
+                        .is_some_and(|attribute| {
+                            matches!(attribute.value(), gimli::AttributeValue::Flag(true))
+                        });
+                    let unsigned = Self::discriminant_is_unsigned(&base_type);
+
+                    // Collect enum variants (one level). Legacy EnumType keeps
+                    // its signed wire representation, while scoped enums retain
+                    // the DWARF signedness needed for the full u64 domain.
                     let mut variants: Vec<crate::EnumVariant> = Vec::new();
+                    let mut scoped_variants: Vec<crate::ScopedEnumVariant> = Vec::new();
+                    let mut variant_index = 0usize;
                     if let Ok(mut tree) = unit.entries_tree(Some(entry.offset())) {
                         if let Ok(root) = tree.root() {
                             let mut children = root.children();
@@ -565,80 +907,60 @@ impl DetailedParser {
                                             }
                                         }
                                     }
-                                    let mut v_val: i64 = 0;
-                                    if let Some(cv) = ce.attr(gimli::DW_AT_const_value) {
-                                        let signed = match &base_type {
-                                            TypeInfo::BaseType { encoding, .. } => {
-                                                *encoding
-                                                    == gimli::constants::DW_ATE_signed.0 as u16
-                                                    || *encoding
-                                                        == gimli::constants::DW_ATE_signed_char.0
-                                                            as u16
-                                            }
-                                            TypeInfo::TypedefType {
-                                                underlying_type, ..
-                                            }
-                                            | TypeInfo::QualifiedType {
-                                                underlying_type, ..
-                                            } => {
-                                                matches!(
-                                                    &**underlying_type,
-                                                    TypeInfo::BaseType { encoding, .. }
-                                                        if *encoding == gimli::constants::DW_ATE_signed.0 as u16
-                                                            || *encoding
-                                                                == gimli::constants::DW_ATE_signed_char.0 as u16
-                                                )
-                                            }
-                                            _ => true,
-                                        };
-                                        v_val = match cv.value() {
-                                            gimli::AttributeValue::Udata(u) => u as i64,
-                                            gimli::AttributeValue::Sdata(s) => s,
-                                            gimli::AttributeValue::Data1(b) => {
-                                                let u = b as u64;
-                                                if signed && (u & 0x80) != 0 {
-                                                    (u as i8) as i64
-                                                } else {
-                                                    u as i64
-                                                }
-                                            }
-                                            gimli::AttributeValue::Data2(u) => {
-                                                let u = u as u64;
-                                                if signed && (u & 0x8000) != 0 {
-                                                    (u as i16) as i64
-                                                } else {
-                                                    u as i64
-                                                }
-                                            }
-                                            gimli::AttributeValue::Data4(u) => {
-                                                let u = u as u64;
-                                                if signed && (u & 0x8000_0000) != 0 {
-                                                    (u as i32) as i64
-                                                } else {
-                                                    u as i64
-                                                }
-                                            }
-                                            gimli::AttributeValue::Data8(u) => u as i64,
-                                            _ => v_val,
-                                        };
-                                    }
                                     if v_name.is_empty() {
-                                        v_name = format!("variant_{}", variants.len());
+                                        v_name = format!("variant_{variant_index}");
                                     }
-                                    variants.push(crate::EnumVariant {
-                                        name: v_name,
-                                        value: v_val,
-                                    });
+                                    let value = ce
+                                        .attr(gimli::DW_AT_const_value)
+                                        .and_then(|attribute| {
+                                            Self::parse_discriminant_attribute(
+                                                attribute, unsigned, byte_size,
+                                            )
+                                        })
+                                        .unwrap_or({
+                                            if unsigned {
+                                                crate::DiscriminantValue::Unsigned(0)
+                                            } else {
+                                                crate::DiscriminantValue::Signed(0)
+                                            }
+                                        });
+                                    if scoped {
+                                        scoped_variants.push(crate::ScopedEnumVariant {
+                                            name: v_name,
+                                            value,
+                                        });
+                                    } else {
+                                        let value = match value {
+                                            crate::DiscriminantValue::Signed(value) => value,
+                                            crate::DiscriminantValue::Unsigned(value) => {
+                                                value as i64
+                                            }
+                                        };
+                                        variants.push(crate::EnumVariant {
+                                            name: v_name,
+                                            value,
+                                        });
+                                    }
+                                    variant_index += 1;
                                 }
                             }
                         }
                     }
-                    return Some(TypeInfo::EnumType {
-                        name,
-                        size: byte_size,
-                        base_type: Box::new(base_type),
-                        variants,
-                    });
+                    return if scoped {
+                        Some(TypeInfo::ScopedEnumType {
+                            name,
+                            size: byte_size,
+                            base_type: Box::new(base_type),
+                            variants: scoped_variants,
+                        })
+                    } else {
+                        Some(TypeInfo::EnumType {
+                            name,
+                            size: byte_size,
+                            base_type: Box::new(base_type),
+                            variants,
+                        })
+                    };
                 }
                 DW_TAG_ARRAY_TYPE => {
                     // element_type shallow + total_size if available + subrange element_count (one step deeper)
@@ -932,6 +1254,66 @@ impl Default for DetailedParser {
 mod tests {
     use super::*;
     use crate::core::{Availability, VariableLocation};
+
+    #[test]
+    fn parses_unsigned_discriminant_labels_and_ranges() {
+        let data = [
+            gimli::constants::DW_DSC_label.0,
+            5,
+            gimli::constants::DW_DSC_range.0,
+            8,
+            13,
+        ];
+        let ranges = DetailedParser::parse_discriminant_list(
+            gimli::EndianSlice::new(&data, gimli::LittleEndian),
+            true,
+        )
+        .expect("valid unsigned discriminant list");
+
+        assert_eq!(
+            ranges,
+            vec![
+                crate::DiscriminantRange {
+                    start: crate::DiscriminantValue::Unsigned(5),
+                    end: crate::DiscriminantValue::Unsigned(5),
+                },
+                crate::DiscriminantRange {
+                    start: crate::DiscriminantValue::Unsigned(8),
+                    end: crate::DiscriminantValue::Unsigned(13),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_signed_discriminant_labels_and_ranges() {
+        let data = [
+            gimli::constants::DW_DSC_label.0,
+            0x7e,
+            gimli::constants::DW_DSC_range.0,
+            0x7c,
+            3,
+        ];
+        let ranges = DetailedParser::parse_discriminant_list(
+            gimli::EndianSlice::new(&data, gimli::LittleEndian),
+            false,
+        )
+        .expect("valid signed discriminant list");
+
+        assert_eq!(
+            ranges,
+            vec![
+                crate::DiscriminantRange {
+                    start: crate::DiscriminantValue::Signed(-2),
+                    end: crate::DiscriminantValue::Signed(-2),
+                },
+                crate::DiscriminantRange {
+                    start: crate::DiscriminantValue::Signed(-4),
+                    end: crate::DiscriminantValue::Signed(3),
+                },
+            ]
+        );
+    }
 
     #[test]
     fn variable_reports_register_value_location() {

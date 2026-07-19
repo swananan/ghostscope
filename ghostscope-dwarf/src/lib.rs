@@ -69,9 +69,10 @@ pub use semantics::is_pointer_or_array_type as is_c_pointer_or_array_type;
 
 // Re-export type definitions from protocol (avoiding circular dependencies)
 pub use ghostscope_protocol::{
-    BTreeEntryPresentation, BTreeFieldPresentation, EnumVariant, HashTableBucketOrder,
-    HashTableEntryPresentation, HashTableFieldPresentation, HashTableOccupancy, StructMember,
-    TypeCache, TypeInfo, TypeKind, TypeQualifier, ValuePresentation,
+    BTreeEntryPresentation, BTreeFieldPresentation, DiscriminantRange, DiscriminantValue,
+    EnumVariant, HashTableBucketOrder, HashTableEntryPresentation, HashTableFieldPresentation,
+    HashTableOccupancy, ScopedEnumVariant, StructMember, TypeCache, TypeInfo, TypeKind,
+    TypeQualifier, ValuePresentation, VariantCase, VariantPart, VariantSelector,
 };
 
 // Re-export gimli types that external users need

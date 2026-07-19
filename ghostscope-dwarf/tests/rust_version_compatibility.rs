@@ -1,6 +1,7 @@
 use ghostscope_dwarf::{
-    BTreeEntryPresentation, DwarfAnalyzer, HashTableEntryPresentation, ProjectedViewFieldCapture,
-    RustcVersion, SourceLanguage, ValueCapturePlan, ValuePresentation, ValueReadPlan,
+    BTreeEntryPresentation, DiscriminantValue, DwarfAnalyzer, HashTableEntryPresentation,
+    ProjectedViewFieldCapture, RustcVersion, SourceLanguage, TypeInfo, ValueCapturePlan,
+    ValuePresentation, ValueReadPlan, VariantCase, VariantSelector,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -409,6 +410,249 @@ async fn assert_parameter_adapter(
     Ok(plan)
 }
 
+async fn resolved_parameter_type(
+    analyzer: &DwarfAnalyzer,
+    function: &str,
+    parameter: &str,
+    toolchain: &str,
+) -> anyhow::Result<TypeInfo> {
+    let context = analyzer
+        .lookup_function_addresses(function)
+        .into_iter()
+        .find_map(|address| analyzer.resolve_pc(&address).ok())
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing function {function}"))?;
+    let parameter_plan = analyzer
+        .plan_variable_by_name(&context, parameter)?
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing {function}::{parameter}"))?;
+    Ok(analyzer
+        .resolved_type_for_plan(&parameter_plan)?
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing type for {function}::{parameter}"))?
+        .summary)
+}
+
+fn variant_name(variant: &VariantCase) -> Option<&str> {
+    match variant.members.as_slice() {
+        [member] => Some(member.name.as_str()),
+        _ => None,
+    }
+}
+
+fn exact_unsigned_selector(variant: &VariantCase) -> Option<u64> {
+    let VariantSelector::Ranges(ranges) = &variant.selector else {
+        return None;
+    };
+    let [range] = ranges.as_slice() else {
+        return None;
+    };
+    match (range.start, range.end) {
+        (DiscriminantValue::Unsigned(start), DiscriminantValue::Unsigned(end)) if start == end => {
+            Some(start)
+        }
+        _ => None,
+    }
+}
+
+fn assert_compat_enum_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Result<()> {
+    let TypeInfo::VariantType {
+        name,
+        size,
+        members,
+        variant_parts,
+    } = type_info
+    else {
+        anyhow::bail!("{toolchain}: CompatEnum did not resolve as a DWARF variant type")
+    };
+    anyhow::ensure!(
+        name == "CompatEnum",
+        "{toolchain}: unexpected enum name {name}"
+    );
+    anyhow::ensure!(*size == 8, "{toolchain}: unexpected CompatEnum size {size}");
+    anyhow::ensure!(members.is_empty(), "{toolchain}: unexpected common fields");
+    let [part] = variant_parts.as_slice() else {
+        anyhow::bail!("{toolchain}: expected one CompatEnum variant part")
+    };
+    let discriminant = part
+        .discriminant
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing CompatEnum discriminant"))?;
+    anyhow::ensure!(
+        discriminant.offset == 0 && discriminant.member_type.is_unsigned_int(),
+        "{toolchain}: unexpected CompatEnum discriminant {discriminant:#?}"
+    );
+    anyhow::ensure!(
+        part.variants
+            .iter()
+            .filter_map(variant_name)
+            .collect::<Vec<_>>()
+            == ["Unit", "Tuple", "Struct"],
+        "{toolchain}: unexpected CompatEnum variants: {:#?}",
+        part.variants
+    );
+    anyhow::ensure!(
+        part.variants
+            .iter()
+            .map(exact_unsigned_selector)
+            .collect::<Vec<_>>()
+            == [Some(0), Some(1), Some(2)],
+        "{toolchain}: unexpected CompatEnum selectors"
+    );
+    Ok(())
+}
+
+fn assert_niche_option_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Result<()> {
+    let TypeInfo::VariantType {
+        name,
+        size,
+        variant_parts,
+        ..
+    } = type_info
+    else {
+        anyhow::bail!("{toolchain}: Option<NonZeroI32> did not resolve as a variant type")
+    };
+    anyhow::ensure!(
+        name.contains("Option<") && *size == 4,
+        "{toolchain}: unexpected niche Option type {name} size {size}"
+    );
+    let [part] = variant_parts.as_slice() else {
+        anyhow::bail!("{toolchain}: expected one Option variant part")
+    };
+    let none = part
+        .variants
+        .iter()
+        .find(|variant| variant_name(variant) == Some("None"))
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing Option::None"))?;
+    let some = part
+        .variants
+        .iter()
+        .find(|variant| variant_name(variant) == Some("Some"))
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing Option::Some"))?;
+    anyhow::ensure!(
+        exact_unsigned_selector(none) == Some(0),
+        "{toolchain}: Option::None is not the zero niche"
+    );
+    anyhow::ensure!(
+        matches!(some.selector, VariantSelector::Default),
+        "{toolchain}: Option::Some is not the default niche branch"
+    );
+    Ok(())
+}
+
+fn assert_fieldless_enum_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Result<()> {
+    let TypeInfo::ScopedEnumType {
+        name,
+        size,
+        base_type,
+        variants,
+    } = type_info
+    else {
+        anyhow::bail!("{toolchain}: CompatFieldless did not resolve as a scoped enum")
+    };
+    anyhow::ensure!(
+        name == "CompatFieldless" && *size == 1 && base_type.is_unsigned_int(),
+        "{toolchain}: unexpected fieldless enum type {type_info:#?}"
+    );
+    anyhow::ensure!(
+        variants
+            .iter()
+            .map(|variant| (variant.name.as_str(), variant.value))
+            .collect::<Vec<_>>()
+            == [
+                ("First", DiscriminantValue::Unsigned(0)),
+                ("Second", DiscriminantValue::Unsigned(1)),
+            ],
+        "{toolchain}: unexpected fieldless enum variants {variants:#?}"
+    );
+    Ok(())
+}
+
+fn assert_single_variant_enum_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Result<()> {
+    let TypeInfo::VariantType {
+        name,
+        size,
+        members,
+        variant_parts,
+    } = type_info
+    else {
+        anyhow::bail!("{toolchain}: CompatSingle did not resolve as a DWARF variant type")
+    };
+    anyhow::ensure!(
+        name == "CompatSingle" && *size == 4 && members.is_empty(),
+        "{toolchain}: unexpected single-variant enum type {type_info:#?}"
+    );
+    let [part] = variant_parts.as_slice() else {
+        anyhow::bail!("{toolchain}: expected one CompatSingle variant part")
+    };
+    anyhow::ensure!(
+        part.discriminant.is_none(),
+        "{toolchain}: CompatSingle unexpectedly has a discriminant"
+    );
+    let [variant] = part.variants.as_slice() else {
+        anyhow::bail!("{toolchain}: expected one CompatSingle variant")
+    };
+    anyhow::ensure!(
+        variant_name(variant) == Some("Only")
+            && matches!(variant.selector, VariantSelector::Default),
+        "{toolchain}: unexpected CompatSingle variant {variant:#?}"
+    );
+    Ok(())
+}
+
+fn assert_signed_enum_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Result<()> {
+    let TypeInfo::ScopedEnumType {
+        name,
+        size,
+        base_type,
+        variants,
+    } = type_info
+    else {
+        anyhow::bail!("{toolchain}: CompatSigned did not resolve as a scoped enum")
+    };
+    anyhow::ensure!(
+        name == "CompatSigned" && *size == 1 && base_type.is_signed_int(),
+        "{toolchain}: unexpected signed enum type {type_info:#?}"
+    );
+    anyhow::ensure!(
+        variants
+            .iter()
+            .map(|variant| (variant.name.as_str(), variant.value))
+            .collect::<Vec<_>>()
+            == [
+                ("Negative", DiscriminantValue::Signed(-1)),
+                ("Positive", DiscriminantValue::Signed(1)),
+            ],
+        "{toolchain}: unexpected signed enum variants {variants:#?}"
+    );
+    Ok(())
+}
+
+fn assert_unsigned_enum_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Result<()> {
+    let TypeInfo::ScopedEnumType {
+        name,
+        size,
+        base_type,
+        variants,
+    } = type_info
+    else {
+        anyhow::bail!("{toolchain}: CompatUnsigned did not resolve as a scoped enum")
+    };
+    anyhow::ensure!(
+        name == "CompatUnsigned" && *size == 8 && base_type.is_unsigned_int(),
+        "{toolchain}: unexpected unsigned enum type {type_info:#?}"
+    );
+    anyhow::ensure!(
+        variants
+            .iter()
+            .map(|variant| (variant.name.as_str(), variant.value))
+            .collect::<Vec<_>>()
+            == [
+                ("Low", DiscriminantValue::Unsigned(1)),
+                ("High", DiscriminantValue::Unsigned(0x8000_0000_0000_0000)),
+            ],
+        "{toolchain}: unexpected unsigned enum variants {variants:#?}"
+    );
+    Ok(())
+}
+
 fn assert_target_rustc_version(analyzer: &DwarfAnalyzer, toolchain: &str) -> anyhow::Result<()> {
     let context = analyzer
         .lookup_function_addresses("observe_values")
@@ -515,6 +759,25 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
                 ));
             }
         }
+        let enum_type =
+            resolved_parameter_type(&analyzer, "observe_values", "enum_value", &toolchain).await?;
+        assert_compat_enum_dwarf(&toolchain, &enum_type)?;
+        let fieldless_type =
+            resolved_parameter_type(&analyzer, "observe_values", "fieldless", &toolchain).await?;
+        assert_fieldless_enum_dwarf(&toolchain, &fieldless_type)?;
+        let single_type =
+            resolved_parameter_type(&analyzer, "observe_values", "single", &toolchain).await?;
+        assert_single_variant_enum_dwarf(&toolchain, &single_type)?;
+        let signed_type =
+            resolved_parameter_type(&analyzer, "observe_values", "signed", &toolchain).await?;
+        assert_signed_enum_dwarf(&toolchain, &signed_type)?;
+        let unsigned_type =
+            resolved_parameter_type(&analyzer, "observe_values", "unsigned", &toolchain).await?;
+        assert_unsigned_enum_dwarf(&toolchain, &unsigned_type)?;
+        let option_type =
+            resolved_parameter_type(&analyzer, "observe_values", "option_nonzero", &toolchain)
+                .await?;
+        assert_niche_option_dwarf(&toolchain, &option_type)?;
         if toolchain != "1.35.0" {
             assert_parameter_adapter(
                 &analyzer,

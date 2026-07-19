@@ -401,7 +401,9 @@ impl DwarfAnalyzer {
         match ty {
             crate::TypeInfo::StructType { .. }
             | crate::TypeInfo::UnionType { .. }
-            | crate::TypeInfo::EnumType { .. } => crate::TypeInfo::TypedefType {
+            | crate::TypeInfo::EnumType { .. }
+            | crate::TypeInfo::VariantType { .. }
+            | crate::TypeInfo::ScopedEnumType { .. } => crate::TypeInfo::TypedefType {
                 name,
                 underlying_type: Box::new(ty),
             },

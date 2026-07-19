@@ -9,8 +9,30 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 pub enum CompatEnum {
+    Unit,
     Tuple(i32),
     Struct { value: i32 },
+}
+
+pub enum CompatFieldless {
+    First,
+    Second,
+}
+
+pub enum CompatSingle {
+    Only(i32),
+}
+
+#[repr(i8)]
+pub enum CompatSigned {
+    Negative = -1,
+    Positive = 1,
+}
+
+#[repr(u64)]
+pub enum CompatUnsigned {
+    Low = 1,
+    High = 0x8000_0000_0000_0000,
 }
 
 #[inline(never)]
@@ -36,10 +58,31 @@ pub fn observe_values(
     ref_cell: RefCell<i32>,
     nonzero: NonZeroI32,
     enum_value: CompatEnum,
+    fieldless: CompatFieldless,
+    single: CompatSingle,
+    signed: CompatSigned,
+    unsigned: CompatUnsigned,
+    option_nonzero: Option<NonZeroI32>,
 ) -> usize {
     let enum_value = match enum_value {
+        CompatEnum::Unit => 0,
         CompatEnum::Tuple(value) => value,
         CompatEnum::Struct { value } => value,
+    };
+    let fieldless = match fieldless {
+        CompatFieldless::First => 0,
+        CompatFieldless::Second => 1,
+    };
+    let single = match single {
+        CompatSingle::Only(value) => value,
+    };
+    let signed = match signed {
+        CompatSigned::Negative => 1,
+        CompatSigned::Positive => 0,
+    };
+    let unsigned = match unsigned {
+        CompatUnsigned::Low => 0,
+        CompatUnsigned::High => 1,
     };
     string.len()
         + os_string.len()
@@ -62,6 +105,11 @@ pub fn observe_values(
         + *ref_cell.borrow() as usize
         + nonzero.get() as usize
         + enum_value as usize
+        + fieldless
+        + single as usize
+        + signed
+        + unsigned
+        + option_nonzero.map_or(0, NonZeroI32::get) as usize
 }
 
 #[inline(never)]
@@ -113,9 +161,14 @@ fn main() {
         RefCell::new(47),
         NonZeroI32::new(53).unwrap(),
         CompatEnum::Struct { value: 59 },
+        CompatFieldless::Second,
+        CompatSingle::Only(71),
+        CompatSigned::Negative,
+        CompatUnsigned::High,
+        NonZeroI32::new(61),
     );
 
-    let guarded = RefCell::new(61);
+    let guarded = RefCell::new(67);
     let shared = observe_ref(guarded.borrow());
     let exclusive = observe_ref_mut(guarded.borrow_mut());
     println!("{}", value + shared as usize + exclusive as usize);

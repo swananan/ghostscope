@@ -83,6 +83,28 @@ pub enum TypeInfo {
 
     /// Optimized out type (variable was optimized away by compiler)
     OptimizedOut { name: String },
+
+    /// Aggregate whose active fields are selected by DWARF variant parts.
+    ///
+    /// This is distinct from `EnumType`, which represents a scalar
+    /// `DW_TAG_enumeration_type`. Rust enums with payloads are emitted as a
+    /// structure containing `DW_TAG_variant_part` and `DW_TAG_variant` DIEs.
+    /// Variant-bearing forms are appended after the legacy alternatives so
+    /// their serialized discriminants remain stable.
+    VariantType {
+        name: String,
+        size: u64,
+        members: Vec<StructMember>,
+        variant_parts: Vec<VariantPart>,
+    },
+
+    /// Scalar `DW_TAG_enumeration_type` marked with `DW_AT_enum_class`.
+    ScopedEnumType {
+        name: String,
+        size: u64,
+        base_type: Box<TypeInfo>,
+        variants: Vec<ScopedEnumVariant>,
+    },
 }
 
 /// Struct/union member information
@@ -100,6 +122,52 @@ pub struct StructMember {
 pub struct EnumVariant {
     pub name: String,
     pub value: i64,
+}
+
+/// Enumerator of a scoped enum, preserving its DWARF signedness.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopedEnumVariant {
+    pub name: String,
+    pub value: DiscriminantValue,
+}
+
+/// A `DW_TAG_variant_part` and the field used to select its active branch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariantPart {
+    /// `DW_AT_discr` points to this member. It is absent for univariant forms.
+    pub discriminant: Option<StructMember>,
+    pub variants: Vec<VariantCase>,
+}
+
+/// One `DW_TAG_variant` branch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariantCase {
+    pub selector: VariantSelector,
+    pub members: Vec<StructMember>,
+    pub variant_parts: Vec<VariantPart>,
+}
+
+/// Values that activate a variant branch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum VariantSelector {
+    /// Neither `DW_AT_discr_value` nor `DW_AT_discr_list` was present.
+    Default,
+    Ranges(Vec<DiscriminantRange>),
+}
+
+/// Inclusive discriminant range from `DW_AT_discr_value` or
+/// `DW_AT_discr_list`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiscriminantRange {
+    pub start: DiscriminantValue,
+    pub end: DiscriminantValue,
+}
+
+/// A discriminant preserves the signedness of its DWARF member type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiscriminantValue {
+    Signed(i64),
+    Unsigned(u64),
 }
 
 /// Type qualifiers
@@ -132,6 +200,8 @@ impl TypeInfo {
             } => underlying_type.size(),
             TypeInfo::UnknownType { .. } => 0,
             TypeInfo::OptimizedOut { .. } => 0, // Optimized out has no size
+            TypeInfo::VariantType { size, .. } => *size,
+            TypeInfo::ScopedEnumType { size, .. } => *size,
         }
     }
 
@@ -258,6 +328,8 @@ impl TypeInfo {
             ),
             TypeInfo::UnknownType { name } => name.clone(),
             TypeInfo::OptimizedOut { name } => format!("<optimized_out> {name}"),
+            TypeInfo::VariantType { name, .. } => format!("enum {name}"),
+            TypeInfo::ScopedEnumType { name, .. } => format!("enum {name}"),
         }
     }
 
@@ -276,6 +348,9 @@ impl TypeInfo {
             TypeInfo::BitfieldType {
                 underlying_type, ..
             } => underlying_type.is_signed_int(),
+            TypeInfo::EnumType { base_type, .. } | TypeInfo::ScopedEnumType { base_type, .. } => {
+                base_type.is_signed_int()
+            }
             TypeInfo::OptimizedOut { .. } => false,
             _ => false,
         }
@@ -296,6 +371,9 @@ impl TypeInfo {
             TypeInfo::BitfieldType {
                 underlying_type, ..
             } => underlying_type.is_unsigned_int(),
+            TypeInfo::EnumType { base_type, .. } | TypeInfo::ScopedEnumType { base_type, .. } => {
+                base_type.is_unsigned_int()
+            }
             TypeInfo::OptimizedOut { .. } => false,
             _ => false,
         }
@@ -495,6 +573,20 @@ impl fmt::Display for TypeInfo {
                     write!(f, "<optimized_out>")
                 } else {
                     write!(f, "<optimized_out> {name}")
+                }
+            }
+            TypeInfo::VariantType { name, .. } => {
+                if name.is_empty() {
+                    write!(f, "enum")
+                } else {
+                    write!(f, "enum {name}")
+                }
+            }
+            TypeInfo::ScopedEnumType { name, .. } => {
+                if name.is_empty() {
+                    write!(f, "enum")
+                } else {
+                    write!(f, "enum {name}")
                 }
             }
         }

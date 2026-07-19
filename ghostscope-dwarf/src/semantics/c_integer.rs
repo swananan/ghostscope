@@ -52,6 +52,9 @@ pub fn c_integer_comparison_type(ty: &TypeInfo) -> Option<CIntegerComparisonType
         }
         TypeInfo::EnumType {
             base_type, size, ..
+        }
+        | TypeInfo::ScopedEnumType {
+            base_type, size, ..
         } => c_integer_comparison_type(base_type).map(|mut ty| {
             if ty.size == 0 {
                 ty.size = *size;
@@ -82,7 +85,9 @@ pub fn is_c_signed_integer_type(ty: &TypeInfo) -> bool {
             *encoding == crate::constants::DW_ATE_signed.0 as u16
                 || *encoding == crate::constants::DW_ATE_signed_char.0 as u16
         }
-        TypeInfo::EnumType { base_type, .. } => is_c_signed_integer_type(base_type),
+        TypeInfo::EnumType { base_type, .. } | TypeInfo::ScopedEnumType { base_type, .. } => {
+            is_c_signed_integer_type(base_type)
+        }
         TypeInfo::BitfieldType {
             underlying_type, ..
         } => is_c_signed_integer_type(underlying_type),

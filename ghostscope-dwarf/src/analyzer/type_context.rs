@@ -1034,8 +1034,9 @@ impl DwarfAnalyzer {
         if let Some(payload) = self.template_type_parameter(type_id, 0)? {
             return Ok(Some(payload));
         }
-        let TypeInfo::StructType { name, .. } = strip_type_aliases(&option.summary) else {
-            return Ok(None);
+        let name = match strip_type_aliases(&option.summary) {
+            TypeInfo::StructType { name, .. } | TypeInfo::VariantType { name, .. } => name,
+            _ => return Ok(None),
         };
         let Some(payload_name) = rust_single_generic_argument(name, "Option") else {
             return Ok(None);

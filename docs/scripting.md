@@ -154,12 +154,23 @@ The currently supported value families are:
 - transparent and state wrappers: `NonZero*`, `Cell<T>`, and `RefCell<T>`;
 - borrow guards: `Ref<T>` and `RefMut<T>`;
 - reference counting: `Rc<T>` and `Arc<T>`;
-- collections: `HashMap`, `HashSet`, `BTreeMap`, and `BTreeSet`; and
+- collections: `HashMap`, `HashSet`, `BTreeMap`, and `BTreeSet`;
+- enums: fieldless, unit, tuple, and struct variants, including DWARF default
+  branches used by niche-optimized types such as `Option<NonZero*>`; and
 - tuple and tuple-struct projections such as `value.0`.
 
 `Rc<str>` and `Arc<str>` are displayed as their target address plus public
 strong and weak counts. GhostScope does not read the dynamically sized string
 contents through these owners.
+
+Rust enum formatting follows the target DWARF rather than a rustc ABI table.
+For payload enums, GhostScope reads `DW_TAG_variant_part`, follows its
+`DW_AT_discr` member, and handles exact values, discriminant ranges, and default
+branches before recursively formatting the active inline payload. Fieldless
+enums use `DW_TAG_enumeration_type` and `DW_AT_enum_class`. The DSL does not yet
+provide Rust pattern matching or direct active-variant payload projection, and
+semantic adapters nested inside an enum payload still use native DWARF
+formatting.
 
 Semantic values use the existing format placeholders:
 

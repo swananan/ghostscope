@@ -26,6 +26,15 @@ trace observe_matrix_values {
 trace observe_matrix_dst {
     print "RUST_MATRIX_DST:{}:{}", rc, arc;
 }
+
+trace observe_matrix_enums {
+    print "RUST_MATRIX_ENUMS:{}:{}:{}:{}:{}:{}", *unit, *tuple,
+        *struct_value, *fieldless, *some, *none;
+}
+
+trace observe_matrix_enum_edges {
+    print "RUST_MATRIX_ENUM_EDGES:{}:{}:{}", *single, *signed, *unsigned;
+}
 "#;
 
 const WRAPPER_SCRIPT: &str = r#"
@@ -116,6 +125,38 @@ fn assert_wrapper_output(toolchain: &str, stdout: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn assert_enum_output(toolchain: &str, stdout: &str) -> anyhow::Result<()> {
+    let enums = marker_line(stdout, "RUST_MATRIX_ENUMS", toolchain)?;
+    for expected in [
+        "MatrixEnum::Unit",
+        "MatrixEnum::Tuple(31)",
+        "MatrixEnum::Struct { value: 47 }",
+        "MatrixFieldless::Second",
+        "Option<core::num::",
+        ">::Some(",
+        ">::None",
+        "59",
+    ] {
+        anyhow::ensure!(
+            enums.contains(expected),
+            "{toolchain}: missing {expected:?} in {enums}"
+        );
+    }
+
+    let edges = marker_line(stdout, "RUST_MATRIX_ENUM_EDGES", toolchain)?;
+    for expected in [
+        "MatrixSingle::Only(71)",
+        "MatrixSigned::Negative",
+        "MatrixUnsigned::High",
+    ] {
+        anyhow::ensure!(
+            edges.contains(expected),
+            "{toolchain}: missing {expected:?} in {edges}"
+        );
+    }
+    Ok(())
+}
+
 fn marker_line<'a>(stdout: &'a str, marker: &str, toolchain: &str) -> anyhow::Result<&'a str> {
     stdout
         .lines()
@@ -176,6 +217,7 @@ mem_dump_cap = 512
         "{toolchain}: exit={exit_code} stderr={stderr} stdout={stdout}"
     );
     assert_common_output(&toolchain, &stdout)?;
+    assert_enum_output(&toolchain, &stdout)?;
     if include_wrappers {
         assert_wrapper_output(&toolchain, &stdout)?;
     }

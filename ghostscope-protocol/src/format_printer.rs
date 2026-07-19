@@ -1693,6 +1693,265 @@ impl FormatPrinter {
         result
     }
 
+    fn discriminant_type_is_unsigned(type_info: &TypeInfo) -> bool {
+        match type_info {
+            TypeInfo::BaseType { encoding, .. } => {
+                *encoding == gimli::constants::DW_ATE_unsigned.0 as u16
+                    || *encoding == gimli::constants::DW_ATE_unsigned_char.0 as u16
+            }
+            TypeInfo::EnumType { base_type, .. }
+            | TypeInfo::ScopedEnumType { base_type, .. }
+            | TypeInfo::TypedefType {
+                underlying_type: base_type,
+                ..
+            }
+            | TypeInfo::QualifiedType {
+                underlying_type: base_type,
+                ..
+            }
+            | TypeInfo::BitfieldType {
+                underlying_type: base_type,
+                ..
+            } => Self::discriminant_type_is_unsigned(base_type),
+            _ => false,
+        }
+    }
+
+    fn discriminant_storage_type(type_info: &TypeInfo) -> &TypeInfo {
+        match type_info {
+            TypeInfo::EnumType { base_type, .. }
+            | TypeInfo::ScopedEnumType { base_type, .. }
+            | TypeInfo::TypedefType {
+                underlying_type: base_type,
+                ..
+            }
+            | TypeInfo::QualifiedType {
+                underlying_type: base_type,
+                ..
+            } => Self::discriminant_storage_type(base_type),
+            _ => type_info,
+        }
+    }
+
+    fn decode_discriminant_value(
+        data: &[u8],
+        type_info: &TypeInfo,
+    ) -> Option<crate::DiscriminantValue> {
+        let unsigned = Self::discriminant_type_is_unsigned(type_info);
+        let storage_type = Self::discriminant_storage_type(type_info);
+
+        if let TypeInfo::BitfieldType {
+            underlying_type,
+            bit_offset,
+            bit_size,
+        } = storage_type
+        {
+            if *bit_size == 0 || *bit_size > 64 {
+                return None;
+            }
+            let storage_size = usize::try_from(underlying_type.size()).ok()?;
+            let raw = data.get(..storage_size)?;
+            let value = Self::extract_bits_le(raw, u32::from(*bit_offset), u32::from(*bit_size));
+            return if unsigned {
+                Some(crate::DiscriminantValue::Unsigned(value))
+            } else {
+                let shift = 64 - u32::from(*bit_size);
+                Some(crate::DiscriminantValue::Signed(
+                    ((value << shift) as i64) >> shift,
+                ))
+            };
+        }
+
+        if unsigned {
+            Self::decode_unsigned_integer(data, storage_type)
+                .and_then(|value| u64::try_from(value).ok())
+                .map(crate::DiscriminantValue::Unsigned)
+        } else {
+            Self::decode_signed_integer(data, storage_type)
+                .and_then(|value| i64::try_from(value).ok())
+                .map(crate::DiscriminantValue::Signed)
+        }
+    }
+
+    fn decode_variant_discriminant(
+        data: &[u8],
+        member: &crate::StructMember,
+    ) -> Option<crate::DiscriminantValue> {
+        let offset = usize::try_from(member.offset).ok()?;
+        Self::decode_discriminant_value(data.get(offset..)?, &member.member_type)
+    }
+
+    fn discriminant_in_range(
+        value: crate::DiscriminantValue,
+        range: &crate::DiscriminantRange,
+    ) -> bool {
+        match (value, range.start, range.end) {
+            (
+                crate::DiscriminantValue::Signed(value),
+                crate::DiscriminantValue::Signed(start),
+                crate::DiscriminantValue::Signed(end),
+            ) => start <= value && value <= end,
+            (
+                crate::DiscriminantValue::Unsigned(value),
+                crate::DiscriminantValue::Unsigned(start),
+                crate::DiscriminantValue::Unsigned(end),
+            ) => start <= value && value <= end,
+            _ => false,
+        }
+    }
+
+    fn active_variant<'a>(
+        data: &[u8],
+        part: &'a crate::VariantPart,
+    ) -> Option<&'a crate::VariantCase> {
+        let default = part
+            .variants
+            .iter()
+            .find(|variant| matches!(variant.selector, crate::VariantSelector::Default));
+        let Some(discriminant) = &part.discriminant else {
+            return default.or_else(|| part.variants.first());
+        };
+        let value = Self::decode_variant_discriminant(data, discriminant)?;
+
+        part.variants
+            .iter()
+            .find(|variant| match &variant.selector {
+                crate::VariantSelector::Default => false,
+                crate::VariantSelector::Ranges(ranges) => ranges
+                    .iter()
+                    .any(|range| Self::discriminant_in_range(value, range)),
+            })
+            .or(default)
+    }
+
+    fn member_data<'a>(data: &'a [u8], member: &crate::StructMember) -> Option<&'a [u8]> {
+        let offset = usize::try_from(member.offset).ok()?;
+        let size = usize::try_from(member.member_type.size()).ok()?;
+        data.get(offset..offset.checked_add(size)?)
+    }
+
+    fn tuple_field_index(name: &str) -> Option<usize> {
+        name.strip_prefix("__")?.parse().ok()
+    }
+
+    fn format_variant_member(
+        data: &[u8],
+        enum_name: &str,
+        member: &crate::StructMember,
+        current_depth: usize,
+        max_depth: usize,
+    ) -> String {
+        let Some(member_data) = Self::member_data(data, member) else {
+            return format!("{enum_name}::{}(<OUT_OF_BOUNDS>)", member.name);
+        };
+
+        if let TypeInfo::StructType {
+            members: payload_members,
+            ..
+        } = member.member_type.underlying_type()
+        {
+            if payload_members.is_empty() {
+                return format!("{enum_name}::{}", member.name);
+            }
+
+            // rustc names tuple payload fields `__0`, `__1`, and so on in
+            // DWARF. The variant/member hierarchy still comes entirely from
+            // DW_TAG_variant_part; this convention only chooses Rust syntax.
+            let is_tuple = payload_members
+                .iter()
+                .enumerate()
+                .all(|(index, field)| Self::tuple_field_index(&field.name) == Some(index));
+            let mut values = Vec::with_capacity(payload_members.len());
+            for field in payload_members {
+                let value = Self::member_data(member_data, field)
+                    .map(|field_data| {
+                        Self::format_data_with_type_info_impl(
+                            field_data,
+                            &field.member_type,
+                            current_depth + 1,
+                            max_depth,
+                        )
+                    })
+                    .unwrap_or_else(|| "<OUT_OF_BOUNDS>".to_string());
+                if is_tuple {
+                    values.push(value);
+                } else {
+                    values.push(format!("{}: {value}", field.name));
+                }
+            }
+
+            if is_tuple {
+                return format!("{enum_name}::{}({})", member.name, values.join(", "));
+            }
+            return format!("{enum_name}::{} {{ {} }}", member.name, values.join(", "));
+        }
+
+        let value = Self::format_data_with_type_info_impl(
+            member_data,
+            &member.member_type,
+            current_depth + 1,
+            max_depth,
+        );
+        format!("{enum_name}::{}({value})", member.name)
+    }
+
+    fn format_variant_type(
+        data: &[u8],
+        name: &str,
+        members: &[crate::StructMember],
+        variant_parts: &[crate::VariantPart],
+        current_depth: usize,
+        max_depth: usize,
+    ) -> String {
+        let mut active_members = Vec::new();
+        Self::collect_active_variant_members(data, variant_parts, &mut active_members);
+
+        if members.is_empty() && active_members.len() == 1 {
+            return Self::format_variant_member(
+                data,
+                name,
+                active_members[0],
+                current_depth,
+                max_depth,
+            );
+        }
+
+        let mut fields = Vec::new();
+        for member in members.iter().chain(active_members) {
+            let value = Self::member_data(data, member)
+                .map(|member_data| {
+                    Self::format_data_with_type_info_impl(
+                        member_data,
+                        &member.member_type,
+                        current_depth + 1,
+                        max_depth,
+                    )
+                })
+                .unwrap_or_else(|| "<OUT_OF_BOUNDS>".to_string());
+            fields.push(format!("{}: {value}", member.name));
+        }
+
+        if fields.is_empty() {
+            format!("{name} {{ <INVALID_VARIANT> }}")
+        } else {
+            format!("{name} {{ {} }}", fields.join(", "))
+        }
+    }
+
+    fn collect_active_variant_members<'a>(
+        data: &[u8],
+        parts: &'a [crate::VariantPart],
+        members: &mut Vec<&'a crate::StructMember>,
+    ) {
+        for part in parts {
+            let Some(active) = Self::active_variant(data, part) else {
+                continue;
+            };
+            members.extend(&active.members);
+            Self::collect_active_variant_members(data, &active.variant_parts, members);
+        }
+    }
+
     /// Internal implementation with depth control for recursion
     fn format_data_with_type_info_impl(
         data: &[u8],
@@ -1909,6 +2168,41 @@ impl FormatPrinter {
                 // No variant matched; still print type name with raw value
                 format!("{name}({base_value})")
             }
+            TypeInfo::ScopedEnumType {
+                name,
+                base_type,
+                variants,
+                ..
+            } => {
+                let discriminant = Self::decode_discriminant_value(data, base_type);
+                let base_value = Self::format_data_with_type_info_impl(
+                    data,
+                    base_type,
+                    current_depth + 1,
+                    max_depth,
+                );
+                if let Some(variant) = discriminant.and_then(|discriminant| {
+                    variants
+                        .iter()
+                        .find(|variant| variant.value == discriminant)
+                }) {
+                    return format!("{}::{}", name, variant.name);
+                }
+                format!("{name}({base_value})")
+            }
+            TypeInfo::VariantType {
+                name,
+                members,
+                variant_parts,
+                ..
+            } => Self::format_variant_type(
+                data,
+                name,
+                members,
+                variant_parts,
+                current_depth,
+                max_depth,
+            ),
             TypeInfo::TypedefType {
                 name,
                 underlying_type,
@@ -1938,6 +2232,44 @@ impl FormatPrinter {
                         Self::format_data_with_type_info_impl(
                             data,
                             &alias_union,
+                            current_depth,
+                            max_depth,
+                        )
+                    }
+                    TypeInfo::VariantType {
+                        size,
+                        members,
+                        variant_parts,
+                        ..
+                    } => {
+                        let alias_variant = TypeInfo::VariantType {
+                            name: name.clone(),
+                            size: *size,
+                            members: members.clone(),
+                            variant_parts: variant_parts.clone(),
+                        };
+                        Self::format_data_with_type_info_impl(
+                            data,
+                            &alias_variant,
+                            current_depth,
+                            max_depth,
+                        )
+                    }
+                    TypeInfo::ScopedEnumType {
+                        size,
+                        base_type,
+                        variants,
+                        ..
+                    } => {
+                        let alias_enum = TypeInfo::ScopedEnumType {
+                            name: name.clone(),
+                            size: *size,
+                            base_type: base_type.clone(),
+                            variants: variants.clone(),
+                        };
+                        Self::format_data_with_type_info_impl(
+                            data,
+                            &alias_enum,
                             current_depth,
                             max_depth,
                         )
@@ -2191,11 +2523,27 @@ impl FormatPrinter {
 
         // Enum mapping
         if let TypeInfo::EnumType { variants, .. } = ty {
-            let sval = val as i64; // interpret as non-negative; signed variants must match exact value
-            for v in variants {
-                if v.value == sval {
-                    return v.name.clone();
-                }
+            let value = val as i64;
+            if let Some(variant) = variants.iter().find(|variant| variant.value == value) {
+                return variant.name.clone();
+            }
+        }
+        if let TypeInfo::ScopedEnumType {
+            base_type,
+            variants,
+            ..
+        } = ty
+        {
+            let value = if Self::discriminant_type_is_unsigned(base_type) {
+                crate::DiscriminantValue::Unsigned(val)
+            } else if bit_size > 0 && bit_size <= 64 {
+                let shift = 64 - bit_size;
+                crate::DiscriminantValue::Signed(((val << shift) as i64) >> shift)
+            } else {
+                crate::DiscriminantValue::Signed(val as i64)
+            };
+            if let Some(variant) = variants.iter().find(|variant| variant.value == value) {
+                return variant.name.clone();
             }
         }
 
@@ -2534,6 +2882,250 @@ mod tests {
             size: 2,
             encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
         }
+    }
+
+    fn test_member(name: &str, member_type: TypeInfo, offset: u64) -> crate::StructMember {
+        crate::StructMember {
+            name: name.to_string(),
+            member_type,
+            offset,
+            bit_offset: None,
+            bit_size: None,
+        }
+    }
+
+    fn unsigned_selector(value: u64) -> crate::VariantSelector {
+        crate::VariantSelector::Ranges(vec![crate::DiscriminantRange {
+            start: crate::DiscriminantValue::Unsigned(value),
+            end: crate::DiscriminantValue::Unsigned(value),
+        }])
+    }
+
+    fn test_variant(
+        name: &str,
+        payload_members: Vec<crate::StructMember>,
+        size: u64,
+        selector: crate::VariantSelector,
+    ) -> crate::VariantCase {
+        crate::VariantCase {
+            selector,
+            members: vec![test_member(
+                name,
+                TypeInfo::StructType {
+                    name: name.to_string(),
+                    size,
+                    members: payload_members,
+                },
+                0,
+            )],
+            variant_parts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn formats_dwarf_variant_unit_tuple_and_struct_branches() {
+        let discriminant_type = TypeInfo::BaseType {
+            name: "u32".to_string(),
+            size: 4,
+            encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+        };
+        let enum_type = TypeInfo::VariantType {
+            name: "CompatEnum".to_string(),
+            size: 8,
+            members: Vec::new(),
+            variant_parts: vec![crate::VariantPart {
+                discriminant: Some(test_member("<discriminant>", discriminant_type, 0)),
+                variants: vec![
+                    test_variant("Unit", Vec::new(), 8, unsigned_selector(0)),
+                    test_variant(
+                        "Tuple",
+                        vec![test_member("__0", signed_i32_type(), 4)],
+                        8,
+                        unsigned_selector(1),
+                    ),
+                    test_variant(
+                        "Struct",
+                        vec![test_member("value", signed_i32_type(), 4)],
+                        8,
+                        unsigned_selector(2),
+                    ),
+                ],
+            }],
+        };
+
+        let mut unit = 0_u32.to_le_bytes().to_vec();
+        unit.extend_from_slice(&0_i32.to_le_bytes());
+        let mut tuple = 1_u32.to_le_bytes().to_vec();
+        tuple.extend_from_slice(&(-7_i32).to_le_bytes());
+        let mut struct_value = 2_u32.to_le_bytes().to_vec();
+        struct_value.extend_from_slice(&59_i32.to_le_bytes());
+
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&unit, &enum_type),
+            "CompatEnum::Unit"
+        );
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&tuple, &enum_type),
+            "CompatEnum::Tuple(-7)"
+        );
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&struct_value, &enum_type),
+            "CompatEnum::Struct { value: 59 }"
+        );
+    }
+
+    #[test]
+    fn formats_default_dwarf_variant_for_niche_layout() {
+        let option_type = TypeInfo::VariantType {
+            name: "Option<NonZeroI32>".to_string(),
+            size: 4,
+            members: Vec::new(),
+            variant_parts: vec![crate::VariantPart {
+                discriminant: Some(test_member(
+                    "<discriminant>",
+                    TypeInfo::BaseType {
+                        name: "u32".to_string(),
+                        size: 4,
+                        encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+                    },
+                    0,
+                )),
+                variants: vec![
+                    test_variant("None", Vec::new(), 4, unsigned_selector(0)),
+                    test_variant(
+                        "Some",
+                        vec![test_member("__0", signed_i32_type(), 0)],
+                        4,
+                        crate::VariantSelector::Default,
+                    ),
+                ],
+            }],
+        };
+
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&0_i32.to_le_bytes(), &option_type),
+            "Option<NonZeroI32>::None"
+        );
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&9_i32.to_le_bytes(), &option_type),
+            "Option<NonZeroI32>::Some(9)"
+        );
+    }
+
+    #[test]
+    fn formats_signed_dwarf_discriminant_ranges() {
+        let range_type = TypeInfo::VariantType {
+            name: "RangeEnum".to_string(),
+            size: 1,
+            members: Vec::new(),
+            variant_parts: vec![crate::VariantPart {
+                discriminant: Some(test_member(
+                    "<discriminant>",
+                    TypeInfo::BaseType {
+                        name: "i8".to_string(),
+                        size: 1,
+                        encoding: gimli::constants::DW_ATE_signed.0 as u16,
+                    },
+                    0,
+                )),
+                variants: vec![
+                    test_variant(
+                        "Negative",
+                        Vec::new(),
+                        1,
+                        crate::VariantSelector::Ranges(vec![crate::DiscriminantRange {
+                            start: crate::DiscriminantValue::Signed(-3),
+                            end: crate::DiscriminantValue::Signed(-1),
+                        }]),
+                    ),
+                    test_variant("Other", Vec::new(), 1, crate::VariantSelector::Default),
+                ],
+            }],
+        };
+
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&[0xfd], &range_type),
+            "RangeEnum::Negative"
+        );
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&[4], &range_type),
+            "RangeEnum::Other"
+        );
+    }
+
+    #[test]
+    fn formats_scoped_scalar_enum_without_numeric_suffix() {
+        let enum_type = TypeInfo::ScopedEnumType {
+            name: "CompatFieldless".to_string(),
+            size: 1,
+            base_type: Box::new(TypeInfo::BaseType {
+                name: "u8".to_string(),
+                size: 1,
+                encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+            }),
+            variants: vec![
+                crate::ScopedEnumVariant {
+                    name: "First".to_string(),
+                    value: crate::DiscriminantValue::Unsigned(0),
+                },
+                crate::ScopedEnumVariant {
+                    name: "Second".to_string(),
+                    value: crate::DiscriminantValue::Unsigned(1),
+                },
+            ],
+        };
+
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&[1], &enum_type),
+            "CompatFieldless::Second"
+        );
+        let alias = TypeInfo::TypedefType {
+            name: "CompatAlias".to_string(),
+            underlying_type: Box::new(enum_type),
+        };
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&[1], &alias),
+            "CompatAlias::Second"
+        );
+    }
+
+    #[test]
+    fn formats_scoped_enum_discriminants_with_dwarf_signedness() {
+        let unsigned_enum = TypeInfo::ScopedEnumType {
+            name: "UnsignedEnum".to_string(),
+            size: 8,
+            base_type: Box::new(TypeInfo::BaseType {
+                name: "u64".to_string(),
+                size: 8,
+                encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+            }),
+            variants: vec![crate::ScopedEnumVariant {
+                name: "High".to_string(),
+                value: crate::DiscriminantValue::Unsigned(1 << 63),
+            }],
+        };
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&(1u64 << 63).to_le_bytes(), &unsigned_enum),
+            "UnsignedEnum::High"
+        );
+
+        let signed_enum = TypeInfo::ScopedEnumType {
+            name: "SignedEnum".to_string(),
+            size: 1,
+            base_type: Box::new(TypeInfo::BaseType {
+                name: "i8".to_string(),
+                size: 1,
+                encoding: gimli::constants::DW_ATE_signed.0 as u16,
+            }),
+            variants: vec![crate::ScopedEnumVariant {
+                name: "Negative".to_string(),
+                value: crate::DiscriminantValue::Signed(-1),
+            }],
+        };
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&[0xff], &signed_enum),
+            "SignedEnum::Negative"
+        );
     }
 
     #[test]
@@ -3744,6 +4336,29 @@ mod tests {
         let data_true = [0x01u8];
         let res3 = FormatPrinter::format_data_with_type_info(&data_true, &bf_bool);
         assert_eq!(res3, "true");
+
+        let scoped_enum = TypeInfo::ScopedEnumType {
+            name: "Scoped".to_string(),
+            size: 1,
+            base_type: Box::new(TypeInfo::BaseType {
+                name: "unsigned char".to_string(),
+                size: 1,
+                encoding: gimli::constants::DW_ATE_unsigned_char.0 as u16,
+            }),
+            variants: vec![crate::ScopedEnumVariant {
+                name: "Second".to_string(),
+                value: crate::DiscriminantValue::Unsigned(1),
+            }],
+        };
+        let bf_scoped_enum = TypeInfo::BitfieldType {
+            underlying_type: Box::new(scoped_enum),
+            bit_offset: 0,
+            bit_size: 2,
+        };
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&data_true, &bf_scoped_enum),
+            "Second"
+        );
     }
 
     #[test]
