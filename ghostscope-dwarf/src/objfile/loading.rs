@@ -394,6 +394,7 @@ impl LoadedObjfile {
             dwarf_index_status,
             lazy_debug_info,
             indexed_debug_info_cus: Mutex::new(HashSet::new()),
+            compilation_unit_languages: RwLock::new(HashMap::new()),
             _dwarf_mapped_file: mapped_file,
             _binary_mapped_file: binary_mapped,
             debug_info_source,

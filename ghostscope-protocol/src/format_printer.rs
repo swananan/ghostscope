@@ -1830,14 +1830,11 @@ impl FormatPrinter {
         data.get(offset..offset.checked_add(size)?)
     }
 
-    fn tuple_field_index(name: &str) -> Option<usize> {
-        name.strip_prefix("__")?.parse().ok()
-    }
-
     fn format_variant_member(
         data: &[u8],
         enum_name: &str,
         member: &crate::StructMember,
+        payload_presentation: crate::VariantPayloadPresentation,
         current_depth: usize,
         max_depth: usize,
     ) -> String {
@@ -1850,17 +1847,13 @@ impl FormatPrinter {
             ..
         } = member.member_type.underlying_type()
         {
-            if payload_members.is_empty() {
+            if payload_members.is_empty()
+                || payload_presentation == crate::VariantPayloadPresentation::Unit
+            {
                 return format!("{enum_name}::{}", member.name);
             }
 
-            // rustc names tuple payload fields `__0`, `__1`, and so on in
-            // DWARF. The variant/member hierarchy still comes entirely from
-            // DW_TAG_variant_part; this convention only chooses Rust syntax.
-            let is_tuple = payload_members
-                .iter()
-                .enumerate()
-                .all(|(index, field)| Self::tuple_field_index(&field.name) == Some(index));
+            let positional = payload_presentation == crate::VariantPayloadPresentation::Tuple;
             let mut values = Vec::with_capacity(payload_members.len());
             for field in payload_members {
                 let value = Self::member_data(member_data, field)
@@ -1873,17 +1866,21 @@ impl FormatPrinter {
                         )
                     })
                     .unwrap_or_else(|| "<OUT_OF_BOUNDS>".to_string());
-                if is_tuple {
+                if positional {
                     values.push(value);
                 } else {
                     values.push(format!("{}: {value}", field.name));
                 }
             }
 
-            if is_tuple {
+            if positional {
                 return format!("{enum_name}::{}({})", member.name, values.join(", "));
             }
             return format!("{enum_name}::{} {{ {} }}", member.name, values.join(", "));
+        }
+
+        if payload_presentation == crate::VariantPayloadPresentation::Unit {
+            return format!("{enum_name}::{}", member.name);
         }
 
         let value = Self::format_data_with_type_info_impl(
@@ -1907,17 +1904,32 @@ impl FormatPrinter {
         Self::collect_active_variant_members(data, variant_parts, &mut active_members);
 
         if members.is_empty() && active_members.len() == 1 {
+            let (member, payload_presentation) = active_members[0];
             return Self::format_variant_member(
                 data,
                 name,
-                active_members[0],
+                member,
+                payload_presentation,
                 current_depth,
                 max_depth,
             );
         }
 
         let mut fields = Vec::new();
-        for member in members.iter().chain(active_members) {
+        for member in members {
+            let value = Self::member_data(data, member)
+                .map(|member_data| {
+                    Self::format_data_with_type_info_impl(
+                        member_data,
+                        &member.member_type,
+                        current_depth + 1,
+                        max_depth,
+                    )
+                })
+                .unwrap_or_else(|| "<OUT_OF_BOUNDS>".to_string());
+            fields.push(format!("{}: {value}", member.name));
+        }
+        for (member, _) in active_members {
             let value = Self::member_data(data, member)
                 .map(|member_data| {
                     Self::format_data_with_type_info_impl(
@@ -1941,13 +1953,18 @@ impl FormatPrinter {
     fn collect_active_variant_members<'a>(
         data: &[u8],
         parts: &'a [crate::VariantPart],
-        members: &mut Vec<&'a crate::StructMember>,
+        members: &mut Vec<(&'a crate::StructMember, crate::VariantPayloadPresentation)>,
     ) {
         for part in parts {
             let Some(active) = Self::active_variant(data, part) else {
                 continue;
             };
-            members.extend(&active.members);
+            members.extend(
+                active
+                    .members
+                    .iter()
+                    .map(|member| (member, active.payload_presentation)),
+            );
             Self::collect_active_variant_members(data, &active.variant_parts, members);
         }
     }
@@ -2906,6 +2923,7 @@ mod tests {
         payload_members: Vec<crate::StructMember>,
         size: u64,
         selector: crate::VariantSelector,
+        payload_presentation: crate::VariantPayloadPresentation,
     ) -> crate::VariantCase {
         crate::VariantCase {
             selector,
@@ -2919,6 +2937,7 @@ mod tests {
                 0,
             )],
             variant_parts: Vec::new(),
+            payload_presentation,
         }
     }
 
@@ -2936,18 +2955,26 @@ mod tests {
             variant_parts: vec![crate::VariantPart {
                 discriminant: Some(test_member("<discriminant>", discriminant_type, 0)),
                 variants: vec![
-                    test_variant("Unit", Vec::new(), 8, unsigned_selector(0)),
+                    test_variant(
+                        "Unit",
+                        Vec::new(),
+                        8,
+                        unsigned_selector(0),
+                        crate::VariantPayloadPresentation::Unit,
+                    ),
                     test_variant(
                         "Tuple",
                         vec![test_member("__0", signed_i32_type(), 4)],
                         8,
                         unsigned_selector(1),
+                        crate::VariantPayloadPresentation::Tuple,
                     ),
                     test_variant(
                         "Struct",
                         vec![test_member("value", signed_i32_type(), 4)],
                         8,
                         unsigned_selector(2),
+                        crate::VariantPayloadPresentation::Struct,
                     ),
                 ],
             }],
@@ -2975,6 +3002,30 @@ mod tests {
     }
 
     #[test]
+    fn does_not_infer_tuple_variants_from_member_names() {
+        let enum_type = TypeInfo::VariantType {
+            name: "RawVariant".to_string(),
+            size: 4,
+            members: Vec::new(),
+            variant_parts: vec![crate::VariantPart {
+                discriminant: None,
+                variants: vec![test_variant(
+                    "Value",
+                    vec![test_member("__0", signed_i32_type(), 0)],
+                    4,
+                    crate::VariantSelector::Default,
+                    crate::VariantPayloadPresentation::Dwarf,
+                )],
+            }],
+        };
+
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&(-7_i32).to_le_bytes(), &enum_type),
+            "RawVariant::Value { __0: -7 }"
+        );
+    }
+
+    #[test]
     fn formats_default_dwarf_variant_for_niche_layout() {
         let option_type = TypeInfo::VariantType {
             name: "Option<NonZeroI32>".to_string(),
@@ -2991,12 +3042,19 @@ mod tests {
                     0,
                 )),
                 variants: vec![
-                    test_variant("None", Vec::new(), 4, unsigned_selector(0)),
+                    test_variant(
+                        "None",
+                        Vec::new(),
+                        4,
+                        unsigned_selector(0),
+                        crate::VariantPayloadPresentation::Unit,
+                    ),
                     test_variant(
                         "Some",
                         vec![test_member("__0", signed_i32_type(), 0)],
                         4,
                         crate::VariantSelector::Default,
+                        crate::VariantPayloadPresentation::Tuple,
                     ),
                 ],
             }],
@@ -3037,8 +3095,15 @@ mod tests {
                             start: crate::DiscriminantValue::Signed(-3),
                             end: crate::DiscriminantValue::Signed(-1),
                         }]),
+                        crate::VariantPayloadPresentation::Unit,
                     ),
-                    test_variant("Other", Vec::new(), 1, crate::VariantSelector::Default),
+                    test_variant(
+                        "Other",
+                        Vec::new(),
+                        1,
+                        crate::VariantSelector::Default,
+                        crate::VariantPayloadPresentation::Unit,
+                    ),
                 ],
             }],
         };

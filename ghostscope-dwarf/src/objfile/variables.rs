@@ -423,6 +423,7 @@ impl LoadedObjfile {
                             dwarf,
                             &unit,
                             td.die_offset,
+                            self.compilation_unit_language(td.cu_offset, &unit),
                         )?;
                         return Some((
                             ty,
@@ -762,10 +763,16 @@ impl LoadedObjfile {
                 dwarf,
                 &def_unit,
                 def_die_off,
+                self.compilation_unit_language(def_cu_off, &def_unit),
             );
         }
 
-        crate::parser::DetailedParser::resolve_type_shallow_at_offset(dwarf, &unit, die_off)
+        crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+            dwarf,
+            &unit,
+            die_off,
+            self.compilation_unit_language(cu_off, &unit),
+        )
     }
 
     pub(crate) fn shallow_type_for_variable_offsets(

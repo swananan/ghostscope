@@ -5,10 +5,10 @@ mod rust;
 use crate::{semantics::PlanError, SourceLanguage, TypeOrigin, VariableAccessSegment};
 
 pub(crate) use rust::{
-    BTreeKind, BTreeLayout, CompositeStructFieldCapture, HashTableBucketLayout, HashTableKind,
+    btree_value_read_plan, hash_table_value_read_plan, CompositeStructFieldCapture,
     IndirectSequenceAddressing, IndirectSequenceKind, ProjectedPathSegment,
     ProjectedStructPresentation, ProjectedValuePresentation, ProjectedValueRequirement,
-    RingSequenceLengthKind, ValueLayout,
+    RingSequenceLengthKind, RustPlanContext, ValueLayout,
 };
 
 pub(crate) fn resolve_value_layout(
@@ -20,6 +20,12 @@ pub(crate) fn resolve_value_layout(
 
 pub(crate) fn requires_dwarf_qualified_name(current: &crate::ResolvedType) -> bool {
     rust::requires_dwarf_qualified_name(current)
+}
+
+pub(crate) fn annotate_type_info(language: SourceLanguage, type_info: &mut crate::TypeInfo) {
+    if language == SourceLanguage::Rust {
+        rust::annotate_type_info(type_info);
+    }
 }
 
 pub(crate) fn resolve_access_segment(

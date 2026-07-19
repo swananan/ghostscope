@@ -44,6 +44,8 @@ pub(crate) struct LoadedObjfile {
     pub(super) dwarf_index_status: crate::DwarfIndexStatus,
     pub(super) lazy_debug_info: bool,
     pub(super) indexed_debug_info_cus: Mutex<HashSet<gimli::DebugInfoOffset>>,
+    pub(super) compilation_unit_languages:
+        RwLock<HashMap<gimli::DebugInfoOffset, crate::SourceLanguage>>,
     pub(super) load_parse_ms: u64,
     pub(super) load_index_ms: u64,
     pub(super) load_total_ms: u64,

@@ -97,7 +97,7 @@ pub use streaming_parser::{
 
 pub use type_info::{
     DiscriminantRange, DiscriminantValue, EnumVariant, ScopedEnumVariant, StructMember, TypeCache,
-    TypeInfo, TypeQualifier, VariantCase, VariantPart, VariantSelector,
+    TypeInfo, TypeQualifier, VariantCase, VariantPart, VariantPayloadPresentation, VariantSelector,
 };
 
 pub use ghostscope_platform as platform;
