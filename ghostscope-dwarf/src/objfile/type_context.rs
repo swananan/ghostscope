@@ -334,6 +334,37 @@ fn projected_type_loc(
 }
 
 impl LoadedObjfile {
+    pub(super) fn compilation_unit_language(
+        &self,
+        cu_off: gimli::DebugInfoOffset,
+        unit: &gimli::Unit<crate::binary::DwarfReader>,
+    ) -> SourceLanguage {
+        if let Some(language) = self
+            .compilation_unit_languages
+            .read()
+            .expect("compilation unit language cache lock poisoned")
+            .get(&cu_off)
+            .copied()
+        {
+            return language;
+        }
+
+        let mut entries = unit.entries();
+        let dwarf_language = entries.next_dfs().ok().flatten().and_then(|root| {
+            match root.attr_value(gimli::DW_AT_language) {
+                Some(gimli::AttributeValue::Language(language)) => Some(language),
+                _ => None,
+            }
+        });
+        let language = SourceLanguage::from_dwarf(dwarf_language);
+        *self
+            .compilation_unit_languages
+            .write()
+            .expect("compilation unit language cache lock poisoned")
+            .entry(cu_off)
+            .or_insert(language)
+    }
+
     pub(crate) fn compilation_unit_metadata(
         &self,
         module: ModuleId,

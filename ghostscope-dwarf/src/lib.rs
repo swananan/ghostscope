@@ -72,7 +72,8 @@ pub use ghostscope_protocol::{
     BTreeEntryPresentation, BTreeFieldPresentation, DiscriminantRange, DiscriminantValue,
     EnumVariant, HashTableBucketOrder, HashTableEntryPresentation, HashTableFieldPresentation,
     HashTableOccupancy, ScopedEnumVariant, StructMember, TypeCache, TypeInfo, TypeKind,
-    TypeQualifier, ValuePresentation, VariantCase, VariantPart, VariantSelector,
+    TypeQualifier, ValuePresentation, VariantCase, VariantPart, VariantPayloadPresentation,
+    VariantSelector,
 };
 
 // Re-export gimli types that external users need

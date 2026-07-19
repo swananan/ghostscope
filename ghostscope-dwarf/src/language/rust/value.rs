@@ -3,6 +3,8 @@ use crate::{
     StructMember, TypeInfo,
 };
 
+use super::plan::{BTreeKind, BTreeLayout, HashTableBucketLayout, HashTableKind, HashTableLayout};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ValueLayout {
     IndirectSequence(IndirectSequenceLayout),
@@ -14,45 +16,6 @@ pub(crate) enum ValueLayout {
     CompositeStruct(CompositeStructLayout),
     HashTable(HashTableLayout),
     BTree(BTreeLayout),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BTreeLayout {
-    pub(crate) map_path: Vec<String>,
-    pub(crate) root_path: Vec<String>,
-    pub(crate) length_path: Vec<String>,
-    pub(crate) kind: BTreeKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BTreeKind {
-    Map,
-    Set,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HashTableLayout {
-    pub(crate) entry_type_path: Vec<String>,
-    pub(crate) control_path: Vec<String>,
-    pub(crate) length_path: Vec<String>,
-    pub(crate) bucket_mask_path: Vec<String>,
-    pub(crate) occupancy: HashTableOccupancy,
-    pub(crate) buckets: HashTableBucketLayout,
-    pub(crate) bucket_order: HashTableBucketOrder,
-    pub(crate) kind: HashTableKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HashTableBucketLayout {
-    Forward { data_path: Vec<String> },
-    ReverseFromControl,
-    LegacyAfterControl { pointer_tag_mask: u64 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HashTableKind {
-    Map,
-    Set,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

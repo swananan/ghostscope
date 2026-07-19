@@ -93,7 +93,9 @@ impl DetailedParser {
         let member_type = resolve_type_ref_in_same_unit_with_origins(dwarf, &entry, unit)
             .ok()
             .flatten()
-            .and_then(|type_offset| Self::resolve_type_shallow_at_offset(dwarf, unit, type_offset))
+            .and_then(|type_offset| {
+                Self::resolve_type_shallow_at_offset_impl(dwarf, unit, type_offset)
+            })
             .unwrap_or_else(|| TypeInfo::UnknownType {
                 name: "unknown".to_string(),
             });
@@ -339,6 +341,7 @@ impl DetailedParser {
             selector,
             members,
             variant_parts,
+            payload_presentation: crate::VariantPayloadPresentation::Dwarf,
         })
     }
 
@@ -392,9 +395,23 @@ impl DetailedParser {
 
     // Full type resolution intentionally removed; only shallow type resolution is supported.
 
-    /// Shallow type resolution (no recursive member expansion)
-    /// Returns minimal TypeInfo with name/size where possible.
+    /// Shallow type resolution (no recursive member expansion).
+    ///
+    /// The physical graph is parsed first, then the compilation unit's source
+    /// language may attach presentation metadata. Producer conventions remain
+    /// outside the generic parser implementation.
     pub fn resolve_type_shallow_at_offset(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        type_offset: gimli::UnitOffset,
+        source_language: crate::SourceLanguage,
+    ) -> Option<TypeInfo> {
+        let mut type_info = Self::resolve_type_shallow_at_offset_impl(dwarf, unit, type_offset)?;
+        crate::language::annotate_type_info(source_language, &mut type_info);
+        Some(type_info)
+    }
+
+    fn resolve_type_shallow_at_offset_impl(
         dwarf: &gimli::Dwarf<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         mut type_offset: gimli::UnitOffset,
@@ -637,9 +654,9 @@ impl DetailedParser {
                                     if let Some(gimli::AttributeValue::UnitRef(toff)) =
                                         ce.attr_value(DW_AT_TYPE)
                                     {
-                                        if let Some(ti) =
-                                            Self::resolve_type_shallow_at_offset(dwarf, unit, toff)
-                                        {
+                                        if let Some(ti) = Self::resolve_type_shallow_at_offset_impl(
+                                            dwarf, unit, toff,
+                                        ) {
                                             m_type = ti;
                                         }
                                     }
@@ -824,9 +841,9 @@ impl DetailedParser {
                                     if let Some(gimli::AttributeValue::UnitRef(toff)) =
                                         ce.attr_value(DW_AT_TYPE)
                                     {
-                                        if let Some(ti) =
-                                            Self::resolve_type_shallow_at_offset(dwarf, unit, toff)
-                                        {
+                                        if let Some(ti) = Self::resolve_type_shallow_at_offset_impl(
+                                            dwarf, unit, toff,
+                                        ) {
                                             m_type = ti;
                                         }
                                     }
@@ -870,7 +887,9 @@ impl DetailedParser {
                     // If DW_AT_type refers to a base type, resolve it shallowly
                     if let Some(gimli::AttributeValue::UnitRef(toff)) = entry.attr_value(DW_AT_TYPE)
                     {
-                        if let Some(ti) = Self::resolve_type_shallow_at_offset(dwarf, unit, toff) {
+                        if let Some(ti) =
+                            Self::resolve_type_shallow_at_offset_impl(dwarf, unit, toff)
+                        {
                             // Accept only base/qualified/typedef chain base type as enum underlying type
                             base_type = ti;
                             // If enum size missing, use underlying base type size
@@ -967,7 +986,7 @@ impl DetailedParser {
                     let mut elem_type: Option<TypeInfo> = None;
                     if let Some(gimli::AttributeValue::UnitRef(eoff)) = entry.attr_value(DW_AT_TYPE)
                     {
-                        elem_type = Self::resolve_type_shallow_at_offset(dwarf, unit, eoff);
+                        elem_type = Self::resolve_type_shallow_at_offset_impl(dwarf, unit, eoff);
                     }
                     let element_type = Box::new(elem_type.unwrap_or(TypeInfo::UnknownType {
                         name: "<elem>".to_string(),

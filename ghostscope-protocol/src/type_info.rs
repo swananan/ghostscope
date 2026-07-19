@@ -145,6 +145,27 @@ pub struct VariantCase {
     pub selector: VariantSelector,
     pub members: Vec<StructMember>,
     pub variant_parts: Vec<VariantPart>,
+    /// Source-language presentation selected before the type enters the
+    /// protocol. The formatter must not infer producer conventions from member
+    /// names.
+    #[serde(default)]
+    pub payload_presentation: VariantPayloadPresentation,
+}
+
+/// Language-neutral rendering style for one variant payload.
+///
+/// DWARF describes the physical variant graph but does not distinguish tuple
+/// payloads from named-field payloads. A source-language adapter supplies this
+/// metadata when the producer convention is known.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VariantPayloadPresentation {
+    /// Preserve the physical DWARF member view without producer-specific name
+    /// inference.
+    #[default]
+    Dwarf,
+    Unit,
+    Tuple,
+    Struct,
 }
 
 /// Values that activate a variant branch.
@@ -590,5 +611,22 @@ impl fmt::Display for TypeInfo {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_variant_cases_default_to_dwarf_presentation() {
+        let case: VariantCase = serde_json::from_value(serde_json::json!({
+            "selector": "Default",
+            "members": [],
+            "variant_parts": []
+        }))
+        .unwrap();
+
+        assert_eq!(case.payload_presentation, VariantPayloadPresentation::Dwarf);
     }
 }

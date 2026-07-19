@@ -1,7 +1,7 @@
 use ghostscope_dwarf::{
     BTreeEntryPresentation, DiscriminantValue, DwarfAnalyzer, HashTableEntryPresentation,
     ProjectedViewFieldCapture, RustcVersion, SourceLanguage, TypeInfo, ValueCapturePlan,
-    ValuePresentation, ValueReadPlan, VariantCase, VariantSelector,
+    ValuePresentation, ValueReadPlan, VariantCase, VariantPayloadPresentation, VariantSelector,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -491,6 +491,18 @@ fn assert_compat_enum_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Re
     anyhow::ensure!(
         part.variants
             .iter()
+            .map(|variant| variant.payload_presentation)
+            .collect::<Vec<_>>()
+            == [
+                VariantPayloadPresentation::Unit,
+                VariantPayloadPresentation::Tuple,
+                VariantPayloadPresentation::Struct,
+            ],
+        "{toolchain}: unexpected CompatEnum payload presentations"
+    );
+    anyhow::ensure!(
+        part.variants
+            .iter()
             .map(exact_unsigned_selector)
             .collect::<Vec<_>>()
             == [Some(0), Some(1), Some(2)],
@@ -533,6 +545,11 @@ fn assert_niche_option_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::R
     anyhow::ensure!(
         matches!(some.selector, VariantSelector::Default),
         "{toolchain}: Option::Some is not the default niche branch"
+    );
+    anyhow::ensure!(
+        none.payload_presentation == VariantPayloadPresentation::Unit
+            && some.payload_presentation == VariantPayloadPresentation::Tuple,
+        "{toolchain}: unexpected Option payload presentations"
     );
     Ok(())
 }
@@ -591,7 +608,8 @@ fn assert_single_variant_enum_dwarf(toolchain: &str, type_info: &TypeInfo) -> an
     };
     anyhow::ensure!(
         variant_name(variant) == Some("Only")
-            && matches!(variant.selector, VariantSelector::Default),
+            && matches!(variant.selector, VariantSelector::Default)
+            && variant.payload_presentation == VariantPayloadPresentation::Tuple,
         "{toolchain}: unexpected CompatSingle variant {variant:#?}"
     );
     Ok(())
