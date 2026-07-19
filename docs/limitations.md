@@ -22,9 +22,27 @@ Official builds and correctness testing currently support **Linux x86_64 (AMD64)
 ## Soft Limitations
 
 ### 1. Language Support
-Primary focus is on **C language**, which currently has the best end-to-end support. **C++** and **Rust** are supported in a more limited, DWARF-layout-oriented way: GhostScope can automatically demangle function names and global/static symbols, but most language-specific features are not modeled yet. In practice, simple C-like layouts work best, while advanced Rust and C++ features still require substantial future work.
+Primary focus is on **C**, which has the best end-to-end coverage. Inline C
+structs, arrays, unions, enums, typedefs, and qualifiers are formatted
+recursively from DWARF. Pointer members are shown as addresses unless the DSL
+or a read plan explicitly follows them; GhostScope does not automatically walk
+arbitrary C pointer graphs or linked data structures. Recursive inline
+formatting has a maximum depth of 32.
 
-For interpreted languages (Lua, Python, Ruby, etc.), only the interpreter itself can be traced (since interpreters are typically implemented in compiled languages). Tracing script code is technically feasible but requires substantial development time. JIT language support is an even more distant goal.
+**Rust** has targeted semantic support for common standard-library value
+families. It is selected from the concrete target DWARF rather than from a
+promised Rust ABI. Nested semantic adapters do not yet compose automatically.
+See [Rust Value Presentation](scripting.md#rust-value-presentation) for the
+current type list, formatting behavior, and nesting boundary.
+
+**C++** remains primarily DWARF-layout-oriented. Simple C-like layouts work
+best; broader standard-library and language-specific semantics are not modeled
+yet.
+
+For interpreted languages (Lua, Python, Ruby, etc.), only the interpreter
+itself can be traced because interpreters are typically implemented in compiled
+languages. Tracing script code is technically feasible but requires substantial
+development time. JIT language support is an even more distant goal.
 
 ### 2. User-Memory Reads via `bpf_probe_read_user`
 In traditional non-sleepable probe paths, helpers such as `bpf_probe_read_user` cannot resolve user-space page faults, so reads from a target virtual address may still fail if the page is not resident or otherwise faults on access.
