@@ -153,8 +153,14 @@ mod tests {
                 discriminant: None,
                 variants: vec![
                     variant("Unit", Vec::new()),
-                    variant("Tuple", vec![member("__0", scalar())]),
-                    variant("Struct", vec![member("value", scalar())]),
+                    variant(
+                        "Tuple",
+                        vec![member("__0", scalar()), member("__1", scalar())],
+                    ),
+                    variant(
+                        "Struct",
+                        vec![member("left", scalar()), member("right", scalar())],
+                    ),
                 ],
             }],
         };

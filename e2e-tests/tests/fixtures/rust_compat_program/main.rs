@@ -10,8 +10,24 @@ static RESULT: AtomicUsize = AtomicUsize::new(0);
 
 pub enum MatrixEnum {
     Unit,
-    Tuple(i32),
-    Struct { value: u16 },
+    Tuple(i16, u16),
+    Struct { value: u16, flag: u16 },
+}
+
+pub enum MatrixInner {
+    Pair(i16, u16),
+}
+
+pub enum MatrixOuter {
+    Empty,
+    Wrapped(MatrixInner),
+}
+
+#[repr(C)]
+pub enum MatrixReprC {
+    Unit,
+    Tuple(i16, u16),
+    Struct { left: i16, right: u16 },
 }
 
 pub enum MatrixFieldless {
@@ -63,6 +79,12 @@ pub fn observe_matrix_dst(rc: Rc<str>, arc: Arc<str>) -> usize {
 
 #[no_mangle]
 #[inline(never)]
+pub fn observe_matrix_mut_str(value: &mut str) -> usize {
+    value.len()
+}
+
+#[no_mangle]
+#[inline(never)]
 pub fn observe_matrix_enums(
     unit: &MatrixEnum,
     tuple: &MatrixEnum,
@@ -76,11 +98,11 @@ pub fn observe_matrix_enums(
         _ => 0,
     };
     let tuple = match *tuple {
-        MatrixEnum::Tuple(value) => value as usize,
+        MatrixEnum::Tuple(left, right) => left as usize + right as usize,
         _ => 0,
     };
     let struct_value = match *struct_value {
-        MatrixEnum::Struct { value } => value as usize,
+        MatrixEnum::Struct { value, flag } => value as usize + flag as usize,
         _ => 0,
     };
     let fieldless = match *fieldless {
@@ -112,6 +134,56 @@ pub fn observe_matrix_enum_edges(
     single + signed + unsigned
 }
 
+#[no_mangle]
+#[inline(never)]
+pub fn observe_matrix_nested(value: &MatrixOuter) -> usize {
+    match value {
+        MatrixOuter::Empty => 0,
+        MatrixOuter::Wrapped(MatrixInner::Pair(left, right)) => {
+            *left as usize + *right as usize
+        }
+    }
+}
+
+#[no_mangle]
+#[inline(never)]
+pub fn observe_matrix_pointer_niche(
+    some: &Option<&i32>,
+    none: &Option<&i32>,
+) -> usize {
+    let some = match *some {
+        Some(value) => *value as usize,
+        None => 0,
+    };
+    let none = match *none {
+        Some(value) => *value as usize,
+        None => 0,
+    };
+    some + none
+}
+
+#[no_mangle]
+#[inline(never)]
+pub fn observe_matrix_repr_c(
+    unit: &MatrixReprC,
+    tuple: &MatrixReprC,
+    struct_value: &MatrixReprC,
+) -> usize {
+    let unit = match unit {
+        MatrixReprC::Unit => 1,
+        _ => 0,
+    };
+    let tuple = match tuple {
+        MatrixReprC::Tuple(left, right) => *left as usize + *right as usize,
+        _ => 0,
+    };
+    let struct_value = match struct_value {
+        MatrixReprC::Struct { left, right } => *left as usize + *right as usize,
+        _ => 0,
+    };
+    unit + tuple + struct_value
+}
+
 fn main() {
     loop {
         let mut btree_map = BTreeMap::new();
@@ -128,10 +200,15 @@ fn main() {
         );
         result += observe_matrix_rc(Rc::new(11));
         result += observe_matrix_dst(Rc::from("matrix-rc"), Arc::from("matrix-arc"));
+        let mut mutable_text = String::from("matrix mutable");
+        result += observe_matrix_mut_str(mutable_text.as_mut_str());
         result += observe_matrix_enums(
             &MatrixEnum::Unit,
-            &MatrixEnum::Tuple(31),
-            &MatrixEnum::Struct { value: 47 },
+            &MatrixEnum::Tuple(31, 37),
+            &MatrixEnum::Struct {
+                value: 47,
+                flag: 53,
+            },
             &MatrixFieldless::Second,
             &NonZeroI32::new(59),
             &None,
@@ -140,6 +217,20 @@ fn main() {
             &MatrixSingle::Only(71),
             &MatrixSigned::Negative,
             &MatrixUnsigned::High,
+        );
+        result += observe_matrix_nested(&MatrixOuter::Wrapped(MatrixInner::Pair(7, 9)));
+
+        let pointed = 67;
+        let pointer_some = Some(&pointed);
+        let pointer_none: Option<&i32> = None;
+        result += observe_matrix_pointer_niche(&pointer_some, &pointer_none);
+        result += observe_matrix_repr_c(
+            &MatrixReprC::Unit,
+            &MatrixReprC::Tuple(73, 79),
+            &MatrixReprC::Struct {
+                left: 83,
+                right: 89,
+            },
         );
         RESULT.store(result, Ordering::Relaxed);
         thread::sleep(Duration::from_millis(25));

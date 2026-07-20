@@ -437,6 +437,25 @@ fn variant_name(variant: &VariantCase) -> Option<&str> {
     }
 }
 
+fn variant_payload_fields(variant: &VariantCase) -> Option<&[ghostscope_dwarf::StructMember]> {
+    let [payload] = variant.members.as_slice() else {
+        return None;
+    };
+    let TypeInfo::StructType { members, .. } = payload.member_type.underlying_type() else {
+        return None;
+    };
+    Some(members)
+}
+
+fn variant_payload_field_names(variant: &VariantCase) -> Option<Vec<&str>> {
+    Some(
+        variant_payload_fields(variant)?
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect(),
+    )
+}
+
 fn exact_unsigned_selector(variant: &VariantCase) -> Option<u64> {
     let VariantSelector::Ranges(ranges) = &variant.selector else {
         return None;
@@ -447,6 +466,26 @@ fn exact_unsigned_selector(variant: &VariantCase) -> Option<u64> {
     match (range.start, range.end) {
         (DiscriminantValue::Unsigned(start), DiscriminantValue::Unsigned(end)) if start == end => {
             Some(start)
+        }
+        _ => None,
+    }
+}
+
+fn exact_nonnegative_selector(variant: &VariantCase) -> Option<u64> {
+    let VariantSelector::Ranges(ranges) = &variant.selector else {
+        return None;
+    };
+    let [range] = ranges.as_slice() else {
+        return None;
+    };
+    match (range.start, range.end) {
+        (DiscriminantValue::Unsigned(start), DiscriminantValue::Unsigned(end)) if start == end => {
+            Some(start)
+        }
+        (DiscriminantValue::Signed(start), DiscriminantValue::Signed(end))
+            if start == end && start >= 0 =>
+        {
+            u64::try_from(start).ok()
         }
         _ => None,
     }
@@ -466,7 +505,7 @@ fn assert_compat_enum_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Re
         name == "CompatEnum",
         "{toolchain}: unexpected enum name {name}"
     );
-    anyhow::ensure!(*size == 8, "{toolchain}: unexpected CompatEnum size {size}");
+    anyhow::ensure!(*size > 0, "{toolchain}: empty CompatEnum layout");
     anyhow::ensure!(members.is_empty(), "{toolchain}: unexpected common fields");
     let [part] = variant_parts.as_slice() else {
         anyhow::bail!("{toolchain}: expected one CompatEnum variant part")
@@ -476,9 +515,25 @@ fn assert_compat_enum_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Re
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing CompatEnum discriminant"))?;
     anyhow::ensure!(
-        discriminant.offset == 0 && discriminant.member_type.is_unsigned_int(),
+        discriminant.offset == 0
+            && discriminant.member_type.is_unsigned_int()
+            && discriminant
+                .offset
+                .checked_add(discriminant.member_type.size())
+                .is_some_and(|end| end <= *size),
         "{toolchain}: unexpected CompatEnum discriminant {discriminant:#?}"
     );
+    for variant in &part.variants {
+        for member in &variant.members {
+            anyhow::ensure!(
+                member
+                    .offset
+                    .checked_add(member.member_type.size())
+                    .is_some_and(|end| end <= *size),
+                "{toolchain}: CompatEnum payload member exceeds its DWARF size: {member:#?}"
+            );
+        }
+    }
     anyhow::ensure!(
         part.variants
             .iter()
@@ -499,6 +554,20 @@ fn assert_compat_enum_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Re
                 VariantPayloadPresentation::Struct,
             ],
         "{toolchain}: unexpected CompatEnum payload presentations"
+    );
+    let payload_fields = part
+        .variants
+        .iter()
+        .map(variant_payload_field_names)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        payload_fields
+            == [
+                Some(Vec::new()),
+                Some(vec!["__0", "__1"]),
+                Some(vec!["left", "right"]),
+            ],
+        "{toolchain}: unexpected CompatEnum payload fields: {payload_fields:#?}"
     );
     anyhow::ensure!(
         part.variants
@@ -551,6 +620,230 @@ fn assert_niche_option_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::R
             && some.payload_presentation == VariantPayloadPresentation::Tuple,
         "{toolchain}: unexpected Option payload presentations"
     );
+    Ok(())
+}
+
+fn assert_nested_enum_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Result<()> {
+    let TypeInfo::VariantType {
+        name,
+        size,
+        members,
+        variant_parts,
+    } = type_info
+    else {
+        anyhow::bail!("{toolchain}: CompatOuter did not resolve as a variant type: {type_info:#?}")
+    };
+    anyhow::ensure!(
+        name == "CompatOuter" && *size > 0 && members.is_empty(),
+        "{toolchain}: unexpected CompatOuter type {type_info:#?}"
+    );
+    let [outer_part] = variant_parts.as_slice() else {
+        anyhow::bail!("{toolchain}: expected one CompatOuter variant part")
+    };
+    anyhow::ensure!(
+        outer_part
+            .variants
+            .iter()
+            .filter_map(variant_name)
+            .collect::<Vec<_>>()
+            == ["Empty", "Wrapped"],
+        "{toolchain}: unexpected CompatOuter variants: {outer_part:#?}"
+    );
+    anyhow::ensure!(
+        outer_part
+            .variants
+            .iter()
+            .map(|variant| variant.payload_presentation)
+            .collect::<Vec<_>>()
+            == [
+                VariantPayloadPresentation::Unit,
+                VariantPayloadPresentation::Tuple,
+            ],
+        "{toolchain}: unexpected CompatOuter payload presentations"
+    );
+
+    let wrapped = outer_part
+        .variants
+        .iter()
+        .find(|variant| variant_name(variant) == Some("Wrapped"))
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing CompatOuter::Wrapped"))?;
+    let [inner_field] = variant_payload_fields(wrapped).unwrap_or_default() else {
+        anyhow::bail!("{toolchain}: unexpected CompatOuter::Wrapped payload {wrapped:#?}")
+    };
+    anyhow::ensure!(
+        inner_field.name == "__0",
+        "{toolchain}: unexpected CompatOuter::Wrapped field {inner_field:#?}"
+    );
+
+    let TypeInfo::VariantType {
+        name,
+        size,
+        members,
+        variant_parts,
+    } = inner_field.member_type.underlying_type()
+    else {
+        anyhow::bail!("{toolchain}: CompatInner did not resolve as a nested variant type")
+    };
+    anyhow::ensure!(
+        name == "CompatInner" && *size > 0 && members.is_empty(),
+        "{toolchain}: unexpected CompatInner type {:#?}",
+        inner_field.member_type
+    );
+    let [inner_part] = variant_parts.as_slice() else {
+        anyhow::bail!("{toolchain}: expected one CompatInner variant part")
+    };
+    let [pair] = inner_part.variants.as_slice() else {
+        anyhow::bail!("{toolchain}: expected one CompatInner variant")
+    };
+    anyhow::ensure!(
+        inner_part.discriminant.is_none()
+            && variant_name(pair) == Some("Pair")
+            && matches!(pair.selector, VariantSelector::Default)
+            && pair.payload_presentation == VariantPayloadPresentation::Tuple
+            && variant_payload_field_names(pair) == Some(vec!["__0", "__1"]),
+        "{toolchain}: unexpected CompatInner::Pair shape {pair:#?}"
+    );
+    Ok(())
+}
+
+fn assert_pointer_niche_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Result<()> {
+    let TypeInfo::VariantType {
+        name,
+        size,
+        variant_parts,
+        ..
+    } = type_info
+    else {
+        anyhow::bail!("{toolchain}: Option<&i32> did not resolve as a variant type")
+    };
+    anyhow::ensure!(
+        name.contains("Option<") && *size > 0,
+        "{toolchain}: unexpected pointer niche type {name} size {size}"
+    );
+    let [part] = variant_parts.as_slice() else {
+        anyhow::bail!("{toolchain}: expected one Option<&i32> variant part")
+    };
+    let none = part
+        .variants
+        .iter()
+        .find(|variant| variant_name(variant) == Some("None"))
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing Option<&i32>::None"))?;
+    let some = part
+        .variants
+        .iter()
+        .find(|variant| variant_name(variant) == Some("Some"))
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing Option<&i32>::Some"))?;
+    anyhow::ensure!(
+        exact_nonnegative_selector(none) == Some(0)
+            && matches!(some.selector, VariantSelector::Default),
+        "{toolchain}: unexpected Option<&i32> niche selectors: {part:#?}"
+    );
+    anyhow::ensure!(
+        none.payload_presentation == VariantPayloadPresentation::Unit
+            && some.payload_presentation == VariantPayloadPresentation::Tuple
+            && variant_payload_field_names(none) == Some(Vec::new())
+            && variant_payload_field_names(some) == Some(vec!["__0"]),
+        "{toolchain}: unexpected Option<&i32> payload shapes: {part:#?}"
+    );
+    let [pointer] = variant_payload_fields(some).unwrap_or_default() else {
+        anyhow::bail!("{toolchain}: unexpected Option<&i32>::Some payload {some:#?}")
+    };
+    let TypeInfo::PointerType {
+        target_type,
+        size: pointer_size,
+    } = pointer.member_type.underlying_type()
+    else {
+        anyhow::bail!("{toolchain}: Option<&i32>::Some payload is not a pointer")
+    };
+    anyhow::ensure!(
+        target_type.type_name() == "i32" && *pointer_size > 0 && *pointer_size <= *size,
+        "{toolchain}: unexpected Option<&i32>::Some pointer {pointer:#?}"
+    );
+    Ok(())
+}
+
+fn assert_repr_c_enum_dwarf(toolchain: &str, type_info: &TypeInfo) -> anyhow::Result<()> {
+    let TypeInfo::VariantType {
+        name,
+        size,
+        members,
+        variant_parts,
+    } = type_info
+    else {
+        anyhow::bail!("{toolchain}: CompatReprC did not resolve as a variant type")
+    };
+    anyhow::ensure!(
+        name == "CompatReprC" && *size > 0 && members.is_empty(),
+        "{toolchain}: unexpected CompatReprC type {type_info:#?}"
+    );
+    let [part] = variant_parts.as_slice() else {
+        anyhow::bail!("{toolchain}: expected one CompatReprC variant part")
+    };
+    let discriminant = part
+        .discriminant
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing CompatReprC discriminant"))?;
+    anyhow::ensure!(
+        (discriminant.member_type.is_signed_int() || discriminant.member_type.is_unsigned_int())
+            && discriminant
+                .offset
+                .checked_add(discriminant.member_type.size())
+                .is_some_and(|end| end <= *size),
+        "{toolchain}: unexpected CompatReprC discriminant {discriminant:#?}"
+    );
+    anyhow::ensure!(
+        part.variants
+            .iter()
+            .filter_map(variant_name)
+            .collect::<Vec<_>>()
+            == ["Unit", "Tuple", "Struct"],
+        "{toolchain}: unexpected CompatReprC variants: {part:#?}"
+    );
+    anyhow::ensure!(
+        part.variants
+            .iter()
+            .map(|variant| variant.payload_presentation)
+            .collect::<Vec<_>>()
+            == [
+                VariantPayloadPresentation::Unit,
+                VariantPayloadPresentation::Tuple,
+                VariantPayloadPresentation::Struct,
+            ],
+        "{toolchain}: unexpected CompatReprC payload presentations"
+    );
+    let payload_fields = part
+        .variants
+        .iter()
+        .map(variant_payload_field_names)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        payload_fields
+            == [
+                Some(Vec::new()),
+                Some(vec!["__0", "__1"]),
+                Some(vec!["left", "right"]),
+            ],
+        "{toolchain}: unexpected CompatReprC payload fields: {payload_fields:#?}"
+    );
+    anyhow::ensure!(
+        part.variants
+            .iter()
+            .map(exact_nonnegative_selector)
+            .collect::<Vec<_>>()
+            == [Some(0), Some(1), Some(2)],
+        "{toolchain}: unexpected CompatReprC selectors: {part:#?}"
+    );
+    for variant in &part.variants {
+        for member in &variant.members {
+            anyhow::ensure!(
+                member
+                    .offset
+                    .checked_add(member.member_type.size())
+                    .is_some_and(|end| end <= *size),
+                "{toolchain}: CompatReprC member exceeds its DWARF size: {member:#?}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -777,6 +1070,16 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
                 ));
             }
         }
+        assert_parameter_adapter(
+            &analyzer,
+            &binary,
+            "observe_mut_str",
+            "value",
+            ExpectedAdapter::Utf8Bytes,
+            &toolchain,
+        )
+        .await?;
+
         let enum_type =
             resolved_parameter_type(&analyzer, "observe_values", "enum_value", &toolchain).await?;
         assert_compat_enum_dwarf(&toolchain, &enum_type)?;
@@ -796,6 +1099,34 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
             resolved_parameter_type(&analyzer, "observe_values", "option_nonzero", &toolchain)
                 .await?;
         assert_niche_option_dwarf(&toolchain, &option_type)?;
+
+        let nested_type =
+            resolved_parameter_type(&analyzer, "observe_nested_enum", "value", &toolchain).await?;
+        assert_nested_enum_dwarf(&toolchain, &nested_type)?;
+
+        let pointer_some =
+            resolved_parameter_type(&analyzer, "observe_pointer_niche", "some", &toolchain).await?;
+        let pointer_none =
+            resolved_parameter_type(&analyzer, "observe_pointer_niche", "none", &toolchain).await?;
+        anyhow::ensure!(
+            pointer_some == pointer_none,
+            "{toolchain}: Option<&i32> parameter types differ"
+        );
+        assert_pointer_niche_dwarf(&toolchain, &pointer_some)?;
+
+        let repr_c_unit =
+            resolved_parameter_type(&analyzer, "observe_repr_c_enum", "unit", &toolchain).await?;
+        let repr_c_tuple =
+            resolved_parameter_type(&analyzer, "observe_repr_c_enum", "tuple", &toolchain).await?;
+        let repr_c_struct =
+            resolved_parameter_type(&analyzer, "observe_repr_c_enum", "struct_value", &toolchain)
+                .await?;
+        anyhow::ensure!(
+            repr_c_unit == repr_c_tuple && repr_c_unit == repr_c_struct,
+            "{toolchain}: CompatReprC parameter types differ"
+        );
+        assert_repr_c_enum_dwarf(&toolchain, &repr_c_unit)?;
+
         if toolchain != "1.35.0" {
             assert_parameter_adapter(
                 &analyzer,
