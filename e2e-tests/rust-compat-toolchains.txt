@@ -3,6 +3,8 @@
 # standard host e2e run against a binary produced by that exact toolchain.
 1.35.0
 1.49.0
+# Last release before Rust 1.82 moved RawVec pointers under `inner`.
+1.81.0
 1.88.0
 1.93.0
 nightly-2026-05-30

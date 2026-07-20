@@ -10,8 +10,24 @@ use std::sync::Arc;
 
 pub enum CompatEnum {
     Unit,
-    Tuple(i32),
-    Struct { value: i32 },
+    Tuple(i16, u16),
+    Struct { left: i16, right: u16 },
+}
+
+pub enum CompatInner {
+    Pair(i16, u16),
+}
+
+pub enum CompatOuter {
+    Empty,
+    Wrapped(CompatInner),
+}
+
+#[repr(C)]
+pub enum CompatReprC {
+    Unit,
+    Tuple(i16, u16),
+    Struct { left: i16, right: u16 },
 }
 
 pub enum CompatFieldless {
@@ -66,8 +82,8 @@ pub fn observe_values(
 ) -> usize {
     let enum_value = match enum_value {
         CompatEnum::Unit => 0,
-        CompatEnum::Tuple(value) => value,
-        CompatEnum::Struct { value } => value,
+        CompatEnum::Tuple(left, right) => i32::from(left) + i32::from(right),
+        CompatEnum::Struct { left, right } => i32::from(left) + i32::from(right),
     };
     let fieldless = match fieldless {
         CompatFieldless::First => 0,
@@ -123,6 +139,58 @@ pub fn observe_ref_mut(mut value: RefMut<'_, i32>) -> i32 {
     *value
 }
 
+#[inline(never)]
+pub fn observe_mut_str(value: &mut str) -> usize {
+    value.len()
+}
+
+// Keep these enum-shaped parameters by value. Rust 1.35 emits only a
+// declaration DIE for some reference targets, while the runtime matrix
+// separately exercises the real reference and dereference path.
+#[inline(never)]
+pub fn observe_nested_enum(value: CompatOuter) -> usize {
+    match value {
+        CompatOuter::Empty => 0,
+        CompatOuter::Wrapped(CompatInner::Pair(left, right)) => {
+            left as usize + right as usize
+        }
+    }
+}
+
+#[inline(never)]
+pub fn observe_pointer_niche(some: Option<&i32>, none: Option<&i32>) -> usize {
+    let some = match some {
+        Some(value) => *value as usize,
+        None => 0,
+    };
+    let none = match none {
+        Some(value) => *value as usize,
+        None => 0,
+    };
+    some + none
+}
+
+#[inline(never)]
+pub fn observe_repr_c_enum(
+    unit: CompatReprC,
+    tuple: CompatReprC,
+    struct_value: CompatReprC,
+) -> usize {
+    let unit = match unit {
+        CompatReprC::Unit => 1,
+        _ => 0,
+    };
+    let tuple = match tuple {
+        CompatReprC::Tuple(left, right) => left as usize + right as usize,
+        _ => 0,
+    };
+    let struct_value = match struct_value {
+        CompatReprC::Struct { left, right } => left as usize + right as usize,
+        _ => 0,
+    };
+    unit + tuple + struct_value
+}
+
 fn main() {
     let mut deque = VecDeque::new();
     deque.push_back(5);
@@ -160,7 +228,10 @@ fn main() {
         Cell::new(43),
         RefCell::new(47),
         NonZeroI32::new(53).unwrap(),
-        CompatEnum::Struct { value: 59 },
+        CompatEnum::Struct {
+            left: 59,
+            right: 61,
+        },
         CompatFieldless::Second,
         CompatSingle::Only(71),
         CompatSigned::Negative,
@@ -168,8 +239,34 @@ fn main() {
         NonZeroI32::new(61),
     );
 
-    let guarded = RefCell::new(67);
+    let mut mutable_text = String::from("mutable-text");
+    let mutable_text_len = observe_mut_str(mutable_text.as_mut_str());
+    let nested = observe_nested_enum(CompatOuter::Wrapped(CompatInner::Pair(7, 9)));
+
+    let pointed = 67;
+    let pointer_some = Some(&pointed);
+    let pointer_none: Option<&i32> = None;
+    let pointer_niche = observe_pointer_niche(pointer_some, pointer_none);
+    let repr_c = observe_repr_c_enum(
+        CompatReprC::Unit,
+        CompatReprC::Tuple(73, 79),
+        CompatReprC::Struct {
+            left: 83,
+            right: 89,
+        },
+    );
+
+    let guarded = RefCell::new(97);
     let shared = observe_ref(guarded.borrow());
     let exclusive = observe_ref_mut(guarded.borrow_mut());
-    println!("{}", value + shared as usize + exclusive as usize);
+    println!(
+        "{}",
+        value
+            + mutable_text_len
+            + nested
+            + pointer_niche
+            + repr_c
+            + shared as usize
+            + exclusive as usize
+    );
 }

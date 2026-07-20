@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use common::{
     init,
     rust_toolchain::{
-        compile_compact_standalone_fixture, configured_toolchains, precompiled_compat_fixture,
-        rustc_for_toolchain, rustc_version, toolchain_id,
+        compile_compact_standalone_fixture, configured_toolchains, fixture_tempdir,
+        precompiled_compat_fixture, rustc_for_toolchain, rustc_version, toolchain_id,
     },
 };
 use ghostscope_dwarf::{DwarfAnalyzer, RustcVersion, SourceLanguage};
@@ -27,6 +27,10 @@ trace observe_matrix_dst {
     print "RUST_MATRIX_DST:{}:{}", rc, arc;
 }
 
+trace observe_matrix_mut_str {
+    print "RUST_MATRIX_MUT_STR:{}", value;
+}
+
 trace observe_matrix_enums {
     print "RUST_MATRIX_ENUMS:{}:{}:{}:{}:{}:{}", *unit, *tuple,
         *struct_value, *fieldless, *some, *none;
@@ -34,6 +38,18 @@ trace observe_matrix_enums {
 
 trace observe_matrix_enum_edges {
     print "RUST_MATRIX_ENUM_EDGES:{}:{}:{}", *single, *signed, *unsigned;
+}
+
+trace observe_matrix_nested {
+    print "RUST_MATRIX_NESTED:{}", *value;
+}
+
+trace observe_matrix_pointer_niche {
+    print "RUST_MATRIX_POINTER_NICHE:{}:{}", *some, *none;
+}
+
+trace observe_matrix_repr_c {
+    print "RUST_MATRIX_REPR_C:{}:{}:{}", *unit, *tuple, *struct_value;
 }
 "#;
 
@@ -113,6 +129,12 @@ fn assert_common_output(toolchain: &str, stdout: &str) -> anyhow::Result<()> {
         expected.is_match(dst),
         "{toolchain}: unexpected Rc<str>/Arc<str> output: {dst}"
     );
+
+    let mutable_text = marker_line(stdout, "RUST_MATRIX_MUT_STR", toolchain)?;
+    anyhow::ensure!(
+        mutable_text.contains(r#""matrix mutable""#),
+        "{toolchain}: unexpected &mut str output: {mutable_text}"
+    );
     Ok(())
 }
 
@@ -129,8 +151,8 @@ fn assert_enum_output(toolchain: &str, stdout: &str) -> anyhow::Result<()> {
     let enums = marker_line(stdout, "RUST_MATRIX_ENUMS", toolchain)?;
     for expected in [
         "MatrixEnum::Unit",
-        "MatrixEnum::Tuple(31)",
-        "MatrixEnum::Struct { value: 47 }",
+        "MatrixEnum::Tuple(31, 37)",
+        "MatrixEnum::Struct { value: 47, flag: 53 }",
         "MatrixFieldless::Second",
         "Option<core::num::",
         ">::Some(",
@@ -154,6 +176,32 @@ fn assert_enum_output(toolchain: &str, stdout: &str) -> anyhow::Result<()> {
             "{toolchain}: missing {expected:?} in {edges}"
         );
     }
+
+    let nested = marker_line(stdout, "RUST_MATRIX_NESTED", toolchain)?;
+    anyhow::ensure!(
+        nested.contains("MatrixOuter::Wrapped(MatrixInner::Pair(7, 9))"),
+        "{toolchain}: unexpected nested enum output: {nested}"
+    );
+
+    let pointer_niche = marker_line(stdout, "RUST_MATRIX_POINTER_NICHE", toolchain)?;
+    let pointer_niche_pattern =
+        Regex::new(concat!(r"::Some\(0x[0-9a-f]+ \(i32\*\)\)", r".*::None",))?;
+    anyhow::ensure!(
+        pointer_niche_pattern.is_match(pointer_niche),
+        "{toolchain}: unexpected pointer niche output: {pointer_niche}"
+    );
+
+    let repr_c = marker_line(stdout, "RUST_MATRIX_REPR_C", toolchain)?;
+    for expected in [
+        "MatrixReprC::Unit",
+        "MatrixReprC::Tuple(73, 79)",
+        "MatrixReprC::Struct { left: 83, right: 89 }",
+    ] {
+        anyhow::ensure!(
+            repr_c.contains(expected),
+            "{toolchain}: missing {expected:?} in {repr_c}"
+        );
+    }
     Ok(())
 }
 
@@ -175,14 +223,15 @@ async fn run_toolchain(toolchain: String, require_all: bool) -> anyhow::Result<b
         return Ok(false);
     };
 
-    let temp_dir = tempfile::tempdir()?;
+    let temp_dir = fixture_tempdir()?;
     let expected_version = rustc_version(&rustc, &toolchain)?;
     let binary = fixture_binary(&rustc, &toolchain, temp_dir.path())?;
     assert_target_rustc_version(&binary, &toolchain, expected_version).await?;
 
     // Keep runtime coverage to representative high-risk layout families.
-    // The DWARF compatibility test checks every adapter for every pinned
-    // compiler, while the complete Rust 1.88 e2e suite checks all output.
+    // The DWARF compatibility test checks every adapter audited for each
+    // pinned compiler, while the complete Rust 1.88 e2e suite checks all
+    // output.
     // Wrapper adapters have a 1.49 floor until their older concrete DWARF
     // shapes receive the same rust-gdb-based audit.
     let mut script = COMMON_SCRIPT.to_string();
