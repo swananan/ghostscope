@@ -14,7 +14,10 @@
 use super::sandbox::SandboxHandle;
 use super::targets::ensure_target_binary_ready_for_default_sandbox;
 use super::targets::TargetHandle;
-use super::termination::{terminate_tokio_child_gracefully, GRACEFUL_TERMINATION_TIMEOUT};
+use super::termination::{
+    terminate_tokio_child_with_escalation, FORCEFUL_TERMINATION_TIMEOUT,
+    GRACEFUL_TERMINATION_TIMEOUT,
+};
 use anyhow::{Context, Result};
 use ghostscope_process::is_shared_object;
 use std::env;
@@ -39,7 +42,9 @@ const GHOSTSCOPE_PID_BOOTSTRAP_PREFIX: &str = "__GHOSTSCOPE_PID__ ";
 const GHOSTSCOPE_READY_MARKER: &str = "__GHOSTSCOPE_READY__";
 const CHILD_CONTAINER_TIMEOUT_SLACK_SECS: u64 = 45;
 const CHILD_CONTAINER_POST_READY_CALLBACK_SLACK_SECS: u64 = 45;
-const CONTAINER_TOPOLOGY_SETUP_SLACK_SECS: u64 = 10;
+// CI commonly starts four BPF-heavy tests together. Leave enough headroom for
+// their verifier work before treating a missing ready marker as a stalled load.
+const CONTAINER_TOPOLOGY_SETUP_SLACK_SECS: u64 = 30;
 
 pub struct GhostscopeRunner {
     script_content: String,
@@ -56,6 +61,7 @@ pub struct GhostscopeRunner {
     sandbox: Option<SandboxHandle>,
     config_content: Option<String>,
     extra_args: Vec<OsString>,
+    startup_timeout_secs: Option<u64>,
 }
 
 impl Default for GhostscopeRunner {
@@ -75,6 +81,7 @@ impl Default for GhostscopeRunner {
             sandbox: None,
             config_content: None,
             extra_args: Vec::new(),
+            startup_timeout_secs: None,
         }
     }
 }
@@ -114,6 +121,12 @@ impl GhostscopeRunner {
 
     pub fn timeout_secs(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn startup_timeout_secs(mut self, secs: u64) -> Self {
+        self.startup_timeout_secs = Some(secs);
         self
     }
 
@@ -421,22 +434,31 @@ impl GhostscopeRunner {
                             setup_timeout_secs
                         );
                     }
-                    if let Some(pid) = managed_ghostscope_pid {
-                        sandbox.terminate_pid(pid).with_context(|| {
-                            format!(
-                                "failed to terminate startup-stalled GhostScope pid {} in {}",
-                                pid,
-                                sandbox.label()
-                            )
-                        })?;
-                    } else {
-                        let _ = terminate_tokio_child_gracefully(
-                            &mut child,
-                            "ghostscope runner child",
-                            GRACEFUL_TERMINATION_TIMEOUT,
-                        )
-                        .await?;
-                    }
+                    let termination_result = terminate_runner_process(
+                        &sandbox,
+                        managed_ghostscope_pid,
+                        &mut child,
+                        "startup-stalled GhostScope",
+                    )
+                    .await;
+                    finish_output_readers(stdout_task, stderr_task).await;
+                    drain_output_channel(
+                        &mut output_rx,
+                        &mut stdout_content,
+                        &mut stderr_content,
+                        ready_marker.as_deref(),
+                        runner_debug,
+                        &sandbox,
+                    );
+                    termination_result?;
+                    anyhow::bail!(
+                        "timed out waiting for ready marker '{}' from {} after {}s. stderr={} stdout={}",
+                        ready_marker.as_deref().unwrap_or("<none>"),
+                        sandbox.label(),
+                        setup_timeout_secs,
+                        stderr_content,
+                        stdout_content
+                    );
                 }
             }
         }
@@ -473,26 +495,29 @@ impl GhostscopeRunner {
                                 post_ready_callback_timeout_secs
                             );
                         }
-                        if let Some(pid) = managed_ghostscope_pid {
-                            sandbox.terminate_pid(pid).with_context(|| {
-                                format!(
-                                    "failed to terminate GhostScope pid {} after post-ready callback timeout in {}",
-                                    pid,
-                                    sandbox.label()
-                                )
-                            })?;
-                        } else {
-                            let _ = terminate_tokio_child_gracefully(
-                                &mut child,
-                                "ghostscope runner child",
-                                GRACEFUL_TERMINATION_TIMEOUT,
-                            )
-                            .await?;
-                        }
+                        let termination_result = terminate_runner_process(
+                            &sandbox,
+                            managed_ghostscope_pid,
+                            &mut child,
+                            "GhostScope after post-ready callback timeout",
+                        )
+                        .await;
+                        finish_output_readers(stdout_task, stderr_task).await;
+                        drain_output_channel(
+                            &mut output_rx,
+                            &mut stdout_content,
+                            &mut stderr_content,
+                            ready_marker.as_deref(),
+                            runner_debug,
+                            &sandbox,
+                        );
+                        termination_result?;
                         anyhow::bail!(
-                            "timed out waiting for post-ready callback after ready marker '{}' in {}",
+                            "timed out waiting for post-ready callback after ready marker '{}' in {}. stderr={} stdout={}",
                             ready_marker.as_deref().unwrap_or("<none>"),
-                            sandbox.label()
+                            sandbox.label(),
+                            stderr_content,
+                            stdout_content
                         );
                     }
                 }
@@ -549,45 +574,29 @@ impl GhostscopeRunner {
             false
         };
 
-        let mut exit_code = match child.try_wait() {
-            Ok(Some(status)) => status.code().unwrap_or(-1),
+        let exit_code_result = match child.try_wait() {
+            Ok(Some(status)) => Ok(status.code().unwrap_or(-1)),
             _ => {
                 if timed_out {
-                    if let Some(pid) = managed_ghostscope_pid {
-                        sandbox.terminate_pid(pid).with_context(|| {
-                            format!(
-                                "failed to terminate timed-out GhostScope pid {} in {}",
-                                pid,
-                                sandbox.label()
-                            )
-                        })?;
-                        match timeout(GRACEFUL_TERMINATION_TIMEOUT, child.wait()).await {
-                            Ok(Ok(status)) => status.code().unwrap_or(-1),
-                            _ => -1,
-                        }
-                    } else {
-                        match terminate_tokio_child_gracefully(
-                            &mut child,
-                            "ghostscope runner child",
-                            GRACEFUL_TERMINATION_TIMEOUT,
-                        )
-                        .await?
-                        {
-                            Some(status) => status.code().unwrap_or(-1),
-                            None => -1,
-                        }
-                    }
+                    terminate_runner_process(
+                        &sandbox,
+                        managed_ghostscope_pid,
+                        &mut child,
+                        "timed-out GhostScope",
+                    )
+                    .await
+                    .map(|status| status.and_then(|status| status.code()).unwrap_or(-1))
                 } else {
                     match timeout(Duration::from_secs(2), child.wait()).await {
-                        Ok(Ok(status)) => status.code().unwrap_or(-1),
-                        _ => -1,
+                        Ok(Ok(status)) => Ok(status.code().unwrap_or(-1)),
+                        Ok(Err(err)) => Err(err.into()),
+                        Err(_) => Ok(-1),
                     }
                 }
             }
         };
 
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
+        finish_output_readers(stdout_task, stderr_task).await;
         drain_output_channel(
             &mut output_rx,
             &mut stdout_content,
@@ -597,6 +606,7 @@ impl GhostscopeRunner {
             &sandbox,
         );
 
+        let mut exit_code = exit_code_result?;
         if exit_code == -1 && (!stdout_content.is_empty() || !stderr_content.is_empty()) {
             exit_code = 0;
         }
@@ -653,6 +663,10 @@ impl GhostscopeRunner {
     }
 
     fn setup_timeout_secs(&self) -> u64 {
+        if let Some(timeout_secs) = self.startup_timeout_secs {
+            return timeout_secs;
+        }
+
         let mut timeout_secs = self.timeout_secs.max(15);
         let docker_topology = [ENV_E2E_GHOSTSCOPE_SANDBOX, ENV_E2E_TARGET_SANDBOX]
             .into_iter()
@@ -729,6 +743,72 @@ where
             }
         }
     })
+}
+
+async fn terminate_runner_process(
+    sandbox: &SandboxHandle,
+    managed_pid: Option<u32>,
+    child: &mut tokio::process::Child,
+    label: &str,
+) -> Result<Option<std::process::ExitStatus>> {
+    let managed_result = managed_pid
+        .map(|pid| {
+            sandbox.terminate_pid(pid).with_context(|| {
+                format!(
+                    "failed to terminate {label} pid {} in {}",
+                    pid,
+                    sandbox.label()
+                )
+            })
+        })
+        .transpose();
+    let child_result = if managed_pid.is_some() {
+        match timeout(GRACEFUL_TERMINATION_TIMEOUT, child.wait()).await {
+            Ok(result) => result.map(Some).map_err(Into::into),
+            Err(_) => {
+                terminate_tokio_child_with_escalation(
+                    child,
+                    "ghostscope runner child",
+                    GRACEFUL_TERMINATION_TIMEOUT,
+                    FORCEFUL_TERMINATION_TIMEOUT,
+                )
+                .await
+            }
+        }
+    } else {
+        terminate_tokio_child_with_escalation(
+            child,
+            "ghostscope runner child",
+            GRACEFUL_TERMINATION_TIMEOUT,
+            FORCEFUL_TERMINATION_TIMEOUT,
+        )
+        .await
+    };
+
+    match (managed_result, child_result) {
+        (Ok(_), Ok(status)) => Ok(status),
+        (Err(err), Ok(_)) | (Ok(_), Err(err)) => Err(err),
+        (Err(managed_err), Err(child_err)) => {
+            anyhow::bail!("{managed_err:#}; host runner process cleanup also failed: {child_err:#}")
+        }
+    }
+}
+
+async fn finish_output_readers(stdout_task: JoinHandle<()>, stderr_task: JoinHandle<()>) {
+    tokio::join!(
+        finish_output_reader(stdout_task),
+        finish_output_reader(stderr_task)
+    );
+}
+
+async fn finish_output_reader(mut task: JoinHandle<()>) {
+    if timeout(FORCEFUL_TERMINATION_TIMEOUT, &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 fn handle_output_line(

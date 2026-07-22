@@ -100,10 +100,11 @@ pub(crate) fn terminate_std_child_gracefully(
     }
 }
 
-pub(crate) async fn terminate_tokio_child_gracefully(
+pub(crate) async fn terminate_tokio_child_with_escalation(
     child: &mut tokio::process::Child,
     label: &str,
-    wait_timeout: Duration,
+    graceful_timeout: Duration,
+    forceful_timeout: Duration,
 ) -> anyhow::Result<Option<std::process::ExitStatus>> {
     if let Some(status) = child.try_wait()? {
         return Ok(Some(status));
@@ -114,7 +115,15 @@ pub(crate) async fn terminate_tokio_child_gracefully(
         .context("child process does not have an OS pid for SIGTERM")?;
     send_sigterm(pid, label)?;
 
-    match tokio::time::timeout(wait_timeout, child.wait()).await {
+    match tokio::time::timeout(graceful_timeout, child.wait()).await {
+        Ok(result) => return result.map(Some).map_err(Into::into),
+        Err(_) => {}
+    }
+
+    child
+        .start_kill()
+        .with_context(|| format!("failed to send SIGKILL to {label} pid {pid}"))?;
+    match tokio::time::timeout(forceful_timeout, child.wait()).await {
         Ok(result) => result.map(Some).map_err(Into::into),
         Err(_) => Ok(None),
     }
