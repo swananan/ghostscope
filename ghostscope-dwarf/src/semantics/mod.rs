@@ -40,7 +40,7 @@ pub use unwind_plan::{
 pub use value::{
     BTreeArrayCapture, BTreeEdgesCapture, HashTableBucketSource, ProjectedValueRead,
     ProjectedValueStep, ProjectedViewField, ProjectedViewFieldCapture, RingSequenceLength,
-    ValueCapturePlan, ValueReadPlan,
+    ValueAdapterOutcome, ValueAdapterReport, ValueAdapterStage, ValueCapturePlan, ValueReadPlan,
 };
 pub(crate) use variable_plan::PlanError;
 pub use variable_plan::{

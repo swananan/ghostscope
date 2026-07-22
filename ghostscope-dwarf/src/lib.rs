@@ -51,10 +51,11 @@ pub use semantics::{
     ProjectedViewField, ProjectedViewFieldCapture, RegisterRecoveryPlan, ResolvedType,
     RingSequenceLength, RuntimeComputedExpr, RuntimeComputedKind, RustcVersion, SemanticType,
     SourceLanguage, SyntheticTypeKind, TypeIdentity, TypeLayoutError, TypeOrigin, TypeProjection,
-    TypeProjectionLayout, UnwindDiagnostic, UnwindDiagnosticKind, ValueCapturePlan, ValueReadPlan,
-    VariableAccessPath, VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan,
-    VariableMaterialization, VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic,
-    VariableReadPlan, VisibleVariable, VisibleVariablesResult,
+    TypeProjectionLayout, UnwindDiagnostic, UnwindDiagnosticKind, ValueAdapterOutcome,
+    ValueAdapterReport, ValueAdapterStage, ValueCapturePlan, ValueReadPlan, VariableAccessPath,
+    VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
+    VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
+    VisibleVariable, VisibleVariablesResult,
 };
 
 pub use semantics::{

@@ -78,6 +78,20 @@ impl CompileError {
 }
 
 impl CodeGenError {
+    pub(crate) fn with_value_adapter_rejection(
+        self,
+        report: ghostscope_dwarf::ValueAdapterReport,
+    ) -> Self {
+        debug_assert!(matches!(
+            report.outcome,
+            ghostscope_dwarf::ValueAdapterOutcome::Rejected { .. }
+        ));
+        Self::ValueAdapterFallback {
+            source: Box::new(self),
+            report: Box::new(report),
+        }
+    }
+
     pub fn user_message(&self) -> Cow<'_, str> {
         match self {
             CodeGenError::VariableNotInScope(name) => {
@@ -87,9 +101,55 @@ impl CodeGenError {
             CodeGenError::TypeSizeNotAvailable(name) => Cow::Owned(format!(
                 "Variable '{name}' has no concrete DWARF size at this probe PC"
             )),
+            CodeGenError::ValueAdapterFallback { source, report } => {
+                let mut message = source.user_message().into_owned();
+                if let Some(diagnostic) = format_value_adapter_rejection(report) {
+                    message.push_str("\n\n");
+                    message.push_str(&diagnostic);
+                }
+                Cow::Owned(message)
+            }
             _ => Cow::Owned(self.to_string()),
         }
     }
+}
+
+fn format_value_adapter_rejection(report: &ghostscope_dwarf::ValueAdapterReport) -> Option<String> {
+    let ghostscope_dwarf::ValueAdapterOutcome::Rejected { stage, reason } = &report.outcome else {
+        return None;
+    };
+    let stage = match stage {
+        ghostscope_dwarf::ValueAdapterStage::LayoutValidation => "layout-validation",
+        ghostscope_dwarf::ValueAdapterStage::ReadPlanConstruction => "read-plan-construction",
+    };
+    let type_name = report
+        .qualified_type_name
+        .as_deref()
+        .unwrap_or(&report.type_name);
+    let mut lines = vec![
+        concat!(
+            "Rust value adapter diagnostic ",
+            "(ordinary DWARF fallback also failed):"
+        )
+        .to_string(),
+        format!(
+            "  adapter: {}",
+            report.adapter.as_deref().unwrap_or("unknown")
+        ),
+        format!("  type: {type_name}"),
+        format!("  rejected at: {stage}"),
+        format!("  reason: {reason}"),
+    ];
+    if let Some(version) = report.rustc_version {
+        lines.push(format!("  target rustc: {version}"));
+    }
+    if let Some(version) = report.dwarf_version {
+        lines.push(format!("  target DWARF: {version}"));
+    }
+    if let Some(producer) = &report.producer {
+        lines.push(format!("  producer: {}", producer.raw));
+    }
+    Some(lines.join("\n"))
 }
 
 // Public re-exports from script::compiler module
@@ -399,6 +459,38 @@ mod tests {
             err.user_message().as_ref(),
             "Use of variable 'x' outside of its scope"
         );
+    }
+
+    #[test]
+    fn user_message_appends_rejected_value_adapter_context() {
+        let report = ghostscope_dwarf::ValueAdapterReport {
+            source_language: ghostscope_dwarf::SourceLanguage::Rust,
+            type_name: "String".to_string(),
+            qualified_type_name: Some("alloc::string::String".to_string()),
+            adapter: Some("String".to_string()),
+            producer: Some(ghostscope_dwarf::ProducerInfo::new(
+                "clang LLVM (rustc version 1.88.0)",
+            )),
+            rustc_version: Some(ghostscope_dwarf::RustcVersion::new(1, 88, 0)),
+            dwarf_version: Some(4),
+            outcome: ghostscope_dwarf::ValueAdapterOutcome::Rejected {
+                stage: ghostscope_dwarf::ValueAdapterStage::LayoutValidation,
+                reason: "missing String Vec layout".to_string(),
+            },
+        };
+        let err = CompileError::CodeGen(
+            CodeGenError::TypeSizeNotAvailable("value".to_string())
+                .with_value_adapter_rejection(report),
+        );
+        let message = err.user_message();
+
+        assert!(message.contains("Variable 'value' has no concrete DWARF size"));
+        assert!(message.contains("adapter: String"));
+        assert!(message.contains("type: alloc::string::String"));
+        assert!(message.contains("rejected at: layout-validation"));
+        assert!(message.contains("reason: missing String Vec layout"));
+        assert!(message.contains("target rustc: 1.88.0"));
+        assert!(message.contains("target DWARF: 4"));
     }
 
     #[test]

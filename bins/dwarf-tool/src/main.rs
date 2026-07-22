@@ -6,7 +6,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ghostscope_dwarf::{
     AddressQueryResult, DwarfAnalyzer, FunctionQueryResult, ModuleLoadingEvent, ModuleLoadingStats,
-    SectionType,
+    SectionType, SourceLanguage, ValueAdapterOutcome, ValueAdapterReport, ValueAdapterStage,
+    ValueCapturePlan, ValuePresentation, VariableAccessPath,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -19,7 +20,7 @@ use tracing::warn;
 #[command(about = "DWARF debug information analysis tool with multiple analysis modes")]
 #[command(author = "swananan")]
 #[command(
-    after_help = "SUBCOMMANDS:\n  source-line (s)            Analyze variables at specific source file:line location\n  function (f)               Find function addresses and analyze variables at those addresses\n  module-addr (m)            Analyze variables at specific module:address location\n  modules (ls)               List all loaded modules\n  source-files (sf)          List source files grouped by module\n  benchmark                  Performance benchmarking\n  benchmark-source-line      Benchmark a source-line query with a warm analyzer"
+    after_help = "SUBCOMMANDS:\n  source-line (s)            Analyze variables at specific source file:line location\n  function (f)               Find function addresses and analyze variables at those addresses\n  module-addr (m)            Analyze variables at specific module:address location\n  rust-adapter (ra)          Explain Rust value adaptation for a global variable\n  modules (ls)               List all loaded modules\n  source-files (sf)          List source files grouped by module\n  benchmark                  Performance benchmarking\n  benchmark-source-line      Benchmark a source-line query with a warm analyzer"
 )]
 struct Cli {
     /// Process ID to analyze
@@ -112,6 +113,18 @@ enum Commands {
         /// Quiet output
         #[arg(short, long)]
         quiet: bool,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explain Rust value adapter selection for a global/static variable
+    #[command(name = "rust-adapter", alias = "ra")]
+    RustAdapter {
+        /// Global/static variable name
+        name: String,
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
         /// JSON output
         #[arg(long)]
         json: bool,
@@ -247,6 +260,24 @@ struct SourceFileOutput {
     basename: String,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct ValueAdapterOutput {
+    variable: String,
+    module: String,
+    type_name: String,
+    qualified_type_name: Option<String>,
+    source_language: String,
+    producer: Option<String>,
+    rustc_version: Option<String>,
+    dwarf_version: Option<u16>,
+    adapter: Option<String>,
+    status: String,
+    stage: Option<String>,
+    reason: Option<String>,
+    presentation: Option<String>,
+    capture: Option<String>,
+}
+
 // Helper trait to extract common options from commands
 trait CommonOptions {
     fn verbose(&self) -> bool;
@@ -260,6 +291,7 @@ impl CommonOptions for Commands {
             Commands::SourceLine { verbose, .. } => *verbose,
             Commands::Function { verbose, .. } => *verbose,
             Commands::ModuleAddr { verbose, .. } => *verbose,
+            Commands::RustAdapter { verbose, .. } => *verbose,
             Commands::Globals { verbose, .. } => *verbose,
             Commands::GlobalsAll { verbose, .. } => *verbose,
             Commands::BenchmarkSourceLine { .. } => false,
@@ -275,6 +307,7 @@ impl CommonOptions for Commands {
             Commands::SourceLine { quiet, .. } => *quiet,
             Commands::Function { quiet, .. } => *quiet,
             Commands::ModuleAddr { quiet, .. } => *quiet,
+            Commands::RustAdapter { .. } => false,
             Commands::Globals { quiet, .. } => *quiet,
             Commands::GlobalsAll { quiet, .. } => *quiet,
             Commands::BenchmarkSourceLine { .. } => false,
@@ -290,6 +323,7 @@ impl CommonOptions for Commands {
             Commands::SourceLine { json, .. } => *json,
             Commands::Function { json, .. } => *json,
             Commands::ModuleAddr { json, .. } => *json,
+            Commands::RustAdapter { json, .. } => *json,
             Commands::Globals { json, .. } => *json,
             Commands::GlobalsAll { json, .. } => *json,
             Commands::BenchmarkSourceLine { json, .. } => *json,
@@ -366,7 +400,9 @@ fn validate_args(cli: &Cli) -> Result<()> {
         if !target_file.is_file() {
             return Err(anyhow::anyhow!("Target path is not a file: {target_path}"));
         }
-        println!("✓ Target file found: {target_path}");
+        if !cli.command.json() {
+            println!("✓ Target file found: {target_path}");
+        }
     }
 
     Ok(())
@@ -515,7 +551,7 @@ async fn load_analyzer_with_breakdown(
 }
 
 async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
-    if !cli.command.quiet() {
+    if !cli.command.quiet() && !cli.command.json() {
         if cli.pid.is_some() {
             println!("Loading modules from PID {}...", cli.pid.unwrap());
         } else if let Some(ref target) = cli.target {
@@ -543,6 +579,9 @@ async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
             module, address, ..
         } => {
             analyze_module_address(&mut analyzer, module, address, &cli.command).await?;
+        }
+        Commands::RustAdapter { name, .. } => {
+            analyze_rust_adapter(&analyzer, name, &cli.command)?;
         }
         Commands::Globals { name, .. } => {
             analyze_globals(&mut analyzer, cli.pid, name, &cli.command).await?;
@@ -812,6 +851,163 @@ async fn analyze_module_address(
     }
 
     Ok(())
+}
+
+fn analyze_rust_adapter(
+    analyzer: &DwarfAnalyzer,
+    variable_name: &str,
+    options: &Commands,
+) -> Result<()> {
+    let preferred_module = analyzer
+        .get_main_executable()
+        .map(|executable| PathBuf::from(executable.path))
+        .or_else(|| {
+            analyzer
+                .get_loaded_modules()
+                .first()
+                .map(|path| (*path).clone())
+        })
+        .ok_or_else(|| anyhow::anyhow!("No loaded module is available for type lookup"))?;
+    let Some((module_path, plan)) = analyzer.plan_global_access_read_plan(
+        &preferred_module,
+        variable_name,
+        &VariableAccessPath::default(),
+    )?
+    else {
+        return Err(anyhow::anyhow!(
+            "Global/static variable '{variable_name}' was not found"
+        ));
+    };
+    let current = analyzer
+        .resolved_type_for_plan(&plan)?
+        .ok_or_else(|| anyhow::anyhow!("Variable '{variable_name}' has no usable DWARF type"))?;
+    let report = analyzer.explain_value_read_plan(&current, Some(&module_path))?;
+    let output = value_adapter_output(variable_name, &module_path, report);
+
+    if options.json() {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("=== Rust Value Adapter: '{variable_name}' ===");
+        println!("Module:     {}", output.module);
+        println!("Type:       {}", output.type_name);
+        if let Some(qualified_type_name) = &output.qualified_type_name {
+            println!("Qualified:  {qualified_type_name}");
+        }
+        println!("Language:   {}", output.source_language);
+        if let Some(producer) = &output.producer {
+            println!("Producer:   {producer}");
+        }
+        if let Some(rustc_version) = &output.rustc_version {
+            println!("rustc:      {rustc_version}");
+        }
+        if let Some(dwarf_version) = output.dwarf_version {
+            println!("DWARF:      {dwarf_version}");
+        }
+        println!(
+            "Adapter:    {}",
+            output.adapter.as_deref().unwrap_or("(none)")
+        );
+        println!("Status:     {}", output.status);
+        if let Some(stage) = &output.stage {
+            println!("Stage:      {stage}");
+        }
+        if let Some(reason) = &output.reason {
+            println!("Reason:     {reason}");
+        }
+        if let Some(presentation) = &output.presentation {
+            println!("Presentation: {presentation}");
+        }
+        if let Some(capture) = &output.capture {
+            println!("Capture:      {capture}");
+        }
+    }
+
+    Ok(())
+}
+
+fn value_adapter_output(
+    variable_name: &str,
+    module_path: &std::path::Path,
+    report: ValueAdapterReport,
+) -> ValueAdapterOutput {
+    let (status, stage, reason, presentation, capture) = match report.outcome {
+        ValueAdapterOutcome::NotApplicable => ("not-applicable", None, None, None, None),
+        ValueAdapterOutcome::Applied { plan } => (
+            "applied",
+            None,
+            None,
+            Some(value_presentation_name(&plan.presentation).to_string()),
+            Some(value_capture_name(&plan.capture).to_string()),
+        ),
+        ValueAdapterOutcome::Rejected { stage, reason } => (
+            "rejected",
+            Some(value_adapter_stage_name(stage).to_string()),
+            Some(reason),
+            None,
+            None,
+        ),
+    };
+
+    ValueAdapterOutput {
+        variable: variable_name.to_string(),
+        module: module_path.display().to_string(),
+        type_name: report.type_name,
+        qualified_type_name: report.qualified_type_name,
+        source_language: source_language_name(report.source_language),
+        producer: report.producer.map(|producer| producer.raw),
+        rustc_version: report.rustc_version.map(|version| version.to_string()),
+        dwarf_version: report.dwarf_version,
+        adapter: report.adapter,
+        status: status.to_string(),
+        stage,
+        reason,
+        presentation,
+        capture,
+    }
+}
+
+fn source_language_name(language: SourceLanguage) -> String {
+    match language {
+        SourceLanguage::C => "C".to_string(),
+        SourceLanguage::Cpp => "C++".to_string(),
+        SourceLanguage::Rust => "Rust".to_string(),
+        SourceLanguage::Other(value) => format!("DW_LANG_0x{value:x}"),
+        SourceLanguage::Unknown => "unknown".to_string(),
+    }
+}
+
+fn value_adapter_stage_name(stage: ValueAdapterStage) -> &'static str {
+    match stage {
+        ValueAdapterStage::LayoutValidation => "layout-validation",
+        ValueAdapterStage::ReadPlanConstruction => "read-plan-construction",
+    }
+}
+
+fn value_presentation_name(presentation: &ValuePresentation) -> &'static str {
+    match presentation {
+        ValuePresentation::Dwarf => "dwarf",
+        ValuePresentation::Utf8String => "utf8-string",
+        ValuePresentation::Sequence { .. } => "sequence",
+        ValuePresentation::ByteString => "byte-string",
+        ValuePresentation::SingleField { .. } => "single-field",
+        ValuePresentation::SignedStateStruct { .. } => "signed-state-struct",
+        ValuePresentation::ReferenceCountedStruct { .. } => "reference-counted-struct",
+        ValuePresentation::HashTable { .. } => "hash-table",
+        ValuePresentation::BTree { .. } => "btree",
+    }
+}
+
+fn value_capture_name(capture: &ValueCapturePlan) -> &'static str {
+    match capture {
+        ValueCapturePlan::ProjectedValue { .. } => "projected-value",
+        ValueCapturePlan::InlineView { .. } => "inline-view",
+        ValueCapturePlan::ProjectedView { .. } => "projected-view",
+        ValueCapturePlan::IndirectBytes { .. } => "indirect-bytes",
+        ValueCapturePlan::IndirectSequence { .. } => "indirect-sequence",
+        ValueCapturePlan::IndirectRingSequence { .. } => "indirect-ring-sequence",
+        ValueCapturePlan::IndirectHashTable { .. } => "indirect-hash-table",
+        ValueCapturePlan::IndirectBTree { .. } => "indirect-btree",
+    }
 }
 
 fn list_modules(analyzer: &DwarfAnalyzer, options: &Commands) {

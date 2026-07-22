@@ -72,6 +72,12 @@ pub enum CodeGenError {
     DwarfError(String),
     #[error("Type size not available for variable: {0}")]
     TypeSizeNotAvailable(String),
+    #[error("{source}")]
+    ValueAdapterFallback {
+        #[source]
+        source: Box<CodeGenError>,
+        report: Box<ghostscope_dwarf::ValueAdapterReport>,
+    },
     #[error("Trace context error: {0}")]
     TraceContext(#[from] ghostscope_protocol::TraceContextOverflow),
 }
