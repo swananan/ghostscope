@@ -2,10 +2,9 @@ use super::DwarfAnalyzer;
 use crate::{
     indexable_element_layout, member_layout, semantics::PlanError, strip_type_aliases,
     CompilationUnitMetadata, CuId, MemberLayout, ModuleId, PcContext, ProjectedValueRead,
-    ProjectedValueStep, ProjectedViewField, ProjectedViewFieldCapture, ResolvedType, Result,
-    SemanticType, StructMember, TypeId, TypeIdentity, TypeInfo, TypeLayoutError, TypeOrigin,
-    TypeProjection, TypeProjectionLayout, ValueAdapterOutcome, ValueAdapterReport,
-    ValueAdapterStage, ValueCapturePlan, ValueReadPlan, VariableAccessSegment, VariableReadPlan,
+    ProjectedValueStep, ResolvedType, Result, SemanticType, TypeId, TypeIdentity, TypeInfo,
+    TypeLayoutError, TypeOrigin, TypeProjection, TypeProjectionLayout, ValueAdapterOutcome,
+    ValueAdapterReport, ValueAdapterStage, ValueReadPlan, VariableAccessSegment, VariableReadPlan,
 };
 use std::path::Path;
 
@@ -295,6 +294,7 @@ impl DwarfAnalyzer {
                 tracing::debug!(
                     target: "ghostscope_dwarf::value_adapter",
                     adapter = report.adapter.as_deref().unwrap_or("unknown"),
+                    source_language = ?report.source_language,
                     type_name = report.type_name,
                     qualified_type_name = ?report.qualified_type_name,
                     producer = ?report.producer.as_ref().map(|producer| producer.raw.as_str()),
@@ -302,7 +302,7 @@ impl DwarfAnalyzer {
                     dwarf_version = ?report.dwarf_version,
                     ?stage,
                     %reason,
-                    "Rust value adapter rejected target DWARF; using DWARF presentation"
+                    "Source-language value adapter rejected target DWARF; using DWARF presentation"
                 );
                 Ok(None)
             }
@@ -358,7 +358,12 @@ impl DwarfAnalyzer {
             }
         };
         report.adapter = Some(adapter.to_string());
-        report.outcome = match self.build_value_read_plan(current, type_module_path, layout)? {
+        report.outcome = match crate::language::build_value_read_plan(
+            self,
+            current,
+            type_module_path,
+            layout,
+        )? {
             Some(plan) => ValueAdapterOutcome::Applied {
                 plan: Box::new(plan),
             },
@@ -373,297 +378,6 @@ impl DwarfAnalyzer {
             },
         };
         Ok(report)
-    }
-
-    fn build_value_read_plan(
-        &self,
-        current: &ResolvedType,
-        type_module_path: Option<&Path>,
-        layout: crate::language::ValueLayout,
-    ) -> Result<Option<ValueReadPlan>> {
-        let layout = match layout {
-            crate::language::ValueLayout::ProjectedValue {
-                value_path,
-                presentation,
-            } => {
-                let value =
-                    self.project_resolved_member_path(current, &value_path, type_module_path)?;
-                let presentation = match presentation {
-                    crate::language::ProjectedValuePresentation::Transparent => {
-                        crate::ValuePresentation::Dwarf
-                    }
-                    crate::language::ProjectedValuePresentation::SingleField {
-                        type_name,
-                        field_name,
-                    } => crate::ValuePresentation::SingleField {
-                        type_name: type_name.to_string(),
-                        field_name: field_name.to_string(),
-                    },
-                };
-                return Ok(Some(ValueReadPlan {
-                    presentation,
-                    capture: ValueCapturePlan::ProjectedValue { value },
-                }));
-            }
-            crate::language::ValueLayout::ProjectedStruct(layout) => {
-                let root_size = current.summary.size();
-                let mut members = Vec::with_capacity(layout.fields.len());
-                for field in layout.fields {
-                    let projected = self.project_resolved_member_path(
-                        current,
-                        &field.value_path,
-                        type_module_path,
-                    )?;
-                    let TypeProjectionLayout::Member { offset } = projected.layout else {
-                        return Err(anyhow::anyhow!(
-                            "semantic struct field produced a non-member projection"
-                        ));
-                    };
-                    let member_type = projected.resolved_type.summary;
-                    let member_end = offset
-                        .checked_add(member_type.size())
-                        .ok_or_else(|| anyhow::anyhow!("semantic struct field end overflow"))?;
-                    if member_end > root_size {
-                        return Err(anyhow::anyhow!(
-                            "semantic struct field '{}' exceeds its DWARF root",
-                            field.name
-                        ));
-                    }
-                    members.push(StructMember {
-                        name: field.name.to_string(),
-                        member_type,
-                        offset,
-                        bit_offset: None,
-                        bit_size: None,
-                    });
-                }
-                let presentation = projected_struct_presentation(layout.presentation);
-                let output_type = TypeInfo::StructType {
-                    name: layout.type_name.to_string(),
-                    size: root_size,
-                    members,
-                };
-                return Ok(Some(ValueReadPlan {
-                    presentation,
-                    capture: ValueCapturePlan::InlineView { output_type },
-                }));
-            }
-            crate::language::ValueLayout::CompositeStruct(layout) => {
-                let mut members = Vec::with_capacity(layout.fields.len());
-                let mut fields = Vec::with_capacity(layout.fields.len());
-                let mut output_size = 0u64;
-                for field in layout.fields {
-                    if members
-                        .iter()
-                        .any(|member: &StructMember| member.name == field.name)
-                    {
-                        return Err(anyhow::anyhow!(
-                            "duplicate semantic struct field '{}'",
-                            field.name
-                        ));
-                    }
-                    let value = self.project_resolved_value_path(
-                        current,
-                        &field.value_path,
-                        type_module_path,
-                        matches!(
-                            field.capture,
-                            crate::language::CompositeStructFieldCapture::Address
-                        ),
-                    )?;
-                    let Some(value) = value else {
-                        return Ok(None);
-                    };
-                    let (member_type, capture) = match field.capture {
-                        crate::language::CompositeStructFieldCapture::Value(requirement) => {
-                            if !projected_value_satisfies(requirement, &value) {
-                                return Ok(None);
-                            }
-                            (
-                                value.resolved_type.summary.clone(),
-                                ProjectedViewFieldCapture::Value,
-                            )
-                        }
-                        crate::language::CompositeStructFieldCapture::Address => {
-                            let Some(member_type) = projected_address_type(&value) else {
-                                return Ok(None);
-                            };
-                            (member_type, ProjectedViewFieldCapture::Address)
-                        }
-                    };
-                    let output_offset = output_size;
-                    output_size = output_size
-                        .checked_add(member_type.size())
-                        .ok_or_else(|| anyhow::anyhow!("semantic struct size overflow"))?;
-                    members.push(StructMember {
-                        name: field.name.to_string(),
-                        member_type,
-                        offset: output_offset,
-                        bit_offset: None,
-                        bit_size: None,
-                    });
-                    fields.push(ProjectedViewField {
-                        output_offset,
-                        value,
-                        capture,
-                    });
-                }
-                let output_type = TypeInfo::StructType {
-                    name: layout.type_name.to_string(),
-                    size: output_size,
-                    members,
-                };
-                return Ok(Some(ValueReadPlan {
-                    presentation: projected_struct_presentation(layout.presentation),
-                    capture: ValueCapturePlan::ProjectedView {
-                        output_type,
-                        fields,
-                    },
-                }));
-            }
-            crate::language::ValueLayout::BTree(layout) => {
-                return crate::language::btree_value_read_plan(
-                    self,
-                    current,
-                    layout,
-                    type_module_path,
-                );
-            }
-            crate::language::ValueLayout::HashTable(layout) => {
-                return crate::language::hash_table_value_read_plan(
-                    self,
-                    current,
-                    layout,
-                    type_module_path,
-                );
-            }
-            crate::language::ValueLayout::IndirectSequence(layout) => layout,
-        };
-        let data =
-            self.project_resolved_member_path(current, &layout.data_path, type_module_path)?;
-
-        let (presentation, element_stride) = match layout.kind {
-            crate::language::IndirectSequenceKind::Utf8String => {
-                (crate::ValuePresentation::Utf8String, None)
-            }
-            crate::language::IndirectSequenceKind::ByteString
-            | crate::language::IndirectSequenceKind::OpaqueByteString => {
-                (crate::ValuePresentation::ByteString, None)
-            }
-            crate::language::IndirectSequenceKind::PointerTarget => {
-                let TypeInfo::PointerType { target_type, .. } =
-                    strip_type_aliases(&data.resolved_type.summary)
-                else {
-                    return Ok(None);
-                };
-                let element_type = target_type.as_ref().clone();
-                if matches!(
-                    strip_type_aliases(&element_type),
-                    TypeInfo::UnknownType { .. } | TypeInfo::OptimizedOut { .. }
-                ) {
-                    return Ok(None);
-                }
-                let element_stride = element_type.size();
-                (
-                    crate::ValuePresentation::Sequence {
-                        element_type: Box::new(element_type),
-                        element_stride,
-                    },
-                    Some(element_stride),
-                )
-            }
-            crate::language::IndirectSequenceKind::TypeParameter { index } => {
-                let Some(type_id) = current.identity.layout_dwarf_id() else {
-                    return Ok(None);
-                };
-                let Some(element) = self.template_type_parameter(type_id, index)? else {
-                    return Ok(None);
-                };
-                if matches!(
-                    strip_type_aliases(&element.summary),
-                    TypeInfo::UnknownType { .. } | TypeInfo::OptimizedOut { .. }
-                ) {
-                    return Ok(None);
-                }
-                let element_stride = element.summary.size();
-                (
-                    crate::ValuePresentation::Sequence {
-                        element_type: Box::new(element.summary),
-                        element_stride,
-                    },
-                    Some(element_stride),
-                )
-            }
-        };
-
-        let capture = match layout.addressing {
-            crate::language::IndirectSequenceAddressing::Contiguous { length_path } => {
-                let length =
-                    self.project_resolved_member_path(current, &length_path, type_module_path)?;
-                match element_stride {
-                    Some(element_stride) => ValueCapturePlan::IndirectSequence {
-                        data,
-                        length,
-                        element_stride,
-                    },
-                    None => ValueCapturePlan::IndirectBytes { data, length },
-                }
-            }
-            crate::language::IndirectSequenceAddressing::Ring {
-                start_path,
-                length_path,
-                length_kind,
-                capacity_path,
-            } => {
-                let Some(element_stride) = element_stride else {
-                    return Ok(None);
-                };
-                let length =
-                    self.project_resolved_member_path(current, &length_path, type_module_path)?;
-                if element_stride == 0
-                    && matches!(
-                        length_kind,
-                        crate::language::RingSequenceLengthKind::Explicit
-                    )
-                {
-                    // Physical order is unobservable for zero-sized elements.
-                    // Avoid depending on a producer-specific capacity encoding.
-                    ValueCapturePlan::IndirectSequence {
-                        data,
-                        length,
-                        element_stride,
-                    }
-                } else {
-                    let start =
-                        self.project_resolved_member_path(current, &start_path, type_module_path)?;
-                    let capacity = self.project_resolved_member_path(
-                        current,
-                        &capacity_path,
-                        type_module_path,
-                    )?;
-                    let length = Box::new(match length_kind {
-                        crate::language::RingSequenceLengthKind::Explicit => {
-                            crate::RingSequenceLength::Explicit(length)
-                        }
-                        crate::language::RingSequenceLengthKind::End => {
-                            crate::RingSequenceLength::End(length)
-                        }
-                    });
-                    ValueCapturePlan::IndirectRingSequence {
-                        data,
-                        start,
-                        length,
-                        capacity,
-                        element_stride,
-                    }
-                }
-            }
-        };
-
-        Ok(Some(ValueReadPlan {
-            presentation,
-            capture,
-        }))
     }
 
     fn project_resolved_member_path(
@@ -972,7 +686,7 @@ impl DwarfAnalyzer {
     }
 }
 
-impl crate::language::RustPlanContext for DwarfAnalyzer {
+impl crate::language::ValueAdapterContext for DwarfAnalyzer {
     fn project_type(
         &self,
         current: &ResolvedType,
@@ -989,6 +703,16 @@ impl crate::language::RustPlanContext for DwarfAnalyzer {
         type_module_path: Option<&Path>,
     ) -> Result<TypeProjection> {
         self.project_resolved_member_path(current, path, type_module_path)
+    }
+
+    fn project_value_path(
+        &self,
+        current: &ResolvedType,
+        path: &[crate::language::ProjectedPathSegment],
+        type_module_path: Option<&Path>,
+        capture_address: bool,
+    ) -> Result<Option<ProjectedValueRead>> {
+        self.project_resolved_value_path(current, path, type_module_path, capture_address)
     }
 
     fn template_type_parameter(
@@ -1049,220 +773,5 @@ impl crate::language::RustPlanContext for DwarfAnalyzer {
             )));
         }
         Ok(None)
-    }
-}
-
-fn projected_struct_presentation(
-    presentation: crate::language::ProjectedStructPresentation,
-) -> crate::ValuePresentation {
-    match presentation {
-        crate::language::ProjectedStructPresentation::SignedState {
-            state_field,
-            non_negative_label,
-            negative_label,
-        } => crate::ValuePresentation::SignedStateStruct {
-            state_field: state_field.to_string(),
-            non_negative_label: non_negative_label.to_string(),
-            negative_label: negative_label.to_string(),
-        },
-        crate::language::ProjectedStructPresentation::ReferenceCounted {
-            strong_field,
-            weak_field,
-            implicit_weak,
-        } => crate::ValuePresentation::ReferenceCountedStruct {
-            strong_field: strong_field.to_string(),
-            weak_field: weak_field.to_string(),
-            implicit_weak,
-        },
-    }
-}
-
-fn projected_address_type(value: &ProjectedValueRead) -> Option<TypeInfo> {
-    if matches!(
-        strip_type_aliases(&value.resolved_type.summary),
-        TypeInfo::UnknownType { .. } | TypeInfo::OptimizedOut { .. }
-    ) {
-        return None;
-    }
-    let pointer_size = value.steps.iter().rev().find_map(|step| match step {
-        ProjectedValueStep::Dereference { pointer_size } => Some(*pointer_size),
-        ProjectedValueStep::Member { .. } => None,
-    })?;
-    matches!(pointer_size, 4 | 8).then(|| TypeInfo::PointerType {
-        target_type: Box::new(value.resolved_type.summary.clone()),
-        size: pointer_size,
-    })
-}
-
-fn projected_value_satisfies(
-    requirement: crate::language::ProjectedValueRequirement,
-    value: &ProjectedValueRead,
-) -> bool {
-    let value_type = strip_type_aliases(&value.resolved_type.summary);
-    match requirement {
-        crate::language::ProjectedValueRequirement::KnownSizedOrZst => match value_type {
-            TypeInfo::UnknownType { .. }
-            | TypeInfo::OptimizedOut { .. }
-            | TypeInfo::ArrayType {
-                total_size: None, ..
-            } => false,
-            TypeInfo::BaseType { name, size: 0, .. } => name == "()",
-            TypeInfo::StructType { size: 0, .. }
-            | TypeInfo::UnionType { size: 0, .. }
-            | TypeInfo::ArrayType {
-                total_size: Some(0),
-                ..
-            } => true,
-            type_info => type_info.size() > 0,
-        },
-        crate::language::ProjectedValueRequirement::SignedPointerSizedInteger => {
-            let TypeInfo::BaseType { size, encoding, .. } = value_type else {
-                return false;
-            };
-            let signed = *encoding == gimli::DW_ATE_signed.0 as u16
-                || *encoding == gimli::DW_ATE_signed_char.0 as u16;
-            let pointer_size = value.steps.iter().rev().find_map(|step| match step {
-                ProjectedValueStep::Dereference { pointer_size } => Some(*pointer_size),
-                ProjectedValueStep::Member { .. } => None,
-            });
-            signed && matches!(*size, 4 | 8) && pointer_size == Some(*size)
-        }
-        crate::language::ProjectedValueRequirement::UnsignedPointerSizedInteger => {
-            let TypeInfo::BaseType { size, encoding, .. } = value_type else {
-                return false;
-            };
-            let unsigned = *encoding == gimli::DW_ATE_unsigned.0 as u16
-                || *encoding == gimli::DW_ATE_unsigned_char.0 as u16;
-            let pointer_size = value.steps.iter().rev().find_map(|step| match step {
-                ProjectedValueStep::Dereference { pointer_size } => Some(*pointer_size),
-                ProjectedValueStep::Member { .. } => None,
-            });
-            unsigned && matches!(*size, 4 | 8) && pointer_size == Some(*size)
-        }
-    }
-}
-
-#[cfg(test)]
-mod projected_value_tests {
-    use super::*;
-
-    fn projected_value(summary: TypeInfo, pointer_size: Option<u64>) -> ProjectedValueRead {
-        let steps = pointer_size
-            .map(|pointer_size| ProjectedValueStep::Dereference { pointer_size })
-            .into_iter()
-            .collect();
-        ProjectedValueRead {
-            steps,
-            resolved_type: ResolvedType::new(summary, TypeIdentity::Unknown, None),
-        }
-    }
-
-    #[test]
-    fn known_sized_requirement_distinguishes_zst_from_unknown_layout() {
-        let requirement = crate::language::ProjectedValueRequirement::KnownSizedOrZst;
-        let unit = projected_value(
-            TypeInfo::BaseType {
-                name: "()".to_string(),
-                size: 0,
-                encoding: gimli::DW_ATE_unsigned.0 as u16,
-            },
-            Some(8),
-        );
-        let unknown = projected_value(
-            TypeInfo::UnknownType {
-                name: "T".to_string(),
-            },
-            Some(8),
-        );
-
-        assert!(projected_value_satisfies(requirement, &unit));
-        assert!(!projected_value_satisfies(requirement, &unknown));
-    }
-
-    #[test]
-    fn projected_address_uses_the_dwarf_pointer_width() {
-        let target = TypeInfo::ArrayType {
-            element_type: Box::new(TypeInfo::BaseType {
-                name: "u8".to_string(),
-                size: 1,
-                encoding: gimli::DW_ATE_unsigned.0 as u16,
-            }),
-            element_count: None,
-            total_size: None,
-        };
-        let value = projected_value(target.clone(), Some(8));
-        assert_eq!(
-            projected_address_type(&value),
-            Some(TypeInfo::PointerType {
-                target_type: Box::new(target),
-                size: 8,
-            })
-        );
-        assert_eq!(
-            projected_address_type(&projected_value(value.resolved_type.summary, None)),
-            None
-        );
-    }
-
-    #[test]
-    fn signed_state_requirement_uses_dwarf_encoding_and_pointer_width() {
-        let requirement = crate::language::ProjectedValueRequirement::SignedPointerSizedInteger;
-        let signed = |size, pointer_size| {
-            projected_value(
-                TypeInfo::BaseType {
-                    name: "isize".to_string(),
-                    size,
-                    encoding: gimli::DW_ATE_signed.0 as u16,
-                },
-                pointer_size,
-            )
-        };
-        assert!(projected_value_satisfies(requirement, &signed(8, Some(8))));
-        assert!(!projected_value_satisfies(requirement, &signed(4, Some(8))));
-        assert!(!projected_value_satisfies(requirement, &signed(8, None)));
-
-        let unsigned = projected_value(
-            TypeInfo::BaseType {
-                name: "usize".to_string(),
-                size: 8,
-                encoding: gimli::DW_ATE_unsigned.0 as u16,
-            },
-            Some(8),
-        );
-        assert!(!projected_value_satisfies(requirement, &unsigned));
-    }
-
-    #[test]
-    fn unsigned_counter_requirement_uses_dwarf_encoding_and_pointer_width() {
-        let requirement = crate::language::ProjectedValueRequirement::UnsignedPointerSizedInteger;
-        let unsigned = |size, pointer_size| {
-            projected_value(
-                TypeInfo::BaseType {
-                    name: "usize".to_string(),
-                    size,
-                    encoding: gimli::DW_ATE_unsigned.0 as u16,
-                },
-                pointer_size,
-            )
-        };
-        assert!(projected_value_satisfies(
-            requirement,
-            &unsigned(8, Some(8))
-        ));
-        assert!(!projected_value_satisfies(
-            requirement,
-            &unsigned(4, Some(8))
-        ));
-        assert!(!projected_value_satisfies(requirement, &unsigned(8, None)));
-
-        let signed = projected_value(
-            TypeInfo::BaseType {
-                name: "isize".to_string(),
-                size: 8,
-                encoding: gimli::DW_ATE_signed.0 as u16,
-            },
-            Some(8),
-        );
-        assert!(!projected_value_satisfies(requirement, &signed));
     }
 }

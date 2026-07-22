@@ -1,31 +1,73 @@
 //! Source-language dispatch for semantic DWARF projections.
 
+mod adapter;
 mod rust;
 
 use crate::{semantics::PlanError, SourceLanguage, TypeOrigin, VariableAccessSegment};
+use std::path::Path;
 
-pub(crate) use rust::{
-    btree_value_read_plan, hash_table_value_read_plan, CompositeStructFieldCapture,
-    IndirectSequenceAddressing, IndirectSequenceKind, ProjectedPathSegment,
-    ProjectedStructPresentation, ProjectedValuePresentation, ProjectedValueRequirement,
-    RingSequenceLengthKind, RustPlanContext, ValueLayout, ValueLayoutResolution,
-};
+pub(crate) use adapter::{ProjectedPathSegment, ValueAdapterContext};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ValueLayout {
+    Rust(rust::ValueLayout),
+}
+
+pub(crate) type ValueLayoutResolution = adapter::ValueLayoutResolution<ValueLayout>;
+
+/// Select an adapter only after dispatching on the type's DWARF language.
+///
+/// This boundary prevents C, C++, and unknown-language values from entering
+/// Rust standard-library recognition or plan construction.
 pub(crate) fn resolve_value_layout(
     current: &crate::ResolvedType,
     dwarf_qualified_name: Option<&str>,
 ) -> ValueLayoutResolution {
-    rust::resolve_value_layout(current, dwarf_qualified_name)
+    match source_language(current) {
+        SourceLanguage::Rust => {
+            rust::resolve_value_layout(current, dwarf_qualified_name).map_layout(ValueLayout::Rust)
+        }
+        SourceLanguage::C
+        | SourceLanguage::Cpp
+        | SourceLanguage::Other(_)
+        | SourceLanguage::Unknown => ValueLayoutResolution::NotApplicable,
+    }
 }
 
 pub(crate) fn requires_dwarf_qualified_name(current: &crate::ResolvedType) -> bool {
-    rust::requires_dwarf_qualified_name(current)
+    match source_language(current) {
+        SourceLanguage::Rust => rust::requires_dwarf_qualified_name(current),
+        SourceLanguage::C
+        | SourceLanguage::Cpp
+        | SourceLanguage::Other(_)
+        | SourceLanguage::Unknown => false,
+    }
+}
+
+pub(crate) fn build_value_read_plan(
+    context: &dyn ValueAdapterContext,
+    current: &crate::ResolvedType,
+    type_module_path: Option<&Path>,
+    layout: ValueLayout,
+) -> crate::Result<Option<crate::ValueReadPlan>> {
+    match layout {
+        ValueLayout::Rust(layout) => {
+            rust::build_value_read_plan(context, current, layout, type_module_path)
+        }
+    }
 }
 
 pub(crate) fn annotate_type_info(language: SourceLanguage, type_info: &mut crate::TypeInfo) {
     if language == SourceLanguage::Rust {
         rust::annotate_type_info(type_info);
     }
+}
+
+fn source_language(current: &crate::ResolvedType) -> SourceLanguage {
+    current
+        .origin
+        .as_ref()
+        .map_or(SourceLanguage::Unknown, |origin| origin.language)
 }
 
 pub(crate) fn resolve_access_segment(
@@ -48,7 +90,7 @@ pub(crate) fn resolve_access_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CuId, ModuleId};
+    use crate::{CuId, ModuleId, ResolvedType, TypeIdentity, TypeInfo};
 
     fn origin(language: SourceLanguage) -> TypeOrigin {
         TypeOrigin {
@@ -82,5 +124,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("not supported for source language C"));
+    }
+
+    #[test]
+    fn non_rust_values_bypass_rust_adapters() {
+        let current = ResolvedType::new(
+            TypeInfo::StructType {
+                name: "&str".to_string(),
+                size: 0,
+                members: Vec::new(),
+            },
+            TypeIdentity::Unknown,
+            Some(origin(SourceLanguage::C)),
+        );
+
+        assert_eq!(
+            resolve_value_layout(&current, None),
+            ValueLayoutResolution::NotApplicable
+        );
+        assert!(!requires_dwarf_qualified_name(&current));
     }
 }
