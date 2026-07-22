@@ -335,6 +335,28 @@ GhostScope 提供了一个独立的 `dwarf-tool` 用于测试和调试 DWARF 解
 cargo build -p dwarf-tool
 ```
 
+可以让工具直接读取目标二进制，检查某个全局或静态变量的 Rust 值适配器
+选择结果；这里使用的是目标程序的 DWARF，而不是 GhostScope 自身的构建
+工具链：
+
+```bash
+cargo run -p dwarf-tool -- \
+  -t ./target/debug/my-program \
+  rust-adapter MY_GLOBAL
+```
+
+报告包含重建后的完整类型名、源语言、`DW_AT_producer`、解析出的 rustc
+版本、DWARF 版本、适配器和采集计划。`rejected` 会指出失败发生在目标布局
+校验还是读取计划构建阶段，并说明未满足的 DWARF 约束。`--json` 可输出
+机器可读结果。如果适配器被拒绝后普通 DWARF 回退也失败，CLI 和 TUI
+原有的编译失败结果会直接包含同一份诊断。成功的保守回退保持静默，只通过
+`ghostscope_dwarf::value_adapter` debug target 输出详细信息：
+
+```bash
+RUST_LOG=ghostscope_dwarf::value_adapter=debug \
+  cargo run -p ghostscope -- --log ...
+```
+
 ### Debug 输出文件
 
 ```bash

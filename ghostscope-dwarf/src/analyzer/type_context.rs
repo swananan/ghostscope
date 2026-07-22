@@ -4,8 +4,8 @@ use crate::{
     CompilationUnitMetadata, CuId, MemberLayout, ModuleId, PcContext, ProjectedValueRead,
     ProjectedValueStep, ProjectedViewField, ProjectedViewFieldCapture, ResolvedType, Result,
     SemanticType, StructMember, TypeId, TypeIdentity, TypeInfo, TypeLayoutError, TypeOrigin,
-    TypeProjection, TypeProjectionLayout, ValueCapturePlan, ValueReadPlan, VariableAccessSegment,
-    VariableReadPlan,
+    TypeProjection, TypeProjectionLayout, ValueAdapterOutcome, ValueAdapterReport,
+    ValueAdapterStage, ValueCapturePlan, ValueReadPlan, VariableAccessSegment, VariableReadPlan,
 };
 use std::path::Path;
 
@@ -287,6 +287,38 @@ impl DwarfAnalyzer {
         current: &ResolvedType,
         type_module_path: Option<&Path>,
     ) -> Result<Option<ValueReadPlan>> {
+        let report = self.explain_value_read_plan(current, type_module_path)?;
+        match report.outcome {
+            ValueAdapterOutcome::NotApplicable => Ok(None),
+            ValueAdapterOutcome::Applied { plan } => Ok(Some(*plan)),
+            ValueAdapterOutcome::Rejected { stage, reason } => {
+                tracing::debug!(
+                    target: "ghostscope_dwarf::value_adapter",
+                    adapter = report.adapter.as_deref().unwrap_or("unknown"),
+                    type_name = report.type_name,
+                    qualified_type_name = ?report.qualified_type_name,
+                    producer = ?report.producer.as_ref().map(|producer| producer.raw.as_str()),
+                    rustc_version = ?report.rustc_version,
+                    dwarf_version = ?report.dwarf_version,
+                    ?stage,
+                    %reason,
+                    "Rust value adapter rejected target DWARF; using DWARF presentation"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Explain whether a source-language adapter can present this value.
+    ///
+    /// A rejected report is a normal, conservative fallback rather than an
+    /// analysis error. Producer metadata is included only to aid debugging;
+    /// target DWARF remains the source of layout truth.
+    pub fn explain_value_read_plan(
+        &self,
+        current: &ResolvedType,
+        type_module_path: Option<&Path>,
+    ) -> Result<ValueAdapterReport> {
         let qualified_name = match (
             crate::language::requires_dwarf_qualified_name(current),
             current.identity.layout_dwarf_id(),
@@ -294,11 +326,61 @@ impl DwarfAnalyzer {
             (true, Some(type_id)) => self.qualified_type_name(type_id)?,
             _ => None,
         };
-        let Some(layout) =
-            crate::language::resolve_value_layout(current, qualified_name.as_deref())
-        else {
-            return Ok(None);
+        let origin = current.origin.as_ref();
+        let mut report = ValueAdapterReport {
+            source_language: origin
+                .map(|origin| origin.language)
+                .unwrap_or(crate::SourceLanguage::Unknown),
+            type_name: current.summary.type_name(),
+            qualified_type_name: qualified_name,
+            adapter: None,
+            producer: origin.and_then(|origin| origin.producer.clone()),
+            rustc_version: origin.and_then(TypeOrigin::rustc_version),
+            dwarf_version: origin.map(|origin| origin.dwarf_version),
+            outcome: ValueAdapterOutcome::NotApplicable,
         };
+
+        let (adapter, layout) = match crate::language::resolve_value_layout(
+            current,
+            report.qualified_type_name.as_deref(),
+        ) {
+            crate::language::ValueLayoutResolution::NotApplicable => return Ok(report),
+            crate::language::ValueLayoutResolution::Rejected { adapter, reason } => {
+                report.adapter = Some(adapter.to_string());
+                report.outcome = ValueAdapterOutcome::Rejected {
+                    stage: ValueAdapterStage::LayoutValidation,
+                    reason: reason.to_string(),
+                };
+                return Ok(report);
+            }
+            crate::language::ValueLayoutResolution::Applied { adapter, layout } => {
+                (adapter, layout)
+            }
+        };
+        report.adapter = Some(adapter.to_string());
+        report.outcome = match self.build_value_read_plan(current, type_module_path, layout)? {
+            Some(plan) => ValueAdapterOutcome::Applied {
+                plan: Box::new(plan),
+            },
+            None => ValueAdapterOutcome::Rejected {
+                stage: ValueAdapterStage::ReadPlanConstruction,
+                reason: concat!(
+                    "validated root layout could not form a capture plan because ",
+                    "a dependent template type, projection, pointer target, width, ",
+                    "or alignment was unavailable or inconsistent in target DWARF"
+                )
+                .to_string(),
+            },
+        };
+        Ok(report)
+    }
+
+    fn build_value_read_plan(
+        &self,
+        current: &ResolvedType,
+        type_module_path: Option<&Path>,
+        layout: crate::language::ValueLayout,
+    ) -> Result<Option<ValueReadPlan>> {
         let layout = match layout {
             crate::language::ValueLayout::ProjectedValue {
                 value_path,

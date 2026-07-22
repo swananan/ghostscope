@@ -199,3 +199,33 @@ async fn test_rust_lookup_functions_and_globals() -> anyhow::Result<()> {
     let _ = guard.0.kill().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn test_rust_adapter_diagnostics_from_target_dwarf() -> anyhow::Result<()> {
+    let bin = build_rust_fixture("rust_global_program");
+
+    let applied = run_dwarf_tool_text(&bin, "rust-adapter", &["G_OWNED_MESSAGE", "--json"]).await?;
+    let applied: serde_json::Value = serde_json::from_str(&applied)?;
+    assert_eq!(applied["source_language"], "Rust");
+    assert_eq!(applied["qualified_type_name"], "alloc::string::String");
+    assert_eq!(applied["adapter"], "String");
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["presentation"], "utf8-string");
+    assert_eq!(applied["capture"], "indirect-bytes");
+    assert!(applied["producer"]
+        .as_str()
+        .is_some_and(|producer| producer.contains("rustc version")));
+    assert!(applied["rustc_version"].as_str().is_some());
+
+    let lookalike = run_dwarf_tool_text(&bin, "rust-adapter", &["G_USER_STRING", "--json"]).await?;
+    let lookalike: serde_json::Value = serde_json::from_str(&lookalike)?;
+    assert_eq!(lookalike["source_language"], "Rust");
+    assert_eq!(
+        lookalike["qualified_type_name"],
+        "rust_global_program::user_types::String"
+    );
+    assert_eq!(lookalike["adapter"], serde_json::Value::Null);
+    assert_eq!(lookalike["status"], "not-applicable");
+
+    Ok(())
+}

@@ -343,6 +343,30 @@ GhostScope provides a standalone `dwarf-tool` for testing and debugging DWARF pa
 cargo build -p dwarf-tool
 ```
 
+To inspect Rust value-adapter selection for a global or static variable, point
+the tool at the target binary rather than GhostScope's own build toolchain:
+
+```bash
+cargo run -p dwarf-tool -- \
+  -t ./target/debug/my-program \
+  rust-adapter MY_GLOBAL
+```
+
+The report includes the reconstructed qualified type name, source language,
+`DW_AT_producer`, parsed rustc version, DWARF version, selected adapter, and
+capture plan. A `rejected` result identifies whether target-layout validation
+or read-plan construction failed and describes the unmet DWARF constraints.
+Use `--json` for machine-readable output. If a rejected adapter is followed by
+a failed ordinary DWARF fallback, the normal CLI and TUI compilation failure
+includes the same diagnostic. Successful conservative fallbacks remain quiet
+and emit details only through the `ghostscope_dwarf::value_adapter` debug
+target:
+
+```bash
+RUST_LOG=ghostscope_dwarf::value_adapter=debug \
+  cargo run -p ghostscope -- --log ...
+```
+
 ### Debug Output Files
 
 ```bash

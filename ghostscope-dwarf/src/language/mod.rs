@@ -8,13 +8,13 @@ pub(crate) use rust::{
     btree_value_read_plan, hash_table_value_read_plan, CompositeStructFieldCapture,
     IndirectSequenceAddressing, IndirectSequenceKind, ProjectedPathSegment,
     ProjectedStructPresentation, ProjectedValuePresentation, ProjectedValueRequirement,
-    RingSequenceLengthKind, RustPlanContext, ValueLayout,
+    RingSequenceLengthKind, RustPlanContext, ValueLayout, ValueLayoutResolution,
 };
 
 pub(crate) fn resolve_value_layout(
     current: &crate::ResolvedType,
     dwarf_qualified_name: Option<&str>,
-) -> Option<ValueLayout> {
+) -> ValueLayoutResolution {
     rust::resolve_value_layout(current, dwarf_qualified_name)
 }
 

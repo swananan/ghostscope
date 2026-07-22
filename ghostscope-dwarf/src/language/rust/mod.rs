@@ -7,7 +7,7 @@ pub(crate) use plan::{btree_value_read_plan, hash_table_value_read_plan, RustPla
 pub(crate) use value::{
     CompositeStructFieldCapture, IndirectSequenceAddressing, IndirectSequenceKind,
     ProjectedPathSegment, ProjectedStructPresentation, ProjectedValuePresentation,
-    ProjectedValueRequirement, RingSequenceLengthKind, ValueLayout,
+    ProjectedValueRequirement, RingSequenceLengthKind, ValueLayout, ValueLayoutResolution,
 };
 
 pub(super) fn resolve_tuple_index(index: u32) -> crate::VariableAccessSegment {
@@ -21,8 +21,8 @@ pub(super) fn annotate_type_info(type_info: &mut crate::TypeInfo) {
 pub(super) fn resolve_value_layout(
     current: &crate::ResolvedType,
     dwarf_qualified_name: Option<&str>,
-) -> Option<ValueLayout> {
-    value::resolve_value_layout(current, dwarf_qualified_name)
+) -> ValueLayoutResolution {
+    value::diagnose_value_layout(current, dwarf_qualified_name)
 }
 
 pub(super) fn requires_dwarf_qualified_name(current: &crate::ResolvedType) -> bool {

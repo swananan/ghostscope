@@ -292,6 +292,12 @@ fn btree_capture_limits(
     Ok((max_nodes, max_len, data_len))
 }
 
+#[derive(Default)]
+struct SemanticValueResolution {
+    plan: Option<ghostscope_dwarf::ValueReadPlan>,
+    rejection: Option<ghostscope_dwarf::ValueAdapterReport>,
+}
+
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(super) const UNKNOWN_CHAR_ARRAY_READ_FALLBACK: usize = 256;
 
@@ -299,13 +305,42 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         &self,
         resolved_type: &ghostscope_dwarf::ResolvedType,
         type_module_path: Option<&std::path::Path>,
-    ) -> Result<Option<ghostscope_dwarf::ValueReadPlan>> {
+    ) -> Result<SemanticValueResolution> {
         let Some(analyzer) = self.process_analyzer else {
-            return Ok(None);
+            return Ok(SemanticValueResolution::default());
         };
-        analyzer
-            .value_read_plan(resolved_type, type_module_path)
-            .map_err(|error| CodeGenError::DwarfError(error.to_string()))
+        let report = analyzer
+            .explain_value_read_plan(resolved_type, type_module_path)
+            .map_err(|error| CodeGenError::DwarfError(error.to_string()))?;
+        match &report.outcome {
+            ghostscope_dwarf::ValueAdapterOutcome::NotApplicable => {
+                Ok(SemanticValueResolution::default())
+            }
+            ghostscope_dwarf::ValueAdapterOutcome::Applied { plan } => {
+                Ok(SemanticValueResolution {
+                    plan: Some((**plan).clone()),
+                    rejection: None,
+                })
+            }
+            ghostscope_dwarf::ValueAdapterOutcome::Rejected { stage, reason } => {
+                debug!(
+                    target: "ghostscope_dwarf::value_adapter",
+                    adapter = report.adapter.as_deref().unwrap_or("unknown"),
+                    type_name = report.type_name,
+                    qualified_type_name = ?report.qualified_type_name,
+                    producer = ?report.producer.as_ref().map(|producer| producer.raw.as_str()),
+                    rustc_version = ?report.rustc_version,
+                    dwarf_version = ?report.dwarf_version,
+                    ?stage,
+                    %reason,
+                    "Rust value adapter rejected target DWARF; using DWARF presentation"
+                );
+                Ok(SemanticValueResolution {
+                    plan: None,
+                    rejection: Some(report),
+                })
+            }
+        }
     }
 
     fn complex_arg_from_value_read_plan(
@@ -621,7 +656,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         display_name: Option<String>,
     ) -> Result<ComplexArg<'ctx>> {
         let pc_address = self.get_compile_time_context()?.pc_address;
-        let semantic_plan = if let Some(analyzer) = self.process_analyzer {
+        let semantic_resolution = if let Some(analyzer) = self.process_analyzer {
             let resolved_type = analyzer
                 .resolved_type_for_plan(&plan)
                 .map_err(|error| CodeGenError::DwarfError(error.to_string()))?;
@@ -629,239 +664,252 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 Some(resolved_type) => {
                     self.semantic_value_read_plan(&resolved_type, plan.module_path.as_deref())?
                 }
-                None => None,
+                None => SemanticValueResolution::default(),
             }
         } else {
-            None
+            SemanticValueResolution::default()
         };
-        let materialized = self.variable_read_plan_to_materialization(plan, pc_address)?;
-        let display_name = display_name.unwrap_or_else(|| materialized.name.clone());
+        let SemanticValueResolution {
+            plan: semantic_plan,
+            rejection,
+        } = semantic_resolution;
+        let fallback_result = (|| {
+            let materialized = self.variable_read_plan_to_materialization(plan, pc_address)?;
+            let display_name = display_name.unwrap_or_else(|| materialized.name.clone());
 
-        match &materialized.materialization {
-            ghostscope_dwarf::VariableMaterialization::Unavailable {
-                availability: ghostscope_dwarf::Availability::OptimizedOut,
-            } => {
-                let optimized_type = ghostscope_dwarf::TypeInfo::OptimizedOut {
-                    name: materialized.name.clone(),
-                };
-                Ok(ComplexArg {
-                    var_name_index: self.trace_context.add_variable_name(display_name)?,
-                    type_index: self.trace_context.add_type(optimized_type)?,
-                    access_path: Vec::new(),
-                    data_len: 0,
-                    source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
-                })
-            }
-            ghostscope_dwarf::VariableMaterialization::Unavailable { availability } => {
-                Err(Self::dwarf_expression_unavailable_error(
-                    &materialized.name,
-                    availability,
-                    pc_address,
-                ))
-            }
-            ghostscope_dwarf::VariableMaterialization::UserMemoryRead { address } => {
-                let dwarf_type = materialized.dwarf_type.clone().ok_or_else(|| {
-                    CodeGenError::DwarfError(
-                        "Expression has no DWARF type information".to_string(),
-                    )
-                })?;
-                let module_hint =
-                    Self::module_path_for_offsets(materialized.module_path.as_deref());
-                if let Some(semantic_plan) = semantic_plan {
-                    let descriptor =
-                        self.resolve_planned_address(address, None, module_hint.as_deref())?;
-                    return self.complex_arg_from_value_read_plan(
-                        display_name,
-                        dwarf_type,
-                        descriptor,
-                        semantic_plan,
-                    );
+            match &materialized.materialization {
+                ghostscope_dwarf::VariableMaterialization::Unavailable {
+                    availability: ghostscope_dwarf::Availability::OptimizedOut,
+                } => {
+                    let optimized_type = ghostscope_dwarf::TypeInfo::OptimizedOut {
+                        name: materialized.name.clone(),
+                    };
+                    Ok(ComplexArg {
+                        var_name_index: self.trace_context.add_variable_name(display_name)?,
+                        type_index: self.trace_context.add_type(optimized_type)?,
+                        access_path: Vec::new(),
+                        data_len: 0,
+                        source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
+                    })
                 }
-                let data_len = Self::compute_read_size_for_type(&dwarf_type);
-                if data_len == 0 {
-                    return Err(CodeGenError::TypeSizeNotAvailable(display_name));
+                ghostscope_dwarf::VariableMaterialization::Unavailable { availability } => {
+                    Err(Self::dwarf_expression_unavailable_error(
+                        &materialized.name,
+                        availability,
+                        pc_address,
+                    ))
                 }
-                Ok(ComplexArg {
-                    var_name_index: self.trace_context.add_variable_name(display_name)?,
-                    type_index: self.trace_context.add_type(dwarf_type.clone())?,
-                    access_path: Vec::new(),
-                    data_len,
-                    source: ComplexArgSource::RuntimeRead {
-                        address: address.clone(),
-                        dwarf_type,
-                        module_for_offsets: module_hint,
-                    },
-                })
-            }
-            ghostscope_dwarf::VariableMaterialization::DirectValue { .. } => {
-                let dwarf_type = materialized.dwarf_type.clone().ok_or_else(|| {
-                    CodeGenError::DwarfError(
-                        "Expression has no DWARF type information".to_string(),
-                    )
-                })?;
-                if let Some(ghostscope_dwarf::ValueReadPlan {
-                    presentation,
-                    capture:
-                        ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value: projected },
-                }) = semantic_plan.as_ref()
-                {
-                    let projected_type = &projected.resolved_type.summary;
-                    if Self::compute_read_size_for_type(projected_type) == 0
-                        && is_known_zero_sized_type(projected_type)
-                    {
-                        return Ok(ComplexArg {
-                            var_name_index: self
-                                .trace_context
-                                .add_variable_name(display_name)?,
-                            type_index: self.trace_context.add_type_with_presentation(
-                                projected_type.clone(),
-                                presentation.clone(),
-                            )?,
-                            access_path: Vec::new(),
-                            data_len: 0,
-                            source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
-                        });
+                ghostscope_dwarf::VariableMaterialization::UserMemoryRead { address } => {
+                    let dwarf_type = materialized.dwarf_type.clone().ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "Expression has no DWARF type information".to_string(),
+                        )
+                    })?;
+                    let module_hint =
+                        Self::module_path_for_offsets(materialized.module_path.as_deref());
+                    if let Some(semantic_plan) = semantic_plan {
+                        let descriptor =
+                            self.resolve_planned_address(address, None, module_hint.as_deref())?;
+                        return self.complex_arg_from_value_read_plan(
+                            display_name,
+                            dwarf_type,
+                            descriptor,
+                            semantic_plan,
+                        );
                     }
-                }
-                if let Some(ghostscope_dwarf::ValueReadPlan {
-                    presentation,
-                    capture:
-                        ghostscope_dwarf::ValueCapturePlan::InlineView { output_type },
-                }) = semantic_plan.as_ref()
-                {
-                    let data_len = inline_view_data_len(&dwarf_type, output_type)?;
+                    let data_len = Self::compute_read_size_for_type(&dwarf_type);
                     if data_len == 0 {
-                        return Ok(ComplexArg {
-                            var_name_index: self
-                                .trace_context
-                                .add_variable_name(display_name)?,
-                            type_index: self.trace_context.add_type_with_presentation(
-                                output_type.clone(),
-                                presentation.clone(),
-                            )?,
-                            access_path: Vec::new(),
-                            data_len: 0,
-                            source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
-                        });
+                        return Err(CodeGenError::TypeSizeNotAvailable(display_name));
                     }
+                    Ok(ComplexArg {
+                        var_name_index: self.trace_context.add_variable_name(display_name)?,
+                        type_index: self.trace_context.add_type(dwarf_type.clone())?,
+                        access_path: Vec::new(),
+                        data_len,
+                        source: ComplexArgSource::RuntimeRead {
+                            address: address.clone(),
+                            dwarf_type,
+                            module_for_offsets: module_hint,
+                        },
+                    })
                 }
-                let value =
-                    self.variable_materialization_to_llvm_value(&materialized, pc_address, None)?;
-                let value = match value {
-                    BasicValueEnum::IntValue(value) => value,
-                    BasicValueEnum::PointerValue(value) => self
-                        .builder
-                        .build_ptr_to_int(value, self.context.i64_type(), "direct_ptr_to_i64")
-                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
-                    _ => {
-                        return Err(CodeGenError::DwarfError(format!(
-                            "direct DWARF value '{}' did not lower to an integer",
-                            materialized.name
-                        )))
+                ghostscope_dwarf::VariableMaterialization::DirectValue { .. } => {
+                    let dwarf_type = materialized.dwarf_type.clone().ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "Expression has no DWARF type information".to_string(),
+                        )
+                    })?;
+                    if let Some(ghostscope_dwarf::ValueReadPlan {
+                        presentation,
+                        capture:
+                            ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value: projected },
+                    }) = semantic_plan.as_ref()
+                    {
+                        let projected_type = &projected.resolved_type.summary;
+                        if Self::compute_read_size_for_type(projected_type) == 0
+                            && is_known_zero_sized_type(projected_type)
+                        {
+                            return Ok(ComplexArg {
+                                var_name_index: self
+                                    .trace_context
+                                    .add_variable_name(display_name)?,
+                                type_index: self.trace_context.add_type_with_presentation(
+                                    projected_type.clone(),
+                                    presentation.clone(),
+                                )?,
+                                access_path: Vec::new(),
+                                data_len: 0,
+                                source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
+                            });
+                        }
                     }
-                };
-                if let Some(semantic_plan) = semantic_plan {
-                    match semantic_plan.capture {
-                        ghostscope_dwarf::ValueCapturePlan::ProjectedValue {
-                            value: projected,
-                        } => {
-                            let offset =
-                                projected_member_offset(&projected, "projected value")?;
-                            let projected_type = projected.resolved_type.summary;
-                            let data_len = Self::compute_read_size_for_type(&projected_type);
-                            let container_len = Self::compute_read_size_for_type(&dwarf_type);
-                            let projected_end = usize::try_from(offset)
-                                .ok()
-                                .and_then(|offset| offset.checked_add(data_len));
-                            if data_len == 0
-                                || data_len > 8
-                                || projected_end
-                                    .is_none_or(|end| end > container_len || end > 8)
-                            {
-                                return Err(CodeGenError::DwarfError(format!(
-                                    "direct semantic projection for '{}' does not fit one eBPF register",
-                                    materialized.name
-                                )));
-                            }
-                            let value = if offset == 0 {
-                                value
-                            } else {
-                                let shift = value.get_type().const_int(offset * 8, false);
-                                self.builder
-                                    .build_right_shift(
-                                        value,
-                                        shift,
-                                        false,
-                                        "semantic_projected_direct_value",
-                                    )
-                                    .map_err(|error| {
-                                        CodeGenError::Builder(error.to_string())
-                                    })?
-                            };
+                    if let Some(ghostscope_dwarf::ValueReadPlan {
+                        presentation,
+                        capture:
+                            ghostscope_dwarf::ValueCapturePlan::InlineView { output_type },
+                    }) = semantic_plan.as_ref()
+                    {
+                        let data_len = inline_view_data_len(&dwarf_type, output_type)?;
+                        if data_len == 0 {
                             return Ok(ComplexArg {
                                 var_name_index: self
                                     .trace_context
                                     .add_variable_name(display_name)?,
                                 type_index: self.trace_context.add_type_with_presentation(
-                                    projected_type,
-                                    semantic_plan.presentation,
+                                    output_type.clone(),
+                                    presentation.clone(),
                                 )?,
                                 access_path: Vec::new(),
-                                data_len,
-                                source: ComplexArgSource::ComputedInt {
-                                    value,
-                                    byte_len: data_len,
-                                },
+                                data_len: 0,
+                                source: ComplexArgSource::ImmediateBytes { bytes: Vec::new() },
                             });
                         }
-                        ghostscope_dwarf::ValueCapturePlan::InlineView { output_type } => {
-                            let data_len = inline_view_data_len(&dwarf_type, &output_type)?;
-                            if data_len == 0 || data_len > 8 {
-                                return Err(CodeGenError::DwarfError(format!(
-                                    "direct semantic view for '{}' does not fit one eBPF register",
-                                    materialized.name
-                                )));
-                            }
-                            return Ok(ComplexArg {
-                                var_name_index: self
-                                    .trace_context
-                                    .add_variable_name(display_name)?,
-                                type_index: self.trace_context.add_type_with_presentation(
-                                    output_type,
-                                    semantic_plan.presentation,
-                                )?,
-                                access_path: Vec::new(),
-                                data_len,
-                                source: ComplexArgSource::ComputedInt {
-                                    value,
-                                    byte_len: data_len,
-                                },
-                            });
-                        }
-                        ghostscope_dwarf::ValueCapturePlan::ProjectedView { .. } => {
+                    }
+                    let value =
+                        self.variable_materialization_to_llvm_value(&materialized, pc_address, None)?;
+                    let value = match value {
+                        BasicValueEnum::IntValue(value) => value,
+                        BasicValueEnum::PointerValue(value) => self
+                            .builder
+                            .build_ptr_to_int(value, self.context.i64_type(), "direct_ptr_to_i64")
+                            .map_err(|e| CodeGenError::Builder(e.to_string()))?,
+                        _ => {
                             return Err(CodeGenError::DwarfError(format!(
-                                "direct semantic view for '{}' requires an address-backed root",
+                                "direct DWARF value '{}' did not lower to an integer",
                                 materialized.name
-                            )));
+                            )))
                         }
-                        _ => {}
+                    };
+                    if let Some(semantic_plan) = semantic_plan {
+                        match semantic_plan.capture {
+                            ghostscope_dwarf::ValueCapturePlan::ProjectedValue {
+                                value: projected,
+                            } => {
+                                let offset =
+                                    projected_member_offset(&projected, "projected value")?;
+                                let projected_type = projected.resolved_type.summary;
+                                let data_len = Self::compute_read_size_for_type(&projected_type);
+                                let container_len = Self::compute_read_size_for_type(&dwarf_type);
+                                let projected_end = usize::try_from(offset)
+                                    .ok()
+                                    .and_then(|offset| offset.checked_add(data_len));
+                                if data_len == 0
+                                    || data_len > 8
+                                    || projected_end
+                                        .is_none_or(|end| end > container_len || end > 8)
+                                {
+                                    return Err(CodeGenError::DwarfError(format!(
+                                        "direct semantic projection for '{}' does not fit one eBPF register",
+                                        materialized.name
+                                    )));
+                                }
+                                let value = if offset == 0 {
+                                    value
+                                } else {
+                                    let shift = value.get_type().const_int(offset * 8, false);
+                                    self.builder
+                                        .build_right_shift(
+                                            value,
+                                            shift,
+                                            false,
+                                            "semantic_projected_direct_value",
+                                        )
+                                        .map_err(|error| {
+                                            CodeGenError::Builder(error.to_string())
+                                        })?
+                                };
+                                return Ok(ComplexArg {
+                                    var_name_index: self
+                                        .trace_context
+                                        .add_variable_name(display_name)?,
+                                    type_index: self.trace_context.add_type_with_presentation(
+                                        projected_type,
+                                        semantic_plan.presentation,
+                                    )?,
+                                    access_path: Vec::new(),
+                                    data_len,
+                                    source: ComplexArgSource::ComputedInt {
+                                        value,
+                                        byte_len: data_len,
+                                    },
+                                });
+                            }
+                            ghostscope_dwarf::ValueCapturePlan::InlineView { output_type } => {
+                                let data_len = inline_view_data_len(&dwarf_type, &output_type)?;
+                                if data_len == 0 || data_len > 8 {
+                                    return Err(CodeGenError::DwarfError(format!(
+                                        "direct semantic view for '{}' does not fit one eBPF register",
+                                        materialized.name
+                                    )));
+                                }
+                                return Ok(ComplexArg {
+                                    var_name_index: self
+                                        .trace_context
+                                        .add_variable_name(display_name)?,
+                                    type_index: self.trace_context.add_type_with_presentation(
+                                        output_type,
+                                        semantic_plan.presentation,
+                                    )?,
+                                    access_path: Vec::new(),
+                                    data_len,
+                                    source: ComplexArgSource::ComputedInt {
+                                        value,
+                                        byte_len: data_len,
+                                    },
+                                });
+                            }
+                            ghostscope_dwarf::ValueCapturePlan::ProjectedView { .. } => {
+                                return Err(CodeGenError::DwarfError(format!(
+                                    "direct semantic view for '{}' requires an address-backed root",
+                                    materialized.name
+                                )));
+                            }
+                            _ => {}
+                        }
                     }
+                    let data_len = Self::compute_read_size_for_type(&dwarf_type).clamp(1, 8);
+                    Ok(ComplexArg {
+                        var_name_index: self.trace_context.add_variable_name(display_name)?,
+                        type_index: self.trace_context.add_type(dwarf_type)?,
+                        access_path: Vec::new(),
+                        data_len,
+                        source: ComplexArgSource::ComputedInt { value, byte_len: data_len },
+                    })
                 }
-                let data_len = Self::compute_read_size_for_type(&dwarf_type).clamp(1, 8);
-                Ok(ComplexArg {
-                    var_name_index: self.trace_context.add_variable_name(display_name)?,
-                    type_index: self.trace_context.add_type(dwarf_type)?,
-                    access_path: Vec::new(),
-                    data_len,
-                    source: ComplexArgSource::ComputedInt { value, byte_len: data_len },
-                })
+                ghostscope_dwarf::VariableMaterialization::Composite { .. } => Err(
+                    CodeGenError::DwarfError(format!(
+                        "DWARF variable '{}' is split across pieces; piece reconstruction is not implemented",
+                        materialized.name
+                    )),
+                ),
             }
-            ghostscope_dwarf::VariableMaterialization::Composite { .. } => Err(
-                CodeGenError::DwarfError(format!(
-                    "DWARF variable '{}' is split across pieces; piece reconstruction is not implemented",
-                    materialized.name
-                )),
-            ),
+        })();
+
+        match rejection {
+            Some(report) => {
+                fallback_result.map_err(|error| error.with_value_adapter_rejection(report))
+            }
+            None => fallback_result,
         }
     }
 
@@ -870,10 +918,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         expr: &crate::script::ast::Expr,
         lvalue: crate::ebpf::expression::DynamicLvalue<'ctx>,
     ) -> Result<ComplexArg<'ctx>> {
-        if let Some(plan) = self.semantic_value_read_plan(
+        let SemanticValueResolution { plan, rejection } = self.semantic_value_read_plan(
             &lvalue.type_info.resolved_type,
             lvalue.type_info.type_module_path.as_deref(),
-        )? {
+        )?;
+        if let Some(plan) = plan {
             return self.complex_arg_from_value_read_plan(
                 self.expr_to_name(expr),
                 lvalue.type_info.resolved_type.summary,
@@ -881,24 +930,32 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 plan,
             );
         }
-        let dwarf_type = lvalue.type_info.resolved_type.summary;
-        let data_len = Self::compute_read_size_for_type(&dwarf_type);
-        if data_len == 0 {
-            return Err(CodeGenError::TypeSizeNotAvailable(self.expr_to_name(expr)));
-        }
+        let fallback_result = (|| {
+            let dwarf_type = lvalue.type_info.resolved_type.summary;
+            let data_len = Self::compute_read_size_for_type(&dwarf_type);
+            if data_len == 0 {
+                return Err(CodeGenError::TypeSizeNotAvailable(self.expr_to_name(expr)));
+            }
 
-        Ok(ComplexArg {
-            var_name_index: self
-                .trace_context
-                .add_variable_name(self.expr_to_name(expr))?,
-            type_index: self.trace_context.add_type(dwarf_type)?,
-            access_path: Vec::new(),
-            data_len,
-            source: ComplexArgSource::MemDump {
-                address: lvalue.address,
-                len: data_len,
-            },
-        })
+            Ok(ComplexArg {
+                var_name_index: self
+                    .trace_context
+                    .add_variable_name(self.expr_to_name(expr))?,
+                type_index: self.trace_context.add_type(dwarf_type)?,
+                access_path: Vec::new(),
+                data_len,
+                source: ComplexArgSource::MemDump {
+                    address: lvalue.address,
+                    len: data_len,
+                },
+            })
+        })();
+        match rejection {
+            Some(report) => {
+                fallback_result.map_err(|error| error.with_value_adapter_rejection(report))
+            }
+            None => fallback_result,
+        }
     }
 
     fn complex_arg_from_cast_expr(

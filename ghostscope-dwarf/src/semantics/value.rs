@@ -1,7 +1,7 @@
 //! Semantic capture plans for values whose source-language meaning is not
 //! represented by their physical DWARF aggregate alone.
 
-use super::TypeProjection;
+use super::{ProducerInfo, RustcVersion, SourceLanguage, TypeProjection};
 use ghostscope_protocol::ValuePresentation;
 
 /// A language-selected presentation and the physical reads needed to produce
@@ -10,6 +10,46 @@ use ghostscope_protocol::ValuePresentation;
 pub struct ValueReadPlan {
     pub presentation: ValuePresentation,
     pub capture: ValueCapturePlan,
+}
+
+/// Stage at which a recognized source-language value adapter was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueAdapterStage {
+    /// The root type did not satisfy the adapter's physical DWARF constraints.
+    LayoutValidation,
+    /// The root layout was valid, but dependent DWARF could not form a plan.
+    ReadPlanConstruction,
+}
+
+/// Result of selecting and constructing a source-language value adapter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValueAdapterOutcome {
+    /// The type is outside every known adapter identity.
+    NotApplicable,
+    /// The adapter was fully validated and produced a capture plan.
+    Applied { plan: Box<ValueReadPlan> },
+    /// The type identity matched, but its target DWARF was insufficient.
+    Rejected {
+        stage: ValueAdapterStage,
+        reason: String,
+    },
+}
+
+/// Structured explanation of source-language value adapter selection.
+///
+/// Producer information is diagnostic metadata only. An adapter is applied
+/// only after the concrete target DWARF satisfies its identity and layout
+/// constraints.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueAdapterReport {
+    pub source_language: SourceLanguage,
+    pub type_name: String,
+    pub qualified_type_name: Option<String>,
+    pub adapter: Option<String>,
+    pub producer: Option<ProducerInfo>,
+    pub rustc_version: Option<RustcVersion>,
+    pub dwarf_version: Option<u16>,
+    pub outcome: ValueAdapterOutcome,
 }
 
 /// Runtime source of a ring sequence's logical element count.

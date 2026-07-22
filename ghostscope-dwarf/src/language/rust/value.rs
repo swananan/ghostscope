@@ -18,6 +18,25 @@ pub(crate) enum ValueLayout {
     BTree(BTreeLayout),
 }
 
+/// Result of asking the Rust adapter layer for a semantic value layout.
+///
+/// Recognition establishes only a candidate type identity. `Applied` means
+/// the concrete target DWARF also passed layout validation. `Rejected` keeps
+/// identity mismatch separate from an unsafe or unsupported layout so callers
+/// can preserve the ordinary DWARF fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ValueLayoutResolution {
+    NotApplicable,
+    Applied {
+        adapter: &'static str,
+        layout: ValueLayout,
+    },
+    Rejected {
+        adapter: &'static str,
+        reason: &'static str,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectedValuePresentation {
     Transparent,
@@ -182,156 +201,304 @@ pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
     })
 }
 
+#[cfg(test)]
 pub(super) fn resolve_value_layout(
     current: &ResolvedType,
     dwarf_qualified_name: Option<&str>,
 ) -> Option<ValueLayout> {
-    if current.origin.as_ref()?.language != SourceLanguage::Rust {
-        return None;
+    match diagnose_value_layout(current, dwarf_qualified_name) {
+        ValueLayoutResolution::Applied { layout, .. } => Some(layout),
+        ValueLayoutResolution::NotApplicable | ValueLayoutResolution::Rejected { .. } => None,
+    }
+}
+
+pub(super) fn diagnose_value_layout(
+    current: &ResolvedType,
+    dwarf_qualified_name: Option<&str>,
+) -> ValueLayoutResolution {
+    if current.origin.as_ref().map(|origin| origin.language) != Some(SourceLanguage::Rust) {
+        return ValueLayoutResolution::NotApplicable;
     }
 
     // rust-gdb does not select printers from the target CU's rustc version.
     // Its wrapper adds the invoking toolchain's `lib/rustlib/etc` directory,
     // while the target only requests the generic loader through
-    // `.debug_gdb_scripts`. GhostScope may use `origin.rustc_version()` to
-    // prioritize candidates, but never as proof of a private layout: every
-    // branch below must validate type identity, member paths, offsets, and
-    // widths from the target's DWARF. Any semantic fact DWARF cannot express
-    // must be documented at the special case that relies on it.
-
+    // `.debug_gdb_scripts`. GhostScope records the producer for diagnostics,
+    // but every adapter below validates identity and physical target DWARF.
     let TypeInfo::StructType { name, .. } = strip_type_aliases(&current.summary) else {
-        return None;
+        return ValueLayoutResolution::NotApplicable;
+    };
+    let Some(adapter) = RustValueAdapter::recognize(name, dwarf_qualified_name) else {
+        return ValueLayoutResolution::NotApplicable;
     };
 
-    if is_std_btree_map(name, dwarf_qualified_name) {
-        return rust_btree_layout(&current.summary, BTreeKind::Map).map(ValueLayout::BTree);
+    match adapter.resolve(&current.summary) {
+        Some(layout) => ValueLayoutResolution::Applied {
+            adapter: adapter.name(),
+            layout,
+        },
+        None => ValueLayoutResolution::Rejected {
+            adapter: adapter.name(),
+            reason: adapter.layout_rejection_reason(),
+        },
+    }
+}
+
+/// Rust standard-library identities with optional semantic presentations.
+///
+/// Recognition selects a candidate; it never proves a physical layout.
+/// `resolve` must validate every required member, offset, and width from the
+/// target DWARF. Validation failure is a conservative rejection, and callers
+/// must retain ordinary DWARF handling rather than require an adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustValueAdapter {
+    BTreeMap,
+    BTreeSet,
+    HashMap,
+    HashSet,
+    Rc { pointee_is_str: bool },
+    Arc { pointee_is_str: bool },
+    Ref,
+    RefMut,
+    RefCell,
+    Cell,
+    NonZero,
+    PathReference,
+    StrReference,
+    SliceReference,
+    BoxStr,
+    String,
+    OsString,
+    PathBuf,
+    Vec,
+    VecDeque,
+}
+
+impl RustValueAdapter {
+    fn recognize(name: &str, dwarf_qualified_name: Option<&str>) -> Option<Self> {
+        if is_std_btree_map(name, dwarf_qualified_name) {
+            Some(Self::BTreeMap)
+        } else if is_std_btree_set(name, dwarf_qualified_name) {
+            Some(Self::BTreeSet)
+        } else if is_std_hash_map(name, dwarf_qualified_name) {
+            Some(Self::HashMap)
+        } else if is_std_hash_set(name, dwarf_qualified_name) {
+            Some(Self::HashSet)
+        } else if is_std_rc(name, dwarf_qualified_name) {
+            Some(Self::Rc {
+                pointee_is_str: has_first_generic_argument(name, "Rc", "str")
+                    || dwarf_qualified_name
+                        .is_some_and(|name| has_first_generic_argument(name, "Rc", "str")),
+            })
+        } else if is_std_arc(name, dwarf_qualified_name) {
+            Some(Self::Arc {
+                pointee_is_str: has_first_generic_argument(name, "Arc", "str")
+                    || dwarf_qualified_name
+                        .is_some_and(|name| has_first_generic_argument(name, "Arc", "str")),
+            })
+        } else if is_std_ref(name, dwarf_qualified_name) {
+            Some(Self::Ref)
+        } else if is_std_ref_mut(name, dwarf_qualified_name) {
+            Some(Self::RefMut)
+        } else if is_std_ref_cell(name, dwarf_qualified_name) {
+            Some(Self::RefCell)
+        } else if is_std_cell(name, dwarf_qualified_name) {
+            Some(Self::Cell)
+        } else if is_std_nonzero(name, dwarf_qualified_name) {
+            Some(Self::NonZero)
+        } else if is_std_path_ref_name(name) {
+            Some(Self::PathReference)
+        } else if matches!(
+            name,
+            "&str" | "&mut str" | "&'static str" | "&'static mut str"
+        ) {
+            Some(Self::StrReference)
+        } else if is_slice_name(name) {
+            Some(Self::SliceReference)
+        } else if is_std_box_str(name, dwarf_qualified_name) {
+            Some(Self::BoxStr)
+        } else if is_std_string(name, dwarf_qualified_name) {
+            Some(Self::String)
+        } else if is_std_os_string(name, dwarf_qualified_name) {
+            Some(Self::OsString)
+        } else if is_std_path_buf(name, dwarf_qualified_name) {
+            Some(Self::PathBuf)
+        } else if is_std_vec(name, dwarf_qualified_name) {
+            Some(Self::Vec)
+        } else if is_std_vec_deque(name, dwarf_qualified_name) {
+            Some(Self::VecDeque)
+        } else {
+            None
+        }
     }
 
-    if is_std_btree_set(name, dwarf_qualified_name) {
-        return rust_btree_layout(&current.summary, BTreeKind::Set).map(ValueLayout::BTree);
+    fn name(self) -> &'static str {
+        match self {
+            Self::BTreeMap => "BTreeMap",
+            Self::BTreeSet => "BTreeSet",
+            Self::HashMap => "HashMap",
+            Self::HashSet => "HashSet",
+            Self::Rc { .. } => "Rc",
+            Self::Arc { .. } => "Arc",
+            Self::Ref => "Ref",
+            Self::RefMut => "RefMut",
+            Self::RefCell => "RefCell",
+            Self::Cell => "Cell",
+            Self::NonZero => "NonZero",
+            Self::PathReference => "&Path",
+            Self::StrReference => "&str",
+            Self::SliceReference => "slice reference",
+            Self::BoxStr => "Box<str>",
+            Self::String => "String",
+            Self::OsString => "OsString",
+            Self::PathBuf => "PathBuf",
+            Self::Vec => "Vec",
+            Self::VecDeque => "VecDeque",
+        }
     }
 
-    if is_std_hash_map(name, dwarf_qualified_name) {
-        return rust_hash_table_layout(&current.summary, HashTableKind::Map)
-            .map(ValueLayout::HashTable);
-    }
-
-    if is_std_hash_set(name, dwarf_qualified_name) {
-        return rust_hash_table_layout(&current.summary, HashTableKind::Set)
-            .map(ValueLayout::HashTable);
-    }
-
-    if is_std_rc(name, dwarf_qualified_name) {
-        let pointee_is_str = has_first_generic_argument(name, "Rc", "str")
-            || dwarf_qualified_name
-                .is_some_and(|name| has_first_generic_argument(name, "Rc", "str"));
-        return rust_reference_counted_layout(&current.summary, "Rc", "value", pointee_is_str)
-            .map(ValueLayout::CompositeStruct);
-    }
-
-    if is_std_arc(name, dwarf_qualified_name) {
-        let pointee_is_str = has_first_generic_argument(name, "Arc", "str")
-            || dwarf_qualified_name
-                .is_some_and(|name| has_first_generic_argument(name, "Arc", "str"));
-        return rust_reference_counted_layout(&current.summary, "Arc", "data", pointee_is_str)
-            .map(ValueLayout::CompositeStruct);
-    }
-
-    if is_std_ref(name, dwarf_qualified_name) || is_std_ref_mut(name, dwarf_qualified_name) {
-        return rust_ref_layout(&current.summary).map(ValueLayout::CompositeStruct);
-    }
-
-    if is_std_ref_cell(name, dwarf_qualified_name) {
-        return rust_ref_cell_layout(&current.summary).map(ValueLayout::ProjectedStruct);
-    }
-
-    if is_std_cell(name, dwarf_qualified_name) {
-        return rust_cell_value_path(&current.summary).map(|value_path| {
-            ValueLayout::ProjectedValue {
-                value_path,
-                presentation: ProjectedValuePresentation::SingleField {
-                    type_name: "Cell",
-                    field_name: "value",
-                },
+    fn resolve(self, root: &TypeInfo) -> Option<ValueLayout> {
+        let layout = match self {
+            Self::BTreeMap => {
+                return rust_btree_layout(root, BTreeKind::Map).map(ValueLayout::BTree)
             }
-        });
-    }
-
-    if is_std_nonzero(name, dwarf_qualified_name) {
-        return rust_nonzero_value_path(&current.summary).map(|value_path| {
-            ValueLayout::ProjectedValue {
-                value_path,
-                presentation: ProjectedValuePresentation::Transparent,
+            Self::BTreeSet => {
+                return rust_btree_layout(root, BTreeKind::Set).map(ValueLayout::BTree)
             }
-        });
+            Self::HashMap => {
+                return rust_hash_table_layout(root, HashTableKind::Map)
+                    .map(ValueLayout::HashTable);
+            }
+            Self::HashSet => {
+                return rust_hash_table_layout(root, HashTableKind::Set)
+                    .map(ValueLayout::HashTable);
+            }
+            Self::Rc { pointee_is_str } => {
+                return rust_reference_counted_layout(root, "Rc", "value", pointee_is_str)
+                    .map(ValueLayout::CompositeStruct);
+            }
+            Self::Arc { pointee_is_str } => {
+                return rust_reference_counted_layout(root, "Arc", "data", pointee_is_str)
+                    .map(ValueLayout::CompositeStruct);
+            }
+            Self::Ref | Self::RefMut => {
+                return rust_ref_layout(root).map(ValueLayout::CompositeStruct);
+            }
+            Self::RefCell => return rust_ref_cell_layout(root).map(ValueLayout::ProjectedStruct),
+            Self::Cell => {
+                return rust_cell_value_path(root).map(|value_path| ValueLayout::ProjectedValue {
+                    value_path,
+                    presentation: ProjectedValuePresentation::SingleField {
+                        type_name: "Cell",
+                        field_name: "value",
+                    },
+                });
+            }
+            Self::NonZero => {
+                return rust_nonzero_value_path(root).map(|value_path| {
+                    ValueLayout::ProjectedValue {
+                        value_path,
+                        presentation: ProjectedValuePresentation::Transparent,
+                    }
+                });
+            }
+            Self::PathReference => validate_indirect_sequence_layout(
+                root,
+                field_path(&["data_ptr"]),
+                field_path(&["length"]),
+                IndirectSequenceKind::OpaqueByteString,
+            ),
+            Self::StrReference => validate_indirect_sequence_layout(
+                root,
+                field_path(&["data_ptr"]),
+                field_path(&["length"]),
+                IndirectSequenceKind::Utf8String,
+            ),
+            Self::SliceReference => validate_indirect_sequence_layout(
+                root,
+                field_path(&["data_ptr"]),
+                field_path(&["length"]),
+                IndirectSequenceKind::PointerTarget,
+            ),
+            Self::BoxStr => validate_indirect_sequence_layout(
+                root,
+                field_path(&["data_ptr"]),
+                field_path(&["length"]),
+                IndirectSequenceKind::Utf8String,
+            ),
+            Self::String => rust_string_layout(root),
+            Self::OsString => rust_os_string_layout(root),
+            Self::PathBuf => rust_path_buf_layout(root),
+            Self::Vec => rust_vec_layout(root),
+            Self::VecDeque => rust_vec_deque_layout(root),
+        };
+
+        layout.map(ValueLayout::IndirectSequence)
     }
 
-    // rustc's bundled GDB printers have treated slice-like DWARF values as
-    // `data_ptr` plus `length` since Rust 1.0, without field-name compatibility
-    // branches. Older printers also removed explicit `'static` lifetimes before
-    // classifying references. These are rustc debuginfo conventions, not Rust
-    // ABI guarantees, so retain the language and structural checks around them.
-    // See rust-lang/rust's `src/etc/gdb_rust_pretty_printing.py` and
-    // `src/etc/gdb_providers.py`.
-    let sequence = if is_std_path_ref_name(name) {
-        // Rust's LLDB provider renders Path as its underlying platform bytes.
-        // GDB classifies the same identity but does not currently register a
-        // provider. Only current DWARF with explicit fat-pointer metadata can
-        // satisfy this validator; older Path* DIEs remain native DWARF.
-        validate_indirect_sequence_layout(
-            &current.summary,
-            field_path(&["data_ptr"]),
-            field_path(&["length"]),
-            IndirectSequenceKind::OpaqueByteString,
-        )
-    } else if matches!(
-        name.as_str(),
-        "&str" | "&mut str" | "&'static str" | "&'static mut str"
-    ) {
-        validate_indirect_sequence_layout(
-            &current.summary,
-            field_path(&["data_ptr"]),
-            field_path(&["length"]),
-            IndirectSequenceKind::Utf8String,
-        )
-    } else if is_slice_name(name) {
-        validate_indirect_sequence_layout(
-            &current.summary,
-            field_path(&["data_ptr"]),
-            field_path(&["length"]),
-            IndirectSequenceKind::PointerTarget,
-        )
-    } else if is_std_box_str(name, dwarf_qualified_name) {
-        // Rust 1.96 and older rust-gdb scripts had no Box<str> provider. The
-        // current provider has no version fallback and reads data_ptr/length.
-        // Accept the pre-allocator generic spelling when DWARF emits it, but
-        // derive every physical detail from the concrete DIE.
-        validate_indirect_sequence_layout(
-            &current.summary,
-            field_path(&["data_ptr"]),
-            field_path(&["length"]),
-            IndirectSequenceKind::Utf8String,
-        )
-    // rustc commonly stores only `String` in DW_AT_name and represents
-    // `alloc::string` with enclosing namespace DIEs. GDB presents the
-    // reconstructed qualified name to its Rust printer. Trust the equivalent
-    // TypeId-backed name from the analyzer for identity; the member checks
-    // below remain responsible only for version-specific physical layout.
-    } else if is_std_string(name, dwarf_qualified_name) {
-        rust_string_layout(&current.summary)
-    } else if is_std_os_string(name, dwarf_qualified_name) {
-        rust_os_string_layout(&current.summary)
-    } else if is_std_path_buf(name, dwarf_qualified_name) {
-        rust_path_buf_layout(&current.summary)
-    } else if is_std_vec(name, dwarf_qualified_name) {
-        rust_vec_layout(&current.summary)
-    } else if is_std_vec_deque(name, dwarf_qualified_name) {
-        rust_vec_deque_layout(&current.summary)
-    } else {
-        None
-    };
-
-    sequence.map(ValueLayout::IndirectSequence)
+    fn layout_rejection_reason(self) -> &'static str {
+        match self {
+            Self::BTreeMap | Self::BTreeSet => concat!(
+                "expected non-overlapping `root` and unsigned 4/8-byte `length` ",
+                "members in the DWARF-described B-Tree map wrapper"
+            ),
+            Self::HashMap | Self::HashSet => concat!(
+                "expected a supported std/hashbrown table path with byte control ",
+                "pointer, pointer-width unsigned length and mask, and ",
+                "non-overlapping metadata"
+            ),
+            Self::Rc { .. } | Self::Arc { .. } => concat!(
+                "expected `ptr.pointer` to resolve to a supported thin or fat ",
+                "allocation pointer whose target exposes value, strong, and weak ",
+                "members with DWARF-derived widths"
+            ),
+            Self::Ref | Self::RefMut => concat!(
+                "expected non-overlapping `value` and `borrow` wrappers with ",
+                "matching 4/8-byte pointers and the rust-gdb borrow-state path"
+            ),
+            Self::RefCell => concat!(
+                "expected non-overlapping `value` and signed `borrow` projections ",
+                "within the root, with a supported 1/2/4/8/16-byte borrow width"
+            ),
+            Self::Cell => concat!(
+                "expected two single-member wrappers ending in a known DWARF ",
+                "value whose range is contained in the root"
+            ),
+            Self::NonZero => concat!(
+                "expected one or two single-member wrappers ending in a nonzero-width ",
+                "signed or unsigned DWARF integer contained in the root"
+            ),
+            Self::PathReference | Self::SliceReference => concat!(
+                "expected non-overlapping `data_ptr` and unsigned `length` members ",
+                "with equal nonzero DWARF widths and in-bounds ranges"
+            ),
+            Self::StrReference | Self::BoxStr => concat!(
+                "expected non-overlapping `data_ptr` and unsigned `length` members ",
+                "with equal nonzero widths and a one-byte unsigned pointer target"
+            ),
+            Self::String => concat!(
+                "expected `vec.buf[.inner].ptr` and `vec.len` through supported ",
+                "single-member pointer wrappers, with pointer-width unsigned ",
+                "length and a one-byte unsigned target"
+            ),
+            Self::OsString => concat!(
+                "expected a supported Unix or Windows OsString Vec path with ",
+                "pointer-width unsigned length and one-byte storage"
+            ),
+            Self::PathBuf => concat!(
+                "expected `inner` to contain a supported OsString Vec path with ",
+                "pointer-width unsigned length and one-byte storage"
+            ),
+            Self::Vec => concat!(
+                "expected `buf[.inner].ptr` and `len` through supported pointer ",
+                "wrappers, with equal nonzero pointer and unsigned length widths"
+            ),
+            Self::VecDeque => concat!(
+                "expected a supported head/len or tail/head ring layout with a ",
+                "DWARF pointer and non-overlapping pointer-width unsigned metadata"
+            ),
+        }
+    }
 }
 
 fn is_slice_name(name: &str) -> bool {
@@ -3171,6 +3338,13 @@ mod tests {
         });
 
         assert_eq!(resolve_value_layout(&current, None), None);
+        let ValueLayoutResolution::Rejected { adapter, reason } =
+            diagnose_value_layout(&current, None)
+        else {
+            panic!("recognized &str layout must report a rejection")
+        };
+        assert_eq!(adapter, "&str");
+        assert!(reason.contains("equal nonzero widths"));
     }
 
     #[test]
@@ -3243,6 +3417,13 @@ mod tests {
                 .offset,
             16
         );
+
+        let ValueLayoutResolution::Applied { adapter, .. } =
+            diagnose_value_layout(&current, Some("alloc::string::String"))
+        else {
+            panic!("valid std String layout must be applied")
+        };
+        assert_eq!(adapter, "String");
     }
 
     #[test]
@@ -3305,6 +3486,10 @@ mod tests {
         let current = rust_string_type("String", SourceLanguage::Rust, 8, true, true);
 
         assert_eq!(resolve_value_layout(&current, Some("app::String")), None);
+        assert_eq!(
+            diagnose_value_layout(&current, Some("app::String")),
+            ValueLayoutResolution::NotApplicable
+        );
     }
 
     #[test]

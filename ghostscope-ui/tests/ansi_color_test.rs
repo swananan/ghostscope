@@ -153,3 +153,40 @@ fn test_trace_results_mixed_colors() {
         "Expected red color for 1 failed, got: {result}"
     );
 }
+
+#[test]
+fn test_trace_results_preserve_multiline_failure_diagnostics() {
+    let emoji_config = EmojiConfig::new(false);
+    let error = concat!(
+        "Variable 'value' has no concrete DWARF size\n\n",
+        "Rust value adapter diagnostic:\n",
+        "  adapter: String\n",
+        "  rejected at: layout-validation",
+    );
+    let compilation_details = ScriptCompilationDetails {
+        total_count: 1,
+        success_count: 0,
+        failed_count: 1,
+        results: vec![ScriptExecutionResult {
+            target_name: "observe_value".to_string(),
+            binary_path: "/path/to/binary".to_string(),
+            pc_address: 0x1000,
+            status: ExecutionStatus::Failed(error.to_string()),
+            source_file: None,
+            source_line: None,
+            is_inline: None,
+        }],
+        trace_ids: vec![],
+    };
+
+    let result = ScriptEditor::format_compilation_results(
+        &compilation_details,
+        Some("trace observe_value"),
+        &emoji_config,
+    );
+
+    assert!(
+        result.contains(error),
+        "multiline diagnostic was lost: {result}"
+    );
+}
