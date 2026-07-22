@@ -4,178 +4,22 @@ use crate::{
 };
 
 use super::plan::{BTreeKind, BTreeLayout, HashTableBucketLayout, HashTableKind, HashTableLayout};
+use crate::language::adapter::{
+    CompositeStructField, CompositeStructFieldCapture, CompositeStructLayout, IndirectSequenceKind,
+    IndirectSequenceLayout, ProjectedPathSegment, ProjectedStructField, ProjectedStructLayout,
+    ProjectedStructPresentation, ProjectedValuePresentation, ProjectedValueRequirement,
+    RingSequenceLengthKind, ValueLayout as AdapterValueLayout,
+    ValueLayoutResolution as AdapterValueLayoutResolution,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ValueLayout {
-    IndirectSequence(IndirectSequenceLayout),
-    ProjectedValue {
-        value_path: Vec<String>,
-        presentation: ProjectedValuePresentation,
-    },
-    ProjectedStruct(ProjectedStructLayout),
-    CompositeStruct(CompositeStructLayout),
+pub(crate) enum RustValueLayout {
     HashTable(HashTableLayout),
     BTree(BTreeLayout),
 }
 
-/// Result of asking the Rust adapter layer for a semantic value layout.
-///
-/// Recognition establishes only a candidate type identity. `Applied` means
-/// the concrete target DWARF also passed layout validation. `Rejected` keeps
-/// identity mismatch separate from an unsafe or unsupported layout so callers
-/// can preserve the ordinary DWARF fallback.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ValueLayoutResolution {
-    NotApplicable,
-    Applied {
-        adapter: &'static str,
-        layout: ValueLayout,
-    },
-    Rejected {
-        adapter: &'static str,
-        reason: &'static str,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProjectedValuePresentation {
-    Transparent,
-    SingleField {
-        type_name: &'static str,
-        field_name: &'static str,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectedStructLayout {
-    pub(crate) type_name: &'static str,
-    pub(crate) fields: Vec<ProjectedStructField>,
-    pub(crate) presentation: ProjectedStructPresentation,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectedStructField {
-    pub(crate) name: &'static str,
-    pub(crate) value_path: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProjectedStructPresentation {
-    SignedState {
-        state_field: &'static str,
-        non_negative_label: &'static str,
-        negative_label: &'static str,
-    },
-    ReferenceCounted {
-        strong_field: &'static str,
-        weak_field: &'static str,
-        implicit_weak: u64,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompositeStructLayout {
-    pub(crate) type_name: &'static str,
-    pub(crate) fields: Vec<CompositeStructField>,
-    pub(crate) presentation: ProjectedStructPresentation,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompositeStructField {
-    pub(crate) name: &'static str,
-    pub(crate) value_path: Vec<ProjectedPathSegment>,
-    pub(crate) capture: CompositeStructFieldCapture,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompositeStructFieldCapture {
-    Value(ProjectedValueRequirement),
-    Address,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ProjectedPathSegment {
-    Member(String),
-    SoleMember,
-    UnwrapScalar,
-    Dereference,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProjectedValueRequirement {
-    KnownSizedOrZst,
-    SignedPointerSizedInteger,
-    UnsignedPointerSizedInteger,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IndirectSequenceLayout {
-    pub(crate) data_path: Vec<String>,
-    pub(crate) addressing: IndirectSequenceAddressing,
-    pub(crate) kind: IndirectSequenceKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum IndirectSequenceAddressing {
-    Contiguous {
-        length_path: Vec<String>,
-    },
-    Ring {
-        start_path: Vec<String>,
-        length_path: Vec<String>,
-        length_kind: RingSequenceLengthKind,
-        capacity_path: Vec<String>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RingSequenceLengthKind {
-    Explicit,
-    End,
-}
-
-impl IndirectSequenceLayout {
-    fn contiguous(
-        data_path: Vec<String>,
-        length_path: Vec<String>,
-        kind: IndirectSequenceKind,
-    ) -> Self {
-        Self {
-            data_path,
-            addressing: IndirectSequenceAddressing::Contiguous { length_path },
-            kind,
-        }
-    }
-
-    fn ring(
-        data_path: Vec<String>,
-        start_path: Vec<String>,
-        length_path: Vec<String>,
-        length_kind: RingSequenceLengthKind,
-        capacity_path: Vec<String>,
-        kind: IndirectSequenceKind,
-    ) -> Self {
-        Self {
-            data_path,
-            addressing: IndirectSequenceAddressing::Ring {
-                start_path,
-                length_path,
-                length_kind,
-                capacity_path,
-            },
-            kind,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IndirectSequenceKind {
-    Utf8String,
-    ByteString,
-    OpaqueByteString,
-    PointerTarget,
-    TypeParameter { index: usize },
-}
+pub(crate) type ValueLayout = AdapterValueLayout<RustValueLayout>;
+pub(crate) type ValueLayoutResolution = AdapterValueLayoutResolution<ValueLayout>;
 
 pub(super) fn requires_dwarf_qualified_name(current: &ResolvedType) -> bool {
     current.origin.as_ref().is_some_and(|origin| {
@@ -216,6 +60,9 @@ pub(super) fn diagnose_value_layout(
     current: &ResolvedType,
     dwarf_qualified_name: Option<&str>,
 ) -> ValueLayoutResolution {
+    // The language dispatcher is the production boundary. Keep this check so
+    // direct internal calls cannot accidentally apply Rust identities to a
+    // value from another source language.
     if current.origin.as_ref().map(|origin| origin.language) != Some(SourceLanguage::Rust) {
         return ValueLayoutResolution::NotApplicable;
     }
@@ -360,18 +207,20 @@ impl RustValueAdapter {
     fn resolve(self, root: &TypeInfo) -> Option<ValueLayout> {
         let layout = match self {
             Self::BTreeMap => {
-                return rust_btree_layout(root, BTreeKind::Map).map(ValueLayout::BTree)
+                return rust_btree_layout(root, BTreeKind::Map)
+                    .map(|layout| ValueLayout::Extension(RustValueLayout::BTree(layout)))
             }
             Self::BTreeSet => {
-                return rust_btree_layout(root, BTreeKind::Set).map(ValueLayout::BTree)
+                return rust_btree_layout(root, BTreeKind::Set)
+                    .map(|layout| ValueLayout::Extension(RustValueLayout::BTree(layout)))
             }
             Self::HashMap => {
                 return rust_hash_table_layout(root, HashTableKind::Map)
-                    .map(ValueLayout::HashTable);
+                    .map(|layout| ValueLayout::Extension(RustValueLayout::HashTable(layout)));
             }
             Self::HashSet => {
                 return rust_hash_table_layout(root, HashTableKind::Set)
-                    .map(ValueLayout::HashTable);
+                    .map(|layout| ValueLayout::Extension(RustValueLayout::HashTable(layout)));
             }
             Self::Rc { pointee_is_str } => {
                 return rust_reference_counted_layout(root, "Rc", "value", pointee_is_str)
@@ -2165,6 +2014,7 @@ fn validate_indirect_sequence_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::language::adapter::IndirectSequenceAddressing;
     use crate::{CuId, ModuleId, StructMember, TypeIdentity, TypeOrigin};
 
     struct RustStrLayout<'a> {
@@ -3980,16 +3830,18 @@ mod tests {
                 &current_map,
                 Some("std::collections::hash::map::HashMap<i32, u16>"),
             ),
-            Some(ValueLayout::HashTable(HashTableLayout {
-                entry_type_path: field_path(&["base", "table"]),
-                control_path: field_path(&["base", "table", "table", "ctrl", "pointer",]),
-                length_path: field_path(&["base", "table", "table", "items"]),
-                bucket_mask_path: field_path(&["base", "table", "table", "bucket_mask",]),
-                occupancy: HashTableOccupancy::ControlByteHighBitClear,
-                buckets: HashTableBucketLayout::ReverseFromControl,
-                bucket_order: HashTableBucketOrder::Reverse,
-                kind: HashTableKind::Map,
-            }))
+            Some(ValueLayout::Extension(RustValueLayout::HashTable(
+                HashTableLayout {
+                    entry_type_path: field_path(&["base", "table"]),
+                    control_path: field_path(&["base", "table", "table", "ctrl", "pointer",]),
+                    length_path: field_path(&["base", "table", "table", "items"]),
+                    bucket_mask_path: field_path(&["base", "table", "table", "bucket_mask",]),
+                    occupancy: HashTableOccupancy::ControlByteHighBitClear,
+                    buckets: HashTableBucketLayout::ReverseFromControl,
+                    bucket_order: HashTableBucketOrder::Reverse,
+                    kind: HashTableKind::Map,
+                },
+            )))
         );
 
         let legacy_map = rust_hash_collection_type(
@@ -4001,7 +3853,8 @@ mod tests {
             false,
             SourceLanguage::Rust,
         );
-        let Some(ValueLayout::HashTable(legacy_map)) = resolve_value_layout(&legacy_map, None)
+        let Some(ValueLayout::Extension(RustValueLayout::HashTable(legacy_map))) =
+            resolve_value_layout(&legacy_map, None)
         else {
             panic!("expected legacy HashMap layout")
         };
@@ -4031,7 +3884,8 @@ mod tests {
             false,
             SourceLanguage::Rust,
         );
-        let Some(ValueLayout::HashTable(current_set)) = resolve_value_layout(&current_set, None)
+        let Some(ValueLayout::Extension(RustValueLayout::HashTable(current_set))) =
+            resolve_value_layout(&current_set, None)
         else {
             panic!("expected current HashSet layout")
         };
@@ -4050,10 +3904,12 @@ mod tests {
             true,
             SourceLanguage::Rust,
         );
-        let Some(ValueLayout::HashTable(legacy_set)) = resolve_value_layout(
-            &legacy_set,
-            Some("std::collections::hash::set::HashSet<i32>"),
-        ) else {
+        let Some(ValueLayout::Extension(RustValueLayout::HashTable(legacy_set))) =
+            resolve_value_layout(
+                &legacy_set,
+                Some("std::collections::hash::set::HashSet<i32>"),
+            )
+        else {
             panic!("expected legacy HashSet layout")
         };
         assert_eq!(
@@ -4080,7 +3936,7 @@ mod tests {
             ),
         ] {
             let value = rust_135_hash_collection_type(name, kind, 8, SourceLanguage::Rust);
-            let Some(ValueLayout::HashTable(layout)) =
+            let Some(ValueLayout::Extension(RustValueLayout::HashTable(layout))) =
                 resolve_value_layout(&value, Some(qualified_name))
             else {
                 panic!("expected Rust 1.35 hash-table layout for {name}")
@@ -4231,12 +4087,14 @@ mod tests {
                 &map,
                 Some("alloc::collections::btree::map::BTreeMap<i32, u16>"),
             ),
-            Some(ValueLayout::BTree(BTreeLayout {
-                map_path: Vec::new(),
-                root_path: field_path(&["root"]),
-                length_path: field_path(&["length"]),
-                kind: BTreeKind::Map,
-            }))
+            Some(ValueLayout::Extension(RustValueLayout::BTree(
+                BTreeLayout {
+                    map_path: Vec::new(),
+                    root_path: field_path(&["root"]),
+                    length_path: field_path(&["length"]),
+                    kind: BTreeKind::Map,
+                },
+            )))
         );
 
         let set = rust_btree_collection_type(
@@ -4247,12 +4105,14 @@ mod tests {
         );
         assert_eq!(
             resolve_value_layout(&set, None),
-            Some(ValueLayout::BTree(BTreeLayout {
-                map_path: field_path(&["map"]),
-                root_path: field_path(&["map", "root"]),
-                length_path: field_path(&["map", "length"]),
-                kind: BTreeKind::Set,
-            }))
+            Some(ValueLayout::Extension(RustValueLayout::BTree(
+                BTreeLayout {
+                    map_path: field_path(&["map"]),
+                    root_path: field_path(&["map", "root"]),
+                    length_path: field_path(&["map", "length"]),
+                    kind: BTreeKind::Set,
+                },
+            )))
         );
     }
 

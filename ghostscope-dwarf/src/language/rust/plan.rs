@@ -1,11 +1,14 @@
 use crate::{
     strip_type_aliases, BTreeArrayCapture, BTreeEdgesCapture, BTreeEntryPresentation,
     BTreeFieldPresentation, HashTableBucketOrder, HashTableBucketSource,
-    HashTableEntryPresentation, HashTableFieldPresentation, HashTableOccupancy, MemberLayout,
-    ResolvedType, Result, StructMember, TypeId, TypeInfo, TypeProjection, TypeProjectionLayout,
-    ValueCapturePlan, ValuePresentation, ValueReadPlan, VariableAccessSegment,
+    HashTableEntryPresentation, HashTableFieldPresentation, HashTableOccupancy, ResolvedType,
+    Result, StructMember, TypeInfo, TypeProjection, TypeProjectionLayout, ValueCapturePlan,
+    ValuePresentation, ValueReadPlan, VariableAccessSegment,
 };
 use std::path::Path;
+
+use super::value::{RustValueLayout, ValueLayout};
+use crate::language::adapter::{self, ValueAdapterContext};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BTreeLayout {
@@ -46,51 +49,30 @@ pub(crate) enum HashTableKind {
     Set,
 }
 
-/// Generic DWARF operations required by Rust-specific value planners.
-///
-/// The language layer owns producer conventions and standard-library layout
-/// validation. The analyzer implements these primitives without exposing its
-/// object-file storage to the language layer.
-pub(crate) trait RustPlanContext {
-    fn project_type(
-        &self,
-        current: &ResolvedType,
-        segment: &VariableAccessSegment,
-        type_module_path: Option<&Path>,
-    ) -> Result<TypeProjection>;
-
-    fn project_member_path(
-        &self,
-        current: &ResolvedType,
-        path: &[String],
-        type_module_path: Option<&Path>,
-    ) -> Result<TypeProjection>;
-
-    fn template_type_parameter(
-        &self,
-        type_id: TypeId,
-        index: usize,
-    ) -> Result<Option<ResolvedType>>;
-
-    fn type_alignment(&self, type_id: TypeId) -> Result<Option<u64>>;
-
-    fn tuple_member_layout(
-        &self,
-        type_id: TypeId,
-        aggregate_type: &TypeInfo,
-        index: u32,
-    ) -> Result<MemberLayout>;
-
-    fn resolve_aggregate_type_in_module(
-        &self,
-        anchor: TypeId,
-        lookup_names: &[&str],
-        exact_qualified_name: Option<&str>,
-    ) -> Result<Option<ResolvedType>>;
+pub(super) fn build_value_read_plan(
+    context: &dyn ValueAdapterContext,
+    current: &ResolvedType,
+    layout: ValueLayout,
+    type_module_path: Option<&Path>,
+) -> Result<Option<ValueReadPlan>> {
+    adapter::build_value_read_plan(
+        context,
+        current,
+        type_module_path,
+        layout,
+        |context, current, type_module_path, extension| match extension {
+            RustValueLayout::BTree(layout) => {
+                btree_value_read_plan(context, current, layout, type_module_path)
+            }
+            RustValueLayout::HashTable(layout) => {
+                hash_table_value_read_plan(context, current, layout, type_module_path)
+            }
+        },
+    )
 }
 
 pub(crate) fn hash_table_value_read_plan(
-    context: &dyn RustPlanContext,
+    context: &dyn ValueAdapterContext,
     current: &ResolvedType,
     layout: HashTableLayout,
     type_module_path: Option<&Path>,
@@ -196,7 +178,7 @@ pub(crate) fn hash_table_value_read_plan(
 }
 
 pub(crate) fn btree_value_read_plan<'a>(
-    context: &'a dyn RustPlanContext,
+    context: &'a dyn ValueAdapterContext,
     current: &ResolvedType,
     layout: BTreeLayout,
     type_module_path: Option<&'a Path>,
@@ -209,7 +191,7 @@ pub(crate) fn btree_value_read_plan<'a>(
 }
 
 struct BTreePlanner<'a> {
-    context: &'a dyn RustPlanContext,
+    context: &'a dyn ValueAdapterContext,
     type_module_path: Option<&'a Path>,
 }
 
