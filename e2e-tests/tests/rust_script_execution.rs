@@ -153,6 +153,111 @@ async fn test_rust_tuple_projection_plan_preserves_semantic_identity() -> anyhow
 }
 
 #[tokio::test]
+async fn test_rust_nested_value_plans_recurse_into_semantic_children() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("rust_global_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+
+    let nested_plan = |name: &str| -> anyhow::Result<ghostscope_dwarf::ValueReadPlan> {
+        let (_, read_plan) = analyzer
+            .plan_global_access_read_plan(
+                &binary_path,
+                name,
+                &ghostscope_dwarf::VariableAccessPath::default(),
+            )?
+            .ok_or_else(|| anyhow::anyhow!("expected {name} read plan"))?;
+        let resolved_type = analyzer
+            .resolved_type_for_plan(&read_plan)?
+            .ok_or_else(|| anyhow::anyhow!("expected {name} resolved type"))?;
+        analyzer
+            .value_read_plan(&resolved_type, Some(&binary_path))?
+            .ok_or_else(|| anyhow::anyhow!("expected {name} semantic value plan"))
+    };
+
+    let cell = nested_plan("G_CELL_STRING")?;
+    let Some(ghostscope_dwarf::ValueNestedPlan::ProjectedValue { value }) = cell.nested else {
+        anyhow::bail!("expected Cell<String> projected child plan")
+    };
+    assert_eq!(
+        value.presentation,
+        ghostscope_dwarf::ValuePresentation::Utf8String
+    );
+
+    let ref_cell = nested_plan("G_REF_CELL_STRING")?;
+    let Some(ghostscope_dwarf::ValueNestedPlan::ProjectedView { fields }) = ref_cell.nested else {
+        anyhow::bail!("expected RefCell<String> projected-view child plan")
+    };
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].field_index, 0);
+    assert_eq!(
+        fields[0].value.presentation,
+        ghostscope_dwarf::ValuePresentation::Utf8String
+    );
+
+    let strings = nested_plan("G_VEC_STRING")?;
+    let Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) = strings.nested.as_ref()
+    else {
+        anyhow::bail!("expected Vec<String> element plan: {strings:#?}")
+    };
+    assert_eq!(
+        element.presentation,
+        ghostscope_dwarf::ValuePresentation::Utf8String
+    );
+
+    let vectors = nested_plan("G_VEC_VEC_I32")?;
+    let Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) = vectors.nested.as_ref()
+    else {
+        anyhow::bail!("expected Vec<Vec<i32>> element plan: {vectors:#?}")
+    };
+    assert!(matches!(
+        element.presentation,
+        ghostscope_dwarf::ValuePresentation::Sequence {
+            element_stride: 4,
+            ..
+        }
+    ));
+    assert!(element.nested.is_none());
+
+    let nested_strings = nested_plan("G_VEC_VEC_STRING")?;
+    let Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) =
+        nested_strings.nested.as_ref()
+    else {
+        anyhow::bail!("expected Vec<Vec<String>> outer element plan: {nested_strings:#?}")
+    };
+    let Some(ghostscope_dwarf::ValueNestedPlan::Sequence {
+        element: string_element,
+    }) = element.nested.as_ref()
+    else {
+        anyhow::bail!("expected Vec<Vec<String>> inner element plan: {nested_strings:#?}")
+    };
+    assert_eq!(
+        string_element.presentation,
+        ghostscope_dwarf::ValuePresentation::Utf8String
+    );
+
+    let depth_one = analyzer
+        .value_read_plan_with_options(
+            &nested_strings.root_type,
+            Some(&binary_path),
+            ghostscope_dwarf::ValueReadPlanOptions {
+                max_nesting_depth: 1,
+            },
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected depth-limited Vec<Vec<String>> plan"))?;
+    let Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) = depth_one.nested.as_ref()
+    else {
+        anyhow::bail!("expected depth-limited outer sequence plan: {depth_one:#?}")
+    };
+    assert!(
+        element.nested.is_none(),
+        "max_nesting_depth=1 must stop before the String adapter: {depth_one:#?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_string_value_plan_uses_type_namespace() -> anyhow::Result<()> {
     init();
 
@@ -655,7 +760,8 @@ async fn test_rust_ref_cell_value_plan_builds_dwarf_inline_view() -> anyhow::Res
             negative_label: "borrow_mut".to_string(),
         }
     );
-    let ghostscope_dwarf::ValueCapturePlan::InlineView { output_type } = value_plan.capture else {
+    let ghostscope_dwarf::ValueCapturePlan::InlineView { output_type, .. } = value_plan.capture
+    else {
         anyhow::bail!("expected inline semantic view for RefCell<i32>")
     };
     let ghostscope_dwarf::TypeInfo::StructType {
@@ -707,7 +813,7 @@ async fn test_rust_ref_cell_value_plan_builds_dwarf_inline_view() -> anyhow::Res
     let unit_view = analyzer
         .value_read_plan(&unit_type, Some(&binary_path))?
         .and_then(|plan| match plan.capture {
-            ghostscope_dwarf::ValueCapturePlan::InlineView { output_type } => Some(output_type),
+            ghostscope_dwarf::ValueCapturePlan::InlineView { output_type, .. } => Some(output_type),
             _ => None,
         })
         .ok_or_else(|| anyhow::anyhow!("expected RefCell<()> inline view"))?;
@@ -1445,6 +1551,142 @@ trace do_stuff {
             .lines()
             .any(|line| line.contains("RVEC_RAW:01 02 03 ff")),
         "Expected raw Rust Vec output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_nested_semantic_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    print "RNESTED:{}:{}:{}:{}:{}", G_CELL_STRING, G_REF_CELL_STRING,
+        G_VEC_STRING, G_VEC_VEC_I32, G_VEC_VEC_STRING;
+}
+trace observe_nested_owners {
+    print "RNESTED_OWNER:{}:{}", rc, arc;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains(r#"RNESTED:Cell { value: "cell nested" }"#)
+                && line.contains(r#"RefCell(borrow=0) { value: "refcell nested", borrow: 0 }"#)
+                && line.contains(r#"["alpha", "nested rust", "omega", "delta"] <truncated>"#)
+                && line.contains("[[1, 2], [3, 5, 8], [-13]]")
+                && line.contains(r#"[["deep alpha"], ["deep beta"]]"#)
+        }),
+        "Expected nested Rust global output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RNESTED_OWNER:Rc(strong=1, weak=0)")
+                && line.contains("value: [3, 5, 8]")
+                && line.contains("Arc(strong=1, weak=0)")
+                && line.contains(r#"value: "arc nested""#)
+        }),
+        "Expected nested Rust owner output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_nested_sequence_respects_configured_element_limit() -> anyhow::Result<()>
+{
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    print "RNESTED_LIMIT:{}", G_VEC_STRING;
+}
+"#;
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_config_content(
+            r#"
+[value_adapters]
+max_nesting_depth = 4
+max_sequence_elements = 2
+"#,
+        )
+        .attach_to(&target)
+        .timeout_secs(9)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("RNESTED_LIMIT:"))
+        .ok_or_else(|| anyhow::anyhow!("missing nested sequence limit output: {stdout}"))?;
+    assert!(
+        line.contains(r#"RNESTED_LIMIT:["alpha", "nested rust"] <truncated>"#),
+        "Unexpected nested sequence limit output: {line}"
+    );
+    assert!(
+        !line.contains("omega"),
+        "Nested sequence exceeded max_sequence_elements=2: {line}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_nested_value_respects_event_budget() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    print "RNESTED_BUDGET:{}", G_CELL_STRING;
+}
+"#;
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_config_content(
+            r#"
+[ebpf]
+mem_dump_cap = 40000
+max_trace_event_size = 32768
+"#,
+        )
+        .attach_to(&target)
+        .timeout_secs(9)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RNESTED_BUDGET:<truncated>")),
+        "Expected an emitted truncated nested value: {stdout}"
     );
     assert!(
         !stdout.contains("ExprError"),

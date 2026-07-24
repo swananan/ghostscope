@@ -222,21 +222,32 @@ Rc<Pair>                  Rc projects Pair and counters; Pair formats inline
 Cell<(i32, u16)>          Cell projects and formats the inline tuple value
 ```
 
-Semantic adapter selection currently occurs once for the root expression type.
-Nested semantic containers are not recursively recaptured:
+Semantic adapters also compose recursively across projected wrappers and
+bounded sequences:
 
 ```text
-Rc<Vec<i32>>              inner Vec elements are not captured recursively
-Cell<String>              inner String bytes are not captured recursively
-Vec<String>               String elements retain physical DWARF formatting
-HashMap<String, Vec<i32>> keys and values do not run nested adapters
+Rc<Vec<i32>>              Rc summary plus captured Vec elements
+Cell<String>              Cell wrapper plus captured String bytes
+Vec<String>               each captured element uses the String adapter
+Vec<Vec<i32>>             each captured element uses the Vec adapter
 ```
 
-Known nested fields remain accessible explicitly through the DSL. The
-limitation applies to automatic whole-value presentation. Recursive semantic
-capture requires bounded depth, byte, element, and dereference budgets; cycle
-detection; deterministic event reservation; and per-child read-error and
-truncation status.
+Recursive semantic capture follows at most
+`value_adapters.max_nesting_depth` adapter edges below the root and detects
+repeated DWARF type identities on the active path. Each semantic sequence
+reserves child captures for at most
+`value_adapters.max_sequence_elements` elements. Both limits default to `4`;
+the former controls recursion depth while the latter controls the width of
+each sequence node. The root and every child share the argument's
+`mem_dump_cap`; reducing that cap can reduce the captured element count or
+fall back to the valid root adapter. Every child carries an independent
+read-error or truncation status. See
+[Value Adapter Limits](configuration.md#value-adapter-limits).
+
+Hash-table and B-Tree entry traversal still formats key and value bytes using
+their DWARF types. For example, `HashMap<String, Vec<i32>>` does not recursively
+run adapters for its keys or values. Known nested fields remain accessible
+explicitly through the DSL.
 
 ## Variables
 

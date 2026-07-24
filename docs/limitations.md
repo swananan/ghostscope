@@ -31,9 +31,11 @@ formatting has a maximum depth of 32.
 
 **Rust** has targeted semantic support for common standard-library value
 families. It is selected from the concrete target DWARF rather than from a
-promised Rust ABI. Nested semantic adapters do not yet compose automatically.
-See [Rust Value Presentation](scripting.md#rust-value-presentation) for the
-current type list, formatting behavior, and nesting boundary.
+promised Rust ABI. Nested adapters compose for projected wrappers and bounded
+sequences under configured depth and per-sequence element limits plus a shared
+byte budget. Hash-table and B-Tree key/value adapters do not yet compose. See
+[Rust Value Presentation](scripting.md#rust-value-presentation) for the current
+type list, formatting behavior, and nesting boundary.
 
 **C++** remains primarily DWARF-layout-oriented. Simple C-like layouts work
 best; broader standard-library and language-specific semantics are not modeled

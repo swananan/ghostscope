@@ -25,6 +25,9 @@ pub static mut G_NUL_OWNED: String = String::new();
 pub static mut G_SEPARATOR_OWNED: String = String::new();
 pub static mut G_VEC_U8: Vec<u8> = Vec::new();
 pub static mut G_VEC_I32: Vec<i32> = Vec::new();
+pub static mut G_VEC_STRING: Vec<String> = Vec::new();
+pub static mut G_VEC_VEC_I32: Vec<Vec<i32>> = Vec::new();
+pub static mut G_VEC_VEC_STRING: Vec<Vec<String>> = Vec::new();
 pub static mut G_EMPTY_VEC: Vec<i32> = Vec::new();
 pub static mut G_VEC_UNIT: Vec<()> = Vec::new();
 pub static mut G_VEC_DEQUE_I32: VecDeque<i32> = VecDeque::new();
@@ -38,11 +41,13 @@ pub static G_NONZERO_U128: NonZeroU128 =
     NonZeroU128::new(340_282_366_920_938_463_463_374_607_431_768_211_454).unwrap();
 pub static mut G_CELL_U32: Cell<u32> = Cell::new(41);
 pub static mut G_CELL_PAIR: Cell<(i32, u16)> = Cell::new((-4, 12));
+pub static mut G_CELL_STRING: Cell<String> = Cell::new(String::new());
 pub static mut G_CELL_UNIT: Cell<()> = Cell::new(());
 pub static mut G_REF_CELL_IDLE: RefCell<i32> = RefCell::new(17);
 pub static mut G_REF_CELL_SHARED: RefCell<i32> = RefCell::new(23);
 pub static mut G_REF_CELL_MUT: RefCell<i32> = RefCell::new(31);
 pub static mut G_REF_CELL_PAIR: RefCell<(i32, u16)> = RefCell::new((-6, 14));
+pub static mut G_REF_CELL_STRING: RefCell<String> = RefCell::new(String::new());
 pub static mut G_REF_CELL_UNIT: RefCell<()> = RefCell::new(());
 
 pub mod user_types {
@@ -360,6 +365,12 @@ pub mod math {
     }
 
     #[inline(never)]
+    pub fn observe_nested_owners(rc: Rc<Vec<i32>>, arc: Arc<String>) -> usize {
+        std::hint::black_box((&rc, &arc));
+        rc.len() + arc.len()
+    }
+
+    #[inline(never)]
     pub fn observe_user_rc_arc(
         rc: &crate::user_types::Rc<i32>,
         arc: &crate::user_types::Arc<i32>,
@@ -540,6 +551,9 @@ fn touch_globals() -> i32 {
             + G_USER_STRING.marker as i64
             + G_VEC_U8.len() as i64
             + G_VEC_I32.len() as i64
+            + G_VEC_STRING.len() as i64
+            + G_VEC_VEC_I32.len() as i64
+            + G_VEC_VEC_STRING.len() as i64
             + G_EMPTY_VEC.len() as i64
             + G_VEC_UNIT.len() as i64
             + G_VEC_DEQUE_I32.len() as i64
@@ -552,10 +566,12 @@ fn touch_globals() -> i32 {
             + G_NONZERO_U128.get() as i64
             + G_CELL_U32.get() as i64
             + G_CELL_PAIR.get().0 as i64
+            + (&*G_CELL_STRING.as_ptr()).len() as i64
             + *G_REF_CELL_IDLE.get_mut() as i64
             + *G_REF_CELL_SHARED.get_mut() as i64
             + *G_REF_CELL_MUT.get_mut() as i64
             + G_REF_CELL_PAIR.get_mut().0 as i64
+            + G_REF_CELL_STRING.get_mut().len() as i64
             + G_USER_NONZERO.0.0 as i64
             + G_USER_CELL.0.0 as i64
             + G_USER_REF_CELL.value.0 as i64
@@ -580,11 +596,25 @@ fn main() {
         G_USER_STRING.vec = b"user bytes".to_vec();
         G_VEC_U8 = vec![1, 2, 3, 255];
         G_VEC_I32 = vec![10, -20, 30, 40];
+        G_VEC_STRING = vec![
+            String::from("alpha"),
+            String::from("nested rust"),
+            String::from("omega"),
+            String::from("delta"),
+            String::from("fifth element"),
+        ];
+        G_VEC_VEC_I32 = vec![vec![1, 2], vec![3, 5, 8], vec![-13]];
+        G_VEC_VEC_STRING = vec![
+            vec![String::from("deep alpha")],
+            vec![String::from("deep beta")],
+        ];
         G_VEC_UNIT = vec![(); 3];
         G_VEC_DEQUE_I32 = VecDeque::from([10, 20, 30, 40]);
         G_VEC_DEQUE_UNIT = VecDeque::from([(), (), ()]);
         G_SLICE_I32 = Box::leak(vec![7, -8, 9].into_boxed_slice());
         G_MUT_SLICE_U16 = Box::leak(vec![1000, 2000, 65535].into_boxed_slice());
+        G_CELL_STRING.set(String::from("cell nested"));
+        *G_REF_CELL_STRING.get_mut() = String::from("refcell nested");
     }
 
     let mut acc: i64 = 0;
@@ -643,6 +673,10 @@ fn main() {
             Rc::new(()),
             Arc::new(()),
         );
+        acc += math::observe_nested_owners(
+            Rc::new(vec![3, 5, 8]),
+            Arc::new(String::from("arc nested")),
+        ) as i64;
         std::hint::black_box((rc_peer, rc_weak, arc_peer, arc_weak));
         let user_rc = user_types::Rc { value: 37_i32 };
         let user_arc = user_types::Arc { value: 41_i32 };

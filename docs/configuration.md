@@ -413,6 +413,17 @@ timeout_secs = 5
 # CLI > config file > DEBUGINFOD_MAXSIZE. Use 0 for no explicit cap.
 max_size_bytes = 0
 
+[value_adapters]
+# Maximum nested adapter edges below the root value. This does not affect
+# ordinary inline DWARF structure formatting.
+# Valid range: 1 to 16. Default: 4.
+max_nesting_depth = 4
+
+# Maximum semantic child elements captured for each nested sequence node.
+# mem_dump_cap can reduce the effective count below this value.
+# Valid range: 1 to 16. Default: 4.
+max_sequence_elements = 4
+
 [files]
 # Save LLVM IR files
 [files.save_llvm_ir]
@@ -536,6 +547,22 @@ force_perf_event_array = false  # Default (auto-detect based on kernel version)
 # churn is high.
 enable_sysmon_for_target = true  # Default
 ```
+
+### Value Adapter Limits
+
+`[value_adapters]` controls recursive source-language semantic adapters:
+
+- `max_nesting_depth` counts adapter edges below the root adapter. It does not
+  count the root itself and is independent of the depth-32 limit for ordinary
+  inline DWARF structure formatting.
+- `max_sequence_elements` limits the semantic children statically emitted for
+  each nested sequence node. It is a per-node width limit, not a recursion
+  depth.
+
+Both settings default to `4` and accept values from `1` through `16`. The
+effective sequence count is also bounded by the runtime sequence length and the
+argument's `ebpf.mem_dump_cap`. Increasing either setting can increase generated
+eBPF program size, event size, and probe overhead.
 
 ### Configuration Examples
 
@@ -737,7 +764,10 @@ GhostScope validates configuration at startup:
 6. **Layout Mode**: Validates against allowed values (Horizontal, Vertical - capitalized)
 7. **UI Configuration**:
    - **ebpf_max_messages**: Must be at least 100
-8. **eBPF Configuration**:
+8. **Value Adapter Configuration**:
+   - **max_nesting_depth**: Must be in range 1-16
+   - **max_sequence_elements**: Must be in range 1-16
+9. **eBPF Configuration**:
    - **ringbuf_size**: Must be power of 2, range 4096-16777216 bytes
    - **perf_page_count**: Must be power of 2, range 8-1024 pages
    - **proc_module_offsets_max_entries**: Must be in range 64-65536

@@ -54,6 +54,9 @@ pub struct UserConfig {
     pub dwarf_allow_loose_debug_match: bool,
     pub dwarf_debuginfod: ResolvedDebuginfodConfig,
 
+    // Source-language value adapter configuration
+    pub value_adapter_config: crate::config::settings::ValueAdapterConfig,
+
     // eBPF configuration
     pub ebpf_config: crate::config::settings::EbpfConfig,
 
@@ -192,6 +195,7 @@ impl UserConfig {
                 config.dwarf.allow_loose_debug_match
             },
             dwarf_debuginfod,
+            value_adapter_config: config.value_adapters,
             ebpf_config: {
                 let mut ebpf_config = config.ebpf;
                 if args.force_perf_event_array {

@@ -14,6 +14,14 @@ pub const INDIRECT_SEQUENCE_HEADER_SIZE: usize = std::mem::size_of::<u64>() * 2;
 /// Offset of the captured element count in an indirect sequence header.
 pub const INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET: usize = std::mem::size_of::<u64>();
 
+/// Fixed bytes before every nested child payload. The first byte stores a
+/// `VariableStatus`; the remaining bytes keep child payloads naturally
+/// separated and leave room for protocol evolution.
+pub const NESTED_VALUE_CHILD_HEADER_SIZE: usize = std::mem::size_of::<u64>();
+
+/// Offset of a nested child's `VariableStatus` within its fixed header.
+pub const NESTED_VALUE_CHILD_STATUS_OFFSET: usize = 0;
+
 /// Number of bytes used by a bounded hash-table payload. The header stores the
 /// logical item count, table capacity, captured bucket count, and byte offset
 /// of the bucket payload. Captured occupancy bytes and any unused reserved
@@ -119,6 +127,45 @@ pub enum BTreeEntryPresentation {
     },
 }
 
+/// Type and semantic presentation for one statically reserved nested payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NestedValuePresentation {
+    pub payload_len: u64,
+    pub type_info: Box<TypeInfo>,
+    pub presentation: Box<ValuePresentation>,
+}
+
+/// One nested payload slot at a fixed offset from its parent's payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NestedValueChildPresentation {
+    pub slot_offset: u64,
+    pub value: Box<NestedValuePresentation>,
+}
+
+/// One projected-view member whose raw bytes have a semantic child sidecar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NestedValueFieldPresentation {
+    pub field_index: u64,
+    pub child: NestedValueChildPresentation,
+}
+
+/// Placement of recursively captured values after an existing root payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NestedValueChildrenPresentation {
+    ProjectedValue {
+        child: Box<NestedValueChildPresentation>,
+    },
+    ProjectedView {
+        fields: Vec<NestedValueFieldPresentation>,
+    },
+    Sequence {
+        first_slot_offset: u64,
+        slot_stride: u64,
+        slot_count: u64,
+        element: Box<NestedValuePresentation>,
+    },
+}
+
 /// User-space presentation selected for a captured value.
 ///
 /// `Dwarf` preserves the existing physical-layout formatter. Other variants
@@ -177,5 +224,13 @@ pub enum ValuePresentation {
     BTree {
         node_capacity: u64,
         entry: BTreeEntryPresentation,
+    },
+    /// An existing semantic root payload followed by fixed child slots. Child
+    /// locations and presentations are compile-time metadata; each slot
+    /// carries its own runtime status.
+    Nested {
+        root: Box<ValuePresentation>,
+        root_payload_len: u64,
+        children: Box<NestedValueChildrenPresentation>,
     },
 }

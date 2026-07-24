@@ -405,6 +405,16 @@ timeout_secs = 5
 # 命令行 > 配置文件 > DEBUGINFOD_MAXSIZE。设置为 0 表示不设置客户端大小上限。
 max_size_bytes = 0
 
+[value_adapters]
+# 根值以下最多跟随多少条嵌套 adapter 边，不影响普通内联 DWARF 结构格式化。
+# 有效范围：1 到 16。默认值：4。
+max_nesting_depth = 4
+
+# 每个嵌套序列节点最多采集多少个语义子元素。
+# mem_dump_cap 可能让实际数量低于该值。
+# 有效范围：1 到 16。默认值：4。
+max_sequence_elements = 4
+
 [files]
 # 保存 LLVM IR 文件
 [files.save_llvm_ir]
@@ -525,6 +535,19 @@ force_perf_event_array = false  # 默认（根据内核版本自动检测）
 # tracepoint；进程频繁创建/退出或内存映射变化频繁的环境下可能带来性能开销。
 enable_sysmon_for_target = true  # 默认开启
 ```
+
+### Value Adapter 限制
+
+`[value_adapters]` 控制源语言语义 adapter 的递归采集：
+
+- `max_nesting_depth` 计算根 adapter 以下的 adapter 边数，不包含根本身，
+  也不影响普通内联 DWARF 结构格式化的 32 层深度限制。
+- `max_sequence_elements` 限制每个嵌套序列节点静态生成的语义子元素数量。
+  它是每个节点的宽度限制，不是递归深度。
+
+两项默认值均为 `4`，有效范围均为 `1..=16`。序列的实际采集数量还会受到
+运行时序列长度和参数 `ebpf.mem_dump_cap` 的限制。提高任一配置都可能增加
+生成的 eBPF 程序大小、事件大小和探针开销。
 
 ### 配置示例
 
@@ -722,7 +745,10 @@ GhostScope 在启动时验证配置：
 6. **布局模式**：验证是否为允许的值（Horizontal, Vertical - 首字母大写）
 7. **UI 配置**：
    - **ebpf_max_messages**：必须至少为 100
-8. **eBPF 配置**：
+8. **Value Adapter 配置**：
+   - **max_nesting_depth**：必须在 1-16 范围内
+   - **max_sequence_elements**：必须在 1-16 范围内
+9. **eBPF 配置**：
    - **ringbuf_size**：必须是 2 的幂，范围 4096-16777216 字节
    - **perf_page_count**：必须是 2 的幂，范围 8-1024 页
    - **proc_module_offsets_max_entries**：必须在 64-65536 范围内

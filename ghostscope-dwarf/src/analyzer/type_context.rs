@@ -4,7 +4,8 @@ use crate::{
     CompilationUnitMetadata, CuId, MemberLayout, ModuleId, PcContext, ProjectedValueRead,
     ProjectedValueStep, ResolvedType, Result, SemanticType, TypeId, TypeIdentity, TypeInfo,
     TypeLayoutError, TypeOrigin, TypeProjection, TypeProjectionLayout, ValueAdapterOutcome,
-    ValueAdapterReport, ValueAdapterStage, ValueReadPlan, VariableAccessSegment, VariableReadPlan,
+    ValueAdapterReport, ValueAdapterStage, ValueCapturePlan, ValueNestedFieldPlan, ValueNestedPlan,
+    ValueReadPlan, ValueReadPlanOptions, VariableAccessSegment, VariableReadPlan,
 };
 use std::path::Path;
 
@@ -286,7 +287,22 @@ impl DwarfAnalyzer {
         current: &ResolvedType,
         type_module_path: Option<&Path>,
     ) -> Result<Option<ValueReadPlan>> {
-        let report = self.explain_value_read_plan(current, type_module_path)?;
+        self.value_read_plan_with_options(
+            current,
+            type_module_path,
+            ValueReadPlanOptions::default(),
+        )
+    }
+
+    /// Build a semantic capture plan with explicit nesting limits.
+    pub fn value_read_plan_with_options(
+        &self,
+        current: &ResolvedType,
+        type_module_path: Option<&Path>,
+        options: ValueReadPlanOptions,
+    ) -> Result<Option<ValueReadPlan>> {
+        let report =
+            self.explain_value_read_plan_with_options(current, type_module_path, options)?;
         match report.outcome {
             ValueAdapterOutcome::NotApplicable => Ok(None),
             ValueAdapterOutcome::Applied { plan } => Ok(Some(*plan)),
@@ -318,6 +334,20 @@ impl DwarfAnalyzer {
         &self,
         current: &ResolvedType,
         type_module_path: Option<&Path>,
+    ) -> Result<ValueAdapterReport> {
+        self.explain_value_read_plan_with_options(
+            current,
+            type_module_path,
+            ValueReadPlanOptions::default(),
+        )
+    }
+
+    /// Explain adapter selection with explicit semantic nesting limits.
+    pub fn explain_value_read_plan_with_options(
+        &self,
+        current: &ResolvedType,
+        type_module_path: Option<&Path>,
+        options: ValueReadPlanOptions,
     ) -> Result<ValueAdapterReport> {
         let qualified_name = match (
             crate::language::requires_dwarf_qualified_name(current),
@@ -364,9 +394,19 @@ impl DwarfAnalyzer {
             type_module_path,
             layout,
         )? {
-            Some(plan) => ValueAdapterOutcome::Applied {
-                plan: Box::new(plan),
-            },
+            Some(plan) => {
+                let plan = self.enrich_nested_value_read_plan(
+                    current,
+                    plan,
+                    type_module_path,
+                    0,
+                    options.max_nesting_depth,
+                    &mut Vec::new(),
+                );
+                ValueAdapterOutcome::Applied {
+                    plan: Box::new(plan),
+                }
+            }
             None => ValueAdapterOutcome::Rejected {
                 stage: ValueAdapterStage::ReadPlanConstruction,
                 reason: concat!(
@@ -378,6 +418,163 @@ impl DwarfAnalyzer {
             },
         };
         Ok(report)
+    }
+
+    fn value_read_plan_shallow(
+        &self,
+        current: &ResolvedType,
+        type_module_path: Option<&Path>,
+    ) -> Result<Option<ValueReadPlan>> {
+        let qualified_name = match (
+            crate::language::requires_dwarf_qualified_name(current),
+            current.identity.layout_dwarf_id(),
+        ) {
+            (true, Some(type_id)) => self.qualified_type_name(type_id)?,
+            _ => None,
+        };
+        let layout = match crate::language::resolve_value_layout(current, qualified_name.as_deref())
+        {
+            crate::language::ValueLayoutResolution::Applied { layout, .. } => layout,
+            crate::language::ValueLayoutResolution::NotApplicable
+            | crate::language::ValueLayoutResolution::Rejected { .. } => return Ok(None),
+        };
+        crate::language::build_value_read_plan(self, current, type_module_path, layout)
+    }
+
+    fn try_nested_value_read_plan(
+        &self,
+        current: &ResolvedType,
+        type_module_path: Option<&Path>,
+        depth: usize,
+        max_nesting_depth: usize,
+        ancestors: &mut Vec<TypeId>,
+    ) -> Option<ValueReadPlan> {
+        let plan = match self.value_read_plan_shallow(current, type_module_path) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::debug!(
+                    target: "ghostscope_dwarf::value_adapter",
+                    child_type = current.summary.type_name(),
+                    %error,
+                    "Nested value adapter could not form a child plan; using DWARF presentation"
+                );
+                return None;
+            }
+        };
+        Some(self.enrich_nested_value_read_plan(
+            current,
+            plan,
+            type_module_path,
+            depth,
+            max_nesting_depth,
+            ancestors,
+        ))
+    }
+
+    fn enrich_nested_value_read_plan(
+        &self,
+        current: &ResolvedType,
+        mut plan: ValueReadPlan,
+        type_module_path: Option<&Path>,
+        depth: usize,
+        max_nesting_depth: usize,
+        ancestors: &mut Vec<TypeId>,
+    ) -> ValueReadPlan {
+        if depth >= max_nesting_depth {
+            return plan;
+        }
+        let current_id = current.identity.layout_dwarf_id();
+        if current_id.is_some_and(|type_id| ancestors.contains(&type_id)) {
+            return plan;
+        }
+        if let Some(type_id) = current_id {
+            ancestors.push(type_id);
+        }
+
+        let nested = match &plan.capture {
+            ValueCapturePlan::ProjectedValue { value } => self
+                .try_nested_value_read_plan(
+                    &value.resolved_type,
+                    type_module_path,
+                    depth + 1,
+                    max_nesting_depth,
+                    ancestors,
+                )
+                .map(|value| ValueNestedPlan::ProjectedValue {
+                    value: Box::new(value),
+                }),
+            ValueCapturePlan::InlineView { fields, .. } => {
+                let nested_fields = fields
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(field_index, field)| {
+                        self.try_nested_value_read_plan(
+                            &field.resolved_type,
+                            type_module_path,
+                            depth + 1,
+                            max_nesting_depth,
+                            ancestors,
+                        )
+                        .map(|value| ValueNestedFieldPlan {
+                            field_index,
+                            value: Box::new(value),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (!nested_fields.is_empty()).then_some(ValueNestedPlan::ProjectedView {
+                    fields: nested_fields,
+                })
+            }
+            ValueCapturePlan::ProjectedView { fields, .. } => {
+                let nested_fields = fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| field.capture == crate::ProjectedViewFieldCapture::Value)
+                    .filter_map(|(field_index, field)| {
+                        self.try_nested_value_read_plan(
+                            &field.value.resolved_type,
+                            type_module_path,
+                            depth + 1,
+                            max_nesting_depth,
+                            ancestors,
+                        )
+                        .map(|value| ValueNestedFieldPlan {
+                            field_index,
+                            value: Box::new(value),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (!nested_fields.is_empty()).then_some(ValueNestedPlan::ProjectedView {
+                    fields: nested_fields,
+                })
+            }
+            ValueCapturePlan::IndirectSequence { .. }
+            | ValueCapturePlan::IndirectRingSequence { .. } => plan
+                .sequence_element
+                .as_ref()
+                .and_then(|element| {
+                    self.try_nested_value_read_plan(
+                        element,
+                        type_module_path,
+                        depth + 1,
+                        max_nesting_depth,
+                        ancestors,
+                    )
+                })
+                .map(|element| ValueNestedPlan::Sequence {
+                    element: Box::new(element),
+                }),
+            ValueCapturePlan::IndirectBytes { .. }
+            | ValueCapturePlan::IndirectHashTable { .. }
+            | ValueCapturePlan::IndirectBTree { .. } => None,
+        };
+
+        if current_id.is_some() {
+            ancestors.pop();
+        }
+        plan.nested = nested;
+        plan
     }
 
     fn project_resolved_member_path(

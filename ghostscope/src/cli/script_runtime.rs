@@ -722,6 +722,7 @@ mod tests {
                 dwarf_search_paths: Vec::new(),
                 dwarf_allow_loose_debug_match: false,
                 dwarf_debuginfod: Default::default(),
+                value_adapter_config: Default::default(),
                 ebpf_config: EbpfConfig::default(),
                 source: Default::default(),
                 config_file_path: None,
@@ -733,6 +734,17 @@ mod tests {
                 supports_ns_current_pid_tgid_helper: false,
             },
         }
+    }
+
+    #[test]
+    fn compile_options_include_value_adapter_limits() {
+        let mut config = sample_config(ScriptOutputMode::Plain, false);
+        config.user.value_adapter_config.max_nesting_depth = 7;
+        config.user.value_adapter_config.max_sequence_elements = 3;
+
+        let options = config.get_compile_options(false, false, false, None);
+        assert_eq!(options.value_adapter_max_nesting_depth, 7);
+        assert_eq!(options.value_adapter_max_sequence_elements, 3);
     }
 
     #[test]

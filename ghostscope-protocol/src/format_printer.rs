@@ -12,12 +12,14 @@ use crate::trace_event::{
 use crate::type_info::TypeInfo;
 use crate::{
     BTreeEntryPresentation, BTreeFieldPresentation, HashTableBucketOrder,
-    HashTableEntryPresentation, HashTableFieldPresentation, HashTableOccupancy, ValuePresentation,
-    BTREE_CAPTURED_ITEM_COUNT_OFFSET, BTREE_HEADER_SIZE, BTREE_NODE_HEADER_SIZE,
+    HashTableEntryPresentation, HashTableFieldPresentation, HashTableOccupancy,
+    NestedValueChildrenPresentation, NestedValueFieldPresentation, NestedValuePresentation,
+    ValuePresentation, BTREE_CAPTURED_ITEM_COUNT_OFFSET, BTREE_HEADER_SIZE, BTREE_NODE_HEADER_SIZE,
     BTREE_NODE_HEIGHT_OFFSET, BTREE_NODE_LENGTH_OFFSET, BTREE_NODE_SLOT_COUNT_OFFSET,
     HASH_TABLE_BUCKET_DATA_OFFSET, HASH_TABLE_CAPACITY_OFFSET, HASH_TABLE_CAPTURED_BUCKETS_OFFSET,
     HASH_TABLE_HEADER_SIZE, INDIRECT_BYTES_LENGTH_PREFIX_SIZE,
     INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET, INDIRECT_SEQUENCE_HEADER_SIZE,
+    NESTED_VALUE_CHILD_HEADER_SIZE, NESTED_VALUE_CHILD_STATUS_OFFSET,
 };
 
 // Removed legacy simple variable wrapper; use complex paths only.
@@ -51,6 +53,18 @@ struct ParsedBTreePayload<'a> {
     captured_count: u64,
     edge_count: usize,
     nodes: Vec<Option<ParsedBTreeNode<'a>>>,
+}
+
+struct RawPresentationPayload<'data, 'presentation> {
+    data: &'data [u8],
+    presentation: &'presentation ValuePresentation,
+    truncated: bool,
+    zero_length: bool,
+}
+
+struct FormatSpecPayload<'a> {
+    bytes: Cow<'a, [u8]>,
+    truncated: bool,
 }
 
 type BTreeEntryBytes<'a> = (&'a [u8], Option<&'a [u8]>);
@@ -412,10 +426,13 @@ impl FormatPrinter {
                                             continue;
                                         } else {
                                             let v = &vars[var_index];
-                                            match Self::format_spec_payload_bytes(v, trace_context)
-                                            {
-                                                Ok(bytes) => {
-                                                    let formatted = bytes
+                                            let truncated = match Self::format_spec_payload_bytes(
+                                                v,
+                                                trace_context,
+                                            ) {
+                                                Ok(payload) => {
+                                                    let formatted = payload
+                                                        .bytes
                                                         .iter()
                                                         .map(|byte| {
                                                             if conv == 'x' {
@@ -427,14 +444,14 @@ impl FormatPrinter {
                                                         .collect::<Vec<_>>()
                                                         .join(" ");
                                                     result.push_str(&formatted);
+                                                    payload.truncated
                                                 }
-                                                Err(error) => result.push_str(error),
-                                            }
-                                            Self::append_semantic_truncation_marker(
-                                                &mut result,
-                                                v,
-                                                trace_context,
-                                            );
+                                                Err(error) => {
+                                                    result.push_str(&error);
+                                                    false
+                                                }
+                                            };
+                                            Self::append_truncation_marker(&mut result, truncated);
                                             var_index += 1;
                                             continue;
                                         }
@@ -542,18 +559,22 @@ impl FormatPrinter {
                                             continue;
                                         } else {
                                             let v = &vars[var_index];
-                                            match Self::format_spec_payload_bytes(v, trace_context)
-                                            {
-                                                Ok(bytes) => {
-                                                    result.push_str(&render_bytes(bytes.as_ref()));
-                                                }
-                                                Err(error) => result.push_str(error),
-                                            }
-                                            Self::append_semantic_truncation_marker(
-                                                &mut result,
+                                            let truncated = match Self::format_spec_payload_bytes(
                                                 v,
                                                 trace_context,
-                                            );
+                                            ) {
+                                                Ok(payload) => {
+                                                    result.push_str(&render_bytes(
+                                                        payload.bytes.as_ref(),
+                                                    ));
+                                                    payload.truncated
+                                                }
+                                                Err(error) => {
+                                                    result.push_str(&error);
+                                                    false
+                                                }
+                                            };
+                                            Self::append_truncation_marker(&mut result, truncated);
                                             var_index += 1;
                                             continue;
                                         }
@@ -632,12 +653,8 @@ impl FormatPrinter {
                 != &ValuePresentation::Dwarf
     }
 
-    fn append_semantic_truncation_marker(
-        output: &mut String,
-        variable: &ParsedComplexVariable,
-        trace_context: &TraceContext,
-    ) {
-        if Self::is_semantic_truncation(variable, trace_context) {
+    fn append_truncation_marker(output: &mut String, truncated: bool) {
+        if truncated {
             if !output.is_empty() {
                 output.push(' ');
             }
@@ -842,7 +859,318 @@ impl FormatPrinter {
                 node_capacity,
                 entry,
             } => Self::format_btree_payload(data, *node_capacity, entry),
+            ValuePresentation::Nested {
+                root,
+                root_payload_len,
+                children,
+            } => Self::format_nested_payload(data, type_info, root, *root_payload_len, children),
         }
+    }
+
+    fn format_nested_payload(
+        data: &[u8],
+        type_info: &TypeInfo,
+        root: &ValuePresentation,
+        root_payload_len: u64,
+        children: &NestedValueChildrenPresentation,
+    ) -> String {
+        let Ok(root_payload_len) = usize::try_from(root_payload_len) else {
+            return "<INVALID_NESTED_PAYLOAD>".to_string();
+        };
+        let Some(root_data) = data.get(..root_payload_len) else {
+            return "<INVALID_NESTED_PAYLOAD>".to_string();
+        };
+
+        match children {
+            NestedValueChildrenPresentation::ProjectedValue { child } => {
+                let value = Self::format_nested_child(data, child.slot_offset, &child.value);
+                match root {
+                    ValuePresentation::Dwarf => value,
+                    ValuePresentation::SingleField {
+                        type_name,
+                        field_name,
+                    } => format!("{type_name} {{ {field_name}: {value} }}"),
+                    _ => "<INVALID_NESTED_PROJECTED_VALUE>".to_string(),
+                }
+            }
+            NestedValueChildrenPresentation::ProjectedView { fields } => {
+                Self::format_nested_projected_view(root_data, data, type_info, root, fields)
+            }
+            NestedValueChildrenPresentation::Sequence {
+                first_slot_offset,
+                slot_stride,
+                slot_count,
+                element,
+            } => {
+                let ValuePresentation::Sequence { element_stride, .. } = root else {
+                    return "<INVALID_NESTED_SEQUENCE>".to_string();
+                };
+                let Some((_, captured_count, _)) =
+                    Self::parse_sequence_payload(root_data, *element_stride)
+                else {
+                    return "<INVALID_NESTED_SEQUENCE_PAYLOAD>".to_string();
+                };
+                if captured_count > *slot_count {
+                    return "<INVALID_NESTED_SEQUENCE_PAYLOAD>".to_string();
+                }
+                let Ok(captured_count) = usize::try_from(captured_count) else {
+                    return "<INVALID_NESTED_SEQUENCE_PAYLOAD>".to_string();
+                };
+                let Ok(first_slot_offset) = usize::try_from(*first_slot_offset) else {
+                    return "<INVALID_NESTED_SEQUENCE_PAYLOAD>".to_string();
+                };
+                let Ok(slot_stride) = usize::try_from(*slot_stride) else {
+                    return "<INVALID_NESTED_SEQUENCE_PAYLOAD>".to_string();
+                };
+                let minimum_slot = NESTED_VALUE_CHILD_HEADER_SIZE
+                    .checked_add(usize::try_from(element.payload_len).unwrap_or(usize::MAX))
+                    .unwrap_or(usize::MAX);
+                if slot_stride < minimum_slot {
+                    return "<INVALID_NESTED_SEQUENCE_PAYLOAD>".to_string();
+                }
+
+                let mut result = String::from("[");
+                for index in 0..captured_count {
+                    if index > 0 {
+                        result.push_str(", ");
+                    }
+                    let Some(slot_offset) = index
+                        .checked_mul(slot_stride)
+                        .and_then(|offset| first_slot_offset.checked_add(offset))
+                    else {
+                        return "<INVALID_NESTED_SEQUENCE_PAYLOAD>".to_string();
+                    };
+                    result.push_str(&Self::format_nested_value_at(data, slot_offset, element));
+                }
+                result.push(']');
+                result
+            }
+        }
+    }
+
+    fn format_nested_child(
+        data: &[u8],
+        slot_offset: u64,
+        value: &NestedValuePresentation,
+    ) -> String {
+        let Ok(slot_offset) = usize::try_from(slot_offset) else {
+            return "<INVALID_NESTED_CHILD>".to_string();
+        };
+        Self::format_nested_value_at(data, slot_offset, value)
+    }
+
+    fn format_nested_value_at(
+        data: &[u8],
+        slot_offset: usize,
+        value: &NestedValuePresentation,
+    ) -> String {
+        let Some(status_offset) = slot_offset.checked_add(NESTED_VALUE_CHILD_STATUS_OFFSET) else {
+            return "<INVALID_NESTED_CHILD>".to_string();
+        };
+        let Some(status) = data.get(status_offset).copied() else {
+            return "<INVALID_NESTED_CHILD>".to_string();
+        };
+        let Some(payload_start) = slot_offset.checked_add(NESTED_VALUE_CHILD_HEADER_SIZE) else {
+            return "<INVALID_NESTED_CHILD>".to_string();
+        };
+        let Ok(payload_len) = usize::try_from(value.payload_len) else {
+            return "<INVALID_NESTED_CHILD>".to_string();
+        };
+        let Some(payload_end) = payload_start.checked_add(payload_len) else {
+            return "<INVALID_NESTED_CHILD>".to_string();
+        };
+        let Some(payload) = data.get(payload_start..payload_end) else {
+            return "<INVALID_NESTED_CHILD>".to_string();
+        };
+        Self::format_nested_value_with_status(
+            payload,
+            status,
+            &value.type_info,
+            &value.presentation,
+        )
+    }
+
+    fn format_nested_value_with_status(
+        data: &[u8],
+        status: u8,
+        type_info: &TypeInfo,
+        presentation: &ValuePresentation,
+    ) -> String {
+        if matches!(
+            status,
+            s if s == VariableStatus::Ok as u8
+                || s == VariableStatus::ZeroLength as u8
+                || s == VariableStatus::Truncated as u8
+        ) {
+            let mut value = Self::format_data_with_presentation(data, type_info, presentation);
+            if status == VariableStatus::Truncated as u8 {
+                value.push_str(" <truncated>");
+            }
+            return value;
+        }
+
+        let type_name = type_info.type_name();
+        match status {
+            s if s == VariableStatus::NullDeref as u8 => {
+                format!("<error: null pointer dereference> ({type_name}*)")
+            }
+            s if s == VariableStatus::ReadError as u8 => {
+                let errno_end =
+                    VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET + std::mem::size_of::<i32>();
+                let addr_end = VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET + std::mem::size_of::<u64>();
+                match (
+                    data.get(VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET..errno_end),
+                    data.get(VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET..addr_end),
+                ) {
+                    (Some(errno), Some(addr)) => {
+                        let errno = i32::from_le_bytes(
+                            errno
+                                .try_into()
+                                .expect("nested read-error errno length checked"),
+                        );
+                        let addr = u64::from_le_bytes(
+                            addr.try_into()
+                                .expect("nested read-error address length checked"),
+                        );
+                        format!("<read_user failed errno={errno} at 0x{addr:x}> ({type_name}*)")
+                    }
+                    _ => format!("<read_user failed> ({type_name}*)"),
+                }
+            }
+            s if s == VariableStatus::AccessError as u8 => {
+                format!("<address compute failed> ({type_name}*)")
+            }
+            s if s == VariableStatus::OffsetsUnavailable as u8 => {
+                format!("<proc offsets unavailable> ({type_name}*)")
+            }
+            _ => format!("<error status={status}> ({type_name}*)"),
+        }
+    }
+
+    fn format_nested_projected_view(
+        root_data: &[u8],
+        full_data: &[u8],
+        type_info: &TypeInfo,
+        root: &ValuePresentation,
+        fields: &[NestedValueFieldPresentation],
+    ) -> String {
+        match root {
+            ValuePresentation::SignedStateStruct {
+                state_field,
+                non_negative_label,
+                negative_label,
+            } => {
+                let TypeInfo::StructType { name, members, .. } = type_info else {
+                    return "<INVALID_NESTED_PROJECTED_VIEW>".to_string();
+                };
+                let Some(state_member) = members.iter().find(|member| member.name == *state_field)
+                else {
+                    return "<INVALID_NESTED_PROJECTED_VIEW>".to_string();
+                };
+                let state = usize::try_from(state_member.offset)
+                    .ok()
+                    .and_then(|offset| root_data.get(offset..))
+                    .and_then(|data| Self::decode_signed_integer(data, &state_member.member_type));
+                let summary = match state {
+                    Some(state) if state >= 0 => {
+                        format!("{name}({non_negative_label}={state})")
+                    }
+                    Some(state) => {
+                        format!("{name}({negative_label}={})", state.unsigned_abs())
+                    }
+                    None => format!("{name}({state_field}=<unavailable>)"),
+                };
+                let Some(rendered) =
+                    Self::format_struct_with_nested_fields(root_data, full_data, type_info, fields)
+                else {
+                    return "<INVALID_NESTED_PROJECTED_VIEW>".to_string();
+                };
+                let Some(rendered) = rendered.strip_prefix(name) else {
+                    return "<INVALID_NESTED_PROJECTED_VIEW>".to_string();
+                };
+                format!("{summary}{rendered}")
+            }
+            ValuePresentation::ReferenceCountedStruct {
+                strong_field,
+                weak_field,
+                implicit_weak,
+            } => {
+                let TypeInfo::StructType { name, members, .. } = type_info else {
+                    return "<INVALID_NESTED_PROJECTED_VIEW>".to_string();
+                };
+                let Some(strong_member) =
+                    members.iter().find(|member| member.name == *strong_field)
+                else {
+                    return "<INVALID_NESTED_PROJECTED_VIEW>".to_string();
+                };
+                let Some(weak_member) = members.iter().find(|member| member.name == *weak_field)
+                else {
+                    return "<INVALID_NESTED_PROJECTED_VIEW>".to_string();
+                };
+                let strong = Self::decode_unsigned_member(root_data, strong_member);
+                let weak = Self::decode_unsigned_member(root_data, weak_member)
+                    .and_then(|weak| weak.checked_sub(u128::from(*implicit_weak)));
+                let mut adjusted_data = root_data.to_vec();
+                if let Some(weak) = weak {
+                    if let Some(field_data) = usize::try_from(weak_member.offset)
+                        .ok()
+                        .and_then(|offset| adjusted_data.get_mut(offset..))
+                    {
+                        let _ = Self::encode_unsigned_integer(
+                            field_data,
+                            &weak_member.member_type,
+                            weak,
+                        );
+                    }
+                }
+                let strong = strong
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<unavailable>".to_string());
+                let weak = weak
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<unavailable>".to_string());
+                let summary = format!("{name}({strong_field}={strong}, {weak_field}={weak})");
+                let Some(rendered) = Self::format_struct_with_nested_fields(
+                    &adjusted_data,
+                    full_data,
+                    type_info,
+                    fields,
+                ) else {
+                    return "<INVALID_NESTED_PROJECTED_VIEW>".to_string();
+                };
+                let Some(rendered) = rendered.strip_prefix(name) else {
+                    return "<INVALID_NESTED_PROJECTED_VIEW>".to_string();
+                };
+                format!("{summary}{rendered}")
+            }
+            _ => Self::format_struct_with_nested_fields(root_data, full_data, type_info, fields)
+                .unwrap_or_else(|| "<INVALID_NESTED_PROJECTED_VIEW>".to_string()),
+        }
+    }
+
+    fn format_struct_with_nested_fields(
+        root_data: &[u8],
+        full_data: &[u8],
+        type_info: &TypeInfo,
+        fields: &[NestedValueFieldPresentation],
+    ) -> Option<String> {
+        let TypeInfo::StructType { name, members, .. } = type_info else {
+            return None;
+        };
+        let mut rendered = Vec::with_capacity(members.len());
+        for (field_index, member) in members.iter().enumerate() {
+            let value = if let Some(field) = fields
+                .iter()
+                .find(|field| usize::try_from(field.field_index).ok() == Some(field_index))
+            {
+                Self::format_nested_child(full_data, field.child.slot_offset, &field.child.value)
+            } else {
+                let member_data = Self::member_data(root_data, member)?;
+                Self::format_data_with_type_info_impl(member_data, &member.member_type, 1, 32)
+            };
+            rendered.push(format!("{}: {value}", member.name));
+        }
+        Some(format!("{name} {{ {} }}", rendered.join(", ")))
     }
 
     fn format_signed_state_struct(
@@ -1022,45 +1350,151 @@ impl FormatPrinter {
     fn format_spec_payload_bytes<'a>(
         variable: &'a ParsedComplexVariable,
         trace_context: &TraceContext,
-    ) -> Result<Cow<'a, [u8]>, &'static str> {
+    ) -> Result<FormatSpecPayload<'a>, String> {
         if variable.status == VariableStatus::ZeroLength as u8 {
-            return Ok(Cow::Borrowed(&[]));
+            return Ok(FormatSpecPayload {
+                bytes: Cow::Borrowed(&[]),
+                truncated: false,
+            });
         }
 
         let presentation = trace_context.get_value_presentation(variable.type_index);
+        let outer_truncated = Self::is_semantic_truncation(variable, trace_context);
+        let raw_payload = match Self::raw_presentation_payload(&variable.data, presentation) {
+            Ok(payload) => payload,
+            Err(_) if outer_truncated => {
+                return Ok(FormatSpecPayload {
+                    bytes: Cow::Borrowed(&[]),
+                    truncated: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let truncated = outer_truncated || raw_payload.truncated;
+        if raw_payload.zero_length {
+            return Ok(FormatSpecPayload {
+                bytes: Cow::Borrowed(&[]),
+                truncated,
+            });
+        }
+
         if let ValuePresentation::HashTable {
             entry_stride,
             bucket_order,
             occupancy,
             ..
-        } = presentation
+        } = raw_payload.presentation
         {
             return Self::hash_table_occupied_bucket_bytes(
-                &variable.data,
+                raw_payload.data,
                 *entry_stride,
                 *bucket_order,
                 *occupancy,
             )
-            .map(Cow::Owned)
-            .ok_or("<INVALID_SEMANTIC_PAYLOAD>");
+            .map(|bytes| FormatSpecPayload {
+                bytes: Cow::Owned(bytes),
+                truncated,
+            })
+            .ok_or_else(|| "<INVALID_SEMANTIC_PAYLOAD>".to_string());
         }
         if let ValuePresentation::BTree {
             node_capacity,
             entry,
-        } = presentation
+        } = raw_payload.presentation
         {
-            return match Self::btree_value_bytes(&variable.data, *node_capacity, entry) {
-                Some(bytes) => Ok(Cow::Owned(bytes)),
-                None if Self::is_semantic_truncation(variable, trace_context) => {
-                    Ok(Cow::Borrowed(&[]))
-                }
-                None => Err("<INVALID_SEMANTIC_PAYLOAD>"),
+            return match Self::btree_value_bytes(raw_payload.data, *node_capacity, entry) {
+                Some(bytes) => Ok(FormatSpecPayload {
+                    bytes: Cow::Owned(bytes),
+                    truncated,
+                }),
+                None if truncated => Ok(FormatSpecPayload {
+                    bytes: Cow::Borrowed(&[]),
+                    truncated: true,
+                }),
+                None => Err("<INVALID_SEMANTIC_PAYLOAD>".to_string()),
             };
         }
-        match Self::presentation_payload_bytes(&variable.data, presentation) {
-            Some(payload) => Ok(Cow::Borrowed(payload)),
-            None if Self::is_semantic_truncation(variable, trace_context) => Ok(Cow::Borrowed(&[])),
-            None => Err("<INVALID_SEMANTIC_PAYLOAD>"),
+        match Self::presentation_payload_bytes(raw_payload.data, raw_payload.presentation) {
+            Some(payload) => Ok(FormatSpecPayload {
+                bytes: Cow::Borrowed(payload),
+                truncated,
+            }),
+            None if truncated => Ok(FormatSpecPayload {
+                bytes: Cow::Borrowed(&[]),
+                truncated: true,
+            }),
+            None => Err("<INVALID_SEMANTIC_PAYLOAD>".to_string()),
+        }
+    }
+
+    fn raw_presentation_payload<'data, 'presentation>(
+        mut data: &'data [u8],
+        mut presentation: &'presentation ValuePresentation,
+    ) -> Result<RawPresentationPayload<'data, 'presentation>, String> {
+        let mut truncated = false;
+        loop {
+            let ValuePresentation::Nested { children, .. } = presentation else {
+                return Ok(RawPresentationPayload {
+                    data,
+                    presentation,
+                    truncated,
+                    zero_length: false,
+                });
+            };
+            let NestedValueChildrenPresentation::ProjectedValue { child } = children.as_ref()
+            else {
+                return Ok(RawPresentationPayload {
+                    data,
+                    presentation,
+                    truncated,
+                    zero_length: false,
+                });
+            };
+
+            let slot_offset = usize::try_from(child.slot_offset)
+                .map_err(|_| "<INVALID_SEMANTIC_PAYLOAD>".to_string())?;
+            let status_offset = slot_offset
+                .checked_add(NESTED_VALUE_CHILD_STATUS_OFFSET)
+                .ok_or_else(|| "<INVALID_SEMANTIC_PAYLOAD>".to_string())?;
+            let status = data
+                .get(status_offset)
+                .copied()
+                .ok_or_else(|| "<INVALID_SEMANTIC_PAYLOAD>".to_string())?;
+            let payload_start = slot_offset
+                .checked_add(NESTED_VALUE_CHILD_HEADER_SIZE)
+                .ok_or_else(|| "<INVALID_SEMANTIC_PAYLOAD>".to_string())?;
+            let payload_len = usize::try_from(child.value.payload_len)
+                .map_err(|_| "<INVALID_SEMANTIC_PAYLOAD>".to_string())?;
+            let payload_end = payload_start
+                .checked_add(payload_len)
+                .ok_or_else(|| "<INVALID_SEMANTIC_PAYLOAD>".to_string())?;
+            let payload = data
+                .get(payload_start..payload_end)
+                .ok_or_else(|| "<INVALID_SEMANTIC_PAYLOAD>".to_string())?;
+
+            match status {
+                s if s == VariableStatus::Ok as u8 => {}
+                s if s == VariableStatus::ZeroLength as u8 => {
+                    return Ok(RawPresentationPayload {
+                        data: &[],
+                        presentation: &child.value.presentation,
+                        truncated,
+                        zero_length: true,
+                    });
+                }
+                s if s == VariableStatus::Truncated as u8 => truncated = true,
+                _ => {
+                    return Err(Self::format_nested_value_with_status(
+                        payload,
+                        status,
+                        &child.value.type_info,
+                        &child.value.presentation,
+                    ));
+                }
+            }
+
+            data = payload;
+            presentation = &child.value.presentation;
         }
     }
 
@@ -1098,6 +1532,23 @@ impl FormatPrinter {
             ValuePresentation::SingleField { .. }
             | ValuePresentation::SignedStateStruct { .. }
             | ValuePresentation::ReferenceCountedStruct { .. } => Some(data),
+            ValuePresentation::Nested {
+                root,
+                root_payload_len,
+                children,
+            } => {
+                if let NestedValueChildrenPresentation::ProjectedValue { child } = children.as_ref()
+                {
+                    let slot = usize::try_from(child.slot_offset).ok()?;
+                    let payload_start = slot.checked_add(NESTED_VALUE_CHILD_HEADER_SIZE)?;
+                    let payload_len = usize::try_from(child.value.payload_len).ok()?;
+                    let payload =
+                        data.get(payload_start..payload_start.checked_add(payload_len)?)?;
+                    return Self::presentation_payload_bytes(payload, &child.value.presentation);
+                }
+                let root_len = usize::try_from(*root_payload_len).ok()?;
+                Self::presentation_payload_bytes(data.get(..root_len)?, root)
+            }
         }
     }
 
@@ -2750,6 +3201,15 @@ mod tests {
         data
     }
 
+    fn nested_child_slot(status: VariableStatus, payload: &[u8], payload_len: usize) -> Vec<u8> {
+        assert!(payload.len() <= payload_len);
+        let mut data = vec![0; NESTED_VALUE_CHILD_HEADER_SIZE + payload_len];
+        data[NESTED_VALUE_CHILD_STATUS_OFFSET] = status as u8;
+        let payload_start = NESTED_VALUE_CHILD_HEADER_SIZE;
+        data[payload_start..payload_start + payload.len()].copy_from_slice(payload);
+        data
+    }
+
     fn hash_table_payload(
         original_count: u64,
         capacity: u64,
@@ -4168,6 +4628,186 @@ mod tests {
         assert_eq!(
             FormatPrinter::format_complex_print_data(format_idx, &vars, &trace_context),
             "[1, -2, 3]"
+        );
+    }
+
+    #[test]
+    fn test_nested_projected_value_formats_semantic_child() {
+        let string_type = TypeInfo::StructType {
+            name: "String".to_string(),
+            size: 24,
+            members: Vec::new(),
+        };
+        let root_payload_len = 24;
+        let child_payload = indirect_bytes_payload(6, b"nested");
+        let child_payload_len = 16;
+        let mut data = vec![0; root_payload_len];
+        data.extend_from_slice(&nested_child_slot(
+            VariableStatus::Ok,
+            &child_payload,
+            child_payload_len,
+        ));
+        let presentation = ValuePresentation::Nested {
+            root: Box::new(ValuePresentation::SingleField {
+                type_name: "Cell".to_string(),
+                field_name: "value".to_string(),
+            }),
+            root_payload_len: root_payload_len as u64,
+            children: Box::new(NestedValueChildrenPresentation::ProjectedValue {
+                child: Box::new(crate::NestedValueChildPresentation {
+                    slot_offset: root_payload_len as u64,
+                    value: Box::new(NestedValuePresentation {
+                        payload_len: child_payload_len as u64,
+                        type_info: Box::new(string_type.clone()),
+                        presentation: Box::new(ValuePresentation::Utf8String),
+                    }),
+                }),
+            }),
+        };
+
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(&data, &string_type, &presentation),
+            r#"Cell { value: "nested" }"#
+        );
+    }
+
+    #[test]
+    fn test_nested_projected_value_raw_specs_propagate_child_status() {
+        let mut trace_context = TraceContext::new();
+        let format_idx = trace_context.add_string("{:s}|{:x}".to_string()).unwrap();
+        let string_type = TypeInfo::StructType {
+            name: "String".to_string(),
+            size: 24,
+            members: Vec::new(),
+        };
+        let cell_type = TypeInfo::StructType {
+            name: "Cell<String>".to_string(),
+            size: 24,
+            members: Vec::new(),
+        };
+        let root_payload_len = 24;
+        let child_payload_len = 16;
+        let presentation = ValuePresentation::Nested {
+            root: Box::new(ValuePresentation::SingleField {
+                type_name: "Cell".to_string(),
+                field_name: "value".to_string(),
+            }),
+            root_payload_len: root_payload_len as u64,
+            children: Box::new(NestedValueChildrenPresentation::ProjectedValue {
+                child: Box::new(crate::NestedValueChildPresentation {
+                    slot_offset: root_payload_len as u64,
+                    value: Box::new(NestedValuePresentation {
+                        payload_len: child_payload_len as u64,
+                        type_info: Box::new(string_type),
+                        presentation: Box::new(ValuePresentation::Utf8String),
+                    }),
+                }),
+            }),
+        };
+        let type_idx = trace_context
+            .add_type_with_presentation(cell_type, presentation)
+            .unwrap();
+        let name_idx = trace_context
+            .add_variable_name("value".to_string())
+            .unwrap();
+
+        let mut truncated_data = vec![0; root_payload_len];
+        truncated_data.extend_from_slice(&nested_child_slot(
+            VariableStatus::Truncated,
+            &indirect_bytes_payload(10, b"nested!!"),
+            child_payload_len,
+        ));
+        let truncated = ParsedComplexVariable {
+            var_name_index: name_idx,
+            type_index: type_idx,
+            access_path: String::new(),
+            status: VariableStatus::Ok as u8,
+            data: truncated_data,
+        };
+        assert_eq!(
+            FormatPrinter::format_complex_print_data(
+                format_idx,
+                &[truncated.clone(), truncated],
+                &trace_context,
+            ),
+            "nested!! <truncated>|6e 65 73 74 65 64 21 21 <truncated>"
+        );
+
+        let mut error_payload = vec![0; VARIABLE_READ_ERROR_PAYLOAD_LEN];
+        let errno_end = VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET + std::mem::size_of::<i32>();
+        let addr_end = VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET + std::mem::size_of::<u64>();
+        error_payload[VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET..errno_end]
+            .copy_from_slice(&(-14i32).to_le_bytes());
+        error_payload[VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET..addr_end]
+            .copy_from_slice(&0x1234u64.to_le_bytes());
+        let mut error_data = vec![0; root_payload_len];
+        error_data.extend_from_slice(&nested_child_slot(
+            VariableStatus::ReadError,
+            &error_payload,
+            child_payload_len,
+        ));
+        let error = ParsedComplexVariable {
+            var_name_index: name_idx,
+            type_index: type_idx,
+            access_path: String::new(),
+            status: VariableStatus::Ok as u8,
+            data: error_data,
+        };
+        assert_eq!(
+            FormatPrinter::format_complex_print_data(
+                format_idx,
+                &[error.clone(), error],
+                &trace_context,
+            ),
+            concat!(
+                "<read_user failed errno=-14 at 0x1234> (struct String*)|",
+                "<read_user failed errno=-14 at 0x1234> (struct String*)"
+            )
+        );
+    }
+
+    #[test]
+    fn test_nested_sequence_formats_each_child_status_independently() {
+        let string_type = TypeInfo::StructType {
+            name: "String".to_string(),
+            size: 24,
+            members: Vec::new(),
+        };
+        let root_payload_len = INDIRECT_SEQUENCE_HEADER_SIZE + 2 * 24;
+        let child_payload_len = 16;
+        let child_slot_len = NESTED_VALUE_CHILD_HEADER_SIZE + child_payload_len;
+        let mut data = indirect_sequence_payload(2, 2, &[0; 2 * 24]);
+        data.extend_from_slice(&nested_child_slot(
+            VariableStatus::Ok,
+            &indirect_bytes_payload(5, b"alpha"),
+            child_payload_len,
+        ));
+        data.extend_from_slice(&nested_child_slot(
+            VariableStatus::Truncated,
+            &indirect_bytes_payload(10, b"betatron"),
+            child_payload_len,
+        ));
+        let presentation = ValuePresentation::Nested {
+            root: Box::new(ValuePresentation::Sequence {
+                element_type: Box::new(string_type.clone()),
+                element_stride: 24,
+            }),
+            root_payload_len: root_payload_len as u64,
+            children: Box::new(NestedValueChildrenPresentation::Sequence {
+                first_slot_offset: root_payload_len as u64,
+                slot_stride: child_slot_len as u64,
+                slot_count: 2,
+                element: Box::new(NestedValuePresentation {
+                    payload_len: child_payload_len as u64,
+                    type_info: Box::new(string_type.clone()),
+                    presentation: Box::new(ValuePresentation::Utf8String),
+                }),
+            }),
+        };
+
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(&data, &string_type, &presentation),
+            r#"["alpha", "betatron" <truncated>]"#
         );
     }
 

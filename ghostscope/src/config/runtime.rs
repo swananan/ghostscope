@@ -266,6 +266,8 @@ impl ResolvedConfig {
             perf_page_count: self.ebpf_config.perf_page_count,
             event_map_type,
             mem_dump_cap: self.ebpf_config.mem_dump_cap,
+            value_adapter_max_nesting_depth: self.value_adapter_config.max_nesting_depth,
+            value_adapter_max_sequence_elements: self.value_adapter_config.max_sequence_elements,
             compare_cap: self.ebpf_config.compare_cap,
             max_trace_event_size: effective_max_event,
             backtrace_depth: self.ebpf_config.backtrace_depth,
