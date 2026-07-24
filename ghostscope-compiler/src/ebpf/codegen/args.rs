@@ -525,7 +525,11 @@ fn compile_nested_root_source(
                 len,
             )
         }
-        ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } => {
+        ghostscope_dwarf::ValueCapturePlan::IndirectBytes {
+            data,
+            length,
+            excluded_tail_bytes,
+        } => {
             if budget < ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE {
                 return Ok(None);
             }
@@ -539,6 +543,7 @@ fn compile_nested_root_source(
                     data_access_size,
                     length_offset,
                     length_access_size,
+                    excluded_tail_bytes: *excluded_tail_bytes,
                     max_len,
                 },
                 ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE + max_len,
@@ -1124,7 +1129,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     ComplexArgSource::ProjectedView { descriptor, fields },
                 )
             }
-            ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } => {
+            ghostscope_dwarf::ValueCapturePlan::IndirectBytes {
+                data,
+                length,
+                excluded_tail_bytes,
+            } => {
                 let (data_offset, data_access_size) = metadata_member(&data, "data")?;
                 let (length_offset, length_access_size) = metadata_member(&length, "length")?;
                 let data_len =
@@ -1137,6 +1146,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         data_access_size,
                         length_offset,
                         length_access_size,
+                        excluded_tail_bytes,
                         max_len: cap,
                     },
                 )
@@ -2953,6 +2963,7 @@ mod semantic_value_tests {
             capture: ValueCapturePlan::IndirectBytes {
                 data: projection(8),
                 length: projection(8),
+                excluded_tail_bytes: 0,
             },
             sequence_element: None,
             nested: None,

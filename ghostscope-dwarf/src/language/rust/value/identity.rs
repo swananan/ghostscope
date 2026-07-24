@@ -65,6 +65,8 @@ fn recognize_exact(
         Some(RustValueAdapter::NonZero)
     } else if is_std_path_ref_name(candidate) {
         Some(RustValueAdapter::PathReference)
+    } else if is_std_c_str_ref_name(candidate) {
+        Some(RustValueAdapter::CStrReference)
     } else if matches!(
         candidate,
         "&str" | "&mut str" | "&'static str" | "&'static mut str"
@@ -74,6 +76,10 @@ fn recognize_exact(
         Some(RustValueAdapter::SliceReference)
     } else if is_std_box_str_name(candidate) {
         Some(RustValueAdapter::BoxStr)
+    } else if is_std_box_c_str_name(candidate) {
+        Some(RustValueAdapter::BoxCStr)
+    } else if is_std_c_string_name(candidate) {
+        Some(RustValueAdapter::CString)
     } else if is_std_string_name(candidate) {
         Some(RustValueAdapter::String)
     } else if is_std_os_string_name(candidate) {
@@ -91,11 +97,14 @@ fn recognize_exact(
 
 fn is_ambiguous_short_name(name: &str) -> bool {
     name == "String"
+        || name == "CString"
         || name == "OsString"
         || name == "PathBuf"
+        || is_short_c_str_ref_name(name)
         || is_short_vec_name(name)
         || is_short_vec_deque_name(name)
         || is_short_box_str_name(name)
+        || is_short_box_c_str_name(name)
         || is_short_nonzero_name(name)
         || is_short_cell_name(name)
         || is_short_ref_cell_name(name)
@@ -139,6 +148,24 @@ fn is_short_vec_deque_name(name: &str) -> bool {
 
 fn is_short_box_str_name(name: &str) -> bool {
     box_str_arguments(name, "Box<").is_some()
+}
+
+fn is_short_box_c_str_name(name: &str) -> bool {
+    let Some(arguments) = name
+        .strip_prefix("Box<")
+        .and_then(|name| name.strip_suffix('>'))
+    else {
+        return false;
+    };
+    arguments
+        .split_once(',')
+        .map_or(arguments, |(target, _)| target)
+        .trim()
+        == "CStr"
+}
+
+fn is_short_c_str_ref_name(name: &str) -> bool {
+    referenced_type_name(name) == Some("CStr")
 }
 
 fn is_short_nonzero_name(name: &str) -> bool {
@@ -307,6 +334,20 @@ fn is_std_box_str_name(name: &str) -> bool {
     is_module_path(module)
 }
 
+fn is_std_box_c_str_name(name: &str) -> bool {
+    let Some(path) = name.strip_prefix("alloc::") else {
+        return false;
+    };
+    let Some((module, _)) = path
+        .split_once("::Box<")
+        .filter(|(_, arguments)| box_c_str_arguments(arguments, "").is_some())
+    else {
+        return false;
+    };
+
+    is_module_path(module)
+}
+
 fn box_str_arguments<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
     let arguments = name.strip_prefix(prefix)?.strip_suffix('>')?;
     (arguments == "str"
@@ -314,6 +355,36 @@ fn box_str_arguments<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
             .strip_prefix("str,")
             .is_some_and(|allocator| !allocator.is_empty()))
     .then_some(arguments)
+}
+
+fn box_c_str_arguments<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    let arguments = name.strip_prefix(prefix)?.strip_suffix('>')?;
+    let target = arguments
+        .split_once(',')
+        .map_or(arguments, |(target, _)| target)
+        .trim();
+    is_std_c_str_name(target).then_some(arguments)
+}
+
+fn is_std_c_string_name(name: &str) -> bool {
+    is_namespaced_plain_name(name, "alloc::ffi::", "CString")
+        || is_namespaced_plain_name(name, "std::ffi::", "CString")
+}
+
+fn is_std_c_str_ref_name(name: &str) -> bool {
+    referenced_type_name(name).is_some_and(is_std_c_str_name)
+}
+
+fn referenced_type_name(name: &str) -> Option<&str> {
+    let referenced = name
+        .strip_prefix("&'static ")
+        .or_else(|| name.strip_prefix('&'))?;
+    Some(referenced.strip_prefix("mut ").unwrap_or(referenced))
+}
+
+fn is_std_c_str_name(name: &str) -> bool {
+    is_namespaced_plain_name(name, "core::ffi::", "CStr")
+        || is_namespaced_plain_name(name, "std::ffi::", "CStr")
 }
 
 fn is_std_string_name(name: &str) -> bool {

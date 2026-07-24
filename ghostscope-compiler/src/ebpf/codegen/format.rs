@@ -66,6 +66,7 @@ struct IndirectCaptureConfig {
     data_access_size: ghostscope_dwarf::MemoryAccessSize,
     length_offset: u64,
     length_access_size: ghostscope_dwarf::MemoryAccessSize,
+    excluded_tail_bytes: u64,
     max_len: usize,
     shape: IndirectCaptureShape,
 }
@@ -2044,7 +2045,33 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             None
         };
 
-        let mut original_len = length_value;
+        let mut original_len = if capture.excluded_tail_bytes == 0 {
+            length_value
+        } else {
+            let excluded_tail = i64_type.const_int(capture.excluded_tail_bytes, false);
+            let has_excluded_tail = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::UGE,
+                    length_value,
+                    excluded_tail,
+                    "indirect_has_excluded_tail",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let adjusted_length = self
+                .builder
+                .build_int_sub(length_value, excluded_tail, "indirect_adjusted_length")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder
+                .build_select(
+                    has_excluded_tail,
+                    adjusted_length,
+                    i64_type.const_zero(),
+                    "indirect_logical_length",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                .into_int_value()
+        };
         let mut ring_start = None;
         let mut ring_capacity = None;
         let mut ring_metadata_valid = None;
@@ -4693,6 +4720,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 data_access_size,
                 length_offset,
                 length_access_size,
+                excluded_tail_bytes,
                 max_len,
             } => self.emit_complex_format_indirect(
                 status_ptr,
@@ -4704,6 +4732,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     data_access_size: *data_access_size,
                     length_offset: *length_offset,
                     length_access_size: *length_access_size,
+                    excluded_tail_bytes: *excluded_tail_bytes,
                     max_len: *max_len,
                     shape: IndirectCaptureShape::Bytes,
                 },
@@ -4727,6 +4756,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     data_access_size: *data_access_size,
                     length_offset: *length_offset,
                     length_access_size: *length_access_size,
+                    excluded_tail_bytes: 0,
                     max_len: *max_len,
                     shape: IndirectCaptureShape::Sequence {
                         element_stride: *element_stride,
@@ -4768,6 +4798,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         data_access_size: *data_access_size,
                         length_offset,
                         length_access_size,
+                        excluded_tail_bytes: 0,
                         max_len: *max_len,
                         shape: IndirectCaptureShape::Sequence {
                             element_stride: *element_stride,
@@ -4982,6 +5013,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 data_access_size,
                 length_offset,
                 length_access_size,
+                excluded_tail_bytes,
                 max_len,
             } => self.emit_complex_format_indirect(
                 status_ptr,
@@ -4993,6 +5025,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     data_access_size: *data_access_size,
                     length_offset: *length_offset,
                     length_access_size: *length_access_size,
+                    excluded_tail_bytes: *excluded_tail_bytes,
                     max_len: *max_len,
                     shape: IndirectCaptureShape::Bytes,
                 },
@@ -5015,6 +5048,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     data_access_size: *data_access_size,
                     length_offset: *length_offset,
                     length_access_size: *length_access_size,
+                    excluded_tail_bytes: 0,
                     max_len: *max_len,
                     shape: IndirectCaptureShape::Sequence {
                         element_stride: *element_stride,
@@ -5055,6 +5089,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         data_access_size: *data_access_size,
                         length_offset,
                         length_access_size,
+                        excluded_tail_bytes: 0,
                         max_len: *max_len,
                         shape: IndirectCaptureShape::Sequence {
                             element_stride: *element_stride,
@@ -5740,6 +5775,7 @@ mod complex_format_layout_tests {
                 data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
                 length_offset: 8,
                 length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+                excluded_tail_bytes: 0,
                 max_len,
             },
         }
@@ -6435,6 +6471,7 @@ mod complex_format_layout_tests {
             data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
             length_offset: 8,
             length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            excluded_tail_bytes: 0,
             max_len: 4,
             shape: IndirectCaptureShape::Bytes,
         });
@@ -6476,6 +6513,7 @@ mod complex_format_layout_tests {
             data_access_size: ghostscope_dwarf::MemoryAccessSize::U32,
             length_offset: 4,
             length_access_size: ghostscope_dwarf::MemoryAccessSize::U32,
+            excluded_tail_bytes: 0,
             max_len: 4,
             shape: IndirectCaptureShape::Bytes,
         });
@@ -6501,12 +6539,30 @@ mod complex_format_layout_tests {
     }
 
     #[test]
+    fn nul_terminated_bytes_emitter_excludes_the_trailing_nul() {
+        let llvm_ir = indirect_emitter_ir(IndirectCaptureConfig {
+            data_offset: 0,
+            data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            length_offset: 8,
+            length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            excluded_tail_bytes: 1,
+            max_len: 16,
+            shape: IndirectCaptureShape::Bytes,
+        });
+
+        assert!(llvm_ir.contains("indirect_has_excluded_tail"));
+        assert!(llvm_ir.contains("indirect_adjusted_length"));
+        assert!(llvm_ir.contains("indirect_logical_length"));
+    }
+
+    #[test]
     fn indirect_sequence_emitter_records_count_and_scales_by_dwarf_stride() {
         let llvm_ir = indirect_emitter_ir(IndirectCaptureConfig {
             data_offset: 0,
             data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
             length_offset: 8,
             length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            excluded_tail_bytes: 0,
             max_len: 8,
             shape: IndirectCaptureShape::Sequence {
                 element_stride: 4,
@@ -6547,6 +6603,7 @@ mod complex_format_layout_tests {
             data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
             length_offset: 8,
             length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            excluded_tail_bytes: 0,
             max_len: 0,
             shape: IndirectCaptureShape::Sequence {
                 element_stride: 0,
@@ -6566,6 +6623,7 @@ mod complex_format_layout_tests {
             data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
             length_offset: 16,
             length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            excluded_tail_bytes: 0,
             max_len: 16,
             shape: IndirectCaptureShape::Sequence {
                 element_stride: 4,
@@ -6599,6 +6657,7 @@ mod complex_format_layout_tests {
             data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
             length_offset: 16,
             length_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            excluded_tail_bytes: 0,
             max_len: 16,
             shape: IndirectCaptureShape::Sequence {
                 element_stride: 4,
