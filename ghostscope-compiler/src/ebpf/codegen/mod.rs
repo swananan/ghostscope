@@ -126,6 +126,7 @@ enum NestedValueRootSource {
         data_access_size: ghostscope_dwarf::MemoryAccessSize,
         length_offset: u64,
         length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        excluded_tail_bytes: u64,
         max_len: usize,
     },
     IndirectSequence {
@@ -248,6 +249,7 @@ enum ComplexArgSource<'ctx> {
         data_access_size: ghostscope_dwarf::MemoryAccessSize,
         length_offset: u64,
         length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        excluded_tail_bytes: u64,
         max_len: usize,
     },
     /// Bounded capture of complete elements through a pointer-and-count

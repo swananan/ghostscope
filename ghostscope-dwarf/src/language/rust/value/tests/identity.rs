@@ -69,6 +69,34 @@ fn qualified_name_lookup_is_limited_to_ambiguous_rust_std_types() {
         "alloc::boxed::Box<str, alloc::alloc::Global>",
         SourceLanguage::Rust,
     )));
+    assert!(requires_dwarf_qualified_name(&rust_c_string_type(
+        "CString",
+        SourceLanguage::Rust,
+    )));
+    assert!(!requires_dwarf_qualified_name(&rust_c_string_type(
+        "alloc::ffi::c_str::CString",
+        SourceLanguage::Rust,
+    )));
+    assert!(requires_dwarf_qualified_name(&rust_c_str_type_64(
+        "&CStr",
+        SourceLanguage::Rust,
+        false,
+    )));
+    assert!(!requires_dwarf_qualified_name(&rust_c_str_type_64(
+        "&core::ffi::c_str::CStr",
+        SourceLanguage::Rust,
+        false,
+    )));
+    assert!(requires_dwarf_qualified_name(&rust_c_str_type_64(
+        "Box<CStr>",
+        SourceLanguage::Rust,
+        false,
+    )));
+    assert!(!requires_dwarf_qualified_name(&rust_c_str_type_64(
+        "alloc::boxed::Box<core::ffi::c_str::CStr>",
+        SourceLanguage::Rust,
+        false,
+    )));
     assert!(requires_dwarf_qualified_name(&rust_os_string_type(
         "OsString", 8, true, None,
     )));

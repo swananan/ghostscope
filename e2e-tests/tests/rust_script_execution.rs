@@ -136,10 +136,15 @@ async fn test_rust_tuple_projection_plan_preserves_semantic_identity() -> anyhow
         value_plan.presentation,
         ghostscope_dwarf::ValuePresentation::Utf8String
     );
-    let ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } = value_plan.capture
+    let ghostscope_dwarf::ValueCapturePlan::IndirectBytes {
+        data,
+        length,
+        excluded_tail_bytes,
+    } = value_plan.capture
     else {
         anyhow::bail!("expected indirect byte capture for Rust &str")
     };
+    assert_eq!(excluded_tail_bytes, 0);
     assert_eq!(
         data.layout,
         ghostscope_dwarf::TypeProjectionLayout::Member { offset: 0 }
@@ -204,6 +209,23 @@ async fn test_rust_nested_value_plans_recurse_into_semantic_children() -> anyhow
         element.presentation,
         ghostscope_dwarf::ValuePresentation::Utf8String
     );
+
+    let c_strings = nested_plan("G_VEC_C_STRING")?;
+    let Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) = c_strings.nested.as_ref()
+    else {
+        anyhow::bail!("expected Vec<CString> element plan: {c_strings:#?}")
+    };
+    assert_eq!(
+        element.presentation,
+        ghostscope_dwarf::ValuePresentation::ByteString
+    );
+    assert!(matches!(
+        element.capture,
+        ghostscope_dwarf::ValueCapturePlan::IndirectBytes {
+            excluded_tail_bytes: 1,
+            ..
+        }
+    ));
 
     let vectors = nested_plan("G_VEC_VEC_I32")?;
     let Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) = vectors.nested.as_ref()
@@ -1569,6 +1591,7 @@ async fn test_rust_script_print_nested_semantic_values() -> anyhow::Result<()> {
 trace do_stuff {
     print "RNESTED:{}:{}:{}:{}:{}", G_CELL_STRING, G_REF_CELL_STRING,
         G_VEC_STRING, G_VEC_VEC_I32, G_VEC_VEC_STRING;
+    print "RNESTED_C:{}", G_VEC_C_STRING;
 }
 trace observe_nested_owners {
     print "RNESTED_OWNER:{}:{}", rc, arc;
@@ -1589,6 +1612,12 @@ trace observe_nested_owners {
                 && line.contains(r#"[["deep alpha"], ["deep beta"]]"#)
         }),
         "Expected nested Rust global output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains(r#"RNESTED_C:["alpha c", "beta c", "gamma c", "delta c"] <truncated>"#)
+        }),
+        "Expected nested Rust CString output: {stdout}"
     );
     assert!(
         stdout.lines().any(|line| {
@@ -2424,6 +2453,43 @@ trace observe_os_string {
             .lines()
             .any(|line| line.contains("ROS:\"os from rust\":\"os\\xffx\":\"\"")),
         "Expected Rust OsString output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_c_string_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_c_strings {
+    print "RCSTR:{}:{}:{}:{}:{}", owned, borrowed, empty, invalid, boxed;
+    print "RCSTR_RAW:{:s}:{:x}", owned, owned;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| { line.contains(r#"RCSTR:"owned c":"borrowed c":"":"c\xffx":"boxed c""#) }),
+        "Expected Rust C string output: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| { line.contains("RCSTR_RAW:owned c:6f 77 6e 65 64 20 63") }),
+        "Expected raw Rust C string output without a trailing NUL: {stdout}"
     );
     assert!(
         !stdout.contains("ExprError"),

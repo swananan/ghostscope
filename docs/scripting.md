@@ -149,6 +149,8 @@ release, and unmatched older layouts fall back to native DWARF presentation.
 The currently supported value families are:
 
 - UTF-8 strings: `&str`, `&mut str`, `String`, and `Box<str>`;
+- C-compatible byte strings: `CString` and supported `&CStr` and `Box<CStr>`
+  layouts;
 - platform byte strings: `OsString`, `PathBuf`, and supported `&Path` layouts;
 - sequences: `Vec<T>`, `&[T]`, `&mut [T]`, and `VecDeque<T>`;
 - transparent and state wrappers: `NonZero*`, `Cell<T>`, and `RefCell<T>`;
@@ -162,6 +164,13 @@ The currently supported value families are:
 `Rc<str>` and `Arc<str>` are displayed as their target address plus public
 strong and weak counts. GhostScope does not read the dynamically sized string
 contents through these owners.
+
+Rust C strings are rendered without their trailing NUL. Non-UTF-8 content uses
+the same `\xNN` escaping as platform byte strings. `CString` is validated
+across every release in the compatibility matrix; `&CStr` and `Box<CStr>` use
+semantic presentation from Rust 1.81 onward, where their target DWARF exposes
+explicit data-pointer and length metadata. Older layouts retain native DWARF
+presentation.
 
 Rust enum formatting follows the target DWARF rather than a rustc ABI table.
 For payload enums, GhostScope reads `DW_TAG_variant_part`, follows its
@@ -229,6 +238,7 @@ bounded sequences:
 Rc<Vec<i32>>              Rc summary plus captured Vec elements
 Cell<String>              Cell wrapper plus captured String bytes
 Vec<String>               each captured element uses the String adapter
+Vec<CString>              each captured element omits its trailing NUL
 Vec<Vec<i32>>             each captured element uses the Vec adapter
 ```
 

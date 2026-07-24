@@ -4,7 +4,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    ffi::OsString,
+    ffi::{CString, OsString},
     marker::{PhantomData, PhantomPinned},
     num::{NonZeroI32, NonZeroU128, NonZeroU32},
     rc::Rc,
@@ -26,6 +26,7 @@ pub static mut G_SEPARATOR_OWNED: String = String::new();
 pub static mut G_VEC_U8: Vec<u8> = Vec::new();
 pub static mut G_VEC_I32: Vec<i32> = Vec::new();
 pub static mut G_VEC_STRING: Vec<String> = Vec::new();
+pub static mut G_VEC_C_STRING: Vec<CString> = Vec::new();
 pub static mut G_VEC_VEC_I32: Vec<Vec<i32>> = Vec::new();
 pub static mut G_VEC_VEC_STRING: Vec<Vec<String>> = Vec::new();
 pub static mut G_EMPTY_VEC: Vec<i32> = Vec::new();
@@ -270,6 +271,7 @@ pub static mut GLOBAL_ENUM_BITS: i32 = 0;
 pub mod math {
     use std::{
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+        ffi::{CStr, CString},
         rc::Rc,
         sync::Arc,
     };
@@ -292,6 +294,21 @@ pub mod math {
         empty: std::ffi::OsString,
     ) -> usize {
         value.len() + invalid.len() + empty.len()
+    }
+
+    #[inline(never)]
+    pub fn observe_c_strings(
+        owned: CString,
+        borrowed: &CStr,
+        empty: CString,
+        invalid: CString,
+        boxed: Box<CStr>,
+    ) -> usize {
+        owned.as_bytes().len()
+            + borrowed.to_bytes().len()
+            + empty.as_bytes().len()
+            + invalid.as_bytes().len()
+            + boxed.to_bytes().len()
     }
 
     #[inline(never)]
@@ -552,6 +569,7 @@ fn touch_globals() -> i32 {
             + G_VEC_U8.len() as i64
             + G_VEC_I32.len() as i64
             + G_VEC_STRING.len() as i64
+            + G_VEC_C_STRING.len() as i64
             + G_VEC_VEC_I32.len() as i64
             + G_VEC_VEC_STRING.len() as i64
             + G_EMPTY_VEC.len() as i64
@@ -603,6 +621,10 @@ fn main() {
             String::from("delta"),
             String::from("fifth element"),
         ];
+        G_VEC_C_STRING = ["alpha c", "beta c", "gamma c", "delta c", "fifth c"]
+            .into_iter()
+            .map(|value| CString::new(value).unwrap())
+            .collect();
         G_VEC_VEC_I32 = vec![vec![1, 2], vec![3, 5, 8], vec![-13]];
         G_VEC_VEC_STRING = vec![
             vec![String::from("deep alpha")],
@@ -625,6 +647,14 @@ fn main() {
             OsString::from("os from rust"),
             OsString::from_vec(vec![b'o', b's', 0xff, b'x']),
             OsString::new(),
+        ) as i64;
+        let borrowed_c_string = CString::new("borrowed c").unwrap();
+        acc += math::observe_c_strings(
+            CString::new("owned c").unwrap(),
+            borrowed_c_string.as_c_str(),
+            CString::new("").unwrap(),
+            CString::new(vec![b'c', 0xff, b'x']).unwrap(),
+            CString::new("boxed c").unwrap().into_boxed_c_str(),
         ) as i64;
         acc += math::observe_vec_deque(
             wrapped_vec_deque(),

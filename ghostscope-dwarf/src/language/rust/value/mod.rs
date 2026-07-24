@@ -104,9 +104,12 @@ enum RustValueAdapter {
     Cell,
     NonZero,
     PathReference,
+    CStrReference,
     StrReference,
     SliceReference,
+    BoxCStr,
     BoxStr,
+    CString,
     String,
     OsString,
     PathBuf,
@@ -129,9 +132,12 @@ impl RustValueAdapter {
             Self::Cell => "Cell",
             Self::NonZero => "NonZero",
             Self::PathReference => "&Path",
+            Self::CStrReference => "&CStr",
             Self::StrReference => "&str",
             Self::SliceReference => "slice reference",
+            Self::BoxCStr => "Box<CStr>",
             Self::BoxStr => "Box<str>",
+            Self::CString => "CString",
             Self::String => "String",
             Self::OsString => "OsString",
             Self::PathBuf => "PathBuf",
@@ -207,6 +213,12 @@ impl RustValueAdapter {
                 layout::field_path(&["length"]),
                 IndirectSequenceKind::OpaqueByteString,
             ),
+            Self::CStrReference | Self::BoxCStr => sequences::validate_indirect_sequence_layout(
+                root,
+                layout::field_path(&["data_ptr"]),
+                layout::field_path(&["length"]),
+                IndirectSequenceKind::NulTerminatedByteString,
+            ),
             Self::StrReference => sequences::validate_indirect_sequence_layout(
                 root,
                 layout::field_path(&["data_ptr"]),
@@ -225,6 +237,7 @@ impl RustValueAdapter {
                 layout::field_path(&["length"]),
                 IndirectSequenceKind::Utf8String,
             ),
+            Self::CString => sequences::rust_c_string_layout(root),
             Self::String => sequences::rust_string_layout(root),
             Self::OsString => sequences::rust_os_string_layout(root),
             Self::PathBuf => sequences::rust_path_buf_layout(root),
@@ -274,6 +287,14 @@ impl RustValueAdapter {
             Self::StrReference | Self::BoxStr => concat!(
                 "expected non-overlapping `data_ptr` and unsigned `length` members ",
                 "with equal nonzero widths and a one-byte unsigned pointer target"
+            ),
+            Self::CStrReference | Self::BoxCStr => concat!(
+                "expected non-overlapping `data_ptr` and unsigned `length` members ",
+                "with equal nonzero widths and a DWARF-described CStr target"
+            ),
+            Self::CString => concat!(
+                "expected `inner.data_ptr` and `inner.length` with equal nonzero ",
+                "widths and one-byte storage"
             ),
             Self::String => concat!(
                 "expected `vec.buf[.inner].ptr` and `vec.len` through supported ",
