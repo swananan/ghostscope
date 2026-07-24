@@ -136,6 +136,19 @@ timeout_secs = 5
 # 设置为 0 表示不设置客户端大小上限。
 max_size_bytes = 0
 
+[value_adapters]
+# 从根值向下最多跟随多少条嵌套的源语言适配器边。此限制与普通内联 DWARF
+# 结构格式化的递归深度相互独立。
+# 有效范围：1 到 16。
+# 默认值：4
+max_nesting_depth = 4
+
+# 每个嵌套序列节点最多采集多少个语义子元素，例如 Vec<String>。如果
+# mem_dump_cap 无法容纳这么多子 payload，实际采集数量会更少。
+# 有效范围：1 到 16。
+# 默认值：4
+max_sequence_elements = 4
+
 [files]
 # 文件保存选项（可通过 --save-*/--no-save-* 参数覆盖）
 # 格式：{ debug = bool, release = bool }

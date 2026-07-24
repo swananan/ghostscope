@@ -4,12 +4,78 @@
 use super::{ProducerInfo, RustcVersion, SourceLanguage, TypeProjection};
 use ghostscope_protocol::ValuePresentation;
 
+/// Default number of source-language adapter edges followed below a root value.
+pub const DEFAULT_VALUE_ADAPTER_NESTING_DEPTH: usize = 4;
+
+/// Maximum configurable source-language adapter nesting depth.
+pub const MAX_VALUE_ADAPTER_NESTING_DEPTH: usize = 16;
+
+/// Options controlling semantic value read-plan construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueReadPlanOptions {
+    /// Maximum number of nested adapter edges followed below the root adapter.
+    pub max_nesting_depth: usize,
+}
+
+impl Default for ValueReadPlanOptions {
+    fn default() -> Self {
+        Self {
+            max_nesting_depth: DEFAULT_VALUE_ADAPTER_NESTING_DEPTH,
+        }
+    }
+}
+
 /// A language-selected presentation and the physical reads needed to produce
 /// its protocol payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValueReadPlan {
+    pub root_type: crate::ResolvedType,
     pub presentation: ValuePresentation,
     pub capture: ValueCapturePlan,
+    /// Exact element identity for sequence captures. Some Rust containers
+    /// erase the physical allocation pointer to `u8`, so this cannot always be
+    /// recovered by dereferencing the data projection.
+    pub sequence_element: Option<crate::ResolvedType>,
+    /// Recursively selected adapters for values embedded in this root capture.
+    ///
+    /// The root capture remains valid on its own. Consumers that do not
+    /// implement nested capture can ignore this metadata and retain the
+    /// existing one-level presentation.
+    pub nested: Option<ValueNestedPlan>,
+}
+
+impl ValueReadPlan {
+    pub(crate) fn new(
+        root_type: crate::ResolvedType,
+        presentation: ValuePresentation,
+        capture: ValueCapturePlan,
+    ) -> Self {
+        Self {
+            root_type,
+            presentation,
+            capture,
+            sequence_element: None,
+            nested: None,
+        }
+    }
+}
+
+/// Adapter plans selected for semantic values embedded in a root capture.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValueNestedPlan {
+    /// The projected value itself has a semantic adapter.
+    ProjectedValue { value: Box<ValueReadPlan> },
+    /// Selected fields in a synthetic projected view have semantic adapters.
+    ProjectedView { fields: Vec<ValueNestedFieldPlan> },
+    /// Every captured sequence element uses the same semantic adapter.
+    Sequence { element: Box<ValueReadPlan> },
+}
+
+/// One projected-view field with a recursively selected semantic adapter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueNestedFieldPlan {
+    pub field_index: usize,
+    pub value: Box<ValueReadPlan>,
 }
 
 /// Stage at which a recognized source-language value adapter was rejected.
@@ -133,8 +199,12 @@ pub enum ValueCapturePlan {
     /// it using the projected type rather than the physical wrapper type.
     ProjectedValue { value: TypeProjection },
     /// Read the physical root value in place, but register and format it using
-    /// a DWARF-derived semantic view of selected embedded fields.
-    InlineView { output_type: crate::TypeInfo },
+    /// a DWARF-derived semantic view of selected embedded fields. `fields`
+    /// retains exact identities for optional nested adapter planning.
+    InlineView {
+        output_type: crate::TypeInfo,
+        fields: Vec<ProjectedValueRead>,
+    },
     /// Assemble a synthetic struct from independently projected values. Every
     /// member offset, pointer width, and final type is derived from DWARF.
     ProjectedView {

@@ -129,6 +129,7 @@ fn complex_format_static_payload_len(arg: &ComplexArg<'_>) -> Option<usize> {
         ComplexArgSource::ProjectedView { .. } => {
             Some(std::cmp::max(arg.data_len, VARIABLE_READ_ERROR_PAYLOAD_LEN))
         }
+        ComplexArgSource::NestedValue { .. } => None,
         ComplexArgSource::MemDumpDynamic { .. } => None,
         ComplexArgSource::IndirectBytes { .. } => None,
         ComplexArgSource::IndirectSequence { .. } => None,
@@ -195,6 +196,8 @@ fn plan_complex_format_layout(
                 .push(ghostscope_protocol::HASH_TABLE_HEADER_SIZE.saturating_add(*max_len));
         } else if let ComplexArgSource::IndirectBTree { max_len, .. } = &arg.source {
             dynamic_max_lens.push(ghostscope_protocol::BTREE_HEADER_SIZE.saturating_add(*max_len));
+        } else if let ComplexArgSource::NestedValue { value, .. } = &arg.source {
+            dynamic_max_lens.push(value.total_len);
         }
 
         arg_payload_plans.push((header_len, static_payload_len));
@@ -1175,8 +1178,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         var_data_ptr: PointerValue<'ctx>,
         address: &RuntimeAddress<'ctx>,
         len: usize,
+        reserved_len: usize,
     ) -> Result<()> {
-        self.emit_complex_format_memdump_at(status_ptr, var_data_ptr, var_data_ptr, address, len)
+        self.emit_complex_format_memdump_at(
+            status_ptr,
+            var_data_ptr,
+            var_data_ptr,
+            address,
+            len,
+            reserved_len,
+        )
     }
 
     fn emit_complex_format_memdump_at(
@@ -1186,6 +1197,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         dst_ptr: PointerValue<'ctx>,
         address: &RuntimeAddress<'ctx>,
         len: usize,
+        payload_reserved_len: usize,
     ) -> Result<()> {
         // Branchy emitters must leave the builder at their continuation block so
         // the caller can append the next formatted argument.
@@ -1289,57 +1301,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .const_int(VariableStatus::ReadError as u64, false),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        // SAFETY: payload_ptr points at the read-error payload.
-        let errno_ptr_i8 = unsafe {
-            self.builder
-                .build_gep(
-                    self.context.i8_type(),
-                    payload_ptr,
-                    &[self
-                        .context
-                        .i32_type()
-                        .const_int(VARIABLE_READ_ERROR_PAYLOAD_ERRNO_OFFSET as u64, false)],
-                    "errno_ptr_i8",
-                )
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-        };
-        let errno_ptr = self
-            .builder
-            .build_pointer_cast(
-                errno_ptr_i8,
-                self.context.ptr_type(AddressSpace::default()),
-                "errno_ptr",
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let errno = self.build_errno_i32(ret, "errno_i32")?;
-        self.builder
-            .build_store(errno_ptr, errno)
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        // SAFETY: read-error payload reserves enough bytes for the addr field.
-        let addr_ptr_i8 = unsafe {
-            self.builder
-                .build_gep(
-                    self.context.i8_type(),
-                    payload_ptr,
-                    &[self
-                        .context
-                        .i32_type()
-                        .const_int(VARIABLE_READ_ERROR_PAYLOAD_ADDR_OFFSET as u64, false)],
-                    "addr_ptr_i8",
-                )
-                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-        };
-        let addr_ptr = self
-            .builder
-            .build_pointer_cast(
-                addr_ptr_i8,
-                self.context.ptr_type(AddressSpace::default()),
-                "addr_ptr",
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        self.builder
-            .build_store(addr_ptr, address.value)
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.emit_complex_format_read_error_payload(
+            payload_ptr,
+            payload_reserved_len,
+            ret,
+            address.value,
+        )?;
         self.mark_any_fail()?;
         self.builder
             .build_unconditional_branch(cont_b)
@@ -1806,6 +1773,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             field_ptr,
                             &address,
                             field.value_len,
+                            reserved_len,
                         )?;
                     }
                     ghostscope_dwarf::ProjectedViewFieldCapture::Address => {
@@ -4701,9 +4669,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             ComplexArgSource::ImmediateBytes { bytes, .. } => {
                 self.emit_complex_format_immediate_bytes(var_data_ptr, bytes)
             }
-            ComplexArgSource::MemDump { address, len } => {
-                self.emit_complex_format_memdump(status_ptr, var_data_ptr, address, *len)
-            }
+            ComplexArgSource::MemDump { address, len } => self.emit_complex_format_memdump(
+                status_ptr,
+                var_data_ptr,
+                address,
+                *len,
+                reserved_len,
+            ),
             ComplexArgSource::MemDumpDynamic {
                 address,
                 len_value,
@@ -4889,6 +4861,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     fields,
                     reserved_len,
                 ),
+            ComplexArgSource::NestedValue { descriptor, value } => self
+                .emit_complex_format_nested_value(
+                    status_ptr,
+                    var_data_ptr,
+                    descriptor,
+                    value,
+                    reserved_len,
+                ),
             ComplexArgSource::ComputedInt { value, byte_len } => {
                 self.emit_complex_format_computed_int(var_data_ptr, *value, *byte_len)
             }
@@ -4917,6 +4897,761 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 self.emit_complex_format_computed_address(status_ptr, var_data_ptr, address)
             }
         }
+    }
+
+    fn emit_complex_format_nested_value(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        var_data_ptr: PointerValue<'ctx>,
+        descriptor: &RuntimeAddress<'ctx>,
+        value: &NestedValueSource,
+        reserved_len: usize,
+    ) -> Result<()> {
+        if reserved_len < value.total_len {
+            self.builder
+                .build_store(
+                    status_ptr,
+                    self.context
+                        .i8_type()
+                        .const_int(VariableStatus::Truncated as u64, false),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.mark_any_fail()?;
+            return Ok(());
+        }
+        self.emit_nested_value_root(status_ptr, var_data_ptr, descriptor, value)?;
+        self.emit_nested_value_children(status_ptr, var_data_ptr, descriptor, value)
+    }
+
+    fn emit_nested_value_root(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        payload_ptr: PointerValue<'ctx>,
+        descriptor: &RuntimeAddress<'ctx>,
+        value: &NestedValueSource,
+    ) -> Result<()> {
+        match &value.root {
+            NestedValueRootSource::ProjectedValue { offset, len } => {
+                if *len == 0 {
+                    return Ok(());
+                }
+                let address = if *offset == 0 {
+                    *descriptor
+                } else {
+                    let address = self
+                        .builder
+                        .build_int_add(
+                            descriptor.value,
+                            self.context.i64_type().const_int(*offset, false),
+                            "nested_projected_value_address",
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                    descriptor.with_value(address)
+                };
+                self.emit_complex_format_memdump(
+                    status_ptr,
+                    payload_ptr,
+                    &address,
+                    *len,
+                    value.root_payload_len,
+                )
+            }
+            NestedValueRootSource::InlineView { len } => {
+                if *len == 0 {
+                    Ok(())
+                } else {
+                    self.emit_complex_format_memdump(
+                        status_ptr,
+                        payload_ptr,
+                        descriptor,
+                        *len,
+                        value.root_payload_len,
+                    )
+                }
+            }
+            NestedValueRootSource::ProjectedView { fields } => self
+                .emit_complex_format_projected_view(
+                    status_ptr,
+                    payload_ptr,
+                    descriptor,
+                    fields,
+                    value.root_payload_len,
+                ),
+            NestedValueRootSource::IndirectBytes {
+                data_offset,
+                data_access_size,
+                length_offset,
+                length_access_size,
+                max_len,
+            } => self.emit_complex_format_indirect(
+                status_ptr,
+                payload_ptr,
+                descriptor,
+                value.root_payload_len,
+                IndirectCaptureConfig {
+                    data_offset: *data_offset,
+                    data_access_size: *data_access_size,
+                    length_offset: *length_offset,
+                    length_access_size: *length_access_size,
+                    max_len: *max_len,
+                    shape: IndirectCaptureShape::Bytes,
+                },
+            ),
+            NestedValueRootSource::IndirectSequence {
+                data_offset,
+                data_access_size,
+                length_offset,
+                length_access_size,
+                element_stride,
+                max_elements,
+                max_len,
+            } => self.emit_complex_format_indirect(
+                status_ptr,
+                payload_ptr,
+                descriptor,
+                value.root_payload_len,
+                IndirectCaptureConfig {
+                    data_offset: *data_offset,
+                    data_access_size: *data_access_size,
+                    length_offset: *length_offset,
+                    length_access_size: *length_access_size,
+                    max_len: *max_len,
+                    shape: IndirectCaptureShape::Sequence {
+                        element_stride: *element_stride,
+                        max_elements: *max_elements,
+                        ring: None,
+                    },
+                },
+            ),
+            NestedValueRootSource::IndirectRingSequence {
+                data_offset,
+                data_access_size,
+                start_offset,
+                start_access_size,
+                length,
+                capacity_offset,
+                capacity_access_size,
+                element_stride,
+                max_elements,
+                max_len,
+            } => {
+                let (length_offset, length_access_size, length_kind) = match length {
+                    RingSequenceLengthSource::Explicit {
+                        offset,
+                        access_size,
+                    } => (*offset, *access_size, RingCaptureLengthKind::Explicit),
+                    RingSequenceLengthSource::End {
+                        offset,
+                        access_size,
+                    } => (*offset, *access_size, RingCaptureLengthKind::End),
+                };
+                self.emit_complex_format_indirect(
+                    status_ptr,
+                    payload_ptr,
+                    descriptor,
+                    value.root_payload_len,
+                    IndirectCaptureConfig {
+                        data_offset: *data_offset,
+                        data_access_size: *data_access_size,
+                        length_offset,
+                        length_access_size,
+                        max_len: *max_len,
+                        shape: IndirectCaptureShape::Sequence {
+                            element_stride: *element_stride,
+                            max_elements: *max_elements,
+                            ring: Some(RingCaptureConfig {
+                                start_offset: *start_offset,
+                                start_access_size: *start_access_size,
+                                capacity_offset: *capacity_offset,
+                                capacity_access_size: *capacity_access_size,
+                                length_kind,
+                            }),
+                        },
+                    },
+                )
+            }
+            NestedValueRootSource::IndirectHashTable {
+                control_offset,
+                control_access_size,
+                length_offset,
+                length_access_size,
+                bucket_mask_offset,
+                bucket_mask_access_size,
+                entry_stride,
+                occupancy,
+                buckets,
+                bucket_order,
+                max_buckets,
+            } => self.emit_complex_format_hash_table(
+                status_ptr,
+                payload_ptr,
+                descriptor,
+                value.root_payload_len,
+                HashTableCaptureConfig {
+                    control_offset: *control_offset,
+                    control_access_size: *control_access_size,
+                    length_offset: *length_offset,
+                    length_access_size: *length_access_size,
+                    bucket_mask_offset: *bucket_mask_offset,
+                    bucket_mask_access_size: *bucket_mask_access_size,
+                    entry_stride: *entry_stride,
+                    occupancy: *occupancy,
+                    buckets: *buckets,
+                    bucket_order: *bucket_order,
+                    max_buckets: *max_buckets,
+                },
+            ),
+            NestedValueRootSource::IndirectBTree {
+                root_pointer_offset,
+                root_pointer_access_size,
+                root_height_offset,
+                root_height_access_size,
+                length_offset,
+                length_access_size,
+                node_length_offset,
+                node_length_access_size,
+                keys,
+                values,
+                edges,
+                node_capacity,
+                max_nodes,
+            } => self.emit_complex_format_btree(
+                status_ptr,
+                payload_ptr,
+                descriptor,
+                value.root_payload_len,
+                BTreeCaptureConfig {
+                    root_pointer_offset: *root_pointer_offset,
+                    root_pointer_access_size: *root_pointer_access_size,
+                    root_height_offset: *root_height_offset,
+                    root_height_access_size: *root_height_access_size,
+                    length_offset: *length_offset,
+                    length_access_size: *length_access_size,
+                    node_length_offset: *node_length_offset,
+                    node_length_access_size: *node_length_access_size,
+                    keys: *keys,
+                    values: *values,
+                    edges: *edges,
+                    node_capacity: *node_capacity,
+                    max_nodes: *max_nodes,
+                },
+            ),
+        }
+    }
+
+    fn emit_nested_value_children(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        payload_ptr: PointerValue<'ctx>,
+        descriptor: &RuntimeAddress<'ctx>,
+        value: &NestedValueSource,
+    ) -> Result<()> {
+        if matches!(value.children, NestedValueChildrenSource::None) {
+            return Ok(());
+        }
+
+        let function = self.current_function("compile nested semantic children")?;
+        let children_block = self
+            .context
+            .append_basic_block(function, "nested_children_ready");
+        let finish_block = self
+            .context
+            .append_basic_block(function, "nested_children_finish");
+        let status = self
+            .builder
+            .build_load(self.context.i8_type(), status_ptr, "nested_root_status")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+        let ok = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                status,
+                self.context.i8_type().const_zero(),
+                "nested_root_ok",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let can_capture = if matches!(value.children, NestedValueChildrenSource::Sequence { .. }) {
+            let truncated = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    status,
+                    self.context
+                        .i8_type()
+                        .const_int(VariableStatus::Truncated as u64, false),
+                    "nested_root_truncated",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder
+                .build_or(ok, truncated, "nested_root_has_elements")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+        } else {
+            ok
+        };
+        self.builder
+            .build_conditional_branch(can_capture, children_block, finish_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(children_block);
+        match &value.children {
+            NestedValueChildrenSource::None => unreachable!("handled before branching"),
+            NestedValueChildrenSource::ProjectedValue { slot_offset, child } => {
+                let NestedValueRootSource::ProjectedValue { offset, .. } = value.root else {
+                    return Err(CodeGenError::DwarfError(
+                        "nested projected child does not match its root capture".to_string(),
+                    ));
+                };
+                let child_descriptor = if offset == 0 {
+                    *descriptor
+                } else {
+                    let address = self
+                        .builder
+                        .build_int_add(
+                            descriptor.value,
+                            self.context.i64_type().const_int(offset, false),
+                            "nested_projected_child_address",
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                    descriptor.with_value(address)
+                };
+                self.emit_nested_child_slot(payload_ptr, *slot_offset, &child_descriptor, child)?;
+            }
+            NestedValueChildrenSource::ProjectedView { fields } => {
+                for (index, field) in fields.iter().enumerate() {
+                    self.emit_nested_projected_field(payload_ptr, descriptor, field, index)?;
+                }
+            }
+            NestedValueChildrenSource::Sequence {
+                first_slot_offset,
+                slot_stride,
+                slot_count,
+                element,
+                metadata,
+            } => self.emit_nested_sequence_children(
+                status_ptr,
+                payload_ptr,
+                descriptor,
+                *first_slot_offset,
+                *slot_stride,
+                *slot_count,
+                element,
+                metadata,
+                finish_block,
+            )?,
+        }
+        if self
+            .builder
+            .get_insert_block()
+            .is_some_and(|block| block.get_terminator().is_none())
+        {
+            self.builder
+                .build_unconditional_branch(finish_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        }
+        self.builder.position_at_end(finish_block);
+        Ok(())
+    }
+
+    fn emit_nested_child_slot(
+        &mut self,
+        parent_payload: PointerValue<'ctx>,
+        slot_offset: usize,
+        descriptor: &RuntimeAddress<'ctx>,
+        child: &NestedValueSource,
+    ) -> Result<()> {
+        let (status_ptr, payload_ptr) =
+            self.initialize_nested_child_header(parent_payload, slot_offset, VariableStatus::Ok)?;
+        self.emit_nested_value_root(status_ptr, payload_ptr, descriptor, child)?;
+        self.emit_nested_value_children(status_ptr, payload_ptr, descriptor, child)
+    }
+
+    fn initialize_nested_child_header(
+        &mut self,
+        parent_payload: PointerValue<'ctx>,
+        slot_offset: usize,
+        status: VariableStatus,
+    ) -> Result<(PointerValue<'ctx>, PointerValue<'ctx>)> {
+        let (status_ptr, payload_ptr) = self.nested_child_pointers(parent_payload, slot_offset)?;
+        self.emit_complex_format_immediate_bytes(
+            status_ptr,
+            &[0; ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE],
+        )?;
+        self.builder
+            .build_store(
+                status_ptr,
+                self.context.i8_type().const_int(status as u64, false),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        Ok((status_ptr, payload_ptr))
+    }
+
+    fn nested_child_pointers(
+        &mut self,
+        parent_payload: PointerValue<'ctx>,
+        slot_offset: usize,
+    ) -> Result<(PointerValue<'ctx>, PointerValue<'ctx>)> {
+        let i32_type = self.context.i32_type();
+        // SAFETY: every nested slot offset is computed from the statically
+        // reserved parent payload.
+        let status_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    parent_payload,
+                    &[i32_type.const_int(slot_offset as u64, false)],
+                    "nested_child_status",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+        };
+        // SAFETY: the fixed child header is part of every reserved slot.
+        let payload_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    status_ptr,
+                    &[i32_type.const_int(
+                        ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE as u64,
+                        false,
+                    )],
+                    "nested_child_payload",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+        };
+        Ok((status_ptr, payload_ptr))
+    }
+
+    fn emit_nested_projected_field(
+        &mut self,
+        parent_payload: PointerValue<'ctx>,
+        descriptor: &RuntimeAddress<'ctx>,
+        field: &NestedValueFieldSource,
+        field_index: usize,
+    ) -> Result<()> {
+        let (status_ptr, payload_ptr) = self.initialize_nested_child_header(
+            parent_payload,
+            field.slot_offset,
+            VariableStatus::Ok,
+        )?;
+        let function = self.current_function("compile nested projected field")?;
+        let finish_block = self.context.append_basic_block(
+            function,
+            &format!("nested_projected_field_{field_index}_finish"),
+        );
+        let address = self.resolve_nested_projected_address(
+            *descriptor,
+            &field.steps,
+            status_ptr,
+            payload_ptr,
+            field.child.total_len,
+            finish_block,
+            field_index,
+        )?;
+        self.emit_nested_value_root(status_ptr, payload_ptr, &address, &field.child)?;
+        self.emit_nested_value_children(status_ptr, payload_ptr, &address, &field.child)?;
+        if self
+            .builder
+            .get_insert_block()
+            .is_some_and(|block| block.get_terminator().is_none())
+        {
+            self.builder
+                .build_unconditional_branch(finish_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        }
+        self.builder.position_at_end(finish_block);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_nested_projected_address(
+        &mut self,
+        mut address: RuntimeAddress<'ctx>,
+        steps: &[ProjectedViewStep],
+        status_ptr: PointerValue<'ctx>,
+        payload_ptr: PointerValue<'ctx>,
+        reserved_len: usize,
+        finish_block: inkwell::basic_block::BasicBlock<'ctx>,
+        field_index: usize,
+    ) -> Result<RuntimeAddress<'ctx>> {
+        let function = self.current_function("resolve nested projected address")?;
+        for (step_index, step) in steps.iter().enumerate() {
+            match step {
+                ProjectedViewStep::Member { offset } => {
+                    if *offset != 0 {
+                        let value = self
+                            .builder
+                            .build_int_add(
+                                address.value,
+                                self.context.i64_type().const_int(*offset, false),
+                                &format!("nested_projected_{field_index}_{step_index}_member"),
+                            )
+                            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                        address = address.with_value(value);
+                    }
+                }
+                ProjectedViewStep::Dereference { pointer_size } => {
+                    let read = self.generate_memory_read_with_diagnostics(
+                        address,
+                        *pointer_size,
+                        Some(status_ptr),
+                        &format!("nested_projected_{field_index}_{step_index}_pointer"),
+                    )?;
+                    let ok = self
+                        .builder
+                        .build_not(
+                            read.combined_fail,
+                            &format!("nested_projected_{field_index}_{step_index}_ok"),
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                    let ok_block = self.context.append_basic_block(
+                        function,
+                        &format!("nested_projected_{field_index}_{step_index}_pointer_ok"),
+                    );
+                    let error_block = self.context.append_basic_block(
+                        function,
+                        &format!("nested_projected_{field_index}_{step_index}_pointer_error"),
+                    );
+                    self.builder
+                        .build_conditional_branch(ok, ok_block, error_block)
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                    self.builder.position_at_end(error_block);
+                    self.emit_complex_format_read_error_payload(
+                        payload_ptr,
+                        reserved_len,
+                        read.helper_result,
+                        address.value,
+                    )?;
+                    self.builder
+                        .build_unconditional_branch(finish_block)
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                    self.builder.position_at_end(ok_block);
+                    address = RuntimeAddress::available(read.value.into_int_value(), self.context);
+                }
+            }
+        }
+        Ok(address)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_nested_sequence_children(
+        &mut self,
+        _status_ptr: PointerValue<'ctx>,
+        parent_payload: PointerValue<'ctx>,
+        descriptor: &RuntimeAddress<'ctx>,
+        first_slot_offset: usize,
+        slot_stride: usize,
+        slot_count: usize,
+        element: &NestedValueSource,
+        metadata: &NestedSequenceMetadataSource,
+        finish_block: inkwell::basic_block::BasicBlock<'ctx>,
+    ) -> Result<()> {
+        let function = self.current_function("compile nested sequence children")?;
+        let i64_type = self.context.i64_type();
+        let i32_type = self.context.i32_type();
+        for index in 0..slot_count {
+            let slot_offset = first_slot_offset
+                .checked_add(index.checked_mul(slot_stride).ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "nested sequence child slot offset overflow".to_string(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "nested sequence child slot offset overflow".to_string(),
+                    )
+                })?;
+            self.initialize_nested_child_header(
+                parent_payload,
+                slot_offset,
+                VariableStatus::AccessError,
+            )?;
+        }
+        let data_member = self
+            .builder
+            .build_int_add(
+                descriptor.value,
+                i64_type.const_int(metadata.data_offset, false),
+                "nested_sequence_data_member",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let data_read = self.generate_memory_read_with_diagnostics(
+            descriptor.with_value(data_member),
+            metadata.data_access_size,
+            None,
+            "nested_sequence_data",
+        )?;
+        let mut metadata_failed = data_read.combined_fail;
+        let ring_reads = if let Some(ring) = metadata.ring {
+            let start_member = self
+                .builder
+                .build_int_add(
+                    descriptor.value,
+                    i64_type.const_int(ring.start_offset, false),
+                    "nested_sequence_start_member",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let start_read = self.generate_memory_read_with_diagnostics(
+                descriptor.with_value(start_member),
+                ring.start_access_size,
+                None,
+                "nested_sequence_start",
+            )?;
+            metadata_failed = self
+                .builder
+                .build_or(
+                    metadata_failed,
+                    start_read.combined_fail,
+                    "nested_sequence_start_failed",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let capacity_member = self
+                .builder
+                .build_int_add(
+                    descriptor.value,
+                    i64_type.const_int(ring.capacity_offset, false),
+                    "nested_sequence_capacity_member",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let capacity_read = self.generate_memory_read_with_diagnostics(
+                descriptor.with_value(capacity_member),
+                ring.capacity_access_size,
+                None,
+                "nested_sequence_capacity",
+            )?;
+            metadata_failed = self
+                .builder
+                .build_or(
+                    metadata_failed,
+                    capacity_read.combined_fail,
+                    "nested_sequence_capacity_failed",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            Some((
+                start_read.value.into_int_value(),
+                capacity_read.value.into_int_value(),
+            ))
+        } else {
+            None
+        };
+
+        let metadata_ok_block = self
+            .context
+            .append_basic_block(function, "nested_sequence_metadata_ok");
+        self.builder
+            .build_conditional_branch(metadata_failed, finish_block, metadata_ok_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.builder.position_at_end(metadata_ok_block);
+
+        // SAFETY: the root sequence payload always reserves its two-u64 header.
+        let captured_count_ptr_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    parent_payload,
+                    &[i32_type.const_int(
+                        ghostscope_protocol::INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET as u64,
+                        false,
+                    )],
+                    "nested_sequence_captured_count_i8",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+        };
+        let captured_count_ptr = self
+            .builder
+            .build_pointer_cast(
+                captured_count_ptr_i8,
+                self.context.ptr_type(AddressSpace::default()),
+                "nested_sequence_captured_count",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let captured_count = self
+            .builder
+            .build_load(i64_type, captured_count_ptr, "nested_sequence_captured")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+        let data_address = data_read.value.into_int_value();
+        let stride = i64_type.const_int(metadata.element_stride, false);
+
+        for index in 0..slot_count {
+            let slot_offset = first_slot_offset
+                .checked_add(index.checked_mul(slot_stride).ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "nested sequence child slot offset overflow".to_string(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "nested sequence child slot offset overflow".to_string(),
+                    )
+                })?;
+            let active = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::ULT,
+                    i64_type.const_int(index as u64, false),
+                    captured_count,
+                    &format!("nested_sequence_{index}_active"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let active_block = self
+                .context
+                .append_basic_block(function, &format!("nested_sequence_{index}_capture"));
+            let continue_block = self
+                .context
+                .append_basic_block(function, &format!("nested_sequence_{index}_continue"));
+            self.builder
+                .build_conditional_branch(active, active_block, continue_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder.position_at_end(active_block);
+
+            let logical_index = i64_type.const_int(index as u64, false);
+            let physical_index = if let Some((start, capacity)) = ring_reads {
+                let unwrapped = self
+                    .builder
+                    .build_int_add(start, logical_index, "nested_sequence_unwrapped_index")
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                let wrapped = self
+                    .builder
+                    .build_int_sub(unwrapped, capacity, "nested_sequence_wrapped_index")
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                let wraps = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::UGE,
+                        unwrapped,
+                        capacity,
+                        "nested_sequence_index_wraps",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                self.builder
+                    .build_select(wraps, wrapped, unwrapped, "nested_sequence_physical_index")
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                    .into_int_value()
+            } else {
+                logical_index
+            };
+            let byte_offset = self
+                .builder
+                .build_int_mul(physical_index, stride, "nested_sequence_element_offset")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let address = self
+                .builder
+                .build_int_add(data_address, byte_offset, "nested_sequence_element_address")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let child_descriptor = RuntimeAddress::available(address, self.context);
+            self.emit_nested_child_slot(parent_payload, slot_offset, &child_descriptor, element)?;
+            if self
+                .builder
+                .get_insert_block()
+                .is_some_and(|block| block.get_terminator().is_none())
+            {
+                self.builder
+                    .build_unconditional_branch(continue_block)
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            }
+            self.builder.position_at_end(continue_block);
+        }
+        Ok(())
     }
 
     /// Generate eBPF code for PrintComplexFormat instruction with runtime reads for variables
@@ -5062,6 +5797,75 @@ mod complex_format_layout_tests {
                 max_len,
             },
         }
+    }
+
+    fn nested_value_arg<'ctx>(context: &'ctx Context, total_len: usize) -> ComplexArg<'ctx> {
+        let value = NestedValueSource {
+            output_type: ghostscope_dwarf::TypeInfo::StructType {
+                name: "Nested".to_string(),
+                size: total_len as u64,
+                members: Vec::new(),
+            },
+            presentation: ghostscope_dwarf::ValuePresentation::Dwarf,
+            root_payload_len: total_len,
+            total_len,
+            root: NestedValueRootSource::InlineView { len: total_len },
+            children: NestedValueChildrenSource::None,
+        };
+        ComplexArg {
+            var_name_index: 0,
+            type_index: 0,
+            access_path: Vec::new(),
+            data_len: total_len,
+            source: ComplexArgSource::NestedValue {
+                descriptor: RuntimeAddress::available(context.i64_type().const_zero(), context),
+                value: Box::new(value),
+            },
+        }
+    }
+
+    fn short_nested_child_emitter_ir() -> String {
+        let context = Context::create();
+        let options = crate::CompileOptions::default();
+        let mut ebpf = EbpfContext::new(&context, "nested_child", Some(0), &options)
+            .expect("create eBPF context");
+        let function_type = context.i64_type().fn_type(&[], false);
+        let function = ebpf
+            .module
+            .add_function("emit_nested_child", function_type, None);
+        let entry = context.append_basic_block(function, "entry");
+        ebpf.builder.position_at_end(entry);
+        let slot_len = ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE + 1;
+        let parent_payload = ebpf
+            .builder
+            .build_alloca(
+                context.i8_type().array_type(slot_len as u32),
+                "parent_payload",
+            )
+            .expect("allocate nested child slot");
+        let descriptor =
+            RuntimeAddress::available(context.i64_type().const_int(0x1000, false), &context);
+        let child = NestedValueSource {
+            output_type: ghostscope_dwarf::TypeInfo::BaseType {
+                name: "u8".to_string(),
+                size: 1,
+                encoding: ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16,
+            },
+            presentation: ghostscope_dwarf::ValuePresentation::Dwarf,
+            root_payload_len: 1,
+            total_len: 1,
+            root: NestedValueRootSource::ProjectedValue { offset: 0, len: 1 },
+            children: NestedValueChildrenSource::None,
+        };
+
+        ebpf.emit_nested_child_slot(parent_payload, 0, &descriptor, &child)
+            .expect("emit nested child capture");
+        ebpf.builder
+            .build_return(Some(&context.i64_type().const_zero()))
+            .expect("return from test function");
+        ebpf.module.verify().expect("verify generated LLVM IR");
+
+        ebpf.module.print_to_string().to_string()
     }
 
     fn indirect_hash_table_arg<'ctx>(
@@ -5393,6 +6197,29 @@ mod complex_format_layout_tests {
                 VARIABLE_READ_ERROR_PAYLOAD_LEN,
             ]
         );
+    }
+
+    #[test]
+    fn complex_format_layout_bounds_nested_values_to_event_and_wire_budgets() {
+        let context = Context::create();
+        let args = vec![nested_value_arg(&context, 40_000)];
+        let max_trace_event_size = 32 * 1024;
+
+        let layout = plan_complex_format_layout(max_trace_event_size, 0, &args);
+        let instruction_budget = print_complex_format_instruction_budget(max_trace_event_size, 0);
+
+        assert_eq!(layout.total_size, instruction_budget);
+        assert!(layout.args[0].reserved_len < 40_000);
+        assert!(layout.inst_data_size <= u16::MAX as usize);
+    }
+
+    #[test]
+    fn short_nested_child_read_errors_stay_within_the_child_slot() {
+        let llvm_ir = short_nested_child_emitter_ir();
+
+        assert!(llvm_ir.contains("probe_read_user_memdump"));
+        assert!(!llvm_ir.contains("indirect_errno_ptr_i8"));
+        assert!(!llvm_ir.contains("indirect_addr_ptr_i8"));
     }
 
     #[test]

@@ -85,6 +85,8 @@ pub struct Config {
     #[serde(default)]
     pub dwarf: DwarfConfig,
     #[serde(default)]
+    pub value_adapters: ValueAdapterConfig,
+    #[serde(default)]
     pub files: FilesConfig,
     #[serde(default)]
     pub ui: UiConfigToml,
@@ -150,6 +152,18 @@ pub struct DwarfConfig {
     /// debuginfod client configuration.
     #[serde(default)]
     pub debuginfod: DwarfDebuginfodConfig,
+}
+
+/// Source-language semantic value adapter limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValueAdapterConfig {
+    /// Maximum adapter edges followed below a root semantic value.
+    #[serde(default = "default_value_adapter_max_nesting_depth")]
+    pub max_nesting_depth: usize,
+    /// Maximum semantic children captured for each nested sequence node.
+    #[serde(default = "default_value_adapter_max_sequence_elements")]
+    pub max_sequence_elements: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum, Default)]
@@ -380,6 +394,14 @@ fn default_mem_dump_cap() -> u32 {
     256
 }
 
+fn default_value_adapter_max_nesting_depth() -> usize {
+    ghostscope_dwarf::DEFAULT_VALUE_ADAPTER_NESTING_DEPTH
+}
+
+fn default_value_adapter_max_sequence_elements() -> usize {
+    ghostscope_compiler::DEFAULT_VALUE_ADAPTER_SEQUENCE_ELEMENTS
+}
+
 fn default_max_trace_event_size() -> u32 {
     32768
 }
@@ -467,6 +489,43 @@ impl Default for DwarfConfig {
             allow_loose_debug_match: false,
             debuginfod: DwarfDebuginfodConfig::default(),
         }
+    }
+}
+
+impl Default for ValueAdapterConfig {
+    fn default() -> Self {
+        Self {
+            max_nesting_depth: default_value_adapter_max_nesting_depth(),
+            max_sequence_elements: default_value_adapter_max_sequence_elements(),
+        }
+    }
+}
+
+impl ValueAdapterConfig {
+    pub fn validate(&self, file_path: &str) -> Result<()> {
+        if !(1..=ghostscope_dwarf::MAX_VALUE_ADAPTER_NESTING_DEPTH)
+            .contains(&self.max_nesting_depth)
+        {
+            return Err(anyhow::anyhow!(
+                "Invalid value adapter configuration in '{}': \
+                 max_nesting_depth must be in range 1 to {}, got {}",
+                file_path,
+                ghostscope_dwarf::MAX_VALUE_ADAPTER_NESTING_DEPTH,
+                self.max_nesting_depth
+            ));
+        }
+        if !(1..=ghostscope_compiler::MAX_VALUE_ADAPTER_SEQUENCE_ELEMENTS)
+            .contains(&self.max_sequence_elements)
+        {
+            return Err(anyhow::anyhow!(
+                "Invalid value adapter configuration in '{}': \
+                 max_sequence_elements must be in range 1 to {}, got {}",
+                file_path,
+                ghostscope_compiler::MAX_VALUE_ADAPTER_SEQUENCE_ELEMENTS,
+                self.max_sequence_elements
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -700,6 +759,11 @@ impl Config {
         // Validate eBPF configuration
         config.ebpf.validate(&path.display().to_string())?;
 
+        // Validate source-language value adapter limits
+        config
+            .value_adapters
+            .validate(&path.display().to_string())?;
+
         // Validate UI configuration
         config.ui.validate(&path.display().to_string())?;
 
@@ -892,6 +956,75 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn value_adapter_defaults_are_bounded() {
+        let config = Config::default().value_adapters;
+        assert_eq!(
+            config.max_nesting_depth,
+            ghostscope_dwarf::DEFAULT_VALUE_ADAPTER_NESTING_DEPTH
+        );
+        assert_eq!(
+            config.max_sequence_elements,
+            ghostscope_compiler::DEFAULT_VALUE_ADAPTER_SEQUENCE_ELEMENTS
+        );
+        config.validate("test.toml").unwrap();
+    }
+
+    #[test]
+    fn value_adapter_limits_deserialize_independently() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [value_adapters]
+            max_nesting_depth = 7
+            max_sequence_elements = 3
+            "#,
+        )
+        .expect("value adapter config should parse")
+        .value_adapters;
+
+        assert_eq!(config.max_nesting_depth, 7);
+        assert_eq!(config.max_sequence_elements, 3);
+        config.validate("test.toml").unwrap();
+    }
+
+    #[test]
+    fn value_adapter_limits_reject_zero() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [value_adapters]
+            max_nesting_depth = 0
+            max_sequence_elements = 0
+            "#,
+        )
+        .expect("value adapter config should parse")
+        .value_adapters;
+
+        assert!(config
+            .validate("test.toml")
+            .unwrap_err()
+            .to_string()
+            .contains("max_nesting_depth"));
+    }
+
+    #[test]
+    fn value_adapter_limits_reject_values_above_supported_maximum() {
+        let mut config = Config::default().value_adapters;
+        config.max_nesting_depth = ghostscope_dwarf::MAX_VALUE_ADAPTER_NESTING_DEPTH + 1;
+        assert!(config
+            .validate("test.toml")
+            .unwrap_err()
+            .to_string()
+            .contains("max_nesting_depth"));
+
+        let mut config = Config::default().value_adapters;
+        config.max_sequence_elements = ghostscope_compiler::MAX_VALUE_ADAPTER_SEQUENCE_ELEMENTS + 1;
+        assert!(config
+            .validate("test.toml")
+            .unwrap_err()
+            .to_string()
+            .contains("max_sequence_elements"));
+    }
 
     #[test]
     fn ebpf_defaults_enable_sysmon_for_target() {

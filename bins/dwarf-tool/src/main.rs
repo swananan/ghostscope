@@ -994,6 +994,7 @@ fn value_presentation_name(presentation: &ValuePresentation) -> &'static str {
         ValuePresentation::ReferenceCountedStruct { .. } => "reference-counted-struct",
         ValuePresentation::HashTable { .. } => "hash-table",
         ValuePresentation::BTree { .. } => "btree",
+        ValuePresentation::Nested { .. } => "nested",
     }
 }
 

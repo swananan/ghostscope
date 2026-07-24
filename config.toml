@@ -145,6 +145,20 @@ timeout_secs = 5
 # DEBUGINFOD_MAXSIZE. Use 0 for no explicit client-side cap.
 max_size_bytes = 0
 
+[value_adapters]
+# Maximum number of nested source-language adapter edges followed below a root
+# value. This is separate from ordinary inline DWARF structure formatting.
+# Valid range: 1 to 16.
+# Default: 4
+max_nesting_depth = 4
+
+# Maximum semantic child elements captured for each nested sequence node, such
+# as Vec<String>. The effective count can be lower when mem_dump_cap cannot fit
+# this many child payloads.
+# Valid range: 1 to 16.
+# Default: 4
+max_sequence_elements = 4
+
 [files]
 # File saving options (overridden by --save-*/--no-save-* flags)
 # Format: { debug = bool, release = bool }

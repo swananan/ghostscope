@@ -99,6 +99,129 @@ enum HashTableBucketSource {
     },
 }
 
+#[derive(Debug, Clone)]
+struct NestedValueSource {
+    output_type: ghostscope_dwarf::TypeInfo,
+    presentation: ghostscope_dwarf::ValuePresentation,
+    root_payload_len: usize,
+    total_len: usize,
+    root: NestedValueRootSource,
+    children: NestedValueChildrenSource,
+}
+
+#[derive(Debug, Clone)]
+enum NestedValueRootSource {
+    ProjectedValue {
+        offset: u64,
+        len: usize,
+    },
+    InlineView {
+        len: usize,
+    },
+    ProjectedView {
+        fields: Vec<ProjectedViewFieldSource>,
+    },
+    IndirectBytes {
+        data_offset: u64,
+        data_access_size: ghostscope_dwarf::MemoryAccessSize,
+        length_offset: u64,
+        length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        max_len: usize,
+    },
+    IndirectSequence {
+        data_offset: u64,
+        data_access_size: ghostscope_dwarf::MemoryAccessSize,
+        length_offset: u64,
+        length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        element_stride: u64,
+        max_elements: usize,
+        max_len: usize,
+    },
+    IndirectRingSequence {
+        data_offset: u64,
+        data_access_size: ghostscope_dwarf::MemoryAccessSize,
+        start_offset: u64,
+        start_access_size: ghostscope_dwarf::MemoryAccessSize,
+        length: RingSequenceLengthSource,
+        capacity_offset: u64,
+        capacity_access_size: ghostscope_dwarf::MemoryAccessSize,
+        element_stride: u64,
+        max_elements: usize,
+        max_len: usize,
+    },
+    IndirectHashTable {
+        control_offset: u64,
+        control_access_size: ghostscope_dwarf::MemoryAccessSize,
+        length_offset: u64,
+        length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        bucket_mask_offset: u64,
+        bucket_mask_access_size: ghostscope_dwarf::MemoryAccessSize,
+        entry_stride: u64,
+        occupancy: ghostscope_dwarf::HashTableOccupancy,
+        buckets: HashTableBucketSource,
+        bucket_order: ghostscope_dwarf::HashTableBucketOrder,
+        max_buckets: usize,
+    },
+    IndirectBTree {
+        root_pointer_offset: u64,
+        root_pointer_access_size: ghostscope_dwarf::MemoryAccessSize,
+        root_height_offset: u64,
+        root_height_access_size: ghostscope_dwarf::MemoryAccessSize,
+        length_offset: u64,
+        length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        node_length_offset: u64,
+        node_length_access_size: ghostscope_dwarf::MemoryAccessSize,
+        keys: BTreeArraySource,
+        values: Option<BTreeArraySource>,
+        edges: BTreeEdgesSource,
+        node_capacity: u64,
+        max_nodes: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum NestedValueChildrenSource {
+    None,
+    ProjectedValue {
+        slot_offset: usize,
+        child: Box<NestedValueSource>,
+    },
+    ProjectedView {
+        fields: Vec<NestedValueFieldSource>,
+    },
+    Sequence {
+        first_slot_offset: usize,
+        slot_stride: usize,
+        slot_count: usize,
+        element: Box<NestedValueSource>,
+        metadata: NestedSequenceMetadataSource,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct NestedValueFieldSource {
+    field_index: usize,
+    slot_offset: usize,
+    steps: Vec<ProjectedViewStep>,
+    child: Box<NestedValueSource>,
+}
+
+#[derive(Debug, Clone)]
+struct NestedSequenceMetadataSource {
+    data_offset: u64,
+    data_access_size: ghostscope_dwarf::MemoryAccessSize,
+    element_stride: u64,
+    ring: Option<NestedRingMetadataSource>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NestedRingMetadataSource {
+    start_offset: u64,
+    start_access_size: ghostscope_dwarf::MemoryAccessSize,
+    capacity_offset: u64,
+    capacity_access_size: ghostscope_dwarf::MemoryAccessSize,
+}
+
 /// Source for complex formatted argument data
 #[derive(Debug, Clone)]
 enum ComplexArgSource<'ctx> {
@@ -192,6 +315,11 @@ enum ComplexArgSource<'ctx> {
     ProjectedView {
         descriptor: RuntimeAddress<'ctx>,
         fields: Vec<ProjectedViewFieldSource>,
+    },
+    /// A root semantic capture plus fixed child sidecars.
+    NestedValue {
+        descriptor: RuntimeAddress<'ctx>,
+        value: Box<NestedValueSource>,
     },
     ImmediateBytes {
         bytes: Vec<u8>,

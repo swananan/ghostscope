@@ -164,6 +164,12 @@ pub enum EventMapType {
     PerfEventArray,
 }
 
+/// Default number of semantic children captured for each nested sequence.
+pub const DEFAULT_VALUE_ADAPTER_SEQUENCE_ELEMENTS: usize = 4;
+
+/// Maximum configurable number of semantic children per nested sequence.
+pub const MAX_VALUE_ADAPTER_SEQUENCE_ELEMENTS: usize = 16;
+
 /// Compilation options including save options and eBPF map configuration
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
@@ -182,6 +188,10 @@ pub struct CompileOptions {
     pub event_map_type: EventMapType,
     /// Max bytes to read per memory-dump argument (format {:x}/{:s}).
     pub mem_dump_cap: u32,
+    /// Maximum source-language adapter edges followed below a root value.
+    pub value_adapter_max_nesting_depth: usize,
+    /// Maximum semantic children captured for each nested sequence.
+    pub value_adapter_max_sequence_elements: usize,
     /// Max bytes to compare for string/memory comparisons (strncmp/starts_with/memcmp)
     pub compare_cap: u32,
     /// Max total bytes in a single trace event (used for PerfEventArray accumulation buffer size).
@@ -229,8 +239,10 @@ impl Default for CompileOptions {
             perf_page_count: 64,                   // 64 pages = 256KB per CPU
             event_map_type: EventMapType::RingBuf, // Default to RingBuf
             mem_dump_cap: 256,                     // Default per-arg dump cap (bytes)
-            compare_cap: 64,                       // Default compare cap for strncmp/memcmp (bytes)
-            max_trace_event_size: 32768,           // Default event size cap (32KB)
+            value_adapter_max_nesting_depth: ghostscope_dwarf::DEFAULT_VALUE_ADAPTER_NESTING_DEPTH,
+            value_adapter_max_sequence_elements: DEFAULT_VALUE_ADAPTER_SEQUENCE_ELEMENTS,
+            compare_cap: 64, // Default compare cap for strncmp/memcmp (bytes)
+            max_trace_event_size: 32768, // Default event size cap (32KB)
             backtrace_depth: DEFAULT_BACKTRACE_DEPTH,
             selected_index: None,
             pid_filter_spec: None,

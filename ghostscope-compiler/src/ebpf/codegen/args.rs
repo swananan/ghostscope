@@ -21,6 +21,28 @@ fn exact_memory_access_size(size: u64, role: &str) -> Result<ghostscope_dwarf::M
     }
 }
 
+fn projected_value_steps(
+    value: &ghostscope_dwarf::ProjectedValueRead,
+) -> Result<Vec<ProjectedViewStep>> {
+    value
+        .steps
+        .iter()
+        .map(|step| match step {
+            ghostscope_dwarf::ProjectedValueStep::Member { offset } => {
+                Ok(ProjectedViewStep::Member { offset: *offset })
+            }
+            ghostscope_dwarf::ProjectedValueStep::Dereference { pointer_size } => {
+                Ok(ProjectedViewStep::Dereference {
+                    pointer_size: exact_memory_access_size(
+                        *pointer_size,
+                        "projected semantic pointer",
+                    )?,
+                })
+            }
+        })
+        .collect()
+}
+
 fn metadata_member(
     projection: &ghostscope_dwarf::TypeProjection,
     role: &str,
@@ -172,26 +194,10 @@ fn projected_view_source(
         }
         ranges.push((output_offset, end));
 
-        let mut steps = Vec::with_capacity(field.value.steps.len());
-        for step in &field.value.steps {
-            steps.push(match step {
-                ghostscope_dwarf::ProjectedValueStep::Member { offset } => {
-                    ProjectedViewStep::Member { offset: *offset }
-                }
-                ghostscope_dwarf::ProjectedValueStep::Dereference { pointer_size } => {
-                    ProjectedViewStep::Dereference {
-                        pointer_size: exact_memory_access_size(
-                            *pointer_size,
-                            "projected semantic pointer",
-                        )?,
-                    }
-                }
-            });
-        }
         sources.push(ProjectedViewFieldSource {
             output_offset,
             value_len,
-            steps,
+            steps: projected_value_steps(&field.value)?,
             capture: field.capture,
         });
     }
@@ -292,6 +298,666 @@ fn btree_capture_limits(
     Ok((max_nodes, max_len, data_len))
 }
 
+fn compile_nested_value_source(
+    plan: &ghostscope_dwarf::ValueReadPlan,
+    budget: usize,
+    max_sequence_elements: usize,
+) -> Result<Option<NestedValueSource>> {
+    let Some(nested) = &plan.nested else {
+        let Some((output_type, root, root_payload_len)) =
+            compile_nested_root_source(plan, budget, None)?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(NestedValueSource {
+            output_type,
+            presentation: plan.presentation.clone(),
+            root_payload_len,
+            total_len: root_payload_len,
+            root,
+            children: NestedValueChildrenSource::None,
+        }));
+    };
+
+    match nested {
+        ghostscope_dwarf::ValueNestedPlan::ProjectedValue { value } => {
+            let Some((output_type, root, root_payload_len)) =
+                compile_nested_root_source(plan, budget, None)?
+            else {
+                return Ok(None);
+            };
+            let child_budget = budget
+                .saturating_sub(root_payload_len)
+                .saturating_sub(ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE);
+            let Some(child) =
+                compile_nested_value_source(value, child_budget, max_sequence_elements)?
+            else {
+                return Ok(None);
+            };
+            let slot_offset = root_payload_len;
+            let total_len = slot_offset
+                .checked_add(ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE)
+                .and_then(|len| len.checked_add(child.total_len))
+                .ok_or_else(|| {
+                    CodeGenError::DwarfError("nested value payload size overflow".to_string())
+                })?;
+            if total_len > budget {
+                return Ok(None);
+            }
+            Ok(Some(NestedValueSource {
+                output_type,
+                presentation: plan.presentation.clone(),
+                root_payload_len,
+                total_len,
+                root,
+                children: NestedValueChildrenSource::ProjectedValue {
+                    slot_offset,
+                    child: Box::new(child),
+                },
+            }))
+        }
+        ghostscope_dwarf::ValueNestedPlan::ProjectedView { fields } => {
+            let Some((output_type, root, root_payload_len)) =
+                compile_nested_root_source(plan, budget, None)?
+            else {
+                return Ok(None);
+            };
+            let header_bytes = fields
+                .len()
+                .checked_mul(ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE)
+                .ok_or_else(|| {
+                    CodeGenError::DwarfError("nested field header size overflow".to_string())
+                })?;
+            let child_budget = budget
+                .saturating_sub(root_payload_len)
+                .saturating_sub(header_bytes)
+                .checked_div(fields.len().max(1))
+                .unwrap_or(0);
+            let mut slot_offset = root_payload_len;
+            let mut compiled_fields = Vec::with_capacity(fields.len());
+            for field in fields {
+                let Some(child) =
+                    compile_nested_value_source(&field.value, child_budget, max_sequence_elements)?
+                else {
+                    continue;
+                };
+                let steps = nested_field_steps(&plan.capture, &root, field.field_index)?;
+                compiled_fields.push(NestedValueFieldSource {
+                    field_index: field.field_index,
+                    slot_offset,
+                    steps,
+                    child: Box::new(child),
+                });
+                slot_offset = slot_offset
+                    .checked_add(ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE)
+                    .and_then(|offset| {
+                        offset.checked_add(
+                            compiled_fields
+                                .last()
+                                .expect("compiled nested field was just pushed")
+                                .child
+                                .total_len,
+                        )
+                    })
+                    .ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "nested projected-view payload size overflow".to_string(),
+                        )
+                    })?;
+            }
+            if compiled_fields.is_empty() || slot_offset > budget {
+                return Ok(None);
+            }
+            Ok(Some(NestedValueSource {
+                output_type,
+                presentation: plan.presentation.clone(),
+                root_payload_len,
+                total_len: slot_offset,
+                root,
+                children: NestedValueChildrenSource::ProjectedView {
+                    fields: compiled_fields,
+                },
+            }))
+        }
+        ghostscope_dwarf::ValueNestedPlan::Sequence { element } => {
+            for slot_count in (1..=max_sequence_elements).rev() {
+                let Some((output_type, root, root_payload_len)) =
+                    compile_nested_root_source(plan, budget, Some(slot_count))?
+                else {
+                    continue;
+                };
+                let header_bytes = slot_count
+                    .checked_mul(ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE)
+                    .ok_or_else(|| {
+                        CodeGenError::DwarfError("nested sequence header size overflow".to_string())
+                    })?;
+                let child_budget = budget
+                    .saturating_sub(root_payload_len)
+                    .saturating_sub(header_bytes)
+                    / slot_count;
+                let Some(child) =
+                    compile_nested_value_source(element, child_budget, max_sequence_elements)?
+                else {
+                    continue;
+                };
+                let slot_stride = ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE
+                    .checked_add(child.total_len)
+                    .ok_or_else(|| {
+                        CodeGenError::DwarfError("nested sequence slot size overflow".to_string())
+                    })?;
+                let total_len = root_payload_len
+                    .checked_add(slot_count.checked_mul(slot_stride).ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "nested sequence payload size overflow".to_string(),
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "nested sequence payload size overflow".to_string(),
+                        )
+                    })?;
+                if total_len > budget {
+                    continue;
+                }
+                let metadata = nested_sequence_metadata(&plan.capture)?;
+                return Ok(Some(NestedValueSource {
+                    output_type,
+                    presentation: plan.presentation.clone(),
+                    root_payload_len,
+                    total_len,
+                    root,
+                    children: NestedValueChildrenSource::Sequence {
+                        first_slot_offset: root_payload_len,
+                        slot_stride,
+                        slot_count,
+                        element: Box::new(child),
+                        metadata,
+                    },
+                }));
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn compile_nested_root_source(
+    plan: &ghostscope_dwarf::ValueReadPlan,
+    budget: usize,
+    sequence_elements: Option<usize>,
+) -> Result<Option<(ghostscope_dwarf::TypeInfo, NestedValueRootSource, usize)>> {
+    let output = match &plan.capture {
+        ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value } => {
+            let offset = projected_member_offset(value, "nested projected value")?;
+            let output_type = value.resolved_type.summary.clone();
+            let len = EbpfContext::compute_read_size_for_type(&output_type);
+            if len == 0 && !is_known_zero_sized_type(&output_type) {
+                return Ok(None);
+            }
+            (
+                output_type,
+                NestedValueRootSource::ProjectedValue { offset, len },
+                len,
+            )
+        }
+        ghostscope_dwarf::ValueCapturePlan::InlineView { output_type, .. } => {
+            let len = usize::try_from(output_type.size()).map_err(|_| {
+                CodeGenError::DwarfError(
+                    "nested inline semantic view size does not fit this host".to_string(),
+                )
+            })?;
+            if len == 0 && !is_known_zero_sized_type(output_type) {
+                return Ok(None);
+            }
+            (
+                output_type.clone(),
+                NestedValueRootSource::InlineView { len },
+                len,
+            )
+        }
+        ghostscope_dwarf::ValueCapturePlan::ProjectedView {
+            output_type,
+            fields,
+        } => {
+            let (len, fields) = projected_view_source(output_type, fields)?;
+            (
+                output_type.clone(),
+                NestedValueRootSource::ProjectedView { fields },
+                len,
+            )
+        }
+        ghostscope_dwarf::ValueCapturePlan::IndirectBytes { data, length } => {
+            if budget < ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE {
+                return Ok(None);
+            }
+            let (data_offset, data_access_size) = metadata_member(data, "nested data")?;
+            let (length_offset, length_access_size) = metadata_member(length, "nested length")?;
+            let max_len = budget - ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE;
+            (
+                plan.root_type.summary.clone(),
+                NestedValueRootSource::IndirectBytes {
+                    data_offset,
+                    data_access_size,
+                    length_offset,
+                    length_access_size,
+                    max_len,
+                },
+                ghostscope_protocol::INDIRECT_BYTES_LENGTH_PREFIX_SIZE + max_len,
+            )
+        }
+        ghostscope_dwarf::ValueCapturePlan::IndirectSequence {
+            data,
+            length,
+            element_stride,
+        } => {
+            if budget < ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE {
+                return Ok(None);
+            }
+            let (data_offset, data_access_size) = metadata_member(data, "nested sequence data")?;
+            let (length_offset, length_access_size) =
+                metadata_member(length, "nested sequence length")?;
+            let (max_elements, max_len, data_len) =
+                nested_sequence_capture_limits(budget, *element_stride, sequence_elements, false)?;
+            (
+                plan.root_type.summary.clone(),
+                NestedValueRootSource::IndirectSequence {
+                    data_offset,
+                    data_access_size,
+                    length_offset,
+                    length_access_size,
+                    element_stride: *element_stride,
+                    max_elements,
+                    max_len,
+                },
+                data_len,
+            )
+        }
+        ghostscope_dwarf::ValueCapturePlan::IndirectRingSequence {
+            data,
+            start,
+            length,
+            capacity,
+            element_stride,
+        } => {
+            if budget < ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE {
+                return Ok(None);
+            }
+            let (data_offset, data_access_size) =
+                metadata_member(data, "nested ring sequence data")?;
+            let (start_offset, start_access_size) =
+                metadata_member(start, "nested ring sequence start")?;
+            let length = match length.as_ref() {
+                ghostscope_dwarf::RingSequenceLength::Explicit(length) => {
+                    let (offset, access_size) =
+                        metadata_member(length, "nested ring sequence length")?;
+                    RingSequenceLengthSource::Explicit {
+                        offset,
+                        access_size,
+                    }
+                }
+                ghostscope_dwarf::RingSequenceLength::End(end) => {
+                    let (offset, access_size) = metadata_member(end, "nested ring sequence end")?;
+                    RingSequenceLengthSource::End {
+                        offset,
+                        access_size,
+                    }
+                }
+            };
+            let (capacity_offset, capacity_access_size) =
+                metadata_member(capacity, "nested ring sequence capacity")?;
+            let (max_elements, max_len, data_len) =
+                nested_sequence_capture_limits(budget, *element_stride, sequence_elements, true)?;
+            (
+                plan.root_type.summary.clone(),
+                NestedValueRootSource::IndirectRingSequence {
+                    data_offset,
+                    data_access_size,
+                    start_offset,
+                    start_access_size,
+                    length,
+                    capacity_offset,
+                    capacity_access_size,
+                    element_stride: *element_stride,
+                    max_elements,
+                    max_len,
+                },
+                data_len,
+            )
+        }
+        ghostscope_dwarf::ValueCapturePlan::IndirectHashTable {
+            control,
+            length,
+            bucket_mask,
+            entry_stride,
+            occupancy,
+            buckets,
+            bucket_order,
+        } => {
+            if budget < ghostscope_protocol::HASH_TABLE_HEADER_SIZE {
+                return Ok(None);
+            }
+            let (control_offset, control_access_size) =
+                metadata_member(control, "nested hash-table control")?;
+            let (length_offset, length_access_size) =
+                metadata_member(length, "nested hash-table length")?;
+            let (bucket_mask_offset, bucket_mask_access_size) =
+                metadata_member(bucket_mask, "nested hash-table bucket mask")?;
+            let buckets = match buckets {
+                ghostscope_dwarf::HashTableBucketSource::Forward { data } => {
+                    let (data_offset, data_access_size) =
+                        metadata_member(data, "nested hash-table data")?;
+                    HashTableBucketSource::Forward {
+                        data_offset,
+                        data_access_size,
+                    }
+                }
+                ghostscope_dwarf::HashTableBucketSource::ReverseFromControl => {
+                    HashTableBucketSource::ReverseFromControl
+                }
+                ghostscope_dwarf::HashTableBucketSource::LegacyAfterControl {
+                    entry_alignment,
+                    pointer_tag_mask,
+                } => HashTableBucketSource::LegacyAfterControl {
+                    entry_alignment: *entry_alignment,
+                    pointer_tag_mask: *pointer_tag_mask,
+                },
+            };
+            let (max_buckets, _, data_len) = hash_table_capture_limits(
+                budget - ghostscope_protocol::HASH_TABLE_HEADER_SIZE,
+                *entry_stride,
+                *occupancy,
+            )?;
+            (
+                plan.root_type.summary.clone(),
+                NestedValueRootSource::IndirectHashTable {
+                    control_offset,
+                    control_access_size,
+                    length_offset,
+                    length_access_size,
+                    bucket_mask_offset,
+                    bucket_mask_access_size,
+                    entry_stride: *entry_stride,
+                    occupancy: *occupancy,
+                    buckets,
+                    bucket_order: *bucket_order,
+                    max_buckets,
+                },
+                data_len,
+            )
+        }
+        ghostscope_dwarf::ValueCapturePlan::IndirectBTree {
+            root_pointer,
+            root_height,
+            length,
+            node_length,
+            keys,
+            values,
+            edges,
+            node_capacity,
+        } => {
+            if budget < ghostscope_protocol::BTREE_HEADER_SIZE {
+                return Ok(None);
+            }
+            let (root_pointer_offset, root_pointer_access_size) =
+                metadata_member(root_pointer, "nested B-Tree root pointer")?;
+            let (root_height_offset, root_height_access_size) =
+                metadata_member(root_height, "nested B-Tree root height")?;
+            let (length_offset, length_access_size) =
+                metadata_member(length, "nested B-Tree length")?;
+            let (node_length_offset, node_length_access_size) =
+                metadata_member(node_length, "nested B-Tree node length")?;
+            let values_source = values.as_ref().map(|values| BTreeArraySource {
+                offset: values.offset,
+                slot_stride: values.slot_stride,
+            });
+            let (max_nodes, _, data_len) = btree_capture_limits(
+                budget - ghostscope_protocol::BTREE_HEADER_SIZE,
+                *node_capacity,
+                keys.slot_stride,
+                values_source.map(|values| values.slot_stride),
+            )?;
+            (
+                plan.root_type.summary.clone(),
+                NestedValueRootSource::IndirectBTree {
+                    root_pointer_offset,
+                    root_pointer_access_size,
+                    root_height_offset,
+                    root_height_access_size,
+                    length_offset,
+                    length_access_size,
+                    node_length_offset,
+                    node_length_access_size,
+                    keys: BTreeArraySource {
+                        offset: keys.offset,
+                        slot_stride: keys.slot_stride,
+                    },
+                    values: values_source,
+                    edges: BTreeEdgesSource {
+                        offset_from_leaf: edges.offset_from_leaf,
+                        slot_stride: edges.slot_stride,
+                        pointer_offset: edges.pointer_offset,
+                        pointer_access_size: exact_memory_access_size(
+                            edges.pointer_size,
+                            "nested B-Tree edge pointer",
+                        )?,
+                        edge_count: edges.edge_count,
+                    },
+                    node_capacity: *node_capacity,
+                    max_nodes,
+                },
+                data_len,
+            )
+        }
+    };
+    Ok((output.2 <= budget).then_some(output))
+}
+
+fn nested_sequence_capture_limits(
+    budget: usize,
+    element_stride: u64,
+    sequence_elements: Option<usize>,
+    ring: bool,
+) -> Result<(usize, usize, usize)> {
+    let factor = if ring { 2 } else { 1 };
+    let available = budget.saturating_sub(ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE);
+    let stride = usize::try_from(element_stride).map_err(|_| {
+        CodeGenError::DwarfError(format!(
+            "nested sequence element DWARF size {element_stride} does not fit this host"
+        ))
+    })?;
+    let max_elements = match sequence_elements {
+        Some(elements) => elements,
+        None if stride == 0 => available,
+        None => available / factor / stride,
+    };
+    let max_len = max_elements.checked_mul(stride).ok_or_else(|| {
+        CodeGenError::DwarfError("nested sequence payload size overflow".to_string())
+    })?;
+    let data_len = ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE
+        .checked_add(max_len.checked_mul(factor).ok_or_else(|| {
+            CodeGenError::DwarfError("nested ring payload size overflow".to_string())
+        })?)
+        .ok_or_else(|| {
+            CodeGenError::DwarfError("nested sequence payload size overflow".to_string())
+        })?;
+    Ok((max_elements, max_len, data_len))
+}
+
+fn nested_field_steps(
+    capture: &ghostscope_dwarf::ValueCapturePlan,
+    root: &NestedValueRootSource,
+    field_index: usize,
+) -> Result<Vec<ProjectedViewStep>> {
+    match (capture, root) {
+        (
+            ghostscope_dwarf::ValueCapturePlan::InlineView { fields, .. },
+            NestedValueRootSource::InlineView { .. },
+        ) => fields
+            .get(field_index)
+            .ok_or_else(|| {
+                CodeGenError::DwarfError(
+                    "nested inline-view field index is out of bounds".to_string(),
+                )
+            })
+            .and_then(projected_value_steps),
+        (
+            ghostscope_dwarf::ValueCapturePlan::ProjectedView { .. },
+            NestedValueRootSource::ProjectedView { fields },
+        ) => fields
+            .get(field_index)
+            .map(|field| field.steps.clone())
+            .ok_or_else(|| {
+                CodeGenError::DwarfError(
+                    "nested projected-view field index is out of bounds".to_string(),
+                )
+            }),
+        _ => Err(CodeGenError::DwarfError(
+            "nested projected-view metadata does not match its root capture".to_string(),
+        )),
+    }
+}
+
+fn nested_sequence_metadata(
+    capture: &ghostscope_dwarf::ValueCapturePlan,
+) -> Result<NestedSequenceMetadataSource> {
+    match capture {
+        ghostscope_dwarf::ValueCapturePlan::IndirectSequence {
+            data,
+            length,
+            element_stride,
+        } => {
+            let (data_offset, data_access_size) =
+                metadata_member(data, "nested sequence child data")?;
+            let _ = length;
+            Ok(NestedSequenceMetadataSource {
+                data_offset,
+                data_access_size,
+                element_stride: *element_stride,
+                ring: None,
+            })
+        }
+        ghostscope_dwarf::ValueCapturePlan::IndirectRingSequence {
+            data,
+            start,
+            length,
+            capacity,
+            element_stride,
+        } => {
+            let (data_offset, data_access_size) = metadata_member(data, "nested ring child data")?;
+            let (start_offset, start_access_size) =
+                metadata_member(start, "nested ring child start")?;
+            let _ = length;
+            let (capacity_offset, capacity_access_size) =
+                metadata_member(capacity, "nested ring child capacity")?;
+            Ok(NestedSequenceMetadataSource {
+                data_offset,
+                data_access_size,
+                element_stride: *element_stride,
+                ring: Some(NestedRingMetadataSource {
+                    start_offset,
+                    start_access_size,
+                    capacity_offset,
+                    capacity_access_size,
+                }),
+            })
+        }
+        _ => Err(CodeGenError::DwarfError(
+            "nested sequence metadata does not match its root capture".to_string(),
+        )),
+    }
+}
+
+fn nested_value_presentation(
+    value: &NestedValueSource,
+) -> Result<ghostscope_dwarf::ValuePresentation> {
+    let children = match &value.children {
+        NestedValueChildrenSource::None => return Ok(value.presentation.clone()),
+        NestedValueChildrenSource::ProjectedValue { slot_offset, child } => {
+            ghostscope_protocol::NestedValueChildrenPresentation::ProjectedValue {
+                child: Box::new(ghostscope_protocol::NestedValueChildPresentation {
+                    slot_offset: u64::try_from(*slot_offset).map_err(|_| {
+                        CodeGenError::DwarfError(
+                            "nested child slot offset does not fit the protocol".to_string(),
+                        )
+                    })?,
+                    value: Box::new(nested_child_presentation(child)?),
+                }),
+            }
+        }
+        NestedValueChildrenSource::ProjectedView { fields } => {
+            ghostscope_protocol::NestedValueChildrenPresentation::ProjectedView {
+                fields: fields
+                    .iter()
+                    .map(|field| {
+                        Ok(ghostscope_protocol::NestedValueFieldPresentation {
+                            field_index: u64::try_from(field.field_index).map_err(|_| {
+                                CodeGenError::DwarfError(
+                                    "nested field index does not fit the protocol".to_string(),
+                                )
+                            })?,
+                            child: ghostscope_protocol::NestedValueChildPresentation {
+                                slot_offset: u64::try_from(field.slot_offset).map_err(|_| {
+                                    CodeGenError::DwarfError(
+                                        "nested field slot offset does not fit the protocol"
+                                            .to_string(),
+                                    )
+                                })?,
+                                value: Box::new(nested_child_presentation(&field.child)?),
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }
+        }
+        NestedValueChildrenSource::Sequence {
+            first_slot_offset,
+            slot_stride,
+            slot_count,
+            element,
+            ..
+        } => ghostscope_protocol::NestedValueChildrenPresentation::Sequence {
+            first_slot_offset: u64::try_from(*first_slot_offset).map_err(|_| {
+                CodeGenError::DwarfError(
+                    "nested sequence offset does not fit the protocol".to_string(),
+                )
+            })?,
+            slot_stride: u64::try_from(*slot_stride).map_err(|_| {
+                CodeGenError::DwarfError(
+                    "nested sequence stride does not fit the protocol".to_string(),
+                )
+            })?,
+            slot_count: u64::try_from(*slot_count).map_err(|_| {
+                CodeGenError::DwarfError(
+                    "nested sequence count does not fit the protocol".to_string(),
+                )
+            })?,
+            element: Box::new(nested_child_presentation(element)?),
+        },
+    };
+    Ok(ghostscope_dwarf::ValuePresentation::Nested {
+        root: Box::new(value.presentation.clone()),
+        root_payload_len: u64::try_from(value.root_payload_len).map_err(|_| {
+            CodeGenError::DwarfError(
+                "nested root payload length does not fit the protocol".to_string(),
+            )
+        })?,
+        children: Box::new(children),
+    })
+}
+
+fn nested_child_presentation(
+    value: &NestedValueSource,
+) -> Result<ghostscope_protocol::NestedValuePresentation> {
+    Ok(ghostscope_protocol::NestedValuePresentation {
+        payload_len: u64::try_from(value.total_len).map_err(|_| {
+            CodeGenError::DwarfError(
+                "nested child payload length does not fit the protocol".to_string(),
+            )
+        })?,
+        type_info: Box::new(value.output_type.clone()),
+        presentation: Box::new(nested_value_presentation(value)?),
+    })
+}
+
 #[derive(Default)]
 struct SemanticValueResolution {
     plan: Option<ghostscope_dwarf::ValueReadPlan>,
@@ -310,7 +976,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             return Ok(SemanticValueResolution::default());
         };
         let report = analyzer
-            .explain_value_read_plan(resolved_type, type_module_path)
+            .explain_value_read_plan_with_options(
+                resolved_type,
+                type_module_path,
+                ghostscope_dwarf::ValueReadPlanOptions {
+                    max_nesting_depth: self.compile_options.value_adapter_max_nesting_depth,
+                },
+            )
             .map_err(|error| CodeGenError::DwarfError(error.to_string()))?;
         match &report.outcome {
             ghostscope_dwarf::ValueAdapterOutcome::NotApplicable => {
@@ -351,9 +1023,41 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         plan: ghostscope_dwarf::ValueReadPlan,
     ) -> Result<ComplexArg<'ctx>> {
         let cap = self.compile_options.mem_dump_cap as usize;
+        if plan.nested.is_some() {
+            if let Some(value) = compile_nested_value_source(
+                &plan,
+                cap,
+                self.compile_options.value_adapter_max_sequence_elements,
+            )? {
+                let output_type = value.output_type.clone();
+                let presentation = nested_value_presentation(&value)?;
+                let data_len = value.total_len;
+                return Ok(ComplexArg {
+                    var_name_index: self.trace_context.add_variable_name(display_name)?,
+                    type_index: self
+                        .trace_context
+                        .add_type_with_presentation(output_type, presentation)?,
+                    access_path: Vec::new(),
+                    data_len,
+                    source: ComplexArgSource::NestedValue {
+                        descriptor,
+                        value: Box::new(value),
+                    },
+                });
+            }
+            debug!(
+                target: "ghostscope_dwarf::value_adapter",
+                type_name = plan.root_type.summary.type_name(),
+                cap,
+                "Nested value plan exceeded its static capture budget; using the root adapter"
+            );
+        }
         let ghostscope_dwarf::ValueReadPlan {
+            root_type: _,
             presentation,
             capture,
+            sequence_element: _,
+            nested: _,
         } = plan;
         let mut output_type = dwarf_type;
         let (data_len, source) = match capture {
@@ -393,6 +1097,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
             ghostscope_dwarf::ValueCapturePlan::InlineView {
                 output_type: view_type,
+                ..
             } => {
                 let data_len = inline_view_data_len(&output_type, &view_type)?;
                 output_type = view_type;
@@ -743,6 +1448,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         presentation,
                         capture:
                             ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value: projected },
+                        nested: None,
+                        ..
                     }) = semantic_plan.as_ref()
                     {
                         let projected_type = &projected.resolved_type.summary;
@@ -766,7 +1473,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if let Some(ghostscope_dwarf::ValueReadPlan {
                         presentation,
                         capture:
-                            ghostscope_dwarf::ValueCapturePlan::InlineView { output_type },
+                            ghostscope_dwarf::ValueCapturePlan::InlineView {
+                                output_type,
+                                ..
+                            },
+                        nested: None,
+                        ..
                     }) = semantic_plan.as_ref()
                     {
                         let data_len = inline_view_data_len(&dwarf_type, output_type)?;
@@ -854,7 +1566,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                     },
                                 });
                             }
-                            ghostscope_dwarf::ValueCapturePlan::InlineView { output_type } => {
+                            ghostscope_dwarf::ValueCapturePlan::InlineView {
+                                output_type,
+                                ..
+                            } => {
                                 let data_len = inline_view_data_len(&dwarf_type, &output_type)?;
                                 if data_len == 0 || data_len > 8 {
                                     return Err(CodeGenError::DwarfError(format!(
@@ -1539,7 +2254,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             | ComplexArgSource::IndirectRingSequence { .. }
             | ComplexArgSource::IndirectHashTable { .. }
             | ComplexArgSource::IndirectBTree { .. }
-            | ComplexArgSource::ProjectedView { .. } => {
+            | ComplexArgSource::ProjectedView { .. }
+            | ComplexArgSource::NestedValue { .. } => {
                 // Use ComplexFormat with "{}"; generate_print_complex_format_instruction handles MemDump
                 let fmt_idx = self.trace_context.add_string("{}".to_string())?;
                 self.generate_print_complex_format_instruction(fmt_idx, &[arg])?;
@@ -1904,6 +2620,7 @@ mod semantic_value_tests {
     use ghostscope_dwarf::{
         MemoryAccessSize, ProjectedValueRead, ProjectedValueStep, ProjectedViewField, ResolvedType,
         StructMember, TypeIdentity, TypeInfo, TypeProjection, TypeProjectionLayout,
+        ValueCapturePlan, ValueNestedPlan, ValuePresentation, ValueReadPlan,
     };
 
     fn projection(size: u64) -> TypeProjection {
@@ -2215,5 +2932,92 @@ mod semantic_value_tests {
         )];
         let error = projected_view_source(&output, &fields).unwrap_err();
         assert!(error.to_string().contains("unsupported DWARF size 3"));
+    }
+
+    fn resolved_struct(name: &str, size: u64) -> ResolvedType {
+        ResolvedType::new(
+            TypeInfo::StructType {
+                name: name.to_string(),
+                size,
+                members: Vec::new(),
+            },
+            TypeIdentity::Unknown,
+            None,
+        )
+    }
+
+    fn string_value_plan() -> ValueReadPlan {
+        ValueReadPlan {
+            root_type: resolved_struct("String", 24),
+            presentation: ValuePresentation::Utf8String,
+            capture: ValueCapturePlan::IndirectBytes {
+                data: projection(8),
+                length: projection(8),
+            },
+            sequence_element: None,
+            nested: None,
+        }
+    }
+
+    fn nested_string_sequence_plan() -> ValueReadPlan {
+        let string = string_value_plan();
+        ValueReadPlan {
+            root_type: resolved_struct("Vec<String>", 24),
+            presentation: ValuePresentation::Sequence {
+                element_type: Box::new(string.root_type.summary.clone()),
+                element_stride: 24,
+            },
+            capture: ValueCapturePlan::IndirectSequence {
+                data: projection(8),
+                length: projection(8),
+                element_stride: 24,
+            },
+            sequence_element: Some(string.root_type.clone()),
+            nested: Some(ValueNestedPlan::Sequence {
+                element: Box::new(string),
+            }),
+        }
+    }
+
+    #[test]
+    fn nested_sequence_capture_reduces_slots_to_fit_the_byte_budget() {
+        let plan = nested_string_sequence_plan();
+
+        let four_slots = compile_nested_value_source(&plan, 256, 4)
+            .unwrap()
+            .expect("256 bytes should fit four nested String slots");
+        let NestedValueChildrenSource::Sequence {
+            slot_count,
+            element,
+            ..
+        } = &four_slots.children
+        else {
+            panic!("expected nested sequence source");
+        };
+        assert_eq!(*slot_count, 4);
+        assert_eq!(element.total_len, 28);
+        assert_eq!(four_slots.total_len, 256);
+
+        let one_slot = compile_nested_value_source(&plan, 80, 4)
+            .unwrap()
+            .expect("80 bytes should fit one nested String slot");
+        let NestedValueChildrenSource::Sequence { slot_count, .. } = one_slot.children else {
+            panic!("expected nested sequence source");
+        };
+        assert_eq!(slot_count, 1);
+        assert_eq!(one_slot.total_len, 80);
+    }
+
+    #[test]
+    fn nested_sequence_capture_respects_configured_element_limit() {
+        let plan = nested_string_sequence_plan();
+
+        let two_slots = compile_nested_value_source(&plan, 256, 2)
+            .unwrap()
+            .expect("256 bytes should fit two configured nested String slots");
+        let NestedValueChildrenSource::Sequence { slot_count, .. } = two_slots.children else {
+            panic!("expected nested sequence source");
+        };
+        assert_eq!(slot_count, 2);
     }
 }

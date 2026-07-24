@@ -275,14 +275,16 @@ where
                     field_name: field_name.to_string(),
                 },
             };
-            return Ok(Some(ValueReadPlan {
+            return Ok(Some(ValueReadPlan::new(
+                current.clone(),
                 presentation,
-                capture: ValueCapturePlan::ProjectedValue { value },
-            }));
+                ValueCapturePlan::ProjectedValue { value },
+            )));
         }
         ValueLayout::ProjectedStruct(layout) => {
             let root_size = current.summary.size();
             let mut members = Vec::with_capacity(layout.fields.len());
+            let mut projected_fields = Vec::with_capacity(layout.fields.len());
             for field in layout.fields {
                 let projected =
                     context.project_member_path(current, &field.value_path, type_module_path)?;
@@ -291,7 +293,7 @@ where
                         "semantic struct field produced a non-member projection"
                     ));
                 };
-                let member_type = projected.resolved_type.summary;
+                let member_type = projected.resolved_type.summary.clone();
                 let member_end = offset
                     .checked_add(member_type.size())
                     .ok_or_else(|| anyhow::anyhow!("semantic struct field end overflow"))?;
@@ -308,6 +310,10 @@ where
                     bit_offset: None,
                     bit_size: None,
                 });
+                projected_fields.push(ProjectedValueRead {
+                    steps: vec![ProjectedValueStep::Member { offset }],
+                    resolved_type: projected.resolved_type,
+                });
             }
             let presentation = projected_struct_presentation(layout.presentation);
             let output_type = TypeInfo::StructType {
@@ -315,10 +321,14 @@ where
                 size: root_size,
                 members,
             };
-            return Ok(Some(ValueReadPlan {
+            return Ok(Some(ValueReadPlan::new(
+                current.clone(),
                 presentation,
-                capture: ValueCapturePlan::InlineView { output_type },
-            }));
+                ValueCapturePlan::InlineView {
+                    output_type,
+                    fields: projected_fields,
+                },
+            )));
         }
         ValueLayout::CompositeStruct(layout) => {
             let mut members = Vec::with_capacity(layout.fields.len());
@@ -382,13 +392,14 @@ where
                 size: output_size,
                 members,
             };
-            return Ok(Some(ValueReadPlan {
-                presentation: projected_struct_presentation(layout.presentation),
-                capture: ValueCapturePlan::ProjectedView {
+            return Ok(Some(ValueReadPlan::new(
+                current.clone(),
+                projected_struct_presentation(layout.presentation),
+                ValueCapturePlan::ProjectedView {
                     output_type,
                     fields,
                 },
-            }));
+            )));
         }
         ValueLayout::Extension(extension) => {
             return build_extension(context, current, type_module_path, extension);
@@ -397,24 +408,24 @@ where
     };
 
     let data = context.project_member_path(current, &layout.data_path, type_module_path)?;
-    let (presentation, element_stride) = match layout.kind {
-        IndirectSequenceKind::Utf8String => (crate::ValuePresentation::Utf8String, None),
+    let (presentation, element_stride, sequence_element) = match layout.kind {
+        IndirectSequenceKind::Utf8String => (crate::ValuePresentation::Utf8String, None, None),
         IndirectSequenceKind::ByteString | IndirectSequenceKind::OpaqueByteString => {
-            (crate::ValuePresentation::ByteString, None)
+            (crate::ValuePresentation::ByteString, None, None)
         }
         IndirectSequenceKind::PointerTarget => {
-            let TypeInfo::PointerType { target_type, .. } =
-                strip_type_aliases(&data.resolved_type.summary)
-            else {
-                return Ok(None);
-            };
-            let element_type = target_type.as_ref().clone();
+            let element = context.project_type(
+                &data.resolved_type,
+                &VariableAccessSegment::Dereference,
+                type_module_path,
+            )?;
             if matches!(
-                strip_type_aliases(&element_type),
+                strip_type_aliases(&element.resolved_type.summary),
                 TypeInfo::UnknownType { .. } | TypeInfo::OptimizedOut { .. }
             ) {
                 return Ok(None);
             }
+            let element_type = element.resolved_type.summary.clone();
             let element_stride = element_type.size();
             (
                 crate::ValuePresentation::Sequence {
@@ -422,6 +433,7 @@ where
                     element_stride,
                 },
                 Some(element_stride),
+                Some(element.resolved_type),
             )
         }
         IndirectSequenceKind::TypeParameter { index } => {
@@ -440,10 +452,11 @@ where
             let element_stride = element.summary.size();
             (
                 crate::ValuePresentation::Sequence {
-                    element_type: Box::new(element.summary),
+                    element_type: Box::new(element.summary.clone()),
                     element_stride,
                 },
                 Some(element_stride),
+                Some(element),
             )
         }
     };
@@ -497,10 +510,9 @@ where
         }
     };
 
-    Ok(Some(ValueReadPlan {
-        presentation,
-        capture,
-    }))
+    let mut plan = ValueReadPlan::new(current.clone(), presentation, capture);
+    plan.sequence_element = sequence_element;
+    Ok(Some(plan))
 }
 
 fn projected_struct_presentation(

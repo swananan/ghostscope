@@ -158,14 +158,15 @@ pub(crate) fn hash_table_value_read_plan(
     let bucket_mask =
         context.project_member_path(current, &layout.bucket_mask_path, type_module_path)?;
 
-    Ok(Some(ValueReadPlan {
-        presentation: ValuePresentation::HashTable {
+    Ok(Some(ValueReadPlan::new(
+        current.clone(),
+        ValuePresentation::HashTable {
             entry_stride,
             bucket_order: layout.bucket_order,
             occupancy: layout.occupancy,
             entry,
         },
-        capture: ValueCapturePlan::IndirectHashTable {
+        ValueCapturePlan::IndirectHashTable {
             control,
             length,
             bucket_mask,
@@ -174,7 +175,7 @@ pub(crate) fn hash_table_value_read_plan(
             buckets,
             bucket_order: layout.bucket_order,
         },
-    }))
+    )))
 }
 
 pub(crate) fn btree_value_read_plan<'a>(
@@ -428,12 +429,13 @@ impl BTreePlanner<'_> {
             return Ok(None);
         };
 
-        Ok(Some(ValueReadPlan {
-            presentation: ValuePresentation::BTree {
+        Ok(Some(ValueReadPlan::new(
+            current.clone(),
+            ValuePresentation::BTree {
                 node_capacity,
                 entry,
             },
-            capture: ValueCapturePlan::IndirectBTree {
+            ValueCapturePlan::IndirectBTree {
                 root_pointer,
                 root_height,
                 length,
@@ -452,7 +454,7 @@ impl BTreePlanner<'_> {
                 },
                 node_capacity,
             },
-        }))
+        )))
     }
 
     fn project_member_path(
