@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{CStr, CString, OsString};
 use std::num::NonZeroI32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -54,6 +54,9 @@ pub enum CompatUnsigned {
 #[inline(never)]
 pub fn observe_values(
     string: String,
+    c_string: CString,
+    c_str: &CStr,
+    boxed_c_str: Box<CStr>,
     os_string: OsString,
     path: &Path,
     path_buf: PathBuf,
@@ -101,6 +104,9 @@ pub fn observe_values(
         CompatUnsigned::High => 1,
     };
     string.len()
+        + c_string.as_bytes().len()
+        + c_str.to_bytes().len()
+        + boxed_c_str.to_bytes().len()
         + os_string.len()
         + path.as_os_str().len()
         + path_buf.as_os_str().len()
@@ -207,8 +213,14 @@ fn main() {
 
     let slice = [29, 31];
     let path = PathBuf::from("borrowed/path");
+    let c_str_owner = CString::new("borrowed-c-string").unwrap();
     let value = observe_values(
         String::from("string"),
+        CString::new("owned-c-string").unwrap(),
+        c_str_owner.as_c_str(),
+        CString::new("boxed-c-string")
+            .unwrap()
+            .into_boxed_c_str(),
         OsString::from("os-string"),
         path.as_path(),
         PathBuf::from("owned/path"),

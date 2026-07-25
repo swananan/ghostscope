@@ -33,6 +33,15 @@ pub(super) fn rust_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayo
     None
 }
 
+pub(super) fn rust_c_string_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
+    validate_indirect_sequence_layout(
+        root,
+        field_path(&["inner", "data_ptr"]),
+        field_path(&["inner", "length"]),
+        IndirectSequenceKind::NulTerminatedByteString,
+    )
+}
+
 pub(super) fn rust_vec_layout(root: &TypeInfo) -> Option<IndirectSequenceLayout> {
     // rust-gdb uses `buf.ptr` through Rust 1.81 and `buf.inner.ptr` from
     // Rust 1.82 onward. In the latter layout RawVecInner erases `T` to `u8`,
@@ -243,7 +252,7 @@ pub(super) fn validate_indirect_sequence_layout(
         return None;
     };
 
-    let utf8_byte_pointer = match strip_type_aliases(target_type) {
+    let unsigned_byte_pointer = match strip_type_aliases(target_type) {
         TypeInfo::BaseType { size, encoding, .. } => {
             *size == 1
                 && (*encoding == gimli::DW_ATE_unsigned.0 as u16
@@ -251,6 +260,7 @@ pub(super) fn validate_indirect_sequence_layout(
         }
         _ => false,
     };
+    let c_str_pointer = is_c_str_pointer_target(target_type);
     let unsigned_length = *length_encoding == gimli::DW_ATE_unsigned.0 as u16;
     // Aggregate size, member offsets, and metadata widths come from DWARF.
     let aggregate_size = root.size();
@@ -262,7 +272,10 @@ pub(super) fn validate_indirect_sequence_layout(
         || (matches!(
             kind,
             IndirectSequenceKind::Utf8String | IndirectSequenceKind::ByteString
-        ) && !utf8_byte_pointer)
+        ) && !unsigned_byte_pointer)
+        || (matches!(kind, IndirectSequenceKind::NulTerminatedByteString)
+            && !unsigned_byte_pointer
+            && !c_str_pointer)
         || !unsigned_length
         || data_end > aggregate_size
         || length_end > aggregate_size
@@ -276,4 +289,52 @@ pub(super) fn validate_indirect_sequence_layout(
         length_path,
         kind,
     ))
+}
+
+fn is_c_str_pointer_target(target: &TypeInfo) -> bool {
+    if matches!(
+        strip_type_aliases(target),
+        TypeInfo::UnknownType { name } if name == "CStr" || name.ends_with("::CStr")
+    ) {
+        return true;
+    }
+    let TypeInfo::StructType {
+        name,
+        size,
+        members,
+    } = strip_type_aliases(target)
+    else {
+        return false;
+    };
+    if *size != 0
+        || !(name == "CStr" || name.ends_with("::CStr"))
+        || members.len() != 1
+        || members[0].name != "inner"
+        || members[0].offset != 0
+    {
+        return false;
+    }
+
+    is_c_char_storage(&members[0].member_type)
+}
+
+fn is_c_char_storage(storage: &TypeInfo) -> bool {
+    let storage = strip_type_aliases(storage);
+    let byte = match storage {
+        TypeInfo::BaseType { .. } => storage,
+        TypeInfo::ArrayType { element_type, .. } => strip_type_aliases(element_type),
+        _ => return false,
+    };
+    matches!(
+        byte,
+        TypeInfo::BaseType { size: 1, encoding, .. }
+            if matches!(
+                *encoding,
+                value
+                    if value == gimli::DW_ATE_signed.0 as u16
+                        || value == gimli::DW_ATE_signed_char.0 as u16
+                        || value == gimli::DW_ATE_unsigned.0 as u16
+                        || value == gimli::DW_ATE_unsigned_char.0 as u16
+            )
+    )
 }

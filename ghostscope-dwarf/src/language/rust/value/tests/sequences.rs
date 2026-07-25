@@ -94,6 +94,108 @@ fn does_not_classify_box_str_from_another_namespace() {
 }
 
 #[test]
+fn recognizes_rust_c_string_layout() {
+    let current = rust_c_string_type("CString", SourceLanguage::Rust);
+
+    assert_eq!(
+        resolve_value_layout(&current, Some("alloc::ffi::c_str::CString")),
+        Some(indirect_contiguous(
+            field_path(&["inner", "data_ptr"]),
+            field_path(&["inner", "length"]),
+            IndirectSequenceKind::NulTerminatedByteString,
+        ))
+    );
+    assert_eq!(resolve_value_layout(&current, None), None);
+
+    let qualified = rust_c_string_type("std::ffi::c_str::CString", SourceLanguage::Rust);
+    assert!(resolve_value_layout(&qualified, None).is_some());
+}
+
+#[test]
+fn recognizes_c_str_references_and_boxes_across_dwarf_generations() {
+    for (name, uses_unsized_array) in [
+        ("&std::ffi::c_str::CStr", true),
+        ("&core::ffi::c_str::CStr", false),
+        ("&mut core::ffi::c_str::CStr", false),
+        ("&'static core::ffi::c_str::CStr", false),
+        (
+            "alloc::boxed::Box<std::ffi::c_str::CStr, alloc::alloc::Global>",
+            true,
+        ),
+        (
+            "alloc::boxed::Box<core::ffi::c_str::CStr, alloc::alloc::Global>",
+            false,
+        ),
+    ] {
+        let current = rust_c_str_type_64(name, SourceLanguage::Rust, uses_unsized_array);
+        assert_eq!(
+            resolve_value_layout(&current, None),
+            Some(indirect_contiguous(
+                field_path(&["data_ptr"]),
+                field_path(&["length"]),
+                IndirectSequenceKind::NulTerminatedByteString,
+            )),
+            "name={name}"
+        );
+    }
+
+    let mut opaque = rust_c_str_type_64("&core::ffi::c_str::CStr", SourceLanguage::Rust, false);
+    let TypeInfo::StructType { members, .. } = &mut opaque.summary else {
+        unreachable!("test CStr reference is a struct")
+    };
+    let TypeInfo::PointerType { target_type, .. } = &mut members[0].member_type else {
+        unreachable!("test CStr data_ptr is a pointer")
+    };
+    *target_type = Box::new(TypeInfo::UnknownType {
+        name: "CStr".to_string(),
+    });
+    assert!(resolve_value_layout(&opaque, None).is_some());
+}
+
+#[test]
+fn requires_standard_namespace_for_short_c_string_names() {
+    let c_string = rust_c_string_type("CString", SourceLanguage::Rust);
+    assert!(resolve_value_layout(&c_string, Some("alloc::ffi::c_str::CString")).is_some());
+    assert_eq!(resolve_value_layout(&c_string, Some("app::CString")), None);
+
+    let c_str = rust_c_str_type_64("&CStr", SourceLanguage::Rust, false);
+    assert!(resolve_value_layout(&c_str, Some("&core::ffi::c_str::CStr")).is_some());
+    assert_eq!(resolve_value_layout(&c_str, Some("&app::CStr")), None);
+
+    let boxed = rust_c_str_type_64("Box<CStr>", SourceLanguage::Rust, false);
+    assert!(
+        resolve_value_layout(&boxed, Some("alloc::boxed::Box<core::ffi::c_str::CStr>")).is_some()
+    );
+    assert_eq!(resolve_value_layout(&boxed, Some("app::Box<CStr>")), None);
+}
+
+#[test]
+fn rejects_c_string_lookalikes_and_invalid_c_str_storage() {
+    let user_c_string = rust_c_string_type("app::CString", SourceLanguage::Rust);
+    assert_eq!(resolve_value_layout(&user_c_string, None), None);
+
+    let user_c_str = rust_c_str_type_64("&app::CStr", SourceLanguage::Rust, false);
+    assert_eq!(resolve_value_layout(&user_c_str, None), None);
+
+    let mut invalid = rust_c_str_type_64("&core::ffi::c_str::CStr", SourceLanguage::Rust, false);
+    let TypeInfo::StructType { members, .. } = &mut invalid.summary else {
+        unreachable!("test CStr reference is a struct")
+    };
+    let TypeInfo::PointerType { target_type, .. } = &mut members[0].member_type else {
+        unreachable!("test CStr data_ptr is a pointer")
+    };
+    let TypeInfo::StructType {
+        members: c_str_members,
+        ..
+    } = target_type.as_mut()
+    else {
+        unreachable!("test CStr target is a struct")
+    };
+    c_str_members[0].member_type = unsigned_type("u16", 2);
+    assert_eq!(resolve_value_layout(&invalid, None), None);
+}
+
+#[test]
 fn recognizes_unix_and_windows_os_string_layouts_across_versions() {
     type LayoutCase<'a> = (bool, Option<&'a str>, &'a [&'a str], &'a [&'a str]);
 

@@ -11,6 +11,7 @@ const DEFAULT_TOOLCHAINS: &str = include_str!("../../e2e-tests/rust-compat-toolc
 #[derive(Clone, Copy)]
 enum ExpectedAdapter {
     Utf8Bytes,
+    CBytes,
     OsBytes,
     Sequence,
     RingSequence,
@@ -28,6 +29,7 @@ enum ExpectedAdapter {
 
 const ALL_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
     ("string", ExpectedAdapter::Utf8Bytes),
+    ("c_string", ExpectedAdapter::CBytes),
     ("os_string", ExpectedAdapter::OsBytes),
     ("path_buf", ExpectedAdapter::OsBytes),
     ("text", ExpectedAdapter::Utf8Bytes),
@@ -49,6 +51,7 @@ const ALL_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
 
 const RUST_135_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
     ("string", ExpectedAdapter::Utf8Bytes),
+    ("c_string", ExpectedAdapter::CBytes),
     ("os_string", ExpectedAdapter::OsBytes),
     ("path_buf", ExpectedAdapter::OsBytes),
     ("text", ExpectedAdapter::Utf8Bytes),
@@ -154,7 +157,18 @@ fn adapter_matches(plan: Option<&ValueReadPlan>, expected: ExpectedAdapter) -> b
         )
         | (
             ValuePresentation::ByteString,
-            ValueCapturePlan::IndirectBytes { .. },
+            ValueCapturePlan::IndirectBytes {
+                excluded_tail_bytes: 1,
+                ..
+            },
+            ExpectedAdapter::CBytes,
+        )
+        | (
+            ValuePresentation::ByteString,
+            ValueCapturePlan::IndirectBytes {
+                excluded_tail_bytes: 0,
+                ..
+            },
             ExpectedAdapter::OsBytes,
         )
         | (
@@ -1069,6 +1083,22 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
                     }
                 ));
             }
+        }
+        let c_str_expected = if matches!(toolchain.as_str(), "1.35.0" | "1.49.0") {
+            ExpectedAdapter::NativeDwarf
+        } else {
+            ExpectedAdapter::CBytes
+        };
+        for parameter in ["c_str", "boxed_c_str"] {
+            assert_parameter_adapter(
+                &analyzer,
+                &binary,
+                "observe_values",
+                parameter,
+                c_str_expected,
+                &toolchain,
+            )
+            .await?;
         }
         assert_parameter_adapter(
             &analyzer,

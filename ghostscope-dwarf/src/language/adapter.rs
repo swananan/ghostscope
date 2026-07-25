@@ -189,6 +189,7 @@ impl IndirectSequenceLayout {
 pub(crate) enum IndirectSequenceKind {
     Utf8String,
     ByteString,
+    NulTerminatedByteString,
     OpaqueByteString,
     PointerTarget,
     TypeParameter { index: usize },
@@ -408,10 +409,13 @@ where
     };
 
     let data = context.project_member_path(current, &layout.data_path, type_module_path)?;
-    let (presentation, element_stride, sequence_element) = match layout.kind {
-        IndirectSequenceKind::Utf8String => (crate::ValuePresentation::Utf8String, None, None),
+    let (presentation, element_stride, sequence_element, excluded_tail_bytes) = match layout.kind {
+        IndirectSequenceKind::Utf8String => (crate::ValuePresentation::Utf8String, None, None, 0),
         IndirectSequenceKind::ByteString | IndirectSequenceKind::OpaqueByteString => {
-            (crate::ValuePresentation::ByteString, None, None)
+            (crate::ValuePresentation::ByteString, None, None, 0)
+        }
+        IndirectSequenceKind::NulTerminatedByteString => {
+            (crate::ValuePresentation::ByteString, None, None, 1)
         }
         IndirectSequenceKind::PointerTarget => {
             let element = context.project_type(
@@ -434,6 +438,7 @@ where
                 },
                 Some(element_stride),
                 Some(element.resolved_type),
+                0,
             )
         }
         IndirectSequenceKind::TypeParameter { index } => {
@@ -457,6 +462,7 @@ where
                 },
                 Some(element_stride),
                 Some(element),
+                0,
             )
         }
     };
@@ -470,7 +476,11 @@ where
                     length,
                     element_stride,
                 },
-                None => ValueCapturePlan::IndirectBytes { data, length },
+                None => ValueCapturePlan::IndirectBytes {
+                    data,
+                    length,
+                    excluded_tail_bytes,
+                },
             }
         }
         IndirectSequenceAddressing::Ring {

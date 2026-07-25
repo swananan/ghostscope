@@ -216,6 +216,9 @@ pub enum ValueCapturePlan {
     IndirectBytes {
         data: TypeProjection,
         length: TypeProjection,
+        /// Number of bytes represented by the physical length but omitted
+        /// from the logical payload, such as a trailing C-string NUL.
+        excluded_tail_bytes: u64,
     },
     /// Read a pointer and logical element count from an aggregate, then capture
     /// a bounded number of complete, contiguous elements.

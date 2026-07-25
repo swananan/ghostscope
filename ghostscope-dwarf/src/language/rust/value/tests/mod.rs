@@ -84,6 +84,54 @@ fn rust_str_type_64(name: &str, language: SourceLanguage) -> ResolvedType {
     })
 }
 
+fn rust_c_str_type_64(
+    name: &str,
+    language: SourceLanguage,
+    uses_unsized_array: bool,
+) -> ResolvedType {
+    let mut current = rust_str_type_64(name, language);
+    let TypeInfo::StructType { members, .. } = &mut current.summary else {
+        unreachable!("test CStr reference is a struct")
+    };
+    let TypeInfo::PointerType { target_type, .. } = &mut members[0].member_type else {
+        unreachable!("test CStr data_ptr is a pointer")
+    };
+    let byte = TypeInfo::BaseType {
+        name: "i8".to_string(),
+        size: 1,
+        encoding: gimli::DW_ATE_signed.0 as u16,
+    };
+    let storage = if uses_unsized_array {
+        TypeInfo::ArrayType {
+            element_type: Box::new(byte),
+            element_count: None,
+            total_size: None,
+        }
+    } else {
+        byte
+    };
+    *target_type = Box::new(TypeInfo::StructType {
+        name: "CStr".to_string(),
+        size: 0,
+        members: vec![member("inner", storage, 0)],
+    });
+    current
+}
+
+fn rust_c_string_type(name: &str, language: SourceLanguage) -> ResolvedType {
+    let inner = rust_str_type_64("alloc::boxed::Box<[u8], alloc::alloc::Global>", language);
+    let origin = inner.origin;
+    ResolvedType::new(
+        TypeInfo::StructType {
+            name: name.to_string(),
+            size: 16,
+            members: vec![member("inner", inner.summary, 0)],
+        },
+        TypeIdentity::Unknown,
+        origin,
+    )
+}
+
 fn rust_path_ref_type_64(name: &str, language: SourceLanguage) -> ResolvedType {
     let mut current = rust_str_type_64(name, language);
     let TypeInfo::StructType { members, .. } = &mut current.summary else {
