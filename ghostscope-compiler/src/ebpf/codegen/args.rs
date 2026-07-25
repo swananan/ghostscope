@@ -980,19 +980,23 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let Some(analyzer) = self.process_analyzer else {
             return Ok(SemanticValueResolution::default());
         };
+        let options = ghostscope_dwarf::ValueReadPlanOptions {
+            max_nesting_depth: self.compile_options.value_adapter_max_nesting_depth,
+        };
         let report = analyzer
-            .explain_value_read_plan_with_options(
-                resolved_type,
-                type_module_path,
-                ghostscope_dwarf::ValueReadPlanOptions {
-                    max_nesting_depth: self.compile_options.value_adapter_max_nesting_depth,
-                },
-            )
+            .explain_value_read_plan_with_options(resolved_type, type_module_path, options)
             .map_err(|error| CodeGenError::DwarfError(error.to_string()))?;
         match &report.outcome {
-            ghostscope_dwarf::ValueAdapterOutcome::NotApplicable => {
-                Ok(SemanticValueResolution::default())
-            }
+            // Adapter reports intentionally describe named source-language
+            // adapters only. Operational resolution may still compose those
+            // adapters through an ordinary Rust struct.
+            ghostscope_dwarf::ValueAdapterOutcome::NotApplicable => analyzer
+                .value_read_plan_with_options(resolved_type, type_module_path, options)
+                .map(|plan| SemanticValueResolution {
+                    plan,
+                    rejection: None,
+                })
+                .map_err(|error| CodeGenError::DwarfError(error.to_string())),
             ghostscope_dwarf::ValueAdapterOutcome::Applied { plan } => {
                 Ok(SemanticValueResolution {
                     plan: Some((**plan).clone()),

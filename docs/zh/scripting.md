@@ -214,9 +214,11 @@ Rc<Pair>                  Rc 投影 Pair 和计数，Pair 内联格式化
 Cell<(i32, u16)>          Cell 投影并格式化内联 tuple 值
 ```
 
-语义适配器也会跨投影包装器和有界序列递归组合：
+语义适配器也会穿过普通 Rust struct、投影包装器和有界序列递归组合：
 
 ```text
+Request { name: String }  Request 保留 DWARF 布局，name 采集字符串字节
+Vec<Request>              每个 Request 元素都会适配其中已识别的字段
 Rc<Vec<i32>>              显示 Rc 摘要并采集内部 Vec 元素
 Cell<String>              显示 Cell 包装并采集 String 字节
 Vec<String>               每个已采集元素使用 String 适配器
@@ -224,13 +226,19 @@ Vec<CString>              每个已采集元素都会排除结尾 NUL
 Vec<Vec<i32>>             每个已采集元素使用 Vec 适配器
 ```
 
+对于普通 Rust struct，GhostScope 从目标 DWARF 推导所有成员偏移和字段类型
+标识，保留 struct 原生的名称和布局，只为已识别字段添加语义子采集。如果
+struct 中没有可识别的语义后代，它仍使用原有的原生 DWARF 路径。该组合能力
+只对 Rust 编译单元启用；C 和 C++ 聚合类型的行为不变。
+
 递归语义采集从根值向下最多跟随
-`value_adapters.max_nesting_depth` 条 adapter 边，并检测当前路径中重复的
-DWARF 类型标识。每个语义序列最多为
+`value_adapters.max_nesting_depth` 条语义子值边，并检测当前路径中重复的
+DWARF 类型标识。为了到达已适配字段而穿过一个普通 Rust struct 也算一条边。
+每个语义序列最多为
 `value_adapters.max_sequence_elements` 个元素预留子采集槽。两项默认值均为
 `4`；前者控制递归深度，后者控制每个序列节点的宽度。根值和所有子值共享
 该参数的 `mem_dump_cap`；降低这个上限可能减少采集的元素数，或回退到仍然
-有效的根 adapter。每个子值都有独立的读取错误和截断状态。配置细节见
+有效的根值展示。每个子值都有独立的读取错误和截断状态。配置细节见
 [Value Adapter 限制](configuration.md#value-adapter-限制)。
 
 Hash 表和 B-Tree 的条目遍历仍按 key/value 的 DWARF 类型格式化字节。例如，

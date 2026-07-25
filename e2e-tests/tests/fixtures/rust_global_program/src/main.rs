@@ -181,6 +181,17 @@ pub struct Config {
 
 pub static mut CONFIG: Config = Config { a: 7, b: 11 };
 
+pub struct AggregateRecord {
+    pub title: String,
+    pub count: i32,
+}
+
+pub static mut G_AGGREGATE_RECORD: AggregateRecord = AggregateRecord {
+    title: String::new(),
+    count: 0,
+};
+pub static mut G_VEC_AGGREGATE_RECORDS: Vec<AggregateRecord> = Vec::new();
+
 pub struct Pair(pub i32, pub i32);
 
 pub struct PhantomWrapper<T> {
@@ -590,6 +601,9 @@ fn touch_globals() -> i32 {
             + *G_REF_CELL_MUT.get_mut() as i64
             + G_REF_CELL_PAIR.get_mut().0 as i64
             + G_REF_CELL_STRING.get_mut().len() as i64
+            + G_AGGREGATE_RECORD.title.len() as i64
+            + G_AGGREGATE_RECORD.count as i64
+            + G_VEC_AGGREGATE_RECORDS.len() as i64
             + G_USER_NONZERO.0.0 as i64
             + G_USER_CELL.0.0 as i64
             + G_USER_REF_CELL.value.0 as i64
@@ -637,6 +651,20 @@ fn main() {
         G_MUT_SLICE_U16 = Box::leak(vec![1000, 2000, 65535].into_boxed_slice());
         G_CELL_STRING.set(String::from("cell nested"));
         *G_REF_CELL_STRING.get_mut() = String::from("refcell nested");
+        G_AGGREGATE_RECORD = AggregateRecord {
+            title: String::from("root aggregate"),
+            count: 7,
+        };
+        G_VEC_AGGREGATE_RECORDS = vec![
+            AggregateRecord {
+                title: String::from("first"),
+                count: 11,
+            },
+            AggregateRecord {
+                title: String::from("second"),
+                count: 13,
+            },
+        ];
     }
 
     let mut acc: i64 = 0;

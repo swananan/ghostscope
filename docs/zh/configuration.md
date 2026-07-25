@@ -406,7 +406,8 @@ timeout_secs = 5
 max_size_bytes = 0
 
 [value_adapters]
-# 根值以下最多跟随多少条嵌套 adapter 边，不影响普通内联 DWARF 结构格式化。
+# 根值以下最多跟随多少条语义子值边；为了到达已适配字段而穿过的普通 Rust
+# struct 也计算在内。它不影响没有语义采集字段的原生内联 DWARF 格式化。
 # 有效范围：1 到 16。默认值：4。
 max_nesting_depth = 4
 
@@ -540,8 +541,9 @@ enable_sysmon_for_target = true  # 默认开启
 
 `[value_adapters]` 控制源语言语义 adapter 的递归采集：
 
-- `max_nesting_depth` 计算根 adapter 以下的 adapter 边数，不包含根本身，
-  也不影响普通内联 DWARF 结构格式化的 32 层深度限制。
+- `max_nesting_depth` 计算根值以下的语义子值边数；为了到达已适配字段而
+  穿过的普通 Rust struct 也计算在内。它不包含根本身，也不影响原生内联
+  DWARF 结构格式化的 32 层深度限制。
 - `max_sequence_elements` 限制每个嵌套序列节点静态生成的语义子元素数量。
   它是每个节点的宽度限制，不是递归深度。
 

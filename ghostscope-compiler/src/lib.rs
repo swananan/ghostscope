@@ -188,7 +188,7 @@ pub struct CompileOptions {
     pub event_map_type: EventMapType,
     /// Max bytes to read per memory-dump argument (format {:x}/{:s}).
     pub mem_dump_cap: u32,
-    /// Maximum source-language adapter edges followed below a root value.
+    /// Maximum semantic child edges followed below a root value.
     pub value_adapter_max_nesting_depth: usize,
     /// Maximum semantic children captured for each nested sequence.
     pub value_adapter_max_sequence_elements: usize,

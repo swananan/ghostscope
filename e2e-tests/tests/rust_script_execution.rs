@@ -258,6 +258,75 @@ async fn test_rust_nested_value_plans_recurse_into_semantic_children() -> anyhow
         ghostscope_dwarf::ValuePresentation::Utf8String
     );
 
+    let aggregate = nested_plan("G_AGGREGATE_RECORD")?;
+    assert_eq!(
+        aggregate.presentation,
+        ghostscope_dwarf::ValuePresentation::Dwarf
+    );
+    let ghostscope_dwarf::ValueCapturePlan::InlineView {
+        output_type,
+        fields: projected_fields,
+    } = &aggregate.capture
+    else {
+        anyhow::bail!("expected ordinary Rust struct inline view: {aggregate:#?}")
+    };
+    let ghostscope_dwarf::TypeInfo::StructType { members, .. } = output_type else {
+        anyhow::bail!("expected ordinary Rust struct output type: {aggregate:#?}")
+    };
+    assert_eq!(projected_fields.len(), members.len());
+    let title_index = members
+        .iter()
+        .position(|member| member.name == "title")
+        .ok_or_else(|| anyhow::anyhow!("expected AggregateRecord.title"))?;
+    let Some(ghostscope_dwarf::ValueNestedPlan::ProjectedView { fields }) =
+        aggregate.nested.as_ref()
+    else {
+        anyhow::bail!("expected ordinary Rust struct child plans: {aggregate:#?}")
+    };
+    let title = fields
+        .iter()
+        .find(|field| field.field_index == title_index)
+        .ok_or_else(|| anyhow::anyhow!("expected AggregateRecord.title child plan"))?;
+    assert_eq!(
+        title.value.presentation,
+        ghostscope_dwarf::ValuePresentation::Utf8String
+    );
+
+    let aggregate_sequence = nested_plan("G_VEC_AGGREGATE_RECORDS")?;
+    let Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) =
+        aggregate_sequence.nested.as_ref()
+    else {
+        anyhow::bail!("expected Vec<AggregateRecord> element plan: {aggregate_sequence:#?}")
+    };
+    assert_eq!(
+        element.presentation,
+        ghostscope_dwarf::ValuePresentation::Dwarf
+    );
+    let Some(ghostscope_dwarf::ValueNestedPlan::ProjectedView { fields }) = element.nested.as_ref()
+    else {
+        anyhow::bail!("expected AggregateRecord field plans in Vec: {aggregate_sequence:#?}")
+    };
+    assert!(fields.iter().any(|field| {
+        field.value.presentation == ghostscope_dwarf::ValuePresentation::Utf8String
+    }));
+
+    let (_, config_read_plan) = analyzer
+        .plan_global_access_read_plan(
+            &binary_path,
+            "CONFIG",
+            &ghostscope_dwarf::VariableAccessPath::default(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("expected CONFIG read plan"))?;
+    let config_type = analyzer
+        .resolved_type_for_plan(&config_read_plan)?
+        .ok_or_else(|| anyhow::anyhow!("expected CONFIG resolved type"))?;
+    assert!(
+        analyzer
+            .value_read_plan(&config_type, Some(&binary_path))?
+            .is_none(),
+        "a Rust struct without semantic descendants must stay on the native path"
+    );
+
     let depth_one = analyzer
         .value_read_plan_with_options(
             &nested_strings.root_type,
@@ -314,11 +383,29 @@ async fn test_rust_string_value_plan_uses_type_namespace() -> anyhow::Result<()>
     let user_type = analyzer
         .resolved_type_for_plan(&user_plan)?
         .ok_or_else(|| anyhow::anyhow!("expected user String type"))?;
+    let user_report = analyzer.explain_value_read_plan(&user_type, Some(&binary_path))?;
+    assert!(matches!(
+        user_report.outcome,
+        ghostscope_dwarf::ValueAdapterOutcome::NotApplicable
+    ));
+    let user_value_plan = analyzer
+        .value_read_plan(&user_type, Some(&binary_path))?
+        .ok_or_else(|| anyhow::anyhow!("expected nested user String field plan"))?;
+    assert_eq!(
+        user_value_plan.presentation,
+        ghostscope_dwarf::ValuePresentation::Dwarf,
+        "user-defined String must retain DWARF root presentation"
+    );
     assert!(
-        analyzer
-            .value_read_plan(&user_type, Some(&binary_path))?
-            .is_none(),
-        "user-defined String must retain DWARF presentation"
+        matches!(
+            user_value_plan.nested,
+            Some(ghostscope_dwarf::ValueNestedPlan::ProjectedView { ref fields })
+                if fields.iter().any(|field| matches!(
+                    field.value.presentation,
+                    ghostscope_dwarf::ValuePresentation::Sequence { .. }
+                ))
+        ),
+        "the real Vec<u8> field should compose without selecting a String root adapter"
     );
 
     Ok(())
@@ -1592,6 +1679,8 @@ trace do_stuff {
     print "RNESTED:{}:{}:{}:{}:{}", G_CELL_STRING, G_REF_CELL_STRING,
         G_VEC_STRING, G_VEC_VEC_I32, G_VEC_VEC_STRING;
     print "RNESTED_C:{}", G_VEC_C_STRING;
+    print "RSTRUCT:{}", G_AGGREGATE_RECORD;
+    print "RSTRUCT_VEC:{}", G_VEC_AGGREGATE_RECORDS;
 }
 trace observe_nested_owners {
     print "RNESTED_OWNER:{}:{}", rc, arc;
@@ -1618,6 +1707,24 @@ trace observe_nested_owners {
             line.contains(r#"RNESTED_C:["alpha c", "beta c", "gamma c", "delta c"] <truncated>"#)
         }),
         "Expected nested Rust CString output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RSTRUCT:")
+                && line.contains(r#"title: "root aggregate""#)
+                && line.contains("count: 7")
+        }),
+        "Expected ordinary Rust struct output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RSTRUCT_VEC:")
+                && line.contains(r#"title: "first""#)
+                && line.contains("count: 11")
+                && line.contains(r#"title: "second""#)
+                && line.contains("count: 13")
+        }),
+        "Expected Vec<ordinary Rust struct> output: {stdout}"
     );
     assert!(
         stdout.lines().any(|line| {

@@ -4,16 +4,16 @@
 use super::{ProducerInfo, RustcVersion, SourceLanguage, TypeProjection};
 use ghostscope_protocol::ValuePresentation;
 
-/// Default number of source-language adapter edges followed below a root value.
+/// Default number of semantic child edges followed below a root value.
 pub const DEFAULT_VALUE_ADAPTER_NESTING_DEPTH: usize = 4;
 
-/// Maximum configurable source-language adapter nesting depth.
+/// Maximum configurable semantic value nesting depth.
 pub const MAX_VALUE_ADAPTER_NESTING_DEPTH: usize = 16;
 
 /// Options controlling semantic value read-plan construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueReadPlanOptions {
-    /// Maximum number of nested adapter edges followed below the root adapter.
+    /// Maximum number of semantic child edges followed below the root value.
     pub max_nesting_depth: usize,
 }
 
