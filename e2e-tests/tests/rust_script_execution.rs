@@ -231,6 +231,26 @@ async fn test_rust_nested_value_plans_recurse_into_semantic_children() -> anyhow
         ghostscope_dwarf::ValuePresentation::Utf8String
     );
 
+    for name in ["G_VEC_DEQUE_STRING", "G_SLICE_STRING"] {
+        let plan = nested_plan(name)?;
+        assert!(
+            matches!(
+                &plan.presentation,
+                ghostscope_dwarf::ValuePresentation::Sequence { .. }
+            ),
+            "{name} must preserve its sequence presentation: {plan:#?}"
+        );
+        let Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) = plan.nested.as_ref()
+        else {
+            anyhow::bail!("expected nested sequence element plan for {name}: {plan:#?}")
+        };
+        assert_eq!(
+            element.presentation,
+            ghostscope_dwarf::ValuePresentation::Utf8String,
+            "{name} must recurse into its String elements"
+        );
+    }
+
     let c_strings = nested_plan("G_VEC_C_STRING")?;
     let Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) = c_strings.nested.as_ref()
     else {
@@ -368,6 +388,69 @@ async fn test_rust_nested_value_plans_recurse_into_semantic_children() -> anyhow
         assert!(
             !fields.is_empty() && contains_utf8_string(&plan),
             "{name} must recurse into its active payload String: {plan:#?}"
+        );
+    }
+
+    let option_vector = nested_plan("G_OPTION_VEC_STRING")?;
+    let Some(ghostscope_dwarf::ValueNestedPlan::Variant { fields }) = option_vector.nested.as_ref()
+    else {
+        anyhow::bail!("expected Option<Vec<String>> variant plan: {option_vector:#?}")
+    };
+    let vector = fields
+        .iter()
+        .find_map(|field| match field.value.nested.as_ref() {
+            Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) => Some(element),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("expected Option<Vec<String>> sequence payload: {option_vector:#?}")
+        })?;
+    assert_eq!(
+        vector.presentation,
+        ghostscope_dwarf::ValuePresentation::Utf8String
+    );
+
+    let result_records = nested_plan("G_RESULT_RECORDS_OK")?;
+    let Some(ghostscope_dwarf::ValueNestedPlan::Variant { fields }) =
+        result_records.nested.as_ref()
+    else {
+        anyhow::bail!(
+            "expected Result<Vec<AggregateRecord>, String> variant plan: {result_records:#?}"
+        )
+    };
+    let records = fields
+        .iter()
+        .find_map(|field| match field.value.nested.as_ref() {
+            Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) => Some(element),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "expected Result<Vec<AggregateRecord>, String> sequence payload: \
+                 {result_records:#?}"
+            )
+        })?;
+    assert!(
+        matches!(
+            records.nested.as_ref(),
+            Some(ghostscope_dwarf::ValueNestedPlan::ProjectedView { .. })
+        ) && contains_utf8_string(records),
+        "Result<Vec<AggregateRecord>, String> must recurse into record fields: \
+         {result_records:#?}"
+    );
+
+    for name in ["G_COW_STR_BORROWED", "G_COW_STR_OWNED"] {
+        let plan = nested_plan(name)?;
+        let Some(ghostscope_dwarf::ValueNestedPlan::Variant { fields }) = plan.nested.as_ref()
+        else {
+            anyhow::bail!("expected Cow<str> variant plan for {name}: {plan:#?}")
+        };
+        assert_eq!(fields.len(), 2, "{name} must plan both Cow variants");
+        assert!(
+            fields.iter().all(|field| {
+                field.value.presentation == ghostscope_dwarf::ValuePresentation::Utf8String
+            }),
+            "{name} must recurse into both Cow string payloads: {plan:#?}"
         );
     }
 
@@ -1759,6 +1842,10 @@ trace do_stuff {
     print "RENUM_OPTION:{}:{}", G_OPTION_STRING, G_OPTION_STRING_NONE;
     print "RENUM_RESULT:{}:{}", G_RESULT_RECORD_OK, G_RESULT_RECORD_ERR;
     print "RENUM_MANY:{}", G_MANY_STRING_VARIANT;
+    print "RCOMPOSE_SEQUENCE:{}:{}", G_VEC_DEQUE_STRING, G_SLICE_STRING;
+    print "RCOMPOSE_OPTION:{}", G_OPTION_VEC_STRING;
+    print "RCOMPOSE_RESULT:{}", G_RESULT_RECORDS_OK;
+    print "RCOMPOSE_COW:{}:{}", G_COW_STR_BORROWED, G_COW_STR_OWNED;
 }
 trace observe_nested_owners {
     print "RNESTED_OWNER:{}:{}", rc, arc;
@@ -1860,6 +1947,40 @@ trace observe_nested_owners {
             line.contains("RENUM_MANY:") && line.contains(r#"::V07("shared variant budget")"#)
         }),
         "Expected shared enum payload budget output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RCOMPOSE_SEQUENCE:")
+                && line.contains(r#"["deque alpha", "deque beta", "deque gamma"]"#)
+                && line.contains(r#"["slice alpha", "slice beta"]"#)
+        }),
+        "Expected nested sequence composition output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RCOMPOSE_OPTION:")
+                && line.contains(r#"::Some(["option alpha", "option beta"])"#)
+        }),
+        "Expected Option<Vec<String>> semantic output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RCOMPOSE_RESULT:")
+                && line.contains("::Ok([")
+                && line.contains(r#"title: "result one""#)
+                && line.contains("count: 37")
+                && line.contains(r#"title: "result two""#)
+                && line.contains("count: 41")
+        }),
+        "Expected Result<Vec<AggregateRecord>, String> semantic output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RCOMPOSE_COW:")
+                && line.contains(r#"::Borrowed("borrowed cow")"#)
+                && line.contains(r#"::Owned("owned cow")"#)
+        }),
+        "Expected Cow<str> semantic output: {stdout}"
     );
     assert!(
         stdout.lines().any(|line| {
