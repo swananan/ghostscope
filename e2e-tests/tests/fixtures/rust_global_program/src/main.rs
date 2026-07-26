@@ -2,6 +2,7 @@
 #![allow(static_mut_refs)]
 
 use std::{
+    borrow::Cow,
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     ffi::{CString, OsString},
@@ -32,10 +33,14 @@ pub static mut G_VEC_VEC_STRING: Vec<Vec<String>> = Vec::new();
 pub static mut G_EMPTY_VEC: Vec<i32> = Vec::new();
 pub static mut G_VEC_UNIT: Vec<()> = Vec::new();
 pub static mut G_VEC_DEQUE_I32: VecDeque<i32> = VecDeque::new();
+pub static mut G_VEC_DEQUE_STRING: VecDeque<String> = VecDeque::new();
 pub static mut G_VEC_DEQUE_UNIT: VecDeque<()> = VecDeque::new();
 pub static mut G_SLICE_I32: &[i32] = &[];
+pub static mut G_SLICE_STRING: &[String] = &[];
 pub static mut G_MUT_SLICE_U16: &mut [u16] = &mut [];
 pub static mut G_EMPTY_SLICE: &[i32] = &[];
+pub static mut G_COW_STR_BORROWED: Cow<'static, str> = Cow::Borrowed("");
+pub static mut G_COW_STR_OWNED: Cow<'static, str> = Cow::Borrowed("");
 pub static G_NONZERO_U32: NonZeroU32 = NonZeroU32::new(7).unwrap();
 pub static G_NONZERO_I32: NonZeroI32 = NonZeroI32::new(-9).unwrap();
 pub static G_NONZERO_U128: NonZeroU128 =
@@ -232,8 +237,10 @@ pub static mut G_AGGREGATE_REPR_C: AggregateReprC = AggregateReprC {
 
 pub static mut G_OPTION_STRING: Option<String> = None;
 pub static mut G_OPTION_STRING_NONE: Option<String> = None;
+pub static mut G_OPTION_VEC_STRING: Option<Vec<String>> = None;
 pub static mut G_RESULT_RECORD_OK: Result<AggregateRecord, String> = Err(String::new());
 pub static mut G_RESULT_RECORD_ERR: Result<AggregateRecord, String> = Err(String::new());
+pub static mut G_RESULT_RECORDS_OK: Result<Vec<AggregateRecord>, String> = Err(String::new());
 
 pub enum ManyStringVariants {
     V00(String),
@@ -559,20 +566,21 @@ pub mod math {
     }
 }
 
-fn wrapped_vec_deque() -> VecDeque<i32> {
-    let mut deque = VecDeque::with_capacity(4);
-    let filler_len = deque.capacity() - 2;
+fn wrapped_vec_deque<T: Clone, const N: usize>(filler: T, values: [T; N]) -> VecDeque<T> {
+    assert!(N > 1);
+    let mut values = values.into_iter();
+    let first = values.next().expect("wrapped deque values are nonempty");
+    let mut deque = VecDeque::with_capacity(N);
+    let filler_len = deque.capacity() - 1;
 
     for _ in 0..filler_len {
-        deque.push_back(-1);
+        deque.push_back(filler.clone());
     }
-    deque.push_back(10);
-    deque.push_back(20);
+    deque.push_back(first);
     for _ in 0..filler_len {
         deque.pop_front();
     }
-    deque.push_back(30);
-    deque.push_back(40);
+    deque.extend(values);
 
     deque
 }
@@ -651,10 +659,14 @@ fn touch_globals() -> i32 {
             + G_EMPTY_VEC.len() as i64
             + G_VEC_UNIT.len() as i64
             + G_VEC_DEQUE_I32.len() as i64
+            + G_VEC_DEQUE_STRING.len() as i64
             + G_VEC_DEQUE_UNIT.len() as i64
             + G_SLICE_I32.len() as i64
+            + G_SLICE_STRING.len() as i64
             + G_MUT_SLICE_U16.len() as i64
             + G_EMPTY_SLICE.len() as i64
+            + G_COW_STR_BORROWED.len() as i64
+            + G_COW_STR_OWNED.len() as i64
             + G_NONZERO_U32.get() as i64
             + G_NONZERO_I32.get() as i64
             + G_NONZERO_U128.get() as i64
@@ -679,12 +691,23 @@ fn touch_globals() -> i32 {
                 .as_ref()
                 .map(String::len)
                 .unwrap_or(0) as i64
+            + G_OPTION_VEC_STRING
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0) as i64
             + match &G_RESULT_RECORD_OK {
                 Ok(record) => record.title.len() as i64 + record.count as i64,
                 Err(error) => error.len() as i64,
             }
             + match &G_RESULT_RECORD_ERR {
                 Ok(record) => record.title.len() as i64 + record.count as i64,
+                Err(error) => error.len() as i64,
+            }
+            + match &G_RESULT_RECORDS_OK {
+                Ok(records) => records
+                    .iter()
+                    .map(|record| record.title.len() as i64 + record.count as i64)
+                    .sum(),
                 Err(error) => error.len() as i64,
             }
             + match &G_MANY_STRING_VARIANT {
@@ -747,9 +770,28 @@ fn main() {
         ];
         G_VEC_UNIT = vec![(); 3];
         G_VEC_DEQUE_I32 = VecDeque::from([10, 20, 30, 40]);
+        let string_deque = wrapped_vec_deque(
+            String::new(),
+            [
+                String::from("deque alpha"),
+                String::from("deque beta"),
+                String::from("deque gamma"),
+            ],
+        );
+        assert!(!string_deque.as_slices().1.is_empty());
+        G_VEC_DEQUE_STRING = string_deque;
         G_VEC_DEQUE_UNIT = VecDeque::from([(), (), ()]);
         G_SLICE_I32 = Box::leak(vec![7, -8, 9].into_boxed_slice());
+        G_SLICE_STRING = Box::leak(
+            vec![
+                String::from("slice alpha"),
+                String::from("slice beta"),
+            ]
+            .into_boxed_slice(),
+        );
         G_MUT_SLICE_U16 = Box::leak(vec![1000, 2000, 65535].into_boxed_slice());
+        G_COW_STR_BORROWED = Cow::Borrowed("borrowed cow");
+        G_COW_STR_OWNED = Cow::Owned(String::from("owned cow"));
         G_CELL_STRING.set(String::from("cell nested"));
         *G_REF_CELL_STRING.get_mut() = String::from("refcell nested");
         G_AGGREGATE_RECORD = AggregateRecord {
@@ -784,11 +826,25 @@ fn main() {
         };
         G_OPTION_STRING = Some(String::from("optional value"));
         G_OPTION_STRING_NONE = None;
+        G_OPTION_VEC_STRING = Some(vec![
+            String::from("option alpha"),
+            String::from("option beta"),
+        ]);
         G_RESULT_RECORD_OK = Ok(AggregateRecord {
             title: String::from("result record"),
             count: 31,
         });
         G_RESULT_RECORD_ERR = Err(String::from("result error"));
+        G_RESULT_RECORDS_OK = Ok(vec![
+            AggregateRecord {
+                title: String::from("result one"),
+                count: 37,
+            },
+            AggregateRecord {
+                title: String::from("result two"),
+                count: 41,
+            },
+        ]);
         G_MANY_STRING_VARIANT =
             ManyStringVariants::V07(String::from("shared variant budget"));
     }
@@ -811,7 +867,7 @@ fn main() {
             CString::new("boxed c").unwrap().into_boxed_c_str(),
         ) as i64;
         acc += math::observe_vec_deque(
-            wrapped_vec_deque(),
+            wrapped_vec_deque(-1, [10, 20, 30, 40]),
             VecDeque::from([7_u16, 8, 9]),
             VecDeque::new(),
         ) as i64;
