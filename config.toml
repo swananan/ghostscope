@@ -147,7 +147,8 @@ max_size_bytes = 0
 
 [value_adapters]
 # Maximum number of nested source-language adapter edges followed below a root
-# value. This is separate from ordinary inline DWARF structure formatting.
+# value, including ordinary Rust struct fields and active enum payloads. This is
+# separate from ordinary inline DWARF structure formatting.
 # Valid range: 1 to 16.
 # Default: 4
 max_nesting_depth = 4

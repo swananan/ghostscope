@@ -149,6 +149,17 @@ pub struct NestedValueFieldPresentation {
     pub child: NestedValueChildPresentation,
 }
 
+/// One DWARF variant payload field whose raw bytes have a semantic child
+/// sidecar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NestedValueVariantFieldPresentation {
+    pub part_index: u64,
+    pub variant_index: u64,
+    pub member_index: u64,
+    pub payload_field_index: u64,
+    pub child: NestedValueChildPresentation,
+}
+
 /// Placement of recursively captured values after an existing root payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NestedValueChildrenPresentation {
@@ -163,6 +174,9 @@ pub enum NestedValueChildrenPresentation {
         slot_stride: u64,
         slot_count: u64,
         element: Box<NestedValuePresentation>,
+    },
+    Variant {
+        fields: Vec<NestedValueVariantFieldPresentation>,
     },
 }
 

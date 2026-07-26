@@ -181,6 +181,82 @@ pub struct Config {
 
 pub static mut CONFIG: Config = Config { a: 7, b: 11 };
 
+pub struct AggregateRecord {
+    pub title: String,
+    pub count: i32,
+}
+
+pub static mut G_AGGREGATE_RECORD: AggregateRecord = AggregateRecord {
+    title: String::new(),
+    count: 0,
+};
+pub static mut G_VEC_AGGREGATE_RECORDS: Vec<AggregateRecord> = Vec::new();
+
+pub struct AggregateOuter {
+    pub inner: AggregateRecord,
+    pub active: bool,
+}
+
+pub static mut G_AGGREGATE_OUTER: AggregateOuter = AggregateOuter {
+    inner: AggregateRecord {
+        title: String::new(),
+        count: 0,
+    },
+    active: false,
+};
+
+pub struct AggregateTuple(pub String, pub i16);
+
+pub static mut G_AGGREGATE_TUPLE: AggregateTuple = AggregateTuple(String::new(), 0);
+
+pub struct AggregateEnvelope<T> {
+    pub value: T,
+    pub id: u32,
+}
+
+pub static mut G_AGGREGATE_ENVELOPE: AggregateEnvelope<String> = AggregateEnvelope {
+    value: String::new(),
+    id: 0,
+};
+
+#[repr(C)]
+pub struct AggregateReprC {
+    pub title: String,
+    pub code: u16,
+}
+
+pub static mut G_AGGREGATE_REPR_C: AggregateReprC = AggregateReprC {
+    title: String::new(),
+    code: 0,
+};
+
+pub static mut G_OPTION_STRING: Option<String> = None;
+pub static mut G_OPTION_STRING_NONE: Option<String> = None;
+pub static mut G_RESULT_RECORD_OK: Result<AggregateRecord, String> = Err(String::new());
+pub static mut G_RESULT_RECORD_ERR: Result<AggregateRecord, String> = Err(String::new());
+
+pub enum ManyStringVariants {
+    V00(String),
+    V01(String),
+    V02(String),
+    V03(String),
+    V04(String),
+    V05(String),
+    V06(String),
+    V07(String),
+    V08(String),
+    V09(String),
+    V10(String),
+    V11(String),
+    V12(String),
+    V13(String),
+    V14(String),
+    V15(String),
+}
+
+pub static mut G_MANY_STRING_VARIANT: ManyStringVariants =
+    ManyStringVariants::V00(String::new());
+
 pub struct Pair(pub i32, pub i32);
 
 pub struct PhantomWrapper<T> {
@@ -590,6 +666,45 @@ fn touch_globals() -> i32 {
             + *G_REF_CELL_MUT.get_mut() as i64
             + G_REF_CELL_PAIR.get_mut().0 as i64
             + G_REF_CELL_STRING.get_mut().len() as i64
+            + G_AGGREGATE_RECORD.title.len() as i64
+            + G_AGGREGATE_RECORD.count as i64
+            + G_VEC_AGGREGATE_RECORDS.len() as i64
+            + G_AGGREGATE_OUTER.inner.title.len() as i64
+            + G_AGGREGATE_OUTER.inner.count as i64
+            + G_AGGREGATE_TUPLE.0.len() as i64
+            + G_AGGREGATE_ENVELOPE.value.len() as i64
+            + G_AGGREGATE_REPR_C.title.len() as i64
+            + G_OPTION_STRING.as_ref().map(String::len).unwrap_or(0) as i64
+            + G_OPTION_STRING_NONE
+                .as_ref()
+                .map(String::len)
+                .unwrap_or(0) as i64
+            + match &G_RESULT_RECORD_OK {
+                Ok(record) => record.title.len() as i64 + record.count as i64,
+                Err(error) => error.len() as i64,
+            }
+            + match &G_RESULT_RECORD_ERR {
+                Ok(record) => record.title.len() as i64 + record.count as i64,
+                Err(error) => error.len() as i64,
+            }
+            + match &G_MANY_STRING_VARIANT {
+                ManyStringVariants::V00(value)
+                | ManyStringVariants::V01(value)
+                | ManyStringVariants::V02(value)
+                | ManyStringVariants::V03(value)
+                | ManyStringVariants::V04(value)
+                | ManyStringVariants::V05(value)
+                | ManyStringVariants::V06(value)
+                | ManyStringVariants::V07(value)
+                | ManyStringVariants::V08(value)
+                | ManyStringVariants::V09(value)
+                | ManyStringVariants::V10(value)
+                | ManyStringVariants::V11(value)
+                | ManyStringVariants::V12(value)
+                | ManyStringVariants::V13(value)
+                | ManyStringVariants::V14(value)
+                | ManyStringVariants::V15(value) => value.len() as i64,
+            }
             + G_USER_NONZERO.0.0 as i64
             + G_USER_CELL.0.0 as i64
             + G_USER_REF_CELL.value.0 as i64
@@ -637,6 +752,45 @@ fn main() {
         G_MUT_SLICE_U16 = Box::leak(vec![1000, 2000, 65535].into_boxed_slice());
         G_CELL_STRING.set(String::from("cell nested"));
         *G_REF_CELL_STRING.get_mut() = String::from("refcell nested");
+        G_AGGREGATE_RECORD = AggregateRecord {
+            title: String::from("root aggregate"),
+            count: 7,
+        };
+        G_VEC_AGGREGATE_RECORDS = vec![
+            AggregateRecord {
+                title: String::from("first"),
+                count: 11,
+            },
+            AggregateRecord {
+                title: String::from("second"),
+                count: 13,
+            },
+        ];
+        G_AGGREGATE_OUTER = AggregateOuter {
+            inner: AggregateRecord {
+                title: String::from("nested record"),
+                count: 17,
+            },
+            active: true,
+        };
+        G_AGGREGATE_TUPLE = AggregateTuple(String::from("tuple aggregate"), 19);
+        G_AGGREGATE_ENVELOPE = AggregateEnvelope {
+            value: String::from("generic aggregate"),
+            id: 23,
+        };
+        G_AGGREGATE_REPR_C = AggregateReprC {
+            title: String::from("repr aggregate"),
+            code: 29,
+        };
+        G_OPTION_STRING = Some(String::from("optional value"));
+        G_OPTION_STRING_NONE = None;
+        G_RESULT_RECORD_OK = Ok(AggregateRecord {
+            title: String::from("result record"),
+            count: 31,
+        });
+        G_RESULT_RECORD_ERR = Err(String::from("result error"));
+        G_MANY_STRING_VARIANT =
+            ManyStringVariants::V07(String::from("shared variant budget"));
     }
 
     let mut acc: i64 = 0;

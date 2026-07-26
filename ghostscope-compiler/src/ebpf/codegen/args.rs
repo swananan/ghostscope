@@ -24,8 +24,13 @@ fn exact_memory_access_size(size: u64, role: &str) -> Result<ghostscope_dwarf::M
 fn projected_value_steps(
     value: &ghostscope_dwarf::ProjectedValueRead,
 ) -> Result<Vec<ProjectedViewStep>> {
-    value
-        .steps
+    projected_steps(&value.steps)
+}
+
+fn projected_steps(
+    steps: &[ghostscope_dwarf::ProjectedValueStep],
+) -> Result<Vec<ProjectedViewStep>> {
+    steps
         .iter()
         .map(|step| match step {
             ghostscope_dwarf::ProjectedValueStep::Member { offset } => {
@@ -41,6 +46,78 @@ fn projected_value_steps(
             }
         })
         .collect()
+}
+
+fn discriminant_is_signed(type_info: &ghostscope_dwarf::TypeInfo) -> Option<bool> {
+    match type_info {
+        ghostscope_dwarf::TypeInfo::BaseType { encoding, .. } => {
+            if *encoding == ghostscope_dwarf::constants::DW_ATE_signed.0 as u16
+                || *encoding == ghostscope_dwarf::constants::DW_ATE_signed_char.0 as u16
+            {
+                Some(true)
+            } else if *encoding == ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16
+                || *encoding == ghostscope_dwarf::constants::DW_ATE_unsigned_char.0 as u16
+                || *encoding == ghostscope_dwarf::constants::DW_ATE_boolean.0 as u16
+            {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        ghostscope_dwarf::TypeInfo::EnumType { base_type, .. }
+        | ghostscope_dwarf::TypeInfo::ScopedEnumType { base_type, .. }
+        | ghostscope_dwarf::TypeInfo::TypedefType {
+            underlying_type: base_type,
+            ..
+        }
+        | ghostscope_dwarf::TypeInfo::QualifiedType {
+            underlying_type: base_type,
+            ..
+        } => discriminant_is_signed(base_type),
+        ghostscope_dwarf::TypeInfo::BitfieldType { .. } => None,
+        _ => None,
+    }
+}
+
+fn compile_nested_variant_condition(
+    condition: &ghostscope_dwarf::ValueNestedVariantCondition,
+) -> Option<NestedValueVariantConditionSource> {
+    match condition {
+        ghostscope_dwarf::ValueNestedVariantCondition::Always => {
+            Some(NestedValueVariantConditionSource::Always)
+        }
+        ghostscope_dwarf::ValueNestedVariantCondition::Discriminant {
+            member,
+            ranges,
+            inverted,
+        } => {
+            let signed = discriminant_is_signed(&member.member_type)?;
+            let access_size =
+                exact_memory_access_size(member.member_type.size(), "nested variant discriminant")
+                    .ok()?;
+            let ranges_match_type = ranges.iter().all(|range| {
+                matches!(
+                    (signed, range.start, range.end),
+                    (
+                        true,
+                        ghostscope_dwarf::DiscriminantValue::Signed(_),
+                        ghostscope_dwarf::DiscriminantValue::Signed(_)
+                    ) | (
+                        false,
+                        ghostscope_dwarf::DiscriminantValue::Unsigned(_),
+                        ghostscope_dwarf::DiscriminantValue::Unsigned(_)
+                    )
+                )
+            });
+            ranges_match_type.then(|| NestedValueVariantConditionSource::Discriminant {
+                offset: member.offset,
+                access_size,
+                signed,
+                ranges: ranges.clone(),
+                inverted: *inverted,
+            })
+        }
+    }
 }
 
 fn metadata_member(
@@ -415,6 +492,127 @@ fn compile_nested_value_source(
                 total_len: slot_offset,
                 root,
                 children: NestedValueChildrenSource::ProjectedView {
+                    fields: compiled_fields,
+                },
+            }))
+        }
+        ghostscope_dwarf::ValueNestedPlan::Variant { fields } => {
+            let Some((output_type, root, root_payload_len)) =
+                compile_nested_root_source(plan, budget, None)?
+            else {
+                return Ok(None);
+            };
+            type VariantFieldCandidate<'a> = (
+                &'a ghostscope_dwarf::ValueNestedVariantFieldPlan,
+                NestedValueVariantConditionSource,
+            );
+            let mut parts = std::collections::BTreeMap::<
+                usize,
+                std::collections::BTreeMap<usize, Vec<VariantFieldCandidate<'_>>>,
+            >::new();
+            for field in fields {
+                let Some(condition) = compile_nested_variant_condition(&field.condition) else {
+                    continue;
+                };
+                parts
+                    .entry(field.part_index)
+                    .or_default()
+                    .entry(field.variant_index)
+                    .or_default()
+                    .push((field, condition));
+            }
+            if parts.is_empty() {
+                return Ok(None);
+            }
+
+            // Variant parts can be active at the same time, but branches in one
+            // part are mutually exclusive and can reuse the same physical slots.
+            let part_budget = budget
+                .saturating_sub(root_payload_len)
+                .checked_div(parts.len())
+                .unwrap_or(0);
+            let mut next_part_offset = root_payload_len;
+            let mut compiled_fields = Vec::with_capacity(fields.len());
+            for variants in parts.into_values() {
+                let slot_count = variants.values().map(Vec::len).max().unwrap_or(0);
+                if slot_count == 0 {
+                    continue;
+                }
+                let header_bytes = slot_count
+                    .checked_mul(ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE)
+                    .ok_or_else(|| {
+                        CodeGenError::DwarfError("nested variant header size overflow".to_string())
+                    })?;
+                let child_budget = part_budget
+                    .saturating_sub(header_bytes)
+                    .checked_div(slot_count)
+                    .unwrap_or(0);
+                let slot_stride = ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE
+                    .checked_add(child_budget)
+                    .ok_or_else(|| {
+                        CodeGenError::DwarfError("nested variant slot stride overflow".to_string())
+                    })?;
+                let part_len = slot_stride.checked_mul(slot_count).ok_or_else(|| {
+                    CodeGenError::DwarfError("nested variant part size overflow".to_string())
+                })?;
+                let mut compiled_part_fields = Vec::new();
+
+                for variant_fields in variants.into_values() {
+                    for (slot_index, (field, condition)) in variant_fields.into_iter().enumerate() {
+                        let Some(child) = compile_nested_value_source(
+                            &field.value,
+                            child_budget,
+                            max_sequence_elements,
+                        )?
+                        else {
+                            continue;
+                        };
+                        if child.total_len > child_budget {
+                            return Err(CodeGenError::DwarfError(
+                                "nested variant child exceeds its slot budget".to_string(),
+                            ));
+                        }
+                        let slot_offset = slot_index
+                            .checked_mul(slot_stride)
+                            .and_then(|offset| next_part_offset.checked_add(offset))
+                            .ok_or_else(|| {
+                                CodeGenError::DwarfError(
+                                    "nested variant slot offset overflow".to_string(),
+                                )
+                            })?;
+                        compiled_part_fields.push(NestedValueVariantFieldSource {
+                            part_index: field.part_index,
+                            variant_index: field.variant_index,
+                            member_index: field.member_index,
+                            payload_field_index: field.payload_field_index,
+                            field: NestedValueFieldSource {
+                                field_index: field.payload_field_index,
+                                slot_offset,
+                                steps: projected_steps(&field.steps)?,
+                                child: Box::new(child),
+                            },
+                            condition,
+                        });
+                    }
+                }
+                if compiled_part_fields.is_empty() {
+                    continue;
+                }
+                compiled_fields.extend(compiled_part_fields);
+                next_part_offset = next_part_offset.checked_add(part_len).ok_or_else(|| {
+                    CodeGenError::DwarfError("nested variant payload size overflow".to_string())
+                })?;
+            }
+            if compiled_fields.is_empty() || next_part_offset > budget {
+                return Ok(None);
+            }
+            Ok(Some(NestedValueSource {
+                output_type,
+                presentation: plan.presentation.clone(),
+                root_payload_len,
+                total_len: next_part_offset,
+                root,
+                children: NestedValueChildrenSource::Variant {
                     fields: compiled_fields,
                 },
             }))
@@ -913,6 +1111,42 @@ fn nested_value_presentation(
                     .collect::<Result<Vec<_>>>()?,
             }
         }
+        NestedValueChildrenSource::Variant { fields } => {
+            ghostscope_protocol::NestedValueChildrenPresentation::Variant {
+                fields: fields
+                    .iter()
+                    .map(|field| {
+                        let protocol_index = |index: usize, role: &str| {
+                            u64::try_from(index).map_err(|_| {
+                                CodeGenError::DwarfError(format!(
+                                    "nested variant {role} index does not fit the protocol"
+                                ))
+                            })
+                        };
+                        Ok(ghostscope_protocol::NestedValueVariantFieldPresentation {
+                            part_index: protocol_index(field.part_index, "part")?,
+                            variant_index: protocol_index(field.variant_index, "branch")?,
+                            member_index: protocol_index(field.member_index, "member")?,
+                            payload_field_index: protocol_index(
+                                field.payload_field_index,
+                                "payload field",
+                            )?,
+                            child: ghostscope_protocol::NestedValueChildPresentation {
+                                slot_offset: u64::try_from(field.field.slot_offset).map_err(
+                                    |_| {
+                                        CodeGenError::DwarfError(
+                                            "nested variant slot offset does not fit the protocol"
+                                                .to_string(),
+                                        )
+                                    },
+                                )?,
+                                value: Box::new(nested_child_presentation(&field.field.child)?),
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }
+        }
         NestedValueChildrenSource::Sequence {
             first_slot_offset,
             slot_stride,
@@ -980,19 +1214,23 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let Some(analyzer) = self.process_analyzer else {
             return Ok(SemanticValueResolution::default());
         };
+        let options = ghostscope_dwarf::ValueReadPlanOptions {
+            max_nesting_depth: self.compile_options.value_adapter_max_nesting_depth,
+        };
         let report = analyzer
-            .explain_value_read_plan_with_options(
-                resolved_type,
-                type_module_path,
-                ghostscope_dwarf::ValueReadPlanOptions {
-                    max_nesting_depth: self.compile_options.value_adapter_max_nesting_depth,
-                },
-            )
+            .explain_value_read_plan_with_options(resolved_type, type_module_path, options)
             .map_err(|error| CodeGenError::DwarfError(error.to_string()))?;
         match &report.outcome {
-            ghostscope_dwarf::ValueAdapterOutcome::NotApplicable => {
-                Ok(SemanticValueResolution::default())
-            }
+            // Adapter reports intentionally describe named source-language
+            // adapters only. Operational resolution may still compose those
+            // adapters through an ordinary Rust struct.
+            ghostscope_dwarf::ValueAdapterOutcome::NotApplicable => analyzer
+                .value_read_plan_with_options(resolved_type, type_module_path, options)
+                .map(|plan| SemanticValueResolution {
+                    plan,
+                    rejection: None,
+                })
+                .map_err(|error| CodeGenError::DwarfError(error.to_string())),
             ghostscope_dwarf::ValueAdapterOutcome::Applied { plan } => {
                 Ok(SemanticValueResolution {
                     plan: Some((**plan).clone()),
@@ -2628,9 +2866,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 mod semantic_value_tests {
     use super::*;
     use ghostscope_dwarf::{
-        MemoryAccessSize, ProjectedValueRead, ProjectedValueStep, ProjectedViewField, ResolvedType,
-        StructMember, TypeIdentity, TypeInfo, TypeProjection, TypeProjectionLayout,
-        ValueCapturePlan, ValueNestedPlan, ValuePresentation, ValueReadPlan,
+        DiscriminantRange, DiscriminantValue, MemoryAccessSize, ProjectedValueRead,
+        ProjectedValueStep, ProjectedViewField, ResolvedType, StructMember, TypeIdentity, TypeInfo,
+        TypeProjection, TypeProjectionLayout, ValueCapturePlan, ValueNestedPlan,
+        ValueNestedVariantCondition, ValueNestedVariantFieldPlan, ValuePresentation, ValueReadPlan,
     };
 
     fn projection(size: u64) -> TypeProjection {
@@ -2988,6 +3227,69 @@ mod semantic_value_tests {
                 element: Box::new(string),
             }),
         }
+    }
+
+    fn many_variant_strings_plan(variant_count: usize) -> ValueReadPlan {
+        let root_type = resolved_struct("ManyStringVariants", 32);
+        let discriminant = output_member(
+            "tag",
+            TypeInfo::BaseType {
+                name: "u8".to_string(),
+                size: 1,
+                encoding: ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16,
+            },
+            0,
+        );
+        let fields = (0..variant_count)
+            .map(|variant_index| ValueNestedVariantFieldPlan {
+                part_index: 0,
+                variant_index,
+                member_index: 0,
+                payload_field_index: 0,
+                steps: vec![ProjectedValueStep::Member { offset: 8 }],
+                condition: ValueNestedVariantCondition::Discriminant {
+                    member: discriminant.clone(),
+                    ranges: vec![DiscriminantRange {
+                        start: DiscriminantValue::Unsigned(variant_index as u64),
+                        end: DiscriminantValue::Unsigned(variant_index as u64),
+                    }],
+                    inverted: false,
+                },
+                value: Box::new(string_value_plan()),
+            })
+            .collect();
+
+        ValueReadPlan {
+            root_type: root_type.clone(),
+            presentation: ValuePresentation::Dwarf,
+            capture: ValueCapturePlan::InlineView {
+                output_type: root_type.summary,
+                fields: Vec::new(),
+            },
+            sequence_element: None,
+            nested: Some(ValueNestedPlan::Variant { fields }),
+        }
+    }
+
+    #[test]
+    fn nested_variant_capture_reuses_slots_across_mutually_exclusive_branches() {
+        let source = compile_nested_value_source(&many_variant_strings_plan(16), 256, 4)
+            .unwrap()
+            .expect("mutually exclusive String variants should share one child slot");
+        let NestedValueChildrenSource::Variant { fields } = &source.children else {
+            panic!("expected nested variant source");
+        };
+        let child_budget =
+            256 - source.root_payload_len - ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE;
+
+        assert_eq!(fields.len(), 16);
+        assert_eq!(source.total_len, 256);
+        assert!(fields
+            .iter()
+            .all(|field| field.field.slot_offset == source.root_payload_len));
+        assert!(fields
+            .iter()
+            .all(|field| field.field.child.total_len == child_budget));
     }
 
     #[test]

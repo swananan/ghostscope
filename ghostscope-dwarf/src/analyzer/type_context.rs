@@ -2,12 +2,20 @@ use super::DwarfAnalyzer;
 use crate::{
     indexable_element_layout, member_layout, semantics::PlanError, strip_type_aliases,
     CompilationUnitMetadata, CuId, MemberLayout, ModuleId, PcContext, ProjectedValueRead,
-    ProjectedValueStep, ResolvedType, Result, SemanticType, TypeId, TypeIdentity, TypeInfo,
-    TypeLayoutError, TypeOrigin, TypeProjection, TypeProjectionLayout, ValueAdapterOutcome,
-    ValueAdapterReport, ValueAdapterStage, ValueCapturePlan, ValueNestedFieldPlan, ValueNestedPlan,
-    ValueReadPlan, ValueReadPlanOptions, VariableAccessSegment, VariableReadPlan,
+    ProjectedValueStep, ResolvedType, Result, SemanticType, SourceLanguage, TypeId, TypeIdentity,
+    TypeInfo, TypeLayoutError, TypeOrigin, TypeProjection, TypeProjectionLayout,
+    ValueAdapterOutcome, ValueAdapterReport, ValueAdapterStage, ValueCapturePlan,
+    ValueNestedFieldPlan, ValueNestedPlan, ValueNestedVariantCondition,
+    ValueNestedVariantFieldPlan, ValuePresentation, ValueReadPlan, ValueReadPlanOptions,
+    VariableAccessSegment, VariableReadPlan, VariantSelector,
 };
 use std::path::Path;
+
+enum ShallowValueReadPlan {
+    Applied(Box<ValueReadPlan>),
+    NotApplicable,
+    Rejected,
+}
 
 impl DwarfAnalyzer {
     /// Return language and producer metadata for a loaded compilation unit.
@@ -63,6 +71,34 @@ impl DwarfAnalyzer {
             .get(module_path)
             .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?
             .type_summary(type_id)
+    }
+
+    fn variant_member_resolved_type(
+        &self,
+        current: TypeId,
+        part_index: usize,
+        variant_index: usize,
+        member_index: usize,
+    ) -> Result<Option<ResolvedType>> {
+        let module_path = self.module_path_for_id(current.module).ok_or_else(|| {
+            anyhow::anyhow!("Semantic module id {:?} is not loaded", current.module)
+        })?;
+        let type_id = self
+            .modules
+            .get(module_path)
+            .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?
+            .variant_member_type_id(current, part_index, variant_index, member_index)?;
+        let Some(type_id) = type_id else {
+            return Ok(None);
+        };
+        let Some(summary) = self.type_summary(type_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(ResolvedType::new(
+            summary,
+            TypeIdentity::Dwarf(type_id),
+            self.type_origin(type_id)?,
+        )))
     }
 
     fn hydrate_projected_type(&self, mut resolved: ResolvedType) -> Result<ResolvedType> {
@@ -304,7 +340,13 @@ impl DwarfAnalyzer {
         let report =
             self.explain_value_read_plan_with_options(current, type_module_path, options)?;
         match report.outcome {
-            ValueAdapterOutcome::NotApplicable => Ok(None),
+            ValueAdapterOutcome::NotApplicable => Ok(self.rust_aggregate_value_read_plan(
+                current,
+                type_module_path,
+                0,
+                options.max_nesting_depth,
+                &mut Vec::new(),
+            )),
             ValueAdapterOutcome::Applied { plan } => Ok(Some(*plan)),
             ValueAdapterOutcome::Rejected { stage, reason } => {
                 tracing::debug!(
@@ -424,7 +466,7 @@ impl DwarfAnalyzer {
         &self,
         current: &ResolvedType,
         type_module_path: Option<&Path>,
-    ) -> Result<Option<ValueReadPlan>> {
+    ) -> Result<ShallowValueReadPlan> {
         let qualified_name = match (
             crate::language::requires_dwarf_qualified_name(current),
             current.identity.layout_dwarf_id(),
@@ -435,10 +477,19 @@ impl DwarfAnalyzer {
         let layout = match crate::language::resolve_value_layout(current, qualified_name.as_deref())
         {
             crate::language::ValueLayoutResolution::Applied { layout, .. } => layout,
-            crate::language::ValueLayoutResolution::NotApplicable
-            | crate::language::ValueLayoutResolution::Rejected { .. } => return Ok(None),
+            crate::language::ValueLayoutResolution::NotApplicable => {
+                return Ok(ShallowValueReadPlan::NotApplicable);
+            }
+            crate::language::ValueLayoutResolution::Rejected { .. } => {
+                return Ok(ShallowValueReadPlan::Rejected);
+            }
         };
-        crate::language::build_value_read_plan(self, current, type_module_path, layout)
+        Ok(
+            match crate::language::build_value_read_plan(self, current, type_module_path, layout)? {
+                Some(plan) => ShallowValueReadPlan::Applied(Box::new(plan)),
+                None => ShallowValueReadPlan::Rejected,
+            },
+        )
     }
 
     fn try_nested_value_read_plan(
@@ -450,8 +501,17 @@ impl DwarfAnalyzer {
         ancestors: &mut Vec<TypeId>,
     ) -> Option<ValueReadPlan> {
         let plan = match self.value_read_plan_shallow(current, type_module_path) {
-            Ok(Some(plan)) => plan,
-            Ok(None) => return None,
+            Ok(ShallowValueReadPlan::Applied(plan)) => *plan,
+            Ok(ShallowValueReadPlan::NotApplicable) => {
+                return self.rust_aggregate_value_read_plan(
+                    current,
+                    type_module_path,
+                    depth,
+                    max_nesting_depth,
+                    ancestors,
+                );
+            }
+            Ok(ShallowValueReadPlan::Rejected) => return None,
             Err(error) => {
                 tracing::debug!(
                     target: "ghostscope_dwarf::value_adapter",
@@ -470,6 +530,251 @@ impl DwarfAnalyzer {
             max_nesting_depth,
             ancestors,
         ))
+    }
+
+    fn rust_aggregate_value_read_plan(
+        &self,
+        current: &ResolvedType,
+        type_module_path: Option<&Path>,
+        depth: usize,
+        max_nesting_depth: usize,
+        ancestors: &mut Vec<TypeId>,
+    ) -> Option<ValueReadPlan> {
+        let plan = self.rust_aggregate_value_read_plan_shallow(current, type_module_path)?;
+        let plan = self.enrich_nested_value_read_plan(
+            current,
+            plan,
+            type_module_path,
+            depth,
+            max_nesting_depth,
+            ancestors,
+        );
+        plan.nested.is_some().then_some(plan)
+    }
+
+    fn rust_aggregate_value_read_plan_shallow(
+        &self,
+        current: &ResolvedType,
+        type_module_path: Option<&Path>,
+    ) -> Option<ValueReadPlan> {
+        if current.origin.as_ref().map(|origin| origin.language) != Some(SourceLanguage::Rust) {
+            return None;
+        }
+        let fields = match strip_type_aliases(&current.summary) {
+            TypeInfo::StructType { members, .. } => {
+                let mut fields = Vec::with_capacity(members.len());
+                for member in members {
+                    let projection = match self.project_resolved_type(
+                        current,
+                        &VariableAccessSegment::Field(member.name.clone()),
+                        type_module_path,
+                    ) {
+                        Ok(projection) => projection,
+                        Err(error) => {
+                            tracing::debug!(
+                                target: "ghostscope_dwarf::value_adapter",
+                                type_name = current.summary.type_name(),
+                                field = member.name,
+                                %error,
+                                "Rust aggregate could not form a nested field projection; using DWARF presentation"
+                            );
+                            return None;
+                        }
+                    };
+                    let TypeProjectionLayout::Member { offset } = projection.layout else {
+                        return None;
+                    };
+                    if offset != member.offset {
+                        return None;
+                    }
+                    fields.push(ProjectedValueRead {
+                        steps: vec![ProjectedValueStep::Member { offset }],
+                        resolved_type: projection.resolved_type,
+                    });
+                }
+                fields
+            }
+            TypeInfo::VariantType { .. } => Vec::new(),
+            _ => return None,
+        };
+
+        Some(ValueReadPlan::new(
+            current.clone(),
+            ValuePresentation::Dwarf,
+            ValueCapturePlan::InlineView {
+                output_type: strip_type_aliases(&current.summary).clone(),
+                fields,
+            },
+        ))
+    }
+
+    fn rust_variant_nested_plan(
+        &self,
+        current: &ResolvedType,
+        type_module_path: Option<&Path>,
+        depth: usize,
+        max_nesting_depth: usize,
+        ancestors: &mut Vec<TypeId>,
+    ) -> Option<ValueNestedPlan> {
+        let current_id = current.identity.layout_dwarf_id()?;
+        let TypeInfo::VariantType { variant_parts, .. } = strip_type_aliases(&current.summary)
+        else {
+            return None;
+        };
+        let mut fields = Vec::new();
+
+        for (part_index, part) in variant_parts.iter().enumerate() {
+            for (variant_index, variant) in part.variants.iter().enumerate() {
+                let Some(condition) = Self::nested_variant_condition(part, variant_index) else {
+                    continue;
+                };
+                for (member_index, member) in variant.members.iter().enumerate() {
+                    let wrapper = match self.variant_member_resolved_type(
+                        current_id,
+                        part_index,
+                        variant_index,
+                        member_index,
+                    ) {
+                        Ok(Some(wrapper)) => wrapper,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            tracing::debug!(
+                                target: "ghostscope_dwarf::value_adapter",
+                                type_name = current.summary.type_name(),
+                                part_index,
+                                variant_index,
+                                member_index,
+                                %error,
+                                "Rust enum payload identity could not be resolved; using DWARF presentation"
+                            );
+                            continue;
+                        }
+                    };
+                    if wrapper.summary != member.member_type {
+                        tracing::debug!(
+                            target: "ghostscope_dwarf::value_adapter",
+                            type_name = current.summary.type_name(),
+                            variant = member.name,
+                            "Rust enum payload identity did not match its parsed member type; using DWARF presentation"
+                        );
+                        continue;
+                    }
+                    let TypeInfo::StructType {
+                        members: payload_fields,
+                        ..
+                    } = strip_type_aliases(&wrapper.summary)
+                    else {
+                        continue;
+                    };
+
+                    for (payload_field_index, payload_field) in payload_fields.iter().enumerate() {
+                        let projection = match self.project_resolved_type(
+                            &wrapper,
+                            &VariableAccessSegment::Field(payload_field.name.clone()),
+                            type_module_path,
+                        ) {
+                            Ok(projection) => projection,
+                            Err(error) => {
+                                tracing::debug!(
+                                    target: "ghostscope_dwarf::value_adapter",
+                                    type_name = current.summary.type_name(),
+                                    variant = member.name,
+                                    field = payload_field.name,
+                                    %error,
+                                    "Rust enum payload field could not be projected; using DWARF presentation"
+                                );
+                                continue;
+                            }
+                        };
+                        let TypeProjectionLayout::Member { offset } = projection.layout else {
+                            continue;
+                        };
+                        if offset != payload_field.offset {
+                            continue;
+                        }
+                        let Some(value) = self.try_nested_value_read_plan(
+                            &projection.resolved_type,
+                            type_module_path,
+                            depth + 1,
+                            max_nesting_depth,
+                            ancestors,
+                        ) else {
+                            continue;
+                        };
+                        fields.push(ValueNestedVariantFieldPlan {
+                            part_index,
+                            variant_index,
+                            member_index,
+                            payload_field_index,
+                            steps: vec![
+                                ProjectedValueStep::Member {
+                                    offset: member.offset,
+                                },
+                                ProjectedValueStep::Member { offset },
+                            ],
+                            condition: condition.clone(),
+                            value: Box::new(value),
+                        });
+                    }
+                }
+            }
+        }
+
+        (!fields.is_empty()).then_some(ValueNestedPlan::Variant { fields })
+    }
+
+    fn nested_variant_condition(
+        part: &crate::VariantPart,
+        variant_index: usize,
+    ) -> Option<ValueNestedVariantCondition> {
+        let variant = part.variants.get(variant_index)?;
+        let Some(discriminant) = &part.discriminant else {
+            let selected = part
+                .variants
+                .iter()
+                .position(|variant| matches!(variant.selector, VariantSelector::Default))
+                .unwrap_or(0);
+            return (selected == variant_index).then_some(ValueNestedVariantCondition::Always);
+        };
+
+        match &variant.selector {
+            VariantSelector::Ranges(ranges) if !ranges.is_empty() => {
+                Some(ValueNestedVariantCondition::Discriminant {
+                    member: discriminant.clone(),
+                    ranges: ranges.clone(),
+                    inverted: false,
+                })
+            }
+            VariantSelector::Ranges(_) => None,
+            VariantSelector::Default => {
+                let first_default = part
+                    .variants
+                    .iter()
+                    .position(|variant| matches!(variant.selector, VariantSelector::Default))?;
+                if first_default != variant_index {
+                    return None;
+                }
+                let ranges = part
+                    .variants
+                    .iter()
+                    .filter_map(|variant| match &variant.selector {
+                        VariantSelector::Ranges(ranges) => Some(ranges.as_slice()),
+                        VariantSelector::Default => None,
+                    })
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if ranges.is_empty() {
+                    Some(ValueNestedVariantCondition::Always)
+                } else {
+                    Some(ValueNestedVariantCondition::Discriminant {
+                        member: discriminant.clone(),
+                        ranges,
+                        inverted: true,
+                    })
+                }
+            }
+        }
     }
 
     fn enrich_nested_value_read_plan(
@@ -504,6 +809,22 @@ impl DwarfAnalyzer {
                 .map(|value| ValueNestedPlan::ProjectedValue {
                     value: Box::new(value),
                 }),
+            ValueCapturePlan::InlineView {
+                output_type,
+                fields: _,
+            } if matches!(
+                strip_type_aliases(output_type),
+                TypeInfo::VariantType { .. }
+            ) =>
+            {
+                self.rust_variant_nested_plan(
+                    current,
+                    type_module_path,
+                    depth,
+                    max_nesting_depth,
+                    ancestors,
+                )
+            }
             ValueCapturePlan::InlineView { fields, .. } => {
                 let nested_fields = fields
                     .iter()

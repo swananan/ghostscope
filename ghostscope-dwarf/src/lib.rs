@@ -53,10 +53,10 @@ pub use semantics::{
     SourceLanguage, SyntheticTypeKind, TypeIdentity, TypeLayoutError, TypeOrigin, TypeProjection,
     TypeProjectionLayout, UnwindDiagnostic, UnwindDiagnosticKind, ValueAdapterOutcome,
     ValueAdapterReport, ValueAdapterStage, ValueCapturePlan, ValueNestedFieldPlan, ValueNestedPlan,
-    ValueReadPlan, ValueReadPlanOptions, VariableAccessPath, VariableAccessSegment,
-    VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
-    VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
-    VisibleVariable, VisibleVariablesResult, DEFAULT_VALUE_ADAPTER_NESTING_DEPTH,
+    ValueNestedVariantCondition, ValueNestedVariantFieldPlan, ValueReadPlan, ValueReadPlanOptions,
+    VariableAccessPath, VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan,
+    VariableMaterialization, VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic,
+    VariableReadPlan, VisibleVariable, VisibleVariablesResult, DEFAULT_VALUE_ADAPTER_NESTING_DEPTH,
     MAX_VALUE_ADAPTER_NESTING_DEPTH,
 };
 

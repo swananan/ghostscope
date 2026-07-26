@@ -197,6 +197,9 @@ enum NestedValueChildrenSource {
         element: Box<NestedValueSource>,
         metadata: NestedSequenceMetadataSource,
     },
+    Variant {
+        fields: Vec<NestedValueVariantFieldSource>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +208,28 @@ struct NestedValueFieldSource {
     slot_offset: usize,
     steps: Vec<ProjectedViewStep>,
     child: Box<NestedValueSource>,
+}
+
+#[derive(Debug, Clone)]
+struct NestedValueVariantFieldSource {
+    part_index: usize,
+    variant_index: usize,
+    member_index: usize,
+    payload_field_index: usize,
+    field: NestedValueFieldSource,
+    condition: NestedValueVariantConditionSource,
+}
+
+#[derive(Debug, Clone)]
+enum NestedValueVariantConditionSource {
+    Always,
+    Discriminant {
+        offset: u64,
+        access_size: ghostscope_dwarf::MemoryAccessSize,
+        signed: bool,
+        ranges: Vec<ghostscope_dwarf::DiscriminantRange>,
+        inverted: bool,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -14,13 +14,26 @@ use crate::{
     BTreeEntryPresentation, BTreeFieldPresentation, HashTableBucketOrder,
     HashTableEntryPresentation, HashTableFieldPresentation, HashTableOccupancy,
     NestedValueChildrenPresentation, NestedValueFieldPresentation, NestedValuePresentation,
-    ValuePresentation, BTREE_CAPTURED_ITEM_COUNT_OFFSET, BTREE_HEADER_SIZE, BTREE_NODE_HEADER_SIZE,
-    BTREE_NODE_HEIGHT_OFFSET, BTREE_NODE_LENGTH_OFFSET, BTREE_NODE_SLOT_COUNT_OFFSET,
-    HASH_TABLE_BUCKET_DATA_OFFSET, HASH_TABLE_CAPACITY_OFFSET, HASH_TABLE_CAPTURED_BUCKETS_OFFSET,
-    HASH_TABLE_HEADER_SIZE, INDIRECT_BYTES_LENGTH_PREFIX_SIZE,
+    NestedValueVariantFieldPresentation, ValuePresentation, BTREE_CAPTURED_ITEM_COUNT_OFFSET,
+    BTREE_HEADER_SIZE, BTREE_NODE_HEADER_SIZE, BTREE_NODE_HEIGHT_OFFSET, BTREE_NODE_LENGTH_OFFSET,
+    BTREE_NODE_SLOT_COUNT_OFFSET, HASH_TABLE_BUCKET_DATA_OFFSET, HASH_TABLE_CAPACITY_OFFSET,
+    HASH_TABLE_CAPTURED_BUCKETS_OFFSET, HASH_TABLE_HEADER_SIZE, INDIRECT_BYTES_LENGTH_PREFIX_SIZE,
     INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET, INDIRECT_SEQUENCE_HEADER_SIZE,
     NESTED_VALUE_CHILD_HEADER_SIZE, NESTED_VALUE_CHILD_STATUS_OFFSET,
 };
+
+struct ActiveVariantMember<'a> {
+    part_index: Option<usize>,
+    variant_index: Option<usize>,
+    member_index: Option<usize>,
+    member: &'a crate::StructMember,
+    payload_presentation: crate::VariantPayloadPresentation,
+}
+
+struct NestedVariantContext<'a> {
+    full_data: &'a [u8],
+    fields: &'a [NestedValueVariantFieldPresentation],
+}
 
 // Removed legacy simple variable wrapper; use complex paths only.
 
@@ -895,6 +908,32 @@ impl FormatPrinter {
             }
             NestedValueChildrenPresentation::ProjectedView { fields } => {
                 Self::format_nested_projected_view(root_data, data, type_info, root, fields)
+            }
+            NestedValueChildrenPresentation::Variant { fields } => {
+                let (
+                    ValuePresentation::Dwarf,
+                    TypeInfo::VariantType {
+                        name,
+                        members,
+                        variant_parts,
+                        ..
+                    },
+                ) = (root, type_info)
+                else {
+                    return "<INVALID_NESTED_VARIANT>".to_string();
+                };
+                Self::format_variant_type(
+                    root_data,
+                    name,
+                    members,
+                    variant_parts,
+                    0,
+                    32,
+                    Some(&NestedVariantContext {
+                        full_data: data,
+                        fields,
+                    }),
+                )
             }
             NestedValueChildrenPresentation::Sequence {
                 first_slot_offset,
@@ -2254,19 +2293,21 @@ impl FormatPrinter {
     fn active_variant<'a>(
         data: &[u8],
         part: &'a crate::VariantPart,
-    ) -> Option<&'a crate::VariantCase> {
+    ) -> Option<(usize, &'a crate::VariantCase)> {
         let default = part
             .variants
             .iter()
-            .find(|variant| matches!(variant.selector, crate::VariantSelector::Default));
+            .enumerate()
+            .find(|(_, variant)| matches!(variant.selector, crate::VariantSelector::Default));
         let Some(discriminant) = &part.discriminant else {
-            return default.or_else(|| part.variants.first());
+            return default.or_else(|| part.variants.first().map(|variant| (0, variant)));
         };
         let value = Self::decode_variant_discriminant(data, discriminant)?;
 
         part.variants
             .iter()
-            .find(|variant| match &variant.selector {
+            .enumerate()
+            .find(|(_, variant)| match &variant.selector {
                 crate::VariantSelector::Default => false,
                 crate::VariantSelector::Ranges(ranges) => ranges
                     .iter()
@@ -2284,11 +2325,13 @@ impl FormatPrinter {
     fn format_variant_member(
         data: &[u8],
         enum_name: &str,
-        member: &crate::StructMember,
-        payload_presentation: crate::VariantPayloadPresentation,
+        active: &ActiveVariantMember<'_>,
         current_depth: usize,
         max_depth: usize,
+        nested: Option<&NestedVariantContext<'_>>,
     ) -> String {
+        let member = active.member;
+        let payload_presentation = active.payload_presentation;
         let Some(member_data) = Self::member_data(data, member) else {
             return format!("{enum_name}::{}(<OUT_OF_BOUNDS>)", member.name);
         };
@@ -2306,17 +2349,42 @@ impl FormatPrinter {
 
             let positional = payload_presentation == crate::VariantPayloadPresentation::Tuple;
             let mut values = Vec::with_capacity(payload_members.len());
-            for field in payload_members {
-                let value = Self::member_data(member_data, field)
-                    .map(|field_data| {
-                        Self::format_data_with_type_info_impl(
-                            field_data,
-                            &field.member_type,
-                            current_depth + 1,
-                            max_depth,
-                        )
-                    })
-                    .unwrap_or_else(|| "<OUT_OF_BOUNDS>".to_string());
+            for (payload_field_index, field) in payload_members.iter().enumerate() {
+                let sidecar = active
+                    .part_index
+                    .zip(active.variant_index)
+                    .zip(active.member_index)
+                    .and_then(|((part_index, variant_index), member_index)| {
+                        nested.and_then(|nested| {
+                            nested.fields.iter().find(|candidate| {
+                                usize::try_from(candidate.part_index).ok() == Some(part_index)
+                                    && usize::try_from(candidate.variant_index).ok()
+                                        == Some(variant_index)
+                                    && usize::try_from(candidate.member_index).ok()
+                                        == Some(member_index)
+                                    && usize::try_from(candidate.payload_field_index).ok()
+                                        == Some(payload_field_index)
+                            })
+                        })
+                    });
+                let value = if let (Some(sidecar), Some(nested)) = (sidecar, nested) {
+                    Self::format_nested_child(
+                        nested.full_data,
+                        sidecar.child.slot_offset,
+                        &sidecar.child.value,
+                    )
+                } else {
+                    Self::member_data(member_data, field)
+                        .map(|field_data| {
+                            Self::format_data_with_type_info_impl(
+                                field_data,
+                                &field.member_type,
+                                current_depth + 1,
+                                max_depth,
+                            )
+                        })
+                        .unwrap_or_else(|| "<OUT_OF_BOUNDS>".to_string())
+                };
                 if positional {
                     values.push(value);
                 } else {
@@ -2350,19 +2418,20 @@ impl FormatPrinter {
         variant_parts: &[crate::VariantPart],
         current_depth: usize,
         max_depth: usize,
+        nested: Option<&NestedVariantContext<'_>>,
     ) -> String {
         let mut active_members = Vec::new();
-        Self::collect_active_variant_members(data, variant_parts, &mut active_members);
+        Self::collect_active_variant_members(data, variant_parts, true, &mut active_members);
 
         if members.is_empty() && active_members.len() == 1 {
-            let (member, payload_presentation) = active_members[0];
+            let active = &active_members[0];
             return Self::format_variant_member(
                 data,
                 name,
-                member,
-                payload_presentation,
+                active,
                 current_depth,
                 max_depth,
+                nested,
             );
         }
 
@@ -2380,18 +2449,18 @@ impl FormatPrinter {
                 .unwrap_or_else(|| "<OUT_OF_BOUNDS>".to_string());
             fields.push(format!("{}: {value}", member.name));
         }
-        for (member, _) in active_members {
-            let value = Self::member_data(data, member)
+        for active in active_members {
+            let value = Self::member_data(data, active.member)
                 .map(|member_data| {
                     Self::format_data_with_type_info_impl(
                         member_data,
-                        &member.member_type,
+                        &active.member.member_type,
                         current_depth + 1,
                         max_depth,
                     )
                 })
                 .unwrap_or_else(|| "<OUT_OF_BOUNDS>".to_string());
-            fields.push(format!("{}: {value}", member.name));
+            fields.push(format!("{}: {value}", active.member.name));
         }
 
         if fields.is_empty() {
@@ -2404,19 +2473,27 @@ impl FormatPrinter {
     fn collect_active_variant_members<'a>(
         data: &[u8],
         parts: &'a [crate::VariantPart],
-        members: &mut Vec<(&'a crate::StructMember, crate::VariantPayloadPresentation)>,
+        direct: bool,
+        members: &mut Vec<ActiveVariantMember<'a>>,
     ) {
-        for part in parts {
-            let Some(active) = Self::active_variant(data, part) else {
+        for (part_index, part) in parts.iter().enumerate() {
+            let Some((variant_index, active)) = Self::active_variant(data, part) else {
                 continue;
             };
             members.extend(
                 active
                     .members
                     .iter()
-                    .map(|member| (member, active.payload_presentation)),
+                    .enumerate()
+                    .map(|(member_index, member)| ActiveVariantMember {
+                        part_index: direct.then_some(part_index),
+                        variant_index: direct.then_some(variant_index),
+                        member_index: direct.then_some(member_index),
+                        member,
+                        payload_presentation: active.payload_presentation,
+                    }),
             );
-            Self::collect_active_variant_members(data, &active.variant_parts, members);
+            Self::collect_active_variant_members(data, &active.variant_parts, false, members);
         }
     }
 
@@ -2670,6 +2747,7 @@ impl FormatPrinter {
                 variant_parts,
                 current_depth,
                 max_depth,
+                None,
             ),
             TypeInfo::TypedefType {
                 name,
@@ -4668,6 +4746,117 @@ mod tests {
         assert_eq!(
             FormatPrinter::format_data_with_presentation(&data, &string_type, &presentation),
             r#"Cell { value: "nested" }"#
+        );
+    }
+
+    #[test]
+    fn test_nested_variant_formats_only_the_active_payload_sidecar() {
+        let string_type = TypeInfo::StructType {
+            name: "String".to_string(),
+            size: 24,
+            members: Vec::new(),
+        };
+        let discriminant_type = TypeInfo::BaseType {
+            name: "u64".to_string(),
+            size: 8,
+            encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+        };
+        let variant_member =
+            |name: &str, payload_members: Vec<crate::StructMember>| crate::StructMember {
+                name: name.to_string(),
+                member_type: TypeInfo::StructType {
+                    name: name.to_string(),
+                    size: 24,
+                    members: payload_members,
+                },
+                offset: 0,
+                bit_offset: None,
+                bit_size: None,
+            };
+        let option_type = TypeInfo::VariantType {
+            name: "Option<String>".to_string(),
+            size: 24,
+            members: Vec::new(),
+            variant_parts: vec![crate::VariantPart {
+                discriminant: Some(crate::StructMember {
+                    name: "<discriminant>".to_string(),
+                    member_type: discriminant_type,
+                    offset: 0,
+                    bit_offset: None,
+                    bit_size: None,
+                }),
+                variants: vec![
+                    crate::VariantCase {
+                        selector: crate::VariantSelector::Ranges(vec![crate::DiscriminantRange {
+                            start: crate::DiscriminantValue::Unsigned(1 << 63),
+                            end: crate::DiscriminantValue::Unsigned(1 << 63),
+                        }]),
+                        members: vec![variant_member("None", Vec::new())],
+                        variant_parts: Vec::new(),
+                        payload_presentation: crate::VariantPayloadPresentation::Unit,
+                    },
+                    crate::VariantCase {
+                        selector: crate::VariantSelector::Default,
+                        members: vec![variant_member(
+                            "Some",
+                            vec![crate::StructMember {
+                                name: "__0".to_string(),
+                                member_type: string_type.clone(),
+                                offset: 0,
+                                bit_offset: None,
+                                bit_size: None,
+                            }],
+                        )],
+                        variant_parts: Vec::new(),
+                        payload_presentation: crate::VariantPayloadPresentation::Tuple,
+                    },
+                ],
+            }],
+        };
+        let root_payload_len = 24;
+        let child_payload_len = 16;
+        let presentation = ValuePresentation::Nested {
+            root: Box::new(ValuePresentation::Dwarf),
+            root_payload_len: root_payload_len as u64,
+            children: Box::new(NestedValueChildrenPresentation::Variant {
+                fields: vec![NestedValueVariantFieldPresentation {
+                    part_index: 0,
+                    variant_index: 1,
+                    member_index: 0,
+                    payload_field_index: 0,
+                    child: crate::NestedValueChildPresentation {
+                        slot_offset: root_payload_len as u64,
+                        value: Box::new(NestedValuePresentation {
+                            payload_len: child_payload_len as u64,
+                            type_info: Box::new(string_type),
+                            presentation: Box::new(ValuePresentation::Utf8String),
+                        }),
+                    },
+                }],
+            }),
+        };
+
+        let mut some_data = vec![0; root_payload_len];
+        some_data.extend_from_slice(&nested_child_slot(
+            VariableStatus::Ok,
+            &indirect_bytes_payload(6, b"nested"),
+            child_payload_len,
+        ));
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(&some_data, &option_type, &presentation),
+            r#"Option<String>::Some("nested")"#
+        );
+
+        let mut none_data = vec![0; root_payload_len];
+        none_data[..8].copy_from_slice(&(1_u64 << 63).to_le_bytes());
+        none_data.extend_from_slice(&nested_child_slot(
+            VariableStatus::AccessError,
+            &[],
+            child_payload_len,
+        ));
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(&none_data, &option_type, &presentation),
+            "Option<String>::None"
         );
     }
 

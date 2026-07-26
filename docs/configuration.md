@@ -414,8 +414,9 @@ timeout_secs = 5
 max_size_bytes = 0
 
 [value_adapters]
-# Maximum nested adapter edges below the root value. This does not affect
-# ordinary inline DWARF structure formatting.
+# Maximum semantic child edges below the root value, including ordinary Rust
+# structs traversed to reach adapted fields. This does not affect native inline
+# DWARF formatting for fields without semantic captures.
 # Valid range: 1 to 16. Default: 4.
 max_nesting_depth = 4
 
@@ -552,9 +553,11 @@ enable_sysmon_for_target = true  # Default
 
 `[value_adapters]` controls recursive source-language semantic adapters:
 
-- `max_nesting_depth` counts adapter edges below the root adapter. It does not
-  count the root itself and is independent of the depth-32 limit for ordinary
-  inline DWARF structure formatting.
+- `max_nesting_depth` counts semantic child edges below the root value,
+  including ordinary Rust structs traversed to reach adapted fields and active
+  enum payload transitions. It does not count the root itself and is
+  independent of the depth-32 limit for native inline DWARF structure
+  formatting.
 - `max_sequence_elements` limits the semantic children statically emitted for
   each nested sequence node. It is a per-node width limit, not a recursion
   depth.
