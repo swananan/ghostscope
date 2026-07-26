@@ -571,7 +571,26 @@ impl DwarfAnalyzer {
             ancestors.push(type_id);
         }
 
-        let nested = match &plan.capture {
+        let language_nested = {
+            let mut resolve_nested = |child: &ResolvedType| {
+                self.try_nested_value_read_plan(
+                    child,
+                    type_module_path,
+                    depth + 1,
+                    max_nesting_depth,
+                    ancestors,
+                )
+            };
+            crate::language::build_nested_value_read_plan(
+                self,
+                current,
+                &plan.capture,
+                type_module_path,
+                &mut resolve_nested,
+            )
+        };
+
+        let mut build_generic_nested = || match &plan.capture {
             ValueCapturePlan::ProjectedValue { value } => self
                 .try_nested_value_read_plan(
                     &value.resolved_type,
@@ -583,30 +602,6 @@ impl DwarfAnalyzer {
                 .map(|value| ValueNestedPlan::ProjectedValue {
                     value: Box::new(value),
                 }),
-            ValueCapturePlan::InlineView {
-                output_type,
-                fields: _,
-            } if matches!(
-                strip_type_aliases(output_type),
-                TypeInfo::VariantType { .. }
-            ) =>
-            {
-                let mut resolve_nested = |child: &ResolvedType| {
-                    self.try_nested_value_read_plan(
-                        child,
-                        type_module_path,
-                        depth + 1,
-                        max_nesting_depth,
-                        ancestors,
-                    )
-                };
-                crate::language::build_variant_nested_plan(
-                    self,
-                    current,
-                    type_module_path,
-                    &mut resolve_nested,
-                )
-            }
             ValueCapturePlan::InlineView { fields, .. } => {
                 let nested_fields = fields
                     .iter()
@@ -671,6 +666,10 @@ impl DwarfAnalyzer {
             ValueCapturePlan::IndirectBytes { .. }
             | ValueCapturePlan::IndirectHashTable { .. }
             | ValueCapturePlan::IndirectBTree { .. } => None,
+        };
+        let nested = match language_nested {
+            crate::language::NestedValuePlanResolution::Handled(nested) => nested,
+            crate::language::NestedValuePlanResolution::NotApplicable => build_generic_nested(),
         };
 
         if current_id.is_some() {
