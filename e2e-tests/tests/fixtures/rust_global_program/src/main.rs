@@ -235,6 +235,28 @@ pub static mut G_OPTION_STRING_NONE: Option<String> = None;
 pub static mut G_RESULT_RECORD_OK: Result<AggregateRecord, String> = Err(String::new());
 pub static mut G_RESULT_RECORD_ERR: Result<AggregateRecord, String> = Err(String::new());
 
+pub enum ManyStringVariants {
+    V00(String),
+    V01(String),
+    V02(String),
+    V03(String),
+    V04(String),
+    V05(String),
+    V06(String),
+    V07(String),
+    V08(String),
+    V09(String),
+    V10(String),
+    V11(String),
+    V12(String),
+    V13(String),
+    V14(String),
+    V15(String),
+}
+
+pub static mut G_MANY_STRING_VARIANT: ManyStringVariants =
+    ManyStringVariants::V00(String::new());
+
 pub struct Pair(pub i32, pub i32);
 
 pub struct PhantomWrapper<T> {
@@ -665,6 +687,24 @@ fn touch_globals() -> i32 {
                 Ok(record) => record.title.len() as i64 + record.count as i64,
                 Err(error) => error.len() as i64,
             }
+            + match &G_MANY_STRING_VARIANT {
+                ManyStringVariants::V00(value)
+                | ManyStringVariants::V01(value)
+                | ManyStringVariants::V02(value)
+                | ManyStringVariants::V03(value)
+                | ManyStringVariants::V04(value)
+                | ManyStringVariants::V05(value)
+                | ManyStringVariants::V06(value)
+                | ManyStringVariants::V07(value)
+                | ManyStringVariants::V08(value)
+                | ManyStringVariants::V09(value)
+                | ManyStringVariants::V10(value)
+                | ManyStringVariants::V11(value)
+                | ManyStringVariants::V12(value)
+                | ManyStringVariants::V13(value)
+                | ManyStringVariants::V14(value)
+                | ManyStringVariants::V15(value) => value.len() as i64,
+            }
             + G_USER_NONZERO.0.0 as i64
             + G_USER_CELL.0.0 as i64
             + G_USER_REF_CELL.value.0 as i64
@@ -749,6 +789,8 @@ fn main() {
             count: 31,
         });
         G_RESULT_RECORD_ERR = Err(String::from("result error"));
+        G_MANY_STRING_VARIANT =
+            ManyStringVariants::V07(String::from("shared variant budget"));
     }
 
     let mut acc: i64 = 0;

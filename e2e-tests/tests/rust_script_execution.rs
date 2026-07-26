@@ -371,6 +371,16 @@ async fn test_rust_nested_value_plans_recurse_into_semantic_children() -> anyhow
         );
     }
 
+    let many_variants = nested_plan("G_MANY_STRING_VARIANT")?;
+    let Some(ghostscope_dwarf::ValueNestedPlan::Variant { fields }) = many_variants.nested.as_ref()
+    else {
+        anyhow::bail!("expected enum payload plans for G_MANY_STRING_VARIANT: {many_variants:#?}")
+    };
+    assert_eq!(fields.len(), 16);
+    assert!(fields.iter().all(|field| {
+        field.value.presentation == ghostscope_dwarf::ValuePresentation::Utf8String
+    }));
+
     let (_, config_read_plan) = analyzer
         .plan_global_access_read_plan(
             &binary_path,
@@ -1748,6 +1758,7 @@ trace do_stuff {
     print "RSTRUCT_REPR_C:{}", G_AGGREGATE_REPR_C;
     print "RENUM_OPTION:{}:{}", G_OPTION_STRING, G_OPTION_STRING_NONE;
     print "RENUM_RESULT:{}:{}", G_RESULT_RECORD_OK, G_RESULT_RECORD_ERR;
+    print "RENUM_MANY:{}", G_MANY_STRING_VARIANT;
 }
 trace observe_nested_owners {
     print "RNESTED_OWNER:{}:{}", rc, arc;
@@ -1843,6 +1854,12 @@ trace observe_nested_owners {
                 && line.contains(r#"::Err("result error")"#)
         }),
         "Expected Result<AggregateRecord, String> semantic output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RENUM_MANY:") && line.contains(r#"::V07("shared variant budget")"#)
+        }),
+        "Expected shared enum payload budget output: {stdout}"
     );
     assert!(
         stdout.lines().any(|line| {

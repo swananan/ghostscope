@@ -5258,6 +5258,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 }
             }
             NestedValueChildrenSource::Variant { fields } => {
+                // Branches can share slots. Initialize every distinct header
+                // before any active branch writes over the shared region.
+                let mut initialized_slots = Vec::new();
+                for field in fields {
+                    if initialized_slots.contains(&field.field.slot_offset) {
+                        continue;
+                    }
+                    self.initialize_nested_child_header(
+                        payload_ptr,
+                        field.field.slot_offset,
+                        VariableStatus::AccessError,
+                    )?;
+                    initialized_slots.push(field.field.slot_offset);
+                }
                 for (index, field) in fields.iter().enumerate() {
                     self.emit_nested_variant_field(payload_ptr, descriptor, field, index)?;
                 }
@@ -5409,11 +5423,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         variant_field: &NestedValueVariantFieldSource,
         field_index: usize,
     ) -> Result<()> {
-        self.initialize_nested_child_header(
-            parent_payload,
-            variant_field.field.slot_offset,
-            VariableStatus::AccessError,
-        )?;
         let active =
             self.emit_nested_variant_condition(descriptor, &variant_field.condition, field_index)?;
         let function = self.current_function("compile nested variant field")?;
