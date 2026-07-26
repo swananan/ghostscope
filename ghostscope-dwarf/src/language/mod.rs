@@ -15,6 +15,12 @@ pub(crate) enum ValueLayout {
 
 pub(crate) type ValueLayoutResolution = adapter::ValueLayoutResolution<ValueLayout>;
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NestedValuePlanResolution {
+    NotApplicable,
+    Handled(Option<crate::ValueNestedPlan>),
+}
+
 /// Select an adapter only after dispatching on the type's DWARF language.
 ///
 /// This boundary prevents C, C++, and unknown-language values from entering
@@ -73,13 +79,24 @@ pub(crate) fn build_aggregate_value_read_plan(
     }
 }
 
-pub(crate) fn build_variant_nested_plan(
+pub(crate) fn build_nested_value_read_plan(
     context: &dyn ValueAdapterContext,
     current: &crate::ResolvedType,
+    capture: &crate::ValueCapturePlan,
     type_module_path: Option<&Path>,
     resolve_nested: &mut dyn FnMut(&crate::ResolvedType) -> Option<crate::ValueReadPlan>,
-) -> Option<crate::ValueNestedPlan> {
-    match source_language(current) {
+) -> NestedValuePlanResolution {
+    let crate::ValueCapturePlan::InlineView { output_type, .. } = capture else {
+        return NestedValuePlanResolution::NotApplicable;
+    };
+    if !matches!(
+        crate::strip_type_aliases(output_type),
+        crate::TypeInfo::VariantType { .. }
+    ) {
+        return NestedValuePlanResolution::NotApplicable;
+    }
+
+    let plan = match source_language(current) {
         SourceLanguage::Rust => {
             rust::build_variant_nested_plan(context, current, type_module_path, resolve_nested)
         }
@@ -87,7 +104,8 @@ pub(crate) fn build_variant_nested_plan(
         | SourceLanguage::Cpp
         | SourceLanguage::Other(_)
         | SourceLanguage::Unknown => None,
-    }
+    };
+    NestedValuePlanResolution::Handled(plan)
 }
 
 pub(crate) fn annotate_type_info(language: SourceLanguage, type_info: &mut crate::TypeInfo) {
@@ -273,8 +291,78 @@ mod tests {
         let mut resolve_nested =
             |_child: &ResolvedType| panic!("non-Rust composition must not resolve nested values");
         assert_eq!(
-            build_variant_nested_plan(&context, &current, None, &mut resolve_nested),
-            None
+            build_nested_value_read_plan(
+                &context,
+                &current,
+                &crate::ValueCapturePlan::InlineView {
+                    output_type: current.summary.clone(),
+                    fields: Vec::new(),
+                },
+                None,
+                &mut resolve_nested,
+            ),
+            NestedValuePlanResolution::NotApplicable
+        );
+    }
+
+    #[test]
+    fn ordinary_rust_inline_views_bypass_language_nested_composition() {
+        let current = ResolvedType::new(
+            TypeInfo::StructType {
+                name: "Request".to_string(),
+                size: 0,
+                members: Vec::new(),
+            },
+            TypeIdentity::Unknown,
+            Some(origin(SourceLanguage::Rust)),
+        );
+        let context = PanicValueAdapterContext;
+        let mut resolve_nested =
+            |_child: &ResolvedType| panic!("ordinary inline views use generic recursion");
+
+        assert_eq!(
+            build_nested_value_read_plan(
+                &context,
+                &current,
+                &crate::ValueCapturePlan::InlineView {
+                    output_type: current.summary.clone(),
+                    fields: Vec::new(),
+                },
+                None,
+                &mut resolve_nested,
+            ),
+            NestedValuePlanResolution::NotApplicable
+        );
+    }
+
+    #[test]
+    fn non_rust_variants_are_handled_without_rust_composition() {
+        let current = ResolvedType::new(
+            TypeInfo::VariantType {
+                name: "Choice".to_string(),
+                size: 0,
+                members: Vec::new(),
+                variant_parts: Vec::new(),
+            },
+            TypeIdentity::Unknown,
+            Some(origin(SourceLanguage::C)),
+        );
+        let context = PanicValueAdapterContext;
+        let mut resolve_nested =
+            |_child: &ResolvedType| panic!("non-Rust variants must not resolve nested values");
+
+        assert_eq!(
+            build_nested_value_read_plan(
+                &context,
+                &current,
+                &crate::ValueCapturePlan::InlineView {
+                    output_type: current.summary.clone(),
+                    fields: Vec::new(),
+                },
+                None,
+                &mut resolve_nested,
+            ),
+            NestedValuePlanResolution::Handled(None)
         );
     }
 }

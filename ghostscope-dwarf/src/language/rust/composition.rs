@@ -226,3 +226,83 @@ fn nested_variant_condition(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        DiscriminantRange, DiscriminantValue, StructMember, VariantCase, VariantPart,
+        VariantPayloadPresentation,
+    };
+
+    fn member(name: &str) -> StructMember {
+        StructMember {
+            name: name.to_string(),
+            member_type: TypeInfo::UnknownType {
+                name: "discriminant".to_string(),
+            },
+            offset: 0,
+            bit_offset: None,
+            bit_size: None,
+        }
+    }
+
+    fn variant(selector: VariantSelector) -> VariantCase {
+        VariantCase {
+            selector,
+            members: Vec::new(),
+            variant_parts: Vec::new(),
+            payload_presentation: VariantPayloadPresentation::Dwarf,
+        }
+    }
+
+    #[test]
+    fn variant_conditions_preserve_explicit_and_default_selection() {
+        let discriminant = member("tag");
+        let ranges = vec![DiscriminantRange {
+            start: DiscriminantValue::Unsigned(1),
+            end: DiscriminantValue::Unsigned(2),
+        }];
+        let part = VariantPart {
+            discriminant: Some(discriminant.clone()),
+            variants: vec![
+                variant(VariantSelector::Ranges(ranges.clone())),
+                variant(VariantSelector::Default),
+            ],
+        };
+
+        assert_eq!(
+            nested_variant_condition(&part, 0),
+            Some(ValueNestedVariantCondition::Discriminant {
+                member: discriminant.clone(),
+                ranges: ranges.clone(),
+                inverted: false,
+            })
+        );
+        assert_eq!(
+            nested_variant_condition(&part, 1),
+            Some(ValueNestedVariantCondition::Discriminant {
+                member: discriminant,
+                ranges,
+                inverted: true,
+            })
+        );
+    }
+
+    #[test]
+    fn univariant_conditions_select_only_the_first_default() {
+        let part = VariantPart {
+            discriminant: None,
+            variants: vec![
+                variant(VariantSelector::Default),
+                variant(VariantSelector::Default),
+            ],
+        };
+
+        assert_eq!(
+            nested_variant_condition(&part, 0),
+            Some(ValueNestedVariantCondition::Always)
+        );
+        assert_eq!(nested_variant_condition(&part, 1), None);
+    }
+}
