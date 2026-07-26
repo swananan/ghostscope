@@ -1,4 +1,5 @@
 mod access;
+mod composition;
 mod plan;
 mod value;
 mod variant;
@@ -31,4 +32,21 @@ pub(super) fn build_value_read_plan(
     type_module_path: Option<&std::path::Path>,
 ) -> crate::Result<Option<crate::ValueReadPlan>> {
     plan::build_value_read_plan(context, current, layout, type_module_path)
+}
+
+pub(super) fn build_aggregate_value_read_plan(
+    context: &dyn crate::language::adapter::ValueAdapterContext,
+    current: &crate::ResolvedType,
+    type_module_path: Option<&std::path::Path>,
+) -> Option<crate::ValueReadPlan> {
+    composition::build_aggregate_value_read_plan(context, current, type_module_path)
+}
+
+pub(super) fn build_variant_nested_plan(
+    context: &dyn crate::language::adapter::ValueAdapterContext,
+    current: &crate::ResolvedType,
+    type_module_path: Option<&std::path::Path>,
+    resolve_nested: &mut dyn FnMut(&crate::ResolvedType) -> Option<crate::ValueReadPlan>,
+) -> Option<crate::ValueNestedPlan> {
+    composition::build_variant_nested_plan(context, current, type_module_path, resolve_nested)
 }
