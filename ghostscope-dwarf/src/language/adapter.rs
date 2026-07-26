@@ -228,6 +228,14 @@ pub(crate) trait ValueAdapterContext {
         index: usize,
     ) -> Result<Option<ResolvedType>>;
 
+    fn variant_member_resolved_type(
+        &self,
+        current: TypeId,
+        part_index: usize,
+        variant_index: usize,
+        member_index: usize,
+    ) -> Result<Option<ResolvedType>>;
+
     fn type_alignment(&self, type_id: TypeId) -> Result<Option<u64>>;
 
     fn tuple_member_layout(

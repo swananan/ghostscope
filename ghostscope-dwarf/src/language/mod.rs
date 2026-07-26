@@ -57,6 +57,39 @@ pub(crate) fn build_value_read_plan(
     }
 }
 
+pub(crate) fn build_aggregate_value_read_plan(
+    context: &dyn ValueAdapterContext,
+    current: &crate::ResolvedType,
+    type_module_path: Option<&Path>,
+) -> Option<crate::ValueReadPlan> {
+    match source_language(current) {
+        SourceLanguage::Rust => {
+            rust::build_aggregate_value_read_plan(context, current, type_module_path)
+        }
+        SourceLanguage::C
+        | SourceLanguage::Cpp
+        | SourceLanguage::Other(_)
+        | SourceLanguage::Unknown => None,
+    }
+}
+
+pub(crate) fn build_variant_nested_plan(
+    context: &dyn ValueAdapterContext,
+    current: &crate::ResolvedType,
+    type_module_path: Option<&Path>,
+    resolve_nested: &mut dyn FnMut(&crate::ResolvedType) -> Option<crate::ValueReadPlan>,
+) -> Option<crate::ValueNestedPlan> {
+    match source_language(current) {
+        SourceLanguage::Rust => {
+            rust::build_variant_nested_plan(context, current, type_module_path, resolve_nested)
+        }
+        SourceLanguage::C
+        | SourceLanguage::Cpp
+        | SourceLanguage::Other(_)
+        | SourceLanguage::Unknown => None,
+    }
+}
+
 pub(crate) fn annotate_type_info(language: SourceLanguage, type_info: &mut crate::TypeInfo) {
     if language == SourceLanguage::Rust {
         rust::annotate_type_info(type_info);
@@ -90,7 +123,82 @@ pub(crate) fn resolve_access_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CuId, ModuleId, ResolvedType, TypeIdentity, TypeInfo};
+    use crate::{
+        CuId, MemberLayout, ModuleId, ProjectedValueRead, ResolvedType, TypeId, TypeIdentity,
+        TypeInfo, TypeProjection,
+    };
+
+    struct PanicValueAdapterContext;
+
+    impl ValueAdapterContext for PanicValueAdapterContext {
+        fn project_type(
+            &self,
+            _current: &ResolvedType,
+            _segment: &VariableAccessSegment,
+            _type_module_path: Option<&Path>,
+        ) -> crate::Result<TypeProjection> {
+            panic!("non-Rust composition must not query DWARF")
+        }
+
+        fn project_member_path(
+            &self,
+            _current: &ResolvedType,
+            _path: &[String],
+            _type_module_path: Option<&Path>,
+        ) -> crate::Result<TypeProjection> {
+            panic!("non-Rust composition must not query DWARF")
+        }
+
+        fn project_value_path(
+            &self,
+            _current: &ResolvedType,
+            _path: &[ProjectedPathSegment],
+            _type_module_path: Option<&Path>,
+            _capture_address: bool,
+        ) -> crate::Result<Option<ProjectedValueRead>> {
+            panic!("non-Rust composition must not query DWARF")
+        }
+
+        fn template_type_parameter(
+            &self,
+            _type_id: TypeId,
+            _index: usize,
+        ) -> crate::Result<Option<ResolvedType>> {
+            panic!("non-Rust composition must not query DWARF")
+        }
+
+        fn variant_member_resolved_type(
+            &self,
+            _current: TypeId,
+            _part_index: usize,
+            _variant_index: usize,
+            _member_index: usize,
+        ) -> crate::Result<Option<ResolvedType>> {
+            panic!("non-Rust composition must not query DWARF")
+        }
+
+        fn type_alignment(&self, _type_id: TypeId) -> crate::Result<Option<u64>> {
+            panic!("non-Rust composition must not query DWARF")
+        }
+
+        fn tuple_member_layout(
+            &self,
+            _type_id: TypeId,
+            _aggregate_type: &TypeInfo,
+            _index: u32,
+        ) -> crate::Result<MemberLayout> {
+            panic!("non-Rust composition must not query DWARF")
+        }
+
+        fn resolve_aggregate_type_in_module(
+            &self,
+            _anchor: TypeId,
+            _lookup_names: &[&str],
+            _exact_qualified_name: Option<&str>,
+        ) -> crate::Result<Option<ResolvedType>> {
+            panic!("non-Rust composition must not query DWARF")
+        }
+    }
 
     fn origin(language: SourceLanguage) -> TypeOrigin {
         TypeOrigin {
@@ -143,5 +251,30 @@ mod tests {
             ValueLayoutResolution::NotApplicable
         );
         assert!(!requires_dwarf_qualified_name(&current));
+    }
+
+    #[test]
+    fn non_rust_aggregates_bypass_rust_composition() {
+        let current = ResolvedType::new(
+            TypeInfo::StructType {
+                name: "Request".to_string(),
+                size: 0,
+                members: Vec::new(),
+            },
+            TypeIdentity::Unknown,
+            Some(origin(SourceLanguage::C)),
+        );
+        let context = PanicValueAdapterContext;
+
+        assert_eq!(
+            build_aggregate_value_read_plan(&context, &current, None),
+            None
+        );
+        let mut resolve_nested =
+            |_child: &ResolvedType| panic!("non-Rust composition must not resolve nested values");
+        assert_eq!(
+            build_variant_nested_plan(&context, &current, None, &mut resolve_nested),
+            None
+        );
     }
 }
