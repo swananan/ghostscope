@@ -5257,6 +5257,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     self.emit_nested_projected_field(payload_ptr, descriptor, field, index)?;
                 }
             }
+            NestedValueChildrenSource::Variant { fields } => {
+                for (index, field) in fields.iter().enumerate() {
+                    self.emit_nested_variant_field(payload_ptr, descriptor, field, index)?;
+                }
+            }
             NestedValueChildrenSource::Sequence {
                 first_slot_offset,
                 slot_stride,
@@ -5395,6 +5400,200 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
         self.builder.position_at_end(finish_block);
         Ok(())
+    }
+
+    fn emit_nested_variant_field(
+        &mut self,
+        parent_payload: PointerValue<'ctx>,
+        descriptor: &RuntimeAddress<'ctx>,
+        variant_field: &NestedValueVariantFieldSource,
+        field_index: usize,
+    ) -> Result<()> {
+        self.initialize_nested_child_header(
+            parent_payload,
+            variant_field.field.slot_offset,
+            VariableStatus::AccessError,
+        )?;
+        let active =
+            self.emit_nested_variant_condition(descriptor, &variant_field.condition, field_index)?;
+        let function = self.current_function("compile nested variant field")?;
+        let active_block = self
+            .context
+            .append_basic_block(function, &format!("nested_variant_{field_index}_active"));
+        let finish_block = self
+            .context
+            .append_basic_block(function, &format!("nested_variant_{field_index}_finish"));
+        self.builder
+            .build_conditional_branch(active, active_block, finish_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+
+        self.builder.position_at_end(active_block);
+        self.emit_nested_projected_field(
+            parent_payload,
+            descriptor,
+            &variant_field.field,
+            field_index,
+        )?;
+        if self
+            .builder
+            .get_insert_block()
+            .is_some_and(|block| block.get_terminator().is_none())
+        {
+            self.builder
+                .build_unconditional_branch(finish_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        }
+        self.builder.position_at_end(finish_block);
+        Ok(())
+    }
+
+    fn emit_nested_variant_condition(
+        &mut self,
+        descriptor: &RuntimeAddress<'ctx>,
+        condition: &NestedValueVariantConditionSource,
+        field_index: usize,
+    ) -> Result<IntValue<'ctx>> {
+        let NestedValueVariantConditionSource::Discriminant {
+            offset,
+            access_size,
+            signed,
+            ranges,
+            inverted,
+        } = condition
+        else {
+            return Ok(self.context.bool_type().const_int(1, false));
+        };
+
+        let address = if *offset == 0 {
+            *descriptor
+        } else {
+            let value = self
+                .builder
+                .build_int_add(
+                    descriptor.value,
+                    self.context.i64_type().const_int(*offset, false),
+                    &format!("nested_variant_{field_index}_discriminant_address"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            descriptor.with_value(value)
+        };
+        let (value, failed) = self.generate_memory_read_with_fail_flag(
+            address,
+            *access_size,
+            &format!("nested_variant_{field_index}_discriminant"),
+        )?;
+        let mut value = value.into_int_value();
+        if *signed && access_size.bytes() < std::mem::size_of::<u64>() {
+            let shift = u64::try_from(
+                (std::mem::size_of::<u64>() - access_size.bytes())
+                    .checked_mul(8)
+                    .expect("discriminant width is bounded by u64"),
+            )
+            .expect("discriminant shift fits u64");
+            let shift = self.context.i64_type().const_int(shift, false);
+            value = self
+                .builder
+                .build_left_shift(
+                    value,
+                    shift,
+                    &format!("nested_variant_{field_index}_sign_shift_left"),
+                )
+                .and_then(|value| {
+                    self.builder.build_right_shift(
+                        value,
+                        shift,
+                        true,
+                        &format!("nested_variant_{field_index}_sign_extend"),
+                    )
+                })
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        }
+
+        let mut matched = self.context.bool_type().const_zero();
+        for (range_index, range) in ranges.iter().enumerate() {
+            let (start, end, lower_predicate, upper_predicate) = match (range.start, range.end) {
+                (
+                    ghostscope_dwarf::DiscriminantValue::Signed(start),
+                    ghostscope_dwarf::DiscriminantValue::Signed(end),
+                ) if *signed => (
+                    start as u64,
+                    end as u64,
+                    inkwell::IntPredicate::SGE,
+                    inkwell::IntPredicate::SLE,
+                ),
+                (
+                    ghostscope_dwarf::DiscriminantValue::Unsigned(start),
+                    ghostscope_dwarf::DiscriminantValue::Unsigned(end),
+                ) if !*signed => (
+                    start,
+                    end,
+                    inkwell::IntPredicate::UGE,
+                    inkwell::IntPredicate::ULE,
+                ),
+                _ => {
+                    return Err(CodeGenError::DwarfError(
+                        "nested variant discriminant range has inconsistent signedness".to_string(),
+                    ));
+                }
+            };
+            let lower = self
+                .builder
+                .build_int_compare(
+                    lower_predicate,
+                    value,
+                    self.context.i64_type().const_int(start, false),
+                    &format!("nested_variant_{field_index}_{range_index}_lower"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let upper = self
+                .builder
+                .build_int_compare(
+                    upper_predicate,
+                    value,
+                    self.context.i64_type().const_int(end, false),
+                    &format!("nested_variant_{field_index}_{range_index}_upper"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let in_range = self
+                .builder
+                .build_and(
+                    lower,
+                    upper,
+                    &format!("nested_variant_{field_index}_{range_index}_in_range"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            matched = self
+                .builder
+                .build_or(
+                    matched,
+                    in_range,
+                    &format!("nested_variant_{field_index}_{range_index}_matched"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        }
+        if *inverted {
+            matched = self
+                .builder
+                .build_not(
+                    matched,
+                    &format!("nested_variant_{field_index}_default_branch"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        }
+        let read_ok = self
+            .builder
+            .build_not(
+                failed,
+                &format!("nested_variant_{field_index}_discriminant_read_ok"),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.builder
+            .build_and(
+                matched,
+                read_ok,
+                &format!("nested_variant_{field_index}_active"),
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))
     }
 
     #[allow(clippy::too_many_arguments)]

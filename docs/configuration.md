@@ -554,9 +554,10 @@ enable_sysmon_for_target = true  # Default
 `[value_adapters]` controls recursive source-language semantic adapters:
 
 - `max_nesting_depth` counts semantic child edges below the root value,
-  including ordinary Rust structs traversed to reach adapted fields. It does
-  not count the root itself and is independent of the depth-32 limit for native
-  inline DWARF structure formatting.
+  including ordinary Rust structs traversed to reach adapted fields and active
+  enum payload transitions. It does not count the root itself and is
+  independent of the depth-32 limit for native inline DWARF structure
+  formatting.
 - `max_sequence_elements` limits the semantic children statically emitted for
   each nested sequence node. It is a per-node width limit, not a recursion
   depth.

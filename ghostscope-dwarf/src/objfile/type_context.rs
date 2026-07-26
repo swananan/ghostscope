@@ -230,6 +230,70 @@ fn projected_member_type_loc(
     Ok(None)
 }
 
+fn variant_member_type_loc(
+    dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+    type_name_index: &crate::index::TypeNameIndex,
+    loc: TypeLoc,
+    part_index: usize,
+    variant_index: usize,
+    member_index: usize,
+) -> Result<Option<TypeLoc>> {
+    let Some(aggregate_loc) = normalize_type_loc(dwarf, type_name_index, loc)? else {
+        return Ok(None);
+    };
+    let header = dwarf.unit_header(aggregate_loc.cu_off)?;
+    let unit = dwarf.unit(header)?;
+    let entry = unit.entry(aggregate_loc.die_off)?;
+    if !matches!(
+        entry.tag(),
+        gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type | gimli::DW_TAG_union_type
+    ) {
+        return Ok(None);
+    }
+
+    let mut tree = unit.entries_tree(Some(entry.offset()))?;
+    let root = tree.root()?;
+    let mut parts = root.children();
+    let mut current_part = 0usize;
+    while let Some(part) = parts.next()? {
+        if part.entry().tag() != gimli::DW_TAG_variant_part {
+            continue;
+        }
+        if current_part != part_index {
+            current_part += 1;
+            continue;
+        }
+
+        let mut variants = part.children();
+        let mut current_variant = 0usize;
+        while let Some(variant) = variants.next()? {
+            if variant.entry().tag() != gimli::DW_TAG_variant {
+                continue;
+            }
+            if current_variant != variant_index {
+                current_variant += 1;
+                continue;
+            }
+
+            let mut members = variant.children();
+            let mut current_member = 0usize;
+            while let Some(member) = members.next()? {
+                if member.entry().tag() != gimli::DW_TAG_member {
+                    continue;
+                }
+                if current_member == member_index {
+                    return resolve_type_ref_with_origins(dwarf, member.entry(), &unit);
+                }
+                current_member += 1;
+            }
+            return Ok(None);
+        }
+        return Ok(None);
+    }
+
+    Ok(None)
+}
+
 fn projected_element_type_loc(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
     type_name_index: &crate::index::TypeNameIndex,
@@ -384,6 +448,28 @@ impl LoadedObjfile {
             .expect("type name index lock poisoned");
         projected_type_loc(self.dwarf(), &type_name_index, type_loc(current)?, segment)
             .map(|loc| loc.map(|loc| type_id_from_loc(current.module, loc)))
+    }
+
+    pub(crate) fn variant_member_type_id(
+        &self,
+        current: TypeId,
+        part_index: usize,
+        variant_index: usize,
+        member_index: usize,
+    ) -> Result<Option<TypeId>> {
+        let type_name_index = self
+            .type_name_index
+            .read()
+            .expect("type name index lock poisoned");
+        variant_member_type_loc(
+            self.dwarf(),
+            &type_name_index,
+            type_loc(current)?,
+            part_index,
+            variant_index,
+            member_index,
+        )
+        .map(|loc| loc.map(|loc| type_id_from_loc(current.module, loc)))
     }
 
     pub(crate) fn type_summary(&self, current: TypeId) -> Result<Option<crate::TypeInfo>> {

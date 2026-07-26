@@ -180,6 +180,27 @@ async fn test_rust_nested_value_plans_recurse_into_semantic_children() -> anyhow
             .ok_or_else(|| anyhow::anyhow!("expected {name} semantic value plan"))
     };
 
+    fn contains_utf8_string(plan: &ghostscope_dwarf::ValueReadPlan) -> bool {
+        if plan.presentation == ghostscope_dwarf::ValuePresentation::Utf8String {
+            return true;
+        }
+        match plan.nested.as_ref() {
+            Some(ghostscope_dwarf::ValueNestedPlan::ProjectedValue { value }) => {
+                contains_utf8_string(value)
+            }
+            Some(ghostscope_dwarf::ValueNestedPlan::ProjectedView { fields }) => fields
+                .iter()
+                .any(|field| contains_utf8_string(&field.value)),
+            Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) => {
+                contains_utf8_string(element)
+            }
+            Some(ghostscope_dwarf::ValueNestedPlan::Variant { fields }) => fields
+                .iter()
+                .any(|field| contains_utf8_string(&field.value)),
+            None => false,
+        }
+    }
+
     let cell = nested_plan("G_CELL_STRING")?;
     let Some(ghostscope_dwarf::ValueNestedPlan::ProjectedValue { value }) = cell.nested else {
         anyhow::bail!("expected Cell<String> projected child plan")
@@ -309,6 +330,46 @@ async fn test_rust_nested_value_plans_recurse_into_semantic_children() -> anyhow
     assert!(fields.iter().any(|field| {
         field.value.presentation == ghostscope_dwarf::ValuePresentation::Utf8String
     }));
+
+    for name in [
+        "G_AGGREGATE_OUTER",
+        "G_AGGREGATE_TUPLE",
+        "G_AGGREGATE_ENVELOPE",
+        "G_AGGREGATE_REPR_C",
+    ] {
+        let plan = nested_plan(name)?;
+        assert_eq!(
+            plan.presentation,
+            ghostscope_dwarf::ValuePresentation::Dwarf,
+            "{name} must preserve its DWARF root presentation"
+        );
+        assert!(
+            contains_utf8_string(&plan),
+            "{name} must recurse into its String field: {plan:#?}"
+        );
+    }
+
+    for name in [
+        "G_OPTION_STRING",
+        "G_OPTION_STRING_NONE",
+        "G_RESULT_RECORD_OK",
+        "G_RESULT_RECORD_ERR",
+    ] {
+        let plan = nested_plan(name)?;
+        assert_eq!(
+            plan.presentation,
+            ghostscope_dwarf::ValuePresentation::Dwarf,
+            "{name} must preserve its DWARF root presentation"
+        );
+        let Some(ghostscope_dwarf::ValueNestedPlan::Variant { fields }) = plan.nested.as_ref()
+        else {
+            anyhow::bail!("expected enum payload child plans for {name}: {plan:#?}")
+        };
+        assert!(
+            !fields.is_empty() && contains_utf8_string(&plan),
+            "{name} must recurse into its active payload String: {plan:#?}"
+        );
+    }
 
     let (_, config_read_plan) = analyzer
         .plan_global_access_read_plan(
@@ -1681,6 +1742,12 @@ trace do_stuff {
     print "RNESTED_C:{}", G_VEC_C_STRING;
     print "RSTRUCT:{}", G_AGGREGATE_RECORD;
     print "RSTRUCT_VEC:{}", G_VEC_AGGREGATE_RECORDS;
+    print "RSTRUCT_OUTER:{}", G_AGGREGATE_OUTER;
+    print "RSTRUCT_TUPLE:{}", G_AGGREGATE_TUPLE;
+    print "RSTRUCT_GENERIC:{}", G_AGGREGATE_ENVELOPE;
+    print "RSTRUCT_REPR_C:{}", G_AGGREGATE_REPR_C;
+    print "RENUM_OPTION:{}:{}", G_OPTION_STRING, G_OPTION_STRING_NONE;
+    print "RENUM_RESULT:{}:{}", G_RESULT_RECORD_OK, G_RESULT_RECORD_ERR;
 }
 trace observe_nested_owners {
     print "RNESTED_OWNER:{}:{}", rc, arc;
@@ -1725,6 +1792,57 @@ trace observe_nested_owners {
                 && line.contains("count: 13")
         }),
         "Expected Vec<ordinary Rust struct> output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RSTRUCT_OUTER:")
+                && line.contains(r#"title: "nested record""#)
+                && line.contains("count: 17")
+                && line.contains("active: true")
+        }),
+        "Expected nested ordinary Rust struct output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RSTRUCT_TUPLE:")
+                && line.contains(r#""tuple aggregate""#)
+                && line.contains("19")
+        }),
+        "Expected tuple struct semantic output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RSTRUCT_GENERIC:")
+                && line.contains(r#"value: "generic aggregate""#)
+                && line.contains("id: 23")
+        }),
+        "Expected generic struct semantic output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RSTRUCT_REPR_C:")
+                && line.contains(r#"title: "repr aggregate""#)
+                && line.contains("code: 29")
+        }),
+        "Expected repr(C) struct semantic output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RENUM_OPTION:")
+                && line.contains(r#"::Some("optional value")"#)
+                && line.contains("::None")
+        }),
+        "Expected Option<String> semantic output: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains("RENUM_RESULT:")
+                && line.contains("::Ok(")
+                && line.contains(r#"title: "result record""#)
+                && line.contains("count: 31")
+                && line.contains(r#"::Err("result error")"#)
+        }),
+        "Expected Result<AggregateRecord, String> semantic output: {stdout}"
     );
     assert!(
         stdout.lines().any(|line| {

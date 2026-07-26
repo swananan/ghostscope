@@ -157,8 +157,9 @@ The currently supported value families are:
 - borrow guards: `Ref<T>` and `RefMut<T>`;
 - reference counting: `Rc<T>` and `Arc<T>`;
 - collections: `HashMap`, `HashSet`, `BTreeMap`, and `BTreeSet`;
-- enums: fieldless, unit, tuple, and struct variants, including DWARF default
-  branches used by niche-optimized types such as `Option<NonZero*>`; and
+- enums: fieldless, unit, tuple, and struct variants, including recursive
+  semantic payloads and DWARF default branches used by niche-optimized types
+  such as `Option<String>` and `Option<NonZero*>`; and
 - tuple and tuple-struct projections such as `value.0`.
 
 `Rc<str>` and `Arc<str>` are displayed as their target address plus public
@@ -177,9 +178,11 @@ For payload enums, GhostScope reads `DW_TAG_variant_part`, follows its
 `DW_AT_discr` member, and handles exact values, discriminant ranges, and default
 branches before recursively formatting the active inline payload. Fieldless
 enums use `DW_TAG_enumeration_type` and `DW_AT_enum_class`. The DSL does not yet
-provide Rust pattern matching or direct active-variant payload projection, and
-semantic adapters nested inside an enum payload still use native DWARF
-formatting.
+provide Rust pattern matching or direct active-variant payload projection.
+When an active payload contains a recognized semantic value, GhostScope
+captures it recursively; inactive payload branches are not read. This supports
+values such as `Option<String>` and `Result<Request, String>` while preserving
+the enum's native tuple or struct-variant formatting.
 
 Semantic values use the existing format placeholders:
 
@@ -232,7 +235,7 @@ Cell<(i32, u16)>          Cell projects and formats the inline tuple value
 ```
 
 Semantic adapters also compose recursively through ordinary Rust structs,
-projected wrappers, and bounded sequences:
+active enum payloads, projected wrappers, and bounded sequences:
 
 ```text
 Request { name: String }  Request keeps DWARF layout; name captures string bytes
@@ -242,6 +245,8 @@ Cell<String>              Cell wrapper plus captured String bytes
 Vec<String>               each captured element uses the String adapter
 Vec<CString>              each captured element omits its trailing NUL
 Vec<Vec<i32>>             each captured element uses the Vec adapter
+Option<String>            only Some captures its String payload
+Result<Request, String>   only the active Ok or Err payload is captured
 ```
 
 For an ordinary Rust struct, GhostScope derives every member offset and field
@@ -254,8 +259,9 @@ existing behavior.
 Recursive semantic capture follows at most
 `value_adapters.max_nesting_depth` semantic child edges below the root value and
 detects repeated DWARF type identities on the active path. Traversing an
-ordinary Rust struct to reach an adapted field counts as one edge. Each semantic
-sequence reserves child captures for at most
+ordinary Rust struct to reach an adapted field counts as one edge. Transitioning
+into an active enum payload also counts as one edge. Each semantic sequence
+reserves child captures for at most
 `value_adapters.max_sequence_elements` elements. Both limits default to `4`;
 the former controls recursion depth while the latter controls the width of
 each sequence node. The root and every child share the argument's

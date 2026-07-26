@@ -2,7 +2,7 @@
 //! represented by their physical DWARF aggregate alone.
 
 use super::{ProducerInfo, RustcVersion, SourceLanguage, TypeProjection};
-use ghostscope_protocol::ValuePresentation;
+use ghostscope_protocol::{DiscriminantRange, StructMember, ValuePresentation};
 
 /// Default number of semantic child edges followed below a root value.
 pub const DEFAULT_VALUE_ADAPTER_NESTING_DEPTH: usize = 4;
@@ -69,6 +69,11 @@ pub enum ValueNestedPlan {
     ProjectedView { fields: Vec<ValueNestedFieldPlan> },
     /// Every captured sequence element uses the same semantic adapter.
     Sequence { element: Box<ValueReadPlan> },
+    /// Selected payload fields in active DWARF variant branches have semantic
+    /// adapters.
+    Variant {
+        fields: Vec<ValueNestedVariantFieldPlan>,
+    },
 }
 
 /// One projected-view field with a recursively selected semantic adapter.
@@ -76,6 +81,29 @@ pub enum ValueNestedPlan {
 pub struct ValueNestedFieldPlan {
     pub field_index: usize,
     pub value: Box<ValueReadPlan>,
+}
+
+/// One enum payload field with a recursively selected semantic adapter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueNestedVariantFieldPlan {
+    pub part_index: usize,
+    pub variant_index: usize,
+    pub member_index: usize,
+    pub payload_field_index: usize,
+    pub steps: Vec<ProjectedValueStep>,
+    pub condition: ValueNestedVariantCondition,
+    pub value: Box<ValueReadPlan>,
+}
+
+/// Runtime condition selecting the active DWARF variant branch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValueNestedVariantCondition {
+    Always,
+    Discriminant {
+        member: StructMember,
+        ranges: Vec<DiscriminantRange>,
+        inverted: bool,
+    },
 }
 
 /// Stage at which a recognized source-language value adapter was rejected.

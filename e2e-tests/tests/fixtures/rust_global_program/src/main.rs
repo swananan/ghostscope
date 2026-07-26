@@ -192,6 +192,49 @@ pub static mut G_AGGREGATE_RECORD: AggregateRecord = AggregateRecord {
 };
 pub static mut G_VEC_AGGREGATE_RECORDS: Vec<AggregateRecord> = Vec::new();
 
+pub struct AggregateOuter {
+    pub inner: AggregateRecord,
+    pub active: bool,
+}
+
+pub static mut G_AGGREGATE_OUTER: AggregateOuter = AggregateOuter {
+    inner: AggregateRecord {
+        title: String::new(),
+        count: 0,
+    },
+    active: false,
+};
+
+pub struct AggregateTuple(pub String, pub i16);
+
+pub static mut G_AGGREGATE_TUPLE: AggregateTuple = AggregateTuple(String::new(), 0);
+
+pub struct AggregateEnvelope<T> {
+    pub value: T,
+    pub id: u32,
+}
+
+pub static mut G_AGGREGATE_ENVELOPE: AggregateEnvelope<String> = AggregateEnvelope {
+    value: String::new(),
+    id: 0,
+};
+
+#[repr(C)]
+pub struct AggregateReprC {
+    pub title: String,
+    pub code: u16,
+}
+
+pub static mut G_AGGREGATE_REPR_C: AggregateReprC = AggregateReprC {
+    title: String::new(),
+    code: 0,
+};
+
+pub static mut G_OPTION_STRING: Option<String> = None;
+pub static mut G_OPTION_STRING_NONE: Option<String> = None;
+pub static mut G_RESULT_RECORD_OK: Result<AggregateRecord, String> = Err(String::new());
+pub static mut G_RESULT_RECORD_ERR: Result<AggregateRecord, String> = Err(String::new());
+
 pub struct Pair(pub i32, pub i32);
 
 pub struct PhantomWrapper<T> {
@@ -604,6 +647,24 @@ fn touch_globals() -> i32 {
             + G_AGGREGATE_RECORD.title.len() as i64
             + G_AGGREGATE_RECORD.count as i64
             + G_VEC_AGGREGATE_RECORDS.len() as i64
+            + G_AGGREGATE_OUTER.inner.title.len() as i64
+            + G_AGGREGATE_OUTER.inner.count as i64
+            + G_AGGREGATE_TUPLE.0.len() as i64
+            + G_AGGREGATE_ENVELOPE.value.len() as i64
+            + G_AGGREGATE_REPR_C.title.len() as i64
+            + G_OPTION_STRING.as_ref().map(String::len).unwrap_or(0) as i64
+            + G_OPTION_STRING_NONE
+                .as_ref()
+                .map(String::len)
+                .unwrap_or(0) as i64
+            + match &G_RESULT_RECORD_OK {
+                Ok(record) => record.title.len() as i64 + record.count as i64,
+                Err(error) => error.len() as i64,
+            }
+            + match &G_RESULT_RECORD_ERR {
+                Ok(record) => record.title.len() as i64 + record.count as i64,
+                Err(error) => error.len() as i64,
+            }
             + G_USER_NONZERO.0.0 as i64
             + G_USER_CELL.0.0 as i64
             + G_USER_REF_CELL.value.0 as i64
@@ -665,6 +726,29 @@ fn main() {
                 count: 13,
             },
         ];
+        G_AGGREGATE_OUTER = AggregateOuter {
+            inner: AggregateRecord {
+                title: String::from("nested record"),
+                count: 17,
+            },
+            active: true,
+        };
+        G_AGGREGATE_TUPLE = AggregateTuple(String::from("tuple aggregate"), 19);
+        G_AGGREGATE_ENVELOPE = AggregateEnvelope {
+            value: String::from("generic aggregate"),
+            id: 23,
+        };
+        G_AGGREGATE_REPR_C = AggregateReprC {
+            title: String::from("repr aggregate"),
+            code: 29,
+        };
+        G_OPTION_STRING = Some(String::from("optional value"));
+        G_OPTION_STRING_NONE = None;
+        G_RESULT_RECORD_OK = Ok(AggregateRecord {
+            title: String::from("result record"),
+            count: 31,
+        });
+        G_RESULT_RECORD_ERR = Err(String::from("result error"));
     }
 
     let mut acc: i64 = 0;

@@ -147,8 +147,9 @@ GhostScope 自身使用 Rust 1.88 构建，但这不会限制被追踪目标使�
 - 借用守卫：`Ref<T>` 和 `RefMut<T>`；
 - 引用计数：`Rc<T>` 和 `Arc<T>`；
 - 集合：`HashMap`、`HashSet`、`BTreeMap` 和 `BTreeSet`；
-- 枚举：无字段、unit、tuple 和 struct variant，包括 `Option<NonZero*>`
-  等 niche 优化类型在 DWARF 中使用的默认分支；
+- 枚举：无字段、unit、tuple 和 struct variant，包括递归语义 payload，
+  以及 `Option<String>`、`Option<NonZero*>` 等 niche 优化类型在 DWARF
+  中使用的默认分支；
 - tuple 和 tuple struct 投影，例如 `value.0`。
 
 `Rc<str>` 和 `Arc<str>` 会显示目标地址以及对外可见的 strong/weak 计数。
@@ -164,8 +165,10 @@ payload 的 enum，GhostScope 解析 `DW_TAG_variant_part`，跟随其
 `DW_AT_discr` 成员，并处理精确判别值、判别值范围和默认分支，随后递归
 格式化当前激活的内联 payload。无字段 enum 使用
 `DW_TAG_enumeration_type` 和 `DW_AT_enum_class`。DSL 目前还不提供 Rust
-模式匹配或直接投影当前 variant payload 的语法；enum payload 内嵌套的
-语义适配器仍按原生 DWARF 格式展示。
+模式匹配或直接投影当前 variant payload 的语法。当激活 payload 包含可识别
+的语义值时，GhostScope 会递归采集它；未激活的 payload 分支不会被读取。
+因此 `Option<String>` 和 `Result<Request, String>` 可以保留原有 tuple 或
+struct variant 格式，同时展示 payload 的语义值。
 
 语义值沿用现有格式占位符：
 
@@ -214,7 +217,8 @@ Rc<Pair>                  Rc 投影 Pair 和计数，Pair 内联格式化
 Cell<(i32, u16)>          Cell 投影并格式化内联 tuple 值
 ```
 
-语义适配器也会穿过普通 Rust struct、投影包装器和有界序列递归组合：
+语义适配器也会穿过普通 Rust struct、激活的 enum payload、投影包装器和
+有界序列递归组合：
 
 ```text
 Request { name: String }  Request 保留 DWARF 布局，name 采集字符串字节
@@ -224,6 +228,8 @@ Cell<String>              显示 Cell 包装并采集 String 字节
 Vec<String>               每个已采集元素使用 String 适配器
 Vec<CString>              每个已采集元素都会排除结尾 NUL
 Vec<Vec<i32>>             每个已采集元素使用 Vec 适配器
+Option<String>            只有 Some 会采集其 String payload
+Result<Request, String>   只采集当前激活的 Ok 或 Err payload
 ```
 
 对于普通 Rust struct，GhostScope 从目标 DWARF 推导所有成员偏移和字段类型
@@ -234,7 +240,7 @@ struct 中没有可识别的语义后代，它仍使用原有的原生 DWARF 路
 递归语义采集从根值向下最多跟随
 `value_adapters.max_nesting_depth` 条语义子值边，并检测当前路径中重复的
 DWARF 类型标识。为了到达已适配字段而穿过一个普通 Rust struct 也算一条边。
-每个语义序列最多为
+从 enum 进入其 payload 同样算一条边。每个语义序列最多为
 `value_adapters.max_sequence_elements` 个元素预留子采集槽。两项默认值均为
 `4`；前者控制递归深度，后者控制每个序列节点的宽度。根值和所有子值共享
 该参数的 `mem_dump_cap`；降低这个上限可能减少采集的元素数，或回退到仍然

@@ -137,8 +137,9 @@ timeout_secs = 5
 max_size_bytes = 0
 
 [value_adapters]
-# 从根值向下最多跟随多少条嵌套的源语言适配器边。此限制与普通内联 DWARF
-# 结构格式化的递归深度相互独立。
+# 从根值向下最多跟随多少条嵌套的源语言适配器边，包括普通 Rust struct
+# 字段和激活的 enum payload。此限制与普通内联 DWARF 结构格式化的递归深度
+# 相互独立。
 # 有效范围：1 到 16。
 # 默认值：4
 max_nesting_depth = 4
