@@ -24,6 +24,7 @@ enum ExpectedAdapter {
     RefCell,
     RefGuard,
     NonZero,
+    Aggregate,
     NativeDwarf,
 }
 
@@ -34,6 +35,9 @@ const ALL_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
     ("path_buf", ExpectedAdapter::OsBytes),
     ("text", ExpectedAdapter::Utf8Bytes),
     ("boxed_text", ExpectedAdapter::Utf8Bytes),
+    ("boxed_i32", ExpectedAdapter::NativeDwarf),
+    ("boxed_string", ExpectedAdapter::NativeDwarf),
+    ("boxed_record", ExpectedAdapter::NativeDwarf),
     ("slice", ExpectedAdapter::Sequence),
     ("vector", ExpectedAdapter::Sequence),
     ("deque", ExpectedAdapter::RingSequence),
@@ -59,6 +63,9 @@ const RUST_135_ADAPTERS: &[(&str, ExpectedAdapter)] = &[
     // applies that provider's semantics to Rust 1.35's concrete fat-pointer
     // DIE rather than implying it was in the bundled 1.35 script.
     ("boxed_text", ExpectedAdapter::Utf8Bytes),
+    ("boxed_i32", ExpectedAdapter::NativeDwarf),
+    ("boxed_string", ExpectedAdapter::NativeDwarf),
+    ("boxed_record", ExpectedAdapter::NativeDwarf),
     ("slice", ExpectedAdapter::Sequence),
     ("vector", ExpectedAdapter::Sequence),
     ("deque", ExpectedAdapter::RingSequence),
@@ -205,6 +212,11 @@ fn adapter_matches(plan: Option<&ValueReadPlan>, expected: ExpectedAdapter) -> b
             ValuePresentation::Dwarf,
             ValueCapturePlan::ProjectedValue { .. },
             ExpectedAdapter::NonZero,
+        )
+        | (
+            ValuePresentation::Dwarf,
+            ValueCapturePlan::InlineView { .. },
+            ExpectedAdapter::Aggregate,
         ) => true,
         (
             ValuePresentation::BTree { entry, .. },
@@ -420,6 +432,53 @@ async fn assert_parameter_adapter(
         adapter_matches(plan.as_ref(), expected),
         "{toolchain}: unexpected adapter for {function}::{parameter}: {plan:#?}\n\
          resolved type: {parameter_type:#?}"
+    );
+    Ok(plan)
+}
+
+async fn assert_dereferenced_parameter_adapter(
+    analyzer: &DwarfAnalyzer,
+    binary: &Path,
+    function: &str,
+    parameter: &str,
+    expected: ExpectedAdapter,
+    toolchain: &str,
+) -> anyhow::Result<Option<ValueReadPlan>> {
+    let context = analyzer
+        .lookup_function_addresses(function)
+        .into_iter()
+        .find_map(|address| analyzer.resolve_pc(&address).ok())
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing function {function}"))?;
+    let parameter_plan = analyzer
+        .plan_variable_by_name(&context, parameter)?
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing {function}::{parameter}"))?;
+    let parameter_type = analyzer
+        .resolved_type_for_plan(&parameter_plan)?
+        .ok_or_else(|| anyhow::anyhow!("{toolchain}: missing type for {function}::{parameter}"))?;
+    anyhow::ensure!(
+        matches!(
+            ghostscope_dwarf::strip_type_aliases(&parameter_type.summary),
+            TypeInfo::PointerType { .. }
+        ),
+        "{toolchain}: sized Box parameter {function}::{parameter} was not \
+         emitted as a pointer: {parameter_type:#?}"
+    );
+    let projected = analyzer.project_resolved_type(
+        &parameter_type,
+        &ghostscope_dwarf::VariableAccessSegment::Dereference,
+        Some(binary),
+    )?;
+    anyhow::ensure!(
+        projected.layout == ghostscope_dwarf::TypeProjectionLayout::Dereference,
+        "{toolchain}: unexpected projection for {function}::{parameter}: \
+         {projected:#?}"
+    );
+    let plan = analyzer.value_read_plan(&projected.resolved_type, Some(binary))?;
+    anyhow::ensure!(
+        adapter_matches(plan.as_ref(), expected),
+        "{toolchain}: unexpected dereferenced adapter for \
+         {function}::{parameter}: {plan:#?}\nresolved type: {:#?}",
+        projected.resolved_type
     );
     Ok(plan)
 }
@@ -1083,6 +1142,21 @@ async fn rust_value_adapters_follow_pinned_toolchain_dwarf() -> anyhow::Result<(
                     }
                 ));
             }
+        }
+        for (parameter, expected) in [
+            ("boxed_i32", ExpectedAdapter::NativeDwarf),
+            ("boxed_string", ExpectedAdapter::Utf8Bytes),
+            ("boxed_record", ExpectedAdapter::Aggregate),
+        ] {
+            assert_dereferenced_parameter_adapter(
+                &analyzer,
+                &binary,
+                "observe_values",
+                parameter,
+                expected,
+                &toolchain,
+            )
+            .await?;
         }
         let c_str_expected = if matches!(toolchain.as_str(), "1.35.0" | "1.49.0") {
             ExpectedAdapter::NativeDwarf

@@ -166,6 +166,22 @@ The currently supported value families are:
 strong and weak counts. GhostScope does not read the dynamically sized string
 contents through these owners.
 
+rustc emits a sized `Box<T>` as an ordinary pointer to `T` in DWARF, without
+retaining the `Box` identity. GhostScope cannot safely distinguish that pointer
+from a reference or raw pointer, so printing the root keeps the native pointer
+presentation. Dereference it explicitly to inspect the owned value and apply
+the pointee's semantic presentation:
+
+```ghostscope
+trace handle_request {
+    print "text={} request={}", *boxed_text, *boxed_request;
+}
+```
+
+This supports scalar, string, struct, and other recognized pointee types.
+Unsized `Box<str>` and supported `Box<CStr>` layouts retain explicit wrapper
+metadata and can be printed directly.
+
 Rust C strings are rendered without their trailing NUL. Non-UTF-8 content uses
 the same `\xNN` escaping as platform byte strings. `CString` is validated
 across every release in the compatibility matrix; `&CStr` and `Box<CStr>` use
@@ -242,6 +258,8 @@ Request { name: String }  Request keeps DWARF layout; name captures string bytes
 Vec<Request>              each Request element adapts its recognized fields
 Rc<Vec<i32>>              Rc summary plus captured Vec elements
 Cell<String>              Cell wrapper plus captured String bytes
+*Box<String>              explicit dereference captures String bytes
+*Box<Request>             explicit dereference adapts Request fields
 Vec<String>               each captured element uses the String adapter
 Vec<CString>              each captured element omits its trailing NUL
 Vec<Vec<i32>>             each captured element uses the Vec adapter
@@ -384,7 +402,10 @@ print obj.field.items[i + 1];
 ```
 
 Tips:
-- Auto‑dereference is supported for locals/params/globals. You don’t need to write `*ptr` or `->`; when safe, pointers are read and dereferenced automatically.
+- Auto-dereference is supported for member access on locals, parameters, and
+  globals. You do not need to write `*ptr` or `->`; when safe, pointers are
+  read and dereferenced automatically. Printing a pointer itself still uses
+  pointer presentation, so use `*ptr` to print its pointee.
 - Array access: supported for one-dimensional arrays such as `arr[index]`, chain-tail `a.b.c[index]`, and array elements followed by member access such as `arr[index].field` or `a.b[index].c`, where `index` can be an integer literal or an integer expression such as `i + 1`. Address-of forms like `&arr[i]` and `&a.b.c[i]` can be printed as pointers, used as memory-format inputs (`{:x.N}`/`{:s.N}`), or passed to `memcmp`. Not supported: multi-dimensional arrays.
 
 #### Explicit Casts

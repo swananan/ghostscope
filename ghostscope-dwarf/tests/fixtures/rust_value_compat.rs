@@ -51,6 +51,11 @@ pub enum CompatUnsigned {
     High = 0x8000_0000_0000_0000,
 }
 
+pub struct CompatBoxRecord {
+    pub name: String,
+    pub count: u16,
+}
+
 #[inline(never)]
 pub fn observe_values(
     string: String,
@@ -62,6 +67,9 @@ pub fn observe_values(
     path_buf: PathBuf,
     text: &str,
     boxed_text: Box<str>,
+    boxed_i32: Box<i32>,
+    boxed_string: Box<String>,
+    boxed_record: Box<CompatBoxRecord>,
     slice: &[i32],
     vector: Vec<i32>,
     deque: VecDeque<i32>,
@@ -112,6 +120,10 @@ pub fn observe_values(
         + path_buf.as_os_str().len()
         + text.len()
         + boxed_text.len()
+        + *boxed_i32 as usize
+        + boxed_string.len()
+        + boxed_record.name.len()
+        + boxed_record.count as usize
         + slice.len()
         + vector.len()
         + deque.len()
@@ -214,6 +226,12 @@ fn main() {
     let slice = [29, 31];
     let path = PathBuf::from("borrowed/path");
     let c_str_owner = CString::new("borrowed-c-string").unwrap();
+    let boxed_i32 = Box::new(101);
+    let boxed_string = Box::new(String::from("boxed-string"));
+    let boxed_record = Box::new(CompatBoxRecord {
+        name: String::from("boxed-record"),
+        count: 103,
+    });
     let value = observe_values(
         String::from("string"),
         CString::new("owned-c-string").unwrap(),
@@ -226,6 +244,9 @@ fn main() {
         PathBuf::from("owned/path"),
         "text",
         String::from("boxed-text").into_boxed_str(),
+        boxed_i32,
+        boxed_string,
+        boxed_record,
         &slice,
         vec![3],
         deque,

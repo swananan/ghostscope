@@ -61,6 +61,12 @@ pub(super) fn diagnose_value_layout(
     // while the target only requests the generic loader through
     // `.debug_gdb_scripts`. GhostScope records the producer for diagnostics,
     // but every adapter below validates identity and physical target DWARF.
+    //
+    // Sized Box<T> is intentionally absent here. rustc emits it as the same
+    // DW_TAG_pointer_type used by references and raw pointers, with no Box
+    // identity left to validate. Only unsized Box<str> and Box<CStr> retain a
+    // recognizable aggregate. A sized Box can still be inspected safely by
+    // explicitly dereferencing it in the script.
     let TypeInfo::StructType { name, .. } = strip_type_aliases(&current.summary) else {
         return ValueLayoutResolution::NotApplicable;
     };
