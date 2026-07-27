@@ -4,7 +4,7 @@ use crate::{
     binary::{
         dwarf_endian_from_object, dwarf_reader_from_arc_with_endian,
         empty_dwarf_reader_with_endian, load_explicit_debug_file, try_load_debug_file, DwarfData,
-        MappedFile,
+        DwarfReader, MappedFile,
     },
     core::{mapping::ModuleMapping, DebugInfoSource, Result},
     index::{BlockIndex, GdbIndex, TypeNameIndex},
@@ -765,7 +765,60 @@ impl LoadedObjfile {
             }
         };
 
-        let dwarf = gimli::Dwarf::load(load_section)?;
+        Self::load_dwarf(load_section)
+    }
+
+    fn load_dwarf(
+        load_section: impl FnMut(gimli::SectionId) -> Result<DwarfReader>,
+    ) -> Result<DwarfData> {
+        let mut dwarf = gimli::Dwarf::load(load_section)?;
+        dwarf.populate_abbreviations_cache(gimli::AbbreviationsCacheStrategy::All);
         Ok(dwarf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binary::dwarf_reader_from_arc;
+    use gimli::write::{Dwarf as WriteDwarf, EndianVec, LineProgram, Sections, Unit};
+    use gimli::{Format, LittleEndian};
+
+    #[test]
+    fn loaded_dwarf_reuses_cached_abbreviations() {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 5,
+            address_size: 8,
+        };
+        let mut fixture = WriteDwarf::new();
+        fixture.units.add(Unit::new(encoding, LineProgram::none()));
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        fixture
+            .write(&mut sections)
+            .expect("DWARF fixture should serialize");
+
+        let dwarf = LoadedObjfile::load_dwarf(|id| {
+            let data = sections
+                .get(id)
+                .map(|section| section.slice().to_vec())
+                .unwrap_or_default();
+            Ok(dwarf_reader_from_arc(Arc::<[u8]>::from(data)))
+        })
+        .expect("DWARF fixture should load");
+        let unit = dwarf
+            .units()
+            .next()
+            .expect("fixture should contain a compilation unit")
+            .expect("compilation unit header should parse");
+
+        let first = dwarf
+            .abbreviations(&unit)
+            .expect("abbreviations should parse");
+        let second = dwarf
+            .abbreviations(&unit)
+            .expect("cached abbreviations should load");
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }
