@@ -1,21 +1,46 @@
 //! Pure address→line mapping lookup (no parsing, no file operations)
 
 use crate::{core::LineEntry, path_match};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    ops::Bound,
+};
 
 /// Pure line mapping table for fast address→line lookup
 #[derive(Debug)]
 pub struct LineMappingTable {
-    /// Complete address to line mapping (built at startup).
+    /// Compacted line rows sorted by address as a dense lookup base.
     ///
     /// Multiple DWARF line rows can legitimately point at the same PC, for
     /// example inline/header locations sharing one instruction. Keep every row
     /// so source-location selection can score all candidates instead of being
     /// decided by insertion order.
-    address_to_line_map: BTreeMap<u64, Vec<LineEntry>>,
+    ///
+    /// Keeping the rows in one allocation avoids cloning them into a pointer-
+    /// heavy tree and makes address-range scans contiguous.
+    entries: Vec<LineEntry>,
 
-    /// Path-based reverse mapping: (file_path, line_number) → addresses
-    /// Uses full paths as keys for accurate lookup
+    /// Address of every equal-address group in `entries`.
+    ///
+    /// This is the hot address-search data: binary search touches only a dense
+    /// vector of addresses before accessing the selected rows.
+    address_group_addresses: Vec<u64>,
+
+    /// Start index of each group in `entries`, parallel to
+    /// `address_group_addresses`.
+    address_group_starts: Vec<usize>,
+
+    /// Rows added after the compact base was built.
+    ///
+    /// Lazy line loading can append one compilation unit at a time. Keeping
+    /// those rows in an incremental index avoids moving and re-indexing every
+    /// previously loaded row on each append.
+    incremental_entries: BTreeMap<u64, Vec<LineEntry>>,
+
+    /// Number of rows in `incremental_entries`.
+    incremental_entry_count: usize,
+
+    /// Path-based reverse mapping: (file_path, line_number) → addresses.
     path_line_to_addresses: HashMap<(String, u64), Vec<u64>>,
 
     /// Basename to full paths mapping for flexible path matching
@@ -32,7 +57,6 @@ impl LineMappingTable {
         mut entries: Vec<LineEntry>,
         scoped: &crate::index::ScopedFileIndexManager,
     ) -> Self {
-        let mut address_to_line_map: BTreeMap<u64, Vec<LineEntry>> = BTreeMap::new();
         let mut path_line_to_addresses: HashMap<(String, u64), Vec<u64>> = HashMap::new();
         let mut basename_to_paths: HashMap<String, HashSet<String>> = HashMap::new();
 
@@ -46,17 +70,10 @@ impl LineMappingTable {
                 }
             }
 
-            // Always populate the address→line map
-            address_to_line_map
-                .entry(e.address)
-                .or_default()
-                .push(e.clone());
-
             // Populate path→(line→addresses) only when we have a resolved path
             if !e.file_path.is_empty() {
-                let key = (e.file_path.clone(), e.line);
                 path_line_to_addresses
-                    .entry(key)
+                    .entry((e.file_path.clone(), e.line))
                     .or_default()
                     .push(e.address);
 
@@ -72,20 +89,184 @@ impl LineMappingTable {
             }
         }
 
+        // Stable sorting preserves insertion order for duplicate-address rows,
+        // including the "last row is representative" behavior.
+        entries.sort_by_key(|entry| entry.address);
+        let (address_group_addresses, address_group_starts) = Self::build_address_groups(&entries);
+
         Self {
-            address_to_line_map,
+            entries,
+            address_group_addresses,
+            address_group_starts,
+            incremental_entries: BTreeMap::new(),
+            incremental_entry_count: 0,
             path_line_to_addresses,
             basename_to_paths,
         }
     }
 
+    fn build_address_groups(entries: &[LineEntry]) -> (Vec<u64>, Vec<usize>) {
+        let mut addresses = Vec::new();
+        let mut starts = Vec::new();
+        let mut previous_address = None;
+        for (index, entry) in entries.iter().enumerate() {
+            if previous_address != Some(entry.address) {
+                addresses.push(entry.address);
+                starts.push(index);
+                previous_address = Some(entry.address);
+            }
+        }
+        (addresses, starts)
+    }
+
+    fn group_entries(&self, group_index: usize) -> &[LineEntry] {
+        let start = self.address_group_starts[group_index];
+        let end = self
+            .address_group_starts
+            .get(group_index + 1)
+            .copied()
+            .unwrap_or(self.entries.len());
+        &self.entries[start..end]
+    }
+
+    fn exact_address_group(&self, address: u64) -> Option<usize> {
+        self.address_group_addresses.binary_search(&address).ok()
+    }
+
+    fn entries_at_address(&self, address: u64) -> impl Iterator<Item = &LineEntry> {
+        let compact_entries = self
+            .exact_address_group(address)
+            .map(|group_index| self.group_entries(group_index))
+            .unwrap_or_default();
+        compact_entries
+            .iter()
+            .chain(self.incremental_entries.get(&address).into_iter().flatten())
+    }
+
+    fn representative_entries_from(
+        &self,
+        address: u64,
+        inclusive: bool,
+    ) -> impl Iterator<Item = (u64, &LineEntry)> {
+        let mut compact_group = self.address_group_addresses.partition_point(|&candidate| {
+            if inclusive {
+                candidate < address
+            } else {
+                candidate <= address
+            }
+        });
+        let lower_bound = if inclusive {
+            Bound::Included(address)
+        } else {
+            Bound::Excluded(address)
+        };
+        let mut incremental = self
+            .incremental_entries
+            .range((lower_bound, Bound::Unbounded))
+            .peekable();
+
+        std::iter::from_fn(move || loop {
+            let compact_address = self.address_group_addresses.get(compact_group).copied();
+            let incremental_address = incremental.peek().map(|(address, _)| **address);
+
+            match (compact_address, incremental_address) {
+                (Some(compact_address), Some(incremental_address))
+                    if compact_address < incremental_address =>
+                {
+                    let entries = self.group_entries(compact_group);
+                    compact_group += 1;
+                    if let Some(entry) = Self::representative_entry(entries) {
+                        return Some((compact_address, entry));
+                    }
+                }
+                (Some(compact_address), Some(incremental_address))
+                    if compact_address == incremental_address =>
+                {
+                    compact_group += 1;
+                    let (_, entries) = incremental.next().expect("peeked incremental line group");
+                    if let Some(entry) = Self::representative_entry(entries) {
+                        return Some((incremental_address, entry));
+                    }
+                }
+                (_, Some(incremental_address)) => {
+                    let (_, entries) = incremental.next().expect("peeked incremental line group");
+                    if let Some(entry) = Self::representative_entry(entries) {
+                        return Some((incremental_address, entry));
+                    }
+                }
+                (Some(compact_address), None) => {
+                    let entries = self.group_entries(compact_group);
+                    compact_group += 1;
+                    if let Some(entry) = Self::representative_entry(entries) {
+                        return Some((compact_address, entry));
+                    }
+                }
+                (None, None) => return None,
+            }
+        })
+    }
+
+    fn compact_incremental_entries(&mut self) {
+        if self.incremental_entries.is_empty() {
+            return;
+        }
+
+        let compact_entries = std::mem::take(&mut self.entries);
+        let capacity = compact_entries.len() + self.incremental_entry_count;
+        let mut compact_entries = compact_entries.into_iter().peekable();
+        let mut incremental_entries = std::mem::take(&mut self.incremental_entries)
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .peekable();
+        let mut merged = Vec::with_capacity(capacity);
+
+        while let (Some(compact), Some(incremental)) =
+            (compact_entries.peek(), incremental_entries.peek())
+        {
+            // Rows already present precede later lazy additions at duplicate
+            // addresses, preserving the representative-row ordering.
+            if compact.address <= incremental.address {
+                merged.push(compact_entries.next().expect("peeked compact line entry"));
+            } else {
+                merged.push(
+                    incremental_entries
+                        .next()
+                        .expect("peeked incremental line entry"),
+                );
+            }
+        }
+        merged.extend(compact_entries);
+        merged.extend(incremental_entries);
+        self.entries = merged;
+        (self.address_group_addresses, self.address_group_starts) =
+            Self::build_address_groups(&self.entries);
+        self.incremental_entry_count = 0;
+    }
+
     pub(crate) fn extend(&mut self, other: Self) {
-        for (address, mut entries) in other.address_to_line_map {
-            self.address_to_line_map
+        if self.entries.is_empty()
+            && self.incremental_entries.is_empty()
+            && self.path_line_to_addresses.is_empty()
+            && self.basename_to_paths.is_empty()
+        {
+            *self = other;
+            return;
+        }
+
+        self.incremental_entry_count += other.entries.len() + other.incremental_entry_count;
+        for entry in other.entries {
+            self.incremental_entries
+                .entry(entry.address)
+                .or_default()
+                .push(entry);
+        }
+        for (address, mut entries) in other.incremental_entries {
+            self.incremental_entries
                 .entry(address)
                 .or_default()
                 .append(&mut entries);
         }
+
         for (key, mut addresses) in other.path_line_to_addresses {
             let current = self.path_line_to_addresses.entry(key).or_default();
             current.append(&mut addresses);
@@ -98,6 +279,13 @@ impl LineMappingTable {
                 .or_default()
                 .extend(paths);
         }
+
+        // Compact geometrically instead of rebuilding on every lazy CU. This
+        // bounds the incremental tail below the compact base size, while each
+        // row participates in only logarithmically many full merges.
+        if self.incremental_entry_count >= self.entries.len().max(1) {
+            self.compact_incremental_entries();
+        }
     }
 
     fn representative_entry(entries: &[LineEntry]) -> Option<&LineEntry> {
@@ -106,14 +294,37 @@ impl LineMappingTable {
 
     /// Find best matching line (closest address <= target address)
     pub(crate) fn lookup_line(&self, address: u64) -> Option<&LineEntry> {
-        // Use BTreeMap's range to find the largest address <= target address
-        let result = self
-            .address_to_line_map
-            .range(..=address)
-            .next_back()
-            .and_then(|(_, entries)| {
-                Self::representative_entry(entries).filter(|entry| entry.contains_address(address))
-            });
+        let compact_candidate = self
+            .address_group_addresses
+            .partition_point(|&candidate| candidate <= address)
+            .checked_sub(1);
+        let compact_candidate = compact_candidate.and_then(|group_index| {
+            Self::representative_entry(self.group_entries(group_index))
+                .map(|entry| (entry.address, entry))
+        });
+        let incremental_candidate = if self.incremental_entries.is_empty() {
+            None
+        } else {
+            self.incremental_entries
+                .range(..=address)
+                .next_back()
+                .and_then(|(&candidate_address, entries)| {
+                    Self::representative_entry(entries).map(|entry| (candidate_address, entry))
+                })
+        };
+        let result = match (compact_candidate, incremental_candidate) {
+            (Some((compact_address, compact)), Some((incremental_address, incremental))) => {
+                if compact_address > incremental_address {
+                    Some(compact)
+                } else {
+                    Some(incremental)
+                }
+            }
+            (Some((_, compact)), None) => Some(compact),
+            (None, Some((_, incremental))) => Some(incremental),
+            (None, None) => None,
+        }
+        .filter(|entry| entry.contains_address(address));
 
         if let Some(entry) = result {
             tracing::debug!(
@@ -132,24 +343,16 @@ impl LineMappingTable {
 
     /// Find all line entries at exact address (for handling overlapping instructions)
     pub(crate) fn lookup_all_lines_at_address(&self, address: u64) -> Vec<&LineEntry> {
-        if let Some(entries) = self.address_to_line_map.get(&address) {
-            let active_entries: Vec<_> = entries
-                .iter()
-                .filter(|entry| entry.contains_address(address))
-                .collect();
-            tracing::debug!(
-                "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> {} active entries",
-                address,
-                active_entries.len()
-            );
-            active_entries
-        } else {
-            tracing::debug!(
-                "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> 0 entries",
-                address
-            );
-            Vec::new()
-        }
+        let active_entries: Vec<_> = self
+            .entries_at_address(address)
+            .filter(|entry| entry.contains_address(address))
+            .collect();
+        tracing::debug!(
+            "LineMapping::lookup_all_lines_at_address: address=0x{:x} -> {} active entries",
+            address,
+            active_entries.len()
+        );
+        active_entries
     }
 
     /// Lookup addresses by file path and line number
@@ -166,7 +369,7 @@ impl LineMappingTable {
             .get(&(file_path.to_string(), line_number))
         {
             tracing::debug!("Found addresses via exact path match: {}", file_path);
-            return self.filter_consecutive_addresses(addresses.clone(), file_path, line_number);
+            return self.filter_consecutive_addresses(addresses, file_path, line_number);
         }
 
         // Strategy 2: Basename candidates + suffix check (avoid global scans)
@@ -188,7 +391,7 @@ impl LineMappingTable {
                                 full_path
                             );
                             return self.filter_consecutive_addresses(
-                                addresses.clone(),
+                                addresses,
                                 full_path,
                                 line_number,
                             );
@@ -214,11 +417,7 @@ impl LineMappingTable {
                         full_path,
                         addresses.len()
                     );
-                    return self.filter_consecutive_addresses(
-                        addresses.clone(),
-                        full_path,
-                        line_number,
-                    );
+                    return self.filter_consecutive_addresses(addresses, full_path, line_number);
                 }
             } else {
                 // Multiple files with same basename - try to match with partial path (best effort)
@@ -236,7 +435,7 @@ impl LineMappingTable {
                                 full_path
                             );
                             return self.filter_consecutive_addresses(
-                                addresses.clone(),
+                                addresses,
                                 full_path,
                                 line_number,
                             );
@@ -254,16 +453,16 @@ impl LineMappingTable {
     /// This helps avoid setting multiple breakpoints on the same logical line
     fn filter_consecutive_addresses(
         &self,
-        addresses: Vec<u64>,
+        addresses: &[u64],
         file_path: &str,
         line_number: u64,
     ) -> Vec<u64> {
         if addresses.is_empty() {
-            return addresses;
+            return Vec::new();
         }
 
         // Sort addresses
-        let mut sorted_addrs = addresses.clone();
+        let mut sorted_addrs = addresses.to_vec();
         sorted_addrs.sort_unstable();
         sorted_addrs.dedup();
 
@@ -295,8 +494,9 @@ impl LineMappingTable {
             if group.len() == 1 {
                 // Single address - check if it's is_stmt
                 let addr = group[0];
-                if let Some(entries) = self.address_to_line_map.get(&addr) {
-                    if entries.iter().any(|entry| {
+                let mut entries = self.entries_at_address(addr).peekable();
+                if entries.peek().is_some() {
+                    if entries.any(|entry| {
                         entry.is_stmt && entry.file_path == file_path && entry.line == line_number
                     }) {
                         result.push(addr);
@@ -317,15 +517,11 @@ impl LineMappingTable {
                 // Multiple consecutive addresses - find the first is_stmt address
                 let mut selected = None;
                 for &addr in &group {
-                    if let Some(entries) = self.address_to_line_map.get(&addr) {
-                        if entries.iter().any(|entry| {
-                            entry.is_stmt
-                                && entry.file_path == file_path
-                                && entry.line == line_number
-                        }) {
-                            selected = Some(addr);
-                            break;
-                        }
+                    if self.entries_at_address(addr).any(|entry| {
+                        entry.is_stmt && entry.file_path == file_path && entry.line == line_number
+                    }) {
+                        selected = Some(addr);
+                        break;
                     }
                 }
 
@@ -397,13 +593,8 @@ impl LineMappingTable {
             function_start
         );
 
-        let mut best_address: Option<u64> = None;
-
         // Iterate through addresses starting from function_start
-        for (&address, entries) in self.address_to_line_map.range(function_start..) {
-            let Some(entry) = Self::representative_entry(entries) else {
-                continue;
-            };
+        for (address, entry) in self.representative_entries_from(function_start, true) {
             if entry.prologue_end {
                 tracing::debug!(
                     "LineMappingTable: found prologue_end=true at 0x{:x} (line {}, file {})",
@@ -411,34 +602,20 @@ impl LineMappingTable {
                     entry.line,
                     entry.file_path
                 );
-
-                match best_address {
-                    None => best_address = Some(address),
-                    Some(current_best) => {
-                        if address < current_best {
-                            best_address = Some(address);
-                        }
-                        break; // Since we're iterating in order, this is the best we'll find
-                    }
-                }
-                break; // Take the first prologue_end we find
+                tracing::debug!(
+                    "LineMappingTable: found prologue_end at 0x{:x} (offset +{})",
+                    address,
+                    address - function_start
+                );
+                return Some(address);
             }
         }
 
-        if let Some(addr) = best_address {
-            tracing::debug!(
-                "LineMappingTable: found prologue_end at 0x{:x} (offset +{})",
-                addr,
-                addr - function_start
-            );
-        } else {
-            tracing::debug!(
-                "LineMappingTable: no prologue_end found after 0x{:x}",
-                function_start
-            );
-        }
-
-        best_address
+        tracing::debug!(
+            "LineMappingTable: no prologue_end found after 0x{:x}",
+            function_start
+        );
+        None
     }
 
     /// This is used for prologue detection following GDB's approach
@@ -450,11 +627,8 @@ impl LineMappingTable {
         );
 
         // Look for the first is_stmt=true address after function_start
-        for (&address, entries) in self
-            .address_to_line_map
-            .range((function_start.saturating_add(1))..)
-        {
-            if let Some(entry) = Self::representative_entry(entries).filter(|entry| entry.is_stmt) {
+        for (address, entry) in self.representative_entries_from(function_start, false) {
+            if entry.is_stmt {
                 tracing::debug!(
                     "LineMappingTable: found is_stmt=true at 0x{:x} (line {}, file {})",
                     address,
@@ -462,7 +636,7 @@ impl LineMappingTable {
                     entry.file_path
                 );
                 return Some(address);
-            } else if let Some(entry) = Self::representative_entry(entries) {
+            } else {
                 // Extra diagnostics to understand why we didn't pick nearer addresses
                 tracing::debug!(
                     "LineMappingTable: skipping non-is_stmt at 0x{:x} (offset +{}, line {}, file {}, prologue_end={})",
@@ -489,9 +663,33 @@ impl LineMappingTable {
         start_addr: u64,
         end_addr: u64,
     ) -> impl Iterator<Item = (&u64, &LineEntry)> {
-        self.address_to_line_map
+        let start = self
+            .entries
+            .partition_point(|entry| entry.address < start_addr);
+        let end = self
+            .entries
+            .partition_point(|entry| entry.address <= end_addr);
+        let mut compact = self.entries[start..end].iter().peekable();
+        let mut incremental = self
+            .incremental_entries
             .range(start_addr..=end_addr)
-            .flat_map(|(address, entries)| entries.iter().map(move |entry| (address, entry)))
+            .flat_map(|(_, entries)| entries)
+            .peekable();
+
+        std::iter::from_fn(move || {
+            let take_compact = match (compact.peek(), incremental.peek()) {
+                (Some(compact), Some(incremental)) => compact.address <= incremental.address,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => return None,
+            };
+            let entry = if take_compact {
+                compact.next().expect("peeked compact line entry")
+            } else {
+                incremental.next().expect("peeked incremental line entry")
+            };
+            Some((&entry.address, entry))
+        })
     }
 }
 
@@ -631,5 +829,108 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].line, 11);
+    }
+
+    #[test]
+    fn address_lookups_sort_unsorted_input_and_scan_ranges_in_order() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let table = LineMappingTable::from_entries_with_scoped_manager(
+            vec![
+                line_entry(0x3000, "/src/main.c", 30, true),
+                line_entry(0x1000, "/src/main.c", 10, true),
+                line_entry(0x2000, "/src/main.c", 20, true),
+            ],
+            &scoped,
+        );
+
+        assert_eq!(table.lookup_line(0x2000).map(|entry| entry.line), Some(20));
+        assert_eq!(
+            table
+                .get_entries_in_range(0x1000, 0x3000)
+                .map(|(address, _)| *address)
+                .collect::<Vec<_>>(),
+            vec![0x1000, 0x2000, 0x3000]
+        );
+    }
+
+    #[test]
+    fn extend_preserves_existing_then_appended_duplicate_row_order() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let mut table = LineMappingTable::from_entries_with_scoped_manager(
+            vec![line_entry(0x1000, "/src/first.c", 10, true)],
+            &scoped,
+        );
+        let other = LineMappingTable::from_entries_with_scoped_manager(
+            vec![line_entry(0x1000, "/src/second.c", 20, true)],
+            &scoped,
+        );
+
+        table.extend(other);
+        table.extend(LineMappingTable::from_entries_with_scoped_manager(
+            vec![line_entry(0x1000, "/src/third.c", 30, true)],
+            &scoped,
+        ));
+
+        let entries = table.lookup_all_lines_at_address(0x1000);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].file_path, "/src/first.c");
+        assert_eq!(entries[1].file_path, "/src/second.c");
+        assert_eq!(entries[2].file_path, "/src/third.c");
+        assert_eq!(table.lookup_line(0x1000).map(|entry| entry.line), Some(30));
+    }
+
+    #[test]
+    fn repeated_extend_compacts_geometrically_and_keeps_ranges_sorted() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let mut table = LineMappingTable::from_entries_with_scoped_manager(Vec::new(), &scoped);
+
+        for index in 0..64 {
+            let address = 0x1000 + index * 0x40;
+            table.extend(LineMappingTable::from_entries_with_scoped_manager(
+                vec![line_entry(
+                    address,
+                    &format!("/src/cu_{index}.c"),
+                    index,
+                    true,
+                )],
+                &scoped,
+            ));
+
+            let total = index as usize + 1;
+            let expected_compact = 1usize << total.ilog2();
+            assert_eq!(table.entries.len(), expected_compact);
+            assert_eq!(table.incremental_entry_count, total - expected_compact);
+            assert!(table.incremental_entry_count < table.entries.len());
+        }
+
+        let addresses = table
+            .get_entries_in_range(0x1000, 0x2000)
+            .map(|(address, _)| *address)
+            .collect::<Vec<_>>();
+        assert!(addresses.windows(2).all(|window| window[0] <= window[1]));
+        assert_eq!(addresses.len(), 64);
+        assert_eq!(table.lookup_line(0x1fc0).map(|entry| entry.line), Some(63));
+    }
+
+    #[test]
+    fn prologue_search_merges_compact_and_incremental_addresses() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let mut compact_prologue = line_entry(0x3000, "/src/base.c", 30, true);
+        compact_prologue.prologue_end = true;
+        let mut table = LineMappingTable::from_entries_with_scoped_manager(
+            vec![
+                line_entry(0x1000, "/src/base.c", 10, true),
+                compact_prologue,
+            ],
+            &scoped,
+        );
+        let mut incremental_prologue = line_entry(0x2000, "/src/lazy.c", 20, true);
+        incremental_prologue.prologue_end = true;
+        table.extend(LineMappingTable::from_entries_with_scoped_manager(
+            vec![incremental_prologue],
+            &scoped,
+        ));
+
+        assert_eq!(table.find_first_executable_address(0x1000), 0x2000);
     }
 }
