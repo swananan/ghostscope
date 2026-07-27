@@ -155,6 +155,21 @@ GhostScope 自身使用 Rust 1.88 构建，但这不会限制被追踪目标使�
 `Rc<str>` 和 `Arc<str>` 会显示目标地址以及对外可见的 strong/weak 计数。
 GhostScope 不会通过这些所有者读取动态大小字符串的内容。
 
+rustc 会把 sized `Box<T>` 作为普通的 `T` 指针写入 DWARF，不保留 `Box`
+类型标识。GhostScope 无法安全地区分该指针与引用或裸指针，因此直接打印根值
+时会保留原生指针展示。显式解引用后，可以检查被所有权指针指向的值，并应用
+pointee 的语义展示：
+
+```ghostscope
+trace handle_request {
+    print "text={} request={}", *boxed_text, *boxed_request;
+}
+```
+
+标量、字符串、struct 以及其他已识别的 pointee 类型都支持这种写法。
+unsized `Box<str>` 和布局验证通过的 `Box<CStr>` 会保留明确的包装元数据，
+因此可以直接打印。
+
 Rust C 字符串展示时不包含结尾 NUL；非 UTF-8 内容与平台原生字节串一样使用
 `\xNN` 转义。兼容性矩阵中的所有版本都会验证 `CString`；`&CStr` 和
 `Box<CStr>` 从 Rust 1.81 起使用语义展示，因为这些版本的目标 DWARF
@@ -225,6 +240,8 @@ Request { name: String }  Request 保留 DWARF 布局，name 采集字符串字�
 Vec<Request>              每个 Request 元素都会适配其中已识别的字段
 Rc<Vec<i32>>              显示 Rc 摘要并采集内部 Vec 元素
 Cell<String>              显示 Cell 包装并采集 String 字节
+*Box<String>              显式解引用后采集 String 字节
+*Box<Request>             显式解引用后适配 Request 字段
 Vec<String>               每个已采集元素使用 String 适配器
 Vec<CString>              每个已采集元素都会排除结尾 NUL
 Vec<Vec<i32>>             每个已采集元素使用 Vec 适配器
@@ -362,7 +379,9 @@ print obj.field.items[i + 1];
 ```
 
 提示：
-- 目前“局部变量、参数、全局变量”均已支持自动解引用（无需显式 `*ptr`，也不需要 `->`，统一使用 `.`，在安全范围内会自动加载并解引用指针值，类似于 Rust 的自动解引用）。
+- 局部变量、参数和全局变量在成员访问时支持自动解引用，无需显式
+  `*ptr`，也不需要 `->`，统一使用 `.`。直接打印指针本身时仍按指针展示；
+  若要打印 pointee，需要显式使用 `*ptr`。
 - 数组访问：已支持一维数组，如顶层 `arr[index]`、“链尾”`a.b.c[index]`，以及数组元素后继续取成员的 `arr[index].field` 或 `a.b[index].c`，其中 `index` 可以是整数字面量，也可以是 `i + 1` 这类整数表达式。`&arr[i]`、`&a.b.c[i]` 这类取地址形式可以按指针打印，也可以用于内存格式化（`{:x.N}`/`{:s.N}`）或作为 `memcmp` 参数。暂不支持：多维数组。
 
 #### 显式类型转换

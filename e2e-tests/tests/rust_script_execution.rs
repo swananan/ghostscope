@@ -2796,6 +2796,39 @@ trace observe_boxed_str {
 }
 
 #[tokio::test]
+async fn test_rust_script_print_sized_box_values_through_dereference() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_box_values {
+    print "RBOXVALUE:{}:{}:{}", *number, *text, *record;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains(
+                "RBOXVALUE:-101:\"boxed string\":AggregateRecord { \
+                 title: \"boxed record\", count: 103 }",
+            )
+        }),
+        "Expected explicitly dereferenced Rust Box<T> output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_os_string_values() -> anyhow::Result<()> {
     init();
 

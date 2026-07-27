@@ -371,6 +371,24 @@ pub mod math {
     }
 
     #[inline(never)]
+    pub fn observe_box_values(
+        number: Box<i32>,
+        text: Box<String>,
+        record: Box<crate::AggregateRecord>,
+    ) -> usize {
+        std::hint::black_box((
+            *number,
+            text.as_str(),
+            record.title.as_str(),
+            record.count,
+        ));
+        number.unsigned_abs() as usize
+            + text.len()
+            + record.title.len()
+            + record.count.unsigned_abs() as usize
+    }
+
+    #[inline(never)]
     pub fn observe_os_string(
         value: std::ffi::OsString,
         invalid: std::ffi::OsString,
@@ -853,6 +871,14 @@ fn main() {
     for _ in 0..50000 {
         acc += math::do_stuff(3) as i64;
         acc += math::observe_boxed_str("boxed from rust".into(), "".into()) as i64;
+        acc += math::observe_box_values(
+            Box::new(-101),
+            Box::new(String::from("boxed string")),
+            Box::new(AggregateRecord {
+                title: String::from("boxed record"),
+                count: 103,
+            }),
+        ) as i64;
         acc += math::observe_os_string(
             OsString::from("os from rust"),
             OsString::from_vec(vec![b'o', b's', 0xff, b'x']),
