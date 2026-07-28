@@ -149,6 +149,15 @@ pub struct NestedValueFieldPresentation {
     pub child: NestedValueChildPresentation,
 }
 
+/// One hash-table entry field repeated in every statically reserved bucket
+/// sidecar. `slot_offset` is relative to that bucket's sidecar base.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NestedValueHashTableFieldPresentation {
+    pub field_index: u64,
+    pub slot_offset: u64,
+    pub value: Box<NestedValuePresentation>,
+}
+
 /// One DWARF variant payload field whose raw bytes have a semantic child
 /// sidecar.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -174,6 +183,12 @@ pub enum NestedValueChildrenPresentation {
         slot_stride: u64,
         slot_count: u64,
         element: Box<NestedValuePresentation>,
+    },
+    HashTable {
+        first_slot_offset: u64,
+        bucket_slot_stride: u64,
+        bucket_count: u64,
+        fields: Vec<NestedValueHashTableFieldPresentation>,
     },
     Variant {
         fields: Vec<NestedValueVariantFieldPresentation>,

@@ -304,6 +304,7 @@ fn hash_table_capture_limits(
     cap: usize,
     entry_stride: u64,
     occupancy: ghostscope_dwarf::HashTableOccupancy,
+    bucket_limit: Option<usize>,
 ) -> Result<(usize, usize, usize)> {
     let stride = usize::try_from(entry_stride).map_err(|_| {
         CodeGenError::DwarfError(format!(
@@ -319,7 +320,7 @@ fn hash_table_capture_limits(
     let bytes_per_bucket = stride.checked_add(occupancy_width).ok_or_else(|| {
         CodeGenError::DwarfError("hash-table bucket capture size overflow".to_string())
     })?;
-    let max_buckets = cap / bytes_per_bucket;
+    let max_buckets = (cap / bytes_per_bucket).min(bucket_limit.unwrap_or(usize::MAX));
     let max_len = max_buckets
         .checked_mul(bytes_per_bucket)
         .ok_or_else(|| CodeGenError::DwarfError("hash-table payload size overflow".to_string()))?;
@@ -382,7 +383,7 @@ fn compile_nested_value_source(
 ) -> Result<Option<NestedValueSource>> {
     let Some(nested) = &plan.nested else {
         let Some((output_type, root, root_payload_len)) =
-            compile_nested_root_source(plan, budget, None)?
+            compile_nested_root_source(plan, budget, None, None)?
         else {
             return Ok(None);
         };
@@ -399,7 +400,7 @@ fn compile_nested_value_source(
     match nested {
         ghostscope_dwarf::ValueNestedPlan::ProjectedValue { value } => {
             let Some((output_type, root, root_payload_len)) =
-                compile_nested_root_source(plan, budget, None)?
+                compile_nested_root_source(plan, budget, None, None)?
             else {
                 return Ok(None);
             };
@@ -435,7 +436,7 @@ fn compile_nested_value_source(
         }
         ghostscope_dwarf::ValueNestedPlan::ProjectedView { fields } => {
             let Some((output_type, root, root_payload_len)) =
-                compile_nested_root_source(plan, budget, None)?
+                compile_nested_root_source(plan, budget, None, None)?
             else {
                 return Ok(None);
             };
@@ -498,7 +499,7 @@ fn compile_nested_value_source(
         }
         ghostscope_dwarf::ValueNestedPlan::Variant { fields } => {
             let Some((output_type, root, root_payload_len)) =
-                compile_nested_root_source(plan, budget, None)?
+                compile_nested_root_source(plan, budget, None, None)?
             else {
                 return Ok(None);
             };
@@ -617,10 +618,115 @@ fn compile_nested_value_source(
                 },
             }))
         }
+        ghostscope_dwarf::ValueNestedPlan::HashTable { fields } => {
+            if fields.is_empty() || max_sequence_elements == 0 {
+                return Ok(None);
+            }
+            let Some((_, unconstrained_root, _)) =
+                compile_nested_root_source(plan, budget, None, None)?
+            else {
+                return Ok(None);
+            };
+            let NestedValueRootSource::IndirectHashTable { max_buckets, .. } = unconstrained_root
+            else {
+                return Err(CodeGenError::DwarfError(
+                    "nested hash-table children do not match their root capture".to_string(),
+                ));
+            };
+            let max_buckets = max_buckets.min(max_sequence_elements);
+            for bucket_count in (1..=max_buckets).rev() {
+                let Some((output_type, root, root_payload_len)) =
+                    compile_nested_root_source(plan, budget, None, Some(bucket_count))?
+                else {
+                    continue;
+                };
+                let header_bytes_per_bucket = fields
+                    .len()
+                    .checked_mul(ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE)
+                    .ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "nested hash-table field header size overflow".to_string(),
+                        )
+                    })?;
+                let child_budget = budget
+                    .saturating_sub(root_payload_len)
+                    .checked_div(bucket_count)
+                    .unwrap_or(0)
+                    .saturating_sub(header_bytes_per_bucket)
+                    .checked_div(fields.len())
+                    .unwrap_or(0);
+                let mut field_slot_offset = 0usize;
+                let mut compiled_fields = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let Some(child) = compile_nested_value_source(
+                        &field.value,
+                        child_budget,
+                        max_sequence_elements,
+                    )?
+                    else {
+                        break;
+                    };
+                    let entry_offset =
+                        nested_hash_table_field_offset(&plan.presentation, field.field_index)?;
+                    compiled_fields.push(NestedHashTableFieldSource {
+                        field_index: field.field_index,
+                        entry_offset,
+                        slot_offset: field_slot_offset,
+                        child: Box::new(child),
+                    });
+                    field_slot_offset = field_slot_offset
+                        .checked_add(ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE)
+                        .and_then(|offset| {
+                            offset.checked_add(
+                                compiled_fields
+                                    .last()
+                                    .expect("compiled hash-table field was just pushed")
+                                    .child
+                                    .total_len,
+                            )
+                        })
+                        .ok_or_else(|| {
+                            CodeGenError::DwarfError(
+                                "nested hash-table field payload size overflow".to_string(),
+                            )
+                        })?;
+                }
+                if compiled_fields.len() != fields.len() {
+                    continue;
+                }
+                let total_len = bucket_count
+                    .checked_mul(field_slot_offset)
+                    .and_then(|children_len| root_payload_len.checked_add(children_len))
+                    .ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "nested hash-table payload size overflow".to_string(),
+                        )
+                    })?;
+                if total_len > budget {
+                    continue;
+                }
+                let metadata = nested_hash_table_metadata(&plan.capture)?;
+                return Ok(Some(NestedValueSource {
+                    output_type,
+                    presentation: plan.presentation.clone(),
+                    root_payload_len,
+                    total_len,
+                    root,
+                    children: NestedValueChildrenSource::HashTable {
+                        first_slot_offset: root_payload_len,
+                        bucket_slot_stride: field_slot_offset,
+                        bucket_count,
+                        fields: compiled_fields,
+                        metadata,
+                    },
+                }));
+            }
+            Ok(None)
+        }
         ghostscope_dwarf::ValueNestedPlan::Sequence { element } => {
             for slot_count in (1..=max_sequence_elements).rev() {
                 let Some((output_type, root, root_payload_len)) =
-                    compile_nested_root_source(plan, budget, Some(slot_count))?
+                    compile_nested_root_source(plan, budget, Some(slot_count), None)?
                 else {
                     continue;
                 };
@@ -682,6 +788,7 @@ fn compile_nested_root_source(
     plan: &ghostscope_dwarf::ValueReadPlan,
     budget: usize,
     sequence_elements: Option<usize>,
+    hash_buckets: Option<usize>,
 ) -> Result<Option<(ghostscope_dwarf::TypeInfo, NestedValueRootSource, usize)>> {
     let output = match &plan.capture {
         ghostscope_dwarf::ValueCapturePlan::ProjectedValue { value } => {
@@ -868,6 +975,7 @@ fn compile_nested_root_source(
                 budget - ghostscope_protocol::HASH_TABLE_HEADER_SIZE,
                 *entry_stride,
                 *occupancy,
+                hash_buckets,
             )?;
             (
                 plan.root_type.summary.clone(),
@@ -1069,6 +1177,84 @@ fn nested_sequence_metadata(
     }
 }
 
+fn nested_hash_table_field_offset(
+    presentation: &ghostscope_dwarf::ValuePresentation,
+    field_index: usize,
+) -> Result<u64> {
+    let ghostscope_dwarf::ValuePresentation::HashTable { entry, .. } = presentation else {
+        return Err(CodeGenError::DwarfError(
+            "nested hash-table fields do not match their root presentation".to_string(),
+        ));
+    };
+    match (entry, field_index) {
+        (ghostscope_dwarf::HashTableEntryPresentation::Map { key, .. }, 0) => Ok(key.offset),
+        (ghostscope_dwarf::HashTableEntryPresentation::Map { value, .. }, 1)
+        | (ghostscope_dwarf::HashTableEntryPresentation::Set { value }, 0) => Ok(value.offset),
+        _ => Err(CodeGenError::DwarfError(
+            "nested hash-table field index is out of bounds".to_string(),
+        )),
+    }
+}
+
+fn nested_hash_table_metadata(
+    capture: &ghostscope_dwarf::ValueCapturePlan,
+) -> Result<NestedHashTableMetadataSource> {
+    let ghostscope_dwarf::ValueCapturePlan::IndirectHashTable {
+        control,
+        entry_stride,
+        occupancy,
+        buckets,
+        bucket_order,
+        ..
+    } = capture
+    else {
+        return Err(CodeGenError::DwarfError(
+            "nested hash-table metadata does not match its root capture".to_string(),
+        ));
+    };
+    let (control_offset, control_access_size) =
+        metadata_member(control, "nested hash-table child control")?;
+    let buckets = match (buckets, bucket_order) {
+        (
+            ghostscope_dwarf::HashTableBucketSource::Forward { data },
+            ghostscope_dwarf::HashTableBucketOrder::Forward,
+        ) => {
+            let (data_offset, data_access_size) =
+                metadata_member(data, "nested hash-table child data")?;
+            HashTableBucketSource::Forward {
+                data_offset,
+                data_access_size,
+            }
+        }
+        (
+            ghostscope_dwarf::HashTableBucketSource::ReverseFromControl,
+            ghostscope_dwarf::HashTableBucketOrder::Reverse,
+        ) => HashTableBucketSource::ReverseFromControl,
+        (
+            ghostscope_dwarf::HashTableBucketSource::LegacyAfterControl {
+                entry_alignment,
+                pointer_tag_mask,
+            },
+            ghostscope_dwarf::HashTableBucketOrder::Forward,
+        ) => HashTableBucketSource::LegacyAfterControl {
+            entry_alignment: *entry_alignment,
+            pointer_tag_mask: *pointer_tag_mask,
+        },
+        _ => {
+            return Err(CodeGenError::DwarfError(
+                "nested hash-table bucket source and order do not match".to_string(),
+            ));
+        }
+    };
+    Ok(NestedHashTableMetadataSource {
+        control_offset,
+        control_access_size,
+        entry_stride: *entry_stride,
+        occupancy: *occupancy,
+        buckets,
+    })
+}
+
 fn nested_value_presentation(
     value: &NestedValueSource,
 ) -> Result<ghostscope_dwarf::ValuePresentation> {
@@ -1111,6 +1297,49 @@ fn nested_value_presentation(
                     .collect::<Result<Vec<_>>>()?,
             }
         }
+        NestedValueChildrenSource::HashTable {
+            first_slot_offset,
+            bucket_slot_stride,
+            bucket_count,
+            fields,
+            ..
+        } => ghostscope_protocol::NestedValueChildrenPresentation::HashTable {
+            first_slot_offset: u64::try_from(*first_slot_offset).map_err(|_| {
+                CodeGenError::DwarfError(
+                    "nested hash-table offset does not fit the protocol".to_string(),
+                )
+            })?,
+            bucket_slot_stride: u64::try_from(*bucket_slot_stride).map_err(|_| {
+                CodeGenError::DwarfError(
+                    "nested hash-table stride does not fit the protocol".to_string(),
+                )
+            })?,
+            bucket_count: u64::try_from(*bucket_count).map_err(|_| {
+                CodeGenError::DwarfError(
+                    "nested hash-table bucket count does not fit the protocol".to_string(),
+                )
+            })?,
+            fields: fields
+                .iter()
+                .map(|field| {
+                    Ok(ghostscope_protocol::NestedValueHashTableFieldPresentation {
+                        field_index: u64::try_from(field.field_index).map_err(|_| {
+                            CodeGenError::DwarfError(
+                                "nested hash-table field index does not fit the protocol"
+                                    .to_string(),
+                            )
+                        })?,
+                        slot_offset: u64::try_from(field.slot_offset).map_err(|_| {
+                            CodeGenError::DwarfError(
+                                "nested hash-table field offset does not fit the protocol"
+                                    .to_string(),
+                            )
+                        })?,
+                        value: Box::new(nested_child_presentation(&field.child)?),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        },
         NestedValueChildrenSource::Variant { fields } => {
             ghostscope_protocol::NestedValueChildrenPresentation::Variant {
                 fields: fields
@@ -1300,6 +1529,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             presentation,
             capture,
             sequence_element: _,
+            hash_table_fields: _,
             nested: _,
         } = plan;
         let mut output_type = dwarf_type;
@@ -1510,7 +1740,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     ));
                 }
                 let (max_buckets, max_len, data_len) =
-                    hash_table_capture_limits(cap, entry_stride, occupancy)?;
+                    hash_table_capture_limits(cap, entry_stride, occupancy, None)?;
                 (
                     data_len,
                     ComplexArgSource::IndirectHashTable {
@@ -2866,9 +3096,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 mod semantic_value_tests {
     use super::*;
     use ghostscope_dwarf::{
-        DiscriminantRange, DiscriminantValue, MemoryAccessSize, ProjectedValueRead,
-        ProjectedValueStep, ProjectedViewField, ResolvedType, StructMember, TypeIdentity, TypeInfo,
-        TypeProjection, TypeProjectionLayout, ValueCapturePlan, ValueNestedPlan,
+        DiscriminantRange, DiscriminantValue, HashTableBucketOrder, HashTableBucketSource,
+        HashTableEntryPresentation, HashTableFieldPresentation, HashTableOccupancy,
+        MemoryAccessSize, ProjectedValueRead, ProjectedValueStep, ProjectedViewField, ResolvedType,
+        StructMember, TypeIdentity, TypeInfo, TypeProjection, TypeProjectionLayout,
+        ValueCapturePlan, ValueNestedHashTableFieldPlan, ValueNestedPlan,
         ValueNestedVariantCondition, ValueNestedVariantFieldPlan, ValuePresentation, ValueReadPlan,
     };
 
@@ -3205,6 +3437,7 @@ mod semantic_value_tests {
                 excluded_tail_bytes: 0,
             },
             sequence_element: None,
+            hash_table_fields: Vec::new(),
             nested: None,
         }
     }
@@ -3223,6 +3456,7 @@ mod semantic_value_tests {
                 element_stride: 24,
             },
             sequence_element: Some(string.root_type.clone()),
+            hash_table_fields: Vec::new(),
             nested: Some(ValueNestedPlan::Sequence {
                 element: Box::new(string),
             }),
@@ -3267,7 +3501,55 @@ mod semantic_value_tests {
                 fields: Vec::new(),
             },
             sequence_element: None,
+            hash_table_fields: Vec::new(),
             nested: Some(ValueNestedPlan::Variant { fields }),
+        }
+    }
+
+    fn nested_string_hash_map_plan() -> ValueReadPlan {
+        let key = string_value_plan();
+        let value = string_value_plan();
+        let entry_type = key.root_type.summary.clone();
+        ValueReadPlan {
+            root_type: resolved_struct("HashMap<String, String>", 48),
+            presentation: ValuePresentation::HashTable {
+                entry_stride: 48,
+                bucket_order: HashTableBucketOrder::Reverse,
+                occupancy: HashTableOccupancy::ControlByteHighBitClear,
+                entry: HashTableEntryPresentation::Map {
+                    key: HashTableFieldPresentation {
+                        offset: 0,
+                        field_type: Box::new(entry_type.clone()),
+                    },
+                    value: HashTableFieldPresentation {
+                        offset: 24,
+                        field_type: Box::new(entry_type),
+                    },
+                },
+            },
+            capture: ValueCapturePlan::IndirectHashTable {
+                control: projection(8),
+                length: projection(8),
+                bucket_mask: projection(8),
+                entry_stride: 48,
+                occupancy: HashTableOccupancy::ControlByteHighBitClear,
+                buckets: HashTableBucketSource::ReverseFromControl,
+                bucket_order: HashTableBucketOrder::Reverse,
+            },
+            sequence_element: None,
+            hash_table_fields: Vec::new(),
+            nested: Some(ValueNestedPlan::HashTable {
+                fields: vec![
+                    ValueNestedHashTableFieldPlan {
+                        field_index: 0,
+                        value: Box::new(key),
+                    },
+                    ValueNestedHashTableFieldPlan {
+                        field_index: 1,
+                        value: Box::new(value),
+                    },
+                ],
+            }),
         }
     }
 
@@ -3332,5 +3614,44 @@ mod semantic_value_tests {
             panic!("expected nested sequence source");
         };
         assert_eq!(slot_count, 2);
+    }
+
+    #[test]
+    fn nested_hash_table_capture_reuses_field_plans_for_bounded_buckets() {
+        let plan = nested_string_hash_map_plan();
+
+        let source = compile_nested_value_source(&plan, 512, 4)
+            .unwrap()
+            .expect("512 bytes should fit four hash-table bucket sidecars");
+        let NestedValueChildrenSource::HashTable {
+            bucket_count,
+            bucket_slot_stride,
+            fields,
+            ..
+        } = &source.children
+        else {
+            panic!("expected nested hash-table source");
+        };
+        assert_eq!(*bucket_count, 4);
+        assert_eq!(*bucket_slot_stride, 70);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(source.total_len, 508);
+
+        let tight = compile_nested_value_source(&plan, 256, 4)
+            .unwrap()
+            .expect("256 bytes should reduce the nested hash-table bucket count");
+        let NestedValueChildrenSource::HashTable { bucket_count, .. } = tight.children else {
+            panic!("expected nested hash-table source");
+        };
+        assert_eq!(bucket_count, 2);
+        assert_eq!(tight.total_len, 254);
+
+        let configured = compile_nested_value_source(&plan, 512, 2)
+            .unwrap()
+            .expect("configured nested element limit should retain a valid hash-table plan");
+        let NestedValueChildrenSource::HashTable { bucket_count, .. } = configured.children else {
+            panic!("expected nested hash-table source");
+        };
+        assert_eq!(bucket_count, 2);
     }
 }

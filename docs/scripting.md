@@ -263,6 +263,8 @@ Cell<String>              Cell wrapper plus captured String bytes
 Vec<String>               each captured element uses the String adapter
 Vec<CString>              each captured element omits its trailing NUL
 Vec<Vec<i32>>             each captured element uses the Vec adapter
+HashMap<String, Vec<i32>> captured keys and values use their adapters
+HashSet<String>           captured values use the String adapter
 Option<String>            only Some captures its String payload
 Result<Request, String>   only the active Ok or Err payload is captured
 ```
@@ -280,18 +282,21 @@ detects repeated DWARF type identities on the active path. Traversing an
 ordinary Rust struct to reach an adapted field counts as one edge. Transitioning
 into an active enum payload also counts as one edge. Each semantic sequence
 reserves child captures for at most
-`value_adapters.max_sequence_elements` elements. Both limits default to `4`;
-the former controls recursion depth while the latter controls the width of
-each sequence node. The root and every child share the argument's
-`mem_dump_cap`; reducing that cap can reduce the captured element count or
-fall back to the valid root presentation. Every child carries an independent
-read-error or truncation status. See
+`value_adapters.max_sequence_elements` elements. Nested hash tables use the
+same setting to bound the number of captured buckets with key/value sidecars;
+because a hash table is sparse, the bounded bucket prefix can contain fewer
+occupied entries. Both limits default to `4`; the former controls recursion
+depth while the latter controls each collection node's width. The root and
+every child share the argument's `mem_dump_cap`; reducing that cap can reduce
+the captured element or bucket count, or fall back to the valid root
+presentation. Every child carries an independent read-error or truncation
+status. See
 [Value Adapter Limits](configuration.md#value-adapter-limits).
 
-Hash-table and B-Tree entry traversal still formats key and value bytes using
-their DWARF types. For example, `HashMap<String, Vec<i32>>` does not recursively
-run adapters for its keys or values. Known nested fields remain accessible
-explicitly through the DSL.
+Hash-table entry traversal recursively applies recognized adapters to keys and
+values while retaining native DWARF formatting for unrecognized fields. B-Tree
+entry traversal still formats key and value bytes using their DWARF types;
+known nested fields remain accessible explicitly through the DSL.
 
 ## Variables
 

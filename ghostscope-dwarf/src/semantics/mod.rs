@@ -41,8 +41,8 @@ pub use value::{
     BTreeArrayCapture, BTreeEdgesCapture, HashTableBucketSource, ProjectedValueRead,
     ProjectedValueStep, ProjectedViewField, ProjectedViewFieldCapture, RingSequenceLength,
     ValueAdapterOutcome, ValueAdapterReport, ValueAdapterStage, ValueCapturePlan,
-    ValueNestedFieldPlan, ValueNestedPlan, ValueNestedVariantCondition,
-    ValueNestedVariantFieldPlan, ValueReadPlan, ValueReadPlanOptions,
+    ValueHashTableField, ValueNestedFieldPlan, ValueNestedHashTableFieldPlan, ValueNestedPlan,
+    ValueNestedVariantCondition, ValueNestedVariantFieldPlan, ValueReadPlan, ValueReadPlanOptions,
     DEFAULT_VALUE_ADAPTER_NESTING_DEPTH, MAX_VALUE_ADAPTER_NESTING_DEPTH,
 };
 pub(crate) use variable_plan::PlanError;

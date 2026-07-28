@@ -13,7 +13,8 @@ use crate::type_info::TypeInfo;
 use crate::{
     BTreeEntryPresentation, BTreeFieldPresentation, HashTableBucketOrder,
     HashTableEntryPresentation, HashTableFieldPresentation, HashTableOccupancy,
-    NestedValueChildrenPresentation, NestedValueFieldPresentation, NestedValuePresentation,
+    NestedValueChildrenPresentation, NestedValueFieldPresentation,
+    NestedValueHashTableFieldPresentation, NestedValuePresentation,
     NestedValueVariantFieldPresentation, ValuePresentation, BTREE_CAPTURED_ITEM_COUNT_OFFSET,
     BTREE_HEADER_SIZE, BTREE_NODE_HEADER_SIZE, BTREE_NODE_HEIGHT_OFFSET, BTREE_NODE_LENGTH_OFFSET,
     BTREE_NODE_SLOT_COUNT_OFFSET, HASH_TABLE_BUCKET_DATA_OFFSET, HASH_TABLE_CAPACITY_OFFSET,
@@ -33,6 +34,14 @@ struct ActiveVariantMember<'a> {
 struct NestedVariantContext<'a> {
     full_data: &'a [u8],
     fields: &'a [NestedValueVariantFieldPresentation],
+}
+
+struct NestedHashTableContext<'a> {
+    full_data: &'a [u8],
+    first_slot_offset: usize,
+    bucket_slot_stride: usize,
+    bucket_count: usize,
+    fields: &'a [NestedValueHashTableFieldPresentation],
 }
 
 // Removed legacy simple variable wrapper; use complex paths only.
@@ -867,6 +876,7 @@ impl FormatPrinter {
                 *bucket_order,
                 *occupancy,
                 entry,
+                None,
             ),
             ValuePresentation::BTree {
                 node_capacity,
@@ -908,6 +918,91 @@ impl FormatPrinter {
             }
             NestedValueChildrenPresentation::ProjectedView { fields } => {
                 Self::format_nested_projected_view(root_data, data, type_info, root, fields)
+            }
+            NestedValueChildrenPresentation::HashTable {
+                first_slot_offset,
+                bucket_slot_stride,
+                bucket_count,
+                fields,
+            } => {
+                let ValuePresentation::HashTable {
+                    entry_stride,
+                    bucket_order,
+                    occupancy,
+                    entry,
+                } = root
+                else {
+                    return "<INVALID_NESTED_HASH_TABLE>".to_string();
+                };
+                let (Ok(first_slot_offset), Ok(bucket_slot_stride), Ok(bucket_count)) = (
+                    usize::try_from(*first_slot_offset),
+                    usize::try_from(*bucket_slot_stride),
+                    usize::try_from(*bucket_count),
+                ) else {
+                    return "<INVALID_NESTED_HASH_TABLE_PAYLOAD>".to_string();
+                };
+                if first_slot_offset < root_payload_len
+                    || bucket_slot_stride == 0
+                    || bucket_count == 0
+                    || fields.is_empty()
+                {
+                    return "<INVALID_NESTED_HASH_TABLE_PAYLOAD>".to_string();
+                }
+                let field_count = match entry {
+                    HashTableEntryPresentation::Map { .. } => 2,
+                    HashTableEntryPresentation::Set { .. } => 1,
+                };
+                let mut seen_fields = vec![false; field_count];
+                for field in fields {
+                    let Ok(field_index) = usize::try_from(field.field_index) else {
+                        return "<INVALID_NESTED_HASH_TABLE_PAYLOAD>".to_string();
+                    };
+                    let Some(seen) = seen_fields.get_mut(field_index) else {
+                        return "<INVALID_NESTED_HASH_TABLE_PAYLOAD>".to_string();
+                    };
+                    if *seen {
+                        return "<INVALID_NESTED_HASH_TABLE_PAYLOAD>".to_string();
+                    }
+                    *seen = true;
+                    let Some(field_end) = usize::try_from(field.slot_offset)
+                        .ok()
+                        .and_then(|offset| offset.checked_add(NESTED_VALUE_CHILD_HEADER_SIZE))
+                        .and_then(|end| {
+                            usize::try_from(field.value.payload_len)
+                                .ok()
+                                .and_then(|payload_len| end.checked_add(payload_len))
+                        })
+                    else {
+                        return "<INVALID_NESTED_HASH_TABLE_PAYLOAD>".to_string();
+                    };
+                    if field_end > bucket_slot_stride {
+                        return "<INVALID_NESTED_HASH_TABLE_PAYLOAD>".to_string();
+                    }
+                }
+                let Some(sidecar_end) = bucket_count
+                    .checked_mul(bucket_slot_stride)
+                    .and_then(|len| first_slot_offset.checked_add(len))
+                else {
+                    return "<INVALID_NESTED_HASH_TABLE_PAYLOAD>".to_string();
+                };
+                if sidecar_end > data.len() {
+                    return "<INVALID_NESTED_HASH_TABLE_PAYLOAD>".to_string();
+                }
+                let nested = NestedHashTableContext {
+                    full_data: data,
+                    first_slot_offset,
+                    bucket_slot_stride,
+                    bucket_count,
+                    fields,
+                };
+                Self::format_hash_table_payload(
+                    root_data,
+                    *entry_stride,
+                    *bucket_order,
+                    *occupancy,
+                    entry,
+                    Some(&nested),
+                )
             }
             NestedValueChildrenPresentation::Variant { fields } => {
                 let (
@@ -1472,7 +1567,12 @@ impl FormatPrinter {
     ) -> Result<RawPresentationPayload<'data, 'presentation>, String> {
         let mut truncated = false;
         loop {
-            let ValuePresentation::Nested { children, .. } = presentation else {
+            let ValuePresentation::Nested {
+                root,
+                root_payload_len,
+                children,
+            } = presentation
+            else {
                 return Ok(RawPresentationPayload {
                     data,
                     presentation,
@@ -1482,12 +1582,13 @@ impl FormatPrinter {
             };
             let NestedValueChildrenPresentation::ProjectedValue { child } = children.as_ref()
             else {
-                return Ok(RawPresentationPayload {
-                    data,
-                    presentation,
-                    truncated,
-                    zero_length: false,
-                });
+                let root_len = usize::try_from(*root_payload_len)
+                    .map_err(|_| "<INVALID_SEMANTIC_PAYLOAD>".to_string())?;
+                data = data
+                    .get(..root_len)
+                    .ok_or_else(|| "<INVALID_SEMANTIC_PAYLOAD>".to_string())?;
+                presentation = root;
+                continue;
             };
 
             let slot_offset = usize::try_from(child.slot_offset)
@@ -1773,7 +1874,28 @@ impl FormatPrinter {
         entry_data: &[u8],
         entry_stride: u64,
         field: &HashTableFieldPresentation,
+        field_index: usize,
+        control_index: usize,
+        nested: Option<&NestedHashTableContext<'_>>,
     ) -> Option<String> {
+        if let Some(nested) = nested {
+            if let Some(nested_field) = nested
+                .fields
+                .iter()
+                .find(|candidate| candidate.field_index == field_index as u64)
+            {
+                let field_slot_offset = usize::try_from(nested_field.slot_offset).ok()?;
+                let slot_offset = control_index
+                    .checked_mul(nested.bucket_slot_stride)
+                    .and_then(|offset| nested.first_slot_offset.checked_add(offset))
+                    .and_then(|offset| offset.checked_add(field_slot_offset))?;
+                return Some(Self::format_nested_value_at(
+                    nested.full_data,
+                    slot_offset,
+                    &nested_field.value,
+                ));
+            }
+        }
         let field_end = field.offset.checked_add(field.field_type.size())?;
         if field_end > entry_stride {
             return None;
@@ -1794,10 +1916,14 @@ impl FormatPrinter {
         bucket_order: HashTableBucketOrder,
         occupancy: HashTableOccupancy,
         entry: &HashTableEntryPresentation,
+        nested: Option<&NestedHashTableContext<'_>>,
     ) -> String {
         let Some(payload) = Self::parse_hash_table_payload(data, entry_stride, occupancy) else {
             return "<INVALID_HASH_TABLE_PAYLOAD>".to_string();
         };
+        if nested.is_some_and(|nested| payload.captured_buckets > nested.bucket_count) {
+            return "<INVALID_NESTED_HASH_TABLE_PAYLOAD>".to_string();
+        }
         let type_name = match entry {
             HashTableEntryPresentation::Map { .. } => "HashMap",
             HashTableEntryPresentation::Set { .. } => "HashSet",
@@ -1823,13 +1949,24 @@ impl FormatPrinter {
             }
             match entry {
                 HashTableEntryPresentation::Map { key, value } => {
-                    let Some(key) = Self::format_hash_table_field(entry_data, entry_stride, key)
-                    else {
+                    let Some(key) = Self::format_hash_table_field(
+                        entry_data,
+                        entry_stride,
+                        key,
+                        0,
+                        control_index,
+                        nested,
+                    ) else {
                         return "<INVALID_HASH_TABLE_ENTRY_LAYOUT>".to_string();
                     };
-                    let Some(value) =
-                        Self::format_hash_table_field(entry_data, entry_stride, value)
-                    else {
+                    let Some(value) = Self::format_hash_table_field(
+                        entry_data,
+                        entry_stride,
+                        value,
+                        1,
+                        control_index,
+                        nested,
+                    ) else {
                         return "<INVALID_HASH_TABLE_ENTRY_LAYOUT>".to_string();
                     };
                     result.push_str(&key);
@@ -1837,9 +1974,14 @@ impl FormatPrinter {
                     result.push_str(&value);
                 }
                 HashTableEntryPresentation::Set { value } => {
-                    let Some(value) =
-                        Self::format_hash_table_field(entry_data, entry_stride, value)
-                    else {
+                    let Some(value) = Self::format_hash_table_field(
+                        entry_data,
+                        entry_stride,
+                        value,
+                        0,
+                        control_index,
+                        nested,
+                    ) else {
                         return "<INVALID_HASH_TABLE_ENTRY_LAYOUT>".to_string();
                     };
                     result.push_str(&value);
@@ -3769,6 +3911,116 @@ mod tests {
     }
 
     #[test]
+    fn nested_hash_table_presentation_formats_semantic_entry_fields() {
+        let controls = [0xff, 0x12];
+        let buckets = vec![0u8; 2 * 48];
+        let root_data = hash_table_payload(1, 2, &controls, &buckets);
+        let root_payload_len = root_data.len();
+
+        let key_payload = indirect_bytes_payload(10, b"alpha");
+        let mut values = Vec::new();
+        for value in [3_i32, 5, 8] {
+            values.extend_from_slice(&value.to_le_bytes());
+        }
+        let value_payload = indirect_sequence_payload(3, 3, &values);
+        let key_slot_len = NESTED_VALUE_CHILD_HEADER_SIZE + key_payload.len();
+        let value_slot_offset = key_slot_len;
+        let bucket_slot_stride =
+            key_slot_len + NESTED_VALUE_CHILD_HEADER_SIZE + value_payload.len();
+
+        let mut data = root_data;
+        data.extend_from_slice(&nested_child_slot(
+            VariableStatus::AccessError,
+            &[],
+            key_payload.len(),
+        ));
+        data.extend_from_slice(&nested_child_slot(
+            VariableStatus::AccessError,
+            &[],
+            value_payload.len(),
+        ));
+        data.extend_from_slice(&nested_child_slot(
+            VariableStatus::Truncated,
+            &key_payload,
+            key_payload.len(),
+        ));
+        data.extend_from_slice(&nested_child_slot(
+            VariableStatus::Ok,
+            &value_payload,
+            value_payload.len(),
+        ));
+
+        let string_type = TypeInfo::StructType {
+            name: "String".to_string(),
+            size: 24,
+            members: Vec::new(),
+        };
+        let vector_type = TypeInfo::StructType {
+            name: "Vec<i32>".to_string(),
+            size: 24,
+            members: Vec::new(),
+        };
+        let root = ValuePresentation::HashTable {
+            entry_stride: 48,
+            bucket_order: HashTableBucketOrder::Forward,
+            occupancy: HashTableOccupancy::ControlByteHighBitClear,
+            entry: HashTableEntryPresentation::Map {
+                key: HashTableFieldPresentation {
+                    offset: 0,
+                    field_type: Box::new(string_type.clone()),
+                },
+                value: HashTableFieldPresentation {
+                    offset: 24,
+                    field_type: Box::new(vector_type.clone()),
+                },
+            },
+        };
+        let presentation = ValuePresentation::Nested {
+            root: Box::new(root),
+            root_payload_len: root_payload_len as u64,
+            children: Box::new(NestedValueChildrenPresentation::HashTable {
+                first_slot_offset: root_payload_len as u64,
+                bucket_slot_stride: bucket_slot_stride as u64,
+                bucket_count: 2,
+                fields: vec![
+                    NestedValueHashTableFieldPresentation {
+                        field_index: 0,
+                        slot_offset: 0,
+                        value: Box::new(NestedValuePresentation {
+                            payload_len: key_payload.len() as u64,
+                            type_info: Box::new(string_type),
+                            presentation: Box::new(ValuePresentation::Utf8String),
+                        }),
+                    },
+                    NestedValueHashTableFieldPresentation {
+                        field_index: 1,
+                        slot_offset: value_slot_offset as u64,
+                        value: Box::new(NestedValuePresentation {
+                            payload_len: value_payload.len() as u64,
+                            type_info: Box::new(vector_type),
+                            presentation: Box::new(ValuePresentation::Sequence {
+                                element_type: Box::new(signed_i32_type()),
+                                element_stride: 4,
+                            }),
+                        }),
+                    },
+                ],
+            }),
+        };
+
+        assert_eq!(
+            FormatPrinter::format_data_with_presentation(
+                &data,
+                &TypeInfo::UnknownType {
+                    name: "HashMap".to_string(),
+                },
+                &presentation,
+            ),
+            "HashMap(size=1) {\"alpha\" <truncated>: [3, 5, 8]}"
+        );
+    }
+
+    #[test]
     fn test_legacy_hash_table_presentation_uses_nonzero_hash_words() {
         let mut occupancy = Vec::new();
         for hash in [0_u64, 0x12, 0, 0x01] {
@@ -3916,7 +4168,7 @@ mod tests {
                 TypeInfo::UnknownType {
                     name: "HashSet".to_string(),
                 },
-                presentation,
+                presentation.clone(),
             )
             .unwrap();
         let name_index = trace_context.add_variable_name("set".to_string()).unwrap();
@@ -3931,7 +4183,60 @@ mod tests {
         assert_eq!(
             FormatPrinter::format_complex_print_data(
                 format_index,
-                &[variable.clone(), variable],
+                &[variable.clone(), variable.clone()],
+                &trace_context,
+            ),
+            "41 00 42 00|A"
+        );
+
+        let root_payload_len = variable.data.len();
+        let child_payload_len = 2;
+        let bucket_slot_stride = NESTED_VALUE_CHILD_HEADER_SIZE + child_payload_len;
+        let mut nested_data = variable.data.clone();
+        for _ in 0..controls.len() {
+            nested_data.extend_from_slice(&nested_child_slot(
+                VariableStatus::AccessError,
+                &[],
+                child_payload_len,
+            ));
+        }
+        let nested_presentation = ValuePresentation::Nested {
+            root: Box::new(presentation),
+            root_payload_len: root_payload_len as u64,
+            children: Box::new(NestedValueChildrenPresentation::HashTable {
+                first_slot_offset: root_payload_len as u64,
+                bucket_slot_stride: bucket_slot_stride as u64,
+                bucket_count: controls.len() as u64,
+                fields: vec![NestedValueHashTableFieldPresentation {
+                    field_index: 0,
+                    slot_offset: 0,
+                    value: Box::new(NestedValuePresentation {
+                        payload_len: child_payload_len as u64,
+                        type_info: Box::new(unsigned_u16_type()),
+                        presentation: Box::new(ValuePresentation::Dwarf),
+                    }),
+                }],
+            }),
+        };
+        let nested_type_index = trace_context
+            .add_type_with_presentation(
+                TypeInfo::UnknownType {
+                    name: "HashSet".to_string(),
+                },
+                nested_presentation,
+            )
+            .unwrap();
+        let nested_variable = ParsedComplexVariable {
+            var_name_index: name_index,
+            type_index: nested_type_index,
+            access_path: String::new(),
+            status: VariableStatus::Ok as u8,
+            data: nested_data,
+        };
+        assert_eq!(
+            FormatPrinter::format_complex_print_data(
+                format_index,
+                &[nested_variable.clone(), nested_variable],
                 &trace_context,
             ),
             "41 00 42 00|A"

@@ -4,8 +4,9 @@ use crate::{
     CompilationUnitMetadata, CuId, MemberLayout, ModuleId, PcContext, ProjectedValueRead,
     ProjectedValueStep, ResolvedType, Result, SemanticType, TypeId, TypeIdentity, TypeInfo,
     TypeLayoutError, TypeOrigin, TypeProjection, TypeProjectionLayout, ValueAdapterOutcome,
-    ValueAdapterReport, ValueAdapterStage, ValueCapturePlan, ValueNestedFieldPlan, ValueNestedPlan,
-    ValueReadPlan, ValueReadPlanOptions, VariableAccessSegment, VariableReadPlan,
+    ValueAdapterReport, ValueAdapterStage, ValueCapturePlan, ValueNestedFieldPlan,
+    ValueNestedHashTableFieldPlan, ValueNestedPlan, ValueReadPlan, ValueReadPlanOptions,
+    VariableAccessSegment, VariableReadPlan,
 };
 use std::path::Path;
 
@@ -663,9 +664,29 @@ impl DwarfAnalyzer {
                 .map(|element| ValueNestedPlan::Sequence {
                     element: Box::new(element),
                 }),
-            ValueCapturePlan::IndirectBytes { .. }
-            | ValueCapturePlan::IndirectHashTable { .. }
-            | ValueCapturePlan::IndirectBTree { .. } => None,
+            ValueCapturePlan::IndirectHashTable { .. } => {
+                let nested_fields = plan
+                    .hash_table_fields
+                    .iter()
+                    .filter_map(|field| {
+                        self.try_nested_value_read_plan(
+                            &field.resolved_type,
+                            type_module_path,
+                            depth + 1,
+                            max_nesting_depth,
+                            ancestors,
+                        )
+                        .map(|value| ValueNestedHashTableFieldPlan {
+                            field_index: field.field_index,
+                            value: Box::new(value),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (!nested_fields.is_empty()).then_some(ValueNestedPlan::HashTable {
+                    fields: nested_fields,
+                })
+            }
+            ValueCapturePlan::IndirectBytes { .. } | ValueCapturePlan::IndirectBTree { .. } => None,
         };
         let nested = match language_nested {
             crate::language::NestedValuePlanResolution::Handled(nested) => nested,
@@ -1049,6 +1070,20 @@ impl crate::language::ValueAdapterContext for DwarfAnalyzer {
         index: u32,
     ) -> Result<MemberLayout> {
         DwarfAnalyzer::tuple_member_layout(self, type_id, aggregate_type, index)
+    }
+
+    fn project_tuple_member(
+        &self,
+        current: &ResolvedType,
+        index: u32,
+        type_module_path: Option<&Path>,
+    ) -> Result<TypeProjection> {
+        DwarfAnalyzer::project_resolved_type(
+            self,
+            current,
+            &VariableAccessSegment::TupleIndex(index),
+            type_module_path,
+        )
     }
 
     fn resolve_aggregate_type_in_module(

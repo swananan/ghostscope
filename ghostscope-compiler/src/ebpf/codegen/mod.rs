@@ -197,6 +197,13 @@ enum NestedValueChildrenSource {
         element: Box<NestedValueSource>,
         metadata: NestedSequenceMetadataSource,
     },
+    HashTable {
+        first_slot_offset: usize,
+        bucket_slot_stride: usize,
+        bucket_count: usize,
+        fields: Vec<NestedHashTableFieldSource>,
+        metadata: NestedHashTableMetadataSource,
+    },
     Variant {
         fields: Vec<NestedValueVariantFieldSource>,
     },
@@ -207,6 +214,14 @@ struct NestedValueFieldSource {
     field_index: usize,
     slot_offset: usize,
     steps: Vec<ProjectedViewStep>,
+    child: Box<NestedValueSource>,
+}
+
+#[derive(Debug, Clone)]
+struct NestedHashTableFieldSource {
+    field_index: usize,
+    entry_offset: u64,
+    slot_offset: usize,
     child: Box<NestedValueSource>,
 }
 
@@ -238,6 +253,15 @@ struct NestedSequenceMetadataSource {
     data_access_size: ghostscope_dwarf::MemoryAccessSize,
     element_stride: u64,
     ring: Option<NestedRingMetadataSource>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NestedHashTableMetadataSource {
+    control_offset: u64,
+    control_access_size: ghostscope_dwarf::MemoryAccessSize,
+    entry_stride: u64,
+    occupancy: ghostscope_dwarf::HashTableOccupancy,
+    buckets: HashTableBucketSource,
 }
 
 #[derive(Debug, Clone, Copy)]

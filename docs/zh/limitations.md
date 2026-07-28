@@ -26,9 +26,9 @@ GhostScope 的脚本和编译器能力面只用于观测，不提供主动修改
 32。
 
 **Rust** 已针对常见标准库类型提供定向语义支持。这些适配器根据具体目标
-的 DWARF 选择，而不是假设一个稳定的 Rust ABI。投影包装器和有界序列中的
-嵌套 adapter 会在配置的递归深度、单序列元素数和共享字节预算内组合；
-Hash 表和 B-Tree 的 key/value adapter 尚不会递归组合。当前类型列表、
+的 DWARF 选择，而不是假设一个稳定的 Rust ABI。投影包装器、有界序列和
+Hash 表条目中的嵌套 adapter 会在配置的递归深度、集合宽度和共享字节预算
+内组合；B-Tree 的 key/value adapter 尚不会递归组合。当前类型列表、
 格式化行为和嵌套边界见
 [Rust 值展示](scripting.md#rust-值展示)。
 

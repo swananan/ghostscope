@@ -194,6 +194,9 @@ async fn test_rust_nested_value_plans_recurse_into_semantic_children() -> anyhow
             Some(ghostscope_dwarf::ValueNestedPlan::Sequence { element }) => {
                 contains_utf8_string(element)
             }
+            Some(ghostscope_dwarf::ValueNestedPlan::HashTable { fields }) => fields
+                .iter()
+                .any(|field| contains_utf8_string(&field.value)),
             Some(ghostscope_dwarf::ValueNestedPlan::Variant { fields }) => fields
                 .iter()
                 .any(|field| contains_utf8_string(&field.value)),
@@ -1491,6 +1494,71 @@ async fn test_rust_hash_collection_plans_follow_dwarf_raw_table_layout() -> anyh
         assert_eq!(capture_order, bucket_order);
     }
 
+    let nested_context = analyzer
+        .lookup_function_addresses("observe_nested_hash_collections")
+        .into_iter()
+        .find_map(|address| analyzer.resolve_pc(&address).ok())
+        .ok_or_else(|| anyhow::anyhow!("expected observe_nested_hash_collections context"))?;
+    for (parameter, is_map) in [("map", true), ("set", false)] {
+        let parameter_plan = analyzer
+            .plan_variable_by_name(&nested_context, parameter)?
+            .ok_or_else(|| anyhow::anyhow!("expected nested {parameter} parameter plan"))?;
+        let parameter_type = analyzer
+            .resolved_type_for_plan(&parameter_plan)?
+            .ok_or_else(|| anyhow::anyhow!("expected nested {parameter} parameter type"))?;
+        let value_plan = analyzer
+            .value_read_plan(&parameter_type, Some(&binary_path))?
+            .ok_or_else(|| anyhow::anyhow!("expected nested {parameter} semantic plan"))?;
+        if is_map {
+            assert_eq!(value_plan.hash_table_fields.len(), 2);
+            assert_eq!(value_plan.hash_table_fields[0].field_index, 0);
+            assert!(value_plan.hash_table_fields[0]
+                .resolved_type
+                .summary
+                .type_name()
+                .ends_with("String"));
+            assert_eq!(value_plan.hash_table_fields[1].field_index, 1);
+            assert!(value_plan.hash_table_fields[1]
+                .resolved_type
+                .summary
+                .type_name()
+                .contains("Vec<"));
+        } else {
+            assert_eq!(value_plan.hash_table_fields.len(), 1);
+            assert_eq!(value_plan.hash_table_fields[0].field_index, 0);
+            assert!(value_plan.hash_table_fields[0]
+                .resolved_type
+                .summary
+                .type_name()
+                .ends_with("String"));
+        }
+        let Some(ghostscope_dwarf::ValueNestedPlan::HashTable { fields }) =
+            value_plan.nested.as_ref()
+        else {
+            anyhow::bail!("expected nested hash-table field plans for {parameter}")
+        };
+        if is_map {
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].field_index, 0);
+            assert_eq!(
+                fields[0].value.presentation,
+                ghostscope_dwarf::ValuePresentation::Utf8String
+            );
+            assert_eq!(fields[1].field_index, 1);
+            assert!(matches!(
+                fields[1].value.presentation,
+                ghostscope_dwarf::ValuePresentation::Sequence { .. }
+            ));
+        } else {
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].field_index, 0);
+            assert_eq!(
+                fields[0].value.presentation,
+                ghostscope_dwarf::ValuePresentation::Utf8String
+            );
+        }
+    }
+
     for (parameter, expected_map) in [("unit_map", true), ("unit_set", false)] {
         let parameter_plan = analyzer
             .plan_variable_by_name(&context, parameter)?
@@ -2489,6 +2557,56 @@ mem_dump_cap = 9
     assert!(line.contains("HashMap(size=2)"), "{line}");
     assert!(line.contains("<truncated>"), "{line}");
     assert!(!line.contains("<INVALID_"), "{line}");
+    assert!(
+        !stdout.contains("ExprError"),
+        "Unexpected ExprError: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_print_nested_hash_collection_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_nested_hash_collections {
+    print "RHASH_NESTED_MAP:{}", map;
+    print "RHASH_NESTED_SET:{}", set;
+}
+"#;
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_config_content(
+            r#"
+[ebpf]
+mem_dump_cap = 1024
+"#,
+        )
+        .attach_to(&target)
+        .timeout_secs(9)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await?;
+    target.terminate().await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    let map_line = stdout
+        .lines()
+        .find(|line| line.contains("RHASH_NESTED_MAP:"))
+        .ok_or_else(|| anyhow::anyhow!("missing nested Rust HashMap output: {stdout}"))?;
+    assert!(map_line.contains("HashMap(size=2)"), "{map_line}");
+    assert!(map_line.contains(r#""alpha": [3, 5, 8]"#), "{map_line}");
+    assert!(map_line.contains(r#""omega": [13, 21]"#), "{map_line}");
+    let set_line = stdout
+        .lines()
+        .find(|line| line.contains("RHASH_NESTED_SET:"))
+        .ok_or_else(|| anyhow::anyhow!("missing nested Rust HashSet output: {stdout}"))?;
+    assert!(set_line.contains("HashSet(size=2)"), "{set_line}");
+    assert!(set_line.contains(r#""left""#), "{set_line}");
+    assert!(set_line.contains(r#""right""#), "{set_line}");
+    assert!(!stdout.contains("<INVALID_"), "invalid payload: {stdout}");
     assert!(
         !stdout.contains("ExprError"),
         "Unexpected ExprError: {stdout}"

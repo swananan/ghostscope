@@ -3,7 +3,7 @@ use crate::{
     BTreeFieldPresentation, HashTableBucketOrder, HashTableBucketSource,
     HashTableEntryPresentation, HashTableFieldPresentation, HashTableOccupancy, ResolvedType,
     Result, StructMember, TypeInfo, TypeProjection, TypeProjectionLayout, ValueCapturePlan,
-    ValuePresentation, ValueReadPlan, VariableAccessSegment,
+    ValueHashTableField, ValuePresentation, ValueReadPlan, VariableAccessSegment,
 };
 use std::path::Path;
 
@@ -97,26 +97,72 @@ pub(crate) fn hash_table_value_read_plan(
     };
     let entry_stride = entry_type.summary.size();
     let field = |index| {
-        context
+        let field = context
             .tuple_member_layout(entry_type_id, &entry_type.summary, index)
+            .ok()?;
+        let field_end = field.offset.checked_add(field.member_type.size())?;
+        if field_end > entry_stride {
+            return None;
+        }
+        let resolved_type = context
+            .project_tuple_member(&entry_type, index, type_module_path)
             .ok()
-            .map(|field| HashTableFieldPresentation {
+            .and_then(|projection| {
+                let TypeProjectionLayout::Member { offset } = projection.layout else {
+                    return None;
+                };
+                (offset == field.offset
+                    && strip_type_aliases(&projection.resolved_type.summary)
+                        == strip_type_aliases(&field.member_type))
+                .then_some(projection.resolved_type)
+            });
+        Some((
+            HashTableFieldPresentation {
                 offset: field.offset,
                 field_type: Box::new(field.member_type),
-            })
+            },
+            resolved_type,
+        ))
     };
-    let entry = match layout.kind {
+    let (entry, hash_table_fields) = match layout.kind {
         HashTableKind::Map => {
             let (Some(key), Some(value)) = (field(0), field(1)) else {
                 return Ok(None);
             };
-            HashTableEntryPresentation::Map { key, value }
+            let mut fields = Vec::new();
+            if let Some(resolved_type) = key.1 {
+                fields.push(ValueHashTableField {
+                    field_index: 0,
+                    resolved_type,
+                });
+            }
+            if let Some(resolved_type) = value.1 {
+                fields.push(ValueHashTableField {
+                    field_index: 1,
+                    resolved_type,
+                });
+            }
+            (
+                HashTableEntryPresentation::Map {
+                    key: key.0,
+                    value: value.0,
+                },
+                fields,
+            )
         }
         HashTableKind::Set => {
             let Some(value) = field(0) else {
                 return Ok(None);
             };
-            HashTableEntryPresentation::Set { value }
+            let fields = value
+                .1
+                .map(|resolved_type| ValueHashTableField {
+                    field_index: 0,
+                    resolved_type,
+                })
+                .into_iter()
+                .collect();
+            (HashTableEntryPresentation::Set { value: value.0 }, fields)
         }
     };
 
@@ -158,7 +204,7 @@ pub(crate) fn hash_table_value_read_plan(
     let bucket_mask =
         context.project_member_path(current, &layout.bucket_mask_path, type_module_path)?;
 
-    Ok(Some(ValueReadPlan::new(
+    let mut plan = ValueReadPlan::new(
         current.clone(),
         ValuePresentation::HashTable {
             entry_stride,
@@ -175,7 +221,9 @@ pub(crate) fn hash_table_value_read_plan(
             buckets,
             bucket_order: layout.bucket_order,
         },
-    )))
+    );
+    plan.hash_table_fields = hash_table_fields;
+    Ok(Some(plan))
 }
 
 pub(crate) fn btree_value_read_plan<'a>(
