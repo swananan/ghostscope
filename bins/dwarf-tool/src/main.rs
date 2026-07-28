@@ -5,9 +5,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ghostscope_dwarf::{
-    AddressQueryResult, DwarfAnalyzer, FunctionQueryResult, ModuleLoadingEvent, ModuleLoadingStats,
-    SectionType, SourceLanguage, ValueAdapterOutcome, ValueAdapterReport, ValueAdapterStage,
-    ValueCapturePlan, ValuePresentation, VariableAccessPath,
+    AddressQueryResult, DwarfAnalyzer, FunctionQueryResult, ModuleAddress, ModuleLoadingEvent,
+    ModuleLoadingStats, SectionType, SourceLanguage, ValueAdapterOutcome, ValueAdapterReport,
+    ValueAdapterStage, ValueCapturePlan, ValuePresentation, VariableAccessPath,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -164,6 +164,9 @@ enum Commands {
         /// Number of runs
         #[arg(long, default_value = "10")]
         runs: usize,
+        /// Number of unmeasured warmup queries
+        #[arg(long, default_value = "10")]
+        warmup_runs: usize,
         /// JSON output
         #[arg(long)]
         json: bool,
@@ -228,6 +231,7 @@ struct SourceLineBenchmarkResult {
     source_location: String,
     loading_time_ms: u64,
     load_breakdown: LoadTimingBreakdown,
+    warmup_runs: usize,
     address_count: usize,
     total_variables: usize,
     first_address: Option<String>,
@@ -433,6 +437,7 @@ async fn main() -> Result<()> {
         Commands::BenchmarkSourceLine {
             location,
             runs,
+            warmup_runs,
             json,
         } => {
             return run_source_line_benchmark(
@@ -440,6 +445,7 @@ async fn main() -> Result<()> {
                 cli.target.as_deref(),
                 location,
                 *runs,
+                *warmup_runs,
                 *json,
             )
             .await;
@@ -1232,6 +1238,7 @@ async fn run_source_line_benchmark(
     target_path: Option<&str>,
     source: &str,
     runs: usize,
+    warmup_runs: usize,
     json: bool,
 ) -> Result<()> {
     if runs == 0 {
@@ -1240,9 +1247,15 @@ async fn run_source_line_benchmark(
 
     if !json {
         if let Some(pid) = pid {
-            println!("Benchmarking source-line query for PID {pid} at {source} ({runs} runs)...\n");
+            println!(
+                "Benchmarking source-line query for PID {pid} at {source} \
+                 ({warmup_runs} warmup, {runs} measured runs)...\n"
+            );
         } else if let Some(target) = target_path {
-            println!("Benchmarking source-line query for {target} at {source} ({runs} runs)...\n");
+            println!(
+                "Benchmarking source-line query for {target} at {source} \
+                 ({warmup_runs} warmup, {runs} measured runs)...\n"
+            );
         }
     }
 
@@ -1266,6 +1279,24 @@ async fn run_source_line_benchmark(
             load_breakdown.index_time_ms,
             load_breakdown.internal_total_time_ms
         );
+        if warmup_runs > 0 {
+            print!("Warming: ");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        }
+    }
+
+    for _ in 0..warmup_runs {
+        let _ = execute_source_line_query(&analyzer, file_path, line_number)?;
+        if !json {
+            print!(".");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        }
+    }
+
+    if !json {
+        if warmup_runs > 0 {
+            println!();
+        }
         print!("Querying: ");
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
     }
@@ -1277,14 +1308,8 @@ async fn run_source_line_benchmark(
         }
 
         let start = Instant::now();
-        let addresses = analyzer.lookup_addresses_by_source_line(file_path, line_number);
-        let mut run_total_variables = 0usize;
-
-        for module_address in &addresses {
-            let pc_context = analyzer.resolve_pc(module_address)?;
-            run_total_variables += analyzer.visible_variables(&pc_context)?.len();
-        }
-
+        let (addresses, run_total_variables) =
+            execute_source_line_query(&analyzer, file_path, line_number)?;
         query_times.push(start.elapsed());
 
         if run_index == 0 {
@@ -1304,6 +1329,7 @@ async fn run_source_line_benchmark(
         source_location: source.to_string(),
         loading_time_ms: loading_time.as_millis() as u64,
         load_breakdown,
+        warmup_runs,
         address_count,
         total_variables,
         first_address,
@@ -1320,6 +1346,7 @@ async fn run_source_line_benchmark(
             println!("  First address: {first_address}");
         }
         println!("\nResults:");
+        println!("  Warmup runs: {}", result.warmup_runs);
         println!("  First run: {:.3}ms", result.benchmark.first_run_ms);
         println!("  Average query time: {:.3}ms", result.benchmark.average_ms);
         println!("  P50: {:.3}ms", result.benchmark.p50_ms);
@@ -1329,6 +1356,22 @@ async fn run_source_line_benchmark(
     }
 
     Ok(())
+}
+
+fn execute_source_line_query(
+    analyzer: &DwarfAnalyzer,
+    file_path: &str,
+    line_number: u32,
+) -> Result<(Vec<ModuleAddress>, usize)> {
+    let addresses = analyzer.lookup_addresses_by_source_line(file_path, line_number);
+    let mut total_variables = 0usize;
+
+    for module_address in &addresses {
+        let pc_context = analyzer.resolve_pc(module_address)?;
+        total_variables += analyzer.visible_variables(&pc_context)?.len();
+    }
+
+    Ok((addresses, total_variables))
 }
 
 fn summarize_durations(durations: &[std::time::Duration]) -> Result<BenchmarkSummary> {
@@ -1463,7 +1506,8 @@ fn parse_address(address_str: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_source_line, percentile_nearest_rank};
+    use super::{parse_source_line, percentile_nearest_rank, Cli, Commands};
+    use clap::Parser;
 
     #[test]
     fn parses_source_line_with_colons_in_path() {
@@ -1477,6 +1521,22 @@ mod tests {
         let samples = [1.0, 2.0, 3.0, 4.0, 5.0];
         assert_eq!(percentile_nearest_rank(&samples, 0.50), 3.0);
         assert_eq!(percentile_nearest_rank(&samples, 0.95), 5.0);
+    }
+
+    #[test]
+    fn source_line_benchmark_defaults_to_ten_warmup_queries() {
+        let cli =
+            Cli::try_parse_from(["dwarf-tool", "benchmark-source-line", "query_hotspot.c:17"])
+                .unwrap();
+
+        let Commands::BenchmarkSourceLine {
+            runs, warmup_runs, ..
+        } = cli.command
+        else {
+            panic!("expected source-line benchmark command");
+        };
+        assert_eq!(runs, 10);
+        assert_eq!(warmup_runs, 10);
     }
 }
 

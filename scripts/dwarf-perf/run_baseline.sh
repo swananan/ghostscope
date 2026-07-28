@@ -6,6 +6,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 BUILD_CORPUS=1
 RUNS=10
+QUERY_WARMUP_RUNS=10
 CORPUS_DIR="$REPO_ROOT/scripts/dwarf-perf/corpus/out"
 RESULTS_DIR="$REPO_ROOT/perf-results"
 RESULT_NAME=""
@@ -21,7 +22,8 @@ Options:
   --corpus-dir PATH      corpus output directory (default: scripts/dwarf-perf/corpus/out)
   --results-dir PATH     result directory (default: perf-results)
   --result-name NAME     result file stem (default: timestamp-based)
-  --runs N               benchmark runs for parse and query baselines (default: 10)
+  --runs N               measured runs for parse and query baselines (default: 10)
+  --query-warmup-runs N  unmeasured source-line query warmups (default: 10)
   --parse-target NAME    run only one parse artifact from the manifest
   --cargo-target-dir P   cargo target dir for dwarf-tool (default: .target_tmp/dwarf-perf)
   -h, --help             show this help
@@ -48,6 +50,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --runs)
             RUNS=$2
+            shift 2
+            ;;
+        --query-warmup-runs)
+            QUERY_WARMUP_RUNS=$2
             shift 2
             ;;
         --parse-target)
@@ -159,6 +165,7 @@ print_query_summary() {
     echo "  source: ${QUERY_SOURCE_ABS}:${QUERY_LINE}"
     echo "  binary: $QUERY_BINARY"
     echo "  loading time: ${QUERY_LOADING_MS}ms"
+    echo "  warmup runs: $QUERY_REPORTED_WARMUP_RUNS"
     echo "  runs: $RUNS"
     echo "  first run: ${QUERY_FIRST_RUN_MS}ms"
     echo "  average: ${QUERY_AVG_MS}ms"
@@ -186,10 +193,12 @@ run_query_benchmark() {
         -t "$QUERY_BINARY" \
         benchmark-source-line "${QUERY_SOURCE_ABS}:${QUERY_LINE}" \
         --runs "$RUNS" \
+        --warmup-runs "$QUERY_WARMUP_RUNS" \
         --json)
 
     query_json=$(printf '%s\n' "$query_output" | sed -n '/^{/,$p')
     QUERY_LOADING_MS=$(require_json_value "query loading time" "$(printf '%s\n' "$query_json" | jq '.loading_time_ms')" "$query_json")
+    QUERY_REPORTED_WARMUP_RUNS=$(require_json_value "query warmup runs" "$(printf '%s\n' "$query_json" | jq '.warmup_runs')" "$query_json")
     QUERY_FIRST_RUN_MS=$(require_json_value "query first run" "$(printf '%s\n' "$query_json" | jq '.benchmark.first_run_ms')" "$query_json")
     QUERY_AVG_MS=$(require_json_value "query average" "$(printf '%s\n' "$query_json" | jq '.benchmark.average_ms')" "$query_json")
     QUERY_P50_MS=$(require_json_value "query p50" "$(printf '%s\n' "$query_json" | jq '.benchmark.p50_ms')" "$query_json")
@@ -283,6 +292,7 @@ write_baseline_json() {
         --argjson internal_total_min_ms "$INTERNAL_TOTAL_MIN_MS" \
         --argjson internal_total_max_ms "$INTERNAL_TOTAL_MAX_MS" \
         --argjson query_loading_ms "$QUERY_LOADING_MS" \
+        --argjson query_warmup_runs "$QUERY_REPORTED_WARMUP_RUNS" \
         --argjson query_first_run_ms "$QUERY_FIRST_RUN_MS" \
         --argjson query_avg_ms "$QUERY_AVG_MS" \
         --argjson query_p50_ms "$QUERY_P50_MS" \
@@ -344,6 +354,7 @@ write_baseline_json() {
                     line: ($query_line | tonumber)
                 },
                 loading_time_ms: $query_loading_ms,
+                warmup_runs: $query_warmup_runs,
                 runs: $runs,
                 metrics_ms: {
                     first_run: $query_first_run_ms,

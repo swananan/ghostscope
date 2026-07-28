@@ -108,11 +108,12 @@ The script prints three separate sections:
 DWARF fast-parse and index-build cost. It reports `average_ms`, `p50_ms`,
 `p95_ms`, `min_ms`, and `max_ms`.
 
-The source-line benchmark keeps one analyzer instance warm, repeats the same
-query multiple times, and records `first_run_ms`, `average_ms`, `p50_ms`,
-`p95_ms`, `min_ms`, and `max_ms`. Its latency covers the full source-line
-query path: source-line lookup, matched address resolution, and variable
-collection for those addresses.
+The source-line benchmark keeps one analyzer instance warm, performs 10
+unmeasured warmup queries by default, and then records `first_run_ms`,
+`average_ms`, `p50_ms`, `p95_ms`, `min_ms`, and `max_ms` from the measured
+queries. Use `--query-warmup-runs` to override the baseline warmup count. Its
+latency covers the full source-line query path: source-line lookup, matched
+address resolution, and variable collection for those addresses.
 
 ## Tuning
 
