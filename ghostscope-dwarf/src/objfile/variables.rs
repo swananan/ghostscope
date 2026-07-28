@@ -93,10 +93,7 @@ impl LoadedObjfile {
         variable.declaration = Some(die_ref(module, cu_offset, die_offset));
 
         let dwarf = self.dwarf();
-        let Ok(header) = dwarf.unit_header(cu_offset) else {
-            return;
-        };
-        let Ok(unit) = dwarf.unit(header) else {
+        let Ok(unit) = self.unit(cu_offset) else {
             return;
         };
         let Ok(entry) = unit.entry(die_offset) else {
@@ -234,15 +231,10 @@ impl LoadedObjfile {
             .cloned()?;
 
         if let Some(inline_idx) = Self::find_innermost_inline_node(&func, address) {
-            let dwarf = self.dwarf();
-            if let Ok(header) = dwarf.unit_header(func.cu_offset) {
-                if let Ok(unit) = dwarf.unit(header) {
-                    if let Some(off) = func.nodes[inline_idx].die_offset {
-                        if let Ok(entry) = unit.entry(off) {
-                            return Some(
-                                entry.tag() == gimli::constants::DW_TAG_inlined_subroutine,
-                            );
-                        }
+            if let Ok(unit) = self.unit(func.cu_offset) {
+                if let Some(off) = func.nodes[inline_idx].die_offset {
+                    if let Ok(entry) = unit.entry(off) {
+                        return Some(entry.tag() == gimli::constants::DW_TAG_inlined_subroutine);
                     }
                 }
             }
@@ -352,8 +344,7 @@ impl LoadedObjfile {
     ) -> Result<Vec<crate::parser::ParsedVariable>> {
         let mut vars = Vec::with_capacity(items.len());
         for (cu_off, die_off, scope_depth) in items.iter().cloned() {
-            let header = self.dwarf.unit_header(cu_off)?;
-            let unit = self.dwarf.unit(header)?;
+            let unit = self.unit(cu_off)?;
             let entry = unit.entry(die_off)?;
             if let Some(v) = self.detailed_parser.parse_variable_entry_with_mode(
                 &entry,
@@ -409,30 +400,26 @@ impl LoadedObjfile {
             .find_typedef(name);
         if let Some(td) = typedef {
             let dwarf = self.dwarf();
-            if let Ok(header) = dwarf.unit_header(td.cu_offset) {
-                if let Ok(unit) = dwarf.unit(header) {
-                    if let Ok(entry) = unit.entry(td.die_offset) {
-                        if let Ok(Some(type_loc)) =
-                            resolve_type_ref_with_origins(dwarf, &entry, &unit)
-                        {
-                            let ty =
-                                self.detailed_shallow_type(type_loc.cu_off, type_loc.die_off)?;
-                            return Some((ty, type_loc));
-                        }
-                        let ty = crate::parser::DetailedParser::resolve_type_shallow_at_offset(
-                            dwarf,
-                            &unit,
-                            td.die_offset,
-                            self.compilation_unit_language(td.cu_offset, &unit),
-                        )?;
-                        return Some((
-                            ty,
-                            TypeLoc {
-                                cu_off: td.cu_offset,
-                                die_off: td.die_offset,
-                            },
-                        ));
+            if let Ok(unit) = self.unit(td.cu_offset) {
+                if let Ok(entry) = unit.entry(td.die_offset) {
+                    if let Ok(Some(type_loc)) = resolve_type_ref_with_origins(dwarf, &entry, &unit)
+                    {
+                        let ty = self.detailed_shallow_type(type_loc.cu_off, type_loc.die_off)?;
+                        return Some((ty, type_loc));
                     }
+                    let ty = crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+                        dwarf,
+                        &unit,
+                        td.die_offset,
+                        self.compilation_unit_language(td.cu_offset, &unit),
+                    )?;
+                    return Some((
+                        ty,
+                        TypeLoc {
+                            cu_off: td.cu_offset,
+                            die_off: td.die_offset,
+                        },
+                    ));
                 }
             }
         }
@@ -547,8 +534,7 @@ impl LoadedObjfile {
         let cu_off = gimli::DebugInfoOffset(function.declaration.cu.0 as usize);
         let die_off = gimli::UnitOffset(function.declaration.offset as usize);
         let dwarf = self.dwarf();
-        let header = dwarf.unit_header(cu_off)?;
-        let unit = dwarf.unit(header)?;
+        let unit = self.unit(cu_off)?;
         let entry = unit.entry(die_off)?;
 
         let params = self.direct_function_parameters(dwarf, &unit, &entry)?;
@@ -631,8 +617,7 @@ impl LoadedObjfile {
 
     fn variable_name_for_ref(&self, var_ref: &VarRef) -> Option<String> {
         let dwarf = self.dwarf();
-        let header = dwarf.unit_header(var_ref.cu_offset).ok()?;
-        let unit = dwarf.unit(header).ok()?;
+        let unit = self.unit(var_ref.cu_offset).ok()?;
         let entry = unit.entry(var_ref.die_offset).ok()?;
         resolve_name_with_origins(dwarf, &unit, &entry)
             .ok()
@@ -655,8 +640,7 @@ impl LoadedObjfile {
         pc: u64,
     ) -> Option<crate::core::CfaResult> {
         let dwarf = self.dwarf();
-        let header = dwarf.unit_header(func.cu_offset).ok()?;
-        let unit = dwarf.unit(header).ok()?;
+        let unit = self.unit(func.cu_offset).ok()?;
         let path = func.block_path_for_pc(pc);
         let mut candidates: Vec<gimli::UnitOffset> = Vec::new();
         for &idx in path.iter().rev() {
@@ -744,8 +728,7 @@ impl LoadedObjfile {
         die_off: gimli::UnitOffset,
     ) -> Option<crate::TypeInfo> {
         let dwarf = self.dwarf();
-        let header = dwarf.unit_header(cu_off).ok()?;
-        let unit = dwarf.unit(header).ok()?;
+        let unit = self.unit(cu_off).ok()?;
         let entry = unit.entry(die_off).ok()?;
         let definition = complete_aggregate_declaration_entry(
             dwarf,
@@ -757,8 +740,7 @@ impl LoadedObjfile {
             &entry,
         );
         if let Some((def_cu_off, def_die_off)) = definition {
-            let def_header = dwarf.unit_header(def_cu_off).ok()?;
-            let def_unit = dwarf.unit(def_header).ok()?;
+            let def_unit = self.unit(def_cu_off).ok()?;
             return crate::parser::DetailedParser::resolve_type_shallow_at_offset(
                 dwarf,
                 &def_unit,
@@ -781,8 +763,7 @@ impl LoadedObjfile {
         die_off: gimli::UnitOffset,
     ) -> Option<crate::TypeInfo> {
         let dwarf = self.dwarf();
-        let header = dwarf.unit_header(cu_off).ok()?;
-        let unit = dwarf.unit(header).ok()?;
+        let unit = self.unit(cu_off).ok()?;
         let entry = unit.entry(die_off).ok()?;
         match resolve_type_ref_with_origins(dwarf, &entry, &unit) {
             Ok(Some(type_loc)) => self.detailed_shallow_type(type_loc.cu_off, type_loc.die_off),
