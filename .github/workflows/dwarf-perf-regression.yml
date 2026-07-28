@@ -167,7 +167,7 @@ jobs:
               --results-dir "$DWARF_PERF_RESULTS_DIR" \
               --result-name "base-${target}" \
               --runs 10 \
-              --cargo-target-dir "$CARGO_TARGET_DIR" \
+              --cargo-target-dir "$CARGO_TARGET_DIR/base" \
               --parse-target "$target"
           done
 
@@ -196,7 +196,7 @@ jobs:
               --results-dir "$DWARF_PERF_RESULTS_DIR" \
               --result-name "head-${target}" \
               --runs 10 \
-              --cargo-target-dir "$CARGO_TARGET_DIR" \
+              --cargo-target-dir "$CARGO_TARGET_DIR/head" \
               --parse-target "$target"
           done
 
@@ -239,7 +239,7 @@ jobs:
               --results-dir "$DWARF_PERF_RESULTS_DIR" \
               --result-name "head-${target}" \
               --runs 10 \
-              --cargo-target-dir "$CARGO_TARGET_DIR" \
+              --cargo-target-dir "$CARGO_TARGET_DIR/head" \
               --parse-target "$target"
           done
 
