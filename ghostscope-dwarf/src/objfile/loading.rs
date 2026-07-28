@@ -387,6 +387,7 @@ impl LoadedObjfile {
             indexed_line_cus: Mutex::new(HashSet::new()),
             unwind_info,
             dwarf,
+            parsed_unit_cache: RwLock::new(Default::default()),
             detailed_parser,
             block_index: std::sync::RwLock::new(BlockIndex::new()),
             type_name_index: RwLock::new(type_name_index),
