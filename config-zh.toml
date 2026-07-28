@@ -144,7 +144,8 @@ max_size_bytes = 0
 # 默认值：4
 max_nesting_depth = 4
 
-# 每个嵌套序列节点最多采集多少个语义子元素，例如 Vec<String>。如果
+# 每个嵌套序列节点最多采集多少个语义子元素，例如 Vec<String>，以及
+# 嵌套 Hash 表中最多为多少个 bucket 采集 key/value sidecar。如果
 # mem_dump_cap 无法容纳这么多子 payload，实际采集数量会更少。
 # 有效范围：1 到 16。
 # 默认值：4

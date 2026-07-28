@@ -208,6 +208,15 @@ mod tests {
             panic!("non-Rust composition must not query DWARF")
         }
 
+        fn project_tuple_member(
+            &self,
+            _current: &ResolvedType,
+            _index: u32,
+            _type_module_path: Option<&Path>,
+        ) -> crate::Result<TypeProjection> {
+            panic!("non-Rust composition must not query DWARF")
+        }
+
         fn resolve_aggregate_type_in_module(
             &self,
             _anchor: TypeId,

@@ -245,6 +245,13 @@ pub(crate) trait ValueAdapterContext {
         index: u32,
     ) -> Result<MemberLayout>;
 
+    fn project_tuple_member(
+        &self,
+        current: &ResolvedType,
+        index: u32,
+        type_module_path: Option<&Path>,
+    ) -> Result<TypeProjection>;
+
     fn resolve_aggregate_type_in_module(
         &self,
         anchor: TypeId,

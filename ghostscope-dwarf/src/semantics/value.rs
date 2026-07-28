@@ -36,6 +36,10 @@ pub struct ValueReadPlan {
     /// erase the physical allocation pointer to `u8`, so this cannot always be
     /// recovered by dereferencing the data projection.
     pub sequence_element: Option<crate::ResolvedType>,
+    /// Exact field identities for one hash-table entry. The physical entry
+    /// presentation retains only normalized DWARF types, which is insufficient
+    /// for recursively selecting source-language adapters.
+    pub hash_table_fields: Vec<ValueHashTableField>,
     /// Recursively selected adapters for values embedded in this root capture.
     ///
     /// The root capture remains valid on its own. Consumers that do not
@@ -55,9 +59,17 @@ impl ValueReadPlan {
             presentation,
             capture,
             sequence_element: None,
+            hash_table_fields: Vec::new(),
             nested: None,
         }
     }
+}
+
+/// Exact source-level identity for one hash-table entry field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueHashTableField {
+    pub field_index: usize,
+    pub resolved_type: crate::ResolvedType,
 }
 
 /// Adapter plans selected for semantic values embedded in a root capture.
@@ -69,6 +81,11 @@ pub enum ValueNestedPlan {
     ProjectedView { fields: Vec<ValueNestedFieldPlan> },
     /// Every captured sequence element uses the same semantic adapter.
     Sequence { element: Box<ValueReadPlan> },
+    /// Selected fields in every occupied hash-table bucket use the same
+    /// semantic adapters.
+    HashTable {
+        fields: Vec<ValueNestedHashTableFieldPlan>,
+    },
     /// Selected payload fields in active DWARF variant branches have semantic
     /// adapters.
     Variant {
@@ -79,6 +96,13 @@ pub enum ValueNestedPlan {
 /// One projected-view field with a recursively selected semantic adapter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValueNestedFieldPlan {
+    pub field_index: usize,
+    pub value: Box<ValueReadPlan>,
+}
+
+/// One source-level hash-table entry field with a recursively selected adapter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueNestedHashTableFieldPlan {
     pub field_index: usize,
     pub value: Box<ValueReadPlan>,
 }

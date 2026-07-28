@@ -523,6 +523,15 @@ pub mod math {
     }
 
     #[inline(never)]
+    pub fn observe_nested_hash_collections(
+        map: HashMap<String, Vec<i32>>,
+        set: HashSet<String>,
+    ) -> usize {
+        std::hint::black_box((&map, &set));
+        map.values().map(Vec::len).sum::<usize>() + set.len()
+    }
+
+    #[inline(never)]
     pub fn observe_user_hash_collections(
         map: &crate::user_types::HashMap<i32, u16>,
         set: &crate::user_types::HashSet<i32>,
@@ -956,6 +965,13 @@ fn main() {
             HashSet::new(),
             HashMap::from([((), ())]),
             HashSet::from([()]),
+        ) as i64;
+        acc += math::observe_nested_hash_collections(
+            HashMap::from([
+                (String::from("alpha"), vec![3, 5, 8]),
+                (String::from("omega"), vec![13, 21]),
+            ]),
+            HashSet::from([String::from("left"), String::from("right")]),
         ) as i64;
         let user_map = user_types::HashMap {
             key: 43_i32,

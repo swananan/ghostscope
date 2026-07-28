@@ -154,8 +154,9 @@ max_size_bytes = 0
 max_nesting_depth = 4
 
 # Maximum semantic child elements captured for each nested sequence node, such
-# as Vec<String>. The effective count can be lower when mem_dump_cap cannot fit
-# this many child payloads.
+# as Vec<String>, and buckets with key/value sidecars in nested hash tables.
+# The effective count can be lower when mem_dump_cap cannot fit this many child
+# payloads.
 # Valid range: 1 to 16.
 # Default: 4
 max_sequence_elements = 4

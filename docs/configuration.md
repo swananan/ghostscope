@@ -559,13 +559,15 @@ enable_sysmon_for_target = true  # Default
   independent of the depth-32 limit for native inline DWARF structure
   formatting.
 - `max_sequence_elements` limits the semantic children statically emitted for
-  each nested sequence node. It is a per-node width limit, not a recursion
-  depth.
+  each nested sequence node and the captured buckets that receive repeated
+  key/value sidecars in a nested hash table. It is a per-node width limit, not
+  a recursion depth.
 
 Both settings default to `4` and accept values from `1` through `16`. The
-effective sequence count is also bounded by the runtime sequence length and the
-argument's `ebpf.mem_dump_cap`. Increasing either setting can increase generated
-eBPF program size, event size, and probe overhead.
+effective collection width is also bounded by the runtime sequence length or
+hash-table capacity and the argument's `ebpf.mem_dump_cap`. Increasing either
+setting can increase generated eBPF program size, event size, and probe
+overhead.
 
 ### Configuration Examples
 

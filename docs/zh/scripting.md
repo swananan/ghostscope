@@ -245,6 +245,8 @@ Cell<String>              显示 Cell 包装并采集 String 字节
 Vec<String>               每个已采集元素使用 String 适配器
 Vec<CString>              每个已采集元素都会排除结尾 NUL
 Vec<Vec<i32>>             每个已采集元素使用 Vec 适配器
+HashMap<String, Vec<i32>> 已采集的 key/value 使用各自的适配器
+HashSet<String>           已采集的值使用 String 适配器
 Option<String>            只有 Some 会采集其 String payload
 Result<Request, String>   只采集当前激活的 Ok 或 Err payload
 ```
@@ -258,15 +260,17 @@ struct 中没有可识别的语义后代，它仍使用原有的原生 DWARF 路
 `value_adapters.max_nesting_depth` 条语义子值边，并检测当前路径中重复的
 DWARF 类型标识。为了到达已适配字段而穿过一个普通 Rust struct 也算一条边。
 从 enum 进入其 payload 同样算一条边。每个语义序列最多为
-`value_adapters.max_sequence_elements` 个元素预留子采集槽。两项默认值均为
-`4`；前者控制递归深度，后者控制每个序列节点的宽度。根值和所有子值共享
-该参数的 `mem_dump_cap`；降低这个上限可能减少采集的元素数，或回退到仍然
+`value_adapters.max_sequence_elements` 个元素预留子采集槽。嵌套 Hash 表也使用
+该配置限制带 key/value sidecar 的 bucket 数；由于 Hash 表是稀疏的，有界
+bucket 前缀中实际占用的条目可能更少。两项默认值均为 `4`；前者控制递归
+深度，后者控制每个集合节点的宽度。根值和所有子值共享该参数的
+`mem_dump_cap`；降低这个上限可能减少采集的元素或 bucket 数，或回退到仍然
 有效的根值展示。每个子值都有独立的读取错误和截断状态。配置细节见
 [Value Adapter 限制](configuration.md#value-adapter-限制)。
 
-Hash 表和 B-Tree 的条目遍历仍按 key/value 的 DWARF 类型格式化字节。例如，
-`HashMap<String, Vec<i32>>` 还不会为 key 或 value 递归运行适配器。已知的
-嵌套字段仍可在 DSL 中显式访问。
+Hash 表条目遍历会对 key/value 递归应用已识别的适配器，未识别字段仍使用
+原生 DWARF 格式。B-Tree 条目遍历仍按 key/value 的 DWARF 类型格式化字节；
+已知的嵌套字段仍可在 DSL 中显式访问。
 
 ## 变量
 

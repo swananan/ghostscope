@@ -5206,7 +5206,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "nested_root_ok",
             )
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
-        let can_capture = if matches!(value.children, NestedValueChildrenSource::Sequence { .. }) {
+        let can_capture = if matches!(
+            value.children,
+            NestedValueChildrenSource::Sequence { .. }
+                | NestedValueChildrenSource::HashTable { .. }
+        ) {
             let truncated = self
                 .builder
                 .build_int_compare(
@@ -5290,6 +5294,22 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 *slot_stride,
                 *slot_count,
                 element,
+                metadata,
+                finish_block,
+            )?,
+            NestedValueChildrenSource::HashTable {
+                first_slot_offset,
+                bucket_slot_stride,
+                bucket_count,
+                fields,
+                metadata,
+            } => self.emit_nested_hash_table_children(
+                payload_ptr,
+                descriptor,
+                *first_slot_offset,
+                *bucket_slot_stride,
+                *bucket_count,
+                fields,
                 metadata,
                 finish_block,
             )?,
@@ -5897,6 +5917,416 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn emit_nested_hash_table_children(
+        &mut self,
+        parent_payload: PointerValue<'ctx>,
+        descriptor: &RuntimeAddress<'ctx>,
+        first_slot_offset: usize,
+        bucket_slot_stride: usize,
+        bucket_count: usize,
+        fields: &[NestedHashTableFieldSource],
+        metadata: &NestedHashTableMetadataSource,
+        finish_block: inkwell::basic_block::BasicBlock<'ctx>,
+    ) -> Result<()> {
+        let function = self.current_function("compile nested hash-table children")?;
+        let i8_type = self.context.i8_type();
+        let i32_type = self.context.i32_type();
+        let i64_type = self.context.i64_type();
+        let occupancy_width = metadata
+            .occupancy
+            .byte_width()
+            .and_then(|width| usize::try_from(width).ok())
+            .ok_or_else(|| {
+                CodeGenError::DwarfError("invalid nested hash-table occupancy width".to_string())
+            })?;
+
+        for bucket_index in 0..bucket_count {
+            let bucket_slot_offset = bucket_index
+                .checked_mul(bucket_slot_stride)
+                .and_then(|offset| first_slot_offset.checked_add(offset))
+                .ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "nested hash-table bucket slot offset overflow".to_string(),
+                    )
+                })?;
+            for field in fields {
+                let slot_offset = bucket_slot_offset
+                    .checked_add(field.slot_offset)
+                    .ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "nested hash-table field slot offset overflow".to_string(),
+                        )
+                    })?;
+                self.initialize_nested_child_header(
+                    parent_payload,
+                    slot_offset,
+                    VariableStatus::AccessError,
+                )?;
+            }
+        }
+
+        let (pointer_offset, pointer_access_size) = match metadata.buckets {
+            HashTableBucketSource::Forward {
+                data_offset,
+                data_access_size,
+            } => (data_offset, data_access_size),
+            HashTableBucketSource::ReverseFromControl
+            | HashTableBucketSource::LegacyAfterControl { .. } => {
+                (metadata.control_offset, metadata.control_access_size)
+            }
+        };
+        let pointer_member = self
+            .builder
+            .build_int_add(
+                descriptor.value,
+                i64_type.const_int(pointer_offset, false),
+                "nested_hash_table_pointer_member",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let pointer_read = self.generate_memory_read_with_diagnostics(
+            descriptor.with_value(pointer_member),
+            pointer_access_size,
+            None,
+            "nested_hash_table_pointer",
+        )?;
+        let metadata_ok_block = self
+            .context
+            .append_basic_block(function, "nested_hash_table_metadata_ok");
+        self.builder
+            .build_conditional_branch(pointer_read.combined_fail, finish_block, metadata_ok_block)
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        self.builder.position_at_end(metadata_ok_block);
+
+        // SAFETY: the hash-table root capture reserves the complete fixed
+        // header.
+        let captured_buckets_ptr_i8 = unsafe {
+            self.builder
+                .build_gep(
+                    i8_type,
+                    parent_payload,
+                    &[i32_type.const_int(
+                        ghostscope_protocol::HASH_TABLE_CAPTURED_BUCKETS_OFFSET as u64,
+                        false,
+                    )],
+                    "nested_hash_table_captured_buckets_i8",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+        };
+        let captured_buckets_ptr = self
+            .builder
+            .build_pointer_cast(
+                captured_buckets_ptr_i8,
+                self.context.ptr_type(AddressSpace::default()),
+                "nested_hash_table_captured_buckets",
+            )
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+        let captured_buckets = self
+            .builder
+            .build_load(i64_type, captured_buckets_ptr, "nested_hash_table_captured")
+            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            .into_int_value();
+
+        let raw_pointer = pointer_read.value.into_int_value();
+        let bucket_base = match metadata.buckets {
+            HashTableBucketSource::Forward { .. } => raw_pointer,
+            HashTableBucketSource::ReverseFromControl => raw_pointer,
+            HashTableBucketSource::LegacyAfterControl {
+                entry_alignment,
+                pointer_tag_mask,
+            } => {
+                let control_address = self
+                    .builder
+                    .build_and(
+                        raw_pointer,
+                        i64_type.const_int(!pointer_tag_mask, false),
+                        "nested_hash_table_legacy_control",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                // SAFETY: the hash-table root capture reserves the complete
+                // fixed header.
+                let capacity_ptr_i8 = unsafe {
+                    self.builder
+                        .build_gep(
+                            i8_type,
+                            parent_payload,
+                            &[i32_type.const_int(
+                                ghostscope_protocol::HASH_TABLE_CAPACITY_OFFSET as u64,
+                                false,
+                            )],
+                            "nested_hash_table_capacity_i8",
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                };
+                let capacity_ptr = self
+                    .builder
+                    .build_pointer_cast(
+                        capacity_ptr_i8,
+                        self.context.ptr_type(AddressSpace::default()),
+                        "nested_hash_table_capacity",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                let capacity = self
+                    .builder
+                    .build_load(i64_type, capacity_ptr, "nested_hash_table_capacity_value")
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                    .into_int_value();
+                let hash_words_len = self
+                    .builder
+                    .build_int_mul(
+                        capacity,
+                        i64_type.const_int(occupancy_width as u64, false),
+                        "nested_hash_table_legacy_hash_words_len",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                let padded_len = self
+                    .builder
+                    .build_int_add(
+                        hash_words_len,
+                        i64_type.const_int(entry_alignment - 1, false),
+                        "nested_hash_table_legacy_padded_len",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                let aligned_len = self
+                    .builder
+                    .build_and(
+                        padded_len,
+                        i64_type.const_int(!(entry_alignment - 1), false),
+                        "nested_hash_table_legacy_aligned_len",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                self.builder
+                    .build_int_add(
+                        control_address,
+                        aligned_len,
+                        "nested_hash_table_legacy_bucket_base",
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+            }
+        };
+        let entry_stride = i64_type.const_int(metadata.entry_stride, false);
+
+        for bucket_index in 0..bucket_count {
+            let index_value = i64_type.const_int(bucket_index as u64, false);
+            let captured = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::ULT,
+                    index_value,
+                    captured_buckets,
+                    &format!("nested_hash_table_{bucket_index}_captured"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let occupancy_offset = ghostscope_protocol::HASH_TABLE_HEADER_SIZE
+                .checked_add(bucket_index.checked_mul(occupancy_width).ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "nested hash-table occupancy offset overflow".to_string(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "nested hash-table occupancy offset overflow".to_string(),
+                    )
+                })?;
+            let mut nonzero = None;
+            for byte_index in 0..occupancy_width {
+                let byte_offset = occupancy_offset.checked_add(byte_index).ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "nested hash-table occupancy byte offset overflow".to_string(),
+                    )
+                })?;
+                // SAFETY: planning bounds every occupancy byte to the reserved
+                // hash-table root payload.
+                let byte_ptr = unsafe {
+                    self.builder
+                        .build_gep(
+                            i8_type,
+                            parent_payload,
+                            &[i32_type.const_int(byte_offset as u64, false)],
+                            &format!("nested_hash_table_{bucket_index}_{byte_index}_occupancy_ptr"),
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                };
+                let byte = self
+                    .builder
+                    .build_load(
+                        i8_type,
+                        byte_ptr,
+                        &format!("nested_hash_table_{bucket_index}_{byte_index}_occupancy"),
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                    .into_int_value();
+                let byte_nonzero = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        byte,
+                        i8_type.const_zero(),
+                        &format!("nested_hash_table_{bucket_index}_{byte_index}_occupancy_nonzero"),
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                nonzero = Some(match nonzero {
+                    Some(previous) => self
+                        .builder
+                        .build_or(
+                            previous,
+                            byte_nonzero,
+                            &format!("nested_hash_table_{bucket_index}_occupancy_nonzero"),
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?,
+                    None => byte_nonzero,
+                });
+            }
+            let occupied = match metadata.occupancy {
+                ghostscope_dwarf::HashTableOccupancy::ControlByteHighBitClear => {
+                    // SAFETY: occupancy_offset selects the first reserved byte
+                    // for this bucket.
+                    let byte_ptr = unsafe {
+                        self.builder
+                            .build_gep(
+                                i8_type,
+                                parent_payload,
+                                &[i32_type.const_int(occupancy_offset as u64, false)],
+                                &format!("nested_hash_table_{bucket_index}_control_ptr"),
+                            )
+                            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                    };
+                    let control = self
+                        .builder
+                        .build_load(
+                            i8_type,
+                            byte_ptr,
+                            &format!("nested_hash_table_{bucket_index}_control"),
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                        .into_int_value();
+                    let high_bit = self
+                        .builder
+                        .build_and(
+                            control,
+                            i8_type.const_int(0x80, false),
+                            &format!("nested_hash_table_{bucket_index}_control_high_bit"),
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                    self.builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::EQ,
+                            high_bit,
+                            i8_type.const_zero(),
+                            &format!("nested_hash_table_{bucket_index}_occupied"),
+                        )
+                        .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                }
+                ghostscope_dwarf::HashTableOccupancy::NonZeroWord { .. } => {
+                    nonzero.ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "nested hash-table occupancy has no bytes".to_string(),
+                        )
+                    })?
+                }
+            };
+            let active = self
+                .builder
+                .build_and(
+                    captured,
+                    occupied,
+                    &format!("nested_hash_table_{bucket_index}_active"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let active_block = self.context.append_basic_block(
+                function,
+                &format!("nested_hash_table_{bucket_index}_capture"),
+            );
+            let continue_block = self.context.append_basic_block(
+                function,
+                &format!("nested_hash_table_{bucket_index}_continue"),
+            );
+            self.builder
+                .build_conditional_branch(active, active_block, continue_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder.position_at_end(active_block);
+
+            let entry_offset = self
+                .builder
+                .build_int_mul(
+                    index_value,
+                    entry_stride,
+                    &format!("nested_hash_table_{bucket_index}_entry_offset"),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let entry_address = match metadata.buckets {
+                HashTableBucketSource::ReverseFromControl => self
+                    .builder
+                    .build_int_sub(
+                        bucket_base,
+                        self.builder
+                            .build_int_add(
+                                entry_offset,
+                                entry_stride,
+                                &format!("nested_hash_table_{bucket_index}_reverse_entry_end"),
+                            )
+                            .map_err(|error| CodeGenError::LLVMError(error.to_string()))?,
+                        &format!("nested_hash_table_{bucket_index}_entry_address"),
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?,
+                HashTableBucketSource::Forward { .. }
+                | HashTableBucketSource::LegacyAfterControl { .. } => self
+                    .builder
+                    .build_int_add(
+                        bucket_base,
+                        entry_offset,
+                        &format!("nested_hash_table_{bucket_index}_entry_address"),
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?,
+            };
+            let bucket_slot_offset = bucket_index
+                .checked_mul(bucket_slot_stride)
+                .and_then(|offset| first_slot_offset.checked_add(offset))
+                .ok_or_else(|| {
+                    CodeGenError::DwarfError(
+                        "nested hash-table bucket slot offset overflow".to_string(),
+                    )
+                })?;
+            for field in fields {
+                let field_address = self
+                    .builder
+                    .build_int_add(
+                        entry_address,
+                        i64_type.const_int(field.entry_offset, false),
+                        &format!(
+                            "nested_hash_table_{bucket_index}_field_{}_address",
+                            field.field_index
+                        ),
+                    )
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+                let slot_offset = bucket_slot_offset
+                    .checked_add(field.slot_offset)
+                    .ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "nested hash-table field slot offset overflow".to_string(),
+                        )
+                    })?;
+                self.emit_nested_child_slot(
+                    parent_payload,
+                    slot_offset,
+                    &RuntimeAddress::available(field_address, self.context),
+                    &field.child,
+                )?;
+            }
+            if self
+                .builder
+                .get_insert_block()
+                .is_some_and(|block| block.get_terminator().is_none())
+            {
+                self.builder
+                    .build_unconditional_branch(continue_block)
+                    .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            }
+            self.builder.position_at_end(continue_block);
+        }
+        Ok(())
+    }
+
     /// Generate eBPF code for PrintComplexFormat instruction with runtime reads for variables
     pub(super) fn generate_print_complex_format_instruction(
         &mut self,
@@ -6283,6 +6713,103 @@ mod complex_format_layout_tests {
         ebpf.module.print_to_string().to_string()
     }
 
+    fn nested_hash_table_emitter_ir(
+        buckets: HashTableBucketSource,
+        occupancy: ghostscope_dwarf::HashTableOccupancy,
+    ) -> String {
+        let context = Context::create();
+        let options = crate::CompileOptions::default();
+        let mut ebpf = EbpfContext::new(&context, "nested_hash_table", Some(0), &options)
+            .expect("create eBPF context");
+        let function_type = context.i64_type().fn_type(&[], false);
+        let function = ebpf
+            .module
+            .add_function("emit_nested_hash_table", function_type, None);
+        let entry = context.append_basic_block(function, "entry");
+        let finish = context.append_basic_block(function, "finish");
+        ebpf.builder.position_at_end(entry);
+
+        let bucket_count = 2usize;
+        let entry_stride = 8u64;
+        let occupancy_width = usize::try_from(
+            occupancy
+                .byte_width()
+                .expect("test occupancy has a known width"),
+        )
+        .expect("test occupancy width fits usize");
+        let root_payload_len = ghostscope_protocol::HASH_TABLE_HEADER_SIZE
+            + bucket_count * (occupancy_width + entry_stride as usize);
+        let child = NestedValueSource {
+            output_type: ghostscope_dwarf::TypeInfo::BaseType {
+                name: "u8".to_string(),
+                size: 1,
+                encoding: ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16,
+            },
+            presentation: ghostscope_dwarf::ValuePresentation::Dwarf,
+            root_payload_len: 1,
+            total_len: 1,
+            root: NestedValueRootSource::ProjectedValue { offset: 0, len: 1 },
+            children: NestedValueChildrenSource::None,
+        };
+        let bucket_slot_stride =
+            ghostscope_protocol::NESTED_VALUE_CHILD_HEADER_SIZE + child.total_len;
+        let total_len = root_payload_len + bucket_count * bucket_slot_stride;
+        let parent_payload = ebpf
+            .builder
+            .build_alloca(
+                context.i8_type().array_type(total_len as u32),
+                "parent_payload",
+            )
+            .expect("allocate nested hash-table payload");
+        let descriptor =
+            RuntimeAddress::available(context.i64_type().const_int(0x1000, false), &context);
+        let control_offset = match buckets {
+            HashTableBucketSource::LegacyAfterControl { .. } => 16,
+            HashTableBucketSource::Forward { .. } | HashTableBucketSource::ReverseFromControl => 0,
+        };
+        let fields = [NestedHashTableFieldSource {
+            field_index: 0,
+            entry_offset: 0,
+            slot_offset: 0,
+            child: Box::new(child),
+        }];
+        let metadata = NestedHashTableMetadataSource {
+            control_offset,
+            control_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            entry_stride,
+            occupancy,
+            buckets,
+        };
+
+        ebpf.emit_nested_hash_table_children(
+            parent_payload,
+            &descriptor,
+            root_payload_len,
+            bucket_slot_stride,
+            bucket_count,
+            &fields,
+            &metadata,
+            finish,
+        )
+        .expect("emit nested hash-table capture");
+        if ebpf
+            .builder
+            .get_insert_block()
+            .is_some_and(|block| block.get_terminator().is_none())
+        {
+            ebpf.builder
+                .build_unconditional_branch(finish)
+                .expect("finish nested hash-table capture");
+        }
+        ebpf.builder.position_at_end(finish);
+        ebpf.builder
+            .build_return(Some(&context.i64_type().const_zero()))
+            .expect("return from test function");
+        ebpf.module.verify().expect("verify generated LLVM IR");
+
+        ebpf.module.print_to_string().to_string()
+    }
+
     fn btree_emitter_ir(capture: BTreeCaptureConfig, max_len: usize) -> String {
         let context = Context::create();
         let options = crate::CompileOptions::default();
@@ -6603,6 +7130,45 @@ mod complex_format_layout_tests {
         assert!(legacy_ir.contains("hash_table_legacy_hash_words_aligned_length"));
         assert!(legacy_ir.contains("hash_table_legacy_bucket_source"));
         assert!(!legacy_ir.contains("hash_table_data_metadata"));
+    }
+
+    #[test]
+    fn nested_hash_table_emitter_uses_each_dwarf_storage_layout() {
+        let reverse_ir = nested_hash_table_emitter_ir(
+            HashTableBucketSource::ReverseFromControl,
+            ghostscope_dwarf::HashTableOccupancy::ControlByteHighBitClear,
+        );
+        assert!(
+            reverse_ir.contains("%nested_hash_table_0_entry_address = sub i64"),
+            "{reverse_ir}"
+        );
+        assert!(
+            reverse_ir.contains("nested_hash_table_0_field_0_address"),
+            "{reverse_ir}"
+        );
+
+        let forward_ir = nested_hash_table_emitter_ir(
+            HashTableBucketSource::Forward {
+                data_offset: 8,
+                data_access_size: ghostscope_dwarf::MemoryAccessSize::U64,
+            },
+            ghostscope_dwarf::HashTableOccupancy::ControlByteHighBitClear,
+        );
+        assert!(forward_ir.contains("%nested_hash_table_0_entry_address = add i64"));
+        assert!(!forward_ir.contains("nested_hash_table_legacy_bucket_base"));
+        assert!(forward_ir.contains("nested_hash_table_0_field_0_address"));
+
+        let legacy_ir = nested_hash_table_emitter_ir(
+            HashTableBucketSource::LegacyAfterControl {
+                entry_alignment: 4,
+                pointer_tag_mask: 1,
+            },
+            ghostscope_dwarf::HashTableOccupancy::NonZeroWord { word_size: 8 },
+        );
+        assert!(legacy_ir.contains("nested_hash_table_legacy_control"));
+        assert!(legacy_ir.contains("nested_hash_table_legacy_aligned_len"));
+        assert!(legacy_ir.contains("nested_hash_table_legacy_bucket_base"));
+        assert!(legacy_ir.contains("%nested_hash_table_0_entry_address = add i64"));
     }
 
     #[test]
