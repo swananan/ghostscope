@@ -33,116 +33,17 @@ impl FormatValidator {
     /// Returns (placeholders, star_extras) where star_extras is the number of additional
     /// dynamic-length arguments required by `.*` occurrences.
     fn count_required_args(format: &str) -> Result<(usize, usize), ParseError> {
-        let mut placeholders = 0usize;
-        let mut star_extras = 0usize;
-        let mut chars = format.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            match ch {
-                '{' => {
-                    if chars.peek() == Some(&'{') {
-                        chars.next(); // Skip escaped '{{'
-                    } else {
-                        // Found a placeholder, look for closing '}'
-                        let mut found_closing = false;
-                        let mut placeholder_content = String::new();
-
-                        for inner_ch in chars.by_ref() {
-                            if inner_ch == '}' {
-                                found_closing = true;
-                                break;
-                            }
-                            placeholder_content.push(inner_ch);
-                        }
-
-                        if !found_closing {
-                            return Err(ParseError::InvalidExpression);
-                        }
-
-                        // Accept: empty "{}" or extended forms like ":x", ":X", ":p", ":s", optionally with
-                        // a length suffix ".N" (digits) or ".*" (dynamic length consumes one extra argument)
-                        if placeholder_content.is_empty() {
-                            placeholders += 1;
-                        } else {
-                            // Must start with ':'
-                            if !placeholder_content.starts_with(':') {
-                                return Err(ParseError::TypeError(format!(
-                        "Invalid format specifier '{{{placeholder_content}}}': expected ':' prefix"
-                    )));
-                            }
-                            // Extract conv and optional suffix
-                            let tail = &placeholder_content[1..];
-                            // conv is first char
-                            let mut iter = tail.chars();
-                            let conv = iter.next().ok_or_else(|| {
-                                ParseError::TypeError("Empty format after ':'".to_string())
-                            })?;
-                            match conv {
-                                'x' | 'X' | 'p' | 's' => {}
-                                _ => {
-                                    return Err(ParseError::TypeError(format!(
-                                        "Unsupported format conversion '{{:{conv}}}'"
-                                    )));
-                                }
-                            }
-                            // Remaining should be empty or ".N" or ".*" or ".name$" (capture variable)
-                            let rest: String = iter.collect();
-                            if rest.is_empty() {
-                                // ok
-                            } else if let Some(rem) = rest.strip_prefix('.') {
-                                if rem == "*" {
-                                    star_extras += 1; // dynamic length consumes next arg
-                                } else if let Some(name) = rem.strip_suffix('$') {
-                                    // capture variable name: [A-Za-z_][A-Za-z0-9_]*$
-                                    let mut chars = name.chars();
-                                    let valid = if let Some(first) = chars.next() {
-                                        (first.is_ascii_alphabetic() || first == '_')
-                                            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-                                    } else {
-                                        false
-                                    };
-                                    if !valid {
-                                        return Err(ParseError::TypeError(format!(
-                                            "Invalid capture variable in specifier '{{:{conv}.{rem}}}'"
-                                        )));
-                                    }
-                                } else if rem.chars().all(|c| c.is_ascii_digit())
-                                    || (rem.starts_with("0x")
-                                        && rem.len() > 2
-                                        && rem[2..].chars().all(|c| c.is_ascii_hexdigit()))
-                                    || (rem.starts_with("0o")
-                                        && rem.len() > 2
-                                        && rem[2..].chars().all(|c| matches!(c, '0'..='7')))
-                                    || (rem.starts_with("0b")
-                                        && rem.len() > 2
-                                        && rem[2..].chars().all(|c| matches!(c, '0' | '1')))
-                                {
-                                    // static length with base support: decimal / 0x.. / 0o.. / 0b..
-                                } else {
-                                    return Err(ParseError::TypeError(format!(
-                                        "Invalid length in specifier '{{:{conv}{rest}}}'"
-                                    )));
-                                }
-                            } else {
-                                return Err(ParseError::TypeError(format!(
-                                    "Invalid specifier syntax '{{:{conv}{rest}}}'"
-                                )));
-                            }
-                            placeholders += 1;
-                        }
-                    }
-                }
-                '}' => {
-                    if chars.peek() == Some(&'}') {
-                        chars.next(); // Skip escaped '}}'
-                    } else {
-                        return Err(ParseError::InvalidExpression); // Unmatched '}'
-                    }
-                }
-                _ => {}
+        let template = ghostscope_protocol::FormatTemplate::parse(format).map_err(|error| {
+            if error.is_structure_error() {
+                ParseError::InvalidExpression
+            } else {
+                ParseError::TypeError(error.to_string())
             }
-        }
-
+        })?;
+        let placeholders = template.slot_count();
+        let star_extras = template
+            .script_argument_count()
+            .saturating_sub(placeholders);
         Ok((placeholders, star_extras))
     }
 }

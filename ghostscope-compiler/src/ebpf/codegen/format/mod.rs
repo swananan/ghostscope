@@ -296,104 +296,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             args.len()
         );
         let format_string_index = self.trace_context.add_string(format.to_string())?;
-        let mut complex_args: Vec<ComplexArg<'ctx>> = Vec::with_capacity(args.len());
-
-        // Parse placeholders from the format string to support extended specifiers
-        #[derive(Clone, Copy, Debug, PartialEq)]
-        enum Conv {
-            Default,
-            HexLower,
-            HexUpper,
-            Ptr,
-            Ascii,
-        }
-        #[derive(Clone, Debug, PartialEq)]
-        enum LenSpec {
-            None,
-            Static(usize),
-            Star,
-            Capture(String),
-        }
-
-        fn parse_static_len(spec: &str) -> Option<usize> {
-            if spec.chars().all(|c| c.is_ascii_digit()) {
-                return spec.parse::<usize>().ok();
-            }
-            if let Some(hex) = spec.strip_prefix("0x") {
-                if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return usize::from_str_radix(hex, 16).ok();
-                }
-            }
-            if let Some(oct) = spec.strip_prefix("0o") {
-                if !oct.is_empty() && oct.chars().all(|c| matches!(c, '0'..='7')) {
-                    return usize::from_str_radix(oct, 8).ok();
-                }
-            }
-            if let Some(bin) = spec.strip_prefix("0b") {
-                if !bin.is_empty() && bin.chars().all(|c| matches!(c, '0' | '1')) {
-                    return usize::from_str_radix(bin, 2).ok();
-                }
-            }
-            None
-        }
-
-        fn parse_slots(fmt: &str) -> Vec<(Conv, LenSpec)> {
-            let mut res = Vec::new();
-            let mut it = fmt.chars().peekable();
-            while let Some(ch) = it.next() {
-                if ch == '{' {
-                    if it.peek() == Some(&'{') {
-                        it.next();
-                        continue;
-                    }
-                    let mut content = String::new();
-                    for c in it.by_ref() {
-                        if c == '}' {
-                            break;
-                        }
-                        content.push(c);
-                    }
-                    if content.is_empty() {
-                        res.push((Conv::Default, LenSpec::None));
-                    } else if let Some(rest) = content.strip_prefix(':') {
-                        let mut sit = rest.chars();
-                        let conv = match sit.next().unwrap_or(' ') {
-                            'x' => Conv::HexLower,
-                            'X' => Conv::HexUpper,
-                            'p' => Conv::Ptr,
-                            's' => Conv::Ascii,
-                            _ => Conv::Default,
-                        };
-                        let rest: String = sit.collect();
-                        let lens = if rest.is_empty() {
-                            LenSpec::None
-                        } else if let Some(r) = rest.strip_prefix('.') {
-                            if r == "*" {
-                                LenSpec::Star
-                            } else if let Some(s) = r.strip_suffix('$') {
-                                LenSpec::Capture(s.to_string())
-                            } else if let Some(n) = parse_static_len(r) {
-                                LenSpec::Static(n)
-                            } else {
-                                LenSpec::None
-                            }
-                        } else {
-                            LenSpec::None
-                        };
-                        res.push((conv, lens));
-                    } else {
-                        res.push((Conv::Default, LenSpec::None));
-                    }
-                }
-            }
-            res
-        }
-
-        let slots = parse_slots(format);
+        let template = FormatTemplate::parse(format)
+            .map_err(|error| CodeGenError::TypeError(error.to_string()))?;
+        let mut complex_args: Vec<ComplexArg<'ctx>> =
+            Vec::with_capacity(template.wire_argument_count());
         let mut ai = 0usize; // arg cursor
-        for (conv, lens) in slots.into_iter() {
-            match conv {
-                Conv::Default => {
+        for slot in template.slots() {
+            match slot.conversion {
+                FormatConversion::Default => {
                     if ai >= args.len() {
                         break;
                     }
@@ -404,7 +314,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     complex_args.push(a);
                     ai += 1;
                 }
-                Conv::Ptr => {
+                FormatConversion::Pointer => {
                     if ai >= args.len() {
                         break;
                     }
@@ -458,12 +368,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     });
                     ai += 1;
                 }
-                Conv::HexLower | Conv::HexUpper | Conv::Ascii => {
+                FormatConversion::LowerHex
+                | FormatConversion::UpperHex
+                | FormatConversion::String => {
                     // Memory dump; handle static length at compile time. Other cases use default read and let user space trim.
                     // Handle star: consume length arg (as computed int) then value arg
-                    let wants_ascii = matches!(conv, Conv::Ascii);
-                    match lens {
-                        LenSpec::Static(n) if ai < args.len() => {
+                    match &slot.length {
+                        FormatLength::Static(n) if ai < args.len() => {
+                            let Ok(n) = usize::try_from(*n) else {
+                                return Err(CodeGenError::TypeError(format!(
+                                    "capture length {n} does not fit this host"
+                                )));
+                            };
                             // Resolve value expr address
                             let expr = &args[ai];
                             let addr_iv = self.resolve_memory_format_address(expr)?;
@@ -493,7 +409,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             });
                             ai += 1;
                         }
-                        LenSpec::Star => {
+                        FormatLength::Dynamic => {
                             // Dynamic length: consume length arg, then create a dynamic mem-dump for value
                             if ai + 1 >= args.len() {
                                 break;
@@ -555,18 +471,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             });
                             ai += 2;
                         }
-                        LenSpec::Capture(name) => {
+                        FormatLength::Capture(name) => {
                             // Use script variable `name` as length; emit a length argument + a dynamic mem-dump argument
                             if ai >= args.len() {
                                 break;
                             }
-                            if !self.variable_exists(&name) {
+                            if !self.variable_exists(name) {
                                 return Err(CodeGenError::TypeError(format!(
                                     "capture length variable '{name}' not found"
                                 )));
                             }
                             // length as computed int
-                            let len_val = self.load_variable(&name)?;
+                            let len_val = self.load_variable(name)?;
                             let (len_iv, byte_len) = match len_val {
                                 BasicValueEnum::IntValue(iv) => (iv, 8usize),
                                 BasicValueEnum::PointerValue(pv) => (
@@ -639,7 +555,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             ai += 1;
                         }
                     }
-                    let _ = wants_ascii; // reserved for future per-arg metadata
                 }
             }
         }
