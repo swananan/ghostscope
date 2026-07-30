@@ -178,6 +178,10 @@ fn plan_complex_format_layout(
         headers_total += header_len;
 
         let static_payload_len = complex_format_static_payload_len(arg);
+        let atomic_dynamic_payload_len = match &arg.source {
+            ComplexArgSource::NestedValue { value, .. } => Some(value.total_len),
+            _ => None,
+        };
         if let Some(payload_len) = static_payload_len {
             static_payload_total += payload_len;
         } else if let ComplexArgSource::MemDumpDynamic { max_len, .. } = &arg.source {
@@ -206,7 +210,7 @@ fn plan_complex_format_layout(
             dynamic_max_lens.push(value.total_len);
         }
 
-        arg_payload_plans.push((header_len, static_payload_len));
+        arg_payload_plans.push((header_len, static_payload_len, atomic_dynamic_payload_len));
         arg_count = arg_count.saturating_add(1);
     }
 
@@ -222,14 +226,23 @@ fn plan_complex_format_layout(
 
     let args = arg_payload_plans
         .into_iter()
-        .map(|(header_len, static_payload_len)| {
-            let reserved_len =
-                static_payload_len.unwrap_or_else(|| dynamic_reservations_iter.next().unwrap_or(0));
-            ComplexFormatArgLayout {
-                header_len,
-                reserved_len,
-            }
-        })
+        .map(
+            |(header_len, static_payload_len, atomic_dynamic_payload_len)| {
+                let reserved_len = static_payload_len
+                    .unwrap_or_else(|| dynamic_reservations_iter.next().unwrap_or(0));
+                // Nested sidecars use fixed offsets in their registered presentation.
+                // A partial reservation cannot be decoded safely, and the emitter
+                // already represents an omitted nested payload as Truncated.
+                let reserved_len = match atomic_dynamic_payload_len {
+                    Some(required_len) if reserved_len < required_len => 0,
+                    _ => reserved_len,
+                };
+                ComplexFormatArgLayout {
+                    header_len,
+                    reserved_len,
+                }
+            },
+        )
         .collect::<Vec<_>>();
 
     let total_args_payload = args
@@ -2960,7 +2973,7 @@ mod complex_format_layout_tests {
     }
 
     #[test]
-    fn complex_format_layout_bounds_nested_values_to_event_and_wire_budgets() {
+    fn complex_format_layout_omits_nested_values_that_do_not_fit_atomically() {
         let context = Context::create();
         let args = vec![nested_value_arg(&context, 40_000)];
         let max_trace_event_size = 32 * 1024;
@@ -2968,9 +2981,19 @@ mod complex_format_layout_tests {
         let layout = plan_complex_format_layout(max_trace_event_size, 0, &args);
         let instruction_budget = print_complex_format_instruction_budget(max_trace_event_size, 0);
 
-        assert_eq!(layout.total_size, instruction_budget);
-        assert!(layout.args[0].reserved_len < 40_000);
+        assert!(layout.total_size < instruction_budget);
+        assert_eq!(layout.args[0].reserved_len, 0);
         assert!(layout.inst_data_size <= u16::MAX as usize);
+    }
+
+    #[test]
+    fn complex_format_layout_reserves_nested_values_that_fit_atomically() {
+        let context = Context::create();
+        let args = vec![nested_value_arg(&context, 64)];
+
+        let layout = plan_complex_format_layout(4096, 0, &args);
+
+        assert_eq!(layout.args[0].reserved_len, 64);
     }
 
     #[test]

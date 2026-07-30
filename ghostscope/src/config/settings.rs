@@ -603,6 +603,18 @@ impl EbpfConfig {
             ));
         }
 
+        if self.max_trace_event_size < ghostscope_compiler::MIN_TRACE_EVENT_SIZE {
+            return Err(anyhow::anyhow!(
+                "❌ Invalid eBPF configuration in '{}':\n\n\
+                max_trace_event_size {} is too small\n\n\
+                💡 Minimum value: {} bytes for the trace event envelope; \
+                individual scripts may require more",
+                file_path,
+                self.max_trace_event_size,
+                ghostscope_compiler::MIN_TRACE_EVENT_SIZE
+            ));
+        }
+
         // Validate proc_module_offsets_max_entries is reasonable (at least 64, at most 65536)
         if self.proc_module_offsets_max_entries < 64 || self.proc_module_offsets_max_entries > 65536
         {
@@ -1053,6 +1065,28 @@ mod tests {
         .expect_err("backtrace_depth=0 should be rejected");
 
         assert!(error.to_string().contains("backtrace_depth"));
+    }
+
+    #[test]
+    fn ebpf_rejects_trace_event_size_below_protocol_minimum() {
+        let mut config = Config::default().ebpf;
+        config.max_trace_event_size = ghostscope_compiler::MIN_TRACE_EVENT_SIZE - 1;
+
+        let error = config
+            .validate("test.toml")
+            .expect_err("undersized trace events should be rejected");
+
+        let message = error.to_string();
+        assert!(message.contains("max_trace_event_size"));
+        assert!(message.contains(&ghostscope_compiler::MIN_TRACE_EVENT_SIZE.to_string()));
+    }
+
+    #[test]
+    fn ebpf_accepts_protocol_minimum_trace_event_size() {
+        let mut config = Config::default().ebpf;
+        config.max_trace_event_size = ghostscope_compiler::MIN_TRACE_EVENT_SIZE;
+
+        config.validate("test.toml").unwrap();
     }
 
     #[test]

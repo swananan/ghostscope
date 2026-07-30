@@ -277,6 +277,7 @@ mem_dump_cap = 256
 # Maximum size (in bytes) of a single trace event message.
 # Applies to PerfEventArray accumulation buffer and serves as an upper bound
 # when constructing print instructions in the kernel.
+# Minimum: 36 bytes for the event envelope; scripts require additional space.
 # Increase if you plan to print many/large variables in one event.
 max_trace_event_size = 32768
 

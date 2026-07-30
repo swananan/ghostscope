@@ -16,6 +16,23 @@ const fn split_pid_tgid(pid_tgid: u64) -> (u32, u32) {
     ((pid_tgid >> 32) as u32, pid_tgid as u32)
 }
 
+fn checked_event_reservation(current: usize, size: u64, maximum: usize) -> Result<usize> {
+    let size = usize::try_from(size).map_err(|_| CodeGenError::TraceEventBudgetExceeded {
+        required: usize::MAX,
+        maximum,
+    })?;
+    let required = current
+        .checked_add(size)
+        .ok_or(CodeGenError::TraceEventBudgetExceeded {
+            required: usize::MAX,
+            maximum,
+        })?;
+    if required > maximum {
+        return Err(CodeGenError::TraceEventBudgetExceeded { required, maximum });
+    }
+    Ok(required)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeEarlyReturnReason {
     AccumulationBufferNull,
@@ -63,6 +80,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         &mut self,
         size: u64,
     ) -> Result<RuntimeReturnAwareValue<'ctx, PointerValue<'ctx>>> {
+        let reserved_upper_bound = checked_event_reservation(
+            self.compile_time_event_bytes_upper_bound,
+            size,
+            self.compile_options.max_trace_event_size as usize,
+        )?;
         let i32_ty = self.context.i32_type();
         let i64_ty = self.context.i64_type();
 
@@ -186,9 +208,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_store(offset_ptr, new_off)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store updated offset: {e}")))?;
-        self.compile_time_event_bytes_upper_bound = self
-            .compile_time_event_bytes_upper_bound
-            .saturating_add(size as usize);
+        self.compile_time_event_bytes_upper_bound = reserved_upper_bound;
 
         Ok(RuntimeReturnAwareValue {
             value: dest_i8,
@@ -712,7 +732,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_pid_tgid;
+    use super::{checked_event_reservation, split_pid_tgid};
+    use crate::ebpf::context::CodeGenError;
 
     #[test]
     fn split_pid_tgid_uses_tgid_for_pid_and_pid_for_tid() {
@@ -722,5 +743,24 @@ mod tests {
 
         assert_eq!(pid, 0x1122_3344);
         assert_eq!(tid, 0x5566_7788);
+    }
+
+    #[test]
+    fn event_reservation_accepts_the_exact_budget() {
+        assert_eq!(checked_event_reservation(28, 14, 42).unwrap(), 42);
+    }
+
+    #[test]
+    fn event_reservation_rejects_compile_time_overflow() {
+        let error = checked_event_reservation(248, 8, 255).unwrap_err();
+
+        assert!(matches!(
+            error,
+            CodeGenError::TraceEventBudgetExceeded {
+                required: 256,
+                maximum: 255
+            }
+        ));
+        assert!(error.to_string().contains("max_trace_event_size"));
     }
 }
