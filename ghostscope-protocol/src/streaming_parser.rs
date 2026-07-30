@@ -1,7 +1,7 @@
 use crate::format_printer::FormatPrinter;
 use crate::trace_context::TraceContext;
 use crate::trace_event::*;
-use crate::{FormatConversion, FormatTemplate, TypeKind};
+use crate::{FormatConversion, FormatPart, FormatTemplate, TypeKind};
 use tracing::{debug, warn};
 use zerocopy::FromBytes;
 
@@ -77,6 +77,54 @@ pub struct ParsedTraceEvent {
     pub instructions: Vec<ParsedInstruction>,
 }
 
+/// Format a legacy `PrintString` followed by contiguous `PrintVariable`
+/// instructions.
+///
+/// Returns `None` when the string is malformed or has no unescaped default
+/// placeholders. The consumed count includes the `PrintString` instruction.
+pub fn format_legacy_string_with_variables(
+    format_string: &str,
+    instructions: &[ParsedInstruction],
+    start_index: usize,
+) -> Option<(String, usize)> {
+    let template = FormatTemplate::parse(format_string).ok()?;
+    if !template
+        .slots()
+        .any(|slot| slot.conversion == FormatConversion::Default)
+    {
+        return None;
+    }
+
+    let mut consumed = 1;
+    let mut result = String::new();
+    let mut instruction_index = start_index;
+    let mut can_substitute = true;
+
+    for part in template.parts() {
+        match part {
+            FormatPart::Literal(literal) => result.push_str(literal),
+            FormatPart::Slot(slot) if slot.conversion == FormatConversion::Default => {
+                if can_substitute {
+                    if let Some(ParsedInstruction::PrintVariable {
+                        formatted_value, ..
+                    }) = instructions.get(instruction_index)
+                    {
+                        result.push_str(formatted_value);
+                        consumed += 1;
+                        instruction_index += 1;
+                        continue;
+                    }
+                    can_substitute = false;
+                }
+                result.push_str(&slot.to_string());
+            }
+            FormatPart::Slot(slot) => result.push_str(&slot.to_string()),
+        }
+    }
+
+    Some((result, consumed))
+}
+
 impl ParsedTraceEvent {
     pub fn has_formatted_output(&self) -> bool {
         self.instructions
@@ -93,17 +141,9 @@ impl ParsedTraceEvent {
         while i < self.instructions.len() {
             match &self.instructions[i] {
                 ParsedInstruction::PrintString { content } => {
-                    let template = FormatTemplate::parse(content).ok();
-                    let has_default_slot = template.as_ref().is_some_and(|template| {
-                        template
-                            .slots()
-                            .any(|slot| slot.conversion == FormatConversion::Default)
-                    });
-                    if has_default_slot {
-                        let (formatted, consumed) = self.format_template_with_variables(
-                            template.as_ref().expect("template parsed above"),
-                            i + 1,
-                        );
+                    if let Some((formatted, consumed)) =
+                        format_legacy_string_with_variables(content, &self.instructions, i + 1)
+                    {
                         emit(&formatted)?;
                         i += consumed;
                     } else {
@@ -137,42 +177,6 @@ impl ParsedTraceEvent {
             });
 
         output
-    }
-
-    /// Format a format string with following variable instructions
-    fn format_template_with_variables(
-        &self,
-        template: &FormatTemplate,
-        start_index: usize,
-    ) -> (String, usize) {
-        let mut consumed = 1; // At least consume the format string itself
-        let mut result = String::new();
-        let mut instruction_index = start_index;
-        let mut can_substitute = true;
-
-        for part in template.parts() {
-            match part {
-                crate::FormatPart::Literal(literal) => result.push_str(literal),
-                crate::FormatPart::Slot(slot) if slot.conversion == FormatConversion::Default => {
-                    if can_substitute {
-                        if let Some(ParsedInstruction::PrintVariable {
-                            formatted_value, ..
-                        }) = self.instructions.get(instruction_index)
-                        {
-                            result.push_str(formatted_value);
-                            consumed += 1;
-                            instruction_index += 1;
-                            continue;
-                        }
-                        can_substitute = false;
-                    }
-                    result.push_str(&slot.to_string());
-                }
-                crate::FormatPart::Slot(slot) => result.push_str(&slot.to_string()),
-            }
-        }
-
-        (result, consumed)
     }
 }
 

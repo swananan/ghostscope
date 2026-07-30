@@ -126,4 +126,43 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn legacy_escaped_braces_match_protocol_output() {
+        let event = ParsedTraceEvent {
+            trace_id: 8,
+            timestamp: 12,
+            pid: 44,
+            tid: 45,
+            instructions: vec![
+                ParsedInstruction::PrintString {
+                    content: "{{}}".to_string(),
+                },
+                ParsedInstruction::PrintVariable {
+                    name: "value".to_string(),
+                    type_encoding: TypeKind::I32,
+                    formatted_value: "42".to_string(),
+                    raw_data: vec![42],
+                },
+                ParsedInstruction::EndInstruction {
+                    total_instructions: 2,
+                    execution_status: 0,
+                },
+            ],
+        };
+
+        let protocol_output = event.to_formatted_output();
+        let display = UiTraceEvent::from_protocol_event(&event);
+
+        assert!(matches!(
+            &display.items[..],
+            [
+                TraceDisplayItem::Text { content },
+                TraceDisplayItem::Variable(variable),
+            ] if content == "{{}}"
+                && variable.name == "value"
+                && variable.formatted_value == "42"
+        ));
+        assert_eq!(display.to_formatted_output(), protocol_output);
+    }
 }

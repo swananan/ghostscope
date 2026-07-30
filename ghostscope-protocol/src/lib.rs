@@ -98,8 +98,8 @@ pub use format_template::{
 };
 
 pub use streaming_parser::{
-    EventSource, ParseState, ParsedBacktraceFrame, ParsedInstruction, ParsedTraceEvent,
-    StreamingTraceParser,
+    format_legacy_string_with_variables, EventSource, ParseState, ParsedBacktraceFrame,
+    ParsedInstruction, ParsedTraceEvent, StreamingTraceParser,
 };
 
 pub use type_info::{
