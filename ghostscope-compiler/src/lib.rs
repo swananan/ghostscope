@@ -170,6 +170,15 @@ pub const DEFAULT_VALUE_ADAPTER_SEQUENCE_ELEMENTS: usize = 4;
 /// Maximum configurable number of semantic children per nested sequence.
 pub const MAX_VALUE_ADAPTER_SEQUENCE_ELEMENTS: usize = 16;
 
+/// Smallest event that can carry the fixed trace envelope and end marker.
+///
+/// Individual scripts require additional bytes for their trace instructions.
+pub const MIN_TRACE_EVENT_SIZE: u32 =
+    (std::mem::size_of::<ghostscope_protocol::trace_event::TraceEventHeader>()
+        + std::mem::size_of::<ghostscope_protocol::trace_event::TraceEventMessage>()
+        + std::mem::size_of::<ghostscope_protocol::trace_event::InstructionHeader>()
+        + std::mem::size_of::<ghostscope_protocol::trace_event::EndInstructionData>()) as u32;
+
 /// Compilation options including save options and eBPF map configuration
 #[derive(Debug, Clone)]
 pub struct CompileOptions {

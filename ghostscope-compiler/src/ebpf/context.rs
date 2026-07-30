@@ -80,6 +80,12 @@ pub enum CodeGenError {
     },
     #[error("Trace context error: {0}")]
     TraceContext(#[from] ghostscope_protocol::TraceContextOverflow),
+    #[error(
+        "Trace event requires at least {required} bytes, but \
+         [ebpf].max_trace_event_size is {maximum} bytes. Increase \
+         max_trace_event_size or reduce the number or size of trace instructions."
+    )]
+    TraceEventBudgetExceeded { required: usize, maximum: usize },
 }
 
 pub type Result<T> = std::result::Result<T, CodeGenError>;

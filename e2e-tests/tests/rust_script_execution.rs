@@ -2157,6 +2157,149 @@ max_trace_event_size = 32768
 }
 
 #[tokio::test]
+async fn test_rust_script_nested_event_truncation_stays_structurally_valid() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace observe_nested_owners {
+    print "RNESTED_EVENT_BUDGET:{}:{}", rc, arc;
+}
+"#;
+    let result = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_config_content(
+            r#"
+[value_adapters]
+max_nesting_depth = 1
+max_sequence_elements = 2
+
+[ebpf]
+mem_dump_cap = 1024
+max_trace_event_size = 256
+"#,
+        )
+        .attach_to(&target)
+        .timeout_secs(9)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await;
+    target.terminate().await?;
+    let (exit_code, stdout, stderr) = result?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RNESTED_EVENT_BUDGET:<truncated>:<truncated>")),
+        "Expected structurally valid nested truncation output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("<INVALID_"),
+        "Nested truncation exposed an internal payload marker: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rust_script_rejects_event_budget_overflow_before_attach() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    print "WIDE:{}:{}:{}:{}:{}:{}",
+        G_VEC_STRING, G_VEC_VEC_STRING, G_AGGREGATE_OUTER,
+        G_OPTION_VEC_STRING, G_RESULT_RECORDS_OK, G_CELL_STRING;
+    print "BYTES:{}:{:s}:{:x}",
+        G_OWNED_MESSAGE, G_OWNED_MESSAGE, G_OWNED_MESSAGE;
+}
+"#;
+    let result = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_config_content(
+            r#"
+[value_adapters]
+max_nesting_depth = 1
+max_sequence_elements = 1
+
+[ebpf]
+mem_dump_cap = 0
+max_trace_event_size = 256
+"#,
+        )
+        .attach_to(&target)
+        .timeout_secs(5)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await;
+    target.terminate().await?;
+    let (exit_code, stdout, stderr) = result?;
+    let output = format!("{stdout}\n{stderr}");
+
+    assert_ne!(
+        exit_code, 0,
+        "An over-budget trace must fail before attach: {output}"
+    );
+    assert!(
+        output.contains("Trace event requires at least")
+            && output.contains("[ebpf].max_trace_event_size is 256 bytes"),
+        "Expected an actionable event-budget diagnostic: {output}"
+    );
+    assert!(
+        !stdout.contains("WIDE:") && !stdout.contains("BYTES:"),
+        "An over-budget trace unexpectedly emitted output: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_trace_event_size_below_protocol_minimum_is_rejected() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace do_stuff {
+    print "TOO_SMALL";
+}
+"#;
+    let result = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .with_config_content(
+            r#"
+[ebpf]
+max_trace_event_size = 0
+"#,
+        )
+        .attach_to(&target)
+        .timeout_secs(5)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await;
+    target.terminate().await?;
+    let (exit_code, stdout, stderr) = result?;
+    let output = format!("{stdout}\n{stderr}");
+
+    assert_ne!(exit_code, 0, "An invalid event size must fail: {output}");
+    assert!(
+        output.contains("max_trace_event_size 0 is too small")
+            && output.contains(&format!(
+                "Minimum value: {} bytes",
+                ghostscope_compiler::MIN_TRACE_EVENT_SIZE
+            )),
+        "Expected a configuration-level event-size diagnostic: {output}"
+    );
+    assert!(
+        !output.contains("Invalid argument (os error 22)"),
+        "The invalid size reached low-level BPF map creation: {output}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_vec_deque_values() -> anyhow::Result<()> {
     init();
 
