@@ -11,17 +11,16 @@ use crate::trace_event::{
 };
 use crate::type_info::TypeInfo;
 use crate::{
-    BTreeEntryPresentation, BTreeFieldPresentation, HashTableBucketOrder,
-    HashTableEntryPresentation, HashTableFieldPresentation, HashTableOccupancy,
+    FormatConversion, FormatLength, FormatPart, FormatTemplate, HashTableEntryPresentation,
     NestedValueChildrenPresentation, NestedValueFieldPresentation,
     NestedValueHashTableFieldPresentation, NestedValuePresentation,
-    NestedValueVariantFieldPresentation, ValuePresentation, BTREE_CAPTURED_ITEM_COUNT_OFFSET,
-    BTREE_HEADER_SIZE, BTREE_NODE_HEADER_SIZE, BTREE_NODE_HEIGHT_OFFSET, BTREE_NODE_LENGTH_OFFSET,
-    BTREE_NODE_SLOT_COUNT_OFFSET, HASH_TABLE_BUCKET_DATA_OFFSET, HASH_TABLE_CAPACITY_OFFSET,
-    HASH_TABLE_CAPTURED_BUCKETS_OFFSET, HASH_TABLE_HEADER_SIZE, INDIRECT_BYTES_LENGTH_PREFIX_SIZE,
-    INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET, INDIRECT_SEQUENCE_HEADER_SIZE,
+    NestedValueVariantFieldPresentation, ValuePresentation, INDIRECT_BYTES_LENGTH_PREFIX_SIZE,
     NESTED_VALUE_CHILD_HEADER_SIZE, NESTED_VALUE_CHILD_STATUS_OFFSET,
 };
+
+mod btree;
+mod hash_table;
+mod sequence;
 
 struct ActiveVariantMember<'a> {
     part_index: Option<usize>,
@@ -56,27 +55,6 @@ pub struct ParsedComplexVariable {
     pub data: Vec<u8>,
 }
 
-struct ParsedHashTablePayload<'a> {
-    original_count: u64,
-    captured_buckets: usize,
-    occupancy: &'a [u8],
-    buckets: &'a [u8],
-}
-
-struct ParsedBTreeNode<'a> {
-    height: u64,
-    length: usize,
-    keys: &'a [u8],
-    values: Option<&'a [u8]>,
-}
-
-struct ParsedBTreePayload<'a> {
-    original_count: u64,
-    captured_count: u64,
-    edge_count: usize,
-    nodes: Vec<Option<ParsedBTreeNode<'a>>>,
-}
-
 struct RawPresentationPayload<'data, 'presentation> {
     data: &'data [u8],
     presentation: &'presentation ValuePresentation,
@@ -88,8 +66,6 @@ struct FormatSpecPayload<'a> {
     bytes: Cow<'a, [u8]>,
     truncated: bool,
 }
-
-type BTreeEntryBytes<'a> = (&'a [u8], Option<&'a [u8]>);
 
 /// Format printer for converting PrintComplexFormat data to formatted strings
 pub struct FormatPrinter;
@@ -116,46 +92,21 @@ impl FormatPrinter {
     /// Simple placeholder applier for tests that don't use complex variables
     #[cfg(test)]
     fn apply_format_strings(format_string: &str, formatted_values: &[String]) -> String {
+        let template = FormatTemplate::parse_lossy(format_string);
         let mut result = String::new();
-        let mut chars = format_string.chars().peekable();
         let mut var_index = 0;
 
-        while let Some(ch) = chars.next() {
-            match ch {
-                '{' => {
-                    if chars.peek() == Some(&'{') {
-                        chars.next();
-                        result.push('{');
+        for part in template.parts() {
+            match part {
+                FormatPart::Literal(literal) => result.push_str(literal),
+                FormatPart::Slot(_) => {
+                    if let Some(value) = formatted_values.get(var_index) {
+                        result.push_str(value);
+                        var_index += 1;
                     } else {
-                        // Skip to closing '}' and substitute
-                        let mut found = false;
-                        for c in chars.by_ref() {
-                            if c == '}' {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if found {
-                            if var_index < formatted_values.len() {
-                                result.push_str(&formatted_values[var_index]);
-                                var_index += 1;
-                            } else {
-                                result.push_str("<MISSING_ARG>");
-                            }
-                        } else {
-                            result.push_str("<MALFORMED_PLACEHOLDER>");
-                        }
+                        result.push_str("<MISSING_ARG>");
                     }
                 }
-                '}' => {
-                    if chars.peek() == Some(&'}') {
-                        chars.next();
-                        result.push('}');
-                    } else {
-                        result.push('}');
-                    }
-                }
-                _ => result.push(ch),
             }
         }
         result
@@ -168,33 +119,384 @@ impl FormatPrinter {
         vars: &[ParsedComplexVariable],
         trace_context: &TraceContext,
     ) -> String {
+        let template = FormatTemplate::parse_lossy(format_string);
         let mut result = String::new();
-        let mut chars = format_string.chars().peekable();
         let mut var_index: usize = 0;
 
-        while let Some(ch) = chars.next() {
-            match ch {
-                '{' => {
-                    if chars.peek() == Some(&'{') {
-                        chars.next();
-                        result.push('{');
-                    } else {
-                        let mut found = false;
-                        let mut content = String::new();
-                        for c in chars.by_ref() {
-                            if c == '}' {
-                                found = true;
-                                break;
-                            }
-                            content.push(c);
+        for part in template.parts() {
+            match part {
+                FormatPart::Literal(literal) => result.push_str(literal),
+                FormatPart::Slot(slot) => {
+                    if slot.conversion == FormatConversion::Default {
+                        if let Some(variable) = vars.get(var_index) {
+                            let formatted = Self::format_complex_variable_with_status(
+                                variable.var_name_index,
+                                variable.type_index,
+                                &variable.access_path,
+                                &variable.data,
+                                variable.status,
+                                trace_context,
+                            );
+                            result.push_str(Self::formatted_value_part(&formatted));
+                            var_index += 1;
+                        } else {
+                            result.push_str("<MISSING_ARG>");
                         }
-                        if !found {
-                            result.push_str("<MALFORMED_PLACEHOLDER>");
-                            continue;
-                        }
+                        continue;
+                    }
+                    let conv = slot.conversion;
+                    let lenspec = &slot.length;
 
-                        if content.is_empty() {
-                            // default {}
+                    // helper: parse signed length from 8-byte little endian, clamp to >=0
+                    fn parse_len_usize(lenb: &[u8]) -> usize {
+                        if lenb.len() >= 8 {
+                            let arr = [
+                                lenb[0], lenb[1], lenb[2], lenb[3], lenb[4], lenb[5], lenb[6],
+                                lenb[7],
+                            ];
+                            let v = i64::from_le_bytes(arr);
+                            if v <= 0 {
+                                0
+                            } else {
+                                v as usize
+                            }
+                        } else {
+                            0
+                        }
+                    }
+
+                    // Format statuses that cannot be consumed by a conversion.
+                    let err_value_part = |idx: usize| -> Option<String> {
+                        if idx >= vars.len() {
+                            return None;
+                        }
+                        let v = &vars[idx];
+                        if v.status == VariableStatus::Ok as u8
+                            || v.status == VariableStatus::ZeroLength as u8
+                        {
+                            None
+                        } else {
+                            let s = Self::format_complex_variable_with_status(
+                                v.var_name_index,
+                                v.type_index,
+                                &v.access_path,
+                                &v.data,
+                                v.status,
+                                trace_context,
+                            );
+                            Some(Self::formatted_value_part(&s).to_string())
+                        }
+                    };
+                    let raw_err_value_part = |idx: usize| -> Option<String> {
+                        if vars.get(idx).is_some_and(|variable| {
+                            Self::is_semantic_truncation(variable, trace_context)
+                        }) {
+                            None
+                        } else {
+                            err_value_part(idx)
+                        }
+                    };
+
+                    match conv {
+                        FormatConversion::LowerHex | FormatConversion::UpperHex => {
+                            match lenspec {
+                                FormatLength::Dynamic => {
+                                    if var_index + 1 >= vars.len() {
+                                        result.push_str("<MISSING_ARG>");
+                                    } else if let Some(err) = err_value_part(var_index) {
+                                        // surface error from length argument
+                                        result.push_str(&err);
+                                        var_index += 2;
+                                        continue;
+                                    } else if let Some(err) = err_value_part(var_index + 1) {
+                                        // surface error from value argument
+                                        result.push_str(&err);
+                                        var_index += 2;
+                                        continue;
+                                    } else {
+                                        // both Ok or ZeroLength
+                                        let lenb = vars[var_index].data.as_slice();
+                                        let n = parse_len_usize(lenb);
+                                        let v = &vars[var_index + 1];
+                                        let full = v.data.as_slice();
+                                        let take = if v.status == VariableStatus::ZeroLength as u8 {
+                                            0
+                                        } else {
+                                            std::cmp::min(n, full.len())
+                                        };
+                                        let b = &full[..take];
+                                        let s = b
+                                            .iter()
+                                            .map(|vv| {
+                                                if conv == FormatConversion::LowerHex {
+                                                    format!("{vv:02x}")
+                                                } else {
+                                                    format!("{vv:02X}")
+                                                }
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(" ");
+                                        result.push_str(&s);
+                                        var_index += 2;
+                                        continue;
+                                    }
+                                    // when missing one of the args, don't advance to avoid misalignment
+                                }
+                                FormatLength::Static(n) => {
+                                    let n = usize::try_from(*n).unwrap_or(usize::MAX);
+                                    if var_index >= vars.len() {
+                                        result.push_str("<MISSING_ARG>");
+                                    } else if let Some(err) = err_value_part(var_index) {
+                                        result.push_str(&err);
+                                        var_index += 1;
+                                        continue;
+                                    } else {
+                                        let v = &vars[var_index];
+                                        let full = v.data.as_slice();
+                                        let take = if v.status == VariableStatus::ZeroLength as u8 {
+                                            0
+                                        } else {
+                                            std::cmp::min(n, full.len())
+                                        };
+                                        let b = &full[..take];
+                                        let s = b
+                                            .iter()
+                                            .map(|vv| {
+                                                if conv == FormatConversion::LowerHex {
+                                                    format!("{vv:02x}")
+                                                } else {
+                                                    format!("{vv:02X}")
+                                                }
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(" ");
+                                        result.push_str(&s);
+                                        var_index += 1;
+                                        continue;
+                                    }
+                                }
+                                FormatLength::Capture(_) => {
+                                    if var_index + 1 >= vars.len() {
+                                        result.push_str("<MISSING_ARG>");
+                                    } else if let Some(err) = err_value_part(var_index) {
+                                        result.push_str(&err);
+                                        var_index += 2;
+                                        continue;
+                                    } else if let Some(err) = err_value_part(var_index + 1) {
+                                        result.push_str(&err);
+                                        var_index += 2;
+                                        continue;
+                                    } else {
+                                        let lenb = vars[var_index].data.as_slice();
+                                        let n = parse_len_usize(lenb);
+                                        let v = &vars[var_index + 1];
+                                        let full = v.data.as_slice();
+                                        let take = if v.status == VariableStatus::ZeroLength as u8 {
+                                            0
+                                        } else {
+                                            std::cmp::min(n, full.len())
+                                        };
+                                        let b = &full[..take];
+                                        let s = b
+                                            .iter()
+                                            .map(|vv| {
+                                                if conv == FormatConversion::LowerHex {
+                                                    format!("{vv:02x}")
+                                                } else {
+                                                    format!("{vv:02X}")
+                                                }
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(" ");
+                                        result.push_str(&s);
+                                        var_index += 2;
+                                        continue;
+                                    }
+                                    // when missing one of the args, don't advance
+                                }
+                                FormatLength::None => {
+                                    if var_index >= vars.len() {
+                                        result.push_str("<MISSING_ARG>");
+                                    } else if let Some(err) = raw_err_value_part(var_index) {
+                                        result.push_str(&err);
+                                        var_index += 1;
+                                        continue;
+                                    } else {
+                                        let v = &vars[var_index];
+                                        let truncated =
+                                            match Self::format_spec_payload_bytes(v, trace_context)
+                                            {
+                                                Ok(payload) => {
+                                                    let formatted = payload
+                                                        .bytes
+                                                        .iter()
+                                                        .map(|byte| {
+                                                            if conv == FormatConversion::LowerHex {
+                                                                format!("{byte:02x}")
+                                                            } else {
+                                                                format!("{byte:02X}")
+                                                            }
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                        .join(" ");
+                                                    result.push_str(&formatted);
+                                                    payload.truncated
+                                                }
+                                                Err(error) => {
+                                                    result.push_str(&error);
+                                                    false
+                                                }
+                                            };
+                                        Self::append_truncation_marker(&mut result, truncated);
+                                        var_index += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        FormatConversion::String => {
+                            let render_bytes = |b: &[u8]| {
+                                let mut out = String::new();
+                                for &c in b.iter() {
+                                    if c == 0 {
+                                        break;
+                                    }
+                                    if (0x20..=0x7e).contains(&c) {
+                                        out.push(c as char);
+                                    } else {
+                                        out.push_str(&format!("\\x{c:02x}"));
+                                    }
+                                }
+                                out
+                            };
+
+                            match lenspec {
+                                FormatLength::Dynamic => {
+                                    if var_index + 1 >= vars.len() {
+                                        result.push_str("<MISSING_ARG>");
+                                    } else if let Some(err) = err_value_part(var_index) {
+                                        result.push_str(&err);
+                                        var_index += 2;
+                                        continue;
+                                    } else if let Some(err) = err_value_part(var_index + 1) {
+                                        result.push_str(&err);
+                                        var_index += 2;
+                                        continue;
+                                    } else {
+                                        let lenb = vars[var_index].data.as_slice();
+                                        let n = parse_len_usize(lenb);
+                                        let v = &vars[var_index + 1];
+                                        let full = v.data.as_slice();
+                                        let take = if v.status == VariableStatus::ZeroLength as u8 {
+                                            0
+                                        } else {
+                                            std::cmp::min(n, full.len())
+                                        };
+                                        result.push_str(&render_bytes(&full[..take]));
+                                        var_index += 2;
+                                        continue;
+                                    }
+                                }
+                                FormatLength::Static(n) => {
+                                    let n = usize::try_from(*n).unwrap_or(usize::MAX);
+                                    if var_index >= vars.len() {
+                                        result.push_str("<MISSING_ARG>");
+                                    } else if let Some(err) = err_value_part(var_index) {
+                                        result.push_str(&err);
+                                        var_index += 1;
+                                        continue;
+                                    } else {
+                                        let v = &vars[var_index];
+                                        let full = v.data.as_slice();
+                                        let take = if v.status == VariableStatus::ZeroLength as u8 {
+                                            0
+                                        } else {
+                                            std::cmp::min(n, full.len())
+                                        };
+                                        result.push_str(&render_bytes(&full[..take]));
+                                        var_index += 1;
+                                        continue;
+                                    }
+                                }
+                                FormatLength::Capture(_) => {
+                                    if var_index + 1 >= vars.len() {
+                                        result.push_str("<MISSING_ARG>");
+                                    } else if let Some(err) = err_value_part(var_index) {
+                                        result.push_str(&err);
+                                        var_index += 2;
+                                        continue;
+                                    } else if let Some(err) = err_value_part(var_index + 1) {
+                                        result.push_str(&err);
+                                        var_index += 2;
+                                        continue;
+                                    } else {
+                                        let lenb = vars[var_index].data.as_slice();
+                                        let n = parse_len_usize(lenb);
+                                        let v = &vars[var_index + 1];
+                                        let full = v.data.as_slice();
+                                        let take = if v.status == VariableStatus::ZeroLength as u8 {
+                                            0
+                                        } else {
+                                            std::cmp::min(n, full.len())
+                                        };
+                                        result.push_str(&render_bytes(&full[..take]));
+                                        var_index += 2;
+                                        continue;
+                                    }
+                                }
+                                FormatLength::None => {
+                                    if var_index >= vars.len() {
+                                        result.push_str("<MISSING_ARG>");
+                                    } else if let Some(err) = raw_err_value_part(var_index) {
+                                        result.push_str(&err);
+                                        var_index += 1;
+                                        continue;
+                                    } else {
+                                        let v = &vars[var_index];
+                                        let truncated =
+                                            match Self::format_spec_payload_bytes(v, trace_context)
+                                            {
+                                                Ok(payload) => {
+                                                    result.push_str(&render_bytes(
+                                                        payload.bytes.as_ref(),
+                                                    ));
+                                                    payload.truncated
+                                                }
+                                                Err(error) => {
+                                                    result.push_str(&error);
+                                                    false
+                                                }
+                                            };
+                                        Self::append_truncation_marker(&mut result, truncated);
+                                        var_index += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        FormatConversion::Pointer => {
+                            if var_index >= vars.len() {
+                                result.push_str("<MISSING_ARG>");
+                            } else if let Some(err) = err_value_part(var_index) {
+                                result.push_str(&err);
+                                var_index += 1;
+                                continue;
+                            } else {
+                                let b = vars[var_index].data.as_slice();
+                                if b.len() >= 8 {
+                                    let addr = u64::from_le_bytes([
+                                        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                                    ]);
+                                    result.push_str(&format!("0x{addr:x}"));
+                                } else {
+                                    result.push_str("<INVALID_POINTER>");
+                                }
+                                var_index += 1;
+                                continue;
+                            }
+                        }
+                        FormatConversion::Default => {
+                            // fallback to default formatting
                             if var_index < vars.len() {
                                 let v = &vars[var_index];
                                 let s = Self::format_complex_variable_with_status(
@@ -211,450 +513,9 @@ impl FormatPrinter {
                             } else {
                                 result.push_str("<MISSING_ARG>");
                             }
-                            continue;
-                        }
-
-                        if !content.starts_with(':') {
-                            result.push_str("<INVALID_SPEC>");
-                            continue;
-                        }
-                        let tail = &content[1..];
-                        let mut it = tail.chars();
-                        let conv = it.next().unwrap_or(' ');
-                        let rest: String = it.collect();
-
-                        // (removed) helper to get bytes of current arg; we now surface errors explicitly
-
-                        enum Len {
-                            None,
-                            Static(usize),
-                            Star,
-                            Capture,
-                        }
-                        // helper: parse static length supporting decimal/0x.. /0o.. /0b..
-                        fn parse_static_len(spec: &str) -> Option<usize> {
-                            if spec.chars().all(|c| c.is_ascii_digit()) {
-                                return spec.parse::<usize>().ok();
-                            }
-                            if let Some(hex) = spec.strip_prefix("0x") {
-                                if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                                    return usize::from_str_radix(hex, 16).ok();
-                                }
-                            }
-                            if let Some(oct) = spec.strip_prefix("0o") {
-                                if !oct.is_empty() && oct.chars().all(|c| matches!(c, '0'..='7')) {
-                                    return usize::from_str_radix(oct, 8).ok();
-                                }
-                            }
-                            if let Some(bin) = spec.strip_prefix("0b") {
-                                if !bin.is_empty() && bin.chars().all(|c| matches!(c, '0' | '1')) {
-                                    return usize::from_str_radix(bin, 2).ok();
-                                }
-                            }
-                            None
-                        }
-
-                        let lenspec = if rest.is_empty() {
-                            Len::None
-                        } else if let Some(r) = rest.strip_prefix('.') {
-                            if r == "*" {
-                                Len::Star
-                            } else if r.ends_with('$') {
-                                Len::Capture
-                            } else if let Some(n) = parse_static_len(r) {
-                                Len::Static(n)
-                            } else {
-                                Len::None
-                            }
-                        } else {
-                            Len::None
-                        };
-
-                        // helper: parse signed length from 8-byte little endian, clamp to >=0
-                        fn parse_len_usize(lenb: &[u8]) -> usize {
-                            if lenb.len() >= 8 {
-                                let arr = [
-                                    lenb[0], lenb[1], lenb[2], lenb[3], lenb[4], lenb[5], lenb[6],
-                                    lenb[7],
-                                ];
-                                let v = i64::from_le_bytes(arr);
-                                if v <= 0 {
-                                    0
-                                } else {
-                                    v as usize
-                                }
-                            } else {
-                                0
-                            }
-                        }
-
-                        // Format statuses that cannot be consumed by a conversion.
-                        let err_value_part = |idx: usize| -> Option<String> {
-                            if idx >= vars.len() {
-                                return None;
-                            }
-                            let v = &vars[idx];
-                            if v.status == VariableStatus::Ok as u8
-                                || v.status == VariableStatus::ZeroLength as u8
-                            {
-                                None
-                            } else {
-                                let s = Self::format_complex_variable_with_status(
-                                    v.var_name_index,
-                                    v.type_index,
-                                    &v.access_path,
-                                    &v.data,
-                                    v.status,
-                                    trace_context,
-                                );
-                                Some(Self::formatted_value_part(&s).to_string())
-                            }
-                        };
-                        let raw_err_value_part = |idx: usize| -> Option<String> {
-                            if vars.get(idx).is_some_and(|variable| {
-                                Self::is_semantic_truncation(variable, trace_context)
-                            }) {
-                                None
-                            } else {
-                                err_value_part(idx)
-                            }
-                        };
-
-                        match conv {
-                            'x' | 'X' => {
-                                match lenspec {
-                                    Len::Star => {
-                                        if var_index + 1 >= vars.len() {
-                                            result.push_str("<MISSING_ARG>");
-                                        } else if let Some(err) = err_value_part(var_index) {
-                                            // surface error from length argument
-                                            result.push_str(&err);
-                                            var_index += 2;
-                                            continue;
-                                        } else if let Some(err) = err_value_part(var_index + 1) {
-                                            // surface error from value argument
-                                            result.push_str(&err);
-                                            var_index += 2;
-                                            continue;
-                                        } else {
-                                            // both Ok or ZeroLength
-                                            let lenb = vars[var_index].data.as_slice();
-                                            let n = parse_len_usize(lenb);
-                                            let v = &vars[var_index + 1];
-                                            let full = v.data.as_slice();
-                                            let take =
-                                                if v.status == VariableStatus::ZeroLength as u8 {
-                                                    0
-                                                } else {
-                                                    std::cmp::min(n, full.len())
-                                                };
-                                            let b = &full[..take];
-                                            let s = b
-                                                .iter()
-                                                .map(|vv| {
-                                                    if conv == 'x' {
-                                                        format!("{vv:02x}")
-                                                    } else {
-                                                        format!("{vv:02X}")
-                                                    }
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join(" ");
-                                            result.push_str(&s);
-                                            var_index += 2;
-                                            continue;
-                                        }
-                                        // when missing one of the args, don't advance to avoid misalignment
-                                    }
-                                    Len::Static(n) => {
-                                        if var_index >= vars.len() {
-                                            result.push_str("<MISSING_ARG>");
-                                        } else if let Some(err) = err_value_part(var_index) {
-                                            result.push_str(&err);
-                                            var_index += 1;
-                                            continue;
-                                        } else {
-                                            let v = &vars[var_index];
-                                            let full = v.data.as_slice();
-                                            let take =
-                                                if v.status == VariableStatus::ZeroLength as u8 {
-                                                    0
-                                                } else {
-                                                    std::cmp::min(n, full.len())
-                                                };
-                                            let b = &full[..take];
-                                            let s = b
-                                                .iter()
-                                                .map(|vv| {
-                                                    if conv == 'x' {
-                                                        format!("{vv:02x}")
-                                                    } else {
-                                                        format!("{vv:02X}")
-                                                    }
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join(" ");
-                                            result.push_str(&s);
-                                            var_index += 1;
-                                            continue;
-                                        }
-                                    }
-                                    Len::Capture => {
-                                        if var_index + 1 >= vars.len() {
-                                            result.push_str("<MISSING_ARG>");
-                                        } else if let Some(err) = err_value_part(var_index) {
-                                            result.push_str(&err);
-                                            var_index += 2;
-                                            continue;
-                                        } else if let Some(err) = err_value_part(var_index + 1) {
-                                            result.push_str(&err);
-                                            var_index += 2;
-                                            continue;
-                                        } else {
-                                            let lenb = vars[var_index].data.as_slice();
-                                            let n = parse_len_usize(lenb);
-                                            let v = &vars[var_index + 1];
-                                            let full = v.data.as_slice();
-                                            let take =
-                                                if v.status == VariableStatus::ZeroLength as u8 {
-                                                    0
-                                                } else {
-                                                    std::cmp::min(n, full.len())
-                                                };
-                                            let b = &full[..take];
-                                            let s = b
-                                                .iter()
-                                                .map(|vv| {
-                                                    if conv == 'x' {
-                                                        format!("{vv:02x}")
-                                                    } else {
-                                                        format!("{vv:02X}")
-                                                    }
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join(" ");
-                                            result.push_str(&s);
-                                            var_index += 2;
-                                            continue;
-                                        }
-                                        // when missing one of the args, don't advance
-                                    }
-                                    Len::None => {
-                                        if var_index >= vars.len() {
-                                            result.push_str("<MISSING_ARG>");
-                                        } else if let Some(err) = raw_err_value_part(var_index) {
-                                            result.push_str(&err);
-                                            var_index += 1;
-                                            continue;
-                                        } else {
-                                            let v = &vars[var_index];
-                                            let truncated = match Self::format_spec_payload_bytes(
-                                                v,
-                                                trace_context,
-                                            ) {
-                                                Ok(payload) => {
-                                                    let formatted = payload
-                                                        .bytes
-                                                        .iter()
-                                                        .map(|byte| {
-                                                            if conv == 'x' {
-                                                                format!("{byte:02x}")
-                                                            } else {
-                                                                format!("{byte:02X}")
-                                                            }
-                                                        })
-                                                        .collect::<Vec<_>>()
-                                                        .join(" ");
-                                                    result.push_str(&formatted);
-                                                    payload.truncated
-                                                }
-                                                Err(error) => {
-                                                    result.push_str(&error);
-                                                    false
-                                                }
-                                            };
-                                            Self::append_truncation_marker(&mut result, truncated);
-                                            var_index += 1;
-                                            continue;
-                                        }
-                                    }
-                                }
-                            }
-                            's' => {
-                                let render_bytes = |b: &[u8]| {
-                                    let mut out = String::new();
-                                    for &c in b.iter() {
-                                        if c == 0 {
-                                            break;
-                                        }
-                                        if (0x20..=0x7e).contains(&c) {
-                                            out.push(c as char);
-                                        } else {
-                                            out.push_str(&format!("\\x{c:02x}"));
-                                        }
-                                    }
-                                    out
-                                };
-
-                                match lenspec {
-                                    Len::Star => {
-                                        if var_index + 1 >= vars.len() {
-                                            result.push_str("<MISSING_ARG>");
-                                        } else if let Some(err) = err_value_part(var_index) {
-                                            result.push_str(&err);
-                                            var_index += 2;
-                                            continue;
-                                        } else if let Some(err) = err_value_part(var_index + 1) {
-                                            result.push_str(&err);
-                                            var_index += 2;
-                                            continue;
-                                        } else {
-                                            let lenb = vars[var_index].data.as_slice();
-                                            let n = parse_len_usize(lenb);
-                                            let v = &vars[var_index + 1];
-                                            let full = v.data.as_slice();
-                                            let take =
-                                                if v.status == VariableStatus::ZeroLength as u8 {
-                                                    0
-                                                } else {
-                                                    std::cmp::min(n, full.len())
-                                                };
-                                            result.push_str(&render_bytes(&full[..take]));
-                                            var_index += 2;
-                                            continue;
-                                        }
-                                    }
-                                    Len::Static(n) => {
-                                        if var_index >= vars.len() {
-                                            result.push_str("<MISSING_ARG>");
-                                        } else if let Some(err) = err_value_part(var_index) {
-                                            result.push_str(&err);
-                                            var_index += 1;
-                                            continue;
-                                        } else {
-                                            let v = &vars[var_index];
-                                            let full = v.data.as_slice();
-                                            let take =
-                                                if v.status == VariableStatus::ZeroLength as u8 {
-                                                    0
-                                                } else {
-                                                    std::cmp::min(n, full.len())
-                                                };
-                                            result.push_str(&render_bytes(&full[..take]));
-                                            var_index += 1;
-                                            continue;
-                                        }
-                                    }
-                                    Len::Capture => {
-                                        if var_index + 1 >= vars.len() {
-                                            result.push_str("<MISSING_ARG>");
-                                        } else if let Some(err) = err_value_part(var_index) {
-                                            result.push_str(&err);
-                                            var_index += 2;
-                                            continue;
-                                        } else if let Some(err) = err_value_part(var_index + 1) {
-                                            result.push_str(&err);
-                                            var_index += 2;
-                                            continue;
-                                        } else {
-                                            let lenb = vars[var_index].data.as_slice();
-                                            let n = parse_len_usize(lenb);
-                                            let v = &vars[var_index + 1];
-                                            let full = v.data.as_slice();
-                                            let take =
-                                                if v.status == VariableStatus::ZeroLength as u8 {
-                                                    0
-                                                } else {
-                                                    std::cmp::min(n, full.len())
-                                                };
-                                            result.push_str(&render_bytes(&full[..take]));
-                                            var_index += 2;
-                                            continue;
-                                        }
-                                    }
-                                    Len::None => {
-                                        if var_index >= vars.len() {
-                                            result.push_str("<MISSING_ARG>");
-                                        } else if let Some(err) = raw_err_value_part(var_index) {
-                                            result.push_str(&err);
-                                            var_index += 1;
-                                            continue;
-                                        } else {
-                                            let v = &vars[var_index];
-                                            let truncated = match Self::format_spec_payload_bytes(
-                                                v,
-                                                trace_context,
-                                            ) {
-                                                Ok(payload) => {
-                                                    result.push_str(&render_bytes(
-                                                        payload.bytes.as_ref(),
-                                                    ));
-                                                    payload.truncated
-                                                }
-                                                Err(error) => {
-                                                    result.push_str(&error);
-                                                    false
-                                                }
-                                            };
-                                            Self::append_truncation_marker(&mut result, truncated);
-                                            var_index += 1;
-                                            continue;
-                                        }
-                                    }
-                                }
-                            }
-                            'p' => {
-                                if var_index >= vars.len() {
-                                    result.push_str("<MISSING_ARG>");
-                                } else if let Some(err) = err_value_part(var_index) {
-                                    result.push_str(&err);
-                                    var_index += 1;
-                                    continue;
-                                } else {
-                                    let b = vars[var_index].data.as_slice();
-                                    if b.len() >= 8 {
-                                        let addr = u64::from_le_bytes([
-                                            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                                        ]);
-                                        result.push_str(&format!("0x{addr:x}"));
-                                    } else {
-                                        result.push_str("<INVALID_POINTER>");
-                                    }
-                                    var_index += 1;
-                                    continue;
-                                }
-                            }
-                            _ => {
-                                // fallback to default formatting
-                                if var_index < vars.len() {
-                                    let v = &vars[var_index];
-                                    let s = Self::format_complex_variable_with_status(
-                                        v.var_name_index,
-                                        v.type_index,
-                                        &v.access_path,
-                                        &v.data,
-                                        v.status,
-                                        trace_context,
-                                    );
-                                    let value_part = Self::formatted_value_part(&s);
-                                    result.push_str(value_part);
-                                    var_index += 1;
-                                } else {
-                                    result.push_str("<MISSING_ARG>");
-                                }
-                            }
                         }
                     }
                 }
-                '}' => {
-                    if chars.peek() == Some(&'}') {
-                        chars.next();
-                        result.push('}');
-                    } else {
-                        result.push('}');
-                    }
-                }
-                _ => result.push(ch),
             }
         }
         result
@@ -1763,568 +1624,6 @@ impl FormatPrinter {
         Some(u64::from_le_bytes(data.get(offset..end)?.try_into().ok()?))
     }
 
-    fn parse_hash_table_payload(
-        data: &[u8],
-        entry_stride: u64,
-        occupancy: HashTableOccupancy,
-    ) -> Option<ParsedHashTablePayload<'_>> {
-        let original_count = Self::payload_u64(data, 0)?;
-        let capacity = Self::payload_u64(data, HASH_TABLE_CAPACITY_OFFSET)?;
-        let captured_buckets = Self::payload_u64(data, HASH_TABLE_CAPTURED_BUCKETS_OFFSET)?;
-        let bucket_offset = Self::payload_u64(data, HASH_TABLE_BUCKET_DATA_OFFSET)?;
-        if original_count > capacity || captured_buckets > capacity {
-            return None;
-        }
-
-        let captured_buckets = usize::try_from(captured_buckets).ok()?;
-        let occupancy_width = usize::try_from(occupancy.byte_width()?).ok()?;
-        let occupancy_len = captured_buckets.checked_mul(occupancy_width)?;
-        let occupancy_end = HASH_TABLE_HEADER_SIZE.checked_add(occupancy_len)?;
-        let bucket_offset = usize::try_from(bucket_offset).ok()?;
-        // The eBPF layout fixes the bucket offset after the maximum reserved
-        // occupancy region so the verifier sees constant destinations. A small
-        // runtime table can therefore leave unused occupancy headroom here.
-        if bucket_offset < occupancy_end {
-            return None;
-        }
-        let stride = usize::try_from(entry_stride).ok()?;
-        let bucket_len = captured_buckets.checked_mul(stride)?;
-        let bucket_end = bucket_offset.checked_add(bucket_len)?;
-        let occupancy_bytes = data.get(HASH_TABLE_HEADER_SIZE..occupancy_end)?;
-        let buckets = data.get(bucket_offset..bucket_end)?;
-        let mut occupied = 0_u64;
-        for bucket_index in 0..captured_buckets {
-            if Self::hash_table_bucket_occupied(occupancy_bytes, occupancy, bucket_index)? {
-                occupied = occupied.checked_add(1)?;
-            }
-        }
-        if occupied > original_count
-            || (u64::try_from(captured_buckets).ok()? == capacity && occupied != original_count)
-        {
-            return None;
-        }
-
-        Some(ParsedHashTablePayload {
-            original_count,
-            captured_buckets,
-            occupancy: occupancy_bytes,
-            buckets,
-        })
-    }
-
-    fn hash_table_bucket_occupied(
-        occupancy_bytes: &[u8],
-        occupancy: HashTableOccupancy,
-        bucket_index: usize,
-    ) -> Option<bool> {
-        let width = usize::try_from(occupancy.byte_width()?).ok()?;
-        let start = bucket_index.checked_mul(width)?;
-        let end = start.checked_add(width)?;
-        let bytes = occupancy_bytes.get(start..end)?;
-        match occupancy {
-            HashTableOccupancy::ControlByteHighBitClear => {
-                Some(bytes.first().copied()? & 0x80 == 0)
-            }
-            HashTableOccupancy::NonZeroWord { .. } => Some(bytes.iter().any(|byte| *byte != 0)),
-        }
-    }
-
-    fn hash_table_bucket<'a>(
-        payload: &ParsedHashTablePayload<'a>,
-        entry_stride: u64,
-        bucket_order: HashTableBucketOrder,
-        control_index: usize,
-    ) -> Option<&'a [u8]> {
-        let stride = usize::try_from(entry_stride).ok()?;
-        let bucket_index = match bucket_order {
-            HashTableBucketOrder::Forward => control_index,
-            HashTableBucketOrder::Reverse => {
-                payload.captured_buckets.checked_sub(control_index + 1)?
-            }
-        };
-        let start = bucket_index.checked_mul(stride)?;
-        let end = start.checked_add(stride)?;
-        payload.buckets.get(start..end)
-    }
-
-    fn hash_table_occupied_bucket_bytes(
-        data: &[u8],
-        entry_stride: u64,
-        bucket_order: HashTableBucketOrder,
-        occupancy: HashTableOccupancy,
-    ) -> Option<Vec<u8>> {
-        let payload = Self::parse_hash_table_payload(data, entry_stride, occupancy)?;
-        let stride = usize::try_from(entry_stride).ok()?;
-        let output_capacity = payload.captured_buckets.checked_mul(stride)?;
-        let mut entries = Vec::with_capacity(output_capacity);
-        for control_index in 0..payload.captured_buckets {
-            if Self::hash_table_bucket_occupied(payload.occupancy, occupancy, control_index)? {
-                entries.extend_from_slice(Self::hash_table_bucket(
-                    &payload,
-                    entry_stride,
-                    bucket_order,
-                    control_index,
-                )?);
-            }
-        }
-        Some(entries)
-    }
-
-    fn format_hash_table_field(
-        entry_data: &[u8],
-        entry_stride: u64,
-        field: &HashTableFieldPresentation,
-        field_index: usize,
-        control_index: usize,
-        nested: Option<&NestedHashTableContext<'_>>,
-    ) -> Option<String> {
-        if let Some(nested) = nested {
-            if let Some(nested_field) = nested
-                .fields
-                .iter()
-                .find(|candidate| candidate.field_index == field_index as u64)
-            {
-                let field_slot_offset = usize::try_from(nested_field.slot_offset).ok()?;
-                let slot_offset = control_index
-                    .checked_mul(nested.bucket_slot_stride)
-                    .and_then(|offset| nested.first_slot_offset.checked_add(offset))
-                    .and_then(|offset| offset.checked_add(field_slot_offset))?;
-                return Some(Self::format_nested_value_at(
-                    nested.full_data,
-                    slot_offset,
-                    &nested_field.value,
-                ));
-            }
-        }
-        let field_end = field.offset.checked_add(field.field_type.size())?;
-        if field_end > entry_stride {
-            return None;
-        }
-        let start = usize::try_from(field.offset).ok()?;
-        let end = usize::try_from(field_end).ok()?;
-        Some(Self::format_data_with_type_info_impl(
-            entry_data.get(start..end)?,
-            &field.field_type,
-            1,
-            32,
-        ))
-    }
-
-    fn format_hash_table_payload(
-        data: &[u8],
-        entry_stride: u64,
-        bucket_order: HashTableBucketOrder,
-        occupancy: HashTableOccupancy,
-        entry: &HashTableEntryPresentation,
-        nested: Option<&NestedHashTableContext<'_>>,
-    ) -> String {
-        let Some(payload) = Self::parse_hash_table_payload(data, entry_stride, occupancy) else {
-            return "<INVALID_HASH_TABLE_PAYLOAD>".to_string();
-        };
-        if nested.is_some_and(|nested| payload.captured_buckets > nested.bucket_count) {
-            return "<INVALID_NESTED_HASH_TABLE_PAYLOAD>".to_string();
-        }
-        let type_name = match entry {
-            HashTableEntryPresentation::Map { .. } => "HashMap",
-            HashTableEntryPresentation::Set { .. } => "HashSet",
-        };
-        let mut result = format!("{type_name}(size={}) {{", payload.original_count);
-        let mut output_index = 0usize;
-        for control_index in 0..payload.captured_buckets {
-            let Some(occupied) =
-                Self::hash_table_bucket_occupied(payload.occupancy, occupancy, control_index)
-            else {
-                return "<INVALID_HASH_TABLE_PAYLOAD>".to_string();
-            };
-            if !occupied {
-                continue;
-            }
-            let Some(entry_data) =
-                Self::hash_table_bucket(&payload, entry_stride, bucket_order, control_index)
-            else {
-                return "<INVALID_HASH_TABLE_PAYLOAD>".to_string();
-            };
-            if output_index > 0 {
-                result.push_str(", ");
-            }
-            match entry {
-                HashTableEntryPresentation::Map { key, value } => {
-                    let Some(key) = Self::format_hash_table_field(
-                        entry_data,
-                        entry_stride,
-                        key,
-                        0,
-                        control_index,
-                        nested,
-                    ) else {
-                        return "<INVALID_HASH_TABLE_ENTRY_LAYOUT>".to_string();
-                    };
-                    let Some(value) = Self::format_hash_table_field(
-                        entry_data,
-                        entry_stride,
-                        value,
-                        1,
-                        control_index,
-                        nested,
-                    ) else {
-                        return "<INVALID_HASH_TABLE_ENTRY_LAYOUT>".to_string();
-                    };
-                    result.push_str(&key);
-                    result.push_str(": ");
-                    result.push_str(&value);
-                }
-                HashTableEntryPresentation::Set { value } => {
-                    let Some(value) = Self::format_hash_table_field(
-                        entry_data,
-                        entry_stride,
-                        value,
-                        0,
-                        control_index,
-                        nested,
-                    ) else {
-                        return "<INVALID_HASH_TABLE_ENTRY_LAYOUT>".to_string();
-                    };
-                    result.push_str(&value);
-                }
-            }
-            output_index += 1;
-        }
-        result.push('}');
-        result
-    }
-
-    fn btree_fields(
-        entry: &BTreeEntryPresentation,
-    ) -> (&BTreeFieldPresentation, Option<&BTreeFieldPresentation>) {
-        match entry {
-            BTreeEntryPresentation::Map { key, value } => (key, Some(value)),
-            BTreeEntryPresentation::Set { value } => (value, None),
-        }
-    }
-
-    fn btree_record_layout(
-        node_capacity: u64,
-        entry: &BTreeEntryPresentation,
-    ) -> Option<(usize, usize, usize)> {
-        let capacity = usize::try_from(node_capacity).ok()?;
-        if capacity == 0 {
-            return None;
-        }
-        let (key, value) = Self::btree_fields(entry);
-        let key_stride = usize::try_from(key.slot_stride).ok()?;
-        let key_bytes = capacity.checked_mul(key_stride)?;
-        let value_bytes = match value {
-            Some(field) => usize::try_from(field.slot_stride)
-                .ok()?
-                .checked_mul(capacity)?,
-            None => 0,
-        };
-        let values_offset = BTREE_NODE_HEADER_SIZE.checked_add(key_bytes)?;
-        let record_size = values_offset.checked_add(value_bytes)?;
-        Some((capacity, values_offset, record_size))
-    }
-
-    fn validate_btree_field(field: &BTreeFieldPresentation) -> bool {
-        field
-            .value_offset
-            .checked_add(field.field_type.size())
-            .is_some_and(|end| {
-                end <= field.slot_stride
-                    || (field.slot_stride == 0 && field.value_offset == 0 && end == 0)
-            })
-    }
-
-    fn parse_btree_payload<'a>(
-        data: &'a [u8],
-        node_capacity: u64,
-        entry: &BTreeEntryPresentation,
-    ) -> Option<ParsedBTreePayload<'a>> {
-        let original_count = Self::payload_u64(data, 0)?;
-        let node_slots = Self::payload_u64(data, BTREE_NODE_SLOT_COUNT_OFFSET)?;
-        let captured_count = Self::payload_u64(data, BTREE_CAPTURED_ITEM_COUNT_OFFSET)?;
-        if captured_count > original_count {
-            return None;
-        }
-        let (key, value) = Self::btree_fields(entry);
-        if !Self::validate_btree_field(key)
-            || value.is_some_and(|field| !Self::validate_btree_field(field))
-        {
-            return None;
-        }
-        let (capacity, values_offset, record_size) =
-            Self::btree_record_layout(node_capacity, entry)?;
-        let node_slots = usize::try_from(node_slots).ok()?;
-        let records_len = node_slots.checked_mul(record_size)?;
-        let records_end = BTREE_HEADER_SIZE.checked_add(records_len)?;
-        let records = data.get(BTREE_HEADER_SIZE..records_end)?;
-        let key_bytes = values_offset.checked_sub(BTREE_NODE_HEADER_SIZE)?;
-        let value_bytes = record_size.checked_sub(values_offset)?;
-
-        let mut nodes = Vec::with_capacity(node_slots);
-        let mut addresses = std::collections::HashSet::with_capacity(node_slots);
-        let mut parsed_count = 0u64;
-        for slot in 0..node_slots {
-            let start = slot.checked_mul(record_size)?;
-            let record = records.get(start..start.checked_add(record_size)?)?;
-            let address = Self::payload_u64(record, 0)?;
-            if address == 0 {
-                nodes.push(None);
-                continue;
-            }
-            if !addresses.insert(address) {
-                return None;
-            }
-            let height = Self::payload_u64(record, BTREE_NODE_HEIGHT_OFFSET)?;
-            let length = Self::payload_u64(record, BTREE_NODE_LENGTH_OFFSET)?;
-            let length = usize::try_from(length).ok()?;
-            if length > capacity {
-                return None;
-            }
-            parsed_count = parsed_count.checked_add(u64::try_from(length).ok()?)?;
-            let keys_end = BTREE_NODE_HEADER_SIZE.checked_add(key_bytes)?;
-            let keys = record.get(BTREE_NODE_HEADER_SIZE..keys_end)?;
-            let values = match value {
-                Some(_) => {
-                    Some(record.get(values_offset..values_offset.checked_add(value_bytes)?)?)
-                }
-                None => None,
-            };
-            nodes.push(Some(ParsedBTreeNode {
-                height,
-                length,
-                keys,
-                values,
-            }));
-        }
-        let root_presence_valid = match (original_count, captured_count) {
-            (0, _) => nodes.iter().all(Option::is_none),
-            (_, 0) => nodes.iter().all(Option::is_none),
-            (_, _) => nodes.first().is_some_and(Option::is_some),
-        };
-        if parsed_count != captured_count || !root_presence_valid {
-            return None;
-        }
-
-        let edge_count = capacity.checked_add(1)?;
-        for slot in 1..nodes.len() {
-            let Some(node) = &nodes[slot] else {
-                continue;
-            };
-            let parent_slot = (slot - 1) / edge_count;
-            let parent_edge = (slot - 1) % edge_count;
-            let Some(Some(parent)) = nodes.get(parent_slot) else {
-                return None;
-            };
-            if parent.height == 0
-                || parent_edge > parent.length
-                || node.height.checked_add(1) != Some(parent.height)
-            {
-                return None;
-            }
-        }
-        for (slot, node) in nodes.iter().enumerate() {
-            let Some(node) = node else {
-                continue;
-            };
-            if node.height == 0 {
-                continue;
-            }
-            for edge in 0..=node.length {
-                let child = slot
-                    .checked_mul(edge_count)?
-                    .checked_add(1)?
-                    .checked_add(edge)?;
-                if child < nodes.len() && nodes[child].is_none() {
-                    return None;
-                }
-                if captured_count == original_count && child >= nodes.len() {
-                    return None;
-                }
-            }
-        }
-
-        Some(ParsedBTreePayload {
-            original_count,
-            captured_count,
-            edge_count,
-            nodes,
-        })
-    }
-
-    fn btree_field_bytes<'a>(
-        slots: &'a [u8],
-        index: usize,
-        field: &BTreeFieldPresentation,
-    ) -> Option<&'a [u8]> {
-        let stride = usize::try_from(field.slot_stride).ok()?;
-        let value_offset = usize::try_from(field.value_offset).ok()?;
-        let value_size = usize::try_from(field.field_type.size()).ok()?;
-        let start = index.checked_mul(stride)?.checked_add(value_offset)?;
-        slots.get(start..start.checked_add(value_size)?)
-    }
-
-    fn collect_btree_entries<'a>(
-        payload: &'a ParsedBTreePayload<'a>,
-        entry: &'a BTreeEntryPresentation,
-        node_index: usize,
-        output: &mut Vec<BTreeEntryBytes<'a>>,
-    ) -> Option<()> {
-        let node = payload.nodes.get(node_index)?.as_ref()?;
-        let (key, value) = Self::btree_fields(entry);
-        for index in 0..node.length {
-            if node.height > 0 {
-                let child = node_index
-                    .checked_mul(payload.edge_count)?
-                    .checked_add(1)?
-                    .checked_add(index)?;
-                if payload.nodes.get(child).is_some_and(Option::is_some) {
-                    Self::collect_btree_entries(payload, entry, child, output)?;
-                }
-            }
-            let key_data = Self::btree_field_bytes(node.keys, index, key)?;
-            let value_data = match (value, node.values) {
-                (Some(field), Some(values)) => Some(Self::btree_field_bytes(values, index, field)?),
-                (None, None) => None,
-                _ => return None,
-            };
-            output.push((key_data, value_data));
-        }
-        if node.height > 0 {
-            let child = node_index
-                .checked_mul(payload.edge_count)?
-                .checked_add(1)?
-                .checked_add(node.length)?;
-            if payload.nodes.get(child).is_some_and(Option::is_some) {
-                Self::collect_btree_entries(payload, entry, child, output)?;
-            }
-        }
-        Some(())
-    }
-
-    fn btree_entries<'a>(
-        payload: &'a ParsedBTreePayload<'a>,
-        entry: &'a BTreeEntryPresentation,
-    ) -> Option<Vec<BTreeEntryBytes<'a>>> {
-        let mut entries = Vec::with_capacity(usize::try_from(payload.captured_count).ok()?);
-        if payload.captured_count > 0 {
-            Self::collect_btree_entries(payload, entry, 0, &mut entries)?;
-        }
-        (u64::try_from(entries.len()).ok()? == payload.captured_count).then_some(entries)
-    }
-
-    fn btree_value_bytes(
-        data: &[u8],
-        node_capacity: u64,
-        entry: &BTreeEntryPresentation,
-    ) -> Option<Vec<u8>> {
-        let payload = Self::parse_btree_payload(data, node_capacity, entry)?;
-        let entries = Self::btree_entries(&payload, entry)?;
-        let mut values = Vec::new();
-        for (key, value) in entries {
-            values.extend_from_slice(key);
-            if let Some(value) = value {
-                values.extend_from_slice(value);
-            }
-        }
-        Some(values)
-    }
-
-    fn format_btree_payload(
-        data: &[u8],
-        node_capacity: u64,
-        entry: &BTreeEntryPresentation,
-    ) -> String {
-        let Some(payload) = Self::parse_btree_payload(data, node_capacity, entry) else {
-            return "<INVALID_BTREE_PAYLOAD>".to_string();
-        };
-        let Some(entries) = Self::btree_entries(&payload, entry) else {
-            return "<INVALID_BTREE_PAYLOAD>".to_string();
-        };
-        let (key, value) = Self::btree_fields(entry);
-        let type_name = match entry {
-            BTreeEntryPresentation::Map { .. } => "BTreeMap",
-            BTreeEntryPresentation::Set { .. } => "BTreeSet",
-        };
-        let mut result = format!("{type_name}(size={}) {{", payload.original_count);
-        for (index, (key_data, value_data)) in entries.into_iter().enumerate() {
-            if index > 0 {
-                result.push_str(", ");
-            }
-            let formatted_key =
-                Self::format_data_with_type_info_impl(key_data, &key.field_type, 1, 32);
-            result.push_str(&formatted_key);
-            if let (Some(field), Some(value_data)) = (value, value_data) {
-                result.push_str(": ");
-                result.push_str(&Self::format_data_with_type_info_impl(
-                    value_data,
-                    &field.field_type,
-                    1,
-                    32,
-                ));
-            }
-        }
-        result.push('}');
-        result
-    }
-
-    fn parse_sequence_payload(data: &[u8], element_stride: u64) -> Option<(u64, u64, &[u8])> {
-        let original_count = u64::from_le_bytes(data.get(..8)?.try_into().ok()?);
-        let captured_count = u64::from_le_bytes(
-            data.get(INDIRECT_SEQUENCE_CAPTURED_COUNT_OFFSET..INDIRECT_SEQUENCE_HEADER_SIZE)?
-                .try_into()
-                .ok()?,
-        );
-        if captured_count > original_count {
-            return None;
-        }
-        let stride = usize::try_from(element_stride).ok()?;
-        let captured = usize::try_from(captured_count).ok()?;
-        let byte_len = captured.checked_mul(stride)?;
-        let payload = data.get(INDIRECT_SEQUENCE_HEADER_SIZE..)?;
-        Some((original_count, captured_count, payload.get(..byte_len)?))
-    }
-
-    fn format_sequence_payload(
-        data: &[u8],
-        element_type: &TypeInfo,
-        element_stride: u64,
-    ) -> String {
-        if element_type.size() != element_stride {
-            return "<INVALID_SEQUENCE_ELEMENT_LAYOUT>".to_string();
-        }
-        let Some((_, captured_count, payload)) = Self::parse_sequence_payload(data, element_stride)
-        else {
-            return "<INVALID_SEQUENCE_PAYLOAD>".to_string();
-        };
-        let Ok(captured_count) = usize::try_from(captured_count) else {
-            return "<INVALID_SEQUENCE_PAYLOAD>".to_string();
-        };
-        let Ok(stride) = usize::try_from(element_stride) else {
-            return "<INVALID_SEQUENCE_ELEMENT_LAYOUT>".to_string();
-        };
-
-        let mut result = String::from("[");
-        for index in 0..captured_count {
-            if index > 0 {
-                result.push_str(", ");
-            }
-            let start = index * stride;
-            let element_data = &payload[start..start + stride];
-            if stride == 0 && element_type.type_name() == "()" {
-                result.push_str("()");
-            } else {
-                result.push_str(&Self::format_data_with_type_info_impl(
-                    element_data,
-                    element_type,
-                    1,
-                    32,
-                ));
-            }
-        }
-        result.push(']');
-        result
-    }
-
     fn discriminant_type_is_unsigned(type_info: &TypeInfo) -> bool {
         match type_info {
             TypeInfo::BaseType { encoding, .. } => {
@@ -3257,6 +2556,12 @@ impl FormatPrinter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        BTreeEntryPresentation, BTreeFieldPresentation, HashTableBucketOrder,
+        HashTableFieldPresentation, HashTableOccupancy, BTREE_CAPTURED_ITEM_COUNT_OFFSET,
+        BTREE_HEADER_SIZE, BTREE_NODE_HEADER_SIZE, HASH_TABLE_HEADER_SIZE,
+        INDIRECT_SEQUENCE_HEADER_SIZE,
+    };
 
     type BTreeMapNode<'a> = (usize, u64, u64, &'a [i32], &'a [u16]);
 

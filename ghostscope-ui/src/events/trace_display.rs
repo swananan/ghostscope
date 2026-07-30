@@ -1,4 +1,5 @@
 use ghostscope_protocol::{
+    format_legacy_string_with_variables,
     trace_event::{backtrace_error_label, BacktraceStatus},
     ParsedInstruction, ParsedTraceEvent,
 };
@@ -230,9 +231,9 @@ fn protocol_instructions_to_display_items(
     while index < instructions.len() {
         match &instructions[index] {
             ParsedInstruction::PrintString { content } => {
-                if content.contains("{}") {
-                    let (formatted, consumed) =
-                        format_string_with_variable_items(content, instructions, index + 1);
+                if let Some((formatted, consumed)) =
+                    format_legacy_string_with_variables(content, instructions, index + 1)
+                {
                     items.push(TraceDisplayItem::FormattedText { content: formatted });
                     index += consumed;
                 } else {
@@ -300,39 +301,6 @@ fn protocol_instructions_to_display_items(
     }
 
     items
-}
-
-fn format_string_with_variable_items(
-    format_string: &str,
-    instructions: &[ParsedInstruction],
-    start_index: usize,
-) -> (String, usize) {
-    let placeholder_count = format_string.matches("{}").count();
-    let mut consumed = 1;
-    let mut result = String::with_capacity(format_string.len());
-    let mut remaining = format_string;
-
-    for instruction_index in start_index..(start_index + placeholder_count).min(instructions.len())
-    {
-        let Some(pos) = remaining.find("{}") else {
-            break;
-        };
-
-        if let Some(ParsedInstruction::PrintVariable {
-            formatted_value, ..
-        }) = instructions.get(instruction_index)
-        {
-            result.push_str(&remaining[..pos]);
-            result.push_str(formatted_value);
-            consumed += 1;
-            remaining = &remaining[pos + 2..];
-        } else {
-            break;
-        }
-    }
-    result.push_str(remaining);
-
-    (result, consumed)
 }
 
 #[derive(Debug, Clone)]

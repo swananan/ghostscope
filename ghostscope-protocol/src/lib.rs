@@ -4,6 +4,7 @@
 
 // Core modules
 pub mod bpf_abi;
+mod format_template;
 mod type_kind;
 mod value_presentation;
 
@@ -92,10 +93,13 @@ pub use trace_context::{
 };
 
 pub use format_printer::FormatPrinter;
+pub use format_template::{
+    FormatConversion, FormatLength, FormatPart, FormatSlot, FormatTemplate, FormatTemplateError,
+};
 
 pub use streaming_parser::{
-    EventSource, ParseState, ParsedBacktraceFrame, ParsedInstruction, ParsedTraceEvent,
-    StreamingTraceParser,
+    format_legacy_string_with_variables, EventSource, ParseState, ParsedBacktraceFrame,
+    ParsedInstruction, ParsedTraceEvent, StreamingTraceParser,
 };
 
 pub use type_info::{

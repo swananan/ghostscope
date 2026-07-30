@@ -1,7 +1,7 @@
 use crate::format_printer::FormatPrinter;
 use crate::trace_context::TraceContext;
 use crate::trace_event::*;
-use crate::TypeKind;
+use crate::{FormatConversion, FormatPart, FormatTemplate, TypeKind};
 use tracing::{debug, warn};
 use zerocopy::FromBytes;
 
@@ -77,6 +77,54 @@ pub struct ParsedTraceEvent {
     pub instructions: Vec<ParsedInstruction>,
 }
 
+/// Format a legacy `PrintString` followed by contiguous `PrintVariable`
+/// instructions.
+///
+/// Returns `None` when the string is malformed or has no unescaped default
+/// placeholders. The consumed count includes the `PrintString` instruction.
+pub fn format_legacy_string_with_variables(
+    format_string: &str,
+    instructions: &[ParsedInstruction],
+    start_index: usize,
+) -> Option<(String, usize)> {
+    let template = FormatTemplate::parse(format_string).ok()?;
+    if !template
+        .slots()
+        .any(|slot| slot.conversion == FormatConversion::Default)
+    {
+        return None;
+    }
+
+    let mut consumed = 1;
+    let mut result = String::new();
+    let mut instruction_index = start_index;
+    let mut can_substitute = true;
+
+    for part in template.parts() {
+        match part {
+            FormatPart::Literal(literal) => result.push_str(literal),
+            FormatPart::Slot(slot) if slot.conversion == FormatConversion::Default => {
+                if can_substitute {
+                    if let Some(ParsedInstruction::PrintVariable {
+                        formatted_value, ..
+                    }) = instructions.get(instruction_index)
+                    {
+                        result.push_str(formatted_value);
+                        consumed += 1;
+                        instruction_index += 1;
+                        continue;
+                    }
+                    can_substitute = false;
+                }
+                result.push_str(&slot.to_string());
+            }
+            FormatPart::Slot(slot) => result.push_str(&slot.to_string()),
+        }
+    }
+
+    Some((result, consumed))
+}
+
 impl ParsedTraceEvent {
     pub fn has_formatted_output(&self) -> bool {
         self.instructions
@@ -93,9 +141,9 @@ impl ParsedTraceEvent {
         while i < self.instructions.len() {
             match &self.instructions[i] {
                 ParsedInstruction::PrintString { content } => {
-                    if content.contains("{}") {
-                        let (formatted, consumed) =
-                            self.format_string_with_variables(content, i + 1);
+                    if let Some((formatted, consumed)) =
+                        format_legacy_string_with_variables(content, &self.instructions, i + 1)
+                    {
                         emit(&formatted)?;
                         i += consumed;
                     } else {
@@ -129,43 +177,6 @@ impl ParsedTraceEvent {
             });
 
         output
-    }
-
-    /// Format a format string with following variable instructions
-    fn format_string_with_variables(
-        &self,
-        format_string: &str,
-        start_index: usize,
-    ) -> (String, usize) {
-        // Count placeholders in format string
-        let placeholder_count = format_string.matches("{}").count();
-
-        let mut consumed = 1; // At least consume the format string itself
-        let mut result = String::with_capacity(format_string.len());
-        let mut remaining = format_string;
-
-        for instruction_index in
-            start_index..(start_index + placeholder_count).min(self.instructions.len())
-        {
-            let Some(pos) = remaining.find("{}") else {
-                break;
-            };
-
-            if let Some(ParsedInstruction::PrintVariable {
-                formatted_value, ..
-            }) = self.instructions.get(instruction_index)
-            {
-                result.push_str(&remaining[..pos]);
-                result.push_str(formatted_value);
-                consumed += 1;
-                remaining = &remaining[pos + 2..];
-            } else {
-                break;
-            }
-        }
-        result.push_str(remaining);
-
-        (result, consumed)
     }
 }
 
@@ -1100,5 +1111,62 @@ mod tests {
                 "value (I32): 42".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn escaped_braces_do_not_consume_following_variables() {
+        let event = ParsedTraceEvent {
+            trace_id: 1,
+            timestamp: 0,
+            pid: 10,
+            tid: 11,
+            instructions: vec![
+                ParsedInstruction::PrintString {
+                    content: "{{}}".to_string(),
+                },
+                ParsedInstruction::PrintVariable {
+                    name: "value".to_string(),
+                    type_encoding: TypeKind::I32,
+                    formatted_value: "42".to_string(),
+                    raw_data: vec![42],
+                },
+                ParsedInstruction::EndInstruction {
+                    total_instructions: 2,
+                    execution_status: 0,
+                },
+            ],
+        };
+
+        assert_eq!(
+            event.to_formatted_output(),
+            vec!["{{}}".to_string(), "value (I32): 42".to_string(),]
+        );
+    }
+
+    #[test]
+    fn escaped_braces_do_not_hide_real_placeholders() {
+        let event = ParsedTraceEvent {
+            trace_id: 1,
+            timestamp: 0,
+            pid: 10,
+            tid: 11,
+            instructions: vec![
+                ParsedInstruction::PrintString {
+                    content: "{{}} {}".to_string(),
+                },
+                ParsedInstruction::PrintVariable {
+                    name: "value".to_string(),
+                    type_encoding: TypeKind::I32,
+                    formatted_value: "42".to_string(),
+                    raw_data: vec![42],
+                },
+                ParsedInstruction::EndInstruction {
+                    total_instructions: 2,
+                    execution_status: 0,
+                },
+            ],
+        };
+
+        assert_eq!(event.to_formatted_output(), vec!["{} 42".to_string()]);
     }
 }
