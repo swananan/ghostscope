@@ -102,6 +102,15 @@ struct NameIndexShard {
     type_map: HashMap<String, Vec<usize>>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct CuRange {
+    start: u64,
+    end: u64,
+    cu: DebugInfoOffset,
+    /// Largest end address in this entry and every preceding entry.
+    max_end: u64,
+}
+
 /// Cooked index - inspired by GDB's cooked_index design
 /// Contains lightweight entries for fast symbol lookup
 #[derive(Debug)]
@@ -118,8 +127,8 @@ pub struct LightweightIndex {
     total_functions: usize,
     total_variables: usize,
 
-    /// Optional fast PC→CU map built from aranges or representative-address fallback.
-    cu_range_map: BTreeMap<u64, (u64, DebugInfoOffset)>,
+    /// Sorted, overlap-aware PC→CU ranges built from aranges or DIE ranges.
+    cu_ranges: Vec<CuRange>,
     /// Optional per-CU function representative-address map (start -> entry idx)
     func_addr_by_cu: HashMap<DebugInfoOffset, BTreeMap<u64, usize>>,
     /// All function-like entries in each CU for correctness fallback scans.
@@ -138,7 +147,7 @@ impl LightweightIndex {
             address_map: BTreeMap::new(),
             total_functions: 0,
             total_variables: 0,
-            cu_range_map: BTreeMap::new(),
+            cu_ranges: Vec::new(),
             func_addr_by_cu: HashMap::new(),
             func_indices_by_cu: HashMap::new(),
             cu_maps_built: false,
@@ -424,25 +433,32 @@ impl LightweightIndex {
     }
 
     fn insert_cu_range(
-        cu_map: &mut BTreeMap<u64, (u64, DebugInfoOffset)>,
+        cu_ranges: &mut Vec<CuRange>,
         start: u64,
         end: u64,
         cu: DebugInfoOffset,
-    ) {
-        if start > end {
-            return;
+    ) -> bool {
+        if start >= end {
+            return false;
         }
 
-        match cu_map.get_mut(&start) {
-            Some((existing_end, existing_cu)) => {
-                if end > *existing_end {
-                    *existing_end = end;
-                    *existing_cu = cu;
-                }
-            }
-            None => {
-                cu_map.insert(start, (end, cu));
-            }
+        cu_ranges.push(CuRange {
+            start,
+            end,
+            cu,
+            max_end: 0,
+        });
+        true
+    }
+
+    fn finalize_cu_ranges(cu_ranges: &mut Vec<CuRange>) {
+        cu_ranges.sort_unstable_by_key(|range| (range.start, range.end, range.cu.0));
+        cu_ranges.dedup_by_key(|range| (range.start, range.end, range.cu.0));
+
+        let mut max_end = 0;
+        for range in cu_ranges {
+            max_end = max_end.max(range.end);
+            range.max_end = max_end;
         }
     }
 
@@ -473,7 +489,7 @@ impl LightweightIndex {
 
     /// Attach CU range map and per-CU function address map built from entries
     pub fn build_cu_maps(&mut self, dwarf: &gimli::Dwarf<DwarfReader>) {
-        let mut cu_map: BTreeMap<u64, (u64, DebugInfoOffset)> = BTreeMap::new();
+        let mut cu_ranges = Vec::new();
         let mut per_cu: HashMap<DebugInfoOffset, BTreeMap<u64, usize>> = HashMap::new();
 
         for (idx, entry) in self.entries.iter().enumerate() {
@@ -492,7 +508,7 @@ impl LightweightIndex {
             let root_ranges = Self::resolve_cu_root_ranges(dwarf, cu).unwrap_or_default();
             if !root_ranges.is_empty() {
                 for (start, end) in root_ranges {
-                    Self::insert_cu_range(&mut cu_map, start, end, cu);
+                    Self::insert_cu_range(&mut cu_ranges, start, end, cu);
                 }
                 continue;
             }
@@ -505,12 +521,13 @@ impl LightweightIndex {
                     continue;
                 };
                 for (start, end) in ranges {
-                    Self::insert_cu_range(&mut cu_map, start, end, cu);
+                    Self::insert_cu_range(&mut cu_ranges, start, end, cu);
                 }
             }
         }
 
-        self.cu_range_map = cu_map;
+        Self::finalize_cu_ranges(&mut cu_ranges);
+        self.cu_ranges = cu_ranges;
         self.func_addr_by_cu = per_cu;
         self.cu_maps_built = true;
     }
@@ -533,8 +550,8 @@ impl LightweightIndex {
                             Ok(Some(arange)) => {
                                 let start = arange.address();
                                 let end = arange.range().end;
-                                Self::insert_cu_range(&mut self.cu_range_map, start, end, cu_off);
-                                added_any = true;
+                                added_any |=
+                                    Self::insert_cu_range(&mut self.cu_ranges, start, end, cu_off);
                             }
                             Ok(None) => break,
                             Err(e) => {
@@ -554,6 +571,7 @@ impl LightweightIndex {
             }
         }
 
+        Self::finalize_cu_ranges(&mut self.cu_ranges);
         self.cu_maps_built = true;
         added_any
     }
@@ -564,22 +582,28 @@ impl LightweightIndex {
         let mut added_any = false;
         for cu in compilation_units {
             for (start, end) in Self::resolve_cu_root_ranges(dwarf, cu).unwrap_or_default() {
-                Self::insert_cu_range(&mut self.cu_range_map, start, end, cu);
-                added_any = true;
+                added_any |= Self::insert_cu_range(&mut self.cu_ranges, start, end, cu);
             }
         }
+        Self::finalize_cu_ranges(&mut self.cu_ranges);
         self.cu_maps_built = true;
         added_any
     }
 
-    /// Find compilation unit by address using CU range map
-    pub fn find_cu_by_address(&self, address: u64) -> Option<DebugInfoOffset> {
-        if let Some((_, (end, cu))) = self.cu_range_map.range(..=address).next_back() {
-            if address <= *end {
-                return Some(*cu);
-            }
-        }
-        None
+    /// Find every compilation unit whose half-open range contains `address`.
+    pub(crate) fn find_cus_by_address(
+        &self,
+        address: u64,
+    ) -> impl Iterator<Item = DebugInfoOffset> + '_ {
+        let end = self
+            .cu_ranges
+            .partition_point(|range| range.start <= address);
+        self.cu_ranges[..end]
+            .iter()
+            .rev()
+            .take_while(move |range| address < range.max_end)
+            .filter(move |range| range.start <= address && address < range.end)
+            .map(|range| range.cu)
     }
 
     /// Find the subprogram DIE that contains the given address.
@@ -596,7 +620,7 @@ impl LightweightIndex {
             "LightweightIndex::find_function_by_address requires build_cu_maps before address lookup"
         );
 
-        if let Some(cu) = self.find_cu_by_address(address) {
+        for cu in self.find_cus_by_address(address) {
             if let Some(map) = self.func_addr_by_cu.get(&cu) {
                 if let Some(entry) = self.find_matching_function_in_indices(
                     map.range(..=address).rev().map(|(_, &idx)| idx),
@@ -682,5 +706,54 @@ impl LightweightIndex {
 impl Default for LightweightIndex {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index_with_ranges(ranges: &[(u64, u64, usize)]) -> LightweightIndex {
+        let mut index = LightweightIndex::new();
+        for &(start, end, cu) in ranges {
+            LightweightIndex::insert_cu_range(
+                &mut index.cu_ranges,
+                start,
+                end,
+                DebugInfoOffset(cu),
+            );
+        }
+        LightweightIndex::finalize_cu_ranges(&mut index.cu_ranges);
+        index
+    }
+
+    #[test]
+    fn nested_cu_range_does_not_hide_outer_match() {
+        let index = index_with_ranges(&[(0x1000, 0x1100, 1), (0x1040, 0x1060, 2)]);
+
+        assert_eq!(
+            index.find_cus_by_address(0x1080).collect::<Vec<_>>(),
+            vec![DebugInfoOffset(1)]
+        );
+    }
+
+    #[test]
+    fn overlapping_cu_lookup_preserves_candidates_and_half_open_ends() {
+        let index = index_with_ranges(&[
+            (0x1000, 0x1100, 1),
+            (0x1040, 0x1060, 2),
+            (0x1040, 0x1080, 3),
+            (0x1080, 0x1080, 4),
+        ]);
+
+        assert_eq!(
+            index.find_cus_by_address(0x1050).collect::<Vec<_>>(),
+            vec![DebugInfoOffset(3), DebugInfoOffset(2), DebugInfoOffset(1)]
+        );
+        assert_eq!(
+            index.find_cus_by_address(0x1060).collect::<Vec<_>>(),
+            vec![DebugInfoOffset(3), DebugInfoOffset(1)]
+        );
+        assert!(index.find_cus_by_address(0x1100).next().is_none());
     }
 }

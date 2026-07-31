@@ -791,7 +791,10 @@ fn parse_debug_info_builds_fallback_cu_map_for_function_body_addresses() {
 
     assert_eq!(entry.name.as_ref(), "body_lookup");
     assert_eq!(
-        result.lightweight_index.find_cu_by_address(0x401020),
+        result
+            .lightweight_index
+            .find_cus_by_address(0x401020)
+            .next(),
         Some(entry.unit_offset),
         "fallback CU map should cover addresses inside the function body, not just the representative address"
     );

@@ -116,6 +116,8 @@ pub(crate) struct GdbIndex {
     type_unit_count: usize,
     units: Vec<GdbUnit>,
     address_count: usize,
+    /// Largest end address in each address record and every preceding record.
+    address_prefix_max_end: Vec<u64>,
     symbol_slot_count: usize,
     symbol_names: OnceLock<GdbSymbolNames>,
 }
@@ -200,7 +202,7 @@ impl GdbIndex {
             anyhow::bail!(".gdb_index symbol table size is not a power of two");
         }
 
-        Ok(Self {
+        let mut index = Self {
             data,
             version,
             layout,
@@ -208,9 +210,22 @@ impl GdbIndex {
             type_unit_count,
             units,
             address_count,
+            address_prefix_max_end: Vec::with_capacity(address_count),
             symbol_slot_count,
             symbol_names: OnceLock::new(),
-        })
+        };
+        let mut previous_low = None;
+        let mut max_end = 0;
+        for address_index in 0..address_count {
+            let (low, high, _) = index.read_address(address_index)?;
+            if previous_low.is_some_and(|previous| low < previous) {
+                anyhow::bail!(".gdb_index address records are not ordered");
+            }
+            previous_low = Some(low);
+            max_end = max_end.max(high);
+            index.address_prefix_max_end.push(max_end);
+        }
+        Ok(index)
     }
 
     pub(crate) fn version(&self) -> u32 {
@@ -361,10 +376,7 @@ impl GdbIndex {
             .get(kind))
     }
 
-    pub(crate) fn find_cu_by_address(
-        &self,
-        address: u64,
-    ) -> Result<Option<gimli::DebugInfoOffset>> {
+    pub(crate) fn find_cus_by_address(&self, address: u64) -> Result<Vec<gimli::DebugInfoOffset>> {
         let mut left = 0usize;
         let mut right = self.address_count;
         while left < right {
@@ -377,16 +389,20 @@ impl GdbIndex {
             }
         }
 
+        let mut units = Vec::new();
         for index in (0..left).rev() {
-            let (low, high, cu_index) = self.read_address(index)?;
-            if low <= address && address < high {
-                return self.unit_offset(cu_index).map(Some);
-            }
-            if high <= address {
+            if self.address_prefix_max_end[index] <= address {
                 break;
             }
+            let (low, high, cu_index) = self.read_address(index)?;
+            if low <= address && address < high {
+                let unit = self.unit_offset(cu_index)?;
+                if !units.contains(&unit) {
+                    units.push(unit);
+                }
+            }
         }
-        Ok(None)
+        Ok(units)
     }
 
     fn validate_layout(
@@ -695,6 +711,43 @@ mod tests {
         fixture_with_symbol("target_function", 3 << 28, None)
     }
 
+    fn overlapping_address_fixture() -> Vec<u8> {
+        let mut bytes = vec![0; VERSION_9_HEADER_SIZE];
+        let cu_list = bytes.len();
+        for offset in [0x120, 0x220] {
+            push_u64(&mut bytes, offset);
+            push_u64(&mut bytes, 0x80);
+        }
+        let type_cu_list = bytes.len();
+        let address_area = bytes.len();
+        for (low, high, cu_index) in [(0x4000, 0x4100, 0), (0x4040, 0x4060, 1)] {
+            push_u64(&mut bytes, low);
+            push_u64(&mut bytes, high);
+            push_u32(&mut bytes, cu_index);
+        }
+        let symbol_table = bytes.len();
+        let shortcut_table = bytes.len();
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        let constant_pool = bytes.len();
+
+        write_u32(&mut bytes, 0, 9);
+        for (word, value) in [
+            cu_list,
+            type_cu_list,
+            address_area,
+            symbol_table,
+            shortcut_table,
+            constant_pool,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write_u32(&mut bytes, (word + 1) * 4, u32::try_from(value).unwrap());
+        }
+        bytes
+    }
+
     fn parse(bytes: Vec<u8>) -> Result<GdbIndex> {
         GdbIndex::parse(dwarf_reader_from_arc_with_endian(
             Arc::from(bytes),
@@ -722,14 +775,32 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(
-            index.find_cu_by_address(0x4080).unwrap(),
-            Some(gimli::DebugInfoOffset(0x120))
+            index
+                .find_cus_by_address(0x4080)
+                .unwrap()
+                .into_iter()
+                .next(),
+            Some(gimli::DebugInfoOffset(0x120)),
         );
-        assert_eq!(index.find_cu_by_address(0x4100).unwrap(), None);
+        assert!(index.find_cus_by_address(0x4100).unwrap().is_empty());
         assert_eq!(
             index.symbol_names(GdbSymbolKind::Function).unwrap(),
             &["target_function".to_string()]
         );
+    }
+
+    #[test]
+    fn overlapping_address_record_does_not_hide_outer_match() {
+        let index = parse(overlapping_address_fixture()).unwrap();
+        assert_eq!(
+            index.find_cus_by_address(0x4050).unwrap(),
+            vec![gimli::DebugInfoOffset(0x220), gimli::DebugInfoOffset(0x120)]
+        );
+        assert_eq!(
+            index.find_cus_by_address(0x4080).unwrap(),
+            vec![gimli::DebugInfoOffset(0x120)]
+        );
+        assert!(index.find_cus_by_address(0x4100).unwrap().is_empty());
     }
 
     #[test]

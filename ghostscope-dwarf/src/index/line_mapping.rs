@@ -6,6 +6,39 @@ use std::{
     ops::Bound,
 };
 
+/// Maximum row end seen at or before an address group.
+///
+/// `LineEntry::end_address == None` means that the row has no known upper
+/// bound, so every later prefix containing that row remains unbounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefixMaxEnd {
+    Finite(u64),
+    Unbounded,
+}
+
+impl PrefixMaxEnd {
+    fn from_end_address(end_address: Option<u64>) -> Self {
+        match end_address {
+            Some(end_address) => Self::Finite(end_address),
+            None => Self::Unbounded,
+        }
+    }
+
+    fn include(self, end_address: Option<u64>) -> Self {
+        match (self, end_address) {
+            (Self::Unbounded, _) | (_, None) => Self::Unbounded,
+            (Self::Finite(current), Some(end_address)) => Self::Finite(current.max(end_address)),
+        }
+    }
+
+    fn can_cover(self, address: u64) -> bool {
+        match self {
+            Self::Finite(end_address) => address < end_address,
+            Self::Unbounded => true,
+        }
+    }
+}
+
 /// Pure line mapping table for fast address→line lookup
 #[derive(Debug)]
 pub struct LineMappingTable {
@@ -30,12 +63,25 @@ pub struct LineMappingTable {
     /// `address_group_addresses`.
     address_group_starts: Vec<usize>,
 
+    /// Maximum row end at or before each compact address group.
+    ///
+    /// This lets reverse lookups stop as soon as no earlier compact row can
+    /// cover the target address.
+    address_group_prefix_max_ends: Vec<PrefixMaxEnd>,
+
     /// Rows added after the compact base was built.
     ///
     /// Lazy line loading can append one compilation unit at a time. Keeping
     /// those rows in an incremental index avoids moving and re-indexing every
     /// previously loaded row on each append.
     incremental_entries: BTreeMap<u64, Vec<LineEntry>>,
+
+    /// Addresses and prefix maximum row ends for `incremental_entries`.
+    ///
+    /// These vectors keep miss lookups logarithmic without rebuilding the
+    /// compact base whenever another compilation unit is loaded.
+    incremental_group_addresses: Vec<u64>,
+    incremental_group_prefix_max_ends: Vec<PrefixMaxEnd>,
 
     /// Number of rows in `incremental_entries`.
     incremental_entry_count: usize,
@@ -92,31 +138,69 @@ impl LineMappingTable {
         // Stable sorting preserves insertion order for duplicate-address rows,
         // including the "last row is representative" behavior.
         entries.sort_by_key(|entry| entry.address);
-        let (address_group_addresses, address_group_starts) = Self::build_address_groups(&entries);
+        let (address_group_addresses, address_group_starts, address_group_prefix_max_ends) =
+            Self::build_address_groups(&entries);
 
         Self {
             entries,
             address_group_addresses,
             address_group_starts,
+            address_group_prefix_max_ends,
             incremental_entries: BTreeMap::new(),
+            incremental_group_addresses: Vec::new(),
+            incremental_group_prefix_max_ends: Vec::new(),
             incremental_entry_count: 0,
             path_line_to_addresses,
             basename_to_paths,
         }
     }
 
-    fn build_address_groups(entries: &[LineEntry]) -> (Vec<u64>, Vec<usize>) {
+    fn build_address_groups(entries: &[LineEntry]) -> (Vec<u64>, Vec<usize>, Vec<PrefixMaxEnd>) {
         let mut addresses = Vec::new();
         let mut starts = Vec::new();
+        let mut prefix_max_ends = Vec::new();
         let mut previous_address = None;
+        let mut prefix_max_end: Option<PrefixMaxEnd> = None;
         for (index, entry) in entries.iter().enumerate() {
+            prefix_max_end = Some(match prefix_max_end {
+                Some(prefix_max_end) => prefix_max_end.include(entry.end_address),
+                None => PrefixMaxEnd::from_end_address(entry.end_address),
+            });
+
             if previous_address != Some(entry.address) {
                 addresses.push(entry.address);
                 starts.push(index);
+                prefix_max_ends.push(prefix_max_end.expect("included current line entry"));
                 previous_address = Some(entry.address);
+            } else {
+                *prefix_max_ends
+                    .last_mut()
+                    .expect("duplicate address follows an address group") =
+                    prefix_max_end.expect("included current line entry");
             }
         }
-        (addresses, starts)
+        (addresses, starts, prefix_max_ends)
+    }
+
+    fn build_incremental_address_groups(
+        entries: &BTreeMap<u64, Vec<LineEntry>>,
+    ) -> (Vec<u64>, Vec<PrefixMaxEnd>) {
+        let mut addresses = Vec::with_capacity(entries.len());
+        let mut prefix_max_ends = Vec::with_capacity(entries.len());
+        let mut prefix_max_end: Option<PrefixMaxEnd> = None;
+
+        for (&address, entries) in entries {
+            for entry in entries {
+                prefix_max_end = Some(match prefix_max_end {
+                    Some(prefix_max_end) => prefix_max_end.include(entry.end_address),
+                    None => PrefixMaxEnd::from_end_address(entry.end_address),
+                });
+            }
+            addresses.push(address);
+            prefix_max_ends.push(prefix_max_end.expect("incremental address group is non-empty"));
+        }
+
+        (addresses, prefix_max_ends)
     }
 
     fn group_entries(&self, group_index: usize) -> &[LineEntry] {
@@ -238,8 +322,13 @@ impl LineMappingTable {
         merged.extend(compact_entries);
         merged.extend(incremental_entries);
         self.entries = merged;
-        (self.address_group_addresses, self.address_group_starts) =
-            Self::build_address_groups(&self.entries);
+        (
+            self.address_group_addresses,
+            self.address_group_starts,
+            self.address_group_prefix_max_ends,
+        ) = Self::build_address_groups(&self.entries);
+        self.incremental_group_addresses.clear();
+        self.incremental_group_prefix_max_ends.clear();
         self.incremental_entry_count = 0;
     }
 
@@ -285,6 +374,11 @@ impl LineMappingTable {
         // row participates in only logarithmically many full merges.
         if self.incremental_entry_count >= self.entries.len().max(1) {
             self.compact_incremental_entries();
+        } else {
+            (
+                self.incremental_group_addresses,
+                self.incremental_group_prefix_max_ends,
+            ) = Self::build_incremental_address_groups(&self.incremental_entries);
         }
     }
 
@@ -292,39 +386,101 @@ impl LineMappingTable {
         entries.last()
     }
 
-    /// Find best matching line (closest address <= target address)
+    fn active_representative_entry(entries: &[LineEntry], address: u64) -> Option<&LineEntry> {
+        entries
+            .iter()
+            .rev()
+            .find(|entry| entry.contains_address(address))
+    }
+
+    /// Find the closest active line row at or before the target address.
     pub(crate) fn lookup_line(&self, address: u64) -> Option<&LineEntry> {
-        let compact_candidate = self
+        let mut compact_group = self
             .address_group_addresses
-            .partition_point(|&candidate| candidate <= address)
-            .checked_sub(1);
-        let compact_candidate = compact_candidate.and_then(|group_index| {
-            Self::representative_entry(self.group_entries(group_index))
-                .map(|entry| (entry.address, entry))
-        });
-        let incremental_candidate = if self.incremental_entries.is_empty() {
-            None
-        } else {
-            self.incremental_entries
-                .range(..=address)
-                .next_back()
-                .and_then(|(&candidate_address, entries)| {
-                    Self::representative_entry(entries).map(|entry| (candidate_address, entry))
-                })
-        };
-        let result = match (compact_candidate, incremental_candidate) {
-            (Some((compact_address, compact)), Some((incremental_address, incremental))) => {
-                if compact_address > incremental_address {
-                    Some(compact)
-                } else {
-                    Some(incremental)
-                }
+            .partition_point(|&candidate| candidate <= address);
+        let mut incremental_group = self
+            .incremental_group_addresses
+            .partition_point(|&candidate| candidate <= address);
+        let mut incremental = self.incremental_entries.range(..=address).rev();
+
+        // Rows from overlapping compilation units can interleave by start
+        // address. A later row whose sequence already ended must not hide an
+        // earlier row that still covers the target. Prefix maximum ends let
+        // each store drop out as soon as none of its remaining rows can cover
+        // the target, keeping sequence-gap misses bounded.
+        let result = loop {
+            if compact_group > 0
+                && !self.address_group_prefix_max_ends[compact_group - 1].can_cover(address)
+            {
+                compact_group = 0;
             }
-            (Some((_, compact)), None) => Some(compact),
-            (None, Some((_, incremental))) => Some(incremental),
-            (None, None) => None,
-        }
-        .filter(|entry| entry.contains_address(address));
+            if incremental_group > 0
+                && !self.incremental_group_prefix_max_ends[incremental_group - 1].can_cover(address)
+            {
+                incremental_group = 0;
+            }
+
+            let compact_group_index = compact_group.checked_sub(1);
+            let compact_address =
+                compact_group_index.map(|group_index| self.address_group_addresses[group_index]);
+            let incremental_address = incremental_group
+                .checked_sub(1)
+                .map(|group_index| self.incremental_group_addresses[group_index]);
+
+            match (compact_address, incremental_address) {
+                (Some(compact_address), Some(incremental_address))
+                    if compact_address > incremental_address =>
+                {
+                    compact_group -= 1;
+                    if let Some(entry) = Self::active_representative_entry(
+                        self.group_entries(compact_group),
+                        address,
+                    ) {
+                        break Some(entry);
+                    }
+                }
+                (Some(compact_address), Some(incremental_address))
+                    if compact_address == incremental_address =>
+                {
+                    compact_group -= 1;
+                    incremental_group -= 1;
+                    let (actual_address, incremental_entries) =
+                        incremental.next().expect("indexed incremental line group");
+                    debug_assert_eq!(*actual_address, incremental_address);
+                    if let Some(entry) =
+                        Self::active_representative_entry(incremental_entries, address).or_else(
+                            || {
+                                Self::active_representative_entry(
+                                    self.group_entries(compact_group),
+                                    address,
+                                )
+                            },
+                        )
+                    {
+                        break Some(entry);
+                    }
+                }
+                (_, Some(incremental_address)) => {
+                    incremental_group -= 1;
+                    let (actual_address, entries) =
+                        incremental.next().expect("indexed incremental line group");
+                    debug_assert_eq!(*actual_address, incremental_address);
+                    if let Some(entry) = Self::active_representative_entry(entries, address) {
+                        break Some(entry);
+                    }
+                }
+                (Some(_), None) => {
+                    compact_group -= 1;
+                    if let Some(entry) = Self::active_representative_entry(
+                        self.group_entries(compact_group),
+                        address,
+                    ) {
+                        break Some(entry);
+                    }
+                }
+                (None, None) => break None,
+            }
+        };
 
         if let Some(entry) = result {
             tracing::debug!(
@@ -798,6 +954,144 @@ mod tests {
         assert!(table.lookup_line(0x1010).is_none());
         assert!(table.lookup_line(0x1fff).is_none());
         assert_eq!(table.lookup_line(0x2000).map(|entry| entry.line), Some(20));
+    }
+
+    #[test]
+    fn lookup_line_scans_past_inactive_row_from_overlapping_sequence() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let mut outer = line_entry(0x1000, "/src/outer.c", 10, true);
+        outer.end_address = Some(0x1100);
+        let mut inner = line_entry(0x1040, "/src/inner.c", 20, true);
+        inner.end_address = Some(0x1060);
+        let table = LineMappingTable::from_entries_with_scoped_manager(vec![outer, inner], &scoped);
+
+        let entry = table
+            .lookup_line(0x1080)
+            .expect("outer row should remain active after inner sequence ends");
+
+        assert_eq!(entry.file_path, "/src/outer.c");
+        assert_eq!(entry.address, 0x1000);
+    }
+
+    #[test]
+    fn lookup_line_scans_past_inactive_incremental_row() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let mut outer = line_entry(0x1000, "/src/outer.c", 10, true);
+        outer.end_address = Some(0x1100);
+        let mut unrelated = line_entry(0x2000, "/src/unrelated.c", 30, true);
+        unrelated.end_address = Some(0x2010);
+        let mut table =
+            LineMappingTable::from_entries_with_scoped_manager(vec![outer, unrelated], &scoped);
+        let mut inner = line_entry(0x1040, "/src/inner.c", 20, true);
+        inner.end_address = Some(0x1060);
+        table.extend(LineMappingTable::from_entries_with_scoped_manager(
+            vec![inner],
+            &scoped,
+        ));
+
+        let entry = table
+            .lookup_line(0x1080)
+            .expect("compact outer row should survive an inactive incremental row");
+
+        assert_eq!(entry.file_path, "/src/outer.c");
+        assert_eq!(entry.address, 0x1000);
+    }
+
+    #[test]
+    fn lookup_line_prefix_max_ends_bound_compact_and_incremental_misses() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let mut compact_first = line_entry(0x1000, "/src/base.c", 10, true);
+        compact_first.end_address = Some(0x1010);
+        let mut compact_duplicate = line_entry(0x1100, "/src/base.c", 11, true);
+        compact_duplicate.end_address = Some(0x1180);
+        let mut compact_longer_duplicate = line_entry(0x1100, "/src/base.c", 12, true);
+        compact_longer_duplicate.end_address = Some(0x1200);
+        let mut compact_later = line_entry(0x2000, "/src/base.c", 20, true);
+        compact_later.end_address = Some(0x2010);
+        let mut table = LineMappingTable::from_entries_with_scoped_manager(
+            vec![
+                compact_first,
+                compact_duplicate,
+                compact_longer_duplicate,
+                compact_later,
+            ],
+            &scoped,
+        );
+
+        let mut incremental_first = line_entry(0x1400, "/src/lazy.c", 14, true);
+        incremental_first.end_address = Some(0x1500);
+        let mut incremental_later = line_entry(0x1800, "/src/lazy.c", 18, true);
+        incremental_later.end_address = Some(0x1810);
+        table.extend(LineMappingTable::from_entries_with_scoped_manager(
+            vec![incremental_first, incremental_later],
+            &scoped,
+        ));
+
+        assert_eq!(
+            table.address_group_prefix_max_ends,
+            vec![
+                PrefixMaxEnd::Finite(0x1010),
+                PrefixMaxEnd::Finite(0x1200),
+                PrefixMaxEnd::Finite(0x2010),
+            ]
+        );
+        assert_eq!(
+            table.incremental_group_prefix_max_ends,
+            vec![PrefixMaxEnd::Finite(0x1500), PrefixMaxEnd::Finite(0x1810),]
+        );
+        assert!(table.lookup_line(0x1900).is_none());
+    }
+
+    #[test]
+    fn lookup_line_prefix_max_end_treats_unknown_end_as_unbounded() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let compact_unbounded = line_entry(0x1000, "/src/base.c", 10, true);
+        let mut compact_inactive = line_entry(0x1040, "/src/base.c", 11, true);
+        compact_inactive.end_address = Some(0x1060);
+        let mut compact_filler = line_entry(0x3000, "/src/base.c", 30, true);
+        compact_filler.end_address = Some(0x3010);
+        let mut compact_filler_later = line_entry(0x4000, "/src/base.c", 40, true);
+        compact_filler_later.end_address = Some(0x4010);
+        let mut table = LineMappingTable::from_entries_with_scoped_manager(
+            vec![
+                compact_unbounded,
+                compact_inactive,
+                compact_filler,
+                compact_filler_later,
+            ],
+            &scoped,
+        );
+
+        assert_eq!(
+            table.lookup_line(0x1080).map(|entry| entry.address),
+            Some(0x1000)
+        );
+        assert_eq!(
+            table.address_group_prefix_max_ends,
+            vec![
+                PrefixMaxEnd::Unbounded,
+                PrefixMaxEnd::Unbounded,
+                PrefixMaxEnd::Unbounded,
+                PrefixMaxEnd::Unbounded,
+            ]
+        );
+
+        let incremental_unbounded = line_entry(0x2000, "/src/lazy.c", 20, true);
+        let mut incremental_inactive = line_entry(0x2040, "/src/lazy.c", 21, true);
+        incremental_inactive.end_address = Some(0x2060);
+        table.extend(LineMappingTable::from_entries_with_scoped_manager(
+            vec![incremental_unbounded, incremental_inactive],
+            &scoped,
+        ));
+
+        assert_eq!(
+            table.incremental_group_prefix_max_ends,
+            vec![PrefixMaxEnd::Unbounded, PrefixMaxEnd::Unbounded]
+        );
+        assert_eq!(
+            table.lookup_line(0x2080).map(|entry| entry.address),
+            Some(0x2000)
+        );
     }
 
     #[test]
