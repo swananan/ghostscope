@@ -4,10 +4,10 @@ use anyhow::Context;
 use common::{fixture_compiler_available, init, FixtureCompiler, OptimizationLevel, FIXTURES};
 use gimli::write::{
     Address, AttributeValue as WriteAttributeValue, DebugInfoRef as WriteDebugInfoRef,
-    Dwarf as WriteDwarf, EndianVec, LineProgram, Sections, Unit,
+    Dwarf as WriteDwarf, EndianVec, LineProgram, LineString, Sections, Unit,
 };
 use gimli::Reader;
-use gimli::{Format, SectionId};
+use gimli::{Format, LineEncoding, SectionId};
 use object::{Object, ObjectSection, ObjectSymbol};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -21,6 +21,14 @@ use tempfile::TempPath;
 // Keep these on the executable inline-body lines in inline_callsite_program.c.
 const INLINE_TRACE_LINE: u32 = 43;
 const COMPLEX_DUPLICATE_PC_LINE: u32 = 20;
+const OVERLAPPING_CU_OUTER_START: u64 = 0x501000;
+const OVERLAPPING_CU_OUTER_ROW_ADDRESS: u64 = 0x501020;
+const OVERLAPPING_CU_INNER_START: u64 = 0x501040;
+const OVERLAPPING_CU_INNER_LINE_END: u64 = 0x501060;
+const OVERLAPPING_CU_TARGET_ADDRESS: u64 = 0x501080;
+const OVERLAPPING_CU_INNER_END: u64 = 0x5010c0;
+const OVERLAPPING_CU_OUTER_END: u64 = 0x501100;
+const OVERLAPPING_CU_TARGET_LINE: u32 = 42;
 
 type TestReader = gimli::EndianArcSlice<gimli::RunTimeEndian>;
 
@@ -1036,6 +1044,176 @@ fn build_cross_cu_ref_addr_binary(out_dir: &Path) -> anyhow::Result<Option<PathB
     Ok(Some(binary))
 }
 
+fn add_overlapping_cu(
+    dwarf: &mut WriteDwarf,
+    encoding: gimli::Encoding,
+    source_name: &[u8],
+    function_name: &[u8],
+    range: std::ops::Range<u64>,
+    row_address: u64,
+    line_end: u64,
+    row_line: u32,
+) {
+    debug_assert!(range.start <= row_address);
+    debug_assert!(row_address < line_end);
+    debug_assert!(line_end <= range.end);
+
+    let source = LineString::String(source_name.to_vec());
+    let mut line_program = LineProgram::new(
+        encoding,
+        LineEncoding::default(),
+        LineString::String(b"/synthetic".to_vec()),
+        None,
+        source.clone(),
+        None,
+    );
+    let file = line_program.add_file(source, line_program.default_directory(), None);
+    line_program.begin_sequence(Some(Address::Constant(range.start)));
+    {
+        let row = line_program.row();
+        row.address_offset = row_address - range.start;
+        row.file = file;
+        row.line = u64::from(row_line);
+        row.is_statement = true;
+    }
+    line_program.generate_row();
+    line_program.end_sequence(line_end - range.start);
+
+    let unit_id = dwarf.units.add(Unit::new(encoding, line_program));
+    let unit = dwarf.units.get_mut(unit_id);
+    let root = unit.root();
+    let root_entry = unit.get_mut(root);
+    root_entry.set(
+        gimli::constants::DW_AT_name,
+        WriteAttributeValue::String(source_name.to_vec()),
+    );
+    root_entry.set(
+        gimli::constants::DW_AT_comp_dir,
+        WriteAttributeValue::String(b"/synthetic".to_vec()),
+    );
+    root_entry.set(
+        gimli::constants::DW_AT_low_pc,
+        WriteAttributeValue::Address(Address::Constant(range.start)),
+    );
+    root_entry.set(
+        gimli::constants::DW_AT_high_pc,
+        WriteAttributeValue::Udata(range.end - range.start),
+    );
+
+    let function = unit.add(root, gimli::constants::DW_TAG_subprogram);
+    let function_entry = unit.get_mut(function);
+    function_entry.set(
+        gimli::constants::DW_AT_name,
+        WriteAttributeValue::String(function_name.to_vec()),
+    );
+    function_entry.set(
+        gimli::constants::DW_AT_low_pc,
+        WriteAttributeValue::Address(Address::Constant(range.start)),
+    );
+    function_entry.set(
+        gimli::constants::DW_AT_high_pc,
+        WriteAttributeValue::Udata(range.end - range.start),
+    );
+}
+
+fn write_overlapping_cu_dwarf_sections(out_dir: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let encoding = gimli::Encoding {
+        format: Format::Dwarf32,
+        version: 5,
+        address_size: 8,
+    };
+    let mut dwarf = WriteDwarf::new();
+
+    add_overlapping_cu(
+        &mut dwarf,
+        encoding,
+        b"overlap_outer.c",
+        b"overlap_outer",
+        OVERLAPPING_CU_OUTER_START..OVERLAPPING_CU_OUTER_END,
+        OVERLAPPING_CU_OUTER_ROW_ADDRESS,
+        OVERLAPPING_CU_OUTER_END,
+        OVERLAPPING_CU_TARGET_LINE,
+    );
+    add_overlapping_cu(
+        &mut dwarf,
+        encoding,
+        b"overlap_inner.c",
+        b"overlap_inner",
+        OVERLAPPING_CU_INNER_START..OVERLAPPING_CU_INNER_END,
+        OVERLAPPING_CU_INNER_START,
+        OVERLAPPING_CU_INNER_LINE_END,
+        7,
+    );
+
+    let mut sections = Sections::new(EndianVec::new(gimli::LittleEndian));
+    dwarf.write(&mut sections)?;
+
+    let mut written = Vec::new();
+    for id in [
+        SectionId::DebugAbbrev,
+        SectionId::DebugInfo,
+        SectionId::DebugLine,
+        SectionId::DebugLineStr,
+        SectionId::DebugStr,
+    ] {
+        let data = sections
+            .get(id)
+            .map(|section| section.slice().to_vec())
+            .unwrap_or_default();
+        if data.is_empty() {
+            continue;
+        }
+        let path = out_dir.join(format!("overlap-{}.bin", id.name().trim_start_matches('.')));
+        fs::write(&path, data)?;
+        written.push((id.name().to_string(), path));
+    }
+    Ok(written)
+}
+
+fn build_overlapping_cu_binary(out_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let Some(cc) = preferred_c_compiler() else {
+        eprintln!("Skipping overlapping-CU e2e: no C compiler is available");
+        return Ok(None);
+    };
+    if !command_available("objcopy") {
+        eprintln!("Skipping overlapping-CU e2e: objcopy is unavailable");
+        return Ok(None);
+    }
+
+    let source = out_dir.join("overlapping_cu_stub.c");
+    let binary = out_dir.join("overlapping_cu_stub");
+    fs::write(&source, "int main(void) { return 0; }\n")?;
+    run_command(
+        StdCommand::new(cc).arg("-o").arg(&binary).arg(&source),
+        "compile overlapping-CU stub",
+    )?;
+
+    let sections = write_overlapping_cu_dwarf_sections(out_dir)?;
+    let mut objcopy = StdCommand::new("objcopy");
+    for (section_name, section_path) in &sections {
+        objcopy
+            .arg("--add-section")
+            .arg(format!("{section_name}={}", section_path.display()));
+    }
+    objcopy.arg(&binary);
+    run_command(&mut objcopy, "objcopy --add-section overlapping-CU DWARF")?;
+    Ok(Some(binary))
+}
+
+fn compilation_unit_ranges(binary_path: &Path) -> anyhow::Result<Vec<std::ops::Range<u64>>> {
+    let dwarf = load_dwarf_from_binary(binary_path)?;
+    let mut units = dwarf.units();
+    let mut ranges = Vec::new();
+    while let Some(header) = units.next()? {
+        let unit = dwarf.unit(header)?;
+        let mut unit_ranges = dwarf.unit_ranges(&unit)?;
+        while let Some(range) = unit_ranges.next()? {
+            ranges.push(range.begin..range.end);
+        }
+    }
+    Ok(ranges)
+}
+
 fn cross_cu_ref_addr_attrs(binary_path: &Path) -> anyhow::Result<HashSet<gimli::DwAt>> {
     let dwarf = load_dwarf_from_binary(binary_path)?;
     let mut found = HashSet::new();
@@ -1287,6 +1465,54 @@ async fn test_cross_cu_ref_addr_origin_and_spec_names_are_indexed() -> anyhow::R
         16,
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_overlapping_cu_inactive_line_row_does_not_hide_outer_source_location(
+) -> anyhow::Result<()> {
+    init();
+
+    let temp_dir = tempfile::tempdir()?;
+    let Some(binary_path) = build_overlapping_cu_binary(temp_dir.path())? else {
+        return Ok(());
+    };
+
+    let ranges = compilation_unit_ranges(&binary_path)?;
+    let outer_range = OVERLAPPING_CU_OUTER_START..OVERLAPPING_CU_OUTER_END;
+    let inner_range = OVERLAPPING_CU_INNER_START..OVERLAPPING_CU_INNER_END;
+    assert!(
+        ranges.contains(&outer_range),
+        "fixture is missing the outer CU range: {ranges:x?}"
+    );
+    assert!(
+        ranges.contains(&inner_range),
+        "fixture is missing the inner CU range: {ranges:x?}"
+    );
+    assert!(outer_range.contains(&OVERLAPPING_CU_TARGET_ADDRESS));
+    assert!(inner_range.contains(&OVERLAPPING_CU_TARGET_ADDRESS));
+    assert!(OVERLAPPING_CU_OUTER_ROW_ADDRESS < OVERLAPPING_CU_TARGET_ADDRESS);
+    assert!(OVERLAPPING_CU_INNER_LINE_END <= OVERLAPPING_CU_TARGET_ADDRESS);
+    let nearest_preceding = ranges
+        .iter()
+        .filter(|range| range.start <= OVERLAPPING_CU_TARGET_ADDRESS)
+        .max_by_key(|range| range.start)
+        .context("fixture has no CU range before the target address")?;
+    assert_eq!(nearest_preceding, &inner_range);
+
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let location = analyzer
+        .lookup_source_location(&ghostscope_dwarf::ModuleAddress::new(
+            binary_path,
+            OVERLAPPING_CU_TARGET_ADDRESS,
+        ))
+        .context("outer CU source location should survive an intervening overlapping CU")?;
+    assert!(
+        location.file_path.ends_with("overlap_outer.c"),
+        "unexpected source file: {location:?}"
+    );
+    assert_eq!(location.line_number, OVERLAPPING_CU_TARGET_LINE);
+    assert_eq!(location.address, OVERLAPPING_CU_OUTER_ROW_ADDRESS);
     Ok(())
 }
 

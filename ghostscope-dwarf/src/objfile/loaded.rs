@@ -271,22 +271,7 @@ impl LoadedObjfile {
         if !self.lazy_debug_info {
             return Ok(());
         }
-        let gdb_cu = self
-            .gdb_index
-            .as_ref()
-            .map(|index| index.find_cu_by_address(address))
-            .transpose()?
-            .flatten();
-        let cu_offset = gdb_cu.or_else(|| {
-            self.lightweight_index
-                .read()
-                .expect("lightweight index lock poisoned")
-                .find_cu_by_address(address)
-        });
-        let Some(cu_offset) = cu_offset else {
-            return Ok(());
-        };
-        self.ensure_debug_info_cus(std::iter::once(cu_offset))
+        self.ensure_debug_info_cus(self.compilation_units_for_address(address)?)
     }
 
     pub(super) fn ensure_debug_info_for_entries(
@@ -320,22 +305,23 @@ impl LoadedObjfile {
     }
 
     pub(super) fn ensure_line_info_for_address(&self, address: u64) -> Result<()> {
-        let gdb_cu = self
-            .gdb_index
-            .as_ref()
-            .map(|index| index.find_cu_by_address(address))
-            .transpose()?
-            .flatten();
-        let unit_offset = gdb_cu.or_else(|| {
-            self.lightweight_index
-                .read()
-                .expect("lightweight index lock poisoned")
-                .find_cu_by_address(address)
-        });
-        if let Some(unit_offset) = unit_offset {
-            self.ensure_line_info_for_unit(unit_offset)?;
+        self.ensure_line_info_cus(self.compilation_units_for_address(address)?)
+    }
+
+    fn compilation_units_for_address(&self, address: u64) -> Result<Vec<gimli::DebugInfoOffset>> {
+        if let Some(index) = &self.gdb_index {
+            let unit_offsets = index.find_cus_by_address(address)?;
+            if !unit_offsets.is_empty() {
+                return Ok(unit_offsets);
+            }
         }
-        Ok(())
+
+        Ok(self
+            .lightweight_index
+            .read()
+            .expect("lightweight index lock poisoned")
+            .find_cus_by_address(address)
+            .collect())
     }
 
     pub(super) fn ensure_line_info_for_source(&self, file_path: &str) -> Result<()> {

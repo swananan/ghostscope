@@ -138,14 +138,21 @@ impl LoadedObjfile {
             {
                 self.add_block_index_functions_if_missing(address, vec![fb]);
             }
-        } else if let Some(cu_off) = self
-            .lightweight_index
-            .read()
-            .expect("lightweight index lock poisoned")
-            .find_cu_by_address(address)
-        {
-            if let Some(funcs) = builder.build_for_unit(cu_off) {
-                self.add_block_index_functions_if_missing(address, funcs);
+        } else {
+            let compilation_units = self
+                .lightweight_index
+                .read()
+                .expect("lightweight index lock poisoned")
+                .find_cus_by_address(address)
+                .collect::<Vec<_>>();
+            let mut functions = Vec::new();
+            for cu_off in compilation_units {
+                if let Some(mut unit_functions) = builder.build_for_unit(cu_off) {
+                    functions.append(&mut unit_functions);
+                }
+            }
+            if !functions.is_empty() {
+                self.add_block_index_functions_if_missing(address, functions);
             }
         }
     }
