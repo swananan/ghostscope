@@ -110,18 +110,19 @@ ghostscope -p 1234 --debug-file /path/to/binary.debug
 
 # 自动检测按以下顺序搜索：
 # 1. 二进制文件本身（.debug_info 节）
-# 2. .gnu_debuglink 节（参见下方搜索路径）
+# 2. 通过 Build-ID 或 .gnu_debuglink 搜索本地独立调试文件
 # 3. 启用 [dwarf.debuginfod] 时，通过 Build-ID 使用 debuginfod
 #
-# GhostScope 不会直接搜索本地 Build-ID 目录布局；当前也不会加载
-# .gnu_debugdata。如需使用独立调试信息，请使用 .gnu_debuglink search_paths
-# 或 debuginfod。默认 search_paths 包含 /usr/lib/debug 和 /usr/local/lib/debug。
+# GhostScope 当前不会加载 .gnu_debugdata。默认 search_paths 包含
+# /usr/lib/debug 和 /usr/local/lib/debug。
 
-# .gnu_debuglink 搜索路径（可在 config.toml 中配置）：
+# 本地独立调试文件搜索路径（可在 config.toml 中配置）：
 # 1. 绝对路径（如果 .gnu_debuglink 包含绝对路径 - 罕见）
-# 2. 用户配置的 search_paths + basename（最高优先级）
-# 3. 二进制文件同目录 + basename
-# 4. 二进制文件同目录的 .debug 子目录 + basename
+# 2. 有 Build-ID 时，<search_path>/.build-id/xx/yyyy.debug
+# 3. 用户配置的 search_paths + basename（GhostScope 兼容路径）
+# 4. 二进制文件同目录 + basename
+# 5. 二进制文件同目录的 .debug 子目录 + basename
+# 6. <search_path>/<二进制绝对目录>/<basename>
 #
 # 注意：如果在 config.toml 中覆盖 search_paths，请保留仍然依赖的系统调试目录。
 ```
@@ -332,22 +333,26 @@ timestamp = "local"
 color = "auto"
 
 [dwarf]
-# DWARF 调试信息搜索路径（用于 .gnu_debuglink 文件）
-# 当二进制文件使用 .gnu_debuglink 引用独立的调试文件时，
-# GhostScope 会在这些路径中搜索调试文件。
+# 本地独立 DWARF 调试信息的全局搜索目录。
+# GhostScope 使用这些目录进行 Build-ID 和 .gnu_debuglink 查找。
 #
-# 这些路径只影响自动 .gnu_debuglink 发现。命令行 --debug-file/-d
-# 会直接指定一个调试文件，并绕过该搜索列表用于选中的目标模块。
+# 命令行 --debug-file/-d 会直接指定一个调试文件，并绕过该搜索列表用于
+# 选中的目标模块。
 #
 # 搜索顺序（优先级从高到低）：
 # 1. 绝对路径（如果 .gnu_debuglink 包含绝对路径 - 罕见）
-# 2. 用户配置的 search_paths + basename（此处配置）
-# 3. 二进制文件所在目录 + basename
-# 4. 二进制文件所在目录的 .debug 子目录 + basename
+# 2. 有 Build-ID 时，<search_path>/.build-id/xx/yyyy.debug
+# 3. 用户配置的 search_paths + basename（GhostScope 兼容路径）
+# 4. 二进制文件所在目录 + basename
+# 5. 二进制文件所在目录的 .debug 子目录 + basename
+# 6. <search_path>/<二进制绝对目录>/<basename>
 #
-# 对于每个用户配置的路径，会检查两种位置：
+# 对于每个用户配置的路径，仍会检查原有的两种平铺位置：
 #   - <路径>/debug_文件名
 #   - <路径>/.debug/debug_文件名
+# 同时也会检查标准 GDB 目录布局：
+#   - <路径>/.build-id/xx/yyyy.debug
+#   - <路径>/<二进制绝对目录>/debug_文件名
 #
 # 特性：
 # - 主目录展开："~/" 会被替换为你的主目录
