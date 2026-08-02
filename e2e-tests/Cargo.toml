@@ -23,6 +23,7 @@ scopeguard = { workspace = true }
 serial_test = { workspace = true }
 gimli = { workspace = true }
 object = { workspace = true }
+aya = { workspace = true }
 ghostscope-compiler = { version = "0.1.6", path = "../ghostscope-compiler" }
 ghostscope-dwarf = { version = "0.1.6", path = "../ghostscope-dwarf" }
 ghostscope-process = { version = "0.1.6", path = "../ghostscope-process" }
