@@ -142,7 +142,7 @@ pub struct ScriptConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DwarfConfig {
-    /// DWARF debug information search paths (for future --debug-file auto-discovery)
+    /// Global directories for local Build-ID and `.gnu_debuglink` discovery.
     #[serde(default = "default_debug_search_paths")]
     pub search_paths: Vec<String>,
     /// Allow non-strict matching of separate debug files (CRC/Build-ID)

@@ -43,4 +43,5 @@ crc32fast = "1.4"
 dirs = "5.0"
 
 [dev-dependencies]
+object = { workspace = true, features = ["write"] }
 tempfile = { workspace = true }

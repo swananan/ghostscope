@@ -120,7 +120,7 @@ impl LoadedObjfile {
                         )
                     } else {
                         tracing::info!(
-                            "No debug info in binary, searching for .gnu_debuglink: {}",
+                            "No debug info in binary, searching for local separate debug information: {}",
                             module_mapping.path.display()
                         );
                         match try_load_debug_file(

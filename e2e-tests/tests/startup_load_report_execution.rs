@@ -4,6 +4,7 @@ mod common;
 
 use anyhow::{bail, Context, Result};
 use common::init;
+use object::Object;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ const FIXTURE_BINARY: &str = "debug_source_report";
 const FIXTURE_DEBUG_FILE: &str = "debug_source_report.debug";
 const EMBEDDED_BINARY: &str = "debug_source_report_embedded";
 const NO_DEBUGLINK_BINARY: &str = "debug_source_report_no_debuglink";
+const NO_DEBUGLINK_UNSTRIPPED: &str = "debug_source_report_no_debuglink.unstripped";
 const NO_DWARF_DEBUGLINK_BINARY: &str = "debug_source_report_no_dwarf_debuglink";
 const NO_DWARF_DEBUG_FILE: &str = "debug_source_report_no_dwarf.debug";
 const MISSING_BINARY: &str = "debug_source_report_missing";
@@ -95,6 +97,129 @@ async fn test_startup_report_shows_debuglink_source() -> Result<()> {
         "debug source path should not be rendered with a leading four-dot truncation\n{}",
         run.output
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_startup_report_finds_gdb_mirrored_debuglink() -> Result<()> {
+    init();
+
+    if !is_host_topology() {
+        println!("skipping startup load report e2e outside host->host topology");
+        return Ok(());
+    }
+
+    let fixture = ensure_startup_report_fixture()?;
+    let layout = TempDir::new().context("failed to create mirrored debuglink layout")?;
+    let binary_dir = layout.path().join("opt/ghostscope/bin");
+    fs::create_dir_all(&binary_dir).context("failed to create temporary binary directory")?;
+    let binary = binary_dir.join(FIXTURE_BINARY);
+    fs::copy(&fixture.binary, &binary).with_context(|| {
+        format!(
+            "failed to copy stripped fixture {} to {}",
+            fixture.binary.display(),
+            binary.display()
+        )
+    })?;
+
+    let debug_root = layout.path().join("debug-root");
+    let debug_path = gdb_mirrored_debug_path(&debug_root, &binary, FIXTURE_DEBUG_FILE)?;
+    fs::create_dir_all(
+        debug_path
+            .parent()
+            .context("mirrored debug path has no parent")?,
+    )
+    .context("failed to create mirrored debug directory")?;
+    fs::copy(&fixture.debug_file, &debug_path).with_context(|| {
+        format!(
+            "failed to copy debug fixture {} to {}",
+            fixture.debug_file.display(),
+            debug_path.display()
+        )
+    })?;
+
+    let config = startup_report_config(&[debug_root.as_path()]);
+    let run = run_startup_report_command_for_binary_with_config(&fixture, &binary, &[], &config)?;
+
+    assert!(
+        run.status.success(),
+        "mirrored debuglink startup report run failed with status {}\n{}",
+        run.status,
+        run.output
+    );
+    assert_output_contains(&run.output, "\x1b[32mDWARF ready:\x1b[0m");
+    assert_output_contains(&run.output, "\x1b[34mdebuglink:1\x1b[0m");
+    assert_output_contains(&run.output, FIXTURE_DEBUG_FILE);
+    assert_output_contains(&run.output, "Dry run complete; no uprobes attached.");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_startup_report_finds_build_id_file_without_debuglink() -> Result<()> {
+    init();
+
+    if !is_host_topology() {
+        println!("skipping startup load report e2e outside host->host topology");
+        return Ok(());
+    }
+
+    let fixture = ensure_startup_report_fixture()?;
+    let layout = TempDir::new().context("failed to create Build-ID debug layout")?;
+    let binary_dir = layout.path().join("opt/ghostscope/bin");
+    fs::create_dir_all(&binary_dir).context("failed to create temporary binary directory")?;
+    let binary = binary_dir.join(NO_DEBUGLINK_BINARY);
+    fs::copy(&fixture.no_debuglink_binary, &binary).with_context(|| {
+        format!(
+            "failed to copy stripped fixture {} to {}",
+            fixture.no_debuglink_binary.display(),
+            binary.display()
+        )
+    })?;
+
+    let debug_root = layout.path().join("debug-root");
+    let binary_build_id = read_build_id_hex(&binary)?;
+    let debug_build_id = read_build_id_hex(&fixture.no_debuglink_unstripped)?;
+    anyhow::ensure!(
+        !has_debuglink(&binary)?,
+        "Build-ID fixture unexpectedly contains .gnu_debuglink"
+    );
+    anyhow::ensure!(
+        binary_build_id == debug_build_id,
+        "stripped and unstripped Build-IDs differ: {binary_build_id} != {debug_build_id}"
+    );
+    let debug_path = build_id_debug_path(&debug_root, &binary_build_id)?;
+    fs::create_dir_all(
+        debug_path
+            .parent()
+            .context("Build-ID debug path has no parent")?,
+    )
+    .context("failed to create Build-ID debug directory")?;
+    fs::copy(&fixture.no_debuglink_unstripped, &debug_path).with_context(|| {
+        format!(
+            "failed to copy Build-ID debug fixture {} to {}",
+            fixture.no_debuglink_unstripped.display(),
+            debug_path.display()
+        )
+    })?;
+
+    let config = startup_report_config(&[debug_root.as_path()]);
+    let run = run_startup_report_command_for_binary_with_config(&fixture, &binary, &[], &config)?;
+
+    assert!(
+        run.status.success(),
+        "Build-ID startup report run failed with status {}\n{}",
+        run.status,
+        run.output
+    );
+    assert_output_contains(&run.output, "\x1b[32mDWARF ready:\x1b[0m");
+    assert_output_contains(&run.output, "\x1b[34mdebuglink:1\x1b[0m");
+    let debug_filename_prefix = &binary_build_id[2..binary_build_id.len().min(14)];
+    assert_output_contains(&run.output, debug_filename_prefix);
+    assert_output_contains(&run.output, "Dry run complete; no uprobes attached.");
 
     Ok(())
 }
@@ -347,6 +472,7 @@ struct StartupReportFixture {
     binary: PathBuf,
     embedded_binary: PathBuf,
     no_debuglink_binary: PathBuf,
+    no_debuglink_unstripped: PathBuf,
     no_dwarf_debuglink_binary: PathBuf,
     no_dwarf_debug_file: PathBuf,
     missing_binary: PathBuf,
@@ -369,6 +495,7 @@ fn ensure_startup_report_fixture() -> Result<StartupReportFixture> {
                 binary: dir.join(FIXTURE_BINARY),
                 embedded_binary: dir.join(EMBEDDED_BINARY),
                 no_debuglink_binary: dir.join(NO_DEBUGLINK_BINARY),
+                no_debuglink_unstripped: dir.join(NO_DEBUGLINK_UNSTRIPPED),
                 no_dwarf_debuglink_binary: dir.join(NO_DWARF_DEBUGLINK_BINARY),
                 no_dwarf_debug_file: dir.join(NO_DWARF_DEBUG_FILE),
                 missing_binary: dir.join(MISSING_BINARY),
@@ -498,6 +625,62 @@ enabled = "off"
 "#,
     );
     config
+}
+
+fn gdb_mirrored_debug_path(
+    debug_root: &Path,
+    binary: &Path,
+    debug_filename: &str,
+) -> Result<PathBuf> {
+    let canonical_binary = binary
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize binary {}", binary.display()))?;
+    let binary_dir = canonical_binary
+        .parent()
+        .context("canonical binary path has no parent")?;
+    let relative_binary_dir = binary_dir
+        .strip_prefix(Path::new("/"))
+        .context("canonical binary path is not absolute")?;
+    Ok(debug_root.join(relative_binary_dir).join(debug_filename))
+}
+
+fn read_build_id_hex(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read ELF {}", path.display()))?;
+    let object = object::File::parse(&bytes[..])
+        .with_context(|| format!("failed to parse ELF {}", path.display()))?;
+    let build_id = object
+        .build_id()
+        .context("failed to read GNU Build-ID note")?
+        .with_context(|| format!("ELF has no Build-ID: {}", path.display()))?;
+
+    let mut hex = String::with_capacity(build_id.len() * 2);
+    for byte in build_id {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
+
+fn has_debuglink(path: &Path) -> Result<bool> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read ELF {}", path.display()))?;
+    let object = object::File::parse(&bytes[..])
+        .with_context(|| format!("failed to parse ELF {}", path.display()))?;
+    Ok(object
+        .gnu_debuglink()
+        .context("failed to read .gnu_debuglink")?
+        .is_some())
+}
+
+fn build_id_debug_path(debug_root: &Path, build_id: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        build_id.len() >= 2,
+        "Build-ID is too short for the standard directory layout: {build_id}"
+    );
+    let (prefix, suffix) = build_id.split_at(2);
+    Ok(debug_root
+        .join(".build-id")
+        .join(prefix)
+        .join(format!("{suffix}.debug")))
 }
 
 fn toml_string(path: &Path) -> String {

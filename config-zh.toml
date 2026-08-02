@@ -57,23 +57,18 @@ timestamp = "local"
 color = "auto"
 
 [dwarf]
-# DWARF 调试信息搜索路径（用于 .gnu_debuglink 文件）
+# 本地独立 DWARF 调试信息的全局搜索目录
 #
-# 当二进制文件使用 .gnu_debuglink 引用独立的调试文件时，
-# GhostScope 会在这些路径中搜索调试文件。
+# GhostScope 使用这些目录搜索 Build-ID 和 .gnu_debuglink 调试文件。
+# 命令行 --debug-file/-d 会直接指定一个调试文件，并绕过该搜索列表用于
+# 选中的目标模块。
 #
-# 这些路径只影响自动 .gnu_debuglink 发现。命令行 --debug-file/-d
-# 会直接指定一个调试文件，并绕过该搜索列表用于选中的目标模块。
-#
-# 搜索顺序（优先级从高到低）：
-# 1. 绝对路径（如果 .gnu_debuglink 包含绝对路径 - 罕见）
-# 2. 用户配置的 search_paths + basename（此处配置）
-# 3. 二进制文件所在目录 + basename
-# 4. 二进制文件所在目录的 .debug 子目录 + basename
-#
-# 对于每个用户配置的路径，会检查两种位置：
+# 支持的位置包括：
+#   - <路径>/.build-id/xx/yyyy.debug
+#   - <路径>/<二进制绝对目录>/<debug_文件名>
 #   - <路径>/debug_文件名
 #   - <路径>/.debug/debug_文件名
+#   - 二进制文件所在目录及其 .debug 子目录
 #
 # 特性：
 # - 主目录展开："~/" 会被替换为你的主目录
@@ -85,9 +80,6 @@ color = "auto"
 #   - 本地调试符号："/usr/local/lib/debug"
 #   - 用户特定：    "~/.local/lib/debug"
 #   - 自定义构建输出："/path/to/build/debug"
-#
-# 注意：.gnu_debuglink 通常使用 basename（相对路径），但也支持绝对路径。
-# 如需使用系统范围的调试目录（如 /usr/lib/debug），请添加到 search_paths。
 #
 # 默认值：["/usr/lib/debug", "/usr/local/lib/debug"]
 search_paths = [

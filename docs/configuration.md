@@ -109,19 +109,19 @@ ghostscope -p 1234 --debug-file /path/to/binary.debug
 
 # Auto-detection searches in order:
 # 1. Binary itself (.debug_info sections)
-# 2. .gnu_debuglink section (see search paths below)
+# 2. Local separate debug files by Build-ID or .gnu_debuglink
 # 3. debuginfod by Build-ID, when [dwarf.debuginfod] is enabled
 #
-# Local Build-ID directory layouts are not searched directly. .gnu_debugdata
-# is not loaded currently. Use .gnu_debuglink search_paths or debuginfod for
-# separate debug information. The default search_paths include /usr/lib/debug
-# and /usr/local/lib/debug.
+# .gnu_debugdata is not loaded currently. The default search_paths include
+# /usr/lib/debug and /usr/local/lib/debug.
 
-# .gnu_debuglink search paths (configurable in config.toml):
+# Local separate-debug search paths (configurable in config.toml):
 # 1. Absolute path (if .gnu_debuglink contains absolute path - rare)
-# 2. User-configured search_paths + basename (highest priority)
-# 3. Same directory as the binary + basename
-# 4. .debug subdirectory next to the binary + basename
+# 2. <search_path>/.build-id/xx/yyyy.debug, when a Build-ID is available
+# 3. User-configured search_paths + basename (GhostScope compatibility path)
+# 4. Same directory as the binary + basename
+# 5. .debug subdirectory next to the binary + basename
+# 6. <search_path>/<absolute_binary_directory>/<basename>
 #
 # Note: If you override search_paths in config.toml, keep any system-wide debug
 # directories that you still rely on.
@@ -334,23 +334,26 @@ timestamp = "local"
 color = "auto"
 
 [dwarf]
-# Debug information search paths for .gnu_debuglink files
-# When a binary uses .gnu_debuglink to reference separate debug files,
-# GhostScope searches these paths to locate the debug file.
+# Global directories for local separate debug information.
+# GhostScope uses these roots for Build-ID and .gnu_debuglink discovery.
 #
-# These paths only affect automatic .gnu_debuglink discovery. The
-# --debug-file/-d CLI option points directly at one debug file and bypasses
+# The --debug-file/-d CLI option points directly at one debug file and bypasses
 # this search list for the selected target module.
 #
 # Search order (highest priority first):
 # 1. Absolute path (if .gnu_debuglink contains an absolute path - rare)
-# 2. User-configured search_paths + basename (configured here)
-# 3. Same directory as the binary + basename
-# 4. .debug subdirectory next to the binary + basename
+# 2. <search_path>/.build-id/xx/yyyy.debug, when a Build-ID is available
+# 3. User-configured search_paths + basename (GhostScope compatibility path)
+# 4. Same directory as the binary + basename
+# 5. .debug subdirectory next to the binary + basename
+# 6. <search_path>/<absolute_binary_directory>/<basename>
 #
-# For each user-configured path, both direct and .debug subdirectory are checked:
+# For each user-configured path, GhostScope also checks the existing flat paths:
 #   - <path>/debug_filename
 #   - <path>/.debug/debug_filename
+# Standard GDB directory layouts are checked as well:
+#   - <path>/.build-id/xx/yyyy.debug
+#   - <path>/<absolute_binary_directory>/debug_filename
 #
 # Features:
 # - Home directory expansion: "~/" is replaced with your home directory

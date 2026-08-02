@@ -183,11 +183,10 @@ pub struct Args {
     ///
     /// Auto-detection otherwise searches:
     /// 1. Binary itself (.debug_info sections)
-    /// 2. .gnu_debuglink section
+    /// 2. Local separate debug files by Build-ID or .gnu_debuglink
     /// 3. debuginfod by Build-ID when enabled
     ///
-    /// Local Build-ID directory layouts are not searched directly.
-    /// .gnu_debugdata is not loaded currently. Default .gnu_debuglink search_paths
+    /// .gnu_debugdata is not loaded currently. Default local debug search paths
     /// include /usr/lib/debug and /usr/local/lib/debug unless overridden in config.
     #[arg(long, short = 'd', value_name = "PATH")]
     pub debug_file: Option<PathBuf>,

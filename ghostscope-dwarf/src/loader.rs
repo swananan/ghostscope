@@ -37,7 +37,7 @@ impl ExplicitDebugFile {
 pub struct LoadConfig {
     /// Maximum number of concurrent module loads
     pub max_module_concurrency: usize,
-    /// Debug file search paths (for .gnu_debuglink)
+    /// Global directories for build-ID and `.gnu_debuglink` discovery.
     pub debug_search_paths: Vec<String>,
     /// Allow non-strict debug file matching (CRC/Build-ID)
     pub allow_loose_debug_match: bool,
@@ -93,7 +93,7 @@ impl ModuleLoader {
         self
     }
 
-    /// Set debug search paths for .gnu_debuglink files
+    /// Set global directories for local separate debug information.
     pub fn with_debug_search_paths(mut self, paths: Vec<String>) -> Self {
         self.config.debug_search_paths = paths;
         self
