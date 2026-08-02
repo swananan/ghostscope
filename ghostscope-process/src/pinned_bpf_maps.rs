@@ -1037,6 +1037,123 @@ pub fn insert_offsets_for_pid(
     Ok(inserted)
 }
 
+trait ModuleRangeSnapshotStore {
+    fn purge_slot(&mut self, pid: u32, slot: u32) -> anyhow::Result<usize>;
+    fn insert_range(
+        &mut self,
+        key: ProcModuleRangeKey,
+        value: ProcModuleRangeValue,
+    ) -> anyhow::Result<()>;
+    fn publish_meta(&mut self, pid: u32, meta: ProcModuleRangeMeta) -> anyhow::Result<()>;
+}
+
+struct PinnedModuleRangeSnapshotStore<'a> {
+    meta: &'a mut AyaHashMap<MapData, u32, ProcModuleRangeMeta>,
+    ranges: &'a mut AyaHashMap<MapData, ProcModuleRangeKey, ProcModuleRangeValue>,
+}
+
+impl ModuleRangeSnapshotStore for PinnedModuleRangeSnapshotStore<'_> {
+    fn purge_slot(&mut self, pid: u32, slot: u32) -> anyhow::Result<usize> {
+        purge_ranges_for_pid_slot(self.ranges, pid, slot)
+    }
+
+    fn insert_range(
+        &mut self,
+        key: ProcModuleRangeKey,
+        value: ProcModuleRangeValue,
+    ) -> anyhow::Result<()> {
+        self.ranges.insert(key, value, 0).map_err(Into::into)
+    }
+
+    fn publish_meta(&mut self, pid: u32, meta: ProcModuleRangeMeta) -> anyhow::Result<()> {
+        self.meta.insert(pid, meta, 0).map_err(Into::into)
+    }
+}
+
+fn rollback_module_range_snapshot<S: ModuleRangeSnapshotStore>(
+    store: &mut S,
+    pid: u32,
+    slot: u32,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match store.purge_slot(pid, slot) {
+        Ok(rolled_back) => {
+            tracing::debug!(
+                "proc_module_ranges rolled back {} inactive-slot entries for pid={} slot={}",
+                rolled_back,
+                pid,
+                slot
+            );
+            error
+        }
+        Err(rollback_error) => error.context(format!(
+            "proc_module_ranges rollback failed for pid={pid} slot={slot}: {rollback_error}"
+        )),
+    }
+}
+
+fn write_module_range_snapshot<S: ModuleRangeSnapshotStore>(
+    store: &mut S,
+    pid: u32,
+    inactive_slot: u32,
+    values: &[ProcModuleRangeValue],
+) -> anyhow::Result<usize> {
+    let count = u32::try_from(values.len()).context(format!(
+        "proc_module_ranges snapshot is too large for pid={pid} slot={inactive_slot}"
+    ))?;
+
+    let purged = store.purge_slot(pid, inactive_slot)?;
+    if purged > 0 {
+        tracing::debug!(
+            "proc_module_ranges purged {} inactive-slot entries for pid={} slot={}",
+            purged,
+            pid,
+            inactive_slot
+        );
+    }
+
+    for (index, value) in values.iter().enumerate() {
+        let key = ProcModuleRangeKey::new(pid, inactive_slot, index as u32);
+        if let Err(error) = store.insert_range(key, *value) {
+            let error = anyhow::anyhow!(
+                "proc_module_ranges insert failed for pid={pid} slot={inactive_slot} index={index}: {error}"
+            );
+            return Err(rollback_module_range_snapshot(
+                store,
+                pid,
+                inactive_slot,
+                error,
+            ));
+        }
+
+        tracing::debug!(
+            "proc_module_ranges insert ok: pid={} slot={} index={} base=0x{:x} end=0x{:x} text=0x{:x} cookie=0x{:08x}{:08x}",
+            pid,
+            inactive_slot,
+            index,
+            value.base,
+            value.end,
+            value.text,
+            value.cookie_hi,
+            value.cookie_lo
+        );
+    }
+
+    if let Err(error) = store.publish_meta(pid, ProcModuleRangeMeta::new(inactive_slot, count)) {
+        let error = anyhow::anyhow!(
+            "proc_module_range_meta update failed for pid={pid} slot={inactive_slot} count={count}: {error}"
+        );
+        return Err(rollback_module_range_snapshot(
+            store,
+            pid,
+            inactive_slot,
+            error,
+        ));
+    }
+
+    Ok(values.len())
+}
+
 /// Replace the raw-address range index for a PID using a full `/proc/<pid>/maps`
 /// snapshot. The inactive slot is rewritten first, then the PID meta entry is
 /// flipped so eBPF readers either see the old complete snapshot or the new one.
@@ -1055,16 +1172,6 @@ pub fn replace_ranges_for_pid(
     let mut ranges = open_pinned_hash_map::<ProcModuleRangeKey, ProcModuleRangeValue>(
         proc_module_ranges_pin_path()?,
     )?;
-    let purged = purge_ranges_for_pid_slot(&mut ranges, pid, inactive_slot)?;
-    if purged > 0 {
-        tracing::debug!(
-            "proc_module_ranges purged {} inactive-slot entries for pid={} slot={}",
-            purged,
-            pid,
-            inactive_slot
-        );
-    }
-
     let mut values = items
         .iter()
         .filter_map(|(cookie, offsets)| {
@@ -1075,43 +1182,11 @@ pub fn replace_ranges_for_pid(
         .collect::<Vec<_>>();
     values.sort_by_key(|value| (value.base, value.end, value.module_cookie()));
 
-    let mut inserted = 0usize;
-    for (index, value) in values.iter().enumerate() {
-        let key = ProcModuleRangeKey::new(pid, inactive_slot, index as u32);
-        match ranges.insert(key, *value, 0) {
-            Ok(()) => {
-                tracing::debug!(
-                    "proc_module_ranges insert ok: pid={} slot={} index={} base=0x{:x} end=0x{:x} text=0x{:x} cookie=0x{:08x}{:08x}",
-                    pid,
-                    inactive_slot,
-                    index,
-                    value.base,
-                    value.end,
-                    value.text,
-                    value.cookie_hi,
-                    value.cookie_lo
-                );
-                inserted += 1;
-            }
-            Err(e) => warn!(
-                "proc_module_ranges insert failed for pid={} slot={} index={}: {}",
-                pid, inactive_slot, index, e
-            ),
-        }
-    }
-
-    meta.insert(
-        pid,
-        ProcModuleRangeMeta::new(inactive_slot, inserted as u32),
-        0,
-    )
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "proc_module_range_meta update failed for pid={pid} slot={inactive_slot} count={inserted}: {e}"
-        )
-    })?;
-
-    Ok(inserted)
+    let mut store = PinnedModuleRangeSnapshotStore {
+        meta: &mut meta,
+        ranges: &mut ranges,
+    };
+    write_module_range_snapshot(&mut store, pid, inactive_slot, &values)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1350,11 +1425,93 @@ pub fn prune_pinned_maps_root(options: &BpffsPruneOptions) -> anyhow::Result<Bpf
 mod tests {
     use super::{
         cleanup_pinned_maps_in_dir, cleanup_stale_pinned_maps_under, parse_pin_dir_name,
-        process_starttime, prune_pinned_maps_under, BpffsPruneMode, BpffsPruneOptions,
-        BpffsPruneStatus, CurrentProcessIdentity, ALLOWED_PIDS_MAP_NAME, PROC_OFFSETS_MAP_NAME,
+        process_starttime, prune_pinned_maps_under, write_module_range_snapshot, BpffsPruneMode,
+        BpffsPruneOptions, BpffsPruneStatus, CurrentProcessIdentity, ModuleRangeSnapshotStore,
+        ProcModuleRangeKey, ProcModuleRangeMeta, ProcModuleRangeValue, ALLOWED_PIDS_MAP_NAME,
+        PROC_OFFSETS_MAP_NAME,
     };
-    use std::{fs, io};
+    use std::{collections::HashMap, fs, io};
     use tempfile::tempdir;
+
+    #[derive(Default)]
+    struct TestModuleRangeSnapshotStore {
+        entries: HashMap<ProcModuleRangeKey, ProcModuleRangeValue>,
+        published: Option<(u32, ProcModuleRangeMeta)>,
+        fail_insert_at: Option<u32>,
+    }
+
+    impl ModuleRangeSnapshotStore for TestModuleRangeSnapshotStore {
+        fn purge_slot(&mut self, pid: u32, slot: u32) -> anyhow::Result<usize> {
+            let before = self.entries.len();
+            self.entries
+                .retain(|key, _| key.pid != pid || key.slot != slot);
+            Ok(before - self.entries.len())
+        }
+
+        fn insert_range(
+            &mut self,
+            key: ProcModuleRangeKey,
+            value: ProcModuleRangeValue,
+        ) -> anyhow::Result<()> {
+            if self.fail_insert_at == Some(key.index) {
+                anyhow::bail!("injected insert failure");
+            }
+            self.entries.insert(key, value);
+            Ok(())
+        }
+
+        fn publish_meta(&mut self, pid: u32, meta: ProcModuleRangeMeta) -> anyhow::Result<()> {
+            self.published = Some((pid, meta));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_module_range_insert_does_not_publish_partial_snapshot() {
+        let pid = 42;
+        let active_value = ProcModuleRangeValue::new(0x1000, 0x2000, 0, 1);
+        let mut store = TestModuleRangeSnapshotStore {
+            fail_insert_at: Some(1),
+            ..Default::default()
+        };
+        store
+            .entries
+            .insert(ProcModuleRangeKey::new(pid, 0, 0), active_value);
+
+        let values = [
+            ProcModuleRangeValue::new(0x3000, 0x4000, 0, 2),
+            ProcModuleRangeValue::new(0x5000, 0x6000, 0, 3),
+            ProcModuleRangeValue::new(0x7000, 0x8000, 0, 4),
+        ];
+        let error = write_module_range_snapshot(&mut store, pid, 1, &values).unwrap_err();
+
+        assert!(error.to_string().contains("index=1"));
+        assert_eq!(store.published, None);
+        assert!(store
+            .entries
+            .contains_key(&ProcModuleRangeKey::new(pid, 0, 0)));
+        assert!(!store
+            .entries
+            .keys()
+            .any(|key| key.pid == pid && key.slot == 1));
+    }
+
+    #[test]
+    fn complete_module_range_snapshot_is_published() {
+        let pid = 42;
+        let values = [
+            ProcModuleRangeValue::new(0x1000, 0x2000, 0, 1),
+            ProcModuleRangeValue::new(0x3000, 0x4000, 0, 2),
+        ];
+        let mut store = TestModuleRangeSnapshotStore::default();
+
+        assert_eq!(
+            write_module_range_snapshot(&mut store, pid, 1, &values).unwrap(),
+            2
+        );
+        assert_eq!(store.published, Some((pid, ProcModuleRangeMeta::new(1, 2))));
+        assert_eq!(store.entries.len(), 2);
+    }
 
     fn host_test_identity(host_pid: u32, starttime: u64) -> CurrentProcessIdentity {
         CurrentProcessIdentity {
