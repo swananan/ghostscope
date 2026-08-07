@@ -443,15 +443,20 @@ impl CfiIndex {
         diagnostics: &mut Vec<UnwindDiagnostic>,
     ) -> RegisterRecoveryPlan {
         match rule {
-            Some(RegisterRule::Undefined) | None => {
+            Some(RegisterRule::Undefined) => RegisterRecoveryPlan::Undefined,
+            None => {
                 if required {
+                    let reason =
+                        format!("no return-address recovery rule for DWARF register {register}");
                     diagnostics.push(UnwindDiagnostic {
                         pc_start,
                         pc_end,
                         kind: UnwindDiagnosticKind::MissingReturnAddressRule { register },
                     });
+                    RegisterRecoveryPlan::Unsupported { reason }
+                } else {
+                    RegisterRecoveryPlan::Undefined
                 }
-                RegisterRecoveryPlan::Undefined
             }
             Some(RegisterRule::SameValue) => RegisterRecoveryPlan::SameValue { register },
             Some(RegisterRule::Register(other)) => {

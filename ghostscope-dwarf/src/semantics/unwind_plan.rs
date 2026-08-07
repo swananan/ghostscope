@@ -69,6 +69,7 @@ pub struct BpfRecoveryPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BpfRecoveryKind {
+    Undefined,
     SameValue,
     Register,
     AtCfaOffset,
@@ -165,6 +166,11 @@ fn bpf_recovery_plan(
     target_register: u16,
 ) -> Result<BpfRecoveryPlan, BpfRecoveryRejection> {
     let plan = match *rule {
+        RegisterRecoveryPlan::Undefined => BpfRecoveryPlan {
+            kind: BpfRecoveryKind::Undefined,
+            register: target_register,
+            offset: 0,
+        },
         RegisterRecoveryPlan::SameValue { register } => BpfRecoveryPlan {
             kind: BpfRecoveryKind::SameValue,
             register,
@@ -185,8 +191,7 @@ fn bpf_recovery_plan(
             register: target_register,
             offset,
         },
-        RegisterRecoveryPlan::Undefined
-        | RegisterRecoveryPlan::Constant { .. }
+        RegisterRecoveryPlan::Constant { .. }
         | RegisterRecoveryPlan::Expression { .. }
         | RegisterRecoveryPlan::Unsupported { .. } => {
             return Err(BpfRecoveryRejection::UnsupportedRule);
@@ -279,6 +284,14 @@ mod tests {
     #[test]
     fn bpf_fast_path_plan_supports_every_runtime_recovery_kind() {
         let cases = [
+            (
+                RegisterRecoveryPlan::Undefined,
+                BpfRecoveryPlan {
+                    kind: BpfRecoveryKind::Undefined,
+                    register: X86_64_DWARF_RIP,
+                    offset: 0,
+                },
+            ),
             (
                 RegisterRecoveryPlan::SameValue {
                     register: X86_64_DWARF_RIP,

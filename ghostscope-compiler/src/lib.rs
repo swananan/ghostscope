@@ -297,6 +297,7 @@ pub fn backtrace_unwind_row_from_compact(
 
 fn backtrace_wire_recovery(plan: BpfRecoveryPlan) -> (u8, u16, i64) {
     let kind = match plan.kind {
+        BpfRecoveryKind::Undefined => BACKTRACE_RECOVERY_UNDEFINED,
         BpfRecoveryKind::SameValue => BACKTRACE_RECOVERY_SAME_VALUE,
         BpfRecoveryKind::Register => BACKTRACE_RECOVERY_REGISTER,
         BpfRecoveryKind::AtCfaOffset => BACKTRACE_RECOVERY_AT_CFA_OFFSET,
@@ -489,6 +490,12 @@ mod tests {
     #[test]
     fn backtrace_unwind_row_encoding_covers_the_fast_path_contract() {
         let cases = [
+            (
+                RegisterRecoveryPlan::Undefined,
+                BACKTRACE_RECOVERY_UNDEFINED,
+                16,
+                0,
+            ),
             (
                 RegisterRecoveryPlan::SameValue { register: 16 },
                 BACKTRACE_RECOVERY_SAME_VALUE,

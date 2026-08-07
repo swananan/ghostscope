@@ -698,6 +698,77 @@ trace register_ra_leaf {
 }
 
 #[tokio::test]
+async fn test_hot_backtrace_undefined_return_address_completes() -> anyhow::Result<()> {
+    init();
+
+    let inline_script = r#"
+trace undefined_ra_inline_leaf {
+    print "UNDEFINED_RA_INLINE_STACK";
+    bt full;
+}
+"#;
+    let (count, stdout, stderr) = run_hot_backtrace_with_depth(inline_script, 4).await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    let inline_block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "UNDEFINED_RA_INLINE_STACK",
+        4,
+        "an inline stack completed by a DW_CFA_undefined return-address rule",
+        &[
+            "#0 undefined_ra_inline_leaf",
+            "#1 undefined_ra_inline_caller",
+        ],
+    )?;
+    assert!(
+        inline_block.contains("backtrace: complete, 2 frames (max 4)"),
+        "undefined RA should complete the inline stack without adding a caller\nBLOCK:\n{inline_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !inline_block.contains("#2 ") && !inline_block.contains("stopped:"),
+        "undefined RA should be a clean inline termination\nBLOCK:\n{inline_block}"
+    );
+
+    let tail_script = r#"
+trace undefined_ra_tail_leaf {
+    print "UNDEFINED_RA_TAIL_STACK";
+    bt full;
+}
+"#;
+    let (count, stdout, stderr) = run_hot_backtrace_with_depth(tail_script, 8).await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    let tail_block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "UNDEFINED_RA_TAIL_STACK",
+        8,
+        "a tail-call stack completed by a DW_CFA_undefined return-address rule",
+        &[
+            "#0 undefined_ra_tail_leaf",
+            "#1 undefined_ra_tail_level_1",
+            "#2 undefined_ra_tail_level_2",
+            "#3 undefined_ra_tail_level_3",
+            "#4 undefined_ra_tail_level_4",
+            "#5 undefined_ra_tail_caller",
+        ],
+    )?;
+    assert!(
+        tail_block.contains("backtrace: complete, 6 frames (max 8)"),
+        "undefined RA should complete the tail-call stack without adding a caller\nBLOCK:\n{tail_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !tail_block.contains("#6 ") && !tail_block.contains("stopped:"),
+        "undefined RA should be a clean tail-call termination\nBLOCK:\n{tail_block}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_hot_backtrace_defaults_to_max_depth_128() -> anyhow::Result<()> {
     init();
 

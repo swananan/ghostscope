@@ -7,6 +7,31 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         state: BtRegisterState<'ctx>,
         scratch: &BtScratch<'ctx>,
     ) -> Result<BtNextFrame<'ctx>> {
+        let current_fn = self.current_function("recover next backtrace frame")?;
+        let terminal_block = self
+            .context
+            .append_basic_block(current_fn, "bt_ra_undefined");
+        let recover_block = self.context.append_basic_block(current_fn, "bt_ra_recover");
+        let join_block = self
+            .context
+            .append_basic_block(current_fn, "bt_ra_recovery_join");
+        let ra_is_undefined = self.is_recovery_kind(
+            row.ra_kind,
+            crate::BACKTRACE_RECOVERY_UNDEFINED,
+            "bt_ra_undefined_kind",
+        )?;
+        self.builder
+            .build_conditional_branch(ra_is_undefined, terminal_block, recover_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(terminal_block);
+        let terminal_ip = self.context.i64_type().const_zero();
+        let terminal_error = self.context.i16_type().const_zero();
+        self.builder
+            .build_unconditional_branch(join_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(recover_block);
         let cfa_base = self.select_register_state(row.cfa_register, state, "bt_cfa_base")?;
         let cfa = self
             .builder
@@ -99,11 +124,41 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         )?;
         let error_code = self.load_i16(scratch.next_error_code_ptr, "bt_next_error_code_value")?;
 
+        let recovered_block = self.current_insert_block("finish backtrace frame recovery")?;
+        self.builder
+            .build_unconditional_branch(join_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(join_block);
+        let ip_phi = self
+            .builder
+            .build_phi(self.context.i64_type(), "bt_next_ip_phi")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        ip_phi.add_incoming(&[(&terminal_ip, terminal_block), (&next_ip, recovered_block)]);
+        let rsp_phi = self
+            .builder
+            .build_phi(self.context.i64_type(), "bt_next_rsp_phi")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        rsp_phi.add_incoming(&[(&state.rsp, terminal_block), (&cfa, recovered_block)]);
+        let rbp_phi = self
+            .builder
+            .build_phi(self.context.i64_type(), "bt_next_rbp_phi")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        rbp_phi.add_incoming(&[(&state.rbp, terminal_block), (&next_rbp, recovered_block)]);
+        let error_phi = self
+            .builder
+            .build_phi(self.context.i16_type(), "bt_next_error_phi")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        error_phi.add_incoming(&[
+            (&terminal_error, terminal_block),
+            (&error_code, recovered_block),
+        ]);
+
         Ok(BtNextFrame {
-            ip: next_ip,
-            rsp: cfa,
-            rbp: next_rbp,
-            error_code,
+            ip: ip_phi.as_basic_value().into_int_value(),
+            rsp: rsp_phi.as_basic_value().into_int_value(),
+            rbp: rbp_phi.as_basic_value().into_int_value(),
+            error_code: error_phi.as_basic_value().into_int_value(),
         })
     }
 
