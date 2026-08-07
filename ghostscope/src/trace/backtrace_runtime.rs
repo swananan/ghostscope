@@ -132,7 +132,7 @@ impl BacktraceRuntimeRunner {
             let mut rows = table
                 .rows
                 .iter()
-                .filter_map(ghostscope_compiler::backtrace_unwind_row_from_compact)
+                .map(ghostscope_compiler::backtrace_unwind_row_from_compact)
                 .collect::<Vec<_>>();
             if rows.is_empty() {
                 continue;

@@ -20,9 +20,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let Some(row) = self.compact_unwind_row_for_backtrace(module_path, pc) else {
             return BacktraceUnwindRowForPc::Missing;
         };
-        match crate::backtrace_unwind_row_from_compact(&row) {
-            Some(row) => BacktraceUnwindRowForPc::Usable(row),
-            None => BacktraceUnwindRowForPc::Unsupported,
+        let row = crate::backtrace_unwind_row_from_compact(&row);
+        if row.ra_kind == crate::BACKTRACE_UNWIND_ROW_UNSUPPORTED_CFI {
+            BacktraceUnwindRowForPc::Unsupported
+        } else {
+            BacktraceUnwindRowForPc::Usable(row)
         }
     }
 
@@ -49,10 +51,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         row: ghostscope_protocol::BacktraceUnwindRow,
     ) -> RuntimeBtUnwindRow<'ctx> {
         let i8_type = self.context.i8_type();
+        let unsupported = self.context.bool_type().const_int(
+            u64::from(row.ra_kind == crate::BACKTRACE_UNWIND_ROW_UNSUPPORTED_CFI),
+            false,
+        );
         let i16_type = self.context.i16_type();
         let i64_type = self.context.i64_type();
         RuntimeBtUnwindRow {
             found: self.context.bool_type().const_int(1, false),
+            unsupported,
             cfa_register: i16_type.const_int(row.cfa_register as u64, false),
             cfa_offset: i64_type.const_int(row.cfa_offset as u64, true),
             ra_kind: i8_type.const_int(row.ra_kind as u64, false),
@@ -326,17 +333,67 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 "bt_final_row_found",
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let ra_kind = self.load_i8(scratch.ra_kind_ptr, "bt_final_ra_kind")?;
+        let unsupported_kind = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                ra_kind,
+                i8_type.const_int(crate::BACKTRACE_UNWIND_ROW_UNSUPPORTED_CFI as u64, false),
+                "bt_final_row_unsupported_kind",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let unsupported = self
+            .builder
+            .build_and(found, unsupported_kind, "bt_final_row_unsupported")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         Ok(RuntimeBtUnwindRow {
             found,
+            unsupported,
             cfa_register: self.load_i16(scratch.cfa_register_ptr, "bt_final_cfa_reg")?,
             cfa_offset: self.load_i64(scratch.cfa_offset_ptr, "bt_final_cfa_off")?,
-            ra_kind: self.load_i8(scratch.ra_kind_ptr, "bt_final_ra_kind")?,
+            ra_kind,
             ra_register: self.load_i16(scratch.ra_register_ptr, "bt_final_ra_reg")?,
             ra_offset: self.load_i64(scratch.ra_offset_ptr, "bt_final_ra_off")?,
             rbp_kind: self.load_i8(scratch.rbp_kind_ptr, "bt_final_rbp_kind")?,
             rbp_register: self.load_i16(scratch.rbp_register_ptr, "bt_final_rbp_reg")?,
             rbp_offset: self.load_i64(scratch.rbp_offset_ptr, "bt_final_rbp_off")?,
         })
+    }
+
+    pub(super) fn runtime_backtrace_unwind_row_is_usable(
+        &self,
+        row: &RuntimeBtUnwindRow<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>> {
+        let supported = self
+            .builder
+            .build_not(row.unsupported, &format!("{name}_supported"))
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_and(row.found, supported, name)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))
+    }
+
+    pub(super) fn status_for_unusable_runtime_backtrace_row(
+        &self,
+        row: &RuntimeBtUnwindRow<'ctx>,
+        offsets_found: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>> {
+        let missing =
+            self.status_or_offsets_unavailable(BacktraceStatus::NoUnwindRowsForPc, offsets_found)?;
+        let unsupported =
+            self.status_or_offsets_unavailable(BacktraceStatus::UnsupportedCfi, offsets_found)?;
+        self.builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                row.unsupported,
+                unsupported.into(),
+                missing.into(),
+                name,
+            )
+            .map(|value| value.into_int_value())
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))
     }
 
     pub(super) fn emit_backtrace_row_runtime_binary_search(

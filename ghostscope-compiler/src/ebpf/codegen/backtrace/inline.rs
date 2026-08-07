@@ -286,14 +286,19 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 let missing_block = self
                     .context
                     .append_basic_block(current_fn, "bt_row_missing");
+                let row_usable = self.runtime_backtrace_unwind_row_is_usable(
+                    &runtime_row,
+                    "bt_runtime_row_usable",
+                )?;
                 self.builder
-                    .build_conditional_branch(runtime_row.found, found_block, missing_block)
+                    .build_conditional_branch(row_usable, found_block, missing_block)
                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
                 self.builder.position_at_end(missing_block);
-                let status = self.status_or_offsets_unavailable(
-                    BacktraceStatus::NoUnwindRowsForPc,
+                let status = self.status_for_unusable_runtime_backtrace_row(
+                    &runtime_row,
                     current_module_found,
+                    "bt_unusable_row_status",
                 )?;
                 self.store_u8_value(
                     inst_buffer,

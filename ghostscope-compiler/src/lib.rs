@@ -35,8 +35,9 @@ pub use ghostscope_protocol::bpf_abi::{
     BACKTRACE_UNWIND_ROW_RA_KIND_OFFSET, BACKTRACE_UNWIND_ROW_RA_OFFSET_OFFSET,
     BACKTRACE_UNWIND_ROW_RA_REGISTER_OFFSET, BACKTRACE_UNWIND_ROW_RBP_KIND_OFFSET,
     BACKTRACE_UNWIND_ROW_RBP_OFFSET_OFFSET, BACKTRACE_UNWIND_ROW_RBP_REGISTER_OFFSET,
-    BACKTRACE_UNWIND_ROW_SIZE, BACKTRACE_UNWIND_WORDS_PER_ROW, BACKTRACE_UNWIND_WORD_CFA_OFFSET,
-    BACKTRACE_UNWIND_WORD_PC_END, BACKTRACE_UNWIND_WORD_PC_START, BACKTRACE_UNWIND_WORD_RA_OFFSET,
+    BACKTRACE_UNWIND_ROW_SIZE, BACKTRACE_UNWIND_ROW_UNSUPPORTED_CFI,
+    BACKTRACE_UNWIND_WORDS_PER_ROW, BACKTRACE_UNWIND_WORD_CFA_OFFSET, BACKTRACE_UNWIND_WORD_PC_END,
+    BACKTRACE_UNWIND_WORD_PC_START, BACKTRACE_UNWIND_WORD_RA_OFFSET,
     BACKTRACE_UNWIND_WORD_RBP_OFFSET, BACKTRACE_UNWIND_WORD_REGISTERS,
 };
 
@@ -271,8 +272,15 @@ pub fn module_cookie_for_path(module_path: &str) -> u64 {
 
 pub fn backtrace_unwind_row_from_compact(
     row: &CompactUnwindRow,
-) -> Option<ghostscope_protocol::BacktraceUnwindRow> {
-    let plan = row.bpf_fast_path_plan().ok()?;
+) -> ghostscope_protocol::BacktraceUnwindRow {
+    let Ok(plan) = row.bpf_fast_path_plan() else {
+        return ghostscope_protocol::BacktraceUnwindRow {
+            pc_start: row.pc_start,
+            pc_end: row.pc_end,
+            ra_kind: BACKTRACE_UNWIND_ROW_UNSUPPORTED_CFI,
+            ..Default::default()
+        };
+    };
 
     let mut wire = ghostscope_protocol::BacktraceUnwindRow {
         pc_start: plan.pc_start,
@@ -292,7 +300,7 @@ pub fn backtrace_unwind_row_from_compact(
     wire.rbp_register = rbp_register;
     wire.rbp_offset = rbp_offset;
 
-    Some(wire)
+    wire
 }
 
 fn backtrace_wire_recovery(plan: BpfRecoveryPlan) -> (u8, u16, i64) {
@@ -536,8 +544,7 @@ mod tests {
                 sp: None,
                 rbp: None,
             };
-            let wire = backtrace_unwind_row_from_compact(&compact)
-                .expect("fast-path plan should have a wire representation");
+            let wire = backtrace_unwind_row_from_compact(&compact);
 
             assert_eq!(wire.ra_kind, expected_kind);
             assert_eq!(wire.ra_register, expected_register);
@@ -548,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn backtrace_unwind_row_encoding_rejects_untracked_registers() {
+    fn backtrace_unwind_row_encoding_preserves_unsupported_ranges() {
         let compact = CompactUnwindRow {
             module: ModuleId(1),
             pc_start: 0x1000,
@@ -563,7 +570,10 @@ mod tests {
             rbp: None,
         };
 
-        assert!(backtrace_unwind_row_from_compact(&compact).is_none());
+        let wire = backtrace_unwind_row_from_compact(&compact);
+        assert_eq!(wire.pc_start, compact.pc_start);
+        assert_eq!(wire.pc_end, compact.pc_end);
+        assert_eq!(wire.ra_kind, BACKTRACE_UNWIND_ROW_UNSUPPORTED_CFI);
     }
 
     #[test]

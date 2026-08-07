@@ -333,6 +333,9 @@ pub const BACKTRACE_RECOVERY_AT_CFA_OFFSET: u8 = 1;
 pub const BACKTRACE_RECOVERY_VAL_CFA_OFFSET: u8 = 2;
 pub const BACKTRACE_RECOVERY_REGISTER: u8 = 3;
 pub const BACKTRACE_RECOVERY_SAME_VALUE: u8 = 4;
+/// Sentinel stored in `BacktraceUnwindRow::ra_kind` when a CFI row exists but
+/// cannot be lowered into the compact eBPF recovery contract.
+pub const BACKTRACE_UNWIND_ROW_UNSUPPORTED_CFI: u8 = u8::MAX;
 
 pub const BACKTRACE_RA_UNDEFINED: u8 = BACKTRACE_RECOVERY_UNDEFINED;
 pub const BACKTRACE_RA_AT_CFA_OFFSET: u8 = BACKTRACE_RECOVERY_AT_CFA_OFFSET;
@@ -455,6 +458,17 @@ mod tests {
             backtrace_unwind_row_word(row, BACKTRACE_UNWIND_WORD_REGISTERS),
         ];
         assert_eq!(backtrace_unwind_row_from_words(words), row);
+
+        let unsupported = BacktraceUnwindRow {
+            ra_kind: BACKTRACE_UNWIND_ROW_UNSUPPORTED_CFI,
+            ..row
+        };
+        let unsupported_words =
+            std::array::from_fn(|word| backtrace_unwind_row_word(unsupported, word));
+        assert_eq!(
+            backtrace_unwind_row_from_words(unsupported_words),
+            unsupported
+        );
     }
 
     #[test]
