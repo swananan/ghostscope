@@ -103,6 +103,46 @@ __attribute__((noinline)) static void register_ra_loop(uint64_t value)
     register_ra_caller(value + 1);
 }
 
+__attribute__((noinline)) void undefined_ra_inline_leaf(uint64_t value)
+{
+    hot_sink += value;
+    asm volatile("" ::: "memory");
+}
+
+extern void undefined_ra_inline_caller(uint64_t value);
+
+__attribute__((noinline)) void undefined_ra_tail_leaf(uint64_t value)
+{
+    hot_sink += value;
+    asm volatile("" ::: "memory");
+}
+
+__attribute__((noinline)) void undefined_ra_tail_level_1(uint64_t value)
+{
+    undefined_ra_tail_leaf(value + 1);
+    asm volatile("" ::: "memory");
+}
+
+__attribute__((noinline)) void undefined_ra_tail_level_2(uint64_t value)
+{
+    undefined_ra_tail_level_1(value + 1);
+    asm volatile("" ::: "memory");
+}
+
+__attribute__((noinline)) void undefined_ra_tail_level_3(uint64_t value)
+{
+    undefined_ra_tail_level_2(value + 1);
+    asm volatile("" ::: "memory");
+}
+
+__attribute__((noinline)) void undefined_ra_tail_level_4(uint64_t value)
+{
+    undefined_ra_tail_level_3(value + 1);
+    asm volatile("" ::: "memory");
+}
+
+extern void undefined_ra_tail_caller(uint64_t value);
+
 static void handle_signal(int signo)
 {
     (void)signo;
@@ -119,6 +159,8 @@ int main(void)
     for (uint64_t i = 0; keep_running; i++) {
         hot_bt_probe(i);
         register_ra_loop(i);
+        undefined_ra_inline_caller(i);
+        undefined_ra_tail_caller(i);
         usleep(1000);
     }
 
