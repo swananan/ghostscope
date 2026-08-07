@@ -34,7 +34,8 @@ pub(crate) use types::{
     resolve_type_ref_in_same_unit_with_origins, resolve_type_ref_with_origins, TypeLoc,
 };
 pub use unwind_plan::{
-    CfaRulePlan, CompactUnwindRow, CompactUnwindStats, CompactUnwindTable, RegisterRecoveryPlan,
+    BpfRecoveryKind, BpfRecoveryPlan, BpfUnwindRowPlan, BpfUnwindRowRejection, CfaRulePlan,
+    CompactUnwindRow, CompactUnwindStats, CompactUnwindTable, RegisterRecoveryPlan,
     UnwindDiagnostic, UnwindDiagnosticKind,
 };
 pub use value::{

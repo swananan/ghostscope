@@ -90,6 +90,19 @@ __attribute__((noinline)) void hot_bt_probe(uint64_t value)
     hot_bt_mid(value + 1);
 }
 
+__attribute__((noinline)) void register_ra_leaf(uint64_t value)
+{
+    hot_sink += value;
+    asm volatile("" ::: "memory");
+}
+
+extern void register_ra_caller(uint64_t value);
+
+__attribute__((noinline)) static void register_ra_loop(uint64_t value)
+{
+    register_ra_caller(value + 1);
+}
+
 static void handle_signal(int signo)
 {
     (void)signo;
@@ -105,6 +118,7 @@ int main(void)
 
     for (uint64_t i = 0; keep_running; i++) {
         hot_bt_probe(i);
+        register_ra_loop(i);
         usleep(1000);
     }
 

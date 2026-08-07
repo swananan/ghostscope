@@ -364,15 +364,6 @@ impl CfiIndex {
                 pc_end,
                 diagnostics,
             );
-            let bpf_supported = cfa.is_bpf_fast_path_supported()
-                && return_address.is_bpf_fast_path_supported()
-                && sp
-                    .as_ref()
-                    .is_none_or(RegisterRecoveryPlan::is_bpf_fast_path_supported)
-                && rbp
-                    .as_ref()
-                    .is_none_or(RegisterRecoveryPlan::is_bpf_fast_path_supported);
-
             rows.push(CompactUnwindRow {
                 module,
                 pc_start,
@@ -382,7 +373,6 @@ impl CfiIndex {
                 return_address,
                 sp,
                 rbp,
-                bpf_supported,
             });
         }
 

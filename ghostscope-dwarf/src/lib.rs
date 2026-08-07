@@ -44,7 +44,8 @@ pub use core::{
 pub use semantics::{
     indexable_element_layout, is_aggregate_type, is_pointer_or_array_type, member_layout,
     strip_type_aliases, AddressOrigin, AddressSpaceInfo, BTreeArrayCapture, BTreeEdgesCapture,
-    CfaRulePlan, CompactUnwindRow, CompactUnwindStats, CompactUnwindTable, CompilationUnitMetadata,
+    BpfRecoveryKind, BpfRecoveryPlan, BpfUnwindRowPlan, BpfUnwindRowRejection, CfaRulePlan,
+    CompactUnwindRow, CompactUnwindStats, CompactUnwindTable, CompilationUnitMetadata,
     FunctionParameter, HashTableBucketSource, IndexableElementLayout, InlineFrame,
     LvalueAddressPlan, MemberLayout, PcContext, PcLineInfo, PcRange, PlannedAddress,
     PlannedAddressKind, PlannedValue, ProducerInfo, ProjectedValueRead, ProjectedValueStep,
