@@ -769,6 +769,118 @@ trace undefined_ra_tail_leaf {
 }
 
 #[tokio::test]
+async fn test_hot_backtrace_preserves_undefined_frame_pointer_state() -> anyhow::Result<()> {
+    init();
+
+    let inline_script = r#"
+trace undefined_rbp_inline_leaf {
+    print "UNDEFINED_RBP_INLINE_STACK";
+    bt full;
+}
+"#;
+    let (count, stdout, stderr) = run_hot_backtrace_with_depth(inline_script, 5).await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    let inline_block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "UNDEFINED_RBP_INLINE_STACK",
+        5,
+        "an inline stack carrying an undefined frame pointer",
+        &[
+            "#0 undefined_rbp_inline_leaf",
+            "#1 undefined_rbp_inline_caller",
+            "#2 undefined_rbp_inline_outer",
+        ],
+    )?;
+    assert!(
+        inline_block.contains("backtrace: invalid frame, 3 frames (max 5)")
+            && inline_block.contains("required-register-unavailable, code=7"),
+        "inline unwind should stop when the next CFA requires undefined RBP\nBLOCK:\n{inline_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !inline_block.contains("#3 main"),
+        "undefined RBP must not inherit the live register value\nBLOCK:\n{inline_block}"
+    );
+
+    let tail_script = r#"
+trace undefined_rbp_tail_leaf {
+    print "UNDEFINED_RBP_TAIL_STACK";
+    bt full;
+}
+"#;
+    let (count, stdout, stderr) = run_hot_backtrace_with_depth(tail_script, 8).await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    let tail_block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "UNDEFINED_RBP_TAIL_STACK",
+        8,
+        "a tail-call stack carrying an undefined frame pointer",
+        &[
+            "#0 undefined_rbp_tail_leaf",
+            "#1 undefined_rbp_tail_level_1",
+            "#2 undefined_rbp_tail_level_2",
+            "#3 undefined_rbp_tail_caller",
+            "#4 undefined_rbp_tail_outer",
+        ],
+    )?;
+    assert!(
+        tail_block.contains("backtrace: invalid frame, 5 frames (max 8)")
+            && tail_block.contains("required-register-unavailable, code=7"),
+        "tail-call unwind should preserve unavailable RBP across the state map\nBLOCK:\n{tail_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !tail_block.contains("#5 main"),
+        "tail-call state must not resurrect undefined RBP\nBLOCK:\n{tail_block}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hot_backtrace_rejects_undefined_return_address_register() -> anyhow::Result<()> {
+    init();
+
+    let script = r#"
+trace undefined_rbp_ra_inline_leaf {
+    print "UNDEFINED_RBP_RA_INLINE_STACK";
+    bt full;
+}
+"#;
+    let (count, stdout, stderr) = run_hot_backtrace_with_depth(script, 5).await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    let block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "UNDEFINED_RBP_RA_INLINE_STACK",
+        5,
+        "an inline stack whose return address requires an undefined register",
+        &[
+            "#0 undefined_rbp_ra_inline_leaf",
+            "#1 undefined_rbp_ra_inline_caller",
+            "#2 undefined_rbp_ra_inline_outer",
+        ],
+    )?;
+    assert!(
+        block.contains("backtrace: invalid frame, 3 frames (max 5)")
+            && block.contains("required-register-unavailable, code=7"),
+        "unwind should reject an unavailable return-address register\nBLOCK:\n{block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !block.contains("#3 main") && !block.contains("backtrace: complete"),
+        "an undefined return-address register must not look like clean completion\nBLOCK:\n{block}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_hot_backtrace_runtime_unsupported_cfi_is_reported() -> anyhow::Result<()> {
     init();
 

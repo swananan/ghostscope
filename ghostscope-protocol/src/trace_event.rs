@@ -266,6 +266,7 @@ pub const BACKTRACE_ERROR_NEXT_IP_BELOW_USER: u16 = 3;
 pub const BACKTRACE_ERROR_NEXT_IP_KERNEL_LIKE: u16 = 4;
 pub const BACKTRACE_ERROR_NEXT_CFA_ZERO: u16 = 5;
 pub const BACKTRACE_ERROR_NEXT_CFA_NOT_ADVANCING: u16 = 6;
+pub const BACKTRACE_ERROR_REQUIRED_REGISTER_UNAVAILABLE: u16 = 7;
 
 pub fn backtrace_error_label(error_code: u16) -> Option<&'static str> {
     match error_code {
@@ -276,6 +277,7 @@ pub fn backtrace_error_label(error_code: u16) -> Option<&'static str> {
         BACKTRACE_ERROR_NEXT_IP_KERNEL_LIKE => Some("next-ip-kernel-like"),
         BACKTRACE_ERROR_NEXT_CFA_ZERO => Some("next-cfa-zero"),
         BACKTRACE_ERROR_NEXT_CFA_NOT_ADVANCING => Some("next-cfa-not-advancing"),
+        BACKTRACE_ERROR_REQUIRED_REGISTER_UNAVAILABLE => Some("required-register-unavailable"),
         _ => Some("unknown"),
     }
 }

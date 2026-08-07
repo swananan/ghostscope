@@ -149,6 +149,87 @@ mod tests {
     }
 
     #[test]
+    fn runtime_return_address_reads_are_guarded_by_the_memory_rule() {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx =
+            EbpfContext::new(&context, "bt_ra_recovery_test", Some(0), &opts).expect("ctx");
+        let i8_type = context.i8_type();
+        let i16_type = context.i16_type();
+        let i64_type = context.i64_type();
+        let fn_type = i64_type.fn_type(&[i8_type.into(), i64_type.into()], false);
+        let function = ctx.module.add_function("bt_ra_recovery", fn_type, None);
+        let entry = context.append_basic_block(function, "entry");
+        ctx.builder.position_at_end(entry);
+
+        let row = RuntimeBtUnwindRow {
+            found: context.bool_type().const_all_ones(),
+            unsupported: context.bool_type().const_zero(),
+            cfa_register: i16_type.const_int(X86_64_DWARF_RSP as u64, false),
+            cfa_offset: i64_type.const_int(8, false),
+            ra_kind: function
+                .get_nth_param(0)
+                .expect("RA kind parameter")
+                .into_int_value(),
+            ra_register: i16_type.const_int(X86_64_DWARF_RBP as u64, false),
+            ra_offset: i64_type.const_int(u64::MAX, false),
+            rbp_kind: i8_type.const_int(crate::BACKTRACE_RECOVERY_UNDEFINED as u64, false),
+            rbp_register: i16_type.const_int(X86_64_DWARF_RBP as u64, false),
+            rbp_offset: i64_type.const_zero(),
+        };
+        let state = BtRegisterState {
+            ip: i64_type.const_int(0x2000, false),
+            rsp: i64_type.const_int(0x3000, false),
+            rbp: function
+                .get_nth_param(1)
+                .expect("RBP parameter")
+                .into_int_value(),
+        };
+        let scratch = ctx.allocate_backtrace_scratch().expect("backtrace scratch");
+        let next = ctx
+            .recover_next_frame_from_runtime_row(&row, state, &scratch)
+            .expect("recover next frame");
+        let error_code = ctx
+            .builder
+            .build_int_z_extend(next.error_code, i64_type, "bt_test_error_code")
+            .expect("extend error code");
+        ctx.builder
+            .build_return(Some(&error_code))
+            .expect("return test result");
+        ctx.module.verify().expect("verify generated LLVM IR");
+
+        let ir = ctx.module.print_to_string().to_string();
+        let memory_start = ir
+            .find("bt_ra_from_memory:")
+            .expect("return-address memory block");
+        let non_memory_start = ir
+            .find("bt_ra_non_memory:")
+            .expect("return-address non-memory block");
+        let join_start = ir.find("bt_ra_join:").expect("return-address join block");
+        let memory_block = &ir[memory_start..non_memory_start];
+        let non_memory_block = &ir[non_memory_start..join_start];
+
+        assert!(
+            ir.contains("br i1 %bt_ra_at_kind, label %bt_ra_from_memory, label %bt_ra_non_memory"),
+            "return-address recovery should branch on the memory rule before probing\nIR:\n{ir}"
+        );
+        assert!(
+            memory_block.contains("bt_ra_read") && memory_block.contains("_gs_any_fail"),
+            "the return-address probe and failure update should stay in the memory block\nIR:\n{ir}"
+        );
+        assert!(
+            !non_memory_block.contains("bt_ra_read")
+                && !non_memory_block.contains("_gs_any_fail"),
+            "non-memory return-address recovery must not probe or update read failure state\nIR:\n{ir}"
+        );
+        assert!(
+            ir.contains("bt_ra_register_available")
+                && ir.contains("bt_required_registers_available"),
+            "return-address register availability should participate in frame recovery\nIR:\n{ir}"
+        );
+    }
+
+    #[test]
     fn runtime_backtrace_frame_module_resolution_generates_range_lookups() {
         let context = inkwell::context::Context::create();
         let opts = CompileOptions::default();

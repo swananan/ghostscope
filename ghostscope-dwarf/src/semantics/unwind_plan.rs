@@ -122,11 +122,7 @@ impl CompactUnwindRow {
                 }
             })?;
 
-        let rbp_rule = self
-            .rbp
-            .as_ref()
-            .filter(|rule| !matches!(rule, RegisterRecoveryPlan::Undefined));
-        let rbp = match rbp_rule {
+        let rbp = match self.rbp.as_ref() {
             Some(rule) => {
                 bpf_recovery_plan(rule, X86_64_DWARF_RBP).map_err(|rejection| match rejection {
                     BpfRecoveryRejection::UnsupportedRule => {
@@ -142,6 +138,18 @@ impl CompactUnwindRow {
                 register: X86_64_DWARF_RBP,
                 offset: 0,
             },
+        };
+        let rbp = if cfa_register == X86_64_DWARF_RBP
+            && cfa_offset == 16
+            && rbp.kind == BpfRecoveryKind::SameValue
+        {
+            BpfRecoveryPlan {
+                kind: BpfRecoveryKind::AtCfaOffset,
+                register: X86_64_DWARF_RBP,
+                offset: -16,
+            }
+        } else {
+            rbp
         };
 
         Ok(BpfUnwindRowPlan {
@@ -359,6 +367,45 @@ mod tests {
         });
 
         assert!(row.bpf_fast_path_plan().is_ok());
+    }
+
+    #[test]
+    fn bpf_fast_path_plan_preserves_undefined_frame_pointer() {
+        let mut row = compact_row(RegisterRecoveryPlan::AtCfaOffset { offset: -8 });
+        row.rbp = Some(RegisterRecoveryPlan::Undefined);
+
+        let plan = row
+            .bpf_fast_path_plan()
+            .expect("undefined RBP is part of the BPF recovery contract");
+        assert_eq!(
+            plan.rbp,
+            BpfRecoveryPlan {
+                kind: BpfRecoveryKind::Undefined,
+                register: X86_64_DWARF_RBP,
+                offset: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn bpf_fast_path_plan_normalizes_frame_pointer_call_frames() {
+        let mut row = compact_row(RegisterRecoveryPlan::AtCfaOffset { offset: -8 });
+        row.cfa = CfaRulePlan::RegPlusOffset {
+            register: X86_64_DWARF_RBP,
+            offset: 16,
+        };
+
+        let plan = row
+            .bpf_fast_path_plan()
+            .expect("frame-pointer call frame is supported");
+        assert_eq!(
+            plan.rbp,
+            BpfRecoveryPlan {
+                kind: BpfRecoveryKind::AtCfaOffset,
+                register: X86_64_DWARF_RBP,
+                offset: -16,
+            }
+        );
     }
 
     #[test]
