@@ -769,6 +769,109 @@ trace undefined_ra_tail_leaf {
 }
 
 #[tokio::test]
+async fn test_hot_backtrace_runtime_unsupported_cfi_is_reported() -> anyhow::Result<()> {
+    init();
+
+    let inline_script = r#"
+trace unsupported_cfi_inline_leaf {
+    print "UNSUPPORTED_CFI_INLINE_STACK";
+    bt full;
+}
+"#;
+    let (count, stdout, stderr) = run_hot_backtrace_with_depth(inline_script, 4).await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    let inline_block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "UNSUPPORTED_CFI_INLINE_STACK",
+        4,
+        "an inline stack stopped by a runtime unsupported CFI row",
+        &[
+            "#0 unsupported_cfi_inline_leaf",
+            "#1 unsupported_cfi_inline_caller",
+        ],
+    )?;
+    assert!(
+        inline_block.contains("backtrace: unsupported CFI, 2 frames (max 4)")
+            && inline_block.contains("stopped: unsupported CFI"),
+        "inline runtime lookup should preserve the unsupported CFI status\nBLOCK:\n{inline_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !inline_block.contains("#2 ") && !inline_block.contains("stopped: no unwind rows for PC"),
+        "unsupported inline CFI must not be reported as a missing row\nBLOCK:\n{inline_block}"
+    );
+
+    let prefix_script = r#"
+trace unsupported_cfi_inline_leaf {
+    print "UNSUPPORTED_CFI_PREFIX_STACK";
+    bt full;
+}
+"#;
+    let (count, stdout, stderr) = run_hot_backtrace_with_depth(prefix_script, 8).await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    let prefix_block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "UNSUPPORTED_CFI_PREFIX_STACK",
+        8,
+        "a tail-mode prefix stopped by a runtime unsupported CFI row",
+        &[
+            "#0 unsupported_cfi_inline_leaf",
+            "#1 unsupported_cfi_inline_caller",
+        ],
+    )?;
+    assert!(
+        prefix_block.contains("backtrace: unsupported CFI, 2 frames (max 8)")
+            && prefix_block.contains("stopped: unsupported CFI"),
+        "tail-mode prefix lookup should preserve the unsupported CFI status\nBLOCK:\n{prefix_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !prefix_block.contains("#2 ") && !prefix_block.contains("stopped: no unwind rows for PC"),
+        "unsupported prefix CFI must not be reported as a missing row\nBLOCK:\n{prefix_block}"
+    );
+
+    let step_script = r#"
+trace unsupported_cfi_tail_leaf {
+    print "UNSUPPORTED_CFI_STEP_STACK";
+    bt full;
+}
+"#;
+    let (count, stdout, stderr) = run_hot_backtrace_with_depth(step_script, 8).await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    let step_block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "UNSUPPORTED_CFI_STEP_STACK",
+        8,
+        "a tail-call step stopped by a runtime unsupported CFI row",
+        &[
+            "#0 unsupported_cfi_tail_leaf",
+            "#1 unsupported_cfi_tail_level_1",
+            "#2 unsupported_cfi_tail_level_2",
+            "#3 unsupported_cfi_tail_level_3",
+            "#4 unsupported_cfi_tail_caller",
+        ],
+    )?;
+    assert!(
+        step_block.contains("backtrace: unsupported CFI, 5 frames (max 8)")
+            && step_block.contains("stopped: unsupported CFI"),
+        "tail-call step lookup should preserve the unsupported CFI status\nBLOCK:\n{step_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !step_block.contains("#5 ") && !step_block.contains("stopped: no unwind rows for PC"),
+        "unsupported tail-step CFI must not be reported as a missing row\nBLOCK:\n{step_block}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_hot_backtrace_defaults_to_max_depth_128() -> anyhow::Result<()> {
     init();
 

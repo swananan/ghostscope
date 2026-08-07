@@ -17,6 +17,7 @@ const BPF_BACKTRACE_STEP_PROG_INDEX: u32 = 0;
 
 struct RuntimeBtUnwindRow<'ctx> {
     found: IntValue<'ctx>,
+    unsupported: IntValue<'ctx>,
     cfa_register: IntValue<'ctx>,
     cfa_offset: IntValue<'ctx>,
     ra_kind: IntValue<'ctx>,

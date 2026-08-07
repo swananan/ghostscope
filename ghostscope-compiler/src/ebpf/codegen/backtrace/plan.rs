@@ -92,7 +92,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         prepared.rows = table
             .rows
             .iter()
-            .filter_map(crate::backtrace_unwind_row_from_compact)
+            .map(crate::backtrace_unwind_row_from_compact)
             .collect();
         prepared.rows.sort_by_key(|row| (row.pc_start, row.pc_end));
         prepared.tail_call_slots = self.required_backtrace_tail_call_slots(statements);
@@ -119,6 +119,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             module_path: PathBuf,
             compact_rows: usize,
             bpf_rows: Vec<ghostscope_protocol::BacktraceUnwindRow>,
+            unsupported_rows: usize,
             elapsed_ms: u128,
         }
 
@@ -135,8 +136,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             let mut bpf_rows = table
                 .rows
                 .iter()
-                .filter_map(crate::backtrace_unwind_row_from_compact)
+                .map(crate::backtrace_unwind_row_from_compact)
                 .collect::<Vec<_>>();
+            let unsupported_rows = bpf_rows
+                .iter()
+                .filter(|row| row.ra_kind == crate::BACKTRACE_UNWIND_ROW_UNSUPPORTED_CFI)
+                .count();
             bpf_rows.sort_by_key(|row| (row.pc_start, row.pc_end));
             if bpf_rows.is_empty() {
                 continue;
@@ -151,6 +156,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 module_path: module.module_path.clone(),
                 compact_rows: table.rows.len(),
                 bpf_rows,
+                unsupported_rows,
                 elapsed_ms: module_started_at.elapsed().as_millis(),
             });
         }
@@ -171,7 +177,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             tracing::info!(
                 module = %module.module_path.display(),
                 compact_rows = module.compact_rows,
-                bpf_rows = module.bpf_rows.len(),
+                map_rows = module.bpf_rows.len(),
+                unsupported_rows = module.unsupported_rows,
                 row_start,
                 row_end,
                 elapsed_ms = module.elapsed_ms,
