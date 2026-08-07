@@ -653,6 +653,51 @@ trace dummy_touch {
 }
 
 #[tokio::test]
+async fn test_hot_backtrace_unwinds_register_return_address_rule() -> anyhow::Result<()> {
+    init();
+
+    let script = r#"
+trace register_ra_leaf {
+    print "REGISTER_RA_STACK";
+    bt full;
+}
+"#;
+
+    let (count, stdout, stderr) = run_hot_backtrace_with_depth(script, 4).await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+
+    let block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "REGISTER_RA_STACK",
+        4,
+        "a stack unwound through a DW_CFA_register return-address rule",
+        &[
+            "#0 register_ra_leaf",
+            "#1 register_ra_caller",
+            "#2 register_ra_loop",
+            "#3 main",
+        ],
+    )?;
+    assert!(
+        block.contains("backtrace: truncated, 4 frames (max 4)"),
+        "expected the register-RA stack prefix to reach main\nBLOCK:\n{block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !block.contains("stopped: invalid frame")
+            && !block.contains("stopped: read error")
+            && !block.contains("stopped: unsupported CFI")
+            && !block.contains("stopped: no unwind rows for PC"),
+        "register-RA stack should not stop on an unwind error\nBLOCK:\n{block}\nSTDERR:\n{stderr}"
+    );
+    assert_no_adjacent_duplicate_frame_locations(&block)?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_hot_backtrace_defaults_to_max_depth_128() -> anyhow::Result<()> {
     init();
 

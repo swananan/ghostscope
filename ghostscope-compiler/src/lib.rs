@@ -6,16 +6,12 @@ pub mod script;
 use crate::script::compiler::AstCompiler;
 use ebpf::context::CodeGenError;
 pub use ghostscope_dwarf::RuntimeCapabilities;
-use ghostscope_dwarf::{CfaRulePlan, CompactUnwindRow, RegisterRecoveryPlan};
+use ghostscope_dwarf::{BpfRecoveryKind, BpfRecoveryPlan, CompactUnwindRow};
 use ghostscope_process::module_probe;
 pub use ghostscope_process::{PidFilterSpec, PidNamespaceId};
 use script::parser::ParseError;
 use std::borrow::Cow;
 use tracing::info;
-
-const X86_64_DWARF_RIP: u16 = 16;
-const X86_64_DWARF_RBP: u16 = 6;
-const X86_64_DWARF_RSP: u16 = 7;
 
 pub fn hello() -> &'static str {
     "Hello from ghostscope-compiler!"
@@ -276,77 +272,37 @@ pub fn module_cookie_for_path(module_path: &str) -> u64 {
 pub fn backtrace_unwind_row_from_compact(
     row: &CompactUnwindRow,
 ) -> Option<ghostscope_protocol::BacktraceUnwindRow> {
-    if !row.bpf_supported {
-        return None;
-    }
-    let CfaRulePlan::RegPlusOffset {
-        register,
-        offset: cfa_offset,
-    } = &row.cfa
-    else {
-        return None;
-    };
-    if !backtrace_supported_state_register(*register) {
-        return None;
-    }
+    let plan = row.bpf_fast_path_plan().ok()?;
 
     let mut wire = ghostscope_protocol::BacktraceUnwindRow {
-        pc_start: row.pc_start,
-        pc_end: row.pc_end,
-        cfa_offset: *cfa_offset,
-        cfa_register: *register,
+        pc_start: plan.pc_start,
+        pc_end: plan.pc_end,
+        cfa_offset: plan.cfa_offset,
+        cfa_register: plan.cfa_register,
         ..Default::default()
     };
 
-    match &row.return_address {
-        RegisterRecoveryPlan::AtCfaOffset { offset } => {
-            wire.ra_kind = BACKTRACE_RECOVERY_AT_CFA_OFFSET;
-            wire.ra_offset = *offset;
-            wire.ra_register = row.return_address_register;
-        }
-        _ => return None,
-    }
+    let (ra_kind, ra_register, ra_offset) = backtrace_wire_recovery(plan.return_address);
+    wire.ra_kind = ra_kind;
+    wire.ra_register = ra_register;
+    wire.ra_offset = ra_offset;
 
-    match row.rbp.as_ref() {
-        Some(RegisterRecoveryPlan::AtCfaOffset { offset }) => {
-            wire.rbp_kind = BACKTRACE_RECOVERY_AT_CFA_OFFSET;
-            wire.rbp_offset = *offset;
-            wire.rbp_register = X86_64_DWARF_RBP;
-        }
-        Some(RegisterRecoveryPlan::ValCfaOffset { offset }) => {
-            wire.rbp_kind = BACKTRACE_RECOVERY_VAL_CFA_OFFSET;
-            wire.rbp_offset = *offset;
-            wire.rbp_register = X86_64_DWARF_RBP;
-        }
-        Some(RegisterRecoveryPlan::Register { register }) => {
-            if !backtrace_supported_state_register(*register) {
-                return None;
-            }
-            wire.rbp_kind = BACKTRACE_RECOVERY_REGISTER;
-            wire.rbp_register = *register;
-        }
-        Some(RegisterRecoveryPlan::SameValue { register }) => {
-            if !backtrace_supported_state_register(*register) {
-                return None;
-            }
-            wire.rbp_kind = BACKTRACE_RECOVERY_SAME_VALUE;
-            wire.rbp_register = *register;
-        }
-        Some(RegisterRecoveryPlan::Undefined) | None => {
-            wire.rbp_kind = BACKTRACE_RECOVERY_SAME_VALUE;
-            wire.rbp_register = X86_64_DWARF_RBP;
-        }
-        _ => return None,
-    }
+    let (rbp_kind, rbp_register, rbp_offset) = backtrace_wire_recovery(plan.rbp);
+    wire.rbp_kind = rbp_kind;
+    wire.rbp_register = rbp_register;
+    wire.rbp_offset = rbp_offset;
 
     Some(wire)
 }
 
-fn backtrace_supported_state_register(register: u16) -> bool {
-    matches!(
-        register,
-        X86_64_DWARF_RIP | X86_64_DWARF_RBP | X86_64_DWARF_RSP
-    )
+fn backtrace_wire_recovery(plan: BpfRecoveryPlan) -> (u8, u16, i64) {
+    let kind = match plan.kind {
+        BpfRecoveryKind::SameValue => BACKTRACE_RECOVERY_SAME_VALUE,
+        BpfRecoveryKind::Register => BACKTRACE_RECOVERY_REGISTER,
+        BpfRecoveryKind::AtCfaOffset => BACKTRACE_RECOVERY_AT_CFA_OFFSET,
+        BpfRecoveryKind::ValCfaOffset => BACKTRACE_RECOVERY_VAL_CFA_OFFSET,
+    };
+    (kind, plan.register, plan.offset)
 }
 
 /// Main compilation interface with DwarfAnalyzer (multi-module support)
@@ -459,6 +415,7 @@ pub fn generate_file_name_for_ast(pid: Option<u32>, binary_path: Option<&str>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghostscope_dwarf::{CfaRulePlan, ModuleId, RegisterRecoveryPlan};
 
     #[test]
     fn user_message_strips_codegen_prefix_for_unavailable_variable() {
@@ -527,6 +484,79 @@ mod tests {
         assert_eq!(BACKTRACE_UNWIND_ROW_RBP_REGISTER_OFFSET, 44);
         assert_eq!(BACKTRACE_UNWIND_ROW_RA_KIND_OFFSET, 46);
         assert_eq!(BACKTRACE_UNWIND_ROW_RBP_KIND_OFFSET, 47);
+    }
+
+    #[test]
+    fn backtrace_unwind_row_encoding_covers_the_fast_path_contract() {
+        let cases = [
+            (
+                RegisterRecoveryPlan::SameValue { register: 16 },
+                BACKTRACE_RECOVERY_SAME_VALUE,
+                16,
+                0,
+            ),
+            (
+                RegisterRecoveryPlan::Register { register: 6 },
+                BACKTRACE_RECOVERY_REGISTER,
+                6,
+                0,
+            ),
+            (
+                RegisterRecoveryPlan::AtCfaOffset { offset: -8 },
+                BACKTRACE_RECOVERY_AT_CFA_OFFSET,
+                16,
+                -8,
+            ),
+            (
+                RegisterRecoveryPlan::ValCfaOffset { offset: -16 },
+                BACKTRACE_RECOVERY_VAL_CFA_OFFSET,
+                16,
+                -16,
+            ),
+        ];
+
+        for (return_address, expected_kind, expected_register, expected_offset) in cases {
+            let compact = CompactUnwindRow {
+                module: ModuleId(1),
+                pc_start: 0x1000,
+                pc_end: 0x1010,
+                cfa: CfaRulePlan::RegPlusOffset {
+                    register: 7,
+                    offset: 16,
+                },
+                return_address_register: 16,
+                return_address,
+                sp: None,
+                rbp: None,
+            };
+            let wire = backtrace_unwind_row_from_compact(&compact)
+                .expect("fast-path plan should have a wire representation");
+
+            assert_eq!(wire.ra_kind, expected_kind);
+            assert_eq!(wire.ra_register, expected_register);
+            assert_eq!(wire.ra_offset, expected_offset);
+            assert_eq!(wire.rbp_kind, BACKTRACE_RECOVERY_SAME_VALUE);
+            assert_eq!(wire.rbp_register, 6);
+        }
+    }
+
+    #[test]
+    fn backtrace_unwind_row_encoding_rejects_untracked_registers() {
+        let compact = CompactUnwindRow {
+            module: ModuleId(1),
+            pc_start: 0x1000,
+            pc_end: 0x1010,
+            cfa: CfaRulePlan::RegPlusOffset {
+                register: 7,
+                offset: 16,
+            },
+            return_address_register: 16,
+            return_address: RegisterRecoveryPlan::Register { register: 3 },
+            sp: None,
+            rbp: None,
+        };
+
+        assert!(backtrace_unwind_row_from_compact(&compact).is_none());
     }
 
     #[test]
