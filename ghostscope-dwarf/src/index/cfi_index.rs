@@ -425,12 +425,9 @@ impl CfiIndex {
         pc_end: u64,
         diagnostics: &mut Vec<UnwindDiagnostic>,
     ) -> Option<RegisterRecoveryPlan> {
-        let plan = self.compact_register_rule(rule, register, pc_start, pc_end, false, diagnostics);
-        if matches!(plan, RegisterRecoveryPlan::Undefined) {
-            None
-        } else {
-            Some(plan)
-        }
+        rule.map(|rule| {
+            self.compact_register_rule(Some(rule), register, pc_start, pc_end, false, diagnostics)
+        })
     }
 
     fn compact_register_rule(

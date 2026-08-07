@@ -552,6 +552,23 @@ mod tests {
             assert_eq!(wire.rbp_kind, BACKTRACE_RECOVERY_SAME_VALUE);
             assert_eq!(wire.rbp_register, 6);
         }
+
+        let compact = CompactUnwindRow {
+            module: ModuleId(1),
+            pc_start: 0x2000,
+            pc_end: 0x2010,
+            cfa: CfaRulePlan::RegPlusOffset {
+                register: 7,
+                offset: 16,
+            },
+            return_address_register: 16,
+            return_address: RegisterRecoveryPlan::AtCfaOffset { offset: -8 },
+            sp: None,
+            rbp: Some(RegisterRecoveryPlan::Undefined),
+        };
+        let wire = backtrace_unwind_row_from_compact(&compact);
+        assert_eq!(wire.rbp_kind, BACKTRACE_RECOVERY_UNDEFINED);
+        assert_eq!(wire.rbp_register, 6);
     }
 
     #[test]

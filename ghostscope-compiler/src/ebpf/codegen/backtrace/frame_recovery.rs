@@ -32,16 +32,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         self.builder.position_at_end(recover_block);
-        let cfa_base = self.select_register_state(row.cfa_register, state, "bt_cfa_base")?;
-        let cfa = self
-            .builder
-            .build_int_add(cfa_base, row.cfa_offset, "bt_runtime_cfa")
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
-        let ra_addr = self
-            .builder
-            .build_int_add(cfa, row.ra_offset, "bt_runtime_ra_addr")
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder
             .build_store(
                 scratch.next_error_code_ptr,
@@ -50,26 +40,25 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .const_int(BACKTRACE_ERROR_NONE as u64, false),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let (ra_from_memory, ra_read_failed) = self.generate_memory_read_with_fail_flag(
-            RuntimeAddress::available(ra_addr, self.context),
-            MemoryAccessSize::U64,
-            "bt_ra_read",
-        )?;
-        let ra_from_memory = ra_from_memory.into_int_value();
+        let cfa_base = self.select_register_state(row.cfa_register, state, "bt_cfa_base")?;
+        let cfa_base_available = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                cfa_base,
+                self.context.i64_type().const_zero(),
+                "bt_cfa_base_available",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let cfa = self
+            .builder
+            .build_int_add(cfa_base, row.cfa_offset, "bt_runtime_cfa")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
         let ra_uses_memory = self.is_recovery_kind(
             row.ra_kind,
             crate::BACKTRACE_RECOVERY_AT_CFA_OFFSET,
             "bt_ra_at_kind",
-        )?;
-        let ra_read_failed = self
-            .builder
-            .build_and(ra_read_failed, ra_uses_memory, "bt_ra_read_failed")
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        self.store_backtrace_error_code_if(
-            scratch.next_error_code_ptr,
-            ra_read_failed,
-            BACKTRACE_ERROR_RETURN_ADDRESS_READ,
-            "bt_ra_error_code",
         )?;
         let ra_from_val = self
             .builder
@@ -95,34 +84,107 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .builder
             .build_or(ra_is_register, ra_is_same, "bt_ra_register_like")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let ra_value_or_memory = self
+        let ra_register_available = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                ra_from_register,
+                self.context.i64_type().const_zero(),
+                "bt_ra_register_available",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let ra_source_available = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                ra_is_register_like,
+                ra_register_available.into(),
+                self.context.bool_type().const_all_ones().into(),
+                "bt_ra_source_available",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let required_registers_available = self
+            .builder
+            .build_and(
+                cfa_base_available,
+                ra_source_available,
+                "bt_required_registers_available",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        let ra_memory_block = self
+            .context
+            .append_basic_block(current_fn, "bt_ra_from_memory");
+        let ra_non_memory_block = self
+            .context
+            .append_basic_block(current_fn, "bt_ra_non_memory");
+        let ra_join_block = self.context.append_basic_block(current_fn, "bt_ra_join");
+        self.builder
+            .build_conditional_branch(ra_uses_memory, ra_memory_block, ra_non_memory_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(ra_memory_block);
+        let ra_addr = self
+            .builder
+            .build_int_add(cfa, row.ra_offset, "bt_runtime_ra_addr")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let (ra_from_memory, ra_read_failed) = self.generate_memory_read_with_fail_flag(
+            RuntimeAddress::available(ra_addr, self.context),
+            MemoryAccessSize::U64,
+            "bt_ra_read",
+        )?;
+        let ra_from_memory = ra_from_memory.into_int_value();
+        self.store_backtrace_error_code_if(
+            scratch.next_error_code_ptr,
+            ra_read_failed,
+            BACKTRACE_ERROR_RETURN_ADDRESS_READ,
+            "bt_ra_error_code",
+        )?;
+        let ra_memory_end = self.current_insert_block("finish backtrace RA memory recovery")?;
+        self.builder
+            .build_unconditional_branch(ra_join_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(ra_non_memory_block);
+        let ra_from_non_memory = self
             .builder
             .build_select::<BasicValueEnum<'ctx>, _>(
                 ra_is_val,
                 ra_from_val.into(),
-                ra_from_memory.into(),
-                "bt_ra_val_or_memory",
+                ra_from_register.into(),
+                "bt_ra_from_non_memory",
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .into_int_value();
+        self.builder
+            .build_unconditional_branch(ra_join_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(ra_join_block);
         let next_ip = self
             .builder
-            .build_select::<BasicValueEnum<'ctx>, _>(
-                ra_is_register_like,
-                ra_from_register.into(),
-                ra_value_or_memory.into(),
-                "bt_next_ip",
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-            .into_int_value();
-        let next_rbp = self.recover_rbp_from_runtime_row(
-            row,
-            cfa,
-            state,
-            scratch.next_rbp_ptr,
-            scratch.next_error_code_ptr,
-        )?;
+            .build_phi(self.context.i64_type(), "bt_next_ip")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        next_ip.add_incoming(&[
+            (&ra_from_memory, ra_memory_end),
+            (&ra_from_non_memory, ra_non_memory_block),
+        ]);
+        let next_ip = next_ip.as_basic_value().into_int_value();
+        let next_rbp = self.recover_rbp_from_runtime_row(row, cfa, state, scratch)?;
         let error_code = self.load_i16(scratch.next_error_code_ptr, "bt_next_error_code_value")?;
+        let error_code = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                required_registers_available,
+                error_code.into(),
+                self.context
+                    .i16_type()
+                    .const_int(BACKTRACE_ERROR_REQUIRED_REGISTER_UNAVAILABLE as u64, false)
+                    .into(),
+                "bt_required_register_unavailable_code",
+            )
+            .map(|value| value.into_int_value())
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         let recovered_block = self.current_insert_block("finish backtrace frame recovery")?;
         self.builder
@@ -394,63 +456,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         row: &RuntimeBtUnwindRow<'ctx>,
         cfa: IntValue<'ctx>,
         state: BtRegisterState<'ctx>,
-        next_rbp_ptr: PointerValue<'ctx>,
-        next_error_code_ptr: PointerValue<'ctx>,
+        scratch: &BtScratch<'ctx>,
     ) -> Result<IntValue<'ctx>> {
         let is_at = self.is_recovery_kind(
             row.rbp_kind,
             crate::BACKTRACE_RECOVERY_AT_CFA_OFFSET,
             "bt_rbp_at_kind",
         )?;
-        let cfa_uses_rbp = self
-            .builder
-            .build_int_compare(
-                inkwell::IntPredicate::EQ,
-                row.cfa_register,
-                self.context
-                    .i16_type()
-                    .const_int(X86_64_DWARF_RBP as u64, false),
-                "bt_rbp_cfa_uses_rbp",
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let cfa_offset_is_frame_pointer_call_frame = self
-            .builder
-            .build_int_compare(
-                inkwell::IntPredicate::EQ,
-                row.cfa_offset,
-                self.context.i64_type().const_int(16, false),
-                "bt_rbp_cfa_offset_is_16",
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let frame_pointer_call_frame = self
-            .builder
-            .build_and(
-                cfa_uses_rbp,
-                cfa_offset_is_frame_pointer_call_frame,
-                "bt_rbp_frame_pointer_call_frame",
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let is_at = self
-            .builder
-            .build_or(
-                is_at,
-                frame_pointer_call_frame,
-                "bt_rbp_at_or_frame_pointer",
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let rbp_offset = self
-            .builder
-            .build_select::<BasicValueEnum<'ctx>, _>(
-                frame_pointer_call_frame,
-                self.context
-                    .i64_type()
-                    .const_int((-16i64) as u64, true)
-                    .into(),
-                row.rbp_offset.into(),
-                "bt_rbp_effective_offset",
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-            .into_int_value();
         let current_fn = self.current_function("recover bt rbp")?;
         let at_block = self.context.append_basic_block(current_fn, "bt_rbp_at");
         let non_at_block = self.context.append_basic_block(current_fn, "bt_rbp_non_at");
@@ -462,7 +474,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder.position_at_end(at_block);
         let rbp_addr = self
             .builder
-            .build_int_add(cfa, rbp_offset, "bt_runtime_rbp_addr")
+            .build_int_add(cfa, row.rbp_offset, "bt_runtime_rbp_addr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let (rbp_from_memory, rbp_read_failed) = self.generate_memory_read_with_fail_flag(
             RuntimeAddress::available(rbp_addr, self.context),
@@ -470,13 +482,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             "bt_rbp_read",
         )?;
         self.store_backtrace_error_code_if(
-            next_error_code_ptr,
+            scratch.next_error_code_ptr,
             rbp_read_failed,
             BACKTRACE_ERROR_FRAME_POINTER_READ,
             "bt_rbp_error_code",
         )?;
         self.builder
-            .build_store(next_rbp_ptr, rbp_from_memory.into_int_value())
+            .build_store(scratch.next_rbp_ptr, rbp_from_memory.into_int_value())
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder
             .build_unconditional_branch(join_block)
@@ -508,13 +520,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .builder
             .build_or(rbp_is_register, rbp_is_same, "bt_rbp_register_like")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let rbp_value_or_current = self
+        let rbp_value_or_zero = self
             .builder
             .build_select::<BasicValueEnum<'ctx>, _>(
                 rbp_is_val,
                 rbp_from_val.into(),
-                state.rbp.into(),
-                "bt_rbp_val_or_current",
+                self.context.i64_type().const_zero().into(),
+                "bt_rbp_val_or_zero",
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .into_int_value();
@@ -523,20 +535,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_select::<BasicValueEnum<'ctx>, _>(
                 rbp_is_register_like,
                 rbp_from_register.into(),
-                rbp_value_or_current.into(),
+                rbp_value_or_zero.into(),
                 "bt_rbp_non_at_value",
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .into_int_value();
         self.builder
-            .build_store(next_rbp_ptr, rbp_non_at)
+            .build_store(scratch.next_rbp_ptr, rbp_non_at)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder
             .build_unconditional_branch(join_block)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         self.builder.position_at_end(join_block);
-        self.load_i64(next_rbp_ptr, "bt_next_rbp_value")
+        self.load_i64(scratch.next_rbp_ptr, "bt_next_rbp_value")
     }
 
     pub(super) fn select_register_state(
