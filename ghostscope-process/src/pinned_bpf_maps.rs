@@ -3,12 +3,11 @@ use crate::pid::{
 };
 use anyhow::Context;
 use aya::maps::{HashMap as AyaHashMap, Map, MapData, MapError};
-use aya_obj::maps::bpf_map_def;
 use aya_obj::{
     generated::bpf_map_type::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH},
-    maps::LegacyMap,
-    EbpfSectionKind, Map as ObjMap,
+    Map as ObjMap,
 };
+use ghostscope_protocol::{BacktraceModuleRowRange, BacktraceUnwindRow};
 use std::io;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -250,13 +249,50 @@ fn map_pin_layout_matches(
     }
 }
 
-fn create_and_pin_hash_map(
+// Aya's typed standalone constructors use generic kernel object names such as
+// `standalone_hash`. Create the same parameterized maps through MapData so
+// MapInfo and bpftool retain GhostScope's logical map names.
+fn create_named_hash_map<K, V>(map_name: &str, max_entries: u32) -> Result<MapData, MapError>
+where
+    K: aya::Pod,
+    V: aya::Pod,
+{
+    let map = ObjMap::new_from_params(
+        BPF_MAP_TYPE_HASH as u32,
+        std::mem::size_of::<K>() as u32,
+        std::mem::size_of::<V>() as u32,
+        max_entries,
+        0,
+    );
+    MapData::create(map, map_name, None)
+}
+
+fn create_named_array_map<V>(map_name: &str, max_entries: u32) -> Result<MapData, MapError>
+where
+    V: aya::Pod,
+{
+    let map = ObjMap::new_from_params(
+        BPF_MAP_TYPE_ARRAY as u32,
+        std::mem::size_of::<u32>() as u32,
+        std::mem::size_of::<V>() as u32,
+        max_entries,
+        0,
+    );
+    MapData::create(map, map_name, None)
+}
+
+fn create_and_pin_hash_map<K, V>(
     map_name: &str,
     pin_path: &Path,
-    key_size: u32,
-    value_size: u32,
     max_entries: u32,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    K: aya::Pod,
+    V: aya::Pod,
+{
+    let key_size = std::mem::size_of::<K>() as u32;
+    let value_size = std::mem::size_of::<V>() as u32;
+
     ensure_pin_dir(pin_path).map_err(|e| {
         let hint = bpffs_mount_hint_for_pin_path(pin_path)
             .map(|hint| format!(" {hint}"))
@@ -301,24 +337,7 @@ fn create_and_pin_hash_map(
         }
     }
 
-    let obj_map = ObjMap::Legacy(LegacyMap {
-        section_index: 0,
-        section_kind: EbpfSectionKind::Maps,
-        symbol_index: None,
-        def: bpf_map_def {
-            map_type: BPF_MAP_TYPE_HASH as u32,
-            key_size,
-            value_size,
-            max_entries,
-            map_flags: 0,
-            id: 0,
-            pinning: aya_obj::maps::PinningType::None,
-        },
-        inner_def: None,
-        data: Vec::new(),
-    });
-
-    let map = MapData::create(obj_map, map_name, None)?;
+    let map = create_named_hash_map::<K, V>(map_name, max_entries)?;
     info!("Created {map_name} map with capacity {max_entries} entries");
 
     match map.pin(pin_path) {
@@ -360,12 +379,16 @@ fn create_and_pin_hash_map(
     }
 }
 
-fn create_and_pin_array_map(
+fn create_and_pin_array_map<V>(
     map_name: &str,
     pin_path: &Path,
-    value_size: u32,
     max_entries: u32,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<bool>
+where
+    V: aya::Pod,
+{
+    let value_size = std::mem::size_of::<V>() as u32;
+
     ensure_pin_dir(pin_path).map_err(|e| {
         let hint = bpffs_mount_hint_for_pin_path(pin_path)
             .map(|hint| format!(" {hint}"))
@@ -402,24 +425,7 @@ fn create_and_pin_array_map(
         }
     }
 
-    let obj_map = ObjMap::Legacy(LegacyMap {
-        section_index: 0,
-        section_kind: EbpfSectionKind::Maps,
-        symbol_index: None,
-        def: bpf_map_def {
-            map_type: BPF_MAP_TYPE_ARRAY as u32,
-            key_size: 4,
-            value_size,
-            max_entries,
-            map_flags: 0,
-            id: 0,
-            pinning: aya_obj::maps::PinningType::None,
-        },
-        inner_def: None,
-        data: Vec::new(),
-    });
-
-    let map = MapData::create(obj_map, map_name, None)?;
+    let map = create_named_array_map::<V>(map_name, max_entries)?;
     info!("Created {map_name} map with capacity {max_entries} entries");
 
     match map.pin(pin_path) {
@@ -504,26 +510,11 @@ pub fn ensure_pinned_proc_offsets_exists(max_entries: u32) -> anyhow::Result<()>
         }
     }
 
-    // Define the map as a legacy map (compatible with Aya expectations)
-    let obj_map = ObjMap::Legacy(LegacyMap {
-        section_index: 0,
-        section_kind: EbpfSectionKind::Maps,
-        symbol_index: None,
-        def: bpf_map_def {
-            map_type: BPF_MAP_TYPE_HASH as u32,
-            key_size: ghostscope_protocol::PROC_MODULE_KEY_SIZE as u32,
-            value_size: ghostscope_protocol::PROC_MODULE_OFFSETS_VALUE_SIZE as u32,
-            max_entries,
-            map_flags: 0,
-            id: 0,
-            pinning: aya_obj::maps::PinningType::None,
-        },
-        inner_def: None,
-        data: Vec::new(),
-    });
-
     // Create the map in kernel
-    let map = MapData::create(obj_map, PROC_OFFSETS_MAP_NAME, None)?;
+    let map = create_named_hash_map::<ProcModuleKey, ProcModuleOffsetsValue>(
+        PROC_OFFSETS_MAP_NAME,
+        max_entries,
+    )?;
     info!(
         "Created {} map with capacity {} entries",
         PROC_OFFSETS_MAP_NAME, max_entries
@@ -652,24 +643,7 @@ pub fn ensure_pinned_allowed_pids_exists(max_entries: u32) -> anyhow::Result<()>
         }
     }
 
-    let obj_map = ObjMap::Legacy(LegacyMap {
-        section_index: 0,
-        section_kind: EbpfSectionKind::Maps,
-        symbol_index: None,
-        def: bpf_map_def {
-            map_type: BPF_MAP_TYPE_HASH as u32,
-            key_size: 4,
-            value_size: 1,
-            max_entries,
-            map_flags: 0,
-            id: 0,
-            pinning: aya_obj::maps::PinningType::None,
-        },
-        inner_def: None,
-        data: Vec::new(),
-    });
-
-    let map = MapData::create(obj_map, ALLOWED_PIDS_MAP_NAME, None)?;
+    let map = create_named_hash_map::<u32, u8>(ALLOWED_PIDS_MAP_NAME, max_entries)?;
     info!(
         "Created {} map with capacity {} entries",
         ALLOWED_PIDS_MAP_NAME, max_entries
@@ -733,24 +707,7 @@ pub fn ensure_pinned_pid_aliases_exists(max_entries: u32) -> anyhow::Result<()> 
         }
     }
 
-    let obj_map = ObjMap::Legacy(LegacyMap {
-        section_index: 0,
-        section_kind: EbpfSectionKind::Maps,
-        symbol_index: None,
-        def: bpf_map_def {
-            map_type: BPF_MAP_TYPE_HASH as u32,
-            key_size: std::mem::size_of::<u32>() as u32,
-            value_size: ghostscope_protocol::PID_ALIAS_VALUE_SIZE as u32,
-            max_entries,
-            map_flags: 0,
-            id: 0,
-            pinning: aya_obj::maps::PinningType::None,
-        },
-        inner_def: None,
-        data: Vec::new(),
-    });
-
-    let map = MapData::create(obj_map, PID_ALIASES_MAP_NAME, None)?;
+    let map = create_named_hash_map::<u32, PidAliasValue>(PID_ALIASES_MAP_NAME, max_entries)?;
     info!(
         "Created {} map with capacity {} entries",
         PID_ALIASES_MAP_NAME, max_entries
@@ -792,11 +749,9 @@ pub fn ensure_pinned_pid_aliases_exists(max_entries: u32) -> anyhow::Result<()> 
 /// Ensure the pinned module range maps exist under the per-process directory.
 pub fn ensure_pinned_proc_module_ranges_exist(max_entries: u32) -> anyhow::Result<()> {
     let meta_pin_path = proc_module_range_meta_pin_path()?;
-    create_and_pin_hash_map(
+    create_and_pin_hash_map::<u32, ProcModuleRangeMeta>(
         PROC_MODULE_RANGE_META_MAP_NAME,
         &meta_pin_path,
-        std::mem::size_of::<u32>() as u32,
-        ghostscope_protocol::PROC_MODULE_RANGE_META_SIZE as u32,
         max_entries.max(1),
     )
     .with_context(|| {
@@ -808,11 +763,9 @@ pub fn ensure_pinned_proc_module_ranges_exist(max_entries: u32) -> anyhow::Resul
     })?;
 
     let ranges_pin_path = proc_module_ranges_pin_path()?;
-    create_and_pin_hash_map(
+    create_and_pin_hash_map::<ProcModuleRangeKey, ProcModuleRangeValue>(
         PROC_MODULE_RANGES_MAP_NAME,
         &ranges_pin_path,
-        ghostscope_protocol::PROC_MODULE_RANGE_KEY_SIZE as u32,
-        ghostscope_protocol::PROC_MODULE_RANGE_VALUE_SIZE as u32,
         proc_module_ranges_max_entries(max_entries),
     )
     .with_context(|| {
@@ -832,10 +785,9 @@ pub fn ensure_pinned_backtrace_cfi_maps_exist(
     module_entries: u32,
 ) -> anyhow::Result<()> {
     let rows_pin_path = bt_unwind_rows_pin_path()?;
-    let rows_created = create_and_pin_array_map(
+    let rows_created = create_and_pin_array_map::<BacktraceUnwindRow>(
         BT_UNWIND_ROWS_MAP_NAME,
         &rows_pin_path,
-        ghostscope_protocol::BACKTRACE_UNWIND_ROW_SIZE as u32,
         unwind_row_entries.max(1),
     )
     .with_context(|| {
@@ -869,11 +821,9 @@ pub fn ensure_pinned_backtrace_cfi_maps_exist(
             rows_pin_path.display()
         );
     }
-    create_and_pin_hash_map(
+    create_and_pin_hash_map::<u64, BacktraceModuleRowRange>(
         BT_MODULE_ROW_RANGES_MAP_NAME,
         &ranges_pin_path,
-        std::mem::size_of::<u64>() as u32,
-        ghostscope_protocol::BACKTRACE_MODULE_ROW_RANGE_SIZE as u32,
         module_entries.max(1),
     )
     .with_context(|| {
