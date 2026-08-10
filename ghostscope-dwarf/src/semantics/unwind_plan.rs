@@ -139,19 +139,6 @@ impl CompactUnwindRow {
                 offset: 0,
             },
         };
-        let rbp = if cfa_register == X86_64_DWARF_RBP
-            && cfa_offset == 16
-            && rbp.kind == BpfRecoveryKind::SameValue
-        {
-            BpfRecoveryPlan {
-                kind: BpfRecoveryKind::AtCfaOffset,
-                register: X86_64_DWARF_RBP,
-                offset: -16,
-            }
-        } else {
-            rbp
-        };
-
         Ok(BpfUnwindRowPlan {
             pc_start: self.pc_start,
             pc_end: self.pc_end,
@@ -388,24 +375,32 @@ mod tests {
     }
 
     #[test]
-    fn bpf_fast_path_plan_normalizes_frame_pointer_call_frames() {
-        let mut row = compact_row(RegisterRecoveryPlan::AtCfaOffset { offset: -8 });
-        row.cfa = CfaRulePlan::RegPlusOffset {
-            register: X86_64_DWARF_RBP,
-            offset: 16,
-        };
-
-        let plan = row
-            .bpf_fast_path_plan()
-            .expect("frame-pointer call frame is supported");
-        assert_eq!(
-            plan.rbp,
-            BpfRecoveryPlan {
-                kind: BpfRecoveryKind::AtCfaOffset,
+    fn bpf_fast_path_plan_preserves_same_value_frame_pointer() {
+        for rbp in [
+            None,
+            Some(RegisterRecoveryPlan::SameValue {
                 register: X86_64_DWARF_RBP,
-                offset: -16,
-            }
-        );
+            }),
+        ] {
+            let mut row = compact_row(RegisterRecoveryPlan::AtCfaOffset { offset: -8 });
+            row.cfa = CfaRulePlan::RegPlusOffset {
+                register: X86_64_DWARF_RBP,
+                offset: 16,
+            };
+            row.rbp = rbp;
+
+            let plan = row
+                .bpf_fast_path_plan()
+                .expect("frame-pointer call frame is supported");
+            assert_eq!(
+                plan.rbp,
+                BpfRecoveryPlan {
+                    kind: BpfRecoveryKind::SameValue,
+                    register: X86_64_DWARF_RBP,
+                    offset: 0,
+                }
+            );
+        }
     }
 
     #[test]
