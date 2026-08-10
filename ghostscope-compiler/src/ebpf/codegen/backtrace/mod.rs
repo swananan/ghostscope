@@ -68,6 +68,7 @@ struct RuntimeBtRowScratch<'ctx> {
 struct BtScratch<'ctx> {
     row: RuntimeBtRowScratch<'ctx>,
     next_rbp_ptr: PointerValue<'ctx>,
+    next_rbp_available_ptr: PointerValue<'ctx>,
     next_error_code_ptr: PointerValue<'ctx>,
 }
 
@@ -76,6 +77,7 @@ struct BtRegisterState<'ctx> {
     ip: IntValue<'ctx>,
     rsp: IntValue<'ctx>,
     rbp: IntValue<'ctx>,
+    rbp_available: IntValue<'ctx>,
 }
 
 #[derive(Clone, Copy)]
@@ -83,7 +85,14 @@ struct BtNextFrame<'ctx> {
     ip: IntValue<'ctx>,
     rsp: IntValue<'ctx>,
     rbp: IntValue<'ctx>,
+    rbp_available: IntValue<'ctx>,
     error_code: IntValue<'ctx>,
+}
+
+#[derive(Clone, Copy)]
+struct BtRecoveredRegister<'ctx> {
+    value: IntValue<'ctx>,
+    available: IntValue<'ctx>,
 }
 
 struct BtFrameValidation<'ctx> {
@@ -149,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_return_address_reads_are_guarded_by_the_memory_rule() {
+    fn runtime_return_address_reads_are_guarded_without_branching_on_availability() {
         let context = inkwell::context::Context::create();
         let opts = CompileOptions::default();
         let mut ctx =
@@ -157,7 +166,10 @@ mod tests {
         let i8_type = context.i8_type();
         let i16_type = context.i16_type();
         let i64_type = context.i64_type();
-        let fn_type = i64_type.fn_type(&[i8_type.into(), i64_type.into()], false);
+        let fn_type = i64_type.fn_type(
+            &[i8_type.into(), i64_type.into(), context.bool_type().into()],
+            false,
+        );
         let function = ctx.module.add_function("bt_ra_recovery", fn_type, None);
         let entry = context.append_basic_block(function, "entry");
         ctx.builder.position_at_end(entry);
@@ -165,7 +177,7 @@ mod tests {
         let row = RuntimeBtUnwindRow {
             found: context.bool_type().const_all_ones(),
             unsupported: context.bool_type().const_zero(),
-            cfa_register: i16_type.const_int(X86_64_DWARF_RSP as u64, false),
+            cfa_register: i16_type.const_int(X86_64_DWARF_RBP as u64, false),
             cfa_offset: i64_type.const_int(8, false),
             ra_kind: function
                 .get_nth_param(0)
@@ -183,6 +195,10 @@ mod tests {
             rbp: function
                 .get_nth_param(1)
                 .expect("RBP parameter")
+                .into_int_value(),
+            rbp_available: function
+                .get_nth_param(2)
+                .expect("RBP availability parameter")
                 .into_int_value(),
         };
         let scratch = ctx.allocate_backtrace_scratch().expect("backtrace scratch");
@@ -210,6 +226,11 @@ mod tests {
         let non_memory_block = &ir[non_memory_start..join_start];
 
         assert!(
+            !ir.contains("br i1 %bt_required_registers_available"),
+            "register availability must remain branchless to avoid multiplying verifier paths across backtrace statements\nIR:\n{ir}"
+        );
+
+        assert!(
             ir.contains("br i1 %bt_ra_at_kind, label %bt_ra_from_memory, label %bt_ra_non_memory"),
             "return-address recovery should branch on the memory rule before probing\nIR:\n{ir}"
         );
@@ -224,8 +245,9 @@ mod tests {
         );
         assert!(
             ir.contains("bt_ra_register_available")
-                && ir.contains("bt_required_registers_available"),
-            "return-address register availability should participate in frame recovery\nIR:\n{ir}"
+                && ir.contains("bt_required_registers_available")
+                && ir.contains("bt_required_register_unavailable_code"),
+            "return-address register availability should select the frame recovery error\nIR:\n{ir}"
         );
     }
 

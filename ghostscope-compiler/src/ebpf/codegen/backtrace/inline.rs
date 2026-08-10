@@ -127,6 +127,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let ip_ptr = self.build_entry_alloca(i64_type, "bt_state_ip")?;
         let rsp_ptr = self.build_entry_alloca(i64_type, "bt_state_rsp")?;
         let rbp_ptr = self.build_entry_alloca(i64_type, "bt_state_rbp")?;
+        let rbp_available_ptr =
+            self.build_entry_alloca(self.context.bool_type(), "bt_state_rbp_available")?;
         let module_bias_ptr = self.build_entry_alloca(i64_type, "bt_state_module_bias")?;
         let module_cookie_ptr = self.build_entry_alloca(i64_type, "bt_state_module_cookie")?;
         let module_found_ptr =
@@ -161,6 +163,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             ip: self.load_i64(ip_ptr, "bt_initial_current_ip")?,
             rsp: self.load_i64(rsp_ptr, "bt_initial_current_rsp")?,
             rbp: self.load_i64(rbp_ptr, "bt_initial_current_rbp")?,
+            rbp_available: self.context.bool_type().const_all_ones(),
         };
         let next = self.recover_next_frame_from_runtime_row(&runtime_row, state, &scratch)?;
         let validation = self.validate_backtrace_next_frame(state, next)?;
@@ -233,6 +236,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder
             .build_store(rbp_ptr, next.rbp)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(rbp_available_ptr, next.rbp_available)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder
             .build_store(module_bias_ptr, frame_module.bias)
@@ -315,6 +321,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     ip: self.load_i64(ip_ptr, "bt_current_ip")?,
                     rsp: self.load_i64(rsp_ptr, "bt_current_rsp")?,
                     rbp: self.load_i64(rbp_ptr, "bt_current_rbp")?,
+                    rbp_available: self.load_bool(rbp_available_ptr, "bt_current_rbp_available")?,
                 };
                 let next =
                     self.recover_next_frame_from_runtime_row(&runtime_row, state, &scratch)?;
@@ -394,6 +401,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                 self.builder
                     .build_store(rbp_ptr, next.rbp)
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                self.builder
+                    .build_store(rbp_available_ptr, next.rbp_available)
                     .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                 self.builder
                     .build_store(module_bias_ptr, frame_module.bias)

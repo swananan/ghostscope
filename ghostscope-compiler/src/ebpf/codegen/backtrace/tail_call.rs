@@ -163,6 +163,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let ip_ptr = self.build_entry_alloca(i64_type, "bt_tail_prefix_ip")?;
         let rsp_ptr = self.build_entry_alloca(i64_type, "bt_tail_prefix_rsp")?;
         let rbp_ptr = self.build_entry_alloca(i64_type, "bt_tail_prefix_rbp")?;
+        let rbp_available_ptr =
+            self.build_entry_alloca(self.context.bool_type(), "bt_tail_prefix_rbp_available")?;
         let module_bias_ptr = self.build_entry_alloca(i64_type, "bt_tail_prefix_module_bias")?;
         let module_cookie_ptr =
             self.build_entry_alloca(i64_type, "bt_tail_prefix_module_cookie")?;
@@ -183,6 +185,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             ip: raw_ip,
             rsp: initial_rsp,
             rbp: initial_rbp,
+            rbp_available: self.context.bool_type().const_all_ones(),
         };
         let next = self.recover_next_frame_from_runtime_row(&runtime_row, state, &scratch)?;
         let validation = self.validate_backtrace_next_frame(state, next)?;
@@ -255,6 +258,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder
             .build_store(rbp_ptr, next.rbp)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(rbp_available_ptr, next.rbp_available)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder
             .build_store(module_bias_ptr, frame_module.bias)
@@ -330,6 +336,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 ip: self.load_i64(ip_ptr, "bt_tail_prefix_current_ip")?,
                 rsp: self.load_i64(rsp_ptr, "bt_tail_prefix_current_rsp")?,
                 rbp: self.load_i64(rbp_ptr, "bt_tail_prefix_current_rbp")?,
+                rbp_available: self
+                    .load_bool(rbp_available_ptr, "bt_tail_prefix_current_rbp_available")?,
             };
             let next = self.recover_next_frame_from_runtime_row(&runtime_row, state, &scratch)?;
             let validation = self.validate_backtrace_next_frame(state, next)?;
@@ -411,6 +419,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .build_store(rbp_ptr, next.rbp)
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
             self.builder
+                .build_store(rbp_available_ptr, next.rbp_available)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            self.builder
                 .build_store(module_bias_ptr, frame_module.bias)
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
             self.builder
@@ -484,6 +495,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let tail_ip = self.load_i64(ip_ptr, "bt_tail_state_prefix_ip")?;
         let tail_rsp = self.load_i64(rsp_ptr, "bt_tail_state_prefix_rsp")?;
         let tail_rbp = self.load_i64(rbp_ptr, "bt_tail_state_prefix_rbp")?;
+        let tail_rbp_available =
+            self.load_bool(rbp_available_ptr, "bt_tail_state_prefix_rbp_available")?;
         let tail_module_bias = self.load_i64(module_bias_ptr, "bt_tail_state_module_bias")?;
         let tail_module_cookie = self.load_i64(module_cookie_ptr, "bt_tail_state_module_cookie")?;
         let tail_module_found = self.load_bool(module_found_ptr, "bt_tail_state_module_found")?;
@@ -504,6 +517,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             crate::BACKTRACE_TAIL_STATE_CURRENT_RBP_OFFSET,
             tail_rbp,
             "bt_state_rbp",
+        )?;
+        let tail_rbp_available_u8 =
+            self.bool_to_u8(tail_rbp_available, "bt_state_rbp_available_u8")?;
+        self.store_u8_value(
+            state_ptr,
+            crate::BACKTRACE_TAIL_STATE_CURRENT_RBP_AVAILABLE_OFFSET,
+            tail_rbp_available_u8,
+            "bt_state_rbp_available",
         )?;
         self.store_state_i64(
             state_ptr,
@@ -1040,6 +1061,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             crate::BACKTRACE_TAIL_STATE_CURRENT_RBP_OFFSET,
             "bt_step_current_rbp",
         )?;
+        let current_rbp_available_u8 = self.load_row_i8(
+            state_ptr,
+            crate::BACKTRACE_TAIL_STATE_CURRENT_RBP_AVAILABLE_OFFSET,
+            "bt_step_current_rbp_available_u8",
+        )?;
+        let current_rbp_available = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                current_rbp_available_u8,
+                self.context.i8_type().const_zero(),
+                "bt_step_current_rbp_available",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let module_bias = self.load_row_i64(
             state_ptr,
             crate::BACKTRACE_TAIL_STATE_MODULE_BIAS_OFFSET,
@@ -1133,6 +1168,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             ip: current_ip,
             rsp: current_rsp,
             rbp: current_rbp,
+            rbp_available: current_rbp_available,
         };
         let next = self.recover_next_frame_from_runtime_row(&runtime_row, state, scratch)?;
         let validation = self.validate_backtrace_next_frame(state, next)?;
@@ -1221,6 +1257,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             crate::BACKTRACE_TAIL_STATE_CURRENT_RBP_OFFSET,
             next.rbp,
             "bt_step_state_next_rbp",
+        )?;
+        let next_rbp_available_u8 =
+            self.bool_to_u8(next.rbp_available, "bt_step_next_rbp_available_u8")?;
+        self.store_u8_value(
+            state_ptr,
+            crate::BACKTRACE_TAIL_STATE_CURRENT_RBP_AVAILABLE_OFFSET,
+            next_rbp_available_u8,
+            "bt_step_state_next_rbp_available",
         )?;
         self.store_state_i64(
             state_ptr,
