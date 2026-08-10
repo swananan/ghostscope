@@ -41,15 +41,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let cfa_base = self.select_register_state(row.cfa_register, state, "bt_cfa_base")?;
-        let cfa_base_available = self
-            .builder
-            .build_int_compare(
-                inkwell::IntPredicate::NE,
-                cfa_base,
-                self.context.i64_type().const_zero(),
-                "bt_cfa_base_available",
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let cfa_base_available =
+            self.select_register_availability(row.cfa_register, state, "bt_cfa_base_available")?;
         let cfa = self
             .builder
             .build_int_add(cfa_base, row.cfa_offset, "bt_runtime_cfa")
@@ -84,15 +77,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .builder
             .build_or(ra_is_register, ra_is_same, "bt_ra_register_like")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let ra_register_available = self
-            .builder
-            .build_int_compare(
-                inkwell::IntPredicate::NE,
-                ra_from_register,
-                self.context.i64_type().const_zero(),
-                "bt_ra_register_available",
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let ra_register_available =
+            self.select_register_availability(row.ra_register, state, "bt_ra_register_available")?;
         let ra_source_available = self
             .builder
             .build_select::<BasicValueEnum<'ctx>, _>(
@@ -172,6 +158,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let next_ip = next_ip.as_basic_value().into_int_value();
         let next_rbp = self.recover_rbp_from_runtime_row(row, cfa, state, scratch)?;
         let error_code = self.load_i16(scratch.next_error_code_ptr, "bt_next_error_code_value")?;
+        // This recovery is inlined for every captured frame. Keep availability
+        // branchless so it does not add another verifier control-flow path at
+        // every frame in scripts with multiple backtraces.
         let error_code = self
             .builder
             .build_select::<BasicValueEnum<'ctx>, _>(
@@ -206,7 +195,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .builder
             .build_phi(self.context.i64_type(), "bt_next_rbp_phi")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        rbp_phi.add_incoming(&[(&state.rbp, terminal_block), (&next_rbp, recovered_block)]);
+        rbp_phi.add_incoming(&[
+            (&state.rbp, terminal_block),
+            (&next_rbp.value, recovered_block),
+        ]);
+        let rbp_available_phi = self
+            .builder
+            .build_phi(self.context.bool_type(), "bt_next_rbp_available_phi")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        rbp_available_phi.add_incoming(&[
+            (&state.rbp_available, terminal_block),
+            (&next_rbp.available, recovered_block),
+        ]);
         let error_phi = self
             .builder
             .build_phi(self.context.i16_type(), "bt_next_error_phi")
@@ -220,6 +220,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             ip: ip_phi.as_basic_value().into_int_value(),
             rsp: rsp_phi.as_basic_value().into_int_value(),
             rbp: rbp_phi.as_basic_value().into_int_value(),
+            rbp_available: rbp_available_phi.as_basic_value().into_int_value(),
             error_code: error_phi.as_basic_value().into_int_value(),
         })
     }
@@ -457,7 +458,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         cfa: IntValue<'ctx>,
         state: BtRegisterState<'ctx>,
         scratch: &BtScratch<'ctx>,
-    ) -> Result<IntValue<'ctx>> {
+    ) -> Result<BtRecoveredRegister<'ctx>> {
         let is_at = self.is_recovery_kind(
             row.rbp_kind,
             crate::BACKTRACE_RECOVERY_AT_CFA_OFFSET,
@@ -481,6 +482,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             MemoryAccessSize::U64,
             "bt_rbp_read",
         )?;
+        let rbp_read_succeeded = self
+            .builder
+            .build_not(rbp_read_failed, "bt_rbp_read_succeeded")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.store_backtrace_error_code_if(
             scratch.next_error_code_ptr,
             rbp_read_failed,
@@ -489,6 +494,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         )?;
         self.builder
             .build_store(scratch.next_rbp_ptr, rbp_from_memory.into_int_value())
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(scratch.next_rbp_available_ptr, rbp_read_succeeded)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder
             .build_unconditional_branch(join_block)
@@ -501,6 +509,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let rbp_from_register =
             self.select_register_state(row.rbp_register, state, "bt_rbp_reg")?;
+        let rbp_register_available =
+            self.select_register_availability(row.rbp_register, state, "bt_rbp_reg_available")?;
         let rbp_is_val = self.is_recovery_kind(
             row.rbp_kind,
             crate::BACKTRACE_RECOVERY_VAL_CFA_OFFSET,
@@ -540,15 +550,41 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .into_int_value();
+        let rbp_value_available = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                rbp_is_val,
+                self.context.bool_type().const_all_ones().into(),
+                self.context.bool_type().const_zero().into(),
+                "bt_rbp_val_available",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        let rbp_non_at_available = self
+            .builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                rbp_is_register_like,
+                rbp_register_available.into(),
+                rbp_value_available.into(),
+                "bt_rbp_non_at_available",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
         self.builder
             .build_store(scratch.next_rbp_ptr, rbp_non_at)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_store(scratch.next_rbp_available_ptr, rbp_non_at_available)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder
             .build_unconditional_branch(join_block)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         self.builder.position_at_end(join_block);
-        self.load_i64(scratch.next_rbp_ptr, "bt_next_rbp_value")
+        Ok(BtRecoveredRegister {
+            value: self.load_i64(scratch.next_rbp_ptr, "bt_next_rbp_value")?,
+            available: self.load_bool(scratch.next_rbp_available_ptr, "bt_next_rbp_available")?,
+        })
     }
 
     pub(super) fn select_register_state(
@@ -594,6 +630,34 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 is_rip,
                 state.ip.into(),
                 rbp_or_rsp.into(),
+                name,
+            )
+            .map(|value| value.into_int_value())
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))
+    }
+
+    pub(super) fn select_register_availability(
+        &self,
+        register: IntValue<'ctx>,
+        state: BtRegisterState<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>> {
+        let is_rbp = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                register,
+                self.context
+                    .i16_type()
+                    .const_int(X86_64_DWARF_RBP as u64, false),
+                &format!("{name}_is_rbp"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_select::<BasicValueEnum<'ctx>, _>(
+                is_rbp,
+                state.rbp_available.into(),
+                self.context.bool_type().const_all_ones().into(),
                 name,
             )
             .map(|value| value.into_int_value())

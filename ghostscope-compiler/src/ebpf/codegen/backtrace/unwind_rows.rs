@@ -89,6 +89,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 rbp_offset_ptr: self.build_entry_alloca(i64_type, "bt_row_rbp_offset")?,
             },
             next_rbp_ptr: self.build_entry_alloca(i64_type, "bt_next_rbp")?,
+            next_rbp_available_ptr: self
+                .build_entry_alloca(self.context.bool_type(), "bt_next_rbp_available")?,
             next_error_code_ptr: self.build_entry_alloca(i16_type, "bt_next_error_code")?,
         })
     }

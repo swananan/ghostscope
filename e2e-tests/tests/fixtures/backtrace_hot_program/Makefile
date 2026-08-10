@@ -7,11 +7,12 @@ REGISTER_RA_OBJ ?= backtrace_register_ra.o
 SAME_VALUE_RBP_OBJ ?= backtrace_same_value_rbp.o
 UNDEFINED_RA_OBJ ?= backtrace_undefined_ra.o
 UNDEFINED_RBP_OBJ ?= backtrace_undefined_rbp.o
+ZERO_RBP_OBJ ?= backtrace_zero_rbp.o
 UNSUPPORTED_CFI_OBJ ?= backtrace_unsupported_cfi.o
 
 all: $(BINARY)
 
-$(BINARY): $(OBJ) $(REGISTER_RA_OBJ) $(SAME_VALUE_RBP_OBJ) $(UNDEFINED_RA_OBJ) $(UNDEFINED_RBP_OBJ) $(UNSUPPORTED_CFI_OBJ)
+$(BINARY): $(OBJ) $(REGISTER_RA_OBJ) $(SAME_VALUE_RBP_OBJ) $(UNDEFINED_RA_OBJ) $(UNDEFINED_RBP_OBJ) $(ZERO_RBP_OBJ) $(UNSUPPORTED_CFI_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(OBJ): backtrace_hot_program.c
@@ -29,10 +30,13 @@ $(UNDEFINED_RA_OBJ): backtrace_undefined_ra.S
 $(UNDEFINED_RBP_OBJ): backtrace_undefined_rbp.S
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+$(ZERO_RBP_OBJ): backtrace_zero_rbp.S
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 $(UNSUPPORTED_CFI_OBJ): backtrace_unsupported_cfi.S
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-backtrace_hot_program_nopie: backtrace_hot_program_nopie.o $(REGISTER_RA_OBJ) $(SAME_VALUE_RBP_OBJ) $(UNDEFINED_RA_OBJ) $(UNDEFINED_RBP_OBJ) $(UNSUPPORTED_CFI_OBJ)
+backtrace_hot_program_nopie: backtrace_hot_program_nopie.o $(REGISTER_RA_OBJ) $(SAME_VALUE_RBP_OBJ) $(UNDEFINED_RA_OBJ) $(UNDEFINED_RBP_OBJ) $(ZERO_RBP_OBJ) $(UNSUPPORTED_CFI_OBJ)
 	$(CC) $(BASE_CFLAGS) -no-pie -o $@ $^
 
 backtrace_hot_program_nopie.o: backtrace_hot_program.c

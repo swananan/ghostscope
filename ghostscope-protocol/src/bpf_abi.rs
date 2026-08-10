@@ -293,6 +293,7 @@ pub struct BacktraceTailCallState {
     pub active_slot: u8,
     pub error_code: u16,
     pub next_slot: u8,
+    pub current_rbp_available: u8,
 }
 
 pub const BACKTRACE_TAIL_STATE_CURRENT_IP_OFFSET: usize =
@@ -325,6 +326,8 @@ pub const BACKTRACE_TAIL_STATE_ERROR_CODE_OFFSET: usize =
     std::mem::offset_of!(BacktraceTailCallState, error_code);
 pub const BACKTRACE_TAIL_STATE_NEXT_SLOT_OFFSET: usize =
     std::mem::offset_of!(BacktraceTailCallState, next_slot);
+pub const BACKTRACE_TAIL_STATE_CURRENT_RBP_AVAILABLE_OFFSET: usize =
+    std::mem::offset_of!(BacktraceTailCallState, current_rbp_available);
 pub const BACKTRACE_TAIL_STATE_SIZE: usize = std::mem::size_of::<BacktraceTailCallState>();
 pub const BACKTRACE_TAIL_NO_NEXT_SLOT: u8 = u8::MAX;
 
@@ -496,5 +499,6 @@ mod tests {
         assert_eq!(BACKTRACE_TAIL_STATE_ACTIVE_SLOT_OFFSET, 53);
         assert_eq!(BACKTRACE_TAIL_STATE_ERROR_CODE_OFFSET, 54);
         assert_eq!(BACKTRACE_TAIL_STATE_NEXT_SLOT_OFFSET, 56);
+        assert_eq!(BACKTRACE_TAIL_STATE_CURRENT_RBP_AVAILABLE_OFFSET, 57);
     }
 }

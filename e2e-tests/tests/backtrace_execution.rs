@@ -570,7 +570,10 @@ async fn test_hot_backtrace_compact_unwind_rows_cover_call_sites() -> anyhow::Re
     Ok(())
 }
 
+// Keep verifier-heavy backtrace loads out of the same kernel and shared
+// container sandbox at the same time. Pure DWARF analysis tests stay parallel.
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_special_stack_and_program_counter_registers_are_printable() -> anyhow::Result<()> {
     init();
 
@@ -610,6 +613,7 @@ trace hot_bt_probe {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_full_unwinds_complete_user_stack() -> anyhow::Result<()> {
     init();
 
@@ -653,6 +657,7 @@ trace dummy_touch {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_unwinds_register_return_address_rule() -> anyhow::Result<()> {
     init();
 
@@ -698,6 +703,7 @@ trace register_ra_leaf {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_preserves_same_value_frame_pointer_rule() -> anyhow::Result<()> {
     init();
 
@@ -743,6 +749,7 @@ trace same_value_rbp_leaf {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_undefined_return_address_completes() -> anyhow::Result<()> {
     init();
 
@@ -814,6 +821,7 @@ trace undefined_ra_tail_leaf {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_preserves_undefined_frame_pointer_state() -> anyhow::Result<()> {
     init();
 
@@ -887,6 +895,7 @@ trace undefined_rbp_tail_leaf {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_rejects_undefined_return_address_register() -> anyhow::Result<()> {
     init();
 
@@ -926,6 +935,51 @@ trace undefined_rbp_ra_inline_leaf {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
+async fn test_hot_backtrace_accepts_available_zero_return_address_register() -> anyhow::Result<()> {
+    init();
+
+    let script = r#"
+trace zero_rbp_tail_leaf {
+    print "ZERO_RBP_TAIL_STACK";
+    bt full;
+}
+"#;
+    let (count, stdout, stderr) = run_hot_backtrace_with_depth(script, 8).await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    let block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "ZERO_RBP_TAIL_STACK",
+        8,
+        "a tail-call stack whose return address uses an available zero-valued register",
+        &[
+            "#0 zero_rbp_tail_leaf",
+            "#1 zero_rbp_tail_level_1",
+            "#2 zero_rbp_tail_level_2",
+            "#3 zero_rbp_tail_level_3",
+            "#4 zero_rbp_tail_level_4",
+            "#5 zero_rbp_tail_boundary",
+        ],
+    )?;
+    assert!(
+        block.contains("backtrace: complete, 6 frames (max 8)"),
+        "an available zero-valued return-address register should terminate cleanly\nBLOCK:\n{block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !block.contains("#6 ")
+            && !block.contains("stopped:")
+            && !block.contains("required-register-unavailable"),
+        "zero must not be confused with an unavailable register\nBLOCK:\n{block}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_runtime_unsupported_cfi_is_reported() -> anyhow::Result<()> {
     init();
 
@@ -1029,6 +1083,7 @@ trace unsupported_cfi_tail_leaf {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_defaults_to_max_depth_128() -> anyhow::Result<()> {
     init();
 
@@ -1060,6 +1115,7 @@ trace dummy_touch {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_depth_from_config_file() -> anyhow::Result<()> {
     init();
 
@@ -1106,6 +1162,7 @@ trace dummy_touch {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_depth_one_stops_after_current_frame() -> anyhow::Result<()> {
     init();
 
@@ -1135,6 +1192,7 @@ trace dummy_touch {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_non_power_of_two_depth_keeps_frame_slots_ordered() -> anyhow::Result<()>
 {
     init();
@@ -1177,6 +1235,7 @@ trace dummy_touch {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_multiple_deep_backtrace_statements_use_tail_calls() -> anyhow::Result<()> {
     init();
 
@@ -1221,6 +1280,7 @@ trace dummy_touch {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_conditional_tail_call_backtrace_ignores_skipped_slots() -> anyhow::Result<()> {
     init();
 
@@ -1284,6 +1344,7 @@ trace dummy_touch {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_default_bt_and_backtrace_alias_render_distinct_modes() -> anyhow::Result<()> {
     init();
 
@@ -1331,6 +1392,7 @@ trace dummy_touch {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_inline_and_noinline_bt_modes_control_inline_frames() -> anyhow::Result<()> {
     init();
 
@@ -1377,6 +1439,7 @@ trace inline_callsite_program.c:43 {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_non_pie_pid_backtrace_uses_load_bias_for_runtime_cfi_rows() -> anyhow::Result<()> {
     init();
 
@@ -1416,6 +1479,7 @@ trace dummy_touch {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_cross_module_backtrace_resolves_so_and_exe_frames() -> anyhow::Result<()> {
     init();
 
@@ -1482,7 +1546,7 @@ trace cross_module_lib_leaf {
 }
 
 #[tokio::test]
-#[serial(backtrace_t_mode)]
+#[serial(backtrace_execution)]
 async fn test_t_mode_cross_module_backtrace_resolves_so_and_exe_frames() -> anyhow::Result<()> {
     init();
     if skip_if_nested_t_mode_unsupported() {
@@ -1549,7 +1613,7 @@ trace cross_module_lib_leaf {
 }
 
 #[tokio::test]
-#[serial(backtrace_t_mode)]
+#[serial(backtrace_execution)]
 async fn test_t_mode_multiple_backtrace_traces_share_cross_module_cfi() -> anyhow::Result<()> {
     init();
     if skip_if_nested_t_mode_unsupported() {
@@ -1647,7 +1711,7 @@ trace cross_module_lib_leaf {
 }
 
 #[tokio::test]
-#[serial(backtrace_dlopen)]
+#[serial(backtrace_execution)]
 async fn test_pid_backtrace_reports_frame_from_library_loaded_by_dlopen() -> anyhow::Result<()> {
     init();
 
@@ -1731,7 +1795,7 @@ trace dlopen_main_callback {
 }
 
 #[tokio::test]
-#[serial(backtrace_t_mode, backtrace_dlopen)]
+#[serial(backtrace_execution)]
 async fn test_t_mode_backtrace_unwinds_library_loaded_by_dlopen() -> anyhow::Result<()> {
     init();
     if skip_if_nested_t_mode_unsupported() {
@@ -1802,7 +1866,7 @@ trace dlopen_main_callback {
 }
 
 #[tokio::test]
-#[serial(backtrace_t_mode, backtrace_dlopen)]
+#[serial(backtrace_execution)]
 async fn test_t_mode_backtrace_unwinds_shared_library_loaded_by_dlopen() -> anyhow::Result<()> {
     init();
     if skip_if_nested_t_mode_unsupported() {
@@ -1883,6 +1947,7 @@ trace dlopen_lib_leaf {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_full_renders_function_parameters() -> anyhow::Result<()> {
     init();
 
@@ -1943,6 +2008,7 @@ async fn test_function_parameters_use_signature_lookup_path() -> anyhow::Result<
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_raw_renders_debug_metadata() -> anyhow::Result<()> {
     init();
 
@@ -1972,6 +2038,7 @@ trace dummy_touch {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_hot_backtrace_full_keeps_up_with_raw() -> anyhow::Result<()> {
     init();
 
@@ -2012,6 +2079,7 @@ trace hot_bt_probe {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_backtrace_depth_128_loads_with_tail_calls() -> anyhow::Result<()> {
     init();
 
@@ -2055,6 +2123,7 @@ trace hot_bt_probe {
 }
 
 #[tokio::test]
+#[serial(backtrace_execution)]
 async fn test_deep_full_backtrace_stays_warm_under_event_load() -> anyhow::Result<()> {
     init();
 
