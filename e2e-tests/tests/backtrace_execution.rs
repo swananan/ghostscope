@@ -698,6 +698,51 @@ trace register_ra_leaf {
 }
 
 #[tokio::test]
+async fn test_hot_backtrace_preserves_same_value_frame_pointer_rule() -> anyhow::Result<()> {
+    init();
+
+    let script = r#"
+trace same_value_rbp_leaf {
+    print "SAME_VALUE_RBP_STACK";
+    bt full;
+}
+"#;
+
+    let (count, stdout, stderr) = run_hot_backtrace_with_depth(script, 4).await?;
+    if count == 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+
+    let block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "SAME_VALUE_RBP_STACK",
+        4,
+        "a stack carrying a DW_CFA_same_value frame pointer",
+        &[
+            "#0 same_value_rbp_leaf",
+            "#1 same_value_rbp_caller",
+            "#2 same_value_rbp_outer",
+            "#3 main",
+        ],
+    )?;
+    assert!(
+        block.contains("backtrace: truncated, 4 frames (max 4)"),
+        "same-value RBP should reach main without a false memory recovery\nBLOCK:\n{block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !block.contains("stopped: invalid frame")
+            && !block.contains("stopped: read error")
+            && !block.contains("stopped: unsupported CFI")
+            && !block.contains("stopped: no unwind rows for PC"),
+        "same-value RBP stack should not stop on an unwind error\nBLOCK:\n{block}\nSTDERR:\n{stderr}"
+    );
+    assert_no_adjacent_duplicate_frame_locations(&block)?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_hot_backtrace_undefined_return_address_completes() -> anyhow::Result<()> {
     init();
 

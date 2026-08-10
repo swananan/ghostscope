@@ -103,6 +103,14 @@ __attribute__((noinline)) static void register_ra_loop(uint64_t value)
     register_ra_caller(value + 1);
 }
 
+__attribute__((noinline)) void same_value_rbp_leaf(uint64_t value)
+{
+    hot_sink += value;
+    asm volatile("" ::: "memory");
+}
+
+extern void same_value_rbp_outer(uint64_t value);
+
 __attribute__((noinline)) void undefined_ra_inline_leaf(uint64_t value)
 {
     hot_sink += value;
@@ -229,6 +237,7 @@ int main(void)
     for (uint64_t i = 0; keep_running; i++) {
         hot_bt_probe(i);
         register_ra_loop(i);
+        same_value_rbp_outer(i);
         undefined_ra_inline_caller(i);
         undefined_ra_tail_caller(i);
         undefined_rbp_inline_outer(i);
