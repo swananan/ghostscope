@@ -29,14 +29,33 @@ impl ScriptEditor {
     /// Enter script editing mode for a trace command
     pub fn enter_script_mode(state: &mut CommandPanelState, command: &str) -> Vec<Action> {
         let rest = command.trim_start_matches("trace").trim();
-        // Support optional index: trace <target> [index]
+        // Support an optional index for non-wildcard targets: trace <target> [index]
         let mut parts = rest.split_whitespace();
         let base_target = parts.next().unwrap_or("");
         let index_opt = parts.next().and_then(|s| s.parse::<usize>().ok());
 
         if base_target.is_empty() {
-            let plain =
-                "Usage: trace <function_name|file:line|0xADDR|module_suffix:0xADDR>".to_string();
+            let plain = "Usage: trace <function_name|function_prefix*|file:line|0xADDR|module_suffix:0xADDR>"
+                .to_string();
+            let styled = vec![
+                crate::components::command_panel::style_builder::StyledLineBuilder::new()
+                    .styled(
+                        plain.clone(),
+                        crate::components::command_panel::style_builder::StylePresets::ERROR,
+                    )
+                    .build(),
+            ];
+            return vec![Action::AddResponseWithStyle {
+                content: plain,
+                styled_lines: Some(styled),
+                response_type: ResponseType::Error,
+            }];
+        }
+
+        if base_target.ends_with('*') && index_opt.is_some() {
+            let plain = format!(
+                "Wildcard target '{base_target}' does not support an address index. Use a narrower prefix or an exact function name."
+            );
             let styled = vec![
                 crate::components::command_panel::style_builder::StyledLineBuilder::new()
                     .styled(
@@ -917,5 +936,41 @@ impl ScriptEditor {
         text.char_indices()
             .nth(char_pos)
             .map_or(text.len(), |(pos, _)| pos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_trace_rejects_address_index_before_opening_editor() {
+        let mut state = CommandPanelState::new();
+
+        let actions = ScriptEditor::enter_script_mode(&mut state, "trace get_* 2");
+
+        assert_eq!(state.mode, InteractionMode::Input);
+        assert!(state.script_cache.is_none());
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::AddResponseWithStyle {
+                content,
+                response_type: ResponseType::Error,
+                ..
+            }] if content.contains("does not support an address index")
+                && content.contains("exact function name")
+        ));
+    }
+
+    #[test]
+    fn wildcard_trace_without_index_opens_editor() {
+        let mut state = CommandPanelState::new();
+
+        ScriptEditor::enter_script_mode(&mut state, "trace get_*");
+
+        assert_eq!(state.mode, InteractionMode::ScriptEditor);
+        let cache = state.script_cache.expect("wildcard script cache");
+        assert_eq!(cache.target, "get_*");
+        assert_eq!(cache.selected_index, None);
     }
 }

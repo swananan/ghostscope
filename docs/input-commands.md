@@ -23,6 +23,7 @@ t <target> [index]          # Short form
 **Parameters:**
 - `<target>`: Can be:
   - Function name: `function_name`
+  - Function-name prefix wildcard: `function_prefix*` (one trailing `*` only)
   - File and line: `file:line` where file can be:
     - Full path: `/path/to/file.c:42`
     - Relative path: `src/file.c:42`
@@ -34,6 +35,7 @@ t <target> [index]          # Short form
       - `-t <binary> -p <pid>`: defaults to `<binary>`; `-p` only limits events to that PID
       - This is not a raw ELF file offset or a runtime ASLR-adjusted address from `/proc/<pid>/maps`.
     - `module_suffix:0xADDR`: Address in a specific module. The module part supports full path or unique suffix matching; ambiguous suffixes will be reported with candidates. In `-t -p` sessions, the module must match the `-t` target.
+- `[index]`: Optional 1-based concrete-address selector for non-wildcard targets. Wildcard targets always trace every match and do not accept an index.
 
 When `-t` and `-p` are both present, function, source-line, and address trace targets are all resolved inside the `-t` module. `-p` only limits runtime events to that process.
 
@@ -42,6 +44,7 @@ When `-t` and `-p` are both present, function, source-line, and address trace ta
 trace main                    # Trace main function
 trace main 2                  # Trace only the 2nd address of 'main' (see 'info function main')
 trace calculate_something     # Trace specific function
+trace get_*                   # Trace every function whose name starts with get_
 trace /home/user/src/sample.c:42    # Full path
 trace /home/user/src/sample.c:42 1  # Trace only the 1st address for that line
 trace src/sample.c:42         # Relative path
@@ -101,6 +104,13 @@ trace main          # Your previous script is restored!
   - Non-inline: selects the first executable instruction after the function prologue (prologue-skip).
   - Inline: selects the inline instance start (low_pc semantics of the inline DIE); this is an entry-like point and may not align to a statement boundary. Use a line target if you need precise statement alignment.
   - Multiple inline instances: if a function is inlined at multiple call sites, you’ll see one address per instance (plus one for the non-inline definition, if present).
+
+- Function-name wildcard target (`trace <function_prefix*> { ... }`):
+  - Performs literal prefix matching; only one trailing `*` is supported, so it is not a general glob or regular expression.
+  - Matches attachable names from DWARF/GDB function indexes and ELF text symbols.
+  - Expands to concrete function addresses in stable function-name/module/address order and deduplicates aliases at the same module address.
+  - A wildcard is limited to 64 concrete addresses. Use a narrower prefix or an exact function name if it exceeds the limit.
+  - PID-only mode searches all modules known at setup. With `-t`, matching is restricted to that target module.
 
 - Source line target (`trace <file:line> { ... }`):
   - Resolves to the statement boundary on that line for each occurrence (one per inline instance across callers), i.e., statement-level semantics.
@@ -181,7 +191,7 @@ s t [file]          # Short form
 
 **Behavior:**
 - Saves each trace as a `trace <target> { ... }` block with metadata.
-- If a trace was created with `trace <target> [index]`, the selected address index is preserved in the save file and restored on load.
+- If a non-wildcard trace was created with `trace <target> [index]`, the selected address index is preserved in the save file and restored on load.
 
 **Examples:**
 ```
@@ -279,7 +289,7 @@ s <file>            # Short form (but not "s t")
 
 **Behavior:**
 - Loads all `trace <target> { ... }` blocks in the file.
-- If a block includes an address index (saved from a prior session), only that indexed address is reattached for the target.
+- If a non-wildcard block includes an address index (saved from a prior session), only that indexed address is reattached for the target.
 
 **Examples:**
 ```

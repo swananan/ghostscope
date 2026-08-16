@@ -1,13 +1,16 @@
 use crate::script::ast::{Program, Statement, TracePattern};
 use crate::CompileError;
 // BinaryAnalyzer is now internal to ghostscope-binary, use DwarfAnalyzer instead
-use ghostscope_dwarf::ModuleDefaultPolicy;
+use ghostscope_dwarf::{FunctionAddressMatch, ModuleDefaultPolicy};
 use inkwell::context::Context;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use tracing::{debug, error, info, warn};
+
+/// Maximum number of concrete uprobe addresses a wildcard may expand to.
+const MAX_WILDCARD_RESOLVED_TARGETS: usize = 64;
 
 /// Resolved target information from DWARF queries
 #[derive(Debug, Clone)]
@@ -28,7 +31,7 @@ pub struct UProbeConfig {
     /// Target binary path
     pub binary_path: String,
 
-    /// Function name (for FunctionName patterns)
+    /// Concrete function name (for exact and wildcard function patterns)
     pub function_name: Option<String>,
 
     /// Resolved function address in the binary
@@ -61,7 +64,7 @@ pub struct UProbeConfig {
     /// Optional eBPF tail-call step program used by the `bt` unwinder.
     pub backtrace_tail_call_program: Option<crate::ebpf::context::BacktraceTailCallProgram>,
 
-    /// Global 1-based index of this address within the resolved target list (if applicable)
+    /// 1-based index of this address within its persisted concrete target.
     pub resolved_address_index: Option<usize>,
 }
 
@@ -139,6 +142,7 @@ impl<'a> AstCompiler<'a> {
             match stmt {
                 Statement::TracePoint { pattern, body } => {
                     debug!("Processing trace point {}: {:?}", index, pattern);
+                    let failed_target_count = self.failed_targets.len();
                     match self.process_trace_point(pattern, body, pid, index) {
                         Ok(_) => {
                             successful_trace_points += 1;
@@ -164,26 +168,12 @@ impl<'a> AstCompiler<'a> {
                             // (e.g., when all addresses failed for a function)
                             // If not, add a general failed target entry
                             let has_failed_for_this_pattern =
-                                self.failed_targets.iter().any(|ft| match pattern {
-                                    TracePattern::FunctionName(name) => ft.target_name == *name,
-                                    TracePattern::SourceLine {
-                                        file_path,
-                                        line_number,
-                                    } => ft.target_name == format!("{file_path}:{line_number}"),
-                                    TracePattern::Address(addr) => {
-                                        ft.target_name == format!("0x{addr:x}")
-                                            && ft.pc_address == *addr
-                                    }
-                                    TracePattern::AddressInModule { module, address } => {
-                                        ft.target_name == format!("{module}:0x{address:x}")
-                                            && ft.pc_address == *address
-                                    }
-                                    _ => false,
-                                });
+                                self.failed_targets.len() > failed_target_count;
 
                             if !has_failed_for_this_pattern {
                                 let target_name = match pattern {
-                                    TracePattern::FunctionName(name) => name.clone(),
+                                    TracePattern::FunctionName(name)
+                                    | TracePattern::Wildcard(name) => name.clone(),
                                     TracePattern::SourceLine {
                                         file_path,
                                         line_number,
@@ -192,7 +182,6 @@ impl<'a> AstCompiler<'a> {
                                     TracePattern::AddressInModule { module, address } => {
                                         format!("{module}:0x{address:x}")
                                     }
-                                    _ => format!("trace_point_{index}"),
                                 };
                                 let pc_address = match pattern {
                                     TracePattern::Address(addr) => *addr,
@@ -543,11 +532,12 @@ impl<'a> AstCompiler<'a> {
             }
             TracePattern::FunctionName(func_name) => {
                 // Resolve all addresses for the function name and generate per-PC programs
-                let module_addresses = if let Some(analyzer) = self.process_analyzer {
-                    analyzer.lookup_function_addresses(func_name)
-                } else {
-                    Vec::new()
-                };
+                let analyzer = self.process_analyzer.ok_or_else(|| {
+                    CompileError::Other(
+                        "No process analyzer available to resolve function".to_string(),
+                    )
+                })?;
+                let module_addresses = analyzer.lookup_function_addresses(func_name);
 
                 if module_addresses.is_empty() {
                     // Strict behavior: fail this trace point immediately instead of skipping silently
@@ -557,129 +547,214 @@ impl<'a> AstCompiler<'a> {
                 }
 
                 let original_address_count = module_addresses.len();
-                let target_path = self.configured_target_path();
-                let module_addresses = self
-                    .process_analyzer
-                    .ok_or_else(|| {
-                        CompileError::Other(
-                            "No process analyzer available to resolve -t target".to_string(),
-                        )
-                    })?
-                    .filter_module_addresses_to_target(module_addresses, target_path)
+                let target_path = self.configured_target_path().map(str::to_owned);
+                let module_addresses = analyzer
+                    .filter_module_addresses_to_target(module_addresses, target_path.as_deref())
                     .map_err(|e| CompileError::Other(e.to_string()))?;
                 if original_address_count > 0 && module_addresses.is_empty() {
-                    let target = target_path.unwrap_or("<unknown>");
+                    let target = target_path.as_deref().unwrap_or("<unknown>");
                     return Err(CompileError::Other(format!(
                         "No addresses resolved for function '{func_name}' in -t target '{target}'. When -t and -p are combined, -t takes precedence for trace target resolution."
                     )));
                 }
 
-                let total_addresses: usize = module_addresses.len();
                 debug!(
-                    "Resolved function '{}' to {} address(es) across {} modules",
+                    "Resolved function '{}' to {} address(es)",
                     func_name,
-                    total_addresses,
                     module_addresses.len()
                 );
 
-                // Validate optional single-index selection (1-based)
-                if let Some(idx) = self.compile_options.selected_index {
-                    if idx == 0 || idx > module_addresses.len() {
+                let resolved_targets = module_addresses
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, module_address)| FunctionAddressMatch {
+                        function_name: func_name.clone(),
+                        module_address,
+                        function_address_index: index + 1,
+                    })
+                    .collect();
+                self.process_resolved_function_addresses(
+                    pattern,
+                    &format!("function '{func_name}'"),
+                    resolved_targets,
+                    statements,
+                    pid,
+                    &format!("Use 'info function {func_name}' to view indices."),
+                )
+            }
+            TracePattern::Wildcard(wildcard_pattern) => {
+                Self::reject_wildcard_index(wildcard_pattern, self.compile_options.selected_index)?;
+                let prefix = wildcard_pattern
+                    .strip_suffix('*')
+                    .filter(|prefix| !prefix.is_empty())
+                    .ok_or_else(|| {
+                        CompileError::Other(format!(
+                            "Invalid wildcard '{wildcard_pattern}': use a non-empty function-name prefix followed by one trailing '*'"
+                        ))
+                    })?;
+                let analyzer = self.process_analyzer.ok_or_else(|| {
+                    CompileError::Other(
+                        "No process analyzer available to resolve wildcard".to_string(),
+                    )
+                })?;
+                let target_path = self.configured_target_path().map(str::to_owned);
+                let target_module = target_path
+                    .as_deref()
+                    .map(|target_path| analyzer.resolve_target_module_path(target_path))
+                    .transpose()
+                    .map_err(|e| CompileError::Other(e.to_string()))?;
+                let resolved_targets = analyzer.lookup_function_addresses_by_prefix(
+                    prefix,
+                    target_module.as_deref(),
+                    MAX_WILDCARD_RESOLVED_TARGETS + 1,
+                );
+
+                if resolved_targets.is_empty() {
+                    if let Some(target) = target_path.as_deref() {
                         return Err(CompileError::Other(format!(
-                            "Selected index {idx} is out of range for function '{func_name}' (valid 1..={}). Use 'info function {func_name}' to view indices.",
-                            module_addresses.len()
+                            "No addresses resolved for wildcard '{wildcard_pattern}' in -t target '{target}'. When -t and -p are combined, -t takes precedence for trace target resolution."
                         )));
                     }
+                    return Err(CompileError::Other(format!(
+                        "No addresses resolved for wildcard '{wildcard_pattern}' - no matching functions with attachable addresses were found"
+                    )));
                 }
 
-                // We may need analyzer again to compute precise uprobe offsets
-                // Optional single-index filter (1-based); otherwise process all addresses
-                let mut successful_addresses = 0;
-                let mut failed_addresses = 0;
+                Self::validate_wildcard_target_count(wildcard_pattern, resolved_targets.len())?;
+                debug!(
+                    "Resolved wildcard '{}' to {} concrete address(es)",
+                    wildcard_pattern,
+                    resolved_targets.len()
+                );
 
-                // Iterate with indices (1-based) so we can propagate the global address index
-                let iterator: Box<dyn Iterator<Item = (usize, &ghostscope_dwarf::ModuleAddress)>> =
-                    if let Some(idx) = self.compile_options.selected_index {
-                        let i = idx - 1; // safe due to validation above
-                        Box::new(std::iter::once((idx, &module_addresses[i])))
-                    } else {
-                        Box::new(module_addresses.iter().enumerate().map(|(i, m)| (i + 1, m)))
-                    };
-
-                for (global_idx, module_address) in iterator {
-                    // Convert DWARF function address (vaddr) to ELF file offset for uprobe attach
-                    let file_off = self.process_analyzer.as_ref().and_then(|an| {
-                        an.vaddr_to_file_offset(&module_address.module_path, module_address.address)
-                    });
-
-                    let target_info = ResolvedTarget {
-                        function_name: Some(func_name.clone()),
-                        function_address: Some(module_address.address),
-                        binary_path: module_address.module_path.to_string_lossy().to_string(),
-                        uprobe_offset: file_off,
-                        pattern: pattern.clone(),
-                    };
-
-                    match self.generate_ebpf_for_target(
-                        &target_info,
-                        statements,
-                        pid,
-                        Some(global_idx),
-                    ) {
-                        Ok(uprobe_config) => {
-                            self.uprobe_configs.push(uprobe_config);
-                            successful_addresses += 1;
-                            info!(
-                                "✓ Successfully generated eBPF for function '{}' at 0x{:x}",
-                                func_name, module_address.address
-                            );
-                        }
-                        Err(e) => {
-                            failed_addresses += 1;
-                            error!(
-                                "❌ Failed to generate eBPF for function '{}' at 0x{:x}: {}",
-                                func_name, module_address.address, e
-                            );
-
-                            // Record this failed target
-                            self.failed_targets.push(FailedTarget {
-                                target_name: func_name.clone(),
-                                pc_address: module_address.address,
-                                error_message: e.user_message().into_owned(),
-                            });
-
-                            // Continue processing other addresses
-                        }
-                    }
-                }
-
-                // Log summary for this trace point
-                if successful_addresses > 0 && failed_addresses == 0 {
-                    info!(
-                        "All {} addresses for function '{}' processed successfully",
-                        successful_addresses, func_name
-                    );
-                    Ok(())
-                } else if successful_addresses > 0 && failed_addresses > 0 {
-                    warn!(
-                        "Partial success for function '{}': {} successful, {} failed addresses",
-                        func_name, successful_addresses, failed_addresses
-                    );
-                    Ok(())
-                } else {
-                    // All addresses failed to process — record failures already captured above
-                    // Defer final error shaping to the caller based on aggregated results
-                    error!(
-                        "All {} addresses for function '{}' failed to process",
-                        failed_addresses, func_name
-                    );
-                    Ok(())
-                }
-            }
-            _ => {
-                unimplemented!();
+                self.process_resolved_function_addresses(
+                    pattern,
+                    &format!("wildcard '{wildcard_pattern}'"),
+                    resolved_targets,
+                    statements,
+                    pid,
+                    "Use a narrower prefix or an exact function name.",
+                )
             }
         }
+    }
+
+    fn reject_wildcard_index(
+        wildcard_pattern: &str,
+        selected_index: Option<usize>,
+    ) -> Result<(), CompileError> {
+        if selected_index.is_some() {
+            return Err(CompileError::Other(format!(
+                "Wildcard target '{wildcard_pattern}' does not support an address index. Use a narrower prefix or an exact function name."
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_wildcard_target_count(
+        wildcard_pattern: &str,
+        target_count: usize,
+    ) -> Result<(), CompileError> {
+        if target_count > MAX_WILDCARD_RESOLVED_TARGETS {
+            return Err(CompileError::Other(format!(
+                "Wildcard '{wildcard_pattern}' resolved to more than {MAX_WILDCARD_RESOLVED_TARGETS} concrete addresses. Use a narrower prefix or an exact function name."
+            )));
+        }
+        Ok(())
+    }
+
+    fn process_resolved_function_addresses(
+        &mut self,
+        pattern: &TracePattern,
+        target_label: &str,
+        resolved_targets: Vec<FunctionAddressMatch>,
+        statements: &[Statement],
+        pid: Option<u32>,
+        selection_hint: &str,
+    ) -> Result<(), CompileError> {
+        if resolved_targets.is_empty() {
+            return Err(CompileError::Other(format!(
+                "No addresses resolved for {target_label}"
+            )));
+        }
+        if let Some(idx) = self.compile_options.selected_index {
+            if idx == 0 || idx > resolved_targets.len() {
+                return Err(CompileError::Other(format!(
+                    "Selected index {idx} is out of range for {target_label} (valid 1..={}). {selection_hint}",
+                    resolved_targets.len()
+                )));
+            }
+        }
+
+        let mut successful_addresses = 0;
+        let mut failed_addresses = 0;
+        let targets: Box<dyn Iterator<Item = &FunctionAddressMatch>> =
+            if let Some(idx) = self.compile_options.selected_index {
+                Box::new(std::iter::once(&resolved_targets[idx - 1]))
+            } else {
+                Box::new(resolved_targets.iter())
+            };
+
+        for resolved in targets {
+            let module_address = &resolved.module_address;
+            let file_off = self.process_analyzer.as_ref().and_then(|analyzer| {
+                analyzer.vaddr_to_file_offset(&module_address.module_path, module_address.address)
+            });
+            let target_info = ResolvedTarget {
+                function_name: Some(resolved.function_name.clone()),
+                function_address: Some(module_address.address),
+                binary_path: module_address.module_path.to_string_lossy().to_string(),
+                uprobe_offset: file_off,
+                pattern: pattern.clone(),
+            };
+
+            match self.generate_ebpf_for_target(
+                &target_info,
+                statements,
+                pid,
+                Some(resolved.function_address_index),
+            ) {
+                Ok(uprobe_config) => {
+                    self.uprobe_configs.push(uprobe_config);
+                    successful_addresses += 1;
+                    info!(
+                        "✓ Successfully generated eBPF for function '{}' at 0x{:x}",
+                        resolved.function_name, module_address.address
+                    );
+                }
+                Err(e) => {
+                    failed_addresses += 1;
+                    error!(
+                        "❌ Failed to generate eBPF for function '{}' at 0x{:x}: {}",
+                        resolved.function_name, module_address.address, e
+                    );
+                    self.failed_targets.push(FailedTarget {
+                        target_name: resolved.function_name.clone(),
+                        pc_address: module_address.address,
+                        error_message: e.user_message().into_owned(),
+                    });
+                }
+            }
+        }
+
+        if successful_addresses > 0 && failed_addresses == 0 {
+            info!(
+                "All {} addresses for {} processed successfully",
+                successful_addresses, target_label
+            );
+        } else if successful_addresses > 0 && failed_addresses > 0 {
+            warn!(
+                "Partial success for {}: {} successful, {} failed addresses",
+                target_label, successful_addresses, failed_addresses
+            );
+        } else {
+            // Failures were recorded above; preserve partial-compilation behavior.
+            error!(
+                "All {} addresses for {} failed to process",
+                failed_addresses, target_label
+            );
+        }
+        Ok(())
     }
 
     /// Generate eBPF bytecode for resolved target
@@ -1039,5 +1114,37 @@ impl<'a> AstCompiler<'a> {
         })?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AstCompiler, MAX_WILDCARD_RESOLVED_TARGETS};
+
+    #[test]
+    fn wildcard_expansion_limit_allows_only_bounded_targets() {
+        assert!(AstCompiler::validate_wildcard_target_count(
+            "get_*",
+            MAX_WILDCARD_RESOLVED_TARGETS,
+        )
+        .is_ok());
+
+        let error =
+            AstCompiler::validate_wildcard_target_count("get_*", MAX_WILDCARD_RESOLVED_TARGETS + 1)
+                .expect_err("a wildcard above the limit must fail");
+        let message = error.user_message();
+        assert!(message.contains("get_*"));
+        assert!(message.contains(&MAX_WILDCARD_RESOLVED_TARGETS.to_string()));
+        assert!(message.contains("narrower prefix"));
+    }
+
+    #[test]
+    fn wildcard_rejects_address_index() {
+        let error = AstCompiler::reject_wildcard_index("get_*", Some(2))
+            .expect_err("a wildcard address index must fail");
+        let message = error.user_message();
+        assert!(message.contains("get_*"));
+        assert!(message.contains("does not support an address index"));
+        assert!(message.contains("exact function name"));
     }
 }

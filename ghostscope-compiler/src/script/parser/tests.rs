@@ -1,5 +1,5 @@
 use super::{parse, ParseError};
-use crate::script::ast::{BinaryOp, Expr, PrintStatement, Statement};
+use crate::script::ast::{BinaryOp, Expr, PrintStatement, Statement, TracePattern};
 
 #[test]
 fn parse_memcmp_builtin_in_if_should_succeed() {
@@ -639,7 +639,14 @@ fn parse_trace_patterns_function_line_address_wildcard() {
 
     // Wildcard
     let s4 = r#"trace printf* { print "W"; }"#;
-    assert!(parse(s4).is_ok());
+    let wildcard_program = parse(s4).expect("wildcard trace should parse");
+    assert!(matches!(
+        &wildcard_program.statements[0],
+        Statement::TracePoint {
+            pattern: TracePattern::Wildcard(pattern),
+            ..
+        } if pattern == "printf*"
+    ));
 
     // Module-qualified address
     let s5 = r#"trace /lib/x86_64-linux-gnu/libc.so.6:0x1234 { print "M"; }"#;

@@ -204,8 +204,10 @@ pub struct CompileOptions {
     pub max_trace_event_size: u32,
     /// Max DWARF-unwound frames captured by each `bt`/`backtrace` instruction.
     pub backtrace_depth: u8,
-    /// Optional single-address filter: if set, only the Nth (1-based) address
-    /// resolved for a target will be compiled. When None, compile all.
+    /// Optional single-address filter for non-wildcard targets: if set, only
+    /// the Nth (1-based) resolved address will be compiled. Wildcard targets
+    /// intentionally reject this option because their expansion has no
+    /// user-visible address index. When None, compile all.
     pub selected_index: Option<usize>,
     /// Optional PID filter strategy override.
     /// When None, compiler falls back to HostTgid using compile_script(pid).

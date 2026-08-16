@@ -1,4 +1,7 @@
-use crate::{core::DebugInfoSource, semantics::VisibleVariable};
+use crate::{
+    core::{DebugInfoSource, ModuleAddress},
+    semantics::VisibleVariable,
+};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +103,15 @@ pub struct LoadedModuleRuntimeInfo {
 pub struct FunctionQueryResult {
     pub function_name: String,
     pub addresses: Vec<AddressQueryResult>,
+}
+
+/// A concrete function entry resolved for tracing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionAddressMatch {
+    pub function_name: String,
+    pub module_address: ModuleAddress,
+    /// 1-based address index within this concrete function after module scoping.
+    pub function_address_index: usize,
 }
 
 /// Module statistics compatible with ghostscope-binary

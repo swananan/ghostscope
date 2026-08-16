@@ -11,7 +11,7 @@ use crate::{
 };
 use ghostscope_debuginfod::DebuginfodClient;
 use object::{Object, ObjectSection};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -818,6 +818,67 @@ impl DwarfAnalyzer {
         results
     }
 
+    /// Lookup a bounded number of concrete function addresses whose names start
+    /// with `prefix`.
+    ///
+    /// The optional module scope is applied before name enumeration or DWARF
+    /// materialization. Results use a stable function-name/module/address order.
+    /// Function aliases that resolve to the same module address are collapsed,
+    /// and resolution stops once `max_results` unique addresses are found.
+    pub fn lookup_function_addresses_by_prefix(
+        &self,
+        prefix: &str,
+        module_scope: Option<&Path>,
+        max_results: usize,
+    ) -> Vec<FunctionAddressMatch> {
+        if prefix.is_empty() || max_results == 0 {
+            return Vec::new();
+        }
+
+        let mut modules: Vec<_> = self
+            .modules
+            .iter()
+            .filter(|(module_path, _)| {
+                module_scope
+                    .is_none_or(|scope| Self::module_paths_equivalent(module_path.as_path(), scope))
+            })
+            .collect();
+        modules.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let mut function_names = BTreeSet::new();
+        for (_, module_data) in &modules {
+            function_names.extend(
+                module_data
+                    .get_attachable_function_names()
+                    .into_iter()
+                    .filter(|name| name.starts_with(prefix)),
+            );
+        }
+
+        let mut results = Vec::new();
+        let mut seen_module_addresses = HashSet::new();
+        for function_name in function_names {
+            let mut function_address_index = 0;
+            for (module_path, module_data) in &modules {
+                for address in module_data.lookup_function_addresses_any(&function_name) {
+                    function_address_index += 1;
+                    let module_address = ModuleAddress::new((*module_path).clone(), address);
+                    if seen_module_addresses.insert(module_address.clone()) {
+                        results.push(FunctionAddressMatch {
+                            function_name: function_name.clone(),
+                            module_address,
+                            function_address_index,
+                        });
+                        if results.len() == max_results {
+                            return results;
+                        }
+                    }
+                }
+            }
+        }
+        results
+    }
+
     /// Query function debug information across all modules.
     pub fn query_function(&self, name: &str) -> Result<FunctionQueryResult> {
         let module_addresses = self.lookup_function_addresses(name);
@@ -1196,7 +1257,7 @@ impl DwarfAnalyzer {
         all_functions
     }
 
-    /// Lookup functions by pattern (simplified - exact match only for now)
+    /// Lookup functions whose names contain a literal substring.
     pub fn lookup_functions_by_pattern(&self, pattern: &str) -> Vec<String> {
         let all_functions = self.list_functions();
         all_functions

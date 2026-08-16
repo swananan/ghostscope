@@ -480,8 +480,8 @@ impl CommandParser {
     fn format_tracing_commands() -> String {
         [
             "📊 Tracing Commands:",
-            "  trace <target>             - Start tracing a function/line/address (t)",
-            "    - target: function_name | file:line | 0xADDR | module_suffix:0xADDR",
+            "  trace <target>             - Start tracing a function/prefix/line/address (t)",
+            "    - target: function_name | function_prefix* | file:line | 0xADDR | module_suffix:0xADDR",
             "  enable <id|all>            - Enable specific trace or all traces (en)",
             "  disable <id|all>           - Disable specific trace or all traces (dis)",
             "  delete <id|all>            - Delete specific trace or all traces (del)",
