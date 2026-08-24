@@ -3279,6 +3279,40 @@ trace do_stuff {
 }
 
 #[tokio::test]
+async fn test_rust_script_print_char_values() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+
+    let script = r#"
+trace do_stuff {
+    print "RCHAR:{}:{}:{}", G_CHAR_ASCII, G_CHAR_UNICODE, G_CHAR_ESCAPE;
+    print "RCHAR_ARRAY:{}", G_CHAR_ARRAY;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 9, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RCHAR:'A':'中':'\\n'")),
+        "Expected Rust char output. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("RCHAR_ARRAY:['A', '中', '\\n']")),
+        "Expected Rust char array output. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_globals() -> anyhow::Result<()> {
     init();
 

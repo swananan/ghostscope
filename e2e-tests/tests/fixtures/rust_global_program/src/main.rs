@@ -20,6 +20,10 @@ pub static mut G_COUNTER: i32 = 0;
 pub static G_MESSAGE: &str = "hello from rust";
 pub static G_EMPTY_MESSAGE: &str = "";
 pub static G_NUL_MESSAGE: &str = "left\0right";
+pub static G_CHAR_ASCII: char = 'A';
+pub static G_CHAR_UNICODE: char = '中';
+pub static G_CHAR_ESCAPE: char = '\n';
+pub static G_CHAR_ARRAY: [char; 3] = [G_CHAR_ASCII, G_CHAR_UNICODE, G_CHAR_ESCAPE];
 pub static mut G_OWNED_MESSAGE: String = String::new();
 pub static mut G_EMPTY_OWNED: String = String::new();
 pub static mut G_NUL_OWNED: String = String::new();
@@ -671,6 +675,10 @@ fn touch_globals() -> i32 {
             + G_MESSAGE.len() as i64
             + G_EMPTY_MESSAGE.len() as i64
             + G_NUL_MESSAGE.len() as i64
+            + G_CHAR_ASCII as u32 as i64
+            + G_CHAR_UNICODE as u32 as i64
+            + G_CHAR_ESCAPE as u32 as i64
+            + G_CHAR_ARRAY[0] as u32 as i64
             + G_OWNED_MESSAGE.len() as i64
             + G_EMPTY_OWNED.len() as i64
             + G_NUL_OWNED.len() as i64

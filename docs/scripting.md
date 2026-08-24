@@ -146,6 +146,10 @@ That matrix records audited DWARF layouts rather than version gates: coverage is
 adapter-specific, so not every value family is validated on every listed
 release, and unmatched older layouts fall back to native DWARF presentation.
 
+Rust `char` values emitted as four-byte `DW_ATE_UTF` scalars use Rust-style
+single-quoted formatting, including Unicode output and debug escapes such as
+`'中'` and `'\n'`.
+
 The currently supported value families are:
 
 - UTF-8 strings: `&str`, `&mut str`, `String`, and `Box<str>`;
