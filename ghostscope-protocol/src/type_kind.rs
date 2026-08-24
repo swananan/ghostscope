@@ -18,6 +18,7 @@ pub enum TypeKind {
     F32 = 0x09,
     F64 = 0x0A,
     Bool = 0x0B,
+    /// Four-byte Unicode scalar represented by `DW_ATE_UTF`, including Rust `char`.
     Char = 0x0C,
 
     Pointer = 0x20,
@@ -97,9 +98,10 @@ impl From<&TypeInfo> for TypeKind {
                         8 => TypeKind::U64,
                         _ => TypeKind::U64, // Default to U64
                     },
-                    6 => TypeKind::I8, // DW_ATE_signed_char
-                    8 => TypeKind::U8, // DW_ATE_unsigned_char
-                    _ => TypeKind::U8, // Default to byte for unknown encoding
+                    6 => TypeKind::I8,                  // DW_ATE_signed_char
+                    8 => TypeKind::U8,                  // DW_ATE_unsigned_char
+                    16 if *size == 4 => TypeKind::Char, // DW_ATE_UTF Rust `char`
+                    _ => TypeKind::U8,                  // Default to byte for unknown encoding
                 }
             }
             TypeInfo::BitfieldType {
@@ -122,6 +124,22 @@ impl From<&TypeInfo> for TypeKind {
             TypeInfo::VariantType { .. } => TypeKind::Struct,
             TypeInfo::ScopedEnumType { base_type, .. } => TypeKind::from(base_type.as_ref()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_dwarf_utf_as_char() {
+        let rust_char = TypeInfo::BaseType {
+            name: "char".to_string(),
+            size: 4,
+            encoding: gimli::constants::DW_ATE_UTF.0 as u16,
+        };
+
+        assert_eq!(TypeKind::from(&rust_char), TypeKind::Char);
     }
 }
 

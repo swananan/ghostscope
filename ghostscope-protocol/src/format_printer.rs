@@ -2299,7 +2299,19 @@ impl FormatPrinter {
 
     /// Format base type data using DWARF encoding information
     fn format_base_type_data(data: &[u8], size: u64, encoding: u16) -> String {
-        if encoding == gimli::constants::DW_ATE_boolean.0 as u16 {
+        if encoding == gimli::constants::DW_ATE_UTF.0 as u16 {
+            if size != 4 {
+                return format!("<UNSUPPORTED_UTF_SIZE_{size}>");
+            }
+            let Some(bytes) = data.get(..4).and_then(|bytes| bytes.try_into().ok()) else {
+                return "<INVALID_UTF_CHAR>".to_string();
+            };
+            let scalar = u32::from_le_bytes(bytes);
+            match char::from_u32(scalar) {
+                Some(character) => format!("{character:?}"),
+                None => format!("<INVALID_UNICODE_SCALAR_0x{scalar:08x}>"),
+            }
+        } else if encoding == gimli::constants::DW_ATE_boolean.0 as u16 {
             if data.is_empty() {
                 "<EMPTY_BOOL>".to_string()
             } else {
@@ -4742,6 +4754,50 @@ mod tests {
                 &trace_context,
             ),
             "values = <truncated>"
+        );
+    }
+
+    #[test]
+    fn formats_dwarf_utf_characters() {
+        let rust_char = TypeInfo::BaseType {
+            name: "char".to_string(),
+            size: 4,
+            encoding: gimli::constants::DW_ATE_UTF.0 as u16,
+        };
+
+        for (character, expected) in [
+            ('A', "'A'"),
+            ('中', "'中'"),
+            ('\n', "'\\n'"),
+            ('\'', "'\\''"),
+            ('\\', "'\\\\'"),
+        ] {
+            assert_eq!(
+                FormatPrinter::format_data_with_type_info(
+                    &(character as u32).to_le_bytes(),
+                    &rust_char,
+                ),
+                expected
+            );
+        }
+
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&[0, 0xd8, 0, 0], &rust_char),
+            "<INVALID_UNICODE_SCALAR_0x0000d800>"
+        );
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&[b'A', 0, 0], &rust_char),
+            "<INVALID_UTF_CHAR>"
+        );
+
+        let unsupported_width = TypeInfo::BaseType {
+            name: "char16_t".to_string(),
+            size: 2,
+            encoding: gimli::constants::DW_ATE_UTF.0 as u16,
+        };
+        assert_eq!(
+            FormatPrinter::format_data_with_type_info(&[b'A', 0], &unsupported_width),
+            "<UNSUPPORTED_UTF_SIZE_2>"
         );
     }
 

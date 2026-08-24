@@ -61,6 +61,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     ) -> ghostscope_dwarf::TypeInfo {
         use ghostscope_dwarf::constants::{
             DW_ATE_boolean, DW_ATE_float, DW_ATE_signed, DW_ATE_signed_char, DW_ATE_unsigned,
+            DW_ATE_UTF,
         };
         use ghostscope_dwarf::TypeInfo as TI;
 
@@ -100,10 +101,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 size: 8,
                 encoding: DW_ATE_signed.0 as u16,
             },
-            TypeKind::U8 | TypeKind::Char => TI::BaseType {
+            TypeKind::U8 => TI::BaseType {
                 name: "u8".to_string(),
                 size: 1,
                 encoding: DW_ATE_unsigned.0 as u16,
+            },
+            TypeKind::Char => TI::BaseType {
+                name: "char".to_string(),
+                size: 4,
+                encoding: DW_ATE_UTF.0 as u16,
             },
             TypeKind::U16 => TI::BaseType {
                 name: "u16".to_string(),

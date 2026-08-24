@@ -43,9 +43,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     ) -> Result<()> {
         // Determine data size based on type
         let data_size = match type_encoding {
-            TypeKind::U8 | TypeKind::I8 | TypeKind::Bool | TypeKind::Char => 1,
+            TypeKind::U8 | TypeKind::I8 | TypeKind::Bool => 1,
             TypeKind::U16 | TypeKind::I16 => 2,
-            TypeKind::U32 | TypeKind::I32 | TypeKind::F32 => 4,
+            TypeKind::U32 | TypeKind::I32 | TypeKind::F32 | TypeKind::Char => 4,
             TypeKind::U64 | TypeKind::I64 | TypeKind::F64 | TypeKind::Pointer => 8,
             _ => 8, // Default to 8 bytes for complex types
         };
