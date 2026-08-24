@@ -92,8 +92,11 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BacktraceStatement {
+    /// Emit machine-facing frame fields instead of symbolized names.
     pub raw: bool,
+    /// Retain compiler disambiguators in symbolized Rust frame names.
     pub full: bool,
+    /// Include source-level inline pseudo-frames.
     pub inline: bool,
 }
 

@@ -292,12 +292,12 @@ mod tests {
     #[test]
     fn backtrace_flags_follow_statement_options() {
         let flags = backtrace_flags(&BacktraceStatement {
-            raw: true,
+            raw: false,
             full: true,
             inline: false,
         });
 
-        assert_eq!(flags & BACKTRACE_FLAG_RAW, BACKTRACE_FLAG_RAW);
+        assert_eq!(flags & BACKTRACE_FLAG_RAW, 0);
         assert_eq!(flags & BACKTRACE_FLAG_FULL, BACKTRACE_FLAG_FULL);
         assert_eq!(flags & BACKTRACE_FLAG_INLINE, 0);
     }

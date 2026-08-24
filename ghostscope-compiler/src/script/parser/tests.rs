@@ -998,6 +998,25 @@ fn parse_backtrace_and_bt_statements() {
 }
 
 #[test]
+fn parse_backtrace_rejects_raw_full_conflict() {
+    let result = parse(
+        r#"
+trace foo {
+    bt raw full;
+}
+"#,
+    );
+
+    match result {
+        Err(ParseError::SyntaxError(message)) => {
+            assert!(message.contains("'raw' and 'full'"), "{message}");
+            assert!(message.contains("mutually exclusive"), "{message}");
+        }
+        other => panic!("expected SyntaxError, got {other:?}"),
+    }
+}
+
+#[test]
 fn parse_backtrace_rejects_named_depth_option() {
     let s = r#"
 	trace foo {

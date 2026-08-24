@@ -23,7 +23,17 @@ pub fn compile_standalone_fixture(
     source: &Path,
     binary: &Path,
 ) -> anyhow::Result<()> {
-    compile_fixture(rustc, toolchain, source, binary, true)
+    compile_fixture(rustc, toolchain, source, binary, true, &["opt-level=0"])
+}
+
+pub fn compile_standalone_fixture_with_codegen_options(
+    rustc: &Path,
+    toolchain: &str,
+    source: &Path,
+    binary: &Path,
+    codegen_options: &[&str],
+) -> anyhow::Result<()> {
+    compile_fixture(rustc, toolchain, source, binary, true, codegen_options)
 }
 
 pub fn compile_compact_standalone_fixture(
@@ -32,7 +42,7 @@ pub fn compile_compact_standalone_fixture(
     source: &Path,
     binary: &Path,
 ) -> anyhow::Result<()> {
-    compile_fixture(rustc, toolchain, source, binary, false)
+    compile_fixture(rustc, toolchain, source, binary, false, &["opt-level=0"])
 }
 
 fn compile_fixture(
@@ -41,12 +51,13 @@ fn compile_fixture(
     source: &Path,
     binary: &Path,
     link_dead_code: bool,
+    codegen_options: &[&str],
 ) -> anyhow::Result<()> {
     let mut command = Command::new(rustc);
-    command
-        .args(["--edition=2018", "-g"])
-        .arg("-C")
-        .arg("opt-level=0");
+    command.args(["--edition=2018", "-g"]);
+    for option in codegen_options {
+        command.arg("-C").arg(option);
+    }
     if link_dead_code {
         command.arg("-C").arg("link-dead-code");
     }

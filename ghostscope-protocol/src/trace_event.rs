@@ -283,6 +283,7 @@ pub fn backtrace_error_label(error_code: u16) -> Option<&'static str> {
 }
 
 pub const BACKTRACE_FLAG_RAW: u8 = 0x01;
+/// Retain compiler disambiguators in symbolized Rust frame names.
 pub const BACKTRACE_FLAG_FULL: u8 = 0x02;
 pub const BACKTRACE_FLAG_INLINE: u8 = 0x04;
 /// ExprError instruction data - structured warning for runtime expression failure

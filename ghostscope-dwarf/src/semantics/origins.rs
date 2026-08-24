@@ -114,34 +114,39 @@ pub(crate) fn resolve_origin_entry(
     }
 }
 
-fn read_name_attr(
+fn read_string_attr(
     dwarf: &gimli::Dwarf<DwarfReader>,
     unit: &DwarfUnit,
     entry: &DwarfEntry,
+    attrs: &[gimli::DwAt],
 ) -> gimli::read::Result<Option<String>> {
-    if let Some(attr) = entry.attr(gimli::DW_AT_name) {
-        if let Ok(name) = dwarf.attr_string(unit, attr.value()) {
-            if let Ok(name) = name.to_string_lossy() {
-                return Ok(Some(name.into_owned()));
+    for attr_name in attrs {
+        if let Some(attr) = entry.attr(*attr_name) {
+            if let Ok(value) = dwarf.attr_string(unit, attr.value()) {
+                if let Ok(value) = value.to_string_lossy() {
+                    return Ok(Some(value.into_owned()));
+                }
             }
         }
     }
     Ok(None)
 }
 
-pub(crate) fn resolve_name_with_origins(
+fn resolve_string_attr_with_origins(
     dwarf: &gimli::Dwarf<DwarfReader>,
     unit: &DwarfUnit,
     entry: &DwarfEntry,
+    attrs: &[gimli::DwAt],
 ) -> gimli::read::Result<Option<String>> {
     fn inner(
         dwarf: &gimli::Dwarf<DwarfReader>,
         unit: &DwarfUnit,
         entry: &DwarfEntry,
+        attrs: &[gimli::DwAt],
         visited: &mut HashSet<gimli::DebugInfoOffset>,
     ) -> gimli::read::Result<Option<String>> {
-        if let Some(name) = read_name_attr(dwarf, unit, entry)? {
-            return Ok(Some(name));
+        if let Some(value) = read_string_attr(dwarf, unit, entry, attrs)? {
+            return Ok(Some(value));
         }
 
         for origin_attr in [
@@ -153,8 +158,10 @@ pub(crate) fn resolve_name_with_origins(
                     resolve_origin_entry(dwarf, unit, value)?
                 {
                     if visited.insert(origin_abs) {
-                        if let Some(name) = inner(dwarf, &origin_unit, &origin_entry, visited)? {
-                            return Ok(Some(name));
+                        if let Some(value) =
+                            inner(dwarf, &origin_unit, &origin_entry, attrs, visited)?
+                        {
+                            return Ok(Some(value));
                         }
                     }
                 }
@@ -164,8 +171,8 @@ pub(crate) fn resolve_name_with_origins(
         Ok(None)
     }
 
-    if let Some(name) = read_name_attr(dwarf, unit, entry)? {
-        return Ok(Some(name));
+    if let Some(value) = read_string_attr(dwarf, unit, entry, attrs)? {
+        return Ok(Some(value));
     }
 
     let has_origin = entry
@@ -182,5 +189,26 @@ pub(crate) fn resolve_name_with_origins(
     if let Some(entry_abs) = entry.offset().to_debug_info_offset(&unit.header) {
         visited.insert(entry_abs);
     }
-    inner(dwarf, unit, entry, &mut visited)
+    inner(dwarf, unit, entry, attrs, &mut visited)
+}
+
+pub(crate) fn resolve_name_with_origins(
+    dwarf: &gimli::Dwarf<DwarfReader>,
+    unit: &DwarfUnit,
+    entry: &DwarfEntry,
+) -> gimli::read::Result<Option<String>> {
+    resolve_string_attr_with_origins(dwarf, unit, entry, &[gimli::DW_AT_name])
+}
+
+pub(crate) fn resolve_linkage_name_with_origins(
+    dwarf: &gimli::Dwarf<DwarfReader>,
+    unit: &DwarfUnit,
+    entry: &DwarfEntry,
+) -> gimli::read::Result<Option<String>> {
+    resolve_string_attr_with_origins(
+        dwarf,
+        unit,
+        entry,
+        &[gimli::DW_AT_linkage_name, gimli::DW_AT_MIPS_linkage_name],
+    )
 }
