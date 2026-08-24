@@ -26,6 +26,12 @@ fn parse_backtrace_stmt(pair: Pair<Rule>) -> Result<BacktraceStatement> {
         }
     }
 
+    if stmt.raw && stmt.full {
+        return Err(ParseError::SyntaxError(
+            "Backtrace options 'raw' and 'full' are mutually exclusive".to_string(),
+        ));
+    }
+
     Ok(stmt)
 }
 pub(super) fn parse_statement(pair: Pair<Rule>) -> Result<Statement> {

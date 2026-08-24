@@ -1,6 +1,6 @@
 use super::DwarfAnalyzer;
 use crate::{
-    core::{ModuleAddress, Provenance, Result},
+    core::{demangle::RustSymbolHashDisplay, ModuleAddress, Provenance, Result},
     semantics::{
         AddressSpaceInfo, FunctionParameter, PcContext, PcLineInfo, PcRange, PlanError,
         VariableAccessPath, VariableAccessSegment, VariableReadPlan, VisibleVariable,
@@ -34,6 +34,34 @@ impl DwarfAnalyzer {
                 module_address.address,
                 context.clone(),
             );
+        Ok(context)
+    }
+
+    /// Resolve a PC while selecting whether user-facing Rust names retain
+    /// compiler disambiguators. Semantic identity and address resolution are
+    /// unchanged; only physical and inline function names are reformatted.
+    pub fn resolve_pc_for_display(
+        &self,
+        module_address: &ModuleAddress,
+        show_rust_hashes: bool,
+    ) -> Result<PcContext> {
+        let mut context = self.resolve_pc(module_address)?;
+        let rust_hashes = if show_rust_hashes {
+            RustSymbolHashDisplay::Shown
+        } else {
+            RustSymbolHashDisplay::Hidden
+        };
+        context.function_name =
+            self.find_function_name_by_module_address_for_display(module_address, rust_hashes);
+        if let Some(module_data) = self
+            .loaded_module_path_for(&module_address.module_path)
+            .and_then(|module_path| self.modules.get(module_path))
+        {
+            for inline_frame in &mut context.inline_chain {
+                inline_frame.function_name =
+                    module_data.find_inline_function_name_for_display(inline_frame, rust_hashes);
+            }
+        }
         Ok(context)
     }
 

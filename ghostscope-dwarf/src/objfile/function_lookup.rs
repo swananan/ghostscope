@@ -1,11 +1,17 @@
 use super::LoadedObjfile;
 use crate::{
     binary::DwarfReader,
-    core::{demangled_name, normalize_demangled_signature, symbol_name_matches_query, Result},
+    core::{
+        demangle::{demangle_by_lang_for_display, is_rust_mangled, RustSymbolHashDisplay},
+        demangled_name, normalize_demangled_signature, symbol_name_matches_query, Result,
+    },
     dwarf_expr::{errors as expr_errors, modes::DwarfExprMode},
     index::{GdbSymbolKind, LightweightIndex},
     parser::RangeExtractor,
-    semantics::{range_contains_pc, resolve_attr_with_unit_origins, resolve_origin_entry},
+    semantics::{
+        range_contains_pc, resolve_attr_with_unit_origins, resolve_linkage_name_with_origins,
+        resolve_origin_entry, InlineFrame,
+    },
 };
 use std::collections::HashSet;
 
@@ -13,6 +19,29 @@ use std::collections::HashSet;
 // before the first non-empty range. Keep the window small so distant
 // caller-side setup PCs still fall back to the range start.
 const MAX_INLINE_POINT_ENTRY_PC_GAP: u64 = 32;
+
+fn function_name_for_display(
+    entry: &crate::core::IndexEntry,
+    rust_hashes: RustSymbolHashDisplay,
+) -> String {
+    if !is_rust_mangled(&entry.name) {
+        return entry.name.to_string();
+    }
+
+    demangle_by_lang_for_display(entry.language, &entry.name, rust_hashes)
+        .unwrap_or_else(|| entry.name.to_string())
+}
+
+fn inline_function_name_for_display(
+    linkage_name: Option<&str>,
+    fallback_name: Option<&str>,
+    rust_hashes: RustSymbolHashDisplay,
+) -> Option<String> {
+    linkage_name
+        .filter(|name| is_rust_mangled(name))
+        .and_then(|name| demangle_by_lang_for_display(Some(gimli::DW_LANG_Rust), name, rust_hashes))
+        .or_else(|| fallback_name.map(str::to_owned))
+}
 
 impl LoadedObjfile {
     pub(crate) fn lookup_function_addresses(&self, name: &str) -> Vec<u64> {
@@ -812,16 +841,46 @@ impl LoadedObjfile {
     }
 
     pub(crate) fn find_function_name_by_address(&self, address: u64) -> Option<String> {
+        self.find_function_name_by_address_for_display(address, RustSymbolHashDisplay::Shown)
+    }
+
+    pub(crate) fn find_function_name_by_address_for_display(
+        &self,
+        address: u64,
+        rust_hashes: RustSymbolHashDisplay,
+    ) -> Option<String> {
         self.find_function_index_entry_by_address(address)
-            .map(|entry| entry.name.to_string())
+            .map(|entry| function_name_for_display(&entry, rust_hashes))
+    }
+
+    pub(crate) fn find_inline_function_name_for_display(
+        &self,
+        inline_frame: &InlineFrame,
+        rust_hashes: RustSymbolHashDisplay,
+    ) -> Option<String> {
+        let cu_offset = gimli::DebugInfoOffset(inline_frame.concrete_die.cu.0 as usize);
+        let die_offset = gimli::UnitOffset(inline_frame.concrete_die.offset as usize);
+        let linkage_name = self.unit(cu_offset).ok().and_then(|unit| {
+            let entry = unit.entry(die_offset).ok()?;
+            resolve_linkage_name_with_origins(self.dwarf(), &unit, &entry)
+                .ok()
+                .flatten()
+        });
+
+        inline_function_name_for_display(
+            linkage_name.as_deref(),
+            inline_frame.function_name.as_deref(),
+            rust_hashes,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::LoadedObjfile;
+    use super::{function_name_for_display, inline_function_name_for_display};
     use crate::binary::{dwarf_reader_from_arc, DwarfReader};
-    use crate::core::{FunctionDieKind, IndexEntry, IndexFlags};
+    use crate::core::{demangle::RustSymbolHashDisplay, FunctionDieKind, IndexEntry, IndexFlags};
     use crate::index::LightweightIndex;
     use gimli::constants;
     use gimli::write::{
@@ -1474,6 +1533,97 @@ mod tests {
         assert_eq!(
             ix.function_candidate_indices_by_fragment(&demangled),
             vec![0]
+        );
+    }
+
+    #[test]
+    fn address_display_names_control_only_rust_disambiguators() {
+        let entry = |name: &str, language| IndexEntry {
+            name: Arc::<str>::from(name),
+            die_offset: gimli::UnitOffset(0),
+            unit_offset: gimli::DebugInfoOffset(0),
+            tag: constants::DW_TAG_subprogram,
+            flags: IndexFlags {
+                is_linkage: true,
+                ..Default::default()
+            },
+            language,
+            representative_addr: Some(0x1000),
+            entry_pc: Some(0x1000),
+            function_kind: FunctionDieKind::ConcreteSubprogram,
+        };
+
+        let legacy = entry(
+            "_ZN22rust_backtrace_program21rust_backtrace_middle17hbd24b59facb94bf3E",
+            Some(gimli::DW_LANG_Rust),
+        );
+        let legacy_concise = function_name_for_display(&legacy, RustSymbolHashDisplay::Hidden);
+        assert_eq!(
+            legacy_concise,
+            "rust_backtrace_program::rust_backtrace_middle"
+        );
+        let legacy_full = function_name_for_display(&legacy, RustSymbolHashDisplay::Shown);
+        assert!(legacy_full.ends_with("::hbd24b59facb94bf3"));
+
+        let v0 = entry("_RNvCs73fAdSrgOJL_4test4main", Some(gimli::DW_LANG_Rust));
+        assert_eq!(
+            function_name_for_display(&v0, RustSymbolHashDisplay::Hidden),
+            "test::main"
+        );
+        let v0_full = function_name_for_display(&v0, RustSymbolHashDisplay::Shown);
+        assert!(
+            v0_full.starts_with("test[") && v0_full.ends_with("::main"),
+            "unexpected Rust v0 display name: {v0_full}"
+        );
+
+        let cpp = entry("_ZN2ns6Widget3runEv", Some(gimli::DW_LANG_C_plus_plus_17));
+        assert_eq!(
+            function_name_for_display(&cpp, RustSymbolHashDisplay::Hidden),
+            cpp.name.as_ref()
+        );
+        assert_eq!(
+            function_name_for_display(&cpp, RustSymbolHashDisplay::Shown),
+            cpp.name.as_ref()
+        );
+    }
+
+    #[test]
+    fn inline_display_names_control_rust_disambiguators_and_preserve_fallbacks() {
+        let v0 = "_RNvCs73fAdSrgOJL_4test4main";
+        assert_eq!(
+            inline_function_name_for_display(
+                Some(v0),
+                Some("test::main"),
+                RustSymbolHashDisplay::Hidden,
+            )
+            .as_deref(),
+            Some("test::main")
+        );
+        let full = inline_function_name_for_display(
+            Some(v0),
+            Some("test::main"),
+            RustSymbolHashDisplay::Shown,
+        )
+        .expect("v0 inline symbol should demangle");
+        assert!(full.starts_with("test[") && full.ends_with("::main"));
+
+        assert_eq!(
+            inline_function_name_for_display(
+                Some("_ZN2ns6Widget3runEv"),
+                Some("ns::Widget::run"),
+                RustSymbolHashDisplay::Shown,
+            )
+            .as_deref(),
+            Some("ns::Widget::run")
+        );
+        assert_eq!(
+            inline_function_name_for_display(
+                None,
+                Some("plain_inline"),
+                RustSymbolHashDisplay::Shown,
+            )
+            .as_deref(),
+            Some("plain_inline")
         );
     }
 

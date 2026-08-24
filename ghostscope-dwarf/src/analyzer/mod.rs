@@ -2,8 +2,8 @@
 
 use crate::{
     core::{
-        mapping::ModuleMapping, CallerFrameRecovery, DebugInfoSource, ModuleAddress, Result,
-        SectionType, SourceLocation,
+        demangle::RustSymbolHashDisplay, mapping::ModuleMapping, CallerFrameRecovery,
+        DebugInfoSource, ModuleAddress, Result, SectionType, SourceLocation,
     },
     loader::ExplicitDebugFile,
     objfile::LoadedObjfile,
@@ -229,10 +229,22 @@ impl DwarfAnalyzer {
         &self,
         module_address: &ModuleAddress,
     ) -> Option<String> {
+        self.find_function_name_by_module_address_for_display(
+            module_address,
+            RustSymbolHashDisplay::Shown,
+        )
+    }
+
+    fn find_function_name_by_module_address_for_display(
+        &self,
+        module_address: &ModuleAddress,
+        rust_hashes: RustSymbolHashDisplay,
+    ) -> Option<String> {
         self.loaded_module_path_for(&module_address.module_path)
             .and_then(|module_path| self.modules.get(module_path))
             .and_then(|module_data| {
-                module_data.find_function_name_by_address(module_address.address)
+                module_data
+                    .find_function_name_by_address_for_display(module_address.address, rust_hashes)
             })
     }
 

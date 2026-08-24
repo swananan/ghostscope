@@ -15,7 +15,8 @@ pub use c_integer::{
     CIntegerComparisonPlan, CIntegerComparisonType,
 };
 pub(crate) use origins::{
-    resolve_attr_with_unit_origins, resolve_name_with_origins, resolve_origin_entry,
+    resolve_attr_with_unit_origins, resolve_linkage_name_with_origins, resolve_name_with_origins,
+    resolve_origin_entry,
 };
 pub(crate) use pc::{range_contains_pc, ranges_contain_pc};
 pub use pc_context::{

@@ -3,7 +3,7 @@ use ghostscope_process::ProcessManager;
 #[cfg(test)]
 use ghostscope_protocol::trace_event::backtrace_error_label;
 use ghostscope_protocol::trace_event::{
-    BacktraceStatus, BACKTRACE_FLAG_INLINE, BACKTRACE_FLAG_RAW,
+    BacktraceStatus, BACKTRACE_FLAG_FULL, BACKTRACE_FLAG_INLINE, BACKTRACE_FLAG_RAW,
 };
 use ghostscope_protocol::{ParsedBacktraceFrame, ParsedInstruction, ParsedTraceEvent};
 use ghostscope_ui::{BacktraceDisplay, BacktraceDisplayFrame, TraceDisplayItem, UiTraceEvent};
@@ -402,6 +402,7 @@ impl BacktraceRenderer {
         }
 
         let raw = (flags & BACKTRACE_FLAG_RAW) != 0;
+        let full = (flags & BACKTRACE_FLAG_FULL) != 0;
         let inline = (flags & BACKTRACE_FLAG_INLINE) != 0;
         let module = resolve_frame_module(coordinator, analyzer, pids, frame);
         let frame_pc = module.as_ref().map(|module| module.pc).unwrap_or(frame.pc);
@@ -423,7 +424,7 @@ impl BacktraceRenderer {
                     module.pc.saturating_sub(1)
                 };
                 let address = ModuleAddress::new(module.module_path.clone(), lookup_pc);
-                analyzer.resolve_pc(&address).ok()
+                analyzer.resolve_pc_for_display(&address, full).ok()
             });
 
         let Some(ctx) = resolved else {
@@ -492,6 +493,7 @@ impl BacktraceRenderer {
         }
 
         let raw = (flags & BACKTRACE_FLAG_RAW) != 0;
+        let full = (flags & BACKTRACE_FLAG_FULL) != 0;
         let inline = (flags & BACKTRACE_FLAG_INLINE) != 0;
         let module = resolve_frame_module(coordinator, analyzer, pids, frame);
         let frame_pc = module.as_ref().map(|module| module.pc).unwrap_or(frame.pc);
@@ -513,7 +515,7 @@ impl BacktraceRenderer {
                     module.pc.saturating_sub(1)
                 };
                 let address = ModuleAddress::new(module.module_path.clone(), lookup_pc);
-                analyzer.resolve_pc(&address).ok()
+                analyzer.resolve_pc_for_display(&address, full).ok()
             });
 
         let Some(ctx) = resolved else {

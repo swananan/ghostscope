@@ -866,12 +866,12 @@ trace test_function {
 }
 ```
 
-Options:
+The compact syntax is `bt [full|raw] [noinline];`. `backtrace` remains an alias for `bt`.
 
-- `bt raw;` prints raw module cookie, module offset, and runtime IP without source symbolization.
-- `bt full;` prints symbolized source-aware frames. Raw IP/cookie debug metadata is kept out of `bt full` and is only shown by `bt raw`.
-- `bt inline;` enables inline call-chain rendering. This is the default.
-- `bt noinline;` suppresses inline call-chain rendering.
+- `bt;` prints source-aware, symbolized frames. Rust compiler disambiguators are hidden by default, so legacy `::h...` suffixes and v0 crate hashes do not clutter normal backtraces.
+- `bt full;` keeps those Rust disambiguators in otherwise identical symbolized frames. `full` changes symbol presentation only: it does not collect more frames or variables, change unwinding, or add raw IP/cookie metadata.
+- `bt raw;` skips source symbolization and prints the module cookie, module offset, and runtime IP. `raw` and `full` are mutually exclusive.
+- Inline call-chain rendering is enabled by default. Append `noinline` to suppress inline pseudo-frames. The explicit `inline` option remains accepted.
 
 Backtrace depth is configured globally, not in the script. Use `--backtrace-depth <N>` or `[ebpf] backtrace_depth = N` in the config file. Valid range is `1..=128`; the default is `128`.
 In `--script-output pretty`, backtrace payload lines are colorized when `[script] color` enables ANSI output. `--script-output plain` always emits the raw payload text without ANSI color.
@@ -880,8 +880,9 @@ Examples:
 
 ```ghostscope
 trace test_function {
-    bt full;
-    bt raw noinline;
+    bt;
+    bt full noinline;
+    bt raw;
 }
 ```
 
@@ -894,6 +895,16 @@ backtrace: complete, 4 frames (max 128)
   #2 main(int argc, char** argv) at sample_program.c:88:12 [sample_program+0x13a0]
   #3 <unknown function> at ?? [libc.so.6+0x2a1ca]
 ```
+
+For Rust frames, concise and full symbol display differ only in compiler-generated disambiguators:
+
+```text
+bt:       my_crate::worker
+bt full:  my_crate::worker::h05af221e174051e9     # legacy mangling
+bt full:  my_crate[a0b1c2d3]::worker              # v0 mangling
+```
+
+The exact disambiguator is compiler-generated and may change between builds. Use `full` when distinguishing otherwise identical paths from different crate instances matters.
 
 `bt raw;` keeps the same header but prints machine-facing fields for diagnosis:
 

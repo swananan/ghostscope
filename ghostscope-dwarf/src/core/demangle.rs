@@ -2,9 +2,23 @@
 
 use gimli::DwLang;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RustSymbolHashDisplay {
+    Hidden,
+    Shown,
+}
+
 /// Demangle a symbol string using language hint when available.
 /// Returns None if demangling fails or is not applicable.
 pub fn demangle_by_lang(lang: Option<DwLang>, s: &str) -> Option<String> {
+    demangle_by_lang_for_display(lang, s, RustSymbolHashDisplay::Shown)
+}
+
+pub(crate) fn demangle_by_lang_for_display(
+    lang: Option<DwLang>,
+    s: &str,
+    rust_hashes: RustSymbolHashDisplay,
+) -> Option<String> {
     let looks_rust = is_rust_mangled(s) || looks_like_legacy_rust(s);
     let looks_cpp = is_itanium_cpp_mangled(s);
     if !looks_rust && !looks_cpp {
@@ -16,7 +30,7 @@ pub fn demangle_by_lang(lang: Option<DwLang>, s: &str) -> Option<String> {
     // match the linkage symbol's mangling style.
     match lang {
         Some(gimli::DW_LANG_Rust) if looks_rust => {
-            if let Some(d) = demangle_rust(s) {
+            if let Some(d) = demangle_rust(s, rust_hashes) {
                 return Some(d);
             }
         }
@@ -36,7 +50,7 @@ pub fn demangle_by_lang(lang: Option<DwLang>, s: &str) -> Option<String> {
 
     // Fall back heuristically when the hint was missing, mismatched, or failed.
     if looks_rust {
-        if let Some(d) = demangle_rust(s) {
+        if let Some(d) = demangle_rust(s, rust_hashes) {
             return Some(d);
         }
     }
@@ -93,9 +107,12 @@ pub fn is_itanium_cpp_mangled(s: &str) -> bool {
     s.starts_with("_Z")
 }
 
-fn demangle_rust(s: &str) -> Option<String> {
+fn demangle_rust(s: &str, hash_display: RustSymbolHashDisplay) -> Option<String> {
     match rustc_demangle::try_demangle(s) {
-        Ok(sym) => Some(sym.to_string()),
+        Ok(sym) => Some(match hash_display {
+            RustSymbolHashDisplay::Hidden => format!("{sym:#}"),
+            RustSymbolHashDisplay::Shown => sym.to_string(),
+        }),
         Err(_) => None,
     }
 }
@@ -109,7 +126,9 @@ fn demangle_cpp(s: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{demangle_by_lang, is_likely_mangled};
+    use super::{
+        demangle_by_lang, demangle_by_lang_for_display, is_likely_mangled, RustSymbolHashDisplay,
+    };
 
     #[test]
     fn skips_plain_names_even_with_language_hint() {
@@ -158,5 +177,46 @@ mod tests {
             demangle_by_lang(Some(gimli::DW_LANG_C_plus_plus_17), rust_name),
             demangle_by_lang(Some(gimli::DW_LANG_Rust), rust_name)
         );
+    }
+
+    #[test]
+    fn rust_display_can_hide_legacy_hashes_and_v0_disambiguators() {
+        let legacy = "_ZN4test4main17h05af221e174051e9E";
+        let v0 = "_RNvCs73fAdSrgOJL_4test4main";
+
+        assert_eq!(
+            demangle_by_lang_for_display(
+                Some(gimli::DW_LANG_Rust),
+                legacy,
+                RustSymbolHashDisplay::Hidden,
+            )
+            .as_deref(),
+            Some("test::main")
+        );
+        assert_eq!(
+            demangle_by_lang_for_display(
+                Some(gimli::DW_LANG_Rust),
+                legacy,
+                RustSymbolHashDisplay::Shown,
+            )
+            .as_deref(),
+            Some("test::main::h05af221e174051e9")
+        );
+        assert_eq!(
+            demangle_by_lang_for_display(
+                Some(gimli::DW_LANG_Rust),
+                v0,
+                RustSymbolHashDisplay::Hidden,
+            )
+            .as_deref(),
+            Some("test::main")
+        );
+        let full_v0 = demangle_by_lang_for_display(
+            Some(gimli::DW_LANG_Rust),
+            v0,
+            RustSymbolHashDisplay::Shown,
+        )
+        .expect("v0 symbol should demangle");
+        assert!(full_v0.starts_with("test[") && full_v0.ends_with("::main"));
     }
 }

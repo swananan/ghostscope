@@ -874,12 +874,12 @@ trace test_function {
 }
 ```
 
-参数：
+紧凑语法为 `bt [full|raw] [noinline];`。`backtrace` 仍是 `bt` 的别名。
 
-- `bt raw;` 输出原始 module cookie、模块内偏移和运行时 IP，不做源码符号化。
-- `bt full;` 输出符号化的源码感知栈帧。raw IP/cookie 调试元数据不会出现在 `bt full` 中，只由 `bt raw` 显示。
-- `bt inline;` 输出 inline 调用链；这是默认行为。
-- `bt noinline;` 关闭 inline 调用链输出。
+- `bt;` 输出源码感知的符号化栈帧。默认隐藏 Rust 编译器消歧信息，避免 legacy `::h...` 后缀和 v0 crate hash 干扰普通回溯阅读。
+- `bt full;` 在相同的符号化栈帧中保留这些 Rust 消歧信息。`full` 只改变符号展示：不会采集更多栈帧或变量，不会改变 unwind，也不会增加 raw IP/cookie 元数据。
+- `bt raw;` 跳过源码符号化，输出 module cookie、模块内偏移和运行时 IP。`raw` 与 `full` 互斥。
+- 默认输出 inline 调用链；追加 `noinline` 可隐藏 inline 伪栈帧。显式的 `inline` 参数仍然可用。
 
 Backtrace 深度是全局配置，不再写在脚本里。使用命令行 `--backtrace-depth <N>`，或在配置文件 `[ebpf]` 中设置 `backtrace_depth = N`。合法范围是 `1..=128`，默认值是 `128`。
 在 `--script-output pretty` 下，如果 `[script] color` 启用了 ANSI 输出，backtrace payload 会带颜色。`--script-output plain` 始终输出不带 ANSI 的原始 payload 文本。
@@ -888,8 +888,9 @@ Backtrace 深度是全局配置，不再写在脚本里。使用命令行 `--bac
 
 ```ghostscope
 trace test_function {
-    bt full;
-    bt raw noinline;
+    bt;
+    bt full noinline;
+    bt raw;
 }
 ```
 
@@ -902,6 +903,16 @@ backtrace: complete, 4 frames (max 128)
   #2 main(int argc, char** argv) at sample_program.c:88:12 [sample_program+0x13a0]
   #3 <unknown function> at ?? [libc.so.6+0x2a1ca]
 ```
+
+对于 Rust 栈帧，简洁输出与 full 输出的区别仅在编译器生成的消歧信息：
+
+```text
+bt:       my_crate::worker
+bt full:  my_crate::worker::h05af221e174051e9     # legacy mangling
+bt full:  my_crate[a0b1c2d3]::worker              # v0 mangling
+```
+
+具体消歧值由编译器生成，可能随构建发生变化。需要区分来自不同 crate 实例、但源码路径相同的符号时再使用 `full`。
 
 `bt raw;` 使用相同的 header，但会输出面向排障的机器字段：
 
