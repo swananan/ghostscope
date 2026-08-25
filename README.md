@@ -24,7 +24,7 @@
 
 GhostScope is a **source-aware userspace tracer** for live Linux processes. With DWARF debug info, it lets you attach at function, source-line, or instruction granularity, print the values that matter, and emit source-aware call stacks without debugger-controlled suspension of the target.
 
-The supported operating envelope and the invariants behind trustworthy output are defined in [Design Guarantees and Trust Model](docs/design-contract.md).
+C has the strongest end-to-end coverage. For Rust targets, GhostScope provides targeted support for common values and demangles application, standard-library, and inline backtrace frames. See [Source Language Support](docs/scripting.md#source-language-support) and [Limitations](docs/limitations.md#1-language-support) for the exact boundaries.
 
 > *"The most effective debugging tool is still careful thought, coupled with judiciously placed print statements."* — Brian Kernighan
 
@@ -185,9 +185,9 @@ With this map in hand, GhostScope leverages **eBPF and uprobe** technology to sa
       <td align="center" width="25%">
         <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/rust.svg" width="60" alt="Rust"/>
         <br />
-        <strong>Built with Rust</strong>
+        <strong>Rust-Aware Tracing</strong>
         <br />
-        <sub>Memory safe & blazing fast</sub>
+        <sub>Targeted values & demangled frames</sub>
       </td>
     </tr>
   </table>
