@@ -20,7 +20,7 @@
 
 GhostScope 是一个 **面向源码语义的用户态追踪器**。有 DWARF 调试信息时，它可以在不由调试器控制目标暂停的前提下，按函数、源码行或指令粒度设点，打印真正重要的信息，并输出源码感知的调用栈。
 
-支持范围以及可信输出所依赖的不变量，统一定义在[设计保证与可信性模型](docs/zh/design-contract.md)中。
+C 的端到端覆盖最完整。对于 Rust 目标，GhostScope 为常用值提供定向支持，并会对应用、标准库和 inline backtrace 栈帧中的符号进行 demangle。准确的支持边界见[源语言支持现状](docs/zh/scripting.md#源语言支持现状)和[使用限制](docs/zh/limitations.md#1-语言支持)。
 
 > *"The most effective debugging tool is still careful thought, coupled with judiciously placed print statements."* — Brian Kernighan
 
@@ -180,9 +180,9 @@ GhostScope 把编译后的二进制重新变成“可观测系统”。在 TUI �
       <td align="center" width="25%">
         <img src="https://raw.githubusercontent.com/swananan/ghostscope/main/assets/icons/rust.svg" width="60" alt="Rust"/>
         <br />
-        <strong>Rust 构建</strong>
+        <strong>Rust 目标支持</strong>
         <br />
-        <sub>内存安全且极速</sub>
+        <sub>定向值支持与 demangle 栈帧</sub>
       </td>
     </tr>
   </table>
