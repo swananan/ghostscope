@@ -1,6 +1,6 @@
 use super::{DynamicLvalue, DynamicTypeInfo, IndexableElementInfo};
 use crate::ebpf::context::{CodeGenError, EbpfContext, Result, RuntimeAddress};
-use crate::script::Expr;
+use crate::script::{Expr, VarType};
 use ghostscope_dwarf::{TypeInfo as DwarfType, TypeProjectionLayout, VariableAccessSegment};
 use inkwell::values::{BasicValueEnum, IntValue};
 use inkwell::AddressSpace;
@@ -15,6 +15,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .is_some_and(|ty| ghostscope_dwarf::is_aggregate_type(&ty));
         }
 
+        if let Expr::Variable(name) = expr {
+            // Match compile_expr's name-resolution order: aliases first, then concrete
+            // script variables, and only then DWARF variables. Script variables cannot
+            // hold aggregate values.
+            if !self.alias_variable_exists(name) && self.variable_exists(name) {
+                return false;
+            }
+        }
+
         if let Ok(Some(var)) = self.query_dwarf_for_complex_expr(expr) {
             if let Some(ref ty) = var.dwarf_type {
                 return ghostscope_dwarf::is_aggregate_type(ty);
@@ -27,6 +36,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Returns true for:
     /// - Explicit address-of forms (&expr)
     /// - Script string literals (compile to pointer data)
+    /// - Script string variables
     /// - Alias variables bound to addresses
     /// - DWARF-backed expressions whose type is pointer or array
     pub(in crate::ebpf) fn is_pointer_like_expr(&mut self, expr: &Expr) -> bool {
@@ -51,6 +61,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             E::Variable(name) => {
                 if self.alias_variable_exists(name) {
                     return true;
+                }
+                if self.variable_exists(name) {
+                    return matches!(self.get_variable_type(name), Some(VarType::String));
                 }
             }
             _ => {}
