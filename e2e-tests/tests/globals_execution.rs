@@ -485,6 +485,40 @@ trace tick_once {
 }
 
 #[tokio::test]
+async fn test_script_variables_shadow_dwarf_types_in_ordered_comparisons() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let target = spawn_globals_program(&binary_path).await?;
+
+    // These names collide with an aggregate in the executable and a pointer in
+    // libgvars.so. The concrete script variables must win type resolution.
+    let script = r#"
+trace globals_program.c:32 {
+    print "DWARF_COLLISION:{}:{}", G_STATE.counter, LIB_AMBIGUOUS_DYNAMIC[0].want;
+    let G_STATE = 100;
+    let LIB_AMBIGUOUS_DYNAMIC = 200;
+    print "SCRIPT_SHADOW:{}:{}", G_STATE < 101, LIB_AMBIGUOUS_DYNAMIC < 201;
+}
+"#;
+
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        Regex::new(r"DWARF_COLLISION:-?\d+:-?\d+")?.is_match(&stdout),
+        "Expected the colliding DWARF symbols to resolve before shadowing. STDOUT: {stdout}"
+    );
+    assert!(
+        stdout.contains("SCRIPT_SHADOW:true:true"),
+        "Expected script variables to shadow DWARF symbol types. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_unknown_member_on_global_reports_members() -> anyhow::Result<()> {
     // Friendly error when accessing a non-existent member of a global struct
     init();

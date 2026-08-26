@@ -1428,13 +1428,21 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let expanded = self.expand_dwarf_aliases(expr)?;
         match &expanded {
-            Expr::Variable(var_name) => self.query_dwarf_for_variable_plan(var_name),
+            Expr::Variable(var_name) => {
+                if self.variable_exists(var_name) {
+                    return Ok(None);
+                }
+                self.query_dwarf_for_variable_plan(var_name)
+            }
             Expr::MemberAccess(_, _)
             | Expr::TupleAccess(_, _)
             | Expr::ArrayAccess(_, _)
             | Expr::ChainAccess(_)
             | Expr::PointerDeref(_) => {
                 if let Some((base, access_path)) = Self::access_path_from_expr(&expanded)? {
+                    if self.variable_exists(&base) {
+                        return Ok(None);
+                    }
                     self.query_dwarf_for_pc_access_plan(&base, &access_path)
                 } else {
                     Ok(None)
@@ -1527,6 +1535,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     /// Query DWARF for variable information
     pub fn query_dwarf_for_variable(&mut self, var_name: &str) -> Result<Option<VariableReadPlan>> {
+        // Script names occupy the namespace before DWARF names. Alias-aware callers
+        // should use query_dwarf_for_complex_expr so the alias target is expanded.
+        if self.alias_variable_exists(var_name) || self.variable_exists(var_name) {
+            return Ok(None);
+        }
+
         let context = self.get_compile_time_context()?;
         let pc_address = context.pc_address;
 
@@ -1905,6 +1919,32 @@ mod tests {
             EbpfContext::<'static, 'static>::access_path_to_string(&base, &path),
             "request.current.*.state"
         );
+    }
+
+    #[test]
+    fn dwarf_queries_skip_concrete_script_variables() {
+        let llctx = LlvmContext::create();
+        let opts = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&llctx, "script_var_priority", Some(0), &opts).expect("ctx");
+        ctx.create_basic_ebpf_function("f").expect("fn");
+        ctx.store_variable("value", llctx.i64_type().const_int(7, false).into())
+            .expect("store script variable");
+
+        let variable = Expr::Variable("value".to_string());
+        assert!(ctx
+            .query_dwarf_for_complex_expr_plan(&variable)
+            .expect("script variable query")
+            .is_none());
+        assert!(ctx
+            .query_dwarf_for_variable("value")
+            .expect("direct script variable query")
+            .is_none());
+
+        let member = Expr::MemberAccess(Box::new(variable), "field".to_string());
+        assert!(ctx
+            .query_dwarf_for_complex_expr_plan(&member)
+            .expect("script-rooted member query")
+            .is_none());
     }
 
     #[test]
