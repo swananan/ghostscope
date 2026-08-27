@@ -174,8 +174,11 @@ trace complex_types_program.c:15 {
 }
 "#;
 
+    // FLAGS cycles through every signed three-bit value in eight target ticks.
+    // Allow a full cycle after asynchronous attachment so each comparison has
+    // a chance to observe its matching value.
     let (exit_code, stdout, stderr) =
-        run_ghostscope_with_script_for_target(script, 4, &target).await?;
+        run_ghostscope_with_script_for_target(script, 8, &target).await?;
     target.terminate().await?;
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
 
