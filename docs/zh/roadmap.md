@@ -20,9 +20,9 @@ GhostScope 仍处在快速演进阶段，以下里程碑按照“优先修补基
 - 详见[容器支持与限制](container.md)和[限制列表](limitations.md#10-容器-wsl-场景下--pid-pid-模式的软限制)。
 
 ## Uprobe 增强
-- 支持 sleepable uprobe（`uprobe.s` / `uretprobe.s`），在合适场景下使用可睡眠 helper，尤其提升用户态内存读取的可靠性。
+- sleepable 入口 uprobe（`uprobe.s`）已通过 `[ebpf].sleepable_uprobe` 配置项提供；普通 `uprobe` 仍是默认的兼容路径。
 - 支持 multi-attach uprobe（`uprobe.multi` / `uretprobe.multi`），让脚本展开出大量探针点时仍能保持更好的扩展性。
-- 对暂时只能走普通 `uprobe` 的内核或 libbpf/Aya 路径保留兼容性回退。
+- 继续改进只支持普通 `uprobe` 的内核或 Aya 路径的兼容性诊断。
 
 ## 栈回溯（Stack Unwinding）
 - 已支持 DWARF-only `bt` / `backtrace`，用于可安全降到 eBPF 执行的

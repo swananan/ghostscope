@@ -20,9 +20,9 @@ GhostScope is still evolving quickly. The milestones below are ordered from “s
 - See [Container support and limits](container.md) and [Limitations](limitations.md#10-container--wsl-limitations-for--p-pid-mode).
 
 ## Uprobe enhancements
-- Add support for sleepable uprobes (`uprobe.s` / `uretprobe.s`) so GhostScope can use sleepable helpers where appropriate, especially for more reliable user-memory reads.
+- Sleepable entry uprobes (`uprobe.s`) are available as an opt-in `[ebpf].sleepable_uprobe` setting. Regular `uprobe` remains the default compatibility path.
 - Add support for multi-attach uprobes (`uprobe.multi` / `uretprobe.multi`) to scale better when a script expands into many probe points.
-- Keep compatibility fallbacks for kernels or libbpf/Aya paths that still require regular `uprobe` attachments.
+- Continue improving compatibility diagnostics for kernels or Aya paths that only support regular `uprobe` attachments.
 
 ## Stack Unwinding
 - DWARF-only `bt` / `backtrace` is now supported for compact CFI rows that can

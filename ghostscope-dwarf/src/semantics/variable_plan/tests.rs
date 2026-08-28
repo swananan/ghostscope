@@ -6,6 +6,7 @@ fn capabilities(regular_uprobe: bool) -> RuntimeCapabilities {
     RuntimeCapabilities {
         regular_uprobe,
         sleepable_uprobe: false,
+        sleepable_tail_calls: false,
         uprobe_multi: false,
         copy_from_user_task: false,
         max_bpf_stack_bytes: 512,

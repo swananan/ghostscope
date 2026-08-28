@@ -2,8 +2,13 @@ use aya::{
     maps::MapType,
     programs::ProgramType,
     sys::{is_helper_supported, is_map_supported, BpfHelper},
+    util::KernelVersion,
 };
-use std::{fmt, sync::OnceLock};
+use aya_obj::generated::{
+    bpf_attr, bpf_cmd, bpf_insn, bpf_map_type, bpf_prog_type, BPF_ALU64, BPF_CALL, BPF_DW,
+    BPF_EXIT, BPF_F_SLEEPABLE, BPF_IMM, BPF_JMP, BPF_K, BPF_LD, BPF_MOV, BPF_PSEUDO_MAP_FD,
+};
+use std::{fmt, io, mem, sync::OnceLock};
 use tracing::{error, info, warn};
 
 /// Global cache for complete, hardware-backed kernel capability probes.
@@ -73,6 +78,13 @@ pub struct KernelCapabilities {
     pub supports_perf_event_array: bool,
     /// Whether bpf_get_ns_current_pid_tgid helper is supported for kprobe/uprobe class programs.
     pub supports_ns_current_pid_tgid_helper: bool,
+    /// Whether the kernel supports the helpers required by GhostScope's sleepable
+    /// uprobe mode (`bpf_get_current_task_btf` and `bpf_copy_from_user_task`,
+    /// introduced in Linux 5.18).
+    pub supports_sleepable_uprobe: bool,
+    /// Whether sleepable KProbe-class programs can use a ProgramArray and
+    /// `bpf_tail_call`. This is required for long DWARF backtraces.
+    pub supports_sleepable_tail_calls: bool,
 }
 
 impl KernelCapabilities {
@@ -142,10 +154,12 @@ where
     };
 
     info!(
-        "Kernel eBPF startup summary: ringbuf_supported={} perf_event_array_supported={} helper_ns_current_pid_tgid={}",
+        "Kernel eBPF startup summary: ringbuf_supported={} perf_event_array_supported={} helper_ns_current_pid_tgid={} sleepable_uprobe={} sleepable_tail_calls={}",
         capabilities.supports_ringbuf,
         capabilities.supports_perf_event_array,
-        capabilities.supports_ns_current_pid_tgid_helper
+        capabilities.supports_ns_current_pid_tgid_helper,
+        capabilities.supports_sleepable_uprobe,
+        capabilities.supports_sleepable_tail_calls,
     );
 
     Ok(capabilities)
@@ -218,15 +232,39 @@ fn detect_full_capabilities() -> Result<KernelCapabilityDetection, KernelCapabil
         warn!("⚠️  Kernel does not support helper bpf_get_ns_current_pid_tgid (id=120)");
     }
 
+    let supports_sleepable_uprobe = detect_sleepable_uprobe_support();
+    if supports_sleepable_uprobe.supported {
+        info!(
+            "✓ Kernel supports GhostScope sleepable uprobe mode (bpf_get_current_task_btf and bpf_copy_from_user_task)"
+        );
+    } else {
+        warn!(
+            "⚠️  Kernel does not support GhostScope sleepable uprobe mode (requires Linux 5.18+)"
+        );
+    }
+
+    let supports_sleepable_tail_calls = if supports_sleepable_uprobe.supported {
+        detect_sleepable_tail_call_support()
+    } else {
+        CapabilityProbe::cacheable(false)
+    };
+    if supports_sleepable_tail_calls.supported {
+        info!("✓ Kernel supports sleepable uprobe tail calls");
+    }
+
     Ok(KernelCapabilityDetection {
         capabilities: KernelCapabilities {
             supports_ringbuf: supports_ringbuf.supported,
             supports_perf_event_array: supports_perf_event_array.supported,
             supports_ns_current_pid_tgid_helper: supports_ns_current_pid_tgid_helper.supported,
+            supports_sleepable_uprobe: supports_sleepable_uprobe.supported,
+            supports_sleepable_tail_calls: supports_sleepable_tail_calls.supported,
         },
         cacheable: supports_ringbuf.cacheable
             && supports_perf_event_array.cacheable
-            && supports_ns_current_pid_tgid_helper.cacheable,
+            && supports_ns_current_pid_tgid_helper.cacheable
+            && supports_sleepable_uprobe.cacheable
+            && supports_sleepable_tail_calls.cacheable,
     })
 }
 
@@ -260,10 +298,32 @@ fn detect_perf_only_capabilities() -> Result<KernelCapabilities, KernelCapabilit
         warn!("⚠️  Kernel does not support helper bpf_get_ns_current_pid_tgid (id=120)");
     }
 
+    let supports_sleepable_uprobe = detect_sleepable_uprobe_support();
+    if supports_sleepable_uprobe.supported {
+        info!(
+            "✓ Kernel supports GhostScope sleepable uprobe mode (bpf_get_current_task_btf and bpf_copy_from_user_task)"
+        );
+    } else {
+        warn!(
+            "⚠️  Kernel does not support GhostScope sleepable uprobe mode (requires Linux 5.18+)"
+        );
+    }
+
+    let supports_sleepable_tail_calls = if supports_sleepable_uprobe.supported {
+        detect_sleepable_tail_call_support()
+    } else {
+        CapabilityProbe::cacheable(false)
+    };
+    if supports_sleepable_tail_calls.supported {
+        info!("✓ Kernel supports sleepable uprobe tail calls");
+    }
+
     Ok(KernelCapabilities {
         supports_ringbuf: false,
         supports_perf_event_array: supports_perf_event_array.supported,
         supports_ns_current_pid_tgid_helper: supports_ns_current_pid_tgid_helper.supported,
+        supports_sleepable_uprobe: supports_sleepable_uprobe.supported,
+        supports_sleepable_tail_calls: supports_sleepable_tail_calls.supported,
     })
 }
 
@@ -334,6 +394,322 @@ fn detect_ns_current_pid_tgid_helper_support() -> CapabilityProbe {
     }
 }
 
+fn detect_sleepable_uprobe_support() -> CapabilityProbe {
+    info!(
+        "Probing helpers required for sleepable uprobes; bpf_copy_from_user_task is probed with BPF_F_SLEEPABLE..."
+    );
+
+    let task_btf = is_helper_supported(
+        ProgramType::KProbe,
+        BpfHelper::BPF_FUNC_get_current_task_btf,
+    );
+    let copy_from_user_task =
+        probe_sleepable_kprobe_helper_support(BpfHelper::BPF_FUNC_copy_from_user_task);
+
+    match (task_btf, copy_from_user_task) {
+        (Ok(true), Ok(true)) => CapabilityProbe::cacheable(true),
+        (Ok(false), _) => {
+            info!("bpf_get_current_task_btf helper support probe reported unsupported");
+            CapabilityProbe::cacheable(false)
+        }
+        (_, Ok(false)) => {
+            info!("bpf_copy_from_user_task helper support probe reported unsupported");
+            CapabilityProbe::cacheable(false)
+        }
+        (Err(task_err), _) => {
+            warn!("bpf_get_current_task_btf helper support probe failed unexpectedly: {task_err}");
+            CapabilityProbe::uncacheable_unsupported()
+        }
+        (_, Err(copy_err)) => {
+            warn!("bpf_copy_from_user_task helper support probe failed unexpectedly: {copy_err}");
+            CapabilityProbe::uncacheable_unsupported()
+        }
+    }
+}
+
+fn detect_sleepable_tail_call_support() -> CapabilityProbe {
+    info!(
+        "Probing sleepable tail-call support with a sleepable KProbe caller, callee, and ProgramArray..."
+    );
+
+    match probe_sleepable_tail_call_support() {
+        Ok(true) => CapabilityProbe::cacheable(true),
+        Ok(false) => {
+            info!("sleepable tail-call capability probe reported unsupported");
+            CapabilityProbe::cacheable(false)
+        }
+        Err(err) => {
+            warn!("sleepable tail-call capability probe failed unexpectedly: {err}");
+            CapabilityProbe::uncacheable_unsupported()
+        }
+    }
+}
+
+/// Probe one KProbe-class helper under the same sleepable program flag that
+/// Aya uses for an `uprobe.s` section.
+///
+/// `bpf_copy_from_user_task` is reported as an invalid helper by a regular
+/// KProbe on kernels where it is intentionally restricted to sleepable
+/// programs. The public Aya helper probe cannot set BPF program load flags.
+// TODO(aya): Replace these raw probes after Aya exposes semantic sleepable
+// uprobe capability probes, including support for sleepable tail calls.
+fn probe_sleepable_kprobe_helper_support(helper: BpfHelper) -> Result<bool, io::Error> {
+    let call = sleepable_helper_probe_instruction((BPF_JMP | BPF_CALL) as u8, helper as i32);
+    let exit = sleepable_helper_probe_instruction((BPF_JMP | BPF_EXIT) as u8, 0);
+    let instructions = [call, exit];
+    match load_sleepable_kprobe_program(&instructions) {
+        Ok(fd) => {
+            close_bpf_fd(fd);
+            Ok(true)
+        }
+        Err(failure) => match classify_sleepable_helper_probe_failure(
+            failure.error.raw_os_error(),
+            failure.verifier_log.as_ref(),
+        ) {
+            Some(supported) => Ok(supported),
+            None => Err(failure.error),
+        },
+    }
+}
+
+/// Probe the complete kernel feature sequence used by a long sleepable `bt`:
+/// load a sleepable callee, load a sleepable caller referencing a ProgramArray
+/// and `bpf_tail_call`, then put the callee in that array.
+fn probe_sleepable_tail_call_support() -> Result<bool, io::Error> {
+    let map_fd = match create_program_array() {
+        Ok(fd) => fd,
+        Err(error) => return classify_sleepable_tail_call_syscall_failure(error),
+    };
+
+    let outcome = (|| {
+        let callee = [
+            bpf_instruction((BPF_ALU64 | BPF_MOV | BPF_K) as u8, 0, 0, 0),
+            bpf_instruction((BPF_JMP | BPF_EXIT) as u8, 0, 0, 0),
+        ];
+        let callee_fd = match load_sleepable_kprobe_program(&callee) {
+            Ok(fd) => fd,
+            Err(failure) => return classify_sleepable_tail_call_load_failure(failure),
+        };
+
+        let outcome = (|| {
+            let caller = sleepable_tail_call_probe_caller(map_fd);
+            let caller_fd = match load_sleepable_kprobe_program(&caller) {
+                Ok(fd) => fd,
+                Err(failure) => return classify_sleepable_tail_call_load_failure(failure),
+            };
+            close_bpf_fd(caller_fd);
+
+            match update_program_array(map_fd, callee_fd) {
+                Ok(()) => Ok(true),
+                Err(error) => classify_sleepable_tail_call_syscall_failure(error),
+            }
+        })();
+
+        close_bpf_fd(callee_fd);
+        outcome
+    })();
+
+    close_bpf_fd(map_fd);
+    outcome
+}
+
+fn create_program_array() -> Result<libc::c_int, io::Error> {
+    // SAFETY: bpf_attr is a C ABI union and zero initialization is valid for
+    // the fields not used by a BPF_MAP_CREATE request.
+    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
+    // SAFETY: __bindgen_anon_1 is the BPF_MAP_CREATE member of bpf_attr.
+    let create = unsafe { &mut attr.__bindgen_anon_1 };
+    create.map_type = bpf_map_type::BPF_MAP_TYPE_PROG_ARRAY as u32;
+    create.key_size = std::mem::size_of::<u32>() as u32;
+    create.value_size = std::mem::size_of::<u32>() as u32;
+    create.max_entries = 1;
+    bpf_syscall(bpf_cmd::BPF_MAP_CREATE, &mut attr)
+}
+
+fn update_program_array(map_fd: libc::c_int, program_fd: libc::c_int) -> Result<(), io::Error> {
+    let key = 0u32;
+    let value = program_fd as u32;
+    // SAFETY: bpf_attr is a C ABI union and zero initialization is valid for
+    // the fields not used by a BPF_MAP_UPDATE_ELEM request.
+    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
+    // SAFETY: __bindgen_anon_2 is the BPF_MAP_UPDATE_ELEM member of bpf_attr.
+    let update = unsafe { &mut attr.__bindgen_anon_2 };
+    update.map_fd = map_fd as u32;
+    update.key = std::ptr::addr_of!(key) as u64;
+    update.__bindgen_anon_1.value = std::ptr::addr_of!(value) as u64;
+
+    bpf_syscall(bpf_cmd::BPF_MAP_UPDATE_ELEM, &mut attr).map(|_| ())
+}
+
+fn sleepable_tail_call_probe_caller(map_fd: libc::c_int) -> [bpf_insn; 6] {
+    [
+        bpf_instruction(
+            (BPF_LD | BPF_DW | BPF_IMM) as u8,
+            2,
+            BPF_PSEUDO_MAP_FD as u8,
+            map_fd,
+        ),
+        bpf_instruction(0, 0, 0, 0),
+        bpf_instruction((BPF_ALU64 | BPF_MOV | BPF_K) as u8, 3, 0, 0),
+        bpf_instruction(
+            (BPF_JMP | BPF_CALL) as u8,
+            0,
+            0,
+            BpfHelper::BPF_FUNC_tail_call as i32,
+        ),
+        bpf_instruction((BPF_ALU64 | BPF_MOV | BPF_K) as u8, 0, 0, 0),
+        bpf_instruction((BPF_JMP | BPF_EXIT) as u8, 0, 0, 0),
+    ]
+}
+
+struct SleepableProgramLoadFailure {
+    error: io::Error,
+    verifier_log: Box<[u8; 4096]>,
+}
+
+fn load_sleepable_kprobe_program(
+    instructions: &[bpf_insn],
+) -> Result<libc::c_int, SleepableProgramLoadFailure> {
+    let mut verifier_log = [0u8; 4096];
+
+    // SAFETY: bpf_attr and bpf_insn are C ABI structs. Zero initialization is
+    // valid for the fields left unset in a BPF_PROG_LOAD request.
+    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
+    // SAFETY: __bindgen_anon_3 is the BPF_PROG_LOAD member of bpf_attr.
+    let load = unsafe { &mut attr.__bindgen_anon_3 };
+    load.prog_type = bpf_prog_type::BPF_PROG_TYPE_KPROBE as u32;
+    load.insn_cnt = instructions.len() as u32;
+    load.insns = instructions.as_ptr() as u64;
+    load.license = c"GPL".as_ptr() as u64;
+    load.log_level = 1;
+    load.log_size = verifier_log.len() as u32;
+    load.log_buf = verifier_log.as_mut_ptr() as u64;
+    load.kern_version = KernelVersion::current().map_or(0, KernelVersion::code);
+    load.prog_flags = BPF_F_SLEEPABLE;
+
+    bpf_syscall(bpf_cmd::BPF_PROG_LOAD, &mut attr).map_err(|error| SleepableProgramLoadFailure {
+        error,
+        verifier_log: Box::new(verifier_log),
+    })
+}
+
+fn bpf_syscall(command: bpf_cmd, attr: &mut bpf_attr) -> Result<libc::c_int, io::Error> {
+    // SAFETY: the command-specific bpf_attr member was initialized by the
+    // caller and the supplied size is the full ABI union size expected by the
+    // BPF syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            command as libc::c_long,
+            attr as *mut bpf_attr,
+            mem::size_of::<bpf_attr>(),
+        )
+    };
+    if result >= 0 {
+        Ok(result as libc::c_int)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn close_bpf_fd(fd: libc::c_int) {
+    // SAFETY: successful BPF syscalls return an owned file descriptor.
+    unsafe { libc::close(fd) };
+}
+
+fn bpf_instruction(code: u8, dst: u8, src: u8, imm: i32) -> bpf_insn {
+    let mut instruction = sleepable_helper_probe_instruction(code, imm);
+    instruction.set_dst_reg(dst);
+    instruction.set_src_reg(src);
+    instruction
+}
+
+fn classify_sleepable_tail_call_syscall_failure(error: io::Error) -> Result<bool, io::Error> {
+    if is_sleepable_tail_call_unsupported_errno(error.raw_os_error()) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+fn classify_sleepable_tail_call_load_failure(
+    failure: SleepableProgramLoadFailure,
+) -> Result<bool, io::Error> {
+    if is_sleepable_tail_call_unsupported_errno(failure.error.raw_os_error())
+        || verifier_log_mentions_sleepable_tail_call_rejection(failure.verifier_log.as_ref())
+    {
+        Ok(false)
+    } else {
+        Err(failure.error)
+    }
+}
+
+fn is_sleepable_tail_call_unsupported_errno(error_code: Option<i32>) -> bool {
+    matches!(error_code, Some(code) if code == libc::EINVAL || code == libc::EOPNOTSUPP)
+}
+
+fn verifier_log_mentions_sleepable_tail_call_rejection(verifier_log: &[u8]) -> bool {
+    let verifier_log = verifier_log
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or(verifier_log);
+    [
+        b"sleepable".as_slice(),
+        b"tail call",
+        b"prog_array",
+        b"program array",
+    ]
+    .iter()
+    .any(|diagnostic| {
+        verifier_log
+            .windows(diagnostic.len())
+            .any(|window| window.eq_ignore_ascii_case(diagnostic))
+    })
+}
+
+fn sleepable_helper_probe_instruction(code: u8, imm: i32) -> bpf_insn {
+    // SAFETY: bpf_insn is a C ABI instruction structure; its zero value is a
+    // valid baseline before the opcode and immediate are assigned.
+    let mut instruction = unsafe { mem::zeroed::<bpf_insn>() };
+    instruction.code = code;
+    instruction.imm = imm;
+    instruction
+}
+
+fn classify_sleepable_helper_probe_failure(
+    error_code: Option<i32>,
+    verifier_log: &[u8],
+) -> Option<bool> {
+    const UNSUPPORTED_HELPER_DIAGNOSTICS: &[&[u8]] = &[
+        b"invalid func ",
+        b"unknown func ",
+        b"program of this type cannot use helper ",
+    ];
+
+    let verifier_log = verifier_log
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or(verifier_log);
+    if verifier_log.is_empty() {
+        return match error_code {
+            Some(libc::EINVAL | libc::E2BIG) => Some(false),
+            _ => None,
+        };
+    }
+
+    if UNSUPPORTED_HELPER_DIAGNOSTICS.iter().any(|diagnostic| {
+        verifier_log
+            .windows(diagnostic.len())
+            .any(|window| window == *diagnostic)
+    }) {
+        Some(false)
+    } else {
+        // The helper was recognized. Invalid arguments are expected because
+        // this deliberately minimal probe supplies no helper arguments.
+        Some(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,11 +718,15 @@ mod tests {
         supports_ringbuf: bool,
         supports_perf_event_array: bool,
         supports_ns_current_pid_tgid_helper: bool,
+        supports_sleepable_uprobe: bool,
+        supports_sleepable_tail_calls: bool,
     ) -> KernelCapabilities {
         KernelCapabilities {
             supports_ringbuf,
             supports_perf_event_array,
             supports_ns_current_pid_tgid_helper,
+            supports_sleepable_uprobe,
+            supports_sleepable_tail_calls,
         }
     }
 
@@ -360,8 +740,8 @@ mod tests {
     #[test]
     fn forced_perf_startup_does_not_populate_full_capabilities_cache() {
         let cache = KernelCapabilityCache::new();
-        let perf_only_caps = caps(false, true, true);
-        let full_caps = caps(true, true, true);
+        let perf_only_caps = caps(false, true, true, true, true);
+        let full_caps = caps(true, true, true, true, true);
 
         let forced = detect_for_startup_with_detectors(
             true,
@@ -397,8 +777,8 @@ mod tests {
     #[test]
     fn uncacheable_full_probe_result_is_not_cached() {
         let cache = KernelCapabilityCache::new();
-        let uncacheable_caps = caps(false, true, false);
-        let cacheable_caps = caps(true, true, true);
+        let uncacheable_caps = caps(false, true, false, false, false);
+        let cacheable_caps = caps(true, true, true, true, true);
 
         let first = cache
             .get_or_detect(|| Ok(detection(uncacheable_caps, false)))
@@ -418,5 +798,47 @@ mod tests {
                 .expect("cached full capabilities"),
             cacheable_caps
         );
+    }
+
+    #[test]
+    fn sleepable_helper_probe_classifies_verifier_results() {
+        assert_eq!(
+            classify_sleepable_helper_probe_failure(Some(libc::EPERM), b"invalid func 191\0"),
+            Some(false)
+        );
+        assert_eq!(
+            classify_sleepable_helper_probe_failure(
+                Some(libc::EPERM),
+                b"R4 type=scalar expected=ptr_\0"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            classify_sleepable_helper_probe_failure(Some(libc::EINVAL), b"\0"),
+            Some(false)
+        );
+        assert_eq!(
+            classify_sleepable_helper_probe_failure(Some(libc::EPERM), b"\0"),
+            None
+        );
+    }
+
+    #[test]
+    fn sleepable_tail_call_probe_classifies_kernel_rejections() {
+        assert!(is_sleepable_tail_call_unsupported_errno(Some(libc::EINVAL)));
+        assert!(is_sleepable_tail_call_unsupported_errno(Some(
+            libc::EOPNOTSUPP
+        )));
+        assert!(!is_sleepable_tail_call_unsupported_errno(Some(libc::EPERM)));
+
+        assert!(verifier_log_mentions_sleepable_tail_call_rejection(
+            b"sleepable programs cannot use prog_array\0"
+        ));
+        assert!(verifier_log_mentions_sleepable_tail_call_rejection(
+            b"Tail call is not allowed here\0"
+        ));
+        assert!(!verifier_log_mentions_sleepable_tail_call_rejection(
+            b"R1 type=scalar expected=ctx\0"
+        ));
     }
 }

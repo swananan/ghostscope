@@ -732,6 +732,8 @@ mod tests {
                 supports_ringbuf: true,
                 supports_perf_event_array: true,
                 supports_ns_current_pid_tgid_helper: false,
+                supports_sleepable_uprobe: false,
+                supports_sleepable_tail_calls: false,
             },
         }
     }

@@ -101,6 +101,8 @@ impl DebugInfoSource {
 pub struct RuntimeCapabilities {
     pub regular_uprobe: bool,
     pub sleepable_uprobe: bool,
+    /// Whether a sleepable uprobe may use `bpf_tail_call` with a ProgramArray.
+    pub sleepable_tail_calls: bool,
     pub uprobe_multi: bool,
     pub copy_from_user_task: bool,
     pub max_bpf_stack_bytes: usize,
@@ -132,6 +134,7 @@ impl Default for RuntimeCapabilities {
         Self {
             regular_uprobe: true,
             sleepable_uprobe: false,
+            sleepable_tail_calls: false,
             uprobe_multi: false,
             copy_from_user_task: false,
             max_bpf_stack_bytes: 512,

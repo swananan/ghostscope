@@ -184,6 +184,10 @@ ghostscope --source-panel       # 显示源码面板
 # 警告：仅用于测试目的。即使在内核 >= 5.8 上也强制使用 PerfEventArray
 ghostscope --force-perf-event-array
 
+# 为本次运行显式启用 sleepable uprobe；会覆盖配置文件中的
+# sleepable_uprobe=false。
+ghostscope --sleepable-uprobe
+
 # 独立 -t 默认启动 target-mode sysmon。-t 与 -p 同时使用时，
 # GhostScope 会改用 -p 的 watched-PID 模块刷新路径。
 # 警告：该选项会全局附加生命周期 tracepoint（exec/fork/exit），也可能
@@ -193,6 +197,40 @@ ghostscope --force-perf-event-array
 # 重新开启。
 ghostscope --enable-sysmon-for-target
 ```
+
+### Sleepable Uprobe
+
+sleepable uprobe 是 `[ebpf]` 下显式开启的配置项：它要求 Linux 5.18+，并且
+探针命中时允许为用户态内存处理缺页，因此可能增加目标线程的探针延迟。默认仍是
+普通、不可睡眠的 `uprobe` 路径。
+
+```toml
+[ebpf]
+sleepable_uprobe = true
+```
+
+如只需单次开启，可使用 `--sleepable-uprobe`；即使配置文件中设置了
+`sleepable_uprobe = false`，该参数也会启用它。若要继续使用普通 uprobe，请不传
+该参数，并保留默认配置 `false`。
+
+sleepable uprobe 必须使用 RingBuf 输出。不要将 `sleepable_uprobe = true`（或
+`--sleepable-uprobe`）与 `force_perf_event_array = true`（或
+`--force-perf-event-array`）同时使用：内核不允许 sleepable BPF 程序使用
+`BPF_MAP_TYPE_PERF_EVENT_ARRAY`，GhostScope 会在 attach 前明确报告该配置冲突。
+
+开启后，GhostScope 会生成 `uprobe.s` 程序。固定长度的用户态内存读取会使用
+`bpf_copy_from_user_task()`，使相关页面能够被 fault-in；需要 NUL 终止和返回实际
+长度语义的字符串读取仍使用 `bpf_probe_read_user_str()`。如果内核不支持
+sleepable uprobe 模式所需的 helper，启动会给出明确错误，而不会静默回退到普通
+uprobe。
+
+较深的 DWARF `bt` 通常使用 tail-call step program。GhostScope 会在启动时探测
+sleepable tail-call 路径；如果内核不允许 sleepable 程序使用
+`BPF_MAP_TYPE_PROG_ARRAY`，则会将该回溯编译为最多五帧的 inline 路径并打印警告。
+这样 sleepable trace 仍可工作，而不会在 eBPF verifier 阶段失败。
+
+只有在 fault-capable 读取的收益值得额外延迟和内核要求时才应开启；将
+`sleepable_uprobe = false`（默认值）即可恢复普通 uprobe。
 
 ### BPFFS 维护
 
@@ -275,6 +313,7 @@ GhostScope 会使用该原生索引选择 CU，并按需调用 fast parser。否
 | `--source-panel` | | 显示源码面板 | 开 |
 | `--config <PATH>` | | 自定义配置文件 | 自动检测 |
 | `--force-perf-event-array` | | 强制 PerfEventArray（测试） | 关 |
+| `--sleepable-uprobe` | | 为本次运行启用 sleepable uprobe；覆盖配置中的 `false` | 关 |
 | `--enable-sysmon-for-target` | | 当配置关闭 sysmon 时，重新为独立 `-t` 开启 target-mode sysmon。独立 `-t` 默认开启；`-t -p` 改用 `-p` 的 watched-PID 模块刷新路径。 | 关 |
 | `[BINARY] [ARGS...]` | | 启动目标程序并传递位置参数 | 无 |
 | `--args <PROGRAM> [ARGS...]` | | 分隔 GhostScope 选项和目标程序参数 | 无 |
@@ -532,6 +571,12 @@ backtrace_unwind_rows_max_entries = 65536
 # 即使在支持 RingBuf 的内核上（>= 5.8）。PerfEventArray 相比 RingBuf
 # 有性能开销，仅应用于兼容性测试。
 force_perf_event_array = false  # 默认（根据内核版本自动检测）
+
+# 显式开启 sleepable uprobe；要求 Linux 5.18+。
+# 固定长度用户态内存读取使用 bpf_copy_from_user_task()。
+# 需要 NUL 终止语义的字符串读取仍使用 bpf_probe_read_user_str()。
+# 较深的 DWARF bt 在内核允许时使用 tail call；否则限制为五帧 inline 回溯并打印警告。
+sleepable_uprobe = false  # 默认关闭
 
 # 为独立 -t 目标启动 sysmon eBPF，
 # 用于维护后续启动进程里的 ASLR 偏移，以及后续映射目标模块或其他

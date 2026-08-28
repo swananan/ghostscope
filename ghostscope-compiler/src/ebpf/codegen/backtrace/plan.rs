@@ -100,6 +100,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     fn required_backtrace_tail_call_slots(&self, statements: &[Statement]) -> u8 {
+        if !self.backtrace_tail_calls_supported() {
+            return 1;
+        }
         let depth = self
             .compile_options
             .backtrace_depth
@@ -195,21 +198,32 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     pub(super) fn plan_backtrace_instruction(
-        &self,
+        &mut self,
         stmt: &BacktraceStatement,
     ) -> BacktraceInstructionPlan {
-        let depth = self
+        let requested_depth = self
             .compile_options
             .backtrace_depth
             .clamp(1, crate::MAX_BACKTRACE_DEPTH);
+        let tail_call_required = self.backtrace_tail_call_required(requested_depth);
+        let depth = if tail_call_required && !self.backtrace_tail_calls_supported() {
+            if !self.warned_sleepable_tail_call_fallback {
+                tracing::warn!(
+                    requested_depth,
+                    inline_depth = BPF_INLINE_BACKTRACE_FRAME_LIMIT,
+                    "Sleepable uprobe tail calls are unavailable; limiting bt depth to the inline limit"
+                );
+                self.warned_sleepable_tail_call_fallback = true;
+            }
+            BPF_INLINE_BACKTRACE_FRAME_LIMIT
+        } else {
+            requested_depth
+        };
         let flags = backtrace_flags(stmt);
         let payload_size =
             BACKTRACE_DATA_SIZE + depth as usize * std::mem::size_of::<BacktraceFrameData>();
         let instruction_size = INSTRUCTION_HEADER_SIZE + payload_size;
-        let mode = if depth > BPF_INLINE_BACKTRACE_FRAME_LIMIT
-            && !self.backtrace_unwind_rows.is_empty()
-            && self.current_compile_time_context.is_some()
-        {
+        let mode = if self.backtrace_tail_call_required(depth) {
             BacktraceEmitMode::TailCall
         } else {
             BacktraceEmitMode::Inline
@@ -222,6 +236,33 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             payload_size,
             instruction_size,
         }
+    }
+
+    pub(crate) fn should_generate_backtrace_tail_call_maps(
+        &self,
+        statements: &[Statement],
+    ) -> bool {
+        statements_have_backtrace(statements)
+            && self.backtrace_tail_calls_supported()
+            && self.backtrace_tail_call_required(
+                self.compile_options
+                    .backtrace_depth
+                    .clamp(1, crate::MAX_BACKTRACE_DEPTH),
+            )
+    }
+
+    fn backtrace_tail_call_required(&self, depth: u8) -> bool {
+        depth > BPF_INLINE_BACKTRACE_FRAME_LIMIT
+            && !self.backtrace_unwind_rows.is_empty()
+            && self.current_compile_time_context.is_some()
+    }
+
+    fn backtrace_tail_calls_supported(&self) -> bool {
+        !self.compile_options.runtime_capabilities.sleepable_uprobe
+            || self
+                .compile_options
+                .runtime_capabilities
+                .sleepable_tail_calls
     }
 }
 
@@ -327,5 +368,52 @@ mod tests {
             plan.instruction_size,
             INSTRUCTION_HEADER_SIZE + plan.payload_size
         );
+    }
+
+    #[test]
+    fn sleepable_backtrace_without_tail_calls_uses_the_inline_limit() {
+        let context = inkwell::context::Context::create();
+        let mut options = crate::CompileOptions::default();
+        options.runtime_capabilities.sleepable_uprobe = true;
+        options.runtime_capabilities.sleepable_tail_calls = false;
+        let mut ctx = EbpfContext::new(&context, "test", None, &options).expect("context");
+        let stmt = BacktraceStatement::default();
+
+        ctx.backtrace_unwind_rows
+            .push(ghostscope_protocol::BacktraceUnwindRow::default());
+        ctx.current_compile_time_context = Some(CompileTimeContext {
+            pc_address: 0x1234,
+            module_path: "/bin/test".to_string(),
+        });
+
+        let plan = ctx.plan_backtrace_instruction(&stmt);
+        assert_eq!(plan.mode, BacktraceEmitMode::Inline);
+        assert_eq!(plan.depth, BPF_INLINE_BACKTRACE_FRAME_LIMIT);
+        assert!(
+            !ctx.should_generate_backtrace_tail_call_maps(&[Statement::Backtrace(stmt.clone())])
+        );
+    }
+
+    #[test]
+    fn sleepable_backtrace_with_tail_calls_keeps_the_tail_call_path() {
+        let context = inkwell::context::Context::create();
+        let mut options = crate::CompileOptions::default();
+        options.runtime_capabilities.sleepable_uprobe = true;
+        options.runtime_capabilities.sleepable_tail_calls = true;
+        let mut ctx = EbpfContext::new(&context, "test", None, &options).expect("context");
+        let stmt = BacktraceStatement::default();
+
+        ctx.backtrace_unwind_rows
+            .push(ghostscope_protocol::BacktraceUnwindRow::default());
+        ctx.current_compile_time_context = Some(CompileTimeContext {
+            pc_address: 0x1234,
+            module_path: "/bin/test".to_string(),
+        });
+
+        assert_eq!(
+            ctx.plan_backtrace_instruction(&stmt).mode,
+            BacktraceEmitMode::TailCall
+        );
+        assert!(ctx.should_generate_backtrace_tail_call_maps(&[Statement::Backtrace(stmt)]));
     }
 }

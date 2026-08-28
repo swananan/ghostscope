@@ -187,6 +187,7 @@ pub struct EbpfContext<'ctx, 'dw> {
     pub(crate) backtrace_module_row_ranges: Vec<BacktraceModuleRowRangeEntry>,
     pub(crate) backtrace_tail_call_slots: u8,
     pub(crate) next_backtrace_tail_call_slot: u8,
+    pub(crate) warned_sleepable_tail_call_fallback: bool,
     pub(crate) pending_backtrace_tail_call: Option<PendingBacktraceTailCall>,
     pub(crate) backtrace_tail_enabled_alloca: Option<inkwell::values::PointerValue<'ctx>>,
     pub(crate) backtrace_tail_last_slot_alloca: Option<inkwell::values::PointerValue<'ctx>>,
@@ -197,6 +198,14 @@ pub struct EbpfContext<'ctx, 'dw> {
 }
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
+    fn uprobe_section(&self) -> &'static str {
+        if self.compile_options.runtime_capabilities.sleepable_uprobe {
+            "uprobe.s"
+        } else {
+            "uprobe"
+        }
+    }
+
     pub(crate) fn backtrace_unwind_row_map_entries(&self) -> u64 {
         (self.compile_options.backtrace_unwind_rows_max_entries as u64)
             .max(self.backtrace_unwind_rows.len() as u64)
@@ -305,6 +314,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             backtrace_module_row_ranges: Vec::new(),
             backtrace_tail_call_slots: 1,
             next_backtrace_tail_call_slot: 0,
+            warned_sleepable_tail_call_fallback: false,
             pending_backtrace_tail_call: None,
             backtrace_tail_enabled_alloca: None,
             backtrace_tail_last_slot_alloca: None,
@@ -418,10 +428,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let function = self.module.add_function(function_name, fn_type, None);
 
-        // Set section attribute for uprobe
+        // Set the section that tells Aya whether the uprobe is sleepable.
         function.add_attribute(
             inkwell::attributes::AttributeLoc::Function,
-            self.context.create_string_attribute("section", "uprobe"),
+            self.context
+                .create_string_attribute("section", self.uprobe_section()),
         );
 
         // Create basic block
@@ -571,6 +582,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 None
             };
         self.prepare_backtrace_unwind_rows(trace_statements);
+        let create_backtrace_tail_call_maps =
+            self.should_generate_backtrace_tail_call_maps(trace_statements);
 
         // Create required maps - critical for eBPF loader
         // Create event output map based on compile options
@@ -723,29 +736,31 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         ))
                     })?;
             }
-            self.map_manager
-                .create_percpu_array_map(
-                    &self.module,
-                    &self.di_builder,
-                    &self.compile_unit,
-                    "bt_state",
-                    self.backtrace_tail_call_slots.max(1) as u64,
-                    crate::BACKTRACE_TAIL_STATE_SIZE as u64,
-                )
-                .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to create bt_state map: {e}"))
-                })?;
-            self.map_manager
-                .create_program_array_map(
-                    &self.module,
-                    &self.di_builder,
-                    &self.compile_unit,
-                    "bt_prog_array",
-                    1,
-                )
-                .map_err(|e| {
-                    CodeGenError::LLVMError(format!("Failed to create bt_prog_array map: {e}"))
-                })?;
+            if create_backtrace_tail_call_maps {
+                self.map_manager
+                    .create_percpu_array_map(
+                        &self.module,
+                        &self.di_builder,
+                        &self.compile_unit,
+                        "bt_state",
+                        self.backtrace_tail_call_slots.max(1) as u64,
+                        crate::BACKTRACE_TAIL_STATE_SIZE as u64,
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to create bt_state map: {e}"))
+                    })?;
+                self.map_manager
+                    .create_program_array_map(
+                        &self.module,
+                        &self.di_builder,
+                        &self.compile_unit,
+                        "bt_prog_array",
+                        1,
+                    )
+                    .map_err(|e| {
+                        CodeGenError::LLVMError(format!("Failed to create bt_prog_array map: {e}"))
+                    })?;
+            }
         }
 
         // Variables are now queried on-demand when accessed in expressions
@@ -804,8 +819,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let fn_type = i32_type.fn_type(&[ptr_type.into()], false);
         let function = self.module.add_function(function_name, fn_type, None);
 
-        // CRITICAL: Set section name for eBPF loader to find the function
-        function.set_section(Some("uprobe"));
+        // The section name selects regular or sleepable uprobe loading in Aya.
+        function.set_section(Some(self.uprobe_section()));
 
         // Create basic block and position builder
         let basic_block = self.context.append_basic_block(function, "entry");
@@ -844,7 +859,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let ptr_type = self.context.ptr_type(AddressSpace::default());
         let fn_type = i32_type.fn_type(&[ptr_type.into()], false);
         let function = self.module.add_function(function_name, fn_type, None);
-        function.set_section(Some("uprobe"));
+        function.set_section(Some(self.uprobe_section()));
 
         let basic_block = self.context.append_basic_block(function, "entry");
         self.builder.position_at_end(basic_block);
@@ -1267,5 +1282,70 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_store(ptr, sel)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn llvm_ir_with_basic_program(options: &crate::CompileOptions) -> String {
+        let llvm_context = Context::create();
+        let mut codegen =
+            EbpfContext::new(&llvm_context, "section_test", Some(1), options).expect("context");
+        codegen
+            .create_basic_ebpf_function("test_program")
+            .expect("basic program");
+        codegen
+            .get_module()
+            .print_to_string()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn regular_uprobe_is_the_default_section() {
+        let llvm_ir = llvm_ir_with_basic_program(&crate::CompileOptions::default());
+        assert!(llvm_ir.contains("uprobe"));
+        assert!(!llvm_ir.contains("uprobe.s"));
+    }
+
+    #[test]
+    fn sleepable_option_emits_uprobe_sleepable_section() {
+        let mut options = crate::CompileOptions::default();
+        options.runtime_capabilities.sleepable_uprobe = true;
+
+        let llvm_ir = llvm_ir_with_basic_program(&options);
+        assert!(llvm_ir.contains("uprobe.s"));
+    }
+
+    #[test]
+    fn sleepable_fixed_size_reads_use_copy_from_user_task() {
+        let llvm_context = Context::create();
+        let mut options = crate::CompileOptions::default();
+        options.runtime_capabilities.sleepable_uprobe = true;
+        options.runtime_capabilities.copy_from_user_task = true;
+        let mut codegen =
+            EbpfContext::new(&llvm_context, "read_test", Some(1), &options).expect("context");
+        codegen
+            .create_basic_ebpf_function("test_program")
+            .expect("basic program");
+        let address = RuntimeAddress::available(
+            llvm_context.i64_type().const_int(0x1000, false),
+            &llvm_context,
+        );
+        codegen
+            .generate_memory_read(address, ghostscope_dwarf::MemoryAccessSize::U64, None)
+            .expect("memory read");
+
+        let llvm_ir = codegen
+            .get_module()
+            .print_to_string()
+            .to_string_lossy()
+            .into_owned();
+        assert!(llvm_ir.contains("current_task_btf_for_user_read"));
+        assert!(llvm_ir.contains("i64 158"));
+        assert!(llvm_ir.contains("i64 191"));
+        assert!(!llvm_ir.contains("i64 112"));
     }
 }
