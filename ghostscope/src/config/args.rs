@@ -305,6 +305,12 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub force_perf_event_array: bool,
 
+    /// Enable sleepable uprobes for this run. Requires Linux 5.18+ and may
+    /// increase probe-hit latency when user-memory pages must be faulted in.
+    /// Cannot be combined with --force-perf-event-array.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub sleepable_uprobe: bool,
+
     /// Re-enable sysmon eBPF for standalone -t if config disabled it.
     /// Standalone -t starts sysmon by default; -t with -p does not use sysmon.
     #[arg(
@@ -357,6 +363,7 @@ pub struct ParsedArgs {
     pub should_save_ast: bool,
     pub layout_mode: LayoutMode,
     pub force_perf_event_array: bool,
+    pub sleepable_uprobe: bool,
     pub enable_sysmon_for_target: bool,
     pub allow_loose_debug_match: bool,
     pub debuginfod: Option<DebuginfodMode>,
@@ -539,6 +546,7 @@ impl Args {
             should_save_ast,
             layout_mode: parsed.layout,
             force_perf_event_array: parsed.force_perf_event_array,
+            sleepable_uprobe: parsed.sleepable_uprobe,
             enable_sysmon_for_target: parsed.enable_sysmon_for_target,
             allow_loose_debug_match: parsed.allow_loose_debug_match,
             debuginfod: parsed.debuginfod,
@@ -912,6 +920,23 @@ mod tests {
             ParsedCommand::Trace(args) => {
                 assert_eq!(args.backtrace_depth, Some(64));
             }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_sleepable_uprobe_flag() {
+        let parsed = Args::parse_args_from(vec![
+            "ghostscope".to_string(),
+            "--pid".to_string(),
+            "1234".to_string(),
+            "--script-file".to_string(),
+            "trace.gs".to_string(),
+            "--sleepable-uprobe".to_string(),
+        ]);
+
+        match parsed {
+            ParsedCommand::Trace(args) => assert!(args.sleepable_uprobe),
             other => panic!("unexpected parse result: {other:?}"),
         }
     }

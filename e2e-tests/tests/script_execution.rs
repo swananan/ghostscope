@@ -303,6 +303,105 @@ trace print_record {
 }
 
 #[tokio::test]
+async fn test_sleepable_uprobe_cli_opt_in_overrides_config_and_reads_user_memory(
+) -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let target = get_global_test_target_with_opt(OptimizationLevel::Debug).await?;
+    let script_content = r#"
+trace process_record {
+    if (record.value > 0) {
+        print "SLEEPABLE_USER_READ";
+    }
+}
+"#;
+
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script_content)
+        .attach_to(&target)
+        .timeout_secs(5)
+        .enable_sysmon_for_target(false)
+        .with_config_content(
+            r#"
+[ebpf]
+sleepable_uprobe = false
+"#,
+        )
+        .with_cli_args(["--sleepable-uprobe"])
+        .run()
+        .await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.contains("SLEEPABLE_USER_READ"),
+        "sleepable uprobe did not read the record field. stdout={stdout} stderr={stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sleepable_uprobe_backtrace_uses_a_kernel_supported_depth() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let target = get_global_test_target_with_opt(OptimizationLevel::Debug).await?;
+    let script_content = r#"
+trace test_function {
+    print "before-sleepable-bt";
+    bt full;
+    print "after-sleepable-bt";
+}
+"#;
+
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script_content)
+        .attach_to(&target)
+        .timeout_secs(5)
+        .enable_sysmon_for_target(false)
+        .with_cli_args(["--sleepable-uprobe", "--backtrace-depth", "6"])
+        .run()
+        .await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    let backtrace = stdout
+        .find("backtrace:")
+        .ok_or_else(|| anyhow::anyhow!("missing backtrace header:\n{stdout}"))?;
+    assert!(
+        stdout[backtrace..].contains("(max 5)") || stdout[backtrace..].contains("(max 6)"),
+        "sleepable bt should preserve depth on kernels with sleepable tail calls or fall back to five inline frames:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("after-sleepable-bt"),
+        "sleepable backtrace did not finish:\n{stdout}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sleepable_uprobe_rejects_forced_perf_event_array() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let target = get_global_test_target_with_opt(OptimizationLevel::Debug).await?;
+    let (exit_code, _stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script("trace process_record { print record.value; }")
+        .attach_to(&target)
+        .timeout_secs(5)
+        .enable_sysmon_for_target(false)
+        .with_cli_args(["--sleepable-uprobe", "--force-perf-event-array"])
+        .run()
+        .await?;
+
+    assert_ne!(exit_code, 0, "conflicting options unexpectedly succeeded");
+    assert!(
+        stderr.contains("sleepable BPF programs cannot use BPF_MAP_TYPE_PERF_EVENT_ARRAY"),
+        "missing conflict explanation: stderr={stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_backtrace_outputs_dwarf_frames_between_prints() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();

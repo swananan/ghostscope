@@ -184,6 +184,10 @@ ghostscope --source-panel       # Show source panel
 # WARNING: Testing purposes only. Forces PerfEventArray even on kernels >= 5.8
 ghostscope --force-perf-event-array
 
+# Opt in to sleepable uprobes for this invocation. This overrides
+# sleepable_uprobe=false in the config file.
+ghostscope --sleepable-uprobe
+
 # Standalone -t starts target-mode sysmon by default. When -t is combined with
 # -p, GhostScope uses the -p watched-PID module-refresh path instead.
 # WARNING: Attaches system-wide lifecycle tracepoints (exec/fork/exit) and may
@@ -193,6 +197,45 @@ ghostscope --force-perf-event-array
 # disable it; this flag can re-enable it for one run.
 ghostscope --enable-sysmon-for-target
 ```
+
+### Sleepable Uprobes
+
+Sleepable uprobes are an opt-in `[ebpf]` configuration because they require a
+Linux 5.18+ kernel and can change probe latency by allowing a user-memory page
+fault to be serviced during a probe hit. The default remains the regular,
+non-sleepable `uprobe` path.
+
+```toml
+[ebpf]
+sleepable_uprobe = true
+```
+
+For a one-off run, use `--sleepable-uprobe`; it enables this setting even when
+the config file has `sleepable_uprobe = false`. To keep regular uprobes, omit
+the flag and leave the configuration at its default `false`.
+
+Sleepable uprobes require RingBuf event output. Do not combine
+`sleepable_uprobe = true` (or `--sleepable-uprobe`) with
+`force_perf_event_array = true` (or `--force-perf-event-array`): the kernel
+does not permit sleepable BPF programs to use `BPF_MAP_TYPE_PERF_EVENT_ARRAY`,
+and GhostScope reports this configuration conflict before attaching.
+
+When enabled, GhostScope emits `uprobe.s` programs. Fixed-size user-memory
+reads use `bpf_copy_from_user_task()` so pages can be faulted in; NUL-terminated
+string reads retain `bpf_probe_read_user_str()` because its early-NUL and
+reported-length semantics differ. Startup fails clearly if the kernel does not
+support the helper required by sleepable uprobe mode rather than silently
+falling back.
+
+Long DWARF `bt` traces normally use a tail-call step program. GhostScope probes
+that sleepable tail-call path at startup; on kernels that do not allow a
+sleepable program to use `BPF_MAP_TYPE_PROG_ARRAY`, it compiles the trace with
+the inline limit of five frames instead and prints a warning. This preserves a
+working sleepable trace rather than failing eBPF verification.
+
+Enable this only when fault-capable reads are worth the added latency and kernel
+requirement. Set `sleepable_uprobe = false` (the default) to use regular
+uprobes again.
 
 ### BPFFS Maintenance
 
@@ -276,6 +319,7 @@ unusable index is reported in CLI/TUI startup status before falling back.
 | `--source-panel` | | Show source panel | On |
 | `--config <PATH>` | | Custom config file | Auto-detect |
 | `--force-perf-event-array` | | Force PerfEventArray (testing) | Off |
+| `--sleepable-uprobe` | | Enable sleepable uprobes for this run; overrides a `false` config value | Off |
 | `--enable-sysmon-for-target` | | Re-enable target-mode sysmon for standalone `-t` when config disables it. Standalone `-t` enables target-mode sysmon by default; `-t -p` uses the `-p` watched-PID module-refresh path instead. | Off |
 | `[BINARY] [ARGS...]` | | Launch target program with positional arguments | None |
 | `--args <PROGRAM> [ARGS...]` | | Separate GhostScope options from target program arguments | None |
@@ -541,6 +585,13 @@ backtrace_unwind_rows_max_entries = 65536
 # even on kernels that support RingBuf (>= 5.8). PerfEventArray has performance
 # overhead compared to RingBuf and should only be used for compatibility testing.
 force_perf_event_array = false  # Default (auto-detect based on kernel version)
+
+# Opt-in sleepable uprobes. Requires Linux 5.18+.
+# Fixed-size user-memory reads use bpf_copy_from_user_task().
+# NUL-terminated string reads retain bpf_probe_read_user_str() semantics.
+# Long DWARF bt uses tail calls when the kernel allows them; otherwise it is
+# limited to five inline frames and GhostScope prints a warning.
+sleepable_uprobe = false  # Default
 
 # Start sysmon eBPF for standalone -t targets.
 # Maintains ASLR offsets for late-start processes and runtime module refresh for

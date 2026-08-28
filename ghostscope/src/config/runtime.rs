@@ -8,7 +8,7 @@ use ghostscope_process::{
 };
 use tracing::{info, warn};
 
-use crate::config::{LayoutMode, UserConfig};
+use crate::config::{settings::EbpfConfig, LayoutMode, UserConfig};
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeContext {
@@ -176,6 +176,8 @@ pub struct ResolvedConfig {
 
 impl ResolvedConfig {
     pub fn resolve(user: UserConfig, kernel_caps: &KernelCapabilities) -> Result<Self> {
+        validate_sleepable_uprobe_config(&user.ebpf_config, kernel_caps)?;
+
         let runtime = RuntimeContext::resolve(&user, kernel_caps)?;
         Ok(Self {
             user,
@@ -276,16 +278,44 @@ impl ResolvedConfig {
             special_pid_ns: self.runtime.special_pid_ns,
             proc_offsets_pid_ns: self.runtime.proc_offsets_pid_ns,
             input_pid: self.input_pid,
-            runtime_capabilities: dwarf_runtime_capabilities_from_kernel(&self.kernel_capabilities),
+            runtime_capabilities: dwarf_runtime_capabilities_from_kernel(
+                &self.kernel_capabilities,
+                self.ebpf_config.sleepable_uprobe,
+            ),
         }
     }
 }
 
+fn validate_sleepable_uprobe_config(
+    ebpf_config: &EbpfConfig,
+    kernel_caps: &KernelCapabilities,
+) -> Result<()> {
+    if ebpf_config.sleepable_uprobe && ebpf_config.force_perf_event_array {
+        return Err(anyhow::anyhow!(
+            "[ebpf].sleepable_uprobe=true conflicts with [ebpf].force_perf_event_array=true: sleepable BPF programs cannot use BPF_MAP_TYPE_PERF_EVENT_ARRAY. Sleepable uprobes require RingBuf event output. Disable force_perf_event_array or disable sleepable_uprobe."
+        ));
+    }
+
+    if ebpf_config.sleepable_uprobe && !kernel_caps.supports_sleepable_uprobe {
+        return Err(anyhow::anyhow!(
+            "[ebpf].sleepable_uprobe=true requires Linux 5.18+ with sleepable uprobe and bpf_copy_from_user_task support. Disable the setting or use a compatible kernel."
+        ));
+    }
+
+    Ok(())
+}
+
 fn dwarf_runtime_capabilities_from_kernel(
     kernel_caps: &KernelCapabilities,
+    sleepable_uprobe_enabled: bool,
 ) -> ghostscope_compiler::RuntimeCapabilities {
     ghostscope_compiler::RuntimeCapabilities {
         regular_uprobe: kernel_caps.supports_ringbuf || kernel_caps.supports_perf_event_array,
+        sleepable_uprobe: sleepable_uprobe_enabled && kernel_caps.supports_sleepable_uprobe,
+        sleepable_tail_calls: sleepable_uprobe_enabled
+            && kernel_caps.supports_sleepable_uprobe
+            && kernel_caps.supports_sleepable_tail_calls,
+        copy_from_user_task: sleepable_uprobe_enabled && kernel_caps.supports_sleepable_uprobe,
         ..Default::default()
     }
 }
@@ -309,5 +339,58 @@ fn map_pid_session_error(err: ResolvePidSessionError) -> anyhow::Error {
                  Please use target mode (-t <binary_path>) instead of -p in this environment."
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kernel_caps(
+        supports_sleepable_uprobe: bool,
+        supports_sleepable_tail_calls: bool,
+    ) -> KernelCapabilities {
+        KernelCapabilities {
+            supports_ringbuf: true,
+            supports_perf_event_array: true,
+            supports_ns_current_pid_tgid_helper: true,
+            supports_sleepable_uprobe,
+            supports_sleepable_tail_calls,
+        }
+    }
+
+    #[test]
+    fn sleepable_runtime_capability_requires_opt_in_and_kernel_support() {
+        let disabled = dwarf_runtime_capabilities_from_kernel(&kernel_caps(true, true), false);
+        assert!(!disabled.sleepable_uprobe);
+        assert!(!disabled.sleepable_tail_calls);
+        assert!(!disabled.copy_from_user_task);
+
+        let unavailable = dwarf_runtime_capabilities_from_kernel(&kernel_caps(false, false), true);
+        assert!(!unavailable.sleepable_uprobe);
+        assert!(!unavailable.sleepable_tail_calls);
+        assert!(!unavailable.copy_from_user_task);
+
+        let enabled = dwarf_runtime_capabilities_from_kernel(&kernel_caps(true, false), true);
+        assert!(enabled.sleepable_uprobe);
+        assert!(!enabled.sleepable_tail_calls);
+        assert!(enabled.copy_from_user_task);
+
+        let tail_calls = dwarf_runtime_capabilities_from_kernel(&kernel_caps(true, true), true);
+        assert!(tail_calls.sleepable_tail_calls);
+    }
+
+    #[test]
+    fn sleepable_uprobe_rejects_forced_perf_event_array() {
+        let mut config = crate::config::Config::default().ebpf;
+        config.sleepable_uprobe = true;
+        config.force_perf_event_array = true;
+
+        let error =
+            validate_sleepable_uprobe_config(&config, &kernel_caps(true, true)).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("sleepable BPF programs cannot use BPF_MAP_TYPE_PERF_EVENT_ARRAY"));
     }
 }

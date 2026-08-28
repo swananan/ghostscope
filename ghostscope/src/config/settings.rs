@@ -255,6 +255,12 @@ pub struct EbpfConfig {
     /// even on kernels that support RingBuf.
     #[serde(default = "default_force_perf_event_array")]
     pub force_perf_event_array: bool,
+    /// Emit sleepable (`uprobe.s`) programs and use fault-capable user-memory reads
+    /// where the generated program uses fixed-size reads. Requires Linux 5.18+
+    /// and RingBuf event output, so it cannot be combined with
+    /// force_perf_event_array.
+    #[serde(default = "default_sleepable_uprobe")]
+    pub sleepable_uprobe: bool,
     /// Per-argument memory dump cap for extended format specifiers ({:x}/{:s})
     /// Default: 256 bytes; larger requests are truncated to this cap.
     #[serde(default = "default_mem_dump_cap")]
@@ -387,6 +393,10 @@ fn default_backtrace_unwind_rows_max_entries() -> u32 {
 }
 
 fn default_force_perf_event_array() -> bool {
+    false
+}
+
+fn default_sleepable_uprobe() -> bool {
     false
 }
 
@@ -537,6 +547,7 @@ impl Default for EbpfConfig {
             proc_module_offsets_max_entries: default_proc_module_offsets_max_entries(),
             backtrace_unwind_rows_max_entries: default_backtrace_unwind_rows_max_entries(),
             force_perf_event_array: default_force_perf_event_array(),
+            sleepable_uprobe: default_sleepable_uprobe(),
             mem_dump_cap: default_mem_dump_cap(),
             compare_cap: default_compare_cap(),
             max_trace_event_size: default_max_trace_event_size(),
@@ -1041,6 +1052,11 @@ mod tests {
     #[test]
     fn ebpf_defaults_enable_sysmon_for_target() {
         assert!(Config::default().ebpf.enable_sysmon_for_target);
+    }
+
+    #[test]
+    fn ebpf_defaults_disable_sleepable_uprobes() {
+        assert!(!Config::default().ebpf.sleepable_uprobe);
     }
 
     #[test]

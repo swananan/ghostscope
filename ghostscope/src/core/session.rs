@@ -786,6 +786,7 @@ mod tests {
             should_save_ast: false,
             layout_mode: crate::config::LayoutMode::Horizontal,
             force_perf_event_array: false,
+            sleepable_uprobe: false,
             enable_sysmon_for_target: false,
             allow_loose_debug_match: false,
             debuginfod: None,
@@ -822,6 +823,8 @@ mod tests {
                 supports_ringbuf: true,
                 supports_perf_event_array: true,
                 supports_ns_current_pid_tgid_helper: false,
+                supports_sleepable_uprobe: false,
+                supports_sleepable_tail_calls: false,
             },
         };
 

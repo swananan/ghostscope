@@ -5,9 +5,10 @@
 
 use super::context::{CodeGenError, EbpfContext, Result, RuntimeAddress};
 use aya_ebpf_bindings::bindings::bpf_func_id::{
-    BPF_FUNC_get_current_pid_tgid, BPF_FUNC_get_current_task, BPF_FUNC_ktime_get_ns,
-    BPF_FUNC_map_lookup_elem, BPF_FUNC_perf_event_output, BPF_FUNC_probe_read_kernel,
-    BPF_FUNC_probe_read_user, BPF_FUNC_probe_read_user_str, BPF_FUNC_ringbuf_output,
+    BPF_FUNC_copy_from_user_task, BPF_FUNC_get_current_pid_tgid, BPF_FUNC_get_current_task,
+    BPF_FUNC_get_current_task_btf, BPF_FUNC_ktime_get_ns, BPF_FUNC_map_lookup_elem,
+    BPF_FUNC_perf_event_output, BPF_FUNC_probe_read_kernel, BPF_FUNC_probe_read_user,
+    BPF_FUNC_probe_read_user_str, BPF_FUNC_ringbuf_output,
 };
 use ghostscope_dwarf::MemoryAccessSize;
 use ghostscope_platform::register_mapping;
@@ -953,13 +954,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .into_pointer_value();
 
         let i32_type = self.context.i32_type();
-        let helper_id = i64_type.const_int(BPF_FUNC_probe_read_user as u64, false);
-        let helper_fn_type =
-            i32_type.fn_type(&[ptr_type.into(), i32_type.into(), ptr_type.into()], false);
-        let helper_fn_ptr = self
-            .builder
-            .build_int_to_ptr(helper_id, ptr_type, "probe_read_user_fn")
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let size_val = i32_type.const_int(result_size as u64, false);
         let zero_i32 = i32_type.const_zero();
         let effective_size = self
@@ -972,28 +966,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .into_int_value();
-        let call_args: Vec<BasicMetadataValueEnum> =
-            vec![dst_ptr.into(), effective_size.into(), src_ptr.into()];
-
-        let call_site = self
-            .builder
-            .build_indirect_call(
-                helper_fn_type,
-                helper_fn_ptr,
-                &call_args,
+        let ret_i64 = self
+            .create_bpf_helper_call(
+                BPF_FUNC_probe_read_user as u64,
+                &[dst_ptr, effective_size.into(), src_ptr.into()],
+                i64_type.into(),
                 "probe_read_result",
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let ret_iv = call_site.try_as_basic_value().left().ok_or_else(|| {
-            CodeGenError::LLVMError("Expected integer return from helper".to_string())
-        })?;
-        let ret_i32 = ret_iv.into_int_value();
+            )?
+            .into_int_value();
         let read_fail = self
             .builder
             .build_int_compare(
                 inkwell::IntPredicate::NE,
-                ret_i32,
-                i32_type.const_zero(),
+                ret_i64,
+                i64_type.const_zero(),
                 "read_fail",
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
@@ -1036,7 +1022,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         Ok(ProbeReadResult {
             loaded_i64,
-            helper_result: ret_i32,
+            helper_result: ret_i64,
             combined_fail,
             not_found,
         })
@@ -1276,6 +1262,61 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Create eBPF helper call using the correct calling convention
     /// This creates an indirect call through the eBPF helper mechanism
     pub fn create_bpf_helper_call(
+        &mut self,
+        helper_id: u64,
+        args: &[BasicValueEnum<'ctx>],
+        return_type: BasicTypeEnum<'ctx>,
+        call_name: &str,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        if helper_id == BPF_FUNC_probe_read_user as u64
+            && self.compile_options.runtime_capabilities.sleepable_uprobe
+            && self
+                .compile_options
+                .runtime_capabilities
+                .copy_from_user_task
+        {
+            return self.create_copy_from_user_task_call(args, return_type, call_name);
+        }
+
+        self.create_raw_bpf_helper_call(helper_id, args, return_type, call_name)
+    }
+
+    fn create_copy_from_user_task_call(
+        &mut self,
+        args: &[BasicValueEnum<'ctx>],
+        return_type: BasicTypeEnum<'ctx>,
+        call_name: &str,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        if args.len() != 3 {
+            return Err(CodeGenError::LLVMError(format!(
+                "bpf_copy_from_user_task replacement expected 3 arguments, got {}",
+                args.len()
+            )));
+        }
+
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let task = self
+            .create_raw_bpf_helper_call(
+                BPF_FUNC_get_current_task_btf as u64,
+                &[],
+                ptr_type.into(),
+                "current_task_btf_for_user_read",
+            )?
+            .into_pointer_value();
+
+        let mut task_args = args.to_vec();
+        task_args.push(task.into());
+        task_args.push(self.context.i64_type().const_zero().into());
+        self.create_raw_bpf_helper_call(
+            BPF_FUNC_copy_from_user_task as u64,
+            &task_args,
+            return_type,
+            call_name,
+        )
+    }
+
+    /// Create one raw eBPF helper call without applying user-memory helper policy.
+    fn create_raw_bpf_helper_call(
         &mut self,
         helper_id: u64,
         args: &[BasicValueEnum<'ctx>],

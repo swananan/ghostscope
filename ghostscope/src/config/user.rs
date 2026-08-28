@@ -201,6 +201,9 @@ impl UserConfig {
                 if args.force_perf_event_array {
                     ebpf_config.force_perf_event_array = true;
                 }
+                if args.sleepable_uprobe {
+                    ebpf_config.sleepable_uprobe = true;
+                }
                 if args.enable_sysmon_for_target {
                     ebpf_config.enable_sysmon_for_target = true;
                 }
