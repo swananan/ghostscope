@@ -35,4 +35,7 @@ void cleanup_test_lib();
 // Void pointer sink for pointer-arithmetic fallback tests
 void sink_void(const void* p);
 
+// Trigger a probe target with a confirmed nonresident anonymous page.
+void trigger_evicted_page_probe(void);
+
 #endif // TEST_LIB_H

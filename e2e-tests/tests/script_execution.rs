@@ -341,6 +341,66 @@ sleepable_uprobe = false
 }
 
 #[tokio::test]
+async fn test_sleepable_uprobe_faults_in_an_evicted_user_page() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let target = get_global_test_target_with_opt(OptimizationLevel::Debug).await?;
+    let script_content = r#"
+trace process_evicted_page {
+    if (page.value == 0) {
+        print "SLEEPABLE_PAGE_FAULT_OK";
+    }
+}
+"#;
+
+    let (default_exit_code, default_stdout, default_stderr) =
+        common::runner::GhostscopeRunner::new()
+            .with_script(script_content)
+            .attach_to(&target)
+            .timeout_secs(5)
+            .enable_sysmon_for_target(false)
+            .with_log_level("info")
+            .run()
+            .await?;
+
+    assert_eq!(
+        default_exit_code, 0,
+        "stderr={default_stderr} stdout={default_stdout}"
+    );
+    assert!(
+        !default_stdout.contains("SLEEPABLE_PAGE_FAULT_OK")
+            && default_stdout.contains("ExprError"),
+        "ordinary uprobe unexpectedly read the evicted page. stdout={default_stdout} stderr={default_stderr}"
+    );
+    assert!(
+        !default_stderr.contains("Probing helpers required for sleepable uprobes")
+            && !default_stderr.contains("Probing sleepable tail-call support"),
+        "default startup unexpectedly ran sleepable capability probes. stderr={default_stderr}"
+    );
+
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script_content)
+        .attach_to(&target)
+        .timeout_secs(5)
+        .enable_sysmon_for_target(false)
+        .with_cli_args(["--sleepable-uprobe"])
+        .run()
+        .await?;
+
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.contains("SLEEPABLE_PAGE_FAULT_OK"),
+        "sleepable uprobe did not fault in and read the evicted page. stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("ExprError"),
+        "fault-capable user-memory read unexpectedly failed. stdout={stdout} stderr={stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_sleepable_uprobe_backtrace_uses_a_kernel_supported_depth() -> anyhow::Result<()> {
     init();
     ensure_global_cleanup_registered();

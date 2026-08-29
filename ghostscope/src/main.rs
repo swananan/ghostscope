@@ -52,9 +52,15 @@ async fn main() -> Result<()> {
     // Dry-run does not attach uprobes, but it still validates the same eBPF
     // privileges and kernel capabilities as a real run.
     crate::util::ensure_privileges();
-    let kernel_caps = ghostscope_loader::KernelCapabilities::detect_for_startup(
-        user_config.ebpf_config.force_perf_event_array,
-    )?;
+    let kernel_caps = if user_config.ebpf_config.sleepable_uprobe {
+        ghostscope_loader::KernelCapabilities::detect_for_startup_with_sleepable_uprobe(
+            user_config.ebpf_config.force_perf_event_array,
+        )?
+    } else {
+        ghostscope_loader::KernelCapabilities::detect_for_startup(
+            user_config.ebpf_config.force_perf_event_array,
+        )?
+    };
     let resolved_config = config::ResolvedConfig::resolve(user_config, &kernel_caps)?;
 
     // Best-effort cleanup for this process's bpffs pins on graceful shutdown and panic unwind.

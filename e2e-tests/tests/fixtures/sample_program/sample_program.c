@@ -71,6 +71,7 @@ int main() {
 
         // Void pointer sink call for pointer-arithmetic fallback tests
         sink_void(numbers);
+        trigger_evicted_page_probe();
         
         // printf("Sleeping for 2 seconds...\n");
         sleep(2);  // Sleep for 2 seconds
