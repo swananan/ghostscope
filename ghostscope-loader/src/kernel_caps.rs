@@ -11,33 +11,45 @@ use aya_obj::generated::{
 use std::{fmt, io, mem, sync::OnceLock};
 use tracing::{error, info, warn};
 
-/// Global cache for complete, hardware-backed kernel capability probes.
+/// Global caches for hardware-backed kernel capability probe sets.
 static KERNEL_CAPS: KernelCapabilityCache = KernelCapabilityCache::new();
 
 #[derive(Debug)]
 struct KernelCapabilityCache {
+    base: OnceLock<KernelCapabilities>,
     full: OnceLock<KernelCapabilities>,
 }
 
 impl KernelCapabilityCache {
     const fn new() -> Self {
         Self {
+            base: OnceLock::new(),
             full: OnceLock::new(),
         }
     }
 
-    fn get_or_detect<F>(&self, detect: F) -> Result<KernelCapabilities, KernelCapabilityError>
+    fn get_or_detect<F>(
+        &self,
+        probe_sleepable: bool,
+        detect: F,
+    ) -> Result<KernelCapabilities, KernelCapabilityError>
     where
         F: FnOnce() -> Result<KernelCapabilityDetection, KernelCapabilityError>,
     {
-        if let Some(capabilities) = self.full.get() {
+        let cache = if probe_sleepable {
+            &self.full
+        } else {
+            &self.base
+        };
+
+        if let Some(capabilities) = cache.get() {
             return Ok(*capabilities);
         }
 
         let detection = detect()?;
         if detection.cacheable {
-            let _ = self.full.set(detection.capabilities);
-            if let Some(capabilities) = self.full.get() {
+            let _ = cache.set(detection.capabilities);
+            if let Some(capabilities) = cache.get() {
                 return Ok(*capabilities);
             }
         } else {
@@ -88,23 +100,43 @@ pub struct KernelCapabilities {
 }
 
 impl KernelCapabilities {
-    /// Detect kernel capabilities for process startup, including startup-oriented logs and
-    /// user-facing error context.
+    /// Detect kernel capabilities for process startup without probing opt-in
+    /// sleepable-uprobe support.
     pub fn detect_for_startup(force_perf_event_array: bool) -> Result<Self, KernelCapabilityError> {
-        detect_for_startup_with_detectors(force_perf_event_array, Self::get, Self::get_perf_only)
+        Self::detect_for_startup_with_options(force_perf_event_array, false)
+    }
+
+    /// Detect kernel capabilities for process startup, including opt-in
+    /// sleepable-uprobe support.
+    pub fn detect_for_startup_with_sleepable_uprobe(
+        force_perf_event_array: bool,
+    ) -> Result<Self, KernelCapabilityError> {
+        Self::detect_for_startup_with_options(force_perf_event_array, true)
+    }
+
+    fn detect_for_startup_with_options(
+        force_perf_event_array: bool,
+        sleepable_uprobe: bool,
+    ) -> Result<Self, KernelCapabilityError> {
+        detect_for_startup_with_detectors(
+            force_perf_event_array,
+            sleepable_uprobe,
+            || Self::get_for_startup(sleepable_uprobe),
+            || detect_perf_only_capabilities(sleepable_uprobe),
+        )
     }
 
     /// Get global kernel capabilities (detected once on first cacheable call)
     /// Returns an error if neither RingBuf nor PerfEventArray support can be verified.
     pub fn get() -> Result<Self, KernelCapabilityError> {
-        KERNEL_CAPS.get_or_detect(detect_full_capabilities)
+        KERNEL_CAPS.get_or_detect(true, || detect_full_capabilities(true))
     }
 
     /// Detect kernel capabilities with PerfEventArray-only startup semantics.
     /// This intentionally bypasses the global cache because force-perf mode is a
     /// runtime policy override, not the kernel's complete hardware capability set.
     pub fn get_perf_only() -> Result<Self, KernelCapabilityError> {
-        detect_perf_only_capabilities()
+        detect_perf_only_capabilities(false)
     }
 
     /// Check if RingBuf is supported (convenience method)
@@ -127,10 +159,17 @@ impl KernelCapabilities {
             .map(|caps| caps.supports_ns_current_pid_tgid_helper)
             .unwrap_or(false)
     }
+
+    fn get_for_startup(probe_sleepable: bool) -> Result<Self, KernelCapabilityError> {
+        KERNEL_CAPS.get_or_detect(probe_sleepable, || {
+            detect_full_capabilities(probe_sleepable)
+        })
+    }
 }
 
 fn detect_for_startup_with_detectors<F, P>(
     force_perf_event_array: bool,
+    sleepable_uprobe: bool,
     detect_full: F,
     detect_perf_only: P,
 ) -> Result<KernelCapabilities, KernelCapabilityError>
@@ -153,14 +192,23 @@ where
         })?
     };
 
-    info!(
-        "Kernel eBPF startup summary: ringbuf_supported={} perf_event_array_supported={} helper_ns_current_pid_tgid={} sleepable_uprobe={} sleepable_tail_calls={}",
-        capabilities.supports_ringbuf,
-        capabilities.supports_perf_event_array,
-        capabilities.supports_ns_current_pid_tgid_helper,
-        capabilities.supports_sleepable_uprobe,
-        capabilities.supports_sleepable_tail_calls,
-    );
+    if sleepable_uprobe {
+        info!(
+            "Kernel eBPF startup summary: ringbuf_supported={} perf_event_array_supported={} helper_ns_current_pid_tgid={} sleepable_uprobe={} sleepable_tail_calls={}",
+            capabilities.supports_ringbuf,
+            capabilities.supports_perf_event_array,
+            capabilities.supports_ns_current_pid_tgid_helper,
+            capabilities.supports_sleepable_uprobe,
+            capabilities.supports_sleepable_tail_calls,
+        );
+    } else {
+        info!(
+            "Kernel eBPF startup summary: ringbuf_supported={} perf_event_array_supported={} helper_ns_current_pid_tgid={}",
+            capabilities.supports_ringbuf,
+            capabilities.supports_perf_event_array,
+            capabilities.supports_ns_current_pid_tgid_helper,
+        );
+    }
 
     Ok(capabilities)
 }
@@ -193,7 +241,9 @@ impl CapabilityProbe {
     }
 }
 
-fn detect_full_capabilities() -> Result<KernelCapabilityDetection, KernelCapabilityError> {
+fn detect_full_capabilities(
+    probe_sleepable: bool,
+) -> Result<KernelCapabilityDetection, KernelCapabilityError> {
     let supports_ringbuf = detect_ringbuf_support();
     let supports_perf_event_array = if !supports_ringbuf.supported {
         detect_perf_event_array_support()
@@ -232,25 +282,8 @@ fn detect_full_capabilities() -> Result<KernelCapabilityDetection, KernelCapabil
         warn!("⚠️  Kernel does not support helper bpf_get_ns_current_pid_tgid (id=120)");
     }
 
-    let supports_sleepable_uprobe = detect_sleepable_uprobe_support();
-    if supports_sleepable_uprobe.supported {
-        info!(
-            "✓ Kernel supports GhostScope sleepable uprobe mode (bpf_get_current_task_btf and bpf_copy_from_user_task)"
-        );
-    } else {
-        warn!(
-            "⚠️  Kernel does not support GhostScope sleepable uprobe mode (requires Linux 5.18+)"
-        );
-    }
-
-    let supports_sleepable_tail_calls = if supports_sleepable_uprobe.supported {
-        detect_sleepable_tail_call_support()
-    } else {
-        CapabilityProbe::cacheable(false)
-    };
-    if supports_sleepable_tail_calls.supported {
-        info!("✓ Kernel supports sleepable uprobe tail calls");
-    }
+    let (supports_sleepable_uprobe, supports_sleepable_tail_calls) =
+        detect_sleepable_capabilities(probe_sleepable);
 
     Ok(KernelCapabilityDetection {
         capabilities: KernelCapabilities {
@@ -268,7 +301,9 @@ fn detect_full_capabilities() -> Result<KernelCapabilityDetection, KernelCapabil
     })
 }
 
-fn detect_perf_only_capabilities() -> Result<KernelCapabilities, KernelCapabilityError> {
+fn detect_perf_only_capabilities(
+    probe_sleepable: bool,
+) -> Result<KernelCapabilities, KernelCapabilityError> {
     info!("Testing mode: Only detecting PerfEventArray support");
     let supports_perf_event_array = detect_perf_event_array_support();
 
@@ -298,25 +333,8 @@ fn detect_perf_only_capabilities() -> Result<KernelCapabilities, KernelCapabilit
         warn!("⚠️  Kernel does not support helper bpf_get_ns_current_pid_tgid (id=120)");
     }
 
-    let supports_sleepable_uprobe = detect_sleepable_uprobe_support();
-    if supports_sleepable_uprobe.supported {
-        info!(
-            "✓ Kernel supports GhostScope sleepable uprobe mode (bpf_get_current_task_btf and bpf_copy_from_user_task)"
-        );
-    } else {
-        warn!(
-            "⚠️  Kernel does not support GhostScope sleepable uprobe mode (requires Linux 5.18+)"
-        );
-    }
-
-    let supports_sleepable_tail_calls = if supports_sleepable_uprobe.supported {
-        detect_sleepable_tail_call_support()
-    } else {
-        CapabilityProbe::cacheable(false)
-    };
-    if supports_sleepable_tail_calls.supported {
-        info!("✓ Kernel supports sleepable uprobe tail calls");
-    }
+    let (supports_sleepable_uprobe, supports_sleepable_tail_calls) =
+        detect_sleepable_capabilities(probe_sleepable);
 
     Ok(KernelCapabilities {
         supports_ringbuf: false,
@@ -392,6 +410,53 @@ fn detect_ns_current_pid_tgid_helper_support() -> CapabilityProbe {
             CapabilityProbe::uncacheable_unsupported()
         }
     }
+}
+
+fn detect_sleepable_capabilities(probe_sleepable: bool) -> (CapabilityProbe, CapabilityProbe) {
+    detect_sleepable_capabilities_with_detectors(
+        probe_sleepable,
+        detect_sleepable_uprobe_support,
+        detect_sleepable_tail_call_support,
+    )
+}
+
+fn detect_sleepable_capabilities_with_detectors<U, T>(
+    probe_sleepable: bool,
+    detect_uprobe: U,
+    detect_tail_calls: T,
+) -> (CapabilityProbe, CapabilityProbe)
+where
+    U: FnOnce() -> CapabilityProbe,
+    T: FnOnce() -> CapabilityProbe,
+{
+    if !probe_sleepable {
+        return (
+            CapabilityProbe::cacheable(false),
+            CapabilityProbe::cacheable(false),
+        );
+    }
+
+    let supports_sleepable_uprobe = detect_uprobe();
+    if supports_sleepable_uprobe.supported {
+        info!(
+            "✓ Kernel supports GhostScope sleepable uprobe mode (bpf_get_current_task_btf and bpf_copy_from_user_task)"
+        );
+    } else {
+        warn!(
+            "⚠️  Kernel does not support GhostScope sleepable uprobe mode (requires Linux 5.18+)"
+        );
+    }
+
+    let supports_sleepable_tail_calls = if supports_sleepable_uprobe.supported {
+        detect_tail_calls()
+    } else {
+        CapabilityProbe::cacheable(false)
+    };
+    if supports_sleepable_tail_calls.supported {
+        info!("✓ Kernel supports sleepable uprobe tail calls");
+    }
+
+    (supports_sleepable_uprobe, supports_sleepable_tail_calls)
 }
 
 fn detect_sleepable_uprobe_support() -> CapabilityProbe {
@@ -745,6 +810,7 @@ mod tests {
 
         let forced = detect_for_startup_with_detectors(
             true,
+            false,
             || -> Result<KernelCapabilities, KernelCapabilityError> {
                 panic!("full detector should not run for forced perf startup")
             },
@@ -756,7 +822,8 @@ mod tests {
 
         let normal = detect_for_startup_with_detectors(
             false,
-            || cache.get_or_detect(|| Ok(detection(full_caps, true))),
+            true,
+            || cache.get_or_detect(true, || Ok(detection(full_caps, true))),
             || -> Result<KernelCapabilities, KernelCapabilityError> {
                 panic!("perf-only detector should not run for normal startup")
             },
@@ -766,12 +833,20 @@ mod tests {
         assert_eq!(normal, full_caps);
         assert_eq!(
             cache
-                .get_or_detect(|| {
+                .get_or_detect(true, || {
                     panic!("full detector should not rerun after cacheable detection")
                 })
                 .expect("cached full capabilities"),
             full_caps
         );
+    }
+
+    #[test]
+    fn startup_api_preserves_one_argument_entry_point() {
+        let _: fn(bool) -> Result<KernelCapabilities, KernelCapabilityError> =
+            KernelCapabilities::detect_for_startup;
+        let _: fn(bool) -> Result<KernelCapabilities, KernelCapabilityError> =
+            KernelCapabilities::detect_for_startup_with_sleepable_uprobe;
     }
 
     #[test]
@@ -781,23 +856,57 @@ mod tests {
         let cacheable_caps = caps(true, true, true, true, true);
 
         let first = cache
-            .get_or_detect(|| Ok(detection(uncacheable_caps, false)))
+            .get_or_detect(true, || Ok(detection(uncacheable_caps, false)))
             .expect("uncacheable startup result");
         assert_eq!(first, uncacheable_caps);
 
         let second = cache
-            .get_or_detect(|| Ok(detection(cacheable_caps, true)))
+            .get_or_detect(true, || Ok(detection(cacheable_caps, true)))
             .expect("cacheable startup result");
         assert_eq!(second, cacheable_caps);
 
         assert_eq!(
             cache
-                .get_or_detect(|| {
+                .get_or_detect(true, || {
                     panic!("full detector should not rerun after cacheable detection")
                 })
                 .expect("cached full capabilities"),
             cacheable_caps
         );
+    }
+
+    #[test]
+    fn base_capability_cache_does_not_hide_later_sleepable_detection() {
+        let cache = KernelCapabilityCache::new();
+        let base_caps = caps(true, true, true, false, false);
+        let sleepable_caps = caps(true, true, true, true, true);
+
+        assert_eq!(
+            cache
+                .get_or_detect(false, || Ok(detection(base_caps, true)))
+                .expect("base capabilities"),
+            base_caps
+        );
+        assert_eq!(
+            cache
+                .get_or_detect(true, || Ok(detection(sleepable_caps, true)))
+                .expect("sleepable capabilities"),
+            sleepable_caps
+        );
+    }
+
+    #[test]
+    fn disabled_sleepable_mode_skips_all_sleepable_probes() {
+        let (uprobe, tail_calls) = detect_sleepable_capabilities_with_detectors(
+            false,
+            || panic!("sleepable uprobe probe should not run when the mode is disabled"),
+            || panic!("sleepable tail-call probe should not run when the mode is disabled"),
+        );
+
+        assert!(!uprobe.supported);
+        assert!(!tail_calls.supported);
+        assert!(uprobe.cacheable);
+        assert!(tail_calls.cacheable);
     }
 
     #[test]
