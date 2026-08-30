@@ -268,7 +268,7 @@ pub(super) async fn create_and_attach_loader(
     Ok(loader)
 }
 
-pub(super) fn register_attached_trace(
+pub(super) async fn register_attached_trace(
     session: &mut GhostSession,
     script: &str,
     config: &ghostscope_compiler::UProbeConfig,
@@ -300,7 +300,11 @@ pub(super) fn register_attached_trace(
                 address_global_index: config.resolved_address_index,
             });
 
-    if let Err(e) = session.trace_manager.enable_trace(config.assigned_trace_id) {
+    if let Err(e) = session
+        .trace_manager
+        .enable_trace(config.assigned_trace_id)
+        .await
+    {
         warn!(
             "Failed to enable trace_id {}: {}",
             config.assigned_trace_id, e

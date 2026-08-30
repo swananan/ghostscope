@@ -9,7 +9,7 @@ pub async fn handle_disable_trace(
     trace_id: u32,
 ) {
     if let Some(ref mut session) = session {
-        match session.trace_manager.disable_trace(trace_id) {
+        match session.trace_manager.disable_trace(trace_id).await {
             Ok(_) => {
                 info!("✓ Disabled trace {}", trace_id);
                 let _ = runtime_channels
@@ -43,7 +43,7 @@ pub async fn handle_enable_trace(
     trace_id: u32,
 ) {
     if let Some(ref mut session) = session {
-        match session.trace_manager.enable_trace(trace_id) {
+        match session.trace_manager.enable_trace(trace_id).await {
             Ok(_) => {
                 info!("✓ Enabled trace {}", trace_id);
                 let _ = runtime_channels
@@ -77,7 +77,7 @@ pub async fn handle_disable_all_traces(
 ) {
     if let Some(ref mut session) = session {
         let trace_count = session.trace_manager.get_all_trace_ids().len();
-        match session.trace_manager.disable_all_traces() {
+        match session.trace_manager.disable_all_traces().await {
             Ok(_) => {
                 info!("✓ Disabled all traces (count: {})", trace_count);
                 let _ = runtime_channels
@@ -114,7 +114,7 @@ pub async fn handle_enable_all_traces(
 ) {
     if let Some(ref mut session) = session {
         let trace_count = session.trace_manager.get_all_trace_ids().len();
-        match session.trace_manager.enable_all_traces() {
+        match session.trace_manager.enable_all_traces().await {
             Ok(_) => {
                 info!("✓ Enabled all traces (count: {})", trace_count);
                 let _ = runtime_channels
@@ -151,7 +151,7 @@ pub async fn handle_delete_trace(
     trace_id: u32,
 ) {
     if let Some(ref mut session) = session {
-        match session.trace_manager.delete_trace(trace_id) {
+        match session.trace_manager.delete_trace(trace_id).await {
             Ok(_) => {
                 info!("✓ Deleted trace {}", trace_id);
                 let _ = runtime_channels
@@ -184,7 +184,7 @@ pub async fn handle_delete_all_traces(
     runtime_channels: &mut RuntimeChannels,
 ) {
     if let Some(ref mut session) = session {
-        match session.trace_manager.delete_all_traces() {
+        match session.trace_manager.delete_all_traces().await {
             Ok(count) => {
                 info!("✓ Deleted all traces (count: {})", count);
                 let _ = runtime_channels

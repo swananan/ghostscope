@@ -100,7 +100,7 @@ use ghostscope_process::pinned_bpf_maps::{
 
 /// Event output map type wrapper
 enum EventMap {
-    RingBuf(RingBuf<MapData>),
+    RingBuf(RingBufEventMap),
     PerfEventArray {
         _map: PerfEventArray<MapData>,
         cpu_buffers: Vec<PerfEventCpuBuffer>,
@@ -108,12 +108,19 @@ enum EventMap {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PerfBufferFd(RawFd);
+struct EventBufferFd(RawFd);
 
-impl AsRawFd for PerfBufferFd {
+impl AsRawFd for EventBufferFd {
     fn as_raw_fd(&self) -> RawFd {
         self.0
     }
+}
+
+struct RingBufEventMap {
+    // Fields are dropped in declaration order. Keep readiness first so Tokio
+    // deregisters the borrowed fd before RingBuf closes the underlying fd.
+    readiness: AsyncFd<EventBufferFd>,
+    ringbuf: RingBuf<MapData>,
 }
 
 fn log_backtrace_unwind_row_samples<T: Borrow<MapData>>(
@@ -152,8 +159,10 @@ fn log_backtrace_unwind_row_samples<T: Borrow<MapData>>(
 
 struct PerfEventCpuBuffer {
     cpu_id: u32,
+    // See RingBufEventMap: reactor registration must be removed before the
+    // perf buffer destroys the fd borrowed by EventBufferFd.
+    readiness: AsyncFd<EventBufferFd>,
     buffer: aya::maps::perf::PerfEventArrayBuffer<MapData>,
-    readiness: AsyncFd<PerfBufferFd>,
 }
 
 fn drain_perf_cpu_buffer(
@@ -785,7 +794,12 @@ impl GhostScopeLoader {
             let ringbuf: RingBuf<_> = map
                 .try_into()
                 .map_err(|e| LoaderError::Generic(format!("Failed to convert ringbuf map: {e}")))?;
-            EventMap::RingBuf(ringbuf)
+            let fd = ringbuf.as_raw_fd();
+            let readiness =
+                AsyncFd::with_interest(EventBufferFd(fd), Interest::READABLE).map_err(|err| {
+                    LoaderError::Generic(format!("Failed to register ring buffer fd: {err}"))
+                })?;
+            EventMap::RingBuf(RingBufEventMap { readiness, ringbuf })
         } else if let Some(map) = self.bpf.take_map("events") {
             info!("Initializing PerfEventArray event map");
             let mut perf_array: PerfEventArray<_> = map.try_into().map_err(|e| {
@@ -822,7 +836,7 @@ impl GhostScopeLoader {
                         }
                         let fd = buffer.as_raw_fd();
                         let readiness =
-                            AsyncFd::with_interest(PerfBufferFd(fd), Interest::READABLE).map_err(
+                            AsyncFd::with_interest(EventBufferFd(fd), Interest::READABLE).map_err(
                                 |err| {
                                     LoaderError::Generic(format!(
                                         "Failed to register perf buffer fd for CPU {cpu_id}: {err}"
@@ -831,8 +845,8 @@ impl GhostScopeLoader {
                             )?;
                         cpu_buffers.push(PerfEventCpuBuffer {
                             cpu_id,
-                            buffer,
                             readiness,
+                            buffer,
                         });
                     }
                     Err(e) => {
@@ -1071,23 +1085,26 @@ impl GhostScopeLoader {
         let mut events = Vec::with_capacity(MAX_EVENTS_PER_WAIT.min(128));
 
         match event_map {
-            EventMap::RingBuf(ringbuf) => {
-                // Create AsyncFd and wait for readable; clear readiness to avoid spin
-                let async_fd = AsyncFd::new(ringbuf.as_raw_fd())
-                    .map_err(|e| LoaderError::Generic(format!("Failed to create AsyncFd: {e}")))?;
-                let mut guard = async_fd
+            EventMap::RingBuf(event_map) => {
+                // The registration lives for the event map's lifetime. Keep its
+                // readiness set when a bounded batch stops before the ring is
+                // empty, so the next call resumes immediately even if the fd
+                // never transitions through another readiness edge.
+                let mut guard = event_map
+                    .readiness
                     .readable()
                     .await
                     .map_err(|e| LoaderError::Generic(format!("AsyncFd error: {e}")))?;
-                guard.clear_ready();
 
                 // Drain a bounded batch. Under very hot probes the ringbuf may never
                 // become empty, so an unbounded drain would starve output and signals.
                 let mut records_read = 0;
+                let mut drained_to_empty = false;
                 while events.len() < MAX_EVENTS_PER_WAIT
                     && records_read < MAX_RINGBUF_RECORDS_PER_WAIT
                 {
-                    let Some(item) = ringbuf.next() else {
+                    let Some(item) = event_map.ringbuf.next() else {
+                        drained_to_empty = true;
                         break;
                     };
                     records_read += 1;
@@ -1100,6 +1117,14 @@ impl GhostScopeLoader {
                             )));
                         }
                     }
+                }
+                if drained_to_empty {
+                    // `clear_ready` is tied to this guard's readiness event, so
+                    // a later edge is not lost if data arrives after the empty
+                    // observation.
+                    guard.clear_ready();
+                } else {
+                    guard.retain_ready();
                 }
                 if events.len() == MAX_EVENTS_PER_WAIT
                     || records_read == MAX_RINGBUF_RECORDS_PER_WAIT
