@@ -155,7 +155,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             return Ok(value);
         }
 
-        let target_type = self.context.custom_width_int_type(bit_width);
+        let target_type = self.custom_width_int_type(bit_width)?;
         if current_width > bit_width {
             self.builder
                 .build_int_truncate(value, target_type, name)
@@ -179,7 +179,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         let target_width = left_width.max(right_width);
-        let target_type = self.context.custom_width_int_type(target_width);
+        let target_type = self.custom_width_int_type(target_width)?;
         let left = if left_width < target_width {
             self.builder
                 .build_int_z_extend(left, target_type, "lhs_width_align")

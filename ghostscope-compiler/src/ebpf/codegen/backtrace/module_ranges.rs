@@ -68,7 +68,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .try_as_basic_value()
-            .left()
+            .basic()
             .ok_or_else(|| {
                 CodeGenError::LLVMError("proc_module_range_meta lookup returned void".to_string())
             })?;
@@ -276,7 +276,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .try_as_basic_value()
-            .left()
+            .basic()
             .ok_or_else(|| {
                 CodeGenError::LLVMError("proc_module_ranges lookup returned void".to_string())
             })?;

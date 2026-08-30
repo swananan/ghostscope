@@ -458,7 +458,7 @@ class JobStore:
         self._append_log(job, f"$ {' '.join(shlex.quote(part) for part in step.command)}")
 
         env = os.environ.copy()
-        env["LLVM_SYS_181_PREFIX"] = self.llvm_prefix
+        env["LLVM_SYS_221_PREFIX"] = self.llvm_prefix
         llvm_config = Path(self.llvm_prefix) / "bin" / "llvm-config"
         if llvm_config.exists():
             env["LLVM_CONFIG_PATH"] = str(llvm_config)
@@ -785,8 +785,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--llvm-prefix",
-        default="/usr/lib/llvm-18",
-        help="LLVM_SYS_181_PREFIX value",
+        default="/usr/lib/llvm-22",
+        help="LLVM_SYS_221_PREFIX value",
     )
     parser.add_argument(
         "--default-sudo",

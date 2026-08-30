@@ -22,7 +22,7 @@ Common env vars:
 
 - `HOST` / `PORT` (default: `127.0.0.1:8788`)
 - `DEFAULT_REPO_DIR` (or legacy `REPO_DIR`)
-- `LLVM_PREFIX` (default: `/usr/lib/llvm-18`)
+- `LLVM_PREFIX` (default: `/usr/lib/llvm-22`)
 - `DEFAULT_SUDO=1|0`
 - `E2E_SERVICE_TOKEN=<token>` (optional auth for POST)
 

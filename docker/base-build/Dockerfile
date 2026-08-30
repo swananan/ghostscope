@@ -39,9 +39,9 @@ RUN set -eux; \
     cmake --version; \
     rm -f /tmp/cmake.tar.gz
 
-# Build and install LLVM 18.1.x from source with FFI disabled
+# Build and install LLVM 22.1.x from source with FFI disabled
 # This removes the runtime dependency on libffi while keeping needed targets.
-ARG LLVM_VER=18.1.8
+ARG LLVM_VER=22.1.8
 RUN <<'SHELL'
 set -eux
 base_url="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}"
@@ -66,14 +66,14 @@ cmake -G Ninja -S /tmp/llvm/llvm -B /tmp/llvm-build \
   -DLLVM_ENABLE_TERMINFO=OFF \
   -DLLVM_ENABLE_ZLIB=ON \
   -DLLVM_ENABLE_ZSTD=ON \
-  -DCMAKE_INSTALL_PREFIX=/opt/llvm-18
+  -DCMAKE_INSTALL_PREFIX=/opt/llvm-22
 ninja -C /tmp/llvm-build install
 # Wrap llvm-config to filter out any stray -lffi from system-libs output
-if [ -x /opt/llvm-18/bin/llvm-config ]; then
-  mv /opt/llvm-18/bin/llvm-config /opt/llvm-18/bin/llvm-config.real
-  cat > /opt/llvm-18/bin/llvm-config <<'WRAP'
+if [ -x /opt/llvm-22/bin/llvm-config ]; then
+  mv /opt/llvm-22/bin/llvm-config /opt/llvm-22/bin/llvm-config.real
+  cat > /opt/llvm-22/bin/llvm-config <<'WRAP'
 #!/bin/sh
-REAL="/opt/llvm-18/bin/llvm-config.real"
+REAL="/opt/llvm-22/bin/llvm-config.real"
 # Capture stdout+stderr and original exit status
 OUT="$($REAL "$@" 2>&1)"; RC=$?
 if [ $RC -ne 0 ]; then
@@ -91,7 +91,7 @@ case " $* " in
 esac
 exit 0
 WRAP
-  chmod +x /opt/llvm-18/bin/llvm-config
+  chmod +x /opt/llvm-22/bin/llvm-config
 fi
 rm -rf /tmp/llvm /tmp/llvm-build /tmp/llvm.tar.xz
 SHELL
@@ -111,8 +111,8 @@ SHELL
 ENV PATH="/root/.cargo/bin:$PATH"
 
 # Expose LLVM to llvm-sys/inkwell
-ENV LLVM_SYS_181_PREFIX=/opt/llvm-18
-ENV PATH="/opt/llvm-18/bin:$PATH"
+ENV LLVM_SYS_221_PREFIX=/opt/llvm-22
+ENV PATH="/opt/llvm-22/bin:$PATH"
 
 # Set working directory
 WORKDIR /workspace

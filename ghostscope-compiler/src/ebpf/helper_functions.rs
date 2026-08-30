@@ -180,7 +180,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .try_as_basic_value()
-            .left()
+            .basic()
             .ok_or_else(|| {
                 CodeGenError::LLVMError("pid_aliases lookup returned void".to_string())
             })?;
@@ -285,7 +285,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .try_as_basic_value()
-            .left()
+            .basic()
             .ok_or_else(|| {
                 CodeGenError::LLVMError("get_current_pid_tgid returned void".to_string())
             })?;
@@ -668,7 +668,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .try_as_basic_value()
-            .left()
+            .basic()
             .ok_or_else(|| CodeGenError::LLVMError("map_lookup_elem returned void".to_string()))?;
 
         let null_ptr = ptr_type.const_null();
@@ -1351,7 +1351,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         // Convert CallSiteValue to BasicValueEnum
-        Ok(call_result.try_as_basic_value().left().unwrap_or_else(|| {
+        Ok(call_result.try_as_basic_value().basic().unwrap_or_else(|| {
             // If it's void, return a null value of the expected type
             return_type.const_zero()
         }))
@@ -1486,7 +1486,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let ret_i32 = call_site
             .try_as_basic_value()
-            .left()
+            .basic()
             .ok_or_else(|| {
                 CodeGenError::LLVMError("Expected integer return from helper".to_string())
             })?

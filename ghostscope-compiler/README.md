@@ -10,7 +10,7 @@ diagnostics belong in `ghostscope-dwarf`; this crate consumes the resulting plan
 and focuses on safe code generation.
 
 ## Build Requirements
-- LLVM 18.x with `llvm-config` available on `PATH` (or set `LLVM_CONFIG_PATH`)
-- The `inkwell` crate's `llvm18-1` feature expects a shared build; consult your package manager or build from source with `-DLLVM_ENABLE_PROJECTS=clang;lld`
+- LLVM 22.1.x with `llvm-config` available on `PATH`
+- The `inkwell` crate's `llvm22-1` feature expects LLVM libraries from your package manager or a source build with the BPF target enabled
 
-If LLVM lives in a non-standard directory, export `LLVM_SYS_180_PREFIX` or `LLVM_CONFIG_PATH` before invoking Cargo. The top-level documentation explains the full workflow: <https://github.com/swananan/ghostscope#readme>.
+If LLVM lives in a non-standard directory, export `LLVM_SYS_221_PREFIX` before invoking Cargo. The top-level documentation explains the full workflow: <https://github.com/swananan/ghostscope#readme>.

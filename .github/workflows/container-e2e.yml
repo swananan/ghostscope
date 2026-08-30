@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+      LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
       FIXTURE_COMPILER_IMAGE: ghcr.io/swananan/ghostscope-fixture-compiler@sha256:b1e716ec17610673dcaf69497bd93ef0c700a2ad7fe8265d6764d15a8c1edc89
       FIXTURE_COMPILER_CACHE_REV: b1e716ec17610673dcaf69497bd93ef0c700a2ad7fe8265d6764d15a8c1edc89-fixture-archive
     strategy:
@@ -41,12 +41,12 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install LLVM 18 and Polly
+      - name: Install LLVM 22 and Polly
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          sudo ./llvm.sh 18
-          sudo apt-get install -y llvm-18-dev libpolly-18-dev
+          sudo ./llvm.sh 22
+          sudo apt-get install -y llvm-22-dev libpolly-22-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.88.0
@@ -102,8 +102,8 @@ jobs:
 
       - name: Run container topology full e2e
         env:
-          E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4
-          E2E_CHILD_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4
+          E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-e2e-runtime@sha256:832c5df935efcd6862e492ac4da2235ef411f494bf66879d737c04d0e96b9bdc
+          E2E_CHILD_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-e2e-runtime@sha256:832c5df935efcd6862e492ac4da2235ef411f494bf66879d737c04d0e96b9bdc
           E2E_RUN_CONTAINER_TOPOLOGY: 1
           E2E_SANDBOX_SESSION: container-e2e-${{ github.run_id }}-${{ github.job }}-${{ matrix.name }}
           E2E_GHOSTSCOPE_SANDBOX: ${{ matrix.ghostscope_sandbox }}
@@ -136,7 +136,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+      LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
       FIXTURE_COMPILER_IMAGE: ghcr.io/swananan/ghostscope-fixture-compiler@sha256:b1e716ec17610673dcaf69497bd93ef0c700a2ad7fe8265d6764d15a8c1edc89
       FIXTURE_COMPILER_CACHE_REV: b1e716ec17610673dcaf69497bd93ef0c700a2ad7fe8265d6764d15a8c1edc89-fixture-archive
     strategy:
@@ -153,12 +153,12 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install LLVM 18 and Polly
+      - name: Install LLVM 22 and Polly
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          sudo ./llvm.sh 18
-          sudo apt-get install -y llvm-18-dev libpolly-18-dev
+          sudo ./llvm.sh 22
+          sudo apt-get install -y llvm-22-dev libpolly-22-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.88.0
@@ -214,8 +214,8 @@ jobs:
 
       - name: Run host-PID same-sandbox smoke
         env:
-          E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4
-          E2E_CHILD_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4
+          E2E_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-e2e-runtime@sha256:832c5df935efcd6862e492ac4da2235ef411f494bf66879d737c04d0e96b9bdc
+          E2E_CHILD_CONTAINER_IMAGE: ghcr.io/swananan/ghostscope-e2e-runtime@sha256:832c5df935efcd6862e492ac4da2235ef411f494bf66879d737c04d0e96b9bdc
           E2E_SANDBOX_SESSION: container-e2e-${{ github.run_id }}-${{ github.job }}-${{ matrix.name }}
           E2E_GHOSTSCOPE_SANDBOX: ${{ matrix.ghostscope_sandbox }}
           E2E_TARGET_SANDBOX: ${{ matrix.target_sandbox }}

@@ -78,6 +78,12 @@ impl From<&str> for MapError {
     }
 }
 
+impl From<inkwell::Error> for MapError {
+    fn from(err: inkwell::Error) -> Self {
+        MapError::DebugInfo(err.to_string())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, MapError>;
 
 impl<'ctx> MapManager<'ctx> {
