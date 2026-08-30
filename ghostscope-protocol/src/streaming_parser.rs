@@ -242,21 +242,27 @@ impl StreamingTraceParser {
             self.parse_state
         );
 
+        // Advance through the buffer by index so parsing several instructions from one
+        // segment does not repeatedly move the unread suffix to the front of the Vec.
+        let mut cursor = 0;
+
         // Process buffer in a loop until we can't make progress
         loop {
             let state = std::mem::replace(&mut self.parse_state, ParseState::Complete);
             let consumed = match state {
                 ParseState::WaitingForHeader => {
                     // Try to read header
-                    let (header, _rest) = match TraceEventHeader::read_from_prefix(&self.buffer) {
+                    let unread = &self.buffer[cursor..];
+                    let (header, _rest) = match TraceEventHeader::read_from_prefix(unread) {
                         Ok((h, r)) => (h, r),
                         Err(_) => {
                             self.parse_state = ParseState::WaitingForHeader;
                             debug!(
                                 "Waiting for more data for header (have {} bytes, need {})",
-                                self.buffer.len(),
+                                unread.len(),
                                 std::mem::size_of::<TraceEventHeader>()
                             );
+                            self.compact_buffer(cursor);
                             return Ok(None);
                         }
                     };
@@ -274,15 +280,17 @@ impl StreamingTraceParser {
 
                 ParseState::WaitingForMessage { header } => {
                     // Try to read message
-                    let (message, _rest) = match TraceEventMessage::read_from_prefix(&self.buffer) {
+                    let unread = &self.buffer[cursor..];
+                    let (message, _rest) = match TraceEventMessage::read_from_prefix(unread) {
                         Ok((m, r)) => (m, r),
                         Err(_) => {
                             self.parse_state = ParseState::WaitingForMessage { header };
                             debug!(
                                 "Waiting for more data for message (have {} bytes, need {})",
-                                self.buffer.len(),
+                                unread.len(),
                                 std::mem::size_of::<TraceEventMessage>()
                             );
+                            self.compact_buffer(cursor);
                             return Ok(None);
                         }
                     };
@@ -310,7 +318,7 @@ impl StreamingTraceParser {
                     mut instructions,
                 } => {
                     // Try to parse instruction from buffer
-                    match self.try_parse_instruction(&self.buffer, trace_context)? {
+                    match self.try_parse_instruction(&self.buffer[cursor..], trace_context)? {
                         Some((parsed_instruction, consumed_bytes)) => {
                             // Check if this is EndInstruction
                             if matches!(
@@ -335,15 +343,16 @@ impl StreamingTraceParser {
 
                                 // Reset state for next event
                                 self.parse_state = ParseState::WaitingForHeader;
+                                let event_consumed = cursor + consumed_bytes;
 
                                 // Handle buffer cleanup based on event source
                                 match self.event_source {
                                     EventSource::RingBuf => {
                                         // RingBuf: continuous stream, preserve residual bytes
-                                        self.buffer.drain(..consumed_bytes);
+                                        self.compact_buffer(event_consumed);
                                         debug!(
                                             "RingBuf mode: consumed {} bytes, {} bytes remain in buffer",
-                                            consumed_bytes,
+                                            event_consumed,
                                             self.buffer.len()
                                         );
                                     }
@@ -377,6 +386,7 @@ impl StreamingTraceParser {
                                 instructions,
                             };
                             debug!("Waiting for more data for instruction");
+                            self.compact_buffer(cursor);
                             return Ok(None);
                         }
                     }
@@ -389,15 +399,28 @@ impl StreamingTraceParser {
                 }
             };
 
-            // Consume processed bytes from buffer
+            // Keep parsed bytes in place until the event completes or more data is needed.
             if consumed > 0 {
-                self.buffer.drain(..consumed);
+                cursor += consumed;
                 debug!(
-                    "Consumed {} bytes, buffer now has {} bytes",
+                    "Advanced parser cursor by {} bytes, {} unread bytes remain",
                     consumed,
-                    self.buffer.len()
+                    self.buffer.len() - cursor
                 );
             }
+        }
+    }
+
+    fn compact_buffer(&mut self, consumed: usize) {
+        debug_assert!(consumed <= self.buffer.len());
+        if consumed == 0 {
+            return;
+        }
+
+        if consumed == self.buffer.len() {
+            self.buffer.clear();
+        } else {
+            self.buffer.drain(..consumed);
         }
     }
 
@@ -874,6 +897,53 @@ impl ParsedInstruction {
 mod tests {
     use super::*;
 
+    fn append_instruction_header(
+        buffer: &mut Vec<u8>,
+        instruction_type: InstructionType,
+        data_length: usize,
+    ) {
+        buffer.push(instruction_type as u8);
+        buffer.extend_from_slice(
+            &u16::try_from(data_length)
+                .expect("test instruction data length fits in u16")
+                .to_le_bytes(),
+        );
+        buffer.push(0);
+    }
+
+    fn print_string_event(trace_id: u64, string_index: u16) -> Vec<u8> {
+        let mut event = Vec::new();
+        let header = TraceEventHeader {
+            magic: crate::consts::MAGIC,
+        };
+        event.extend_from_slice(zerocopy::IntoBytes::as_bytes(&header));
+
+        let message = TraceEventMessage {
+            trace_id,
+            timestamp: trace_id + 1,
+            pid: 10,
+            tid: 11,
+        };
+        event.extend_from_slice(zerocopy::IntoBytes::as_bytes(&message));
+
+        append_instruction_header(
+            &mut event,
+            InstructionType::PrintStringIndex,
+            std::mem::size_of::<PrintStringIndexData>(),
+        );
+        event.extend_from_slice(&string_index.to_le_bytes());
+
+        append_instruction_header(
+            &mut event,
+            InstructionType::EndInstruction,
+            std::mem::size_of::<EndInstructionData>(),
+        );
+        event.extend_from_slice(&1u16.to_le_bytes());
+        event.push(0);
+        event.push(0);
+        event
+    }
+
     #[test]
     fn test_streaming_parser() {
         let mut trace_context = TraceContext::new();
@@ -1074,6 +1144,64 @@ mod tests {
             }
             other => panic!("unexpected instruction: {other:?}"),
         }
+    }
+
+    #[test]
+    fn compacts_parsed_prefix_when_instruction_needs_another_segment() {
+        let mut trace_context = TraceContext::new();
+        let string_index = trace_context
+            .add_string("hello".to_string())
+            .expect("add test string");
+        let event = print_string_event(7, string_index);
+        let end_instruction_size =
+            std::mem::size_of::<InstructionHeader>() + std::mem::size_of::<EndInstructionData>();
+        let split = event.len() - end_instruction_size + 2;
+        let mut parser = StreamingTraceParser::new();
+
+        assert!(parser
+            .process_segment(&event[..split], &trace_context)
+            .expect("parse first segment")
+            .is_none());
+        assert!(matches!(
+            &parser.parse_state,
+            ParseState::WaitingForInstructions { .. }
+        ));
+        assert_eq!(parser.buffer, event[split - 2..split]);
+
+        let parsed = parser
+            .process_segment(&event[split..], &trace_context)
+            .expect("parse second segment")
+            .expect("event completes");
+        assert_eq!(parsed.trace_id, 7);
+        assert_eq!(parsed.instructions.len(), 2);
+        assert!(parser.buffer.is_empty());
+    }
+
+    #[test]
+    fn ringbuf_preserves_the_next_event_after_completing_one() {
+        let mut trace_context = TraceContext::new();
+        let string_index = trace_context
+            .add_string("hello".to_string())
+            .expect("add test string");
+        let first = print_string_event(1, string_index);
+        let second = print_string_event(2, string_index);
+        let mut segment = first;
+        segment.extend_from_slice(&second);
+        let mut parser = StreamingTraceParser::new();
+
+        let first = parser
+            .process_segment(&segment, &trace_context)
+            .expect("parse concatenated events")
+            .expect("first event completes");
+        assert_eq!(first.trace_id, 1);
+        assert_eq!(parser.buffer, second);
+
+        let second = parser
+            .process_segment(&[], &trace_context)
+            .expect("parse buffered event")
+            .expect("second event completes");
+        assert_eq!(second.trace_id, 2);
+        assert!(parser.buffer.is_empty());
     }
 
     #[test]

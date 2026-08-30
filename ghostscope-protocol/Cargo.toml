@@ -24,5 +24,12 @@ gimli = { workspace = true }
 ghostscope-platform = { version = "0.1.6", path = "../ghostscope-platform" }
 zerocopy = { version = "0.8", features = ["derive"] }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
 [features]
 aya-pod = ["dep:aya"]
+
+[[bench]]
+name = "streaming_parser"
+harness = false
