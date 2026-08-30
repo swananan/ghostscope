@@ -382,56 +382,75 @@ impl LoadedObjfile {
                 error
             );
         }
-        for &tag in tags {
-            let loc = self
-                .type_name_index
-                .read()
-                .expect("type name index lock poisoned")
-                .find_aggregate_definition(name, tag);
-            if let Some(loc) = loc {
-                let ty = self.detailed_shallow_type(loc.cu_offset, loc.die_offset)?;
-                return Some((
-                    ty,
-                    TypeLoc {
-                        cu_off: loc.cu_offset,
-                        die_off: loc.die_offset,
-                    },
-                ));
-            }
-        }
-
-        let typedef = self
-            .type_name_index
-            .read()
-            .expect("type name index lock poisoned")
-            .find_typedef(name);
-        if let Some(td) = typedef {
-            let dwarf = self.dwarf();
-            if let Ok(unit) = self.unit(td.cu_offset) {
-                if let Ok(entry) = unit.entry(td.die_offset) {
-                    if let Ok(Some(type_loc)) = resolve_type_ref_with_origins(dwarf, &entry, &unit)
-                    {
-                        let ty = self.detailed_shallow_type(type_loc.cu_off, type_loc.die_off)?;
-                        return Some((ty, type_loc));
-                    }
-                    let ty = crate::parser::DetailedParser::resolve_type_shallow_at_offset(
-                        dwarf,
-                        &unit,
-                        td.die_offset,
-                        self.compilation_unit_language(td.cu_offset, &unit),
-                    )?;
+        let resolve_materialized = || -> Option<(crate::TypeInfo, TypeLoc)> {
+            for &tag in tags {
+                let loc = self
+                    .type_name_index
+                    .read()
+                    .expect("type name index lock poisoned")
+                    .find_aggregate_definition(name, tag);
+                if let Some(loc) = loc {
+                    let ty = self.detailed_shallow_type(loc.cu_offset, loc.die_offset)?;
                     return Some((
                         ty,
                         TypeLoc {
-                            cu_off: td.cu_offset,
-                            die_off: td.die_offset,
+                            cu_off: loc.cu_offset,
+                            die_off: loc.die_offset,
                         },
                     ));
                 }
             }
+
+            let typedef = self
+                .type_name_index
+                .read()
+                .expect("type name index lock poisoned")
+                .find_typedef(name);
+            if let Some(td) = typedef {
+                let dwarf = self.dwarf();
+                if let Ok(unit) = self.unit(td.cu_offset) {
+                    if let Ok(entry) = unit.entry(td.die_offset) {
+                        if let Ok(Some(type_loc)) =
+                            resolve_type_ref_with_origins(dwarf, &entry, &unit)
+                        {
+                            let ty =
+                                self.detailed_shallow_type(type_loc.cu_off, type_loc.die_off)?;
+                            return Some((ty, type_loc));
+                        }
+                        let ty = crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+                            dwarf,
+                            &unit,
+                            td.die_offset,
+                            self.compilation_unit_language(td.cu_offset, &unit),
+                        )?;
+                        return Some((
+                            ty,
+                            TypeLoc {
+                                cu_off: td.cu_offset,
+                                die_off: td.die_offset,
+                            },
+                        ));
+                    }
+                }
+            }
+
+            None
+        };
+
+        let resolved = resolve_materialized();
+        if resolved.is_some() || !self.uses_gnu_pub_index() {
+            return resolved;
         }
 
-        None
+        if let Err(error) = self.ensure_all_debug_info_for_gnu_index() {
+            tracing::warn!(
+                "Failed to exhaust GNU-indexed DWARF for type '{}' in {}: {}",
+                name,
+                self.module_path().display(),
+                error
+            );
+        }
+        resolve_materialized()
     }
 
     pub(crate) fn get_visible_variables_at_address_best_effort_with_diagnostics(

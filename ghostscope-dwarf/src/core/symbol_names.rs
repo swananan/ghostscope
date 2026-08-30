@@ -46,7 +46,50 @@ pub(crate) fn normalize_demangled_signature(s: &str) -> Option<String> {
 }
 
 pub(crate) fn plain_leaf(name: &str) -> &str {
-    name.rsplit("::").next().unwrap_or(name)
+    let mut angle_depth = 0_u32;
+    let mut paren_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
+    let mut leaf_start = 0;
+    let mut chars = name.char_indices().peekable();
+
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '<' => angle_depth = angle_depth.saturating_add(1),
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth = bracket_depth.saturating_add(1),
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            ':' if angle_depth == 0
+                && paren_depth == 0
+                && bracket_depth == 0
+                && chars.peek().is_some_and(|(_, next)| *next == ':') =>
+            {
+                let _ = chars.next();
+                leaf_start = index + 2;
+            }
+            _ => {}
+        }
+    }
+
+    &name[leaf_start..]
+}
+
+fn raw_symbol_matches_query(raw_symbol: &str, query: &str) -> bool {
+    let raw_leaf = plain_leaf(raw_symbol);
+    let query_leaf = plain_leaf(query);
+    if raw_symbol == query
+        || raw_leaf == query
+        || raw_symbol == query_leaf
+        || raw_leaf == query_leaf
+    {
+        return true;
+    }
+
+    let Some((callable_leaf, _)) = query_leaf.split_once('(') else {
+        return false;
+    };
+    !callable_leaf.is_empty() && (raw_symbol == callable_leaf || raw_leaf == callable_leaf)
 }
 
 pub(crate) fn symbol_name_matches_query(
@@ -55,12 +98,12 @@ pub(crate) fn symbol_name_matches_query(
     raw_symbol: &str,
     demangled: Option<&DemangledName>,
 ) -> bool {
-    if raw_symbol == query || plain_leaf(raw_symbol) == query {
+    if raw_symbol_matches_query(raw_symbol, query) {
         return true;
     }
 
     if let Some(normalized_query) = normalized_query {
-        if raw_symbol == normalized_query || plain_leaf(raw_symbol) == normalized_query {
+        if raw_symbol_matches_query(raw_symbol, normalized_query) {
             return true;
         }
     }
@@ -467,9 +510,15 @@ fn should_index_fragment(fragment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        demangled_name, extract_name_fragments, normalize_demangled_signature,
+        demangled_name, extract_name_fragments, normalize_demangled_signature, plain_leaf,
         symbol_name_matches_query,
     };
+
+    #[test]
+    fn extracts_template_aware_cpp_leaf() {
+        assert_eq!(plain_leaf("ns2::Box<ns1::Inner>"), "Box<ns1::Inner>");
+        assert_eq!(plain_leaf("ns2::f(ns1::Inner)"), "f(ns1::Inner)");
+    }
 
     #[test]
     fn extracts_plain_name_fragments() {
@@ -521,6 +570,17 @@ mod tests {
             normalize_demangled_signature("ns::Widget::run( )").as_deref(),
             "_ZN2ns6Widget3runEv",
             Some(&demangled)
+        ));
+    }
+
+    #[test]
+    fn matches_unqualified_dwarf_names_against_qualified_signatures() {
+        assert!(symbol_name_matches_query("ns::f(int)", None, "f", None));
+        assert!(symbol_name_matches_query(
+            "ns::nested_member_probe",
+            None,
+            "nested_member_probe",
+            None
         ));
     }
 }

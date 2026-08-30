@@ -88,6 +88,7 @@ jobs:
           ./scripts/dwarf-perf/build_corpus.sh
           parse_targets=(
             parse-stress
+            gnu-pubnames-stress
             rust-parse-stress
             cpp-template-stress
             rust-generic-stress

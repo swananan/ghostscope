@@ -1,5 +1,6 @@
 pub(crate) mod block_index;
 pub(crate) mod cfi_index;
+pub(crate) mod gnu_pub_index;
 pub(crate) mod lightweight_file_index;
 pub(crate) mod lightweight_index;
 pub(crate) mod line_mapping;
@@ -11,6 +12,7 @@ pub(crate) use block_index::{BlockIndex, BlockIndexBuilder, FunctionBlocks, VarR
 #[cfg(test)]
 pub(crate) use block_index::{BlockNode, CallSiteParameter, CallSiteRecord};
 pub(crate) use cfi_index::CfiIndex;
+pub(crate) use gnu_pub_index::GnuPubIndex;
 pub(crate) use lightweight_file_index::{LightweightFileIndex, ScopedFileIndexManager};
 pub(crate) use lightweight_index::{LightweightIndex, LightweightIndexShard};
 pub(crate) use line_mapping::LineMappingTable;

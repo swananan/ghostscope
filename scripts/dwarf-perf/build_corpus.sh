@@ -93,6 +93,7 @@ docker run --rm \
 echo "Host artifacts:"
 echo "  $OUT_DIR/query-hotspot/query_hotspot"
 echo "  $OUT_DIR/parse-stress/parse_stress"
+echo "  $OUT_DIR/gnu-pubnames-stress/gnu_pubnames_stress"
 echo "  $OUT_DIR/rust-parse-stress/rust_parse_stress"
 echo "  $OUT_DIR/cpp-template-stress/cpp_template_stress"
 echo "  $OUT_DIR/rust-generic-stress/rust_generic_stress"

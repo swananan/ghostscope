@@ -12,6 +12,7 @@ from typing import Any
 MAX_HISTORY_ENTRIES = 500
 PREFERRED_PARSE_TARGETS = [
     "parse-stress",
+    "gnu-pubnames-stress",
     "rust-parse-stress",
     "cpp-template-stress",
     "rust-generic-stress",

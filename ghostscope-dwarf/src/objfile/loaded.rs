@@ -4,7 +4,7 @@ use crate::{
     binary::{DwarfReader, MappedFile},
     core::{mapping::ModuleMapping, DebugInfoSource, Result},
     index::{
-        BlockIndex, GdbIndex, GdbSymbolKind, LightweightIndex, LineMappingTable,
+        BlockIndex, GdbIndex, GdbSymbolKind, GnuPubIndex, LightweightIndex, LineMappingTable,
         ScopedFileIndexManager, TypeNameIndex,
     },
     objfile::ModuleUnwindInfo,
@@ -118,6 +118,7 @@ pub(crate) struct LoadedObjfile {
     pub(super) block_index: RwLock<BlockIndex>,
     pub(super) type_name_index: RwLock<TypeNameIndex>,
     pub(super) gdb_index: Option<GdbIndex>,
+    pub(super) gnu_pub_index: Option<GnuPubIndex>,
     pub(super) dwarf_index_status: crate::DwarfIndexStatus,
     pub(super) lazy_debug_info: bool,
     pub(super) indexed_debug_info_cus: Mutex<HashSet<gimli::DebugInfoOffset>>,
@@ -163,6 +164,13 @@ impl LoadedObjfile {
                 ),
             }
         }
+        if let Err(error) = self.ensure_all_debug_info_for_gnu_index() {
+            tracing::warn!(
+                "Failed to materialize all GNU-indexed DWARF functions in {}: {}",
+                self.module_path().display(),
+                error
+            );
+        }
         self.lightweight_index
             .read()
             .expect("lightweight index lock poisoned")
@@ -182,6 +190,13 @@ impl LoadedObjfile {
                     error
                 ),
             }
+        }
+        if let Err(error) = self.ensure_all_debug_info_for_gnu_index() {
+            tracing::warn!(
+                "Failed to materialize all GNU-indexed DWARF variables in {}: {}",
+                self.module_path().display(),
+                error
+            );
         }
         self.lightweight_index
             .read()
@@ -204,6 +219,9 @@ impl LoadedObjfile {
                 .symbol_names(GdbSymbolKind::Type)
                 .map_or(0, <[String]>::len);
             return (functions, variables, functions + variables + types);
+        }
+        if let Some(index) = &self.gnu_pub_index {
+            return index.get_stats();
         }
         self.lightweight_index
             .read()
@@ -256,15 +274,27 @@ impl LoadedObjfile {
         kind: GdbSymbolKind,
         match_variants: bool,
     ) -> Result<()> {
-        let Some(index) = &self.gdb_index else {
-            return Ok(());
-        };
-        let symbols = if match_variants {
-            index.lookup_matching_symbols(name, kind)?
-        } else {
-            index.lookup_symbol(name, kind)?
-        };
-        self.ensure_debug_info_cus(symbols.into_iter().map(|symbol| symbol.cu_offset))
+        if let Some(index) = &self.gdb_index {
+            let symbols = if match_variants {
+                index.lookup_matching_symbols(name, kind)?
+            } else {
+                index.lookup_symbol(name, kind)?
+            };
+            return self.ensure_debug_info_cus(symbols.into_iter().map(|symbol| symbol.cu_offset));
+        }
+
+        if let Some(index) = &self.gnu_pub_index {
+            let mut unit_offsets = index.lookup_units(name, kind, match_variants);
+            if unit_offsets.is_empty() && !match_variants {
+                unit_offsets = index.lookup_units(name, kind, true);
+            }
+            if unit_offsets.is_empty() {
+                return self.ensure_all_debug_info_for_gnu_index();
+            }
+            return self.ensure_debug_info_cus(unit_offsets);
+        }
+
+        Ok(())
     }
 
     pub(super) fn ensure_debug_info_for_address(&self, address: u64) -> Result<()> {
@@ -334,6 +364,17 @@ impl LoadedObjfile {
             .flat_map(|(_, offsets)| offsets.iter().copied())
             .collect::<Vec<_>>();
         self.ensure_line_info_cus(unit_offsets)
+    }
+
+    pub(super) fn uses_gnu_pub_index(&self) -> bool {
+        self.gnu_pub_index.is_some()
+    }
+
+    pub(super) fn ensure_all_debug_info_for_gnu_index(&self) -> Result<()> {
+        let Some(index) = &self.gnu_pub_index else {
+            return Ok(());
+        };
+        self.ensure_debug_info_cus(index.all_unit_offsets().iter().copied())
     }
 
     fn ensure_debug_info_cus(

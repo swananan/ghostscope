@@ -303,6 +303,404 @@ fn test_read_uleb128_rejects_values_that_overflow_u64() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn test_gnu_pubnames_resolve_symbols_lazily_and_reject_corruption() -> anyhow::Result<()> {
+    init();
+
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample_program");
+    let temp_dir = tempfile::tempdir()?;
+    let mut indexed_binaries = Vec::new();
+
+    for compiler in ["gcc", "clang"] {
+        if !command_available(compiler) {
+            continue;
+        }
+        for optimization in ["O0", "O2"] {
+            let indexed = temp_dir.path().join(format!(
+                "sample_program.{compiler}-{optimization}-gnu-pubnames"
+            ));
+            run_command(
+                StdCommand::new(compiler)
+                    .arg("-gdwarf-5")
+                    .arg("-ggnu-pubnames")
+                    .arg(format!("-{optimization}"))
+                    .arg(fixture_dir.join("sample_program.c"))
+                    .arg(fixture_dir.join("sample_lib.c"))
+                    .arg("-o")
+                    .arg(&indexed),
+                &format!("{compiler} {optimization} GNU pubnames fixture build"),
+            )?;
+
+            let indexed_bytes = fs::read(&indexed)?;
+            let indexed_object = object::File::parse(&*indexed_bytes)?;
+            anyhow::ensure!(
+                indexed_object
+                    .section_by_name(".debug_gnu_pubnames")
+                    .is_some(),
+                "{compiler} {optimization} -ggnu-pubnames did not emit .debug_gnu_pubnames"
+            );
+            anyhow::ensure!(
+                indexed_object
+                    .section_by_name(".debug_gnu_pubtypes")
+                    .is_some(),
+                "{compiler} {optimization} -ggnu-pubnames did not emit .debug_gnu_pubtypes"
+            );
+            anyhow::ensure!(
+                indexed_object.section_by_name(".debug_names").is_none()
+                    && indexed_object.section_by_name(".gdb_index").is_none(),
+                "{compiler} {optimization} GNU pubnames fixture unexpectedly contains a higher-priority index"
+            );
+
+            let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&indexed).await?;
+            assert_eq!(
+                analyzer.dwarf_index_status_for_module(&indexed),
+                Some(&ghostscope_dwarf::DwarfIndexStatus::GnuPubNames),
+                "GhostScope did not select {compiler} {optimization} GNU pubnames"
+            );
+            assert_native_index_queries(&analyzer, &indexed, "GNU pubnames")?;
+
+            let function_address = find_symbol_address(&indexed, "calculate_something")?;
+            let context = analyzer.resolve_pc(&ghostscope_dwarf::ModuleAddress::new(
+                indexed.clone(),
+                function_address,
+            ))?;
+            assert_eq!(
+                context.function_name.as_deref(),
+                Some("calculate_something"),
+                "{compiler} {optimization} GNU pubnames did not seed address-based lazy CU loading"
+            );
+            indexed_binaries.push(indexed);
+        }
+    }
+
+    if let Some(compiler) = ["g++", "clang++"]
+        .into_iter()
+        .find(|compiler| command_available(compiler))
+    {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cpp_complex_program/main.cpp");
+        let indexed = temp_dir
+            .path()
+            .join(format!("cpp_complex.{compiler}-gnu-pubnames"));
+        run_command(
+            StdCommand::new(compiler)
+                .arg("-gdwarf-5")
+                .arg("-ggnu-pubnames")
+                .arg("-O0")
+                .arg(&source)
+                .arg("-o")
+                .arg(&indexed),
+            &format!("{compiler} C++ GNU pubnames fixture build"),
+        )?;
+
+        let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&indexed).await?;
+        assert_eq!(
+            analyzer.dwarf_index_status_for_module(&indexed),
+            Some(&ghostscope_dwarf::DwarfIndexStatus::GnuPubNames),
+            "GhostScope did not select {compiler} C++ GNU pubnames"
+        );
+        assert!(
+            !analyzer
+                .lookup_function_addresses("ns1::nested_member_probe")
+                .is_empty(),
+            "C++ GNU pubnames did not resolve a qualified function name"
+        );
+        let outer = analyzer
+            .resolve_struct_type_shallow_by_name("Outer")
+            .context("C++ GNU pubtypes did not resolve the leaf type name Outer")?;
+        assert_eq!(outer.size(), 16, "unexpected ns1::Outer size");
+        assert!(
+            analyzer
+                .find_global_variables_by_name("g_counter")
+                .iter()
+                .any(|(_, global)| global.link_address.is_some()),
+            "C++ GNU pubnames did not resolve g_counter"
+        );
+    }
+
+    let lossy_source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gnu_pubnames_lossy/main.cpp");
+    for compiler in ["g++", "clang++"] {
+        if !command_available(compiler) {
+            continue;
+        }
+        let lossy = temp_dir
+            .path()
+            .join(format!("gnu-pubnames-lossy.{compiler}"));
+        run_command(
+            StdCommand::new(compiler)
+                .arg("-gdwarf-5")
+                .arg("-ggnu-pubnames")
+                .arg("-O0")
+                .arg(&lossy_source)
+                .arg("-o")
+                .arg(&lossy),
+            &format!("{compiler} lossy GNU pubnames fixture build"),
+        )?;
+
+        let overload_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lossy).await?;
+        assert_eq!(
+            overload_analyzer.dwarf_index_status_for_module(&lossy),
+            Some(&ghostscope_dwarf::DwarfIndexStatus::GnuPubNames),
+            "GhostScope did not select {compiler} lossy GNU pubnames"
+        );
+        let overloads = overload_analyzer.lookup_function_addresses("ns2::f");
+        assert_eq!(
+            overloads.len(),
+            2,
+            "{compiler} GNU pubnames did not materialize both ns2::f overloads: {overloads:?}"
+        );
+
+        let signature_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lossy).await?;
+        let signature_first = signature_analyzer.lookup_function_addresses("ns2::f(int)");
+        assert_eq!(
+            signature_first.len(),
+            1,
+            "{compiler} GNU pubnames did not resolve the exact signature-first overload: {signature_first:?}"
+        );
+        let ordered_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lossy).await?;
+        let _ = ordered_analyzer.lookup_function_addresses("ns2::f");
+        let signature_after_seed = ordered_analyzer.lookup_function_addresses("ns2::f(int)");
+        assert_eq!(
+            signature_first, signature_after_seed,
+            "{compiler} GNU pubnames made signature lookup query-order dependent"
+        );
+
+        let global_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lossy).await?;
+        assert!(
+            global_analyzer
+                .find_global_variables_by_name("ns2::qualified_global")
+                .iter()
+                .any(|(_, global)| global.link_address.is_some()),
+            "{compiler} GNU pubnames returned an unmaterialized qualified global"
+        );
+
+        let local_static_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lossy).await?;
+        assert!(
+            local_static_analyzer
+                .find_global_variables_by_name("counter")
+                .iter()
+                .any(|(_, global)| global.link_address.is_some()),
+            "{compiler} GNU pubnames miss did not materialize a function-local static"
+        );
+
+        let local_type_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lossy).await?;
+        assert!(
+            local_type_analyzer
+                .resolve_struct_type_shallow_by_name("LocalType")
+                .is_some(),
+            "{compiler} GNU pubtypes miss did not materialize a local type"
+        );
+
+        let template_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lossy).await?;
+        assert!(
+            template_analyzer
+                .resolve_struct_type_shallow_by_name("Box<ns1::Inner>")
+                .is_some(),
+            "{compiler} GNU pubtypes did not match a template-aware leaf name"
+        );
+
+        let kind_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lossy).await?;
+        assert!(
+            kind_analyzer
+                .resolve_union_type_shallow_by_name("Inner")
+                .is_none(),
+            "{compiler} GNU pubtypes fabricated a union result for a struct"
+        );
+        assert!(
+            kind_analyzer
+                .resolve_struct_type_shallow_by_name("Inner")
+                .is_some(),
+            "{compiler} GNU pubtypes did not materialize the real struct kind"
+        );
+
+        let enumeration_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&lossy).await?;
+        let function_names = enumeration_analyzer
+            .get_all_function_names()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert!(
+            function_names.contains("f"),
+            "{compiler} GNU pubnames enumeration omitted cooked function names: {function_names:?}"
+        );
+        let global_names = enumeration_analyzer
+            .list_all_global_variables()
+            .into_iter()
+            .map(|(_, global)| global.name)
+            .collect::<HashSet<_>>();
+        assert!(
+            global_names.contains("counter"),
+            "{compiler} GNU pubnames enumeration omitted a function-local static: {global_names:?}"
+        );
+    }
+
+    for compiler in ["g++", "clang++"] {
+        if !command_available(compiler) {
+            continue;
+        }
+        let type_units = temp_dir
+            .path()
+            .join(format!("gnu-pubnames-lossy.type-units.{compiler}"));
+        run_command(
+            StdCommand::new(compiler)
+                .arg("-gdwarf-5")
+                .arg("-ggnu-pubnames")
+                .arg("-fdebug-types-section")
+                .arg("-O0")
+                .arg(&lossy_source)
+                .arg("-o")
+                .arg(&type_units),
+            &format!("{compiler} GNU pubnames type-unit fixture build"),
+        )?;
+        anyhow::ensure!(
+            dwarf_has_type_unit(&type_units)?,
+            "{compiler} did not emit a DWARF5 type unit for GNU pubnames"
+        );
+
+        let type_unit_analyzer =
+            ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&type_units).await?;
+        assert_eq!(
+            type_unit_analyzer.dwarf_index_status_for_module(&type_units),
+            Some(&ghostscope_dwarf::DwarfIndexStatus::GnuPubNames),
+            "GhostScope rejected {compiler} GNU pubnames because .debug_info contains type units"
+        );
+        assert!(
+            type_unit_analyzer
+                .resolve_struct_type_shallow_by_name("Box<ns1::Inner>")
+                .is_some(),
+            "{compiler} GNU pubnames did not resolve a type from a DWARF type-unit binary"
+        );
+    }
+
+    if let Some(compiler) = ["gcc", "clang"]
+        .into_iter()
+        .find(|compiler| command_available(compiler))
+    {
+        let indexed_object = temp_dir.path().join("mixed-indexed.o");
+        let unindexed_object = temp_dir.path().join("mixed-unindexed.o");
+        let mixed = temp_dir.path().join("sample_program.partial-gnu-pubnames");
+        run_command(
+            StdCommand::new(compiler)
+                .arg("-gdwarf-5")
+                .arg("-ggnu-pubnames")
+                .arg("-O0")
+                .arg("-c")
+                .arg(fixture_dir.join("sample_program.c"))
+                .arg("-o")
+                .arg(&indexed_object),
+            &format!("{compiler} indexed object build"),
+        )?;
+        run_command(
+            StdCommand::new(compiler)
+                .arg("-gdwarf-5")
+                .arg("-O0")
+                .arg("-c")
+                .arg(fixture_dir.join("sample_lib.c"))
+                .arg("-o")
+                .arg(&unindexed_object),
+            &format!("{compiler} unindexed object build"),
+        )?;
+        run_command(
+            StdCommand::new(compiler)
+                .arg(&indexed_object)
+                .arg(&unindexed_object)
+                .arg("-o")
+                .arg(&mixed),
+            &format!("{compiler} partially indexed fixture link"),
+        )?;
+
+        let fallback_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&mixed).await?;
+        match fallback_analyzer.dwarf_index_status_for_module(&mixed) {
+            Some(ghostscope_dwarf::DwarfIndexStatus::Rejected { reason }) => {
+                assert!(
+                    reason.contains("does not cover all .debug_info units"),
+                    "unexpected partial GNU pubnames rejection: {reason}"
+                );
+            }
+            status => panic!("partial GNU pubnames index was not rejected: {status:?}"),
+        }
+        assert_native_index_queries(&fallback_analyzer, &mixed, "partial GNU pubnames fallback")?;
+    }
+
+    let Some(indexed) = indexed_binaries.first() else {
+        eprintln!("Skipping GNU pubnames integration test because GCC and Clang are unavailable");
+        return Ok(());
+    };
+
+    let compressed = temp_dir
+        .path()
+        .join("sample_program.compressed-gnu-pubnames");
+    fs::copy(indexed, &compressed)?;
+    run_command(
+        StdCommand::new("objcopy")
+            .arg("--compress-debug-sections=zlib")
+            .arg(&compressed),
+        "compress GNU pubnames fixture",
+    )?;
+    let compressed_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&compressed).await?;
+    assert_eq!(
+        compressed_analyzer.dwarf_index_status_for_module(&compressed),
+        Some(&ghostscope_dwarf::DwarfIndexStatus::GnuPubNames),
+        "GhostScope did not select compressed GNU pubnames"
+    );
+    assert_native_index_queries(&compressed_analyzer, &compressed, "compressed GNU pubnames")?;
+
+    let mut corrupted_bytes = fs::read(indexed)?;
+    let (version_offset, endianness) = {
+        let object = object::File::parse(&*corrupted_bytes)?;
+        let section = object
+            .section_by_name(".debug_gnu_pubnames")
+            .context("GNU pubnames fixture has no .debug_gnu_pubnames")?;
+        let (section_offset, _) = section
+            .file_range()
+            .context(".debug_gnu_pubnames has no file range")?;
+        let section_offset = usize::try_from(section_offset)?;
+        let initial_length = corrupted_bytes
+            .get(section_offset..section_offset + 4)
+            .context(".debug_gnu_pubnames initial length is truncated")?;
+        let initial_length = match object.endianness() {
+            object::Endianness::Little => u32::from_le_bytes(initial_length.try_into()?),
+            object::Endianness::Big => u32::from_be_bytes(initial_length.try_into()?),
+        };
+        let initial_length_size = if initial_length == u32::MAX { 12 } else { 4 };
+        (
+            section_offset
+                .checked_add(initial_length_size)
+                .context(".debug_gnu_pubnames version offset overflow")?,
+            object.endianness(),
+        )
+    };
+    let invalid_version = match endianness {
+        object::Endianness::Little => u16::MAX.to_le_bytes(),
+        object::Endianness::Big => u16::MAX.to_be_bytes(),
+    };
+    corrupted_bytes
+        .get_mut(version_offset..version_offset + invalid_version.len())
+        .context(".debug_gnu_pubnames version is truncated")?
+        .copy_from_slice(&invalid_version);
+    let corrupted = temp_dir.path().join("sample_program.corrupt-gnu-pubnames");
+    fs::write(&corrupted, corrupted_bytes)?;
+
+    let fallback_analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&corrupted).await?;
+    match fallback_analyzer.dwarf_index_status_for_module(&corrupted) {
+        Some(ghostscope_dwarf::DwarfIndexStatus::Rejected { reason }) => {
+            assert!(
+                reason.contains("GNU pubnames index could not be used"),
+                "unexpected GNU pubnames rejection: {reason}"
+            );
+        }
+        status => panic!("malformed GNU pubnames did not fall back: {status:?}"),
+    }
+    assert_native_index_queries(
+        &fallback_analyzer,
+        &corrupted,
+        "rejected GNU pubnames fallback",
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn test_gdb_index_resolves_function_type_and_global_lazily() -> anyhow::Result<()> {
     init();
 

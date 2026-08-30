@@ -579,6 +579,14 @@ impl LightweightIndex {
     /// Build only CU root ranges without walking every function DIE as a fallback.
     pub(crate) fn build_cu_maps_from_roots(&mut self, dwarf: &gimli::Dwarf<DwarfReader>) -> bool {
         let compilation_units = self.func_indices_by_cu.keys().copied().collect::<Vec<_>>();
+        self.build_cu_maps_from_unit_roots(dwarf, compilation_units)
+    }
+
+    pub(crate) fn build_cu_maps_from_unit_roots(
+        &mut self,
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        compilation_units: impl IntoIterator<Item = DebugInfoOffset>,
+    ) -> bool {
         let mut added_any = false;
         for cu in compilation_units {
             for (start, end) in Self::resolve_cu_root_ranges(dwarf, cu).unwrap_or_default() {
