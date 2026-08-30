@@ -325,7 +325,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let bit_width = c_type.size.saturating_mul(8).clamp(1, 64) as u32;
         let current_width = int_value.get_type().get_bit_width();
-        let narrow_type = self.context.custom_width_int_type(bit_width);
+        let narrow_type = self.custom_width_int_type(bit_width)?;
         let narrowed = if current_width > bit_width {
             self.builder
                 .build_int_truncate(int_value, narrow_type, "direct_int_trunc")

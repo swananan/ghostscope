@@ -448,7 +448,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         };
 
         let bit_width = integer_type.size.saturating_mul(8).clamp(1, 64) as u32;
-        let target_int_type = self.context.custom_width_int_type(bit_width);
+        let target_int_type = self.custom_width_int_type(bit_width)?;
         let current_width = value.get_type().get_bit_width();
         let narrowed = if current_width > bit_width {
             self.builder

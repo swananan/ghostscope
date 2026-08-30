@@ -4,9 +4,9 @@
 
 - Rust 1.88.0（通过 `rust-toolchain.toml` 强制指定）
 - Linux 内核 4.4+
-- LLVM 18（包括 Polly 库：`libpolly-18-dev`）
+- LLVM 22（包括 Polly 库：`libpolly-22-dev`）
 
-### 设置 LLVM 18
+### 设置 LLVM 22
 
 #### Ubuntu/Debian
 
@@ -15,27 +15,27 @@
 wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
 
 # Ubuntu 22.04 (Jammy)
-sudo add-apt-repository "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main"
+sudo add-apt-repository "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main"
 
 # Ubuntu 20.04 (Focal)
-sudo add-apt-repository "deb http://apt.llvm.org/focal/ llvm-toolchain-focal-18 main"
+sudo add-apt-repository "deb http://apt.llvm.org/focal/ llvm-toolchain-focal-22 main"
 
 # Ubuntu 24.04 (Noble)
-sudo add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-18 main"
+sudo add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main"
 
-# 安装 LLVM 18 及依赖
+# 安装 LLVM 22 及依赖
 sudo apt-get update
 sudo apt-get install -y \
-  llvm-18 llvm-18-dev llvm-18-runtime \
-  clang-18 libclang-18-dev \
-  libpolly-18-dev \
+  llvm-22 llvm-22-dev llvm-22-runtime \
+  clang-22 libclang-22-dev \
+  libpolly-22-dev \
   libzstd-dev zlib1g-dev libtinfo-dev libxml2-dev
 
 # 设置环境变量（添加到 ~/.bashrc 以持久化）
-export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 # 验证安装
-llvm-config-18 --version
+llvm-config-22 --version
 ```
 
 #### 故障排查
@@ -43,11 +43,11 @@ llvm-config-18 --version
 如果构建时遇到 `No suitable version of LLVM was found` 错误：
 
 ```bash
-# 确保设置了 LLVM_SYS_181_PREFIX
-export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+# 确保设置了 LLVM_SYS_221_PREFIX
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 # 验证 LLVM 安装
-llvm-config-18 --prefix
+llvm-config-22 --prefix
 
 # 清理并重新构建
 cargo clean
@@ -60,7 +60,7 @@ cargo build
 
 ```bash
 # 如果未在 ~/.bashrc 中设置，需要先设置 LLVM 前缀
-export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 # 构建 debug 版本
 cargo build
@@ -70,7 +70,7 @@ cargo build
 
 ```bash
 # 如果未在 ~/.bashrc 中设置，需要先设置 LLVM 前缀
-export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 # 构建 release 版本
 cargo build --release
@@ -319,7 +319,7 @@ done
 - `docker-private -> child-container` 通过 `E2E_TARGET_MODE=child-container` 启用，表示目标进程运行在外层 private sandbox 里再启动的子容器中。这个拓扑现在已经进入 full-CI 矩阵，但 target-mode 覆盖仍是分开的：nested backtrace `-t` 用例会运行，而 `globals_target` nested `-t` 用例仍沿用显式跳过路径。
 - `docker-host -> same docker-host` 仍保留为 smoke，因为它更接近默认的 host PID 视角。
 - `docker-private` 这一组通常需要 `sudo`，因为宿主机上的测试 harness 需要检查该 sandbox 的 PID namespace。
-- topology-aware e2e 默认使用专门给容器 e2e 发布的 Ubuntu 24.04 runtime 镜像的固定 digest：`ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4`。
+- topology-aware e2e 默认使用专门给容器 e2e 发布的 Ubuntu 24.04 runtime 镜像的固定 digest：`ghcr.io/swananan/ghostscope-e2e-runtime@sha256:832c5df935efcd6862e492ac4da2235ef411f494bf66879d737c04d0e96b9bdc`。
 - 容器 e2e 使用上面的 runtime 镜像；release / 容器化构建则继续使用从 `docker/base-build/Dockerfile` 发布出来的独立 `ghostscope-build` 基础镜像。
 - 可通过 `E2E_CONTAINER_IMAGE` 覆盖容器镜像；只有在你明确想测试本地镜像或某个固定 digest 时，才建议手动改这个变量。
 - nested `child-container` 默认会继承 `E2E_CONTAINER_IMAGE`。只有在你明确想让子容器使用不同镜像时，才需要额外设置 `E2E_CHILD_CONTAINER_IMAGE`。

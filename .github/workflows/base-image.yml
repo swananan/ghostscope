@@ -32,7 +32,7 @@ jobs:
         with:
           images: ghcr.io/swananan/ghostscope-build
           tags: |
-            type=raw,value=ubuntu20.04-llvm18.1.8
+            type=raw,value=ubuntu20.04-llvm22.1.8
             type=sha
 
       - name: Build and push

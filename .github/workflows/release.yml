@@ -16,7 +16,7 @@ jobs:
     - name: Use GHCR base image (pinned digest)
       run: |
         set -euo pipefail
-        IMAGE="ghcr.io/swananan/ghostscope-build@sha256:3f0f6184919e7527bb6c74e897f650e672809e5cbfecb6f70c775da851ea99e0"
+        IMAGE="ghcr.io/swananan/ghostscope-build@sha256:6ef243d05b1157004a96d87f1abb35c499819d3c5d51d86379f8bf3b7ceb540f"
         docker pull "$IMAGE" >/dev/null
         echo "Using GHCR base image (pinned digest): $IMAGE"
         echo "BASE_IMAGE=$IMAGE" >> "$GITHUB_ENV"
@@ -38,7 +38,7 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           "${BASE_IMAGE}" \
-          bash -lc 'export LLVM_SYS_181_PREFIX=/opt/llvm-18; export LLVM_CONFIG_PATH=/opt/llvm-18/bin/llvm-config; export RUSTFLAGS="-C link-arg=-Wl,--as-needed"; rustup show; llvm-config --version; echo "llvm-config system-libs:"; llvm-config --system-libs; cargo clean; cargo build --release'
+          bash -lc 'export LLVM_SYS_221_PREFIX=/opt/llvm-22; export LLVM_CONFIG_PATH=/opt/llvm-22/bin/llvm-config; export RUSTFLAGS="-C link-arg=-Wl,--as-needed"; rustup show; llvm-config --version; echo "llvm-config system-libs:"; llvm-config --system-libs; cargo clean; cargo build --release'
 
     - name: Check glibc dependency
       run: |

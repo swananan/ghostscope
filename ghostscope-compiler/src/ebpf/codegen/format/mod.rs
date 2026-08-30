@@ -1843,7 +1843,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
             .try_as_basic_value()
-            .left()
+            .basic()
             .ok_or_else(|| CodeGenError::LLVMError("BPF passthrough returned void".to_string()))?
             .into_int_value();
         let verifier_mask = u32::MAX >> max_len.leading_zeros();

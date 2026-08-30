@@ -747,14 +747,11 @@ also the built-in fallback level, so use the config file when you need to make
 
 ### LLVM_SYS_*_PREFIX
 
-Specify LLVM installation path if not found automatically:
+GhostScope requires LLVM 22.1.x. Specify its installation path if it is not
+found automatically:
 
 ```bash
-# For LLVM 15
-export LLVM_SYS_150_PREFIX=/usr/lib/llvm-15
-
-# For LLVM 17
-export LLVM_SYS_170_PREFIX=/usr/lib/llvm-17
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 ```
 
 ## Default Behaviors

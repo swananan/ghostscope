@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_REMOTE_IMAGE: &str = "ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4";
+const DEFAULT_REMOTE_IMAGE: &str = "ghcr.io/swananan/ghostscope-e2e-runtime@sha256:832c5df935efcd6862e492ac4da2235ef411f494bf66879d737c04d0e96b9bdc";
 const CONTAINER_REPO_ROOT: &str = "/workspace";
 const CONTAINER_TARGET_DIR: &str = "/tmp/ghostscope-target";
 const STAGED_TOOL_DIR: &str = ".ghostscope-test-bin";

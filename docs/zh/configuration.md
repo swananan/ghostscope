@@ -725,14 +725,10 @@ ghostscope -p 1234 --script-file trace.gs --log
 
 ### LLVM_SYS_*_PREFIX
 
-如果未自动找到，指定 LLVM 安装路径：
+GhostScope 需要 LLVM 22.1.x。如果未自动找到，请指定其安装路径：
 
 ```bash
-# 对于 LLVM 15
-export LLVM_SYS_150_PREFIX=/usr/lib/llvm-15
-
-# 对于 LLVM 17
-export LLVM_SYS_170_PREFIX=/usr/lib/llvm-17
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 ```
 
 ## 默认行为

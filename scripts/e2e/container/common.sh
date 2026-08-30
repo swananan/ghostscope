@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-DEFAULT_RUNTIME_IMAGE="ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4"
+DEFAULT_RUNTIME_IMAGE="ghcr.io/swananan/ghostscope-e2e-runtime@sha256:832c5df935efcd6862e492ac4da2235ef411f494bf66879d737c04d0e96b9bdc"
 DEFAULT_SMOKE_TESTS=(
   test_invalid_pid_handling
   test_correct_pid_filtering

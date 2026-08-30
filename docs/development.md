@@ -4,9 +4,9 @@
 
 - Rust 1.88.0 (enforced via `rust-toolchain.toml`)
 - Linux kernel 4.4+
-- LLVM 18 (including Polly library: `libpolly-18-dev`)
+- LLVM 22 (including Polly library: `libpolly-22-dev`)
 
-### Setting Up LLVM 18
+### Setting Up LLVM 22
 
 #### Ubuntu/Debian
 
@@ -15,27 +15,27 @@
 wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
 
 # For Ubuntu 22.04 (Jammy)
-sudo add-apt-repository "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main"
+sudo add-apt-repository "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main"
 
 # For Ubuntu 20.04 (Focal)
-sudo add-apt-repository "deb http://apt.llvm.org/focal/ llvm-toolchain-focal-18 main"
+sudo add-apt-repository "deb http://apt.llvm.org/focal/ llvm-toolchain-focal-22 main"
 
 # For Ubuntu 24.04 (Noble)
-sudo add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-18 main"
+sudo add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main"
 
-# Install LLVM 18 and dependencies
+# Install LLVM 22 and dependencies
 sudo apt-get update
 sudo apt-get install -y \
-  llvm-18 llvm-18-dev llvm-18-runtime \
-  clang-18 libclang-18-dev \
-  libpolly-18-dev \
+  llvm-22 llvm-22-dev llvm-22-runtime \
+  clang-22 libclang-22-dev \
+  libpolly-22-dev \
   libzstd-dev zlib1g-dev libtinfo-dev libxml2-dev
 
 # Set environment variable (add to ~/.bashrc for persistence)
-export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 # Verify installation
-llvm-config-18 --version
+llvm-config-22 --version
 ```
 
 #### Troubleshooting
@@ -43,11 +43,11 @@ llvm-config-18 --version
 If you encounter `No suitable version of LLVM was found` error during build:
 
 ```bash
-# Ensure LLVM_SYS_181_PREFIX is set
-export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+# Ensure LLVM_SYS_221_PREFIX is set
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 # Verify LLVM installation
-llvm-config-18 --prefix
+llvm-config-22 --prefix
 
 # Clean and rebuild
 cargo clean
@@ -60,7 +60,7 @@ cargo build
 
 ```bash
 # Set LLVM prefix if not in ~/.bashrc
-export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 # Build debug version
 cargo build
@@ -70,7 +70,7 @@ cargo build
 
 ```bash
 # Set LLVM prefix if not in ~/.bashrc
-export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 # Build release version
 cargo build --release
@@ -327,7 +327,7 @@ Notes:
 - `docker-private -> child-container` uses `E2E_TARGET_MODE=child-container` and launches the target in a nested Docker child container inside the outer private sandbox. The full suite now runs in CI for that topology, but target-mode coverage is still split: nested backtrace `-t` cases run, while `globals_target` nested `-t` cases still follow their explicit skip path.
 - `docker-host -> same docker-host` remains a smoke run because it is close to the default host PID view.
 - Running the `docker-private` variant usually requires `sudo` because the host-side test harness must inspect the sandbox PID namespace.
-- By default the topology-aware e2e framework uses a pinned digest of the dedicated Ubuntu 24.04 runtime image published for container e2e: `ghcr.io/swananan/ghostscope-e2e-runtime@sha256:d5df1b977c38f7a51bbf28b878f2246705a05b83ac6df7cb6be8f8a4de4105f4`.
+- By default the topology-aware e2e framework uses a pinned digest of the dedicated Ubuntu 24.04 runtime image published for container e2e: `ghcr.io/swananan/ghostscope-e2e-runtime@sha256:832c5df935efcd6862e492ac4da2235ef411f494bf66879d737c04d0e96b9bdc`.
 - Container e2e uses the dedicated runtime image above; release/containerized builds continue to use the separate `ghostscope-build` base image published from `docker/base-build/Dockerfile`.
 - Override the Docker image with `E2E_CONTAINER_IMAGE`. Use this when you explicitly want to test a local image or a pinned digest of the runtime image.
 - Nested `child-container` targets inherit `E2E_CONTAINER_IMAGE` by default. Override `E2E_CHILD_CONTAINER_IMAGE` only when you intentionally want a different child image.

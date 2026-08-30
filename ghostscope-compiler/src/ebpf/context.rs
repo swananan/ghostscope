@@ -12,10 +12,12 @@ use inkwell::context::Context;
 use inkwell::debug_info::DebugInfoBuilder;
 use inkwell::module::Module;
 use inkwell::targets::{Target, TargetTriple};
+use inkwell::types::IntType;
 use inkwell::values::{FunctionValue, IntValue, PointerValue};
 use inkwell::AddressSpace;
 use inkwell::OptimizationLevel;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use thiserror::Error;
 use tracing::info;
 
@@ -202,6 +204,15 @@ pub struct EbpfContext<'ctx, 'dw> {
 }
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
+    pub(crate) fn custom_width_int_type(&self, bit_width: u32) -> Result<IntType<'ctx>> {
+        let bit_width = NonZeroU32::new(bit_width).ok_or_else(|| {
+            CodeGenError::TypeError("LLVM integer bit width must be non-zero".to_string())
+        })?;
+        self.context
+            .custom_width_int_type(bit_width)
+            .map_err(|error| CodeGenError::TypeError(error.to_string()))
+    }
+
     fn uprobe_section(&self) -> &'static str {
         if self.compile_options.runtime_capabilities.sleepable_uprobe {
             "uprobe.s"

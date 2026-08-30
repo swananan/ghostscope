@@ -32,7 +32,7 @@ jobs:
         with:
           images: ghcr.io/swananan/ghostscope-e2e-runtime
           tags: |
-            type=raw,value=ubuntu24.04-llvm18
+            type=raw,value=ubuntu24.04-llvm22
             type=sha
 
       - name: Build and push
