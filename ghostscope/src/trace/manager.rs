@@ -16,6 +16,12 @@ use tracing::{debug, error, info, warn};
 
 const MAX_AGGREGATED_EVENTS_PER_WAIT: usize = 1024;
 
+#[derive(Debug)]
+struct DeferredActorError {
+    trace_id: u32,
+    error: anyhow::Error,
+}
+
 /// Manager for all active trace instances
 #[derive(Debug)]
 pub struct TraceManager {
@@ -29,7 +35,7 @@ pub struct TraceManager {
     fatal_sender: mpsc::UnboundedSender<TraceActorFatal>,
     fatal_receiver: mpsc::UnboundedReceiver<TraceActorFatal>,
     pending_events: VecDeque<ParsedTraceEvent>,
-    pending_error: Option<anyhow::Error>,
+    pending_error: Option<DeferredActorError>,
     minimum_event_generations: HashMap<u32, u64>,
     last_reported_event_loss: HashMap<u32, EventLossStats>,
     last_reported_delivery_loss: HashMap<u32, u64>,
@@ -177,6 +183,13 @@ impl TraceManager {
             self.trace_created_times.remove(&trace_id);
             self.pending_events
                 .retain(|event| event.trace_id != trace_id as u64);
+            if self
+                .pending_error
+                .as_ref()
+                .is_some_and(|pending| pending.trace_id == trace_id)
+            {
+                self.pending_error = None;
+            }
             self.minimum_event_generations.remove(&trace_id);
             self.last_reported_event_loss.remove(&trace_id);
             self.last_reported_delivery_loss.remove(&trace_id);
@@ -234,11 +247,15 @@ impl TraceManager {
 
     /// Disable a specific trace by ID
     pub async fn disable_trace(&mut self, trace_id: u32) -> Result<()> {
-        if let Some(trace) = self.traces.get_mut(&trace_id) {
-            trace.disable().await
-        } else {
-            Err(anyhow::anyhow!("Trace {trace_id} not found"))
-        }
+        let generation = {
+            let trace = self
+                .traces
+                .get_mut(&trace_id)
+                .ok_or_else(|| anyhow::anyhow!("Trace {trace_id} not found"))?;
+            trace.disable().await?
+        };
+        self.invalidate_queued_events(trace_id, generation);
+        Ok(())
     }
 
     /// Enable all traces
@@ -366,18 +383,7 @@ impl TraceManager {
             };
             match update {
                 Ok(update) => {
-                    let stats = update.stats;
-                    if stats.modules > 0 {
-                        self.require_event_generation(trace_id, update.event_generation);
-                        debug!(
-                            trace_id,
-                            modules = stats.modules,
-                            rows = stats.rows,
-                            "Appended runtime DWARF bt unwind rows to trace"
-                        );
-                        total.modules += stats.modules;
-                        total.rows += stats.rows;
-                    }
+                    self.record_backtrace_actor_update(trace_id, update, &mut total);
                 }
                 Err(err) => {
                     warn!(
@@ -389,6 +395,39 @@ impl TraceManager {
         }
 
         total
+    }
+
+    fn record_backtrace_actor_update(
+        &mut self,
+        trace_id: u32,
+        update: crate::trace::actor::TraceActorBacktraceUpdate,
+        total: &mut BacktraceUnwindRowsAppendStats,
+    ) {
+        // Apply the generation even when this actor inserted no rows: another
+        // actor may have updated the shared pinned CFI maps first.
+        self.require_event_generation(trace_id, update.event_generation);
+
+        let stats = update.stats;
+        if stats.modules == 0 {
+            return;
+        }
+        debug!(
+            trace_id,
+            modules = stats.modules,
+            rows = stats.rows,
+            "Appended runtime DWARF bt unwind rows to trace"
+        );
+        total.modules += stats.modules;
+        total.rows += stats.rows;
+    }
+
+    fn invalidate_queued_events(&mut self, trace_id: u32, generation: Option<u64>) {
+        if let Some(generation) = generation {
+            self.require_event_generation(trace_id, generation);
+        } else {
+            self.pending_events
+                .retain(|event| event.trace_id != trace_id as u64);
+        }
     }
 
     fn require_event_generation(&mut self, trace_id: u32, generation: u64) {
@@ -410,8 +449,14 @@ impl TraceManager {
         if let Some(events) = self.take_pending_events() {
             return Ok(events);
         }
-        if let Some(error) = self.pending_error.take() {
-            return Err(error);
+        if let Some(pending) = self.pending_error.take() {
+            if self.traces.contains_key(&pending.trace_id) {
+                return Err(pending.error);
+            }
+            debug!(
+                trace_id = pending.trace_id,
+                "Ignoring deferred fatal error from deleted trace actor"
+            );
         }
 
         let mut aggregated_events = Vec::new();
@@ -461,11 +506,12 @@ impl TraceManager {
 
         if let Ok(fatal) = self.fatal_receiver.try_recv() {
             if self.traces.contains_key(&fatal.trace_id) {
+                let trace_id = fatal.trace_id;
                 let error = actor_fatal_error(fatal);
                 if aggregated_events.is_empty() {
                     return Err(error);
                 }
-                self.pending_error = Some(error);
+                self.pending_error = Some(DeferredActorError { trace_id, error });
             } else {
                 debug!(
                     trace_id = fatal.trace_id,
@@ -498,7 +544,10 @@ impl TraceManager {
             } => {
                 // Delete waits for the actor to tear down its loader, but batches
                 // sent before that acknowledgement may still be queued.
-                if !self.traces.contains_key(&trace_id) {
+                let Some(trace) = self.traces.get(&trace_id) else {
+                    return;
+                };
+                if !trace.is_enabled {
                     return;
                 }
                 if generation
@@ -585,8 +634,9 @@ impl Default for TraceManager {
 #[cfg(test)]
 mod tests {
     use super::{append_with_limit, AddTraceParams, TraceManager, MAX_AGGREGATED_EVENTS_PER_WAIT};
-    use crate::trace::actor::{TraceActorEvent, TraceActorFatal};
+    use crate::trace::actor::{TraceActorBacktraceUpdate, TraceActorEvent, TraceActorFatal};
     use crate::trace::instance::TracePidContext;
+    use ghostscope_loader::BacktraceUnwindRowsAppendStats;
     use ghostscope_protocol::ParsedTraceEvent;
     use std::collections::VecDeque;
 
@@ -613,6 +663,11 @@ mod tests {
             ebpf_function_name: String::new(),
             address_global_index: None,
         });
+        manager
+            .traces
+            .get_mut(&trace_id)
+            .expect("test trace should exist")
+            .is_enabled = true;
     }
 
     #[test]
@@ -731,6 +786,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_events_for_a_disabled_trace_stay_invalid_after_reenable() {
+        let mut manager = TraceManager::new();
+        add_test_trace(&mut manager, 7);
+        manager
+            .event_sender
+            .send(TraceActorEvent::Events {
+                trace_id: 7,
+                generation: 0,
+                events: vec![event(7)],
+            })
+            .await
+            .unwrap();
+
+        manager.traces.get_mut(&7).unwrap().is_enabled = false;
+        manager.invalidate_queued_events(7, Some(1));
+        manager.traces.get_mut(&7).unwrap().is_enabled = true;
+        manager
+            .event_sender
+            .send(TraceActorEvent::Events {
+                trace_id: 7,
+                generation: 1,
+                events: vec![event(7)],
+            })
+            .await
+            .unwrap();
+
+        let events = manager.wait_for_all_events_async().await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].trace_id, 7);
+    }
+
+    #[tokio::test]
+    async fn queued_events_are_not_forwarded_while_trace_is_disabled() {
+        let mut manager = TraceManager::new();
+        add_test_trace(&mut manager, 7);
+        add_test_trace(&mut manager, 8);
+        manager
+            .event_sender
+            .send(TraceActorEvent::Events {
+                trace_id: 7,
+                generation: 0,
+                events: vec![event(7)],
+            })
+            .await
+            .unwrap();
+        manager.traces.get_mut(&7).unwrap().is_enabled = false;
+        manager
+            .event_sender
+            .send(TraceActorEvent::Events {
+                trace_id: 8,
+                generation: 0,
+                events: vec![event(8)],
+            })
+            .await
+            .unwrap();
+
+        let events = manager.wait_for_all_events_async().await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].trace_id, 8);
+    }
+
+    #[test]
+    fn shared_cfi_updates_invalidate_batches_for_every_actor() {
+        let mut manager = TraceManager::new();
+        add_test_trace(&mut manager, 7);
+        add_test_trace(&mut manager, 8);
+        manager.pending_events.push_back(event(7));
+        manager.pending_events.push_back(event(8));
+        let mut total = BacktraceUnwindRowsAppendStats::default();
+
+        manager.record_backtrace_actor_update(
+            7,
+            TraceActorBacktraceUpdate {
+                stats: BacktraceUnwindRowsAppendStats {
+                    modules: 1,
+                    rows: 2,
+                },
+                event_generation: 1,
+            },
+            &mut total,
+        );
+        manager.record_backtrace_actor_update(
+            8,
+            TraceActorBacktraceUpdate {
+                stats: BacktraceUnwindRowsAppendStats::default(),
+                event_generation: 1,
+            },
+            &mut total,
+        );
+
+        assert_eq!(manager.minimum_event_generations.get(&7), Some(&1));
+        assert_eq!(manager.minimum_event_generations.get(&8), Some(&1));
+        assert!(manager.pending_events.is_empty());
+        assert_eq!(total.modules, 1);
+        assert_eq!(total.rows, 2);
+    }
+
+    #[tokio::test]
     async fn stale_event_generations_and_pending_events_are_ignored_after_update() {
         let mut manager = TraceManager::new();
         add_test_trace(&mut manager, 7);
@@ -793,5 +946,45 @@ mod tests {
 
         let error = manager.wait_for_all_events_async().await.unwrap_err();
         assert!(error.to_string().contains("reader failed"));
+    }
+
+    #[tokio::test]
+    async fn deleting_trace_clears_its_deferred_fatal_error() {
+        let mut manager = TraceManager::new();
+        add_test_trace(&mut manager, 7);
+        add_test_trace(&mut manager, 8);
+        manager
+            .event_sender
+            .send(TraceActorEvent::Events {
+                trace_id: 7,
+                generation: 0,
+                events: vec![event(7)],
+            })
+            .await
+            .unwrap();
+        manager
+            .fatal_sender
+            .send(TraceActorFatal {
+                trace_id: 7,
+                error: "reader failed".to_string(),
+            })
+            .unwrap();
+
+        let events = manager.wait_for_all_events_async().await.unwrap();
+        assert_eq!(events.len(), 1);
+        manager.delete_trace(7).await.unwrap();
+        manager
+            .event_sender
+            .send(TraceActorEvent::Events {
+                trace_id: 8,
+                generation: 0,
+                events: vec![event(8)],
+            })
+            .await
+            .unwrap();
+
+        let events = manager.wait_for_all_events_async().await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].trace_id, 8);
     }
 }
