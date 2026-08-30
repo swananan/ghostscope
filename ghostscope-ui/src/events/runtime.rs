@@ -350,6 +350,14 @@ pub enum RuntimeStatus {
         dropped_total: u64,
         queue_capacity: usize,
     },
+    /// Per-trace readers kept draining kernel buffers but could not enqueue all parsed events.
+    TraceReaderBackpressure {
+        trace_id: u32,
+        target_display: String,
+        dropped_since_last: u64,
+        dropped_total: u64,
+        queue_capacity_batches: usize,
+    },
     /// eBPF program failed to write events into the kernel output buffer.
     EbpfOutputLoss {
         trace_id: u32,

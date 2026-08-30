@@ -102,12 +102,14 @@ impl BacktraceRuntimeRunner {
             .await
     }
 
-    pub fn append_loaded_module_cfi(
+    pub async fn append_loaded_module_cfi(
         analyzer: &DwarfAnalyzer,
         trace_manager: &mut TraceManager,
     ) -> BacktraceUnwindRowsAppendStats {
         let modules = Self::collect_backtrace_unwind_rows(analyzer);
-        let stats = trace_manager.append_backtrace_unwind_rows_for_modules(&modules);
+        let stats = trace_manager
+            .append_backtrace_unwind_rows_for_modules(&modules)
+            .await;
         if stats.modules > 0 {
             info!(
                 modules = stats.modules,

@@ -20,7 +20,12 @@ pub async fn compile_and_load_script_for_tui(
     refresh_runtime_modules_before_compile(script, session, &mut compile_options).await?;
 
     let binary_path = main_executable_path(session)?;
-    let compilation_result = match compile_script_with_session(script, session, &compile_options) {
+    // Compilation is synchronous and can be long-running. Mark the section as
+    // blocking so Tokio replaces this runtime worker while trace actors keep
+    // draining their RingBuf/PerfEventArray sources on other workers.
+    let compilation_result = match tokio::task::block_in_place(|| {
+        compile_script_with_session(script, session, &compile_options)
+    }) {
         Ok(result) => result,
         Err(SessionCompileError::Compile(e)) => {
             let friendly = e.user_message().into_owned();
@@ -63,7 +68,7 @@ pub async fn compile_and_load_script_for_tui(
                         "✓ Successfully attached uprobe for trace_id {}",
                         config.assigned_trace_id
                     );
-                    if register_attached_trace(session, script, config, loader) {
+                    if register_attached_trace(session, script, config, loader).await {
                         attached_count += 1;
                     }
                 }

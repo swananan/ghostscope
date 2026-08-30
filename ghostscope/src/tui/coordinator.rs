@@ -167,7 +167,7 @@ async fn run_runtime_coordinator(
 ) -> Result<()> {
     info!("Runtime coordinator started");
 
-    // Create trace sender for event polling task
+    // Create trace sender for forwarding actor-delivered events to the UI.
     let trace_sender = runtime_channels.create_trace_sender();
     let trace_channel_capacity = runtime_channels.trace_channel_capacity;
     let mut backtrace_renderer = crate::trace::backtrace::BacktraceRenderer::default();
@@ -177,7 +177,7 @@ async fn run_runtime_coordinator(
 
     loop {
         tokio::select! {
-            // Wait for events asynchronously from active traces' loaders
+            // Wait on the shared queue populated by independent trace actors.
             result = async {
                 if let Some(ref mut session) = session {
                     // Use trace_manager's built-in event polling method
@@ -466,7 +466,8 @@ async fn run_runtime_coordinator(
                 }
 
                 if let Some(ref mut session) = session {
-                    for report in session.trace_manager.collect_event_loss_reports() {
+                    let loss_reports = session.trace_manager.collect_event_loss_reports().await;
+                    for report in loss_reports.kernel {
                         warn!(
                             "eBPF output helper loss detected: trace {} ({}) lost {} events in last interval (total {})",
                             report.trace_id,
@@ -480,6 +481,26 @@ async fn run_runtime_coordinator(
                             lost_since_last: report.lost_since_last,
                             lost_total: report.lost_total,
                         });
+                    }
+                    for report in loss_reports.delivery {
+                        warn!(
+                            "Trace reader queue backpressure: trace {} ({}) dropped {} parsed events in last interval (total {}) while continuing to drain the kernel buffer",
+                            report.trace_id,
+                            report.target_display,
+                            report.dropped_since_last,
+                            report.dropped_total
+                        );
+                        let _ = runtime_channels.status_sender.send(
+                            RuntimeStatus::TraceReaderBackpressure {
+                                trace_id: report.trace_id,
+                                target_display: report.target_display,
+                                dropped_since_last: report.dropped_since_last,
+                                dropped_total: report.dropped_total,
+                                queue_capacity_batches: session
+                                    .trace_manager
+                                    .event_channel_capacity(),
+                            },
+                        );
                     }
                 }
             }
@@ -592,7 +613,7 @@ fn recalculate_script_compilation_counts(
     details.total_count = success_count + failed_count;
 }
 
-fn restore_loaded_traces_as_disabled(
+async fn restore_loaded_traces_as_disabled(
     session: &mut GhostSession,
     details: &mut ghostscope_ui::events::ScriptCompilationDetails,
 ) {
@@ -627,7 +648,7 @@ fn restore_loaded_traces_as_disabled(
             continue;
         };
 
-        match session.trace_manager.disable_trace(trace_id) {
+        match session.trace_manager.disable_trace(trace_id).await {
             Ok(()) => {
                 info!("Loaded trace {} as disabled", trace_id);
                 retained_trace_ids.push(trace_id);
@@ -756,7 +777,7 @@ async fn handle_load_traces(
 
         if !trace.enabled {
             if let Some(ref mut session) = session {
-                restore_loaded_traces_as_disabled(session, &mut details);
+                restore_loaded_traces_as_disabled(session, &mut details).await;
             }
         }
 

@@ -509,7 +509,7 @@ async fn run_cli_with_session(
             }
 
             _ = ebpf_loss_report_ticker.tick() => {
-                report_ebpf_output_loss_reports(&mut session.trace_manager);
+                report_ebpf_output_loss_reports(&mut session.trace_manager).await;
             }
 
             signal = &mut shutdown_signal => {
@@ -525,14 +525,26 @@ async fn run_cli_with_session(
     Ok(())
 }
 
-fn report_ebpf_output_loss_reports(trace_manager: &mut crate::trace::TraceManager) {
-    for report in trace_manager.collect_event_loss_reports() {
+async fn report_ebpf_output_loss_reports(trace_manager: &mut crate::trace::TraceManager) {
+    let reports = trace_manager.collect_event_loss_reports().await;
+    for report in reports.kernel {
         let message = format!(
             "eBPF output helper failed: trace #{} ({}) lost {} events in kernel before userspace delivery (total {})",
             report.trace_id,
             report.target_display,
             report.lost_since_last,
             report.lost_total
+        );
+        warn!("{message}");
+        eprintln!("ghostscope: {message}");
+    }
+    for report in reports.delivery {
+        let message = format!(
+            "trace reader queue dropped {} parsed events for trace #{} ({}) while continuing to drain the kernel buffer (total {})",
+            report.dropped_since_last,
+            report.trace_id,
+            report.target_display,
+            report.dropped_total
         );
         warn!("{message}");
         eprintln!("ghostscope: {message}");

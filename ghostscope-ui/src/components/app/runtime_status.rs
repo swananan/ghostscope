@@ -1241,6 +1241,21 @@ impl App {
                     queue_capacity,
                 );
             }
+            RuntimeStatus::TraceReaderBackpressure {
+                trace_id,
+                target_display,
+                dropped_since_last,
+                dropped_total,
+                queue_capacity_batches,
+            } => {
+                self.show_trace_reader_backpressure_alert(
+                    trace_id,
+                    target_display,
+                    dropped_since_last,
+                    dropped_total,
+                    queue_capacity_batches,
+                );
+            }
             RuntimeStatus::EbpfOutputLoss {
                 trace_id,
                 target_display,
@@ -1347,6 +1362,34 @@ impl App {
 
         self.add_ebpf_runtime_warning(format!(
             "Warning: TUI trace queue saturated; dropped {dropped_since_last} events before display in last 1s (total {dropped_total}, capacity {queue_capacity})"
+        ));
+    }
+
+    fn show_trace_reader_backpressure_alert(
+        &mut self,
+        trace_id: u32,
+        target_display: String,
+        dropped_since_last: u64,
+        dropped_total: u64,
+        queue_capacity_batches: usize,
+    ) {
+        let content = format!(
+            "⚠ Trace reader queue saturated: trace #{trace_id} ({target_display}) dropped {dropped_since_last} parsed events in last 1s (total {dropped_total}, capacity {queue_capacity_batches} batches); kernel draining continued"
+        );
+        let styled_lines =
+            crate::components::command_panel::ResponseFormatter::style_generic_message_lines(
+                &content,
+            );
+        crate::components::command_panel::ResponseFormatter::upsert_runtime_alert_with_style(
+            &mut self.state.command_panel,
+            content,
+            Some(styled_lines),
+            crate::action::ResponseType::Warning,
+        );
+        self.state.command_renderer.mark_pending_updates();
+
+        self.add_ebpf_runtime_warning(format!(
+            "Warning: trace reader queue saturated for trace #{trace_id} ({target_display}); dropped {dropped_since_last} parsed events in last 1s while kernel draining continued (total {dropped_total}, capacity {queue_capacity_batches} batches)"
         ));
     }
 

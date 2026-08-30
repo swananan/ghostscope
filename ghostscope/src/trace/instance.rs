@@ -1,6 +1,8 @@
+use super::actor::{TraceActorBacktraceUpdate, TraceActorHandle, TraceActorLossStats};
 use anyhow::Result;
-use ghostscope_loader::{EventLossStats, GhostScopeLoader};
-use tracing::{error, info, warn};
+use ghostscope_protocol::BacktraceUnwindRow;
+use std::sync::Arc;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TracePidContext {
@@ -20,7 +22,7 @@ impl TracePidContext {
 
 /// Individual trace instance with single PC value
 #[derive(Debug)]
-pub struct TraceInstance {
+pub(super) struct TraceInstance {
     pub trace_id: u32,
     pub target: String, // Target identifier for grouping (e.g., "test_program:L15")
     pub script_content: String, // Original script content
@@ -29,12 +31,12 @@ pub struct TraceInstance {
     pub pc: u64,        // Program counter value for this trace (file offset for uprobe)
     pub pid_context: TracePidContext,
     pub is_enabled: bool, // Whether the uprobe is currently enabled
-    pub loader: Option<GhostScopeLoader>, // eBPF loader for this trace
+    pub(super) actor: Option<TraceActorHandle>, // Owns the eBPF loader for this trace
     pub ebpf_function_name: String, // eBPF function name for uprobe attachment
     pub address_global_index: Option<usize>, // Global 1-based index of the resolved address
 }
 
-pub struct TraceInstanceArgs {
+pub(super) struct TraceInstanceArgs {
     pub trace_id: u32,
     pub target: String,
     pub script_content: String,
@@ -42,13 +44,13 @@ pub struct TraceInstanceArgs {
     pub binary_path: String,
     pub target_display: String,
     pub pid_context: TracePidContext,
-    pub loader: Option<ghostscope_loader::GhostScopeLoader>,
+    pub(super) actor: Option<TraceActorHandle>,
     pub ebpf_function_name: String,
     pub address_global_index: Option<usize>,
 }
 
 impl TraceInstance {
-    pub fn new(args: TraceInstanceArgs) -> Self {
+    pub(super) fn new(args: TraceInstanceArgs) -> Self {
         Self {
             trace_id: args.trace_id,
             target: args.target,
@@ -58,86 +60,28 @@ impl TraceInstance {
             target_display: args.target_display,
             pid_context: args.pid_context,
             is_enabled: false,
-            loader: args.loader,
+            actor: args.actor,
             ebpf_function_name: args.ebpf_function_name,
             address_global_index: args.address_global_index,
         }
     }
 
     /// Enable this trace instance
-    pub fn enable(&mut self) -> Result<()> {
+    pub(super) async fn enable(&mut self) -> Result<()> {
         if self.is_enabled {
             info!("Trace {} is already enabled", self.trace_id);
             Ok(())
-        } else if let Some(ref mut loader) = self.loader {
-            let already_attached = loader.is_uprobe_attached();
-            if !already_attached {
-                info!(
-                    "Enabling trace {} for target '{}' at PC 0x{:x} in binary '{}'",
-                    self.trace_id, self.target_display, self.pc, self.binary_path
-                );
-            }
-            if already_attached {
-                self.is_enabled = true;
-                Ok(())
-            } else if loader.get_attachment_info().is_some() {
-                info!(
-                    "Re-attaching uprobe for trace {} (program already loaded)",
-                    self.trace_id
-                );
-                match loader.reattach_uprobe() {
-                    Ok(_) => {
-                        info!(
-                            "✓ Successfully re-attached uprobe for trace {}",
-                            self.trace_id
-                        );
-                        self.is_enabled = true;
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!(
-                            "❌ Failed to re-attach uprobe for trace {}: {}",
-                            self.trace_id, e
-                        );
-                        Err(anyhow::anyhow!("Failed to re-attach uprobe: {e}"))
-                    }
-                }
-            } else {
-                info!(
-                    "Attaching uprobe for trace {} at offset 0x{:x} using program '{}'",
-                    self.trace_id, self.pc, self.ebpf_function_name
-                );
-                match loader.attach_uprobe(
-                    &self.binary_path,
-                    &self.ebpf_function_name,
-                    Some(self.pc),
-                    self.pid_context.attach_pid.map(|pid| pid as i32),
-                ) {
-                    Ok(_) => {
-                        info!(
-                            "✓ Successfully attached uprobe for trace {} at offset 0x{:x}",
-                            self.trace_id, self.pc
-                        );
-                        self.is_enabled = true;
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!(
-                            "❌ Failed to attach uprobe for trace {}: {}",
-                            self.trace_id, e
-                        );
-                        Err(anyhow::anyhow!("Failed to attach uprobe: {e}"))
-                    }
-                }
-            }
+        } else if let Some(actor) = &self.actor {
+            actor.enable().await?;
+            self.is_enabled = true;
+            Ok(())
         } else {
-            error!("No eBPF loader available for trace {}", self.trace_id);
-            Err(anyhow::anyhow!("No eBPF loader available"))
+            Err(anyhow::anyhow!("No trace actor available"))
         }
     }
 
     /// Disable this trace instance
-    pub fn disable(&mut self) -> Result<()> {
+    pub(super) async fn disable(&mut self) -> Result<()> {
         if !self.is_enabled {
             info!("Trace {} is already disabled", self.trace_id);
             return Ok(());
@@ -148,25 +92,13 @@ impl TraceInstance {
             self.trace_id, self.target_display, self.pc
         );
 
-        // Detach uprobe using the loader
-        if let Some(ref mut loader) = self.loader {
-            match loader.detach_uprobe() {
-                Ok(_) => {
-                    info!("✓ Successfully detached uprobe for trace {}", self.trace_id);
-                    self.is_enabled = false;
-                    Ok(())
-                }
-                Err(e) => {
-                    error!(
-                        "❌ Failed to detach uprobe for trace {}: {}",
-                        self.trace_id, e
-                    );
-                    Err(anyhow::anyhow!("Failed to detach uprobe: {e}"))
-                }
-            }
+        if let Some(actor) = &self.actor {
+            actor.disable().await?;
+            self.is_enabled = false;
+            Ok(())
         } else {
             warn!(
-                "No eBPF loader available for trace {}, marking as disabled",
+                "No trace actor available for trace {}, marking as disabled",
                 self.trace_id
             );
             self.is_enabled = false;
@@ -174,37 +106,30 @@ impl TraceInstance {
         }
     }
 
-    /// Wait for events asynchronously from this trace instance
-    pub async fn wait_for_events_async(
-        &mut self,
-    ) -> Result<Vec<ghostscope_protocol::ParsedTraceEvent>> {
-        if !self.is_enabled {
-            return Ok(Vec::new());
-        }
-
-        // Wait for events using the loader
-        if let Some(ref mut loader) = self.loader {
-            match loader.wait_for_events_async().await {
-                Ok(events) => Ok(events),
-                Err(e) => {
-                    warn!(
-                        "Error waiting for events from trace {}: {}",
-                        self.trace_id, e
-                    );
-                    Err(e.into())
-                }
-            }
+    pub(super) async fn read_loss_stats(&self) -> Result<TraceActorLossStats> {
+        if let Some(actor) = &self.actor {
+            actor.read_loss_stats().await
         } else {
-            error!("No eBPF loader available for trace {}", self.trace_id);
-            Err(anyhow::anyhow!("No eBPF loader available"))
+            Ok(TraceActorLossStats::default())
         }
     }
 
-    pub fn read_event_loss_stats(&self) -> Result<Option<EventLossStats>> {
-        if let Some(loader) = &self.loader {
-            loader.read_event_loss_stats().map_err(Into::into)
+    pub(super) async fn append_backtrace_rows(
+        &self,
+        modules: Arc<Vec<(u64, Vec<BacktraceUnwindRow>)>>,
+    ) -> Result<TraceActorBacktraceUpdate> {
+        if let Some(actor) = &self.actor {
+            actor.append_backtrace_rows(modules).await
         } else {
-            Ok(None)
+            Ok(Default::default())
+        }
+    }
+
+    pub(super) async fn delete(&self) -> Result<()> {
+        if let Some(actor) = &self.actor {
+            actor.delete().await
+        } else {
+            Ok(())
         }
     }
 }
