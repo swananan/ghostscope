@@ -84,7 +84,7 @@ pub async fn compile_and_load_script_for_cli(
                     "✓ Successfully attached uprobe for trace_id {}",
                     config.assigned_trace_id
                 );
-                if register_attached_trace(session, script, config, loader) {
+                if register_attached_trace(session, script, config, loader).await {
                     attached_count += 1;
                 }
             }

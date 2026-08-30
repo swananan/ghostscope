@@ -77,7 +77,7 @@ pub struct GhostSession {
     pub target_binary: Option<String>,
     pub target_args: Vec<String>,
     pid_context: Option<RuntimePidContext>,
-    pub trace_manager: TraceManager, // Manages all trace instances with their loaders
+    pub trace_manager: TraceManager, // Manages trace metadata and loader-owning actors
     pub source_path_resolver: SourcePathResolver, // Resolves DWARF paths to actual filesystem paths
     #[allow(dead_code)]
     pub debug_file: Option<String>, // Optional debug file path
@@ -490,7 +490,8 @@ impl GhostSession {
         .await?;
 
         if loaded > 0 {
-            BacktraceRuntimeRunner::append_loaded_module_cfi(analyzer, &mut self.trace_manager);
+            BacktraceRuntimeRunner::append_loaded_module_cfi(analyzer, &mut self.trace_manager)
+                .await;
             info!(
                 "Refreshed PID {} runtime module analysis with {} new module(s)",
                 proc_pid, loaded
@@ -546,7 +547,8 @@ impl GhostSession {
         .await?;
 
         if loaded > 0 {
-            BacktraceRuntimeRunner::append_loaded_module_cfi(analyzer, &mut self.trace_manager);
+            BacktraceRuntimeRunner::append_loaded_module_cfi(analyzer, &mut self.trace_manager)
+                .await;
             info!(
                 "Refreshed target-mode runtime module analysis with {} new module(s)",
                 loaded
