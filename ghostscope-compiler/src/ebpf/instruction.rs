@@ -35,7 +35,6 @@ fn checked_event_reservation(current: usize, size: u64, maximum: usize) -> Resul
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeEarlyReturnReason {
-    AccumulationBufferNull,
     EventBufferOverflow,
 }
 
@@ -88,10 +87,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let i32_ty = self.context.i32_type();
         let i64_ty = self.context.i64_type();
 
-        // Lookup accumulation buffer value pointer; early-return if NULL
-        let accum_buffer_lookup = self.get_or_create_perf_accumulation_buffer_or_return_zero()?;
-        let accum_buffer = accum_buffer_lookup.value;
-        let mut early_returns = accum_buffer_lookup.early_returns;
+        let accum_buffer = self.current_event_accumulation_buffer()?;
+        let mut early_returns = Vec::new();
         let offset_ptr = self.get_or_create_perf_buffer_offset()?;
 
         // Load current offset
@@ -228,10 +225,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.reserve_event_space_or_return_zero(size)
     }
 
-    /// Get per-CPU accumulation buffer pointer (event_accum_buffer[0]) and return early if null.
-    fn get_or_create_perf_accumulation_buffer_or_return_zero(
+    /// Look up event_accum_buffer[0] once for the current eBPF program.
+    ///
+    /// The resulting map-value pointer is an SSA value owned by the current function. It must not
+    /// be reused by another eBPF program, including a tail-call step program.
+    pub(crate) fn initialize_event_accumulation_buffer_or_return_zero(
         &mut self,
-    ) -> Result<RuntimeReturnAwareValue<'ctx, PointerValue<'ctx>>> {
+    ) -> Result<PointerValue<'ctx>> {
+        let current_fn = self
+            .current_codegen_continuation("initialize accumulation buffer")?
+            .function;
+        if let Some(accum_buffer) = self.event_accumulation_buffers.get(&current_fn) {
+            return Ok(*accum_buffer);
+        }
+
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let val_ptr = self.lookup_percpu_value_ptr("event_accum_buffer", 0)?;
 
@@ -240,9 +247,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .builder
             .build_is_null(val_ptr, "accum_buf_is_null")
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to check buffer null: {e}")))?;
-        let current_fn = self
-            .current_codegen_continuation("check accumulation buffer")?
-            .function;
         let cont_bb = self
             .context
             .append_basic_block(current_fn, "accum_buf_cont");
@@ -278,17 +282,24 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         };
 
-        Ok(RuntimeReturnAwareValue {
-            value: accum_buffer,
-            continuation: CodegenContinuation {
-                function: current_fn,
-                block: cont_bb,
-            },
-            early_returns: vec![RuntimeEarlyReturn {
-                reason: RuntimeEarlyReturnReason::AccumulationBufferNull,
-                block: ret_bb,
-            }],
-        })
+        self.event_accumulation_buffers
+            .insert(current_fn, accum_buffer);
+        Ok(accum_buffer)
+    }
+
+    fn current_event_accumulation_buffer(&self) -> Result<PointerValue<'ctx>> {
+        let current_fn = self
+            .current_codegen_continuation("get accumulation buffer")?
+            .function;
+        self.event_accumulation_buffers
+            .get(&current_fn)
+            .copied()
+            .ok_or_else(|| {
+                CodeGenError::LLVMError(
+                    "event_accum_buffer was not initialized for the current eBPF program"
+                        .to_string(),
+                )
+            })
     }
 
     /// Get pointer to per-invocation stack event offset (u32)
@@ -664,9 +675,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     pub(crate) fn emit_accumulated_event_output_from_stack_offset(&mut self) -> Result<()> {
-        let accum_buffer = self
-            .get_or_create_perf_accumulation_buffer_or_return_zero()?
-            .into_value_after_runtime_returns();
+        let accum_buffer = self.current_event_accumulation_buffer()?;
         let offset_ptr = self.get_or_create_perf_buffer_offset()?;
 
         let total_accumulated_size = self

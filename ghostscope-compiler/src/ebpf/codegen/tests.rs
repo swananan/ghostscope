@@ -1,6 +1,7 @@
 use super::*;
 use crate::CompileOptions;
 use ghostscope_protocol::trace_event::{TraceEventHeader, TraceEventMessage};
+use inkwell::values::AnyValue;
 
 #[test]
 fn print_complex_format_budget_tracks_event_size() {
@@ -106,6 +107,115 @@ fn computed_int_in_format_compiles() {
     let program = crate::script::Program::new();
     let res = ctx.compile_program(&program, "test_fmt", &[stmt], None, None, None);
     assert!(res.is_ok(), "Compilation failed: {:?}", res.err());
+}
+
+#[test]
+fn event_accumulation_buffer_is_looked_up_once_per_program() {
+    let context = inkwell::context::Context::create();
+    let opts = CompileOptions::default();
+    let mut ctx =
+        EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("create EbpfContext");
+    let statements = [
+        crate::script::Statement::Print(crate::script::PrintStatement::String("first".to_string())),
+        crate::script::Statement::Print(crate::script::PrintStatement::String(
+            "second".to_string(),
+        )),
+    ];
+    let program = crate::script::Program::new();
+
+    let (function, _) = ctx
+        .compile_program(
+            &program,
+            "single_accum_lookup",
+            &statements,
+            None,
+            None,
+            None,
+        )
+        .expect("compile program");
+    let ir = function.print_to_string().to_string();
+
+    assert_eq!(
+        ir.matches("@event_accum_buffer").count(),
+        1,
+        "generated program must reference event_accum_buffer once:\n{ir}"
+    );
+}
+
+#[test]
+fn namespace_pid_filter_reuses_entry_stack_before_accumulation_buffer_lookup() {
+    let context = inkwell::context::Context::create();
+    let opts = CompileOptions {
+        pid_filter_spec: Some(crate::PidFilterSpec::NamespaceTgid {
+            filter_pid: 42,
+            pid_ns: crate::PidNamespaceId {
+                dev: Some(1),
+                inode: 2,
+            },
+        }),
+        ..CompileOptions::default()
+    };
+    let mut ctx =
+        EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("create EbpfContext");
+    let program = crate::script::Program::new();
+
+    let (function, _) = ctx
+        .compile_program(&program, "namespace_pid_filter", &[], None, None, None)
+        .expect("compile namespace-filtered program");
+    ctx.module.verify().expect("verify generated LLVM IR");
+
+    let ir = function.print_to_string().to_string();
+    assert!(ir.contains("%pm_key = alloca [4 x i32]"));
+    assert!(
+        !ir.contains("%pidns_info = alloca"),
+        "namespace filtering must reuse entry-block key storage:\n{ir}"
+    );
+    let continue_offset = ir
+        .find("continue_execution:")
+        .expect("namespace filter has a continuation block");
+    let lookup_offset = ir
+        .find("@event_accum_buffer")
+        .expect("program looks up event_accum_buffer");
+    assert!(
+        lookup_offset > continue_offset,
+        "accumulation buffer lookup must follow namespace filtering:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("@event_accum_buffer").count(),
+        1,
+        "namespace-filtered program must still look up event_accum_buffer once"
+    );
+}
+
+#[test]
+fn event_accumulation_buffer_lookup_is_not_shared_across_programs() {
+    let context = inkwell::context::Context::create();
+    let opts = CompileOptions::default();
+    let mut ctx =
+        EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("create EbpfContext");
+    let program = crate::script::Program::new();
+    let (main_function, _) = ctx
+        .compile_program(&program, "main_program", &[], None, None, None)
+        .expect("compile main program");
+
+    let step_function = ctx
+        .create_tail_call_function("tail_step_program")
+        .expect("create tail-call step program");
+    ctx.initialize_event_accumulation_buffer_or_return_zero()
+        .expect("initialize tail-call accumulation buffer");
+    ctx.builder
+        .build_return(Some(&context.i32_type().const_zero()))
+        .expect("return from tail-call step program");
+    ctx.module.verify().expect("verify generated LLVM IR");
+
+    let main_ir = main_function.print_to_string().to_string();
+    let step_ir = step_function.print_to_string().to_string();
+    assert_eq!(main_ir.matches("@event_accum_buffer").count(), 1);
+    assert_eq!(
+        step_ir.matches("@event_accum_buffer").count(),
+        1,
+        "tail-call step program must perform its own lookup:\n{step_ir}"
+    );
 }
 
 #[test]
