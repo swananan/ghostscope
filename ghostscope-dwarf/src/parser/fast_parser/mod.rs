@@ -4,8 +4,8 @@ use crate::{
     binary::{dwarf_reader_from_arc_with_endian, DwarfReader},
     core::{FunctionDieKind, IndexEntry, LineEntry, Result},
     index::{
-        directory_from_index, resolve_file_path, LightweightFileIndex, LightweightIndex,
-        LightweightIndexShard, LineMappingTable, ScopedFileIndexManager,
+        directory_from_index, resolve_file_path, GdbSymbolKind, GnuPubIndex, LightweightFileIndex,
+        LightweightIndex, LightweightIndexShard, LineMappingTable, ScopedFileIndexManager,
     },
 };
 use gimli::{Reader, Section};
@@ -15,6 +15,33 @@ use std::{
     sync::Arc,
 };
 use tracing::debug;
+
+#[derive(Debug, Clone)]
+pub(crate) struct GnuPubSections {
+    pub_names: gimli::DebugGnuPubNames<DwarfReader>,
+    pub_types: gimli::DebugGnuPubTypes<DwarfReader>,
+}
+
+impl GnuPubSections {
+    pub(crate) fn new(pub_names: DwarfReader, pub_types: DwarfReader) -> Self {
+        Self {
+            pub_names: gimli::DebugGnuPubNames::from(pub_names),
+            pub_types: gimli::DebugGnuPubTypes::from(pub_types),
+        }
+    }
+}
+
+fn gnu_pub_symbol_kind(
+    kind: gimli::constants::GdbIndexSymbolKind,
+) -> Result<Option<GdbSymbolKind>> {
+    match kind {
+        gimli::constants::GDB_INDEX_SYMBOL_KIND_TYPE => Ok(Some(GdbSymbolKind::Type)),
+        gimli::constants::GDB_INDEX_SYMBOL_KIND_VARIABLE => Ok(Some(GdbSymbolKind::Variable)),
+        gimli::constants::GDB_INDEX_SYMBOL_KIND_FUNCTION => Ok(Some(GdbSymbolKind::Function)),
+        gimli::constants::GDB_INDEX_SYMBOL_KIND_OTHER => Ok(None),
+        _ => anyhow::bail!("invalid GNU pubnames symbol kind {kind}"),
+    }
+}
 
 fn is_gdb2_name_index(header: &gimli::NameIndexHeader<DwarfReader>) -> Result<bool> {
     let Some(augmentation) = header.augmentation_string() else {
@@ -142,6 +169,7 @@ fn patch_gdb2_abbreviations(
 #[derive(Clone, Default)]
 struct FunctionMetadata {
     name: Option<Arc<str>>,
+    linkage_name: Option<Arc<str>>,
     has_inline_attribute: bool,
     is_linkage_name: bool,
     is_external: Option<bool>,
@@ -337,7 +365,7 @@ impl<'a> DwarfParser<'a> {
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
                         };
-                        let linkage_name = raw_attrs.linkage_name.as_ref().map(Arc::clone);
+                        let linkage_name = metadata.linkage_name.as_ref().map(Arc::clone);
                         let seed = FunctionEntrySeed {
                             die_offset: entry_offset,
                             tag,
@@ -381,7 +409,7 @@ impl<'a> DwarfParser<'a> {
                             is_linkage: metadata.is_linkage_name,
                             ..Default::default()
                         };
-                        let linkage_name = raw_attrs.linkage_name.as_ref().map(Arc::clone);
+                        let linkage_name = metadata.linkage_name.as_ref().map(Arc::clone);
                         let seed = FunctionEntrySeed {
                             die_offset: entry_offset,
                             tag,
@@ -861,6 +889,7 @@ impl<'a> DwarfParser<'a> {
             metadata.name = Some(Arc::clone(name));
             metadata.is_linkage_name = true;
         }
+        metadata.linkage_name = attrs.linkage_name.as_ref().map(Arc::clone);
 
         metadata.has_inline_attribute = attrs.has_inline_attribute;
         metadata.is_external = attrs.is_external;
@@ -888,6 +917,9 @@ impl<'a> DwarfParser<'a> {
 
             if metadata.name.is_none() {
                 metadata.name = origin_metadata.name.as_ref().map(Arc::clone);
+            }
+            if metadata.linkage_name.is_none() {
+                metadata.linkage_name = origin_metadata.linkage_name.as_ref().map(Arc::clone);
             }
             if metadata.is_external.is_none() {
                 metadata.is_external = origin_metadata.is_external;
@@ -1376,6 +1408,53 @@ impl<'a> DwarfParser<'a> {
         })
     }
 
+    fn validate_gnu_pub_set(
+        &self,
+        section_name: &str,
+        unit_offset: gimli::DebugInfoOffset,
+        unit_length: usize,
+        format: gimli::Format,
+    ) -> Result<()> {
+        let header = self.dwarf.unit_header(unit_offset).map_err(|error| {
+            anyhow::anyhow!(
+                "{section_name} references invalid CU 0x{:x}: {error}",
+                unit_offset.0
+            )
+        })?;
+        if header.format() != format {
+            anyhow::bail!(
+                "{section_name} CU 0x{:x} uses {:?}, but its index contribution uses {:?}",
+                unit_offset.0,
+                header.format(),
+                format
+            );
+        }
+        let actual_length = header.length_including_self();
+        if actual_length != unit_length {
+            anyhow::bail!(
+                "{section_name} CU 0x{:x} length 0x{unit_length:x} does not match .debug_info length 0x{actual_length:x}",
+                unit_offset.0
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_gnu_pub_die_offset(
+        section_name: &str,
+        unit_offset: gimli::DebugInfoOffset,
+        unit_length: usize,
+        die_offset: gimli::UnitOffset,
+    ) -> Result<()> {
+        if die_offset.0 >= unit_length {
+            anyhow::bail!(
+                "{section_name} DIE offset 0x{:x} is outside CU 0x{:x} with length 0x{unit_length:x}",
+                die_offset.0,
+                unit_offset.0
+            );
+        }
+        Ok(())
+    }
+
     fn compatible_debug_names(&self) -> Result<gimli::DebugNames<DwarfReader>> {
         let mut patches = Vec::new();
         let mut headers = self.dwarf.debug_names.headers();
@@ -1536,6 +1615,174 @@ impl<'a> DwarfParser<'a> {
             functions_count,
             variables_count,
         }))
+    }
+
+    pub(crate) fn parse_gnu_pubnames(
+        &self,
+        sections: &GnuPubSections,
+        module_path: &str,
+    ) -> Result<(DebugParseResult, GnuPubIndex)> {
+        debug!("Starting GNU pubnames parsing for: {}", module_path);
+        let mut pub_names_sets = Vec::new();
+        let mut pub_names_set_iter = sections.pub_names.sets();
+        while let Some(set) = pub_names_set_iter.next()? {
+            pub_names_sets.push(set);
+        }
+        let mut pub_types_sets = Vec::new();
+        let mut pub_types_set_iter = sections.pub_types.sets();
+        while let Some(set) = pub_types_set_iter.next()? {
+            pub_types_sets.push(set);
+        }
+
+        let pub_names_set_count = pub_names_sets.len();
+        let pub_types_set_count = pub_types_sets.len();
+        if pub_names_set_count == 0 || pub_types_set_count == 0 {
+            anyhow::bail!(
+                "GNU pubnames index is incomplete: {pub_names_set_count} pubnames sets and {pub_types_set_count} pubtypes sets"
+            );
+        }
+
+        let pub_names_units = pub_names_sets
+            .iter()
+            .map(|set| set.unit_header_offset())
+            .collect::<HashSet<_>>();
+        let pub_types_units = pub_types_sets
+            .iter()
+            .map(|set| set.unit_header_offset())
+            .collect::<HashSet<_>>();
+        if pub_names_units.len() != pub_names_set_count
+            || pub_types_units.len() != pub_types_set_count
+        {
+            anyhow::bail!("GNU pubnames index contains duplicate CU contributions");
+        }
+
+        let mut all_debug_info_units = Vec::new();
+        let mut pub_contribution_units = HashSet::new();
+        let mut units = self.dwarf.units();
+        while let Some(header) = units.next()? {
+            if let Some(unit_offset) = header.debug_info_offset() {
+                all_debug_info_units.push(unit_offset);
+                if !matches!(
+                    header.type_(),
+                    gimli::UnitType::Type { .. } | gimli::UnitType::SplitType { .. }
+                ) {
+                    pub_contribution_units.insert(unit_offset);
+                }
+            }
+        }
+        let missing_pub_names = pub_contribution_units.difference(&pub_names_units).count();
+        let missing_pub_types = pub_contribution_units.difference(&pub_types_units).count();
+        let extra_pub_names = pub_names_units.difference(&pub_contribution_units).count();
+        let extra_pub_types = pub_types_units.difference(&pub_contribution_units).count();
+        if missing_pub_names != 0
+            || missing_pub_types != 0
+            || extra_pub_names != 0
+            || extra_pub_types != 0
+        {
+            anyhow::bail!(
+                "GNU pubnames index does not cover all .debug_info units: {missing_pub_names} missing pubnames, {missing_pub_types} missing pubtypes, {extra_pub_names} unknown pubnames, {extra_pub_types} unknown pubtypes contributions"
+            );
+        }
+
+        let pub_name_seed_shards = pub_names_sets
+            .into_par_iter()
+            .map(
+                |set| -> Result<Vec<(String, gimli::DebugInfoOffset, GdbSymbolKind)>> {
+                    let unit_offset = set.unit_header_offset();
+                    let unit_length = set.unit_length();
+                    self.validate_gnu_pub_set(
+                        ".debug_gnu_pubnames",
+                        unit_offset,
+                        unit_length,
+                        set.format(),
+                    )?;
+                    let mut seeds = Vec::new();
+                    let mut entries = set.items();
+                    while let Some(entry) = entries.next()? {
+                        let die_offset = entry.die_offset();
+                        Self::validate_gnu_pub_die_offset(
+                            ".debug_gnu_pubnames",
+                            unit_offset,
+                            unit_length,
+                            die_offset,
+                        )?;
+                        if let Some(kind) = gnu_pub_symbol_kind(entry.kind())? {
+                            let name = entry.name().to_string_lossy()?.into_owned();
+                            seeds.push((name, unit_offset, kind));
+                        }
+                    }
+                    Ok(seeds)
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        let pub_type_seed_shards = pub_types_sets
+            .into_par_iter()
+            .map(
+                |set| -> Result<Vec<(String, gimli::DebugInfoOffset, GdbSymbolKind)>> {
+                    let unit_offset = set.unit_header_offset();
+                    let unit_length = set.unit_length();
+                    self.validate_gnu_pub_set(
+                        ".debug_gnu_pubtypes",
+                        unit_offset,
+                        unit_length,
+                        set.format(),
+                    )?;
+                    let mut seeds = Vec::new();
+                    let mut entries = set.items();
+                    while let Some(entry) = entries.next()? {
+                        let die_offset = entry.die_offset();
+                        Self::validate_gnu_pub_die_offset(
+                            ".debug_gnu_pubtypes",
+                            unit_offset,
+                            unit_length,
+                            die_offset,
+                        )?;
+                        if let Some(kind) = gnu_pub_symbol_kind(entry.kind())? {
+                            let name = entry.name().to_string_lossy()?.into_owned();
+                            seeds.push((name, unit_offset, kind));
+                        }
+                    }
+                    Ok(seeds)
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut gnu_pub_index = GnuPubIndex::new(all_debug_info_units);
+        for (name, unit_offset, kind) in pub_name_seed_shards
+            .into_iter()
+            .chain(pub_type_seed_shards)
+            .flatten()
+        {
+            gnu_pub_index.insert(name, unit_offset, kind);
+        }
+
+        let (functions_count, variables_count, _) = gnu_pub_index.get_stats();
+        let mut lightweight_index = LightweightIndex::new();
+        let has_aranges = lightweight_index.build_cu_maps_from_aranges(self.dwarf);
+        let has_root_ranges = lightweight_index
+            .build_cu_maps_from_unit_roots(self.dwarf, pub_contribution_units.iter().copied());
+        if !has_aranges && !has_root_ranges && functions_count > 0 {
+            anyhow::bail!(
+                "GNU pubnames index for {module_path} has functions but no usable address-to-CU ranges",
+            );
+        }
+
+        debug!(
+            "Completed GNU pubnames parsing for {}: {} functions, {} variables, {} pubnames sets, {} pubtypes sets",
+            module_path,
+            functions_count,
+            variables_count,
+            pub_names_set_count,
+            pub_types_set_count
+        );
+        Ok((
+            DebugParseResult {
+                lightweight_index,
+                functions_count,
+                variables_count,
+            },
+            gnu_pub_index,
+        ))
     }
 
     pub(crate) fn parse_debug_info_cus(

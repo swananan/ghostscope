@@ -274,10 +274,12 @@ Behavior:
 
 ### Native DWARF Indexes
 
-When the ELF file containing DWARF also contains `.debug_names` or
-`.gdb_index`, GhostScope uses that native index to select compilation units for
-on-demand parsing. Otherwise, it performs its normal full DWARF scan. An
-unusable index is reported in CLI/TUI startup status before falling back.
+When the ELF file containing DWARF also contains `.debug_names`, `.gdb_index`,
+or a complete `.debug_gnu_pubnames` / `.debug_gnu_pubtypes` pair, GhostScope
+uses that native index to select compilation units for on-demand parsing. The
+preference order is `.debug_names`, `.gdb_index`, then the GNU pubnames pair.
+Otherwise, it performs its normal full DWARF scan. An unusable or incomplete
+index is reported in CLI/TUI startup status before falling back.
 
 ### Complete Command Reference
 

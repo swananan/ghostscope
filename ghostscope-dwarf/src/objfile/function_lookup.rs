@@ -243,13 +243,31 @@ impl LoadedObjfile {
                 error
             );
         }
-        Self::function_candidate_indices(
+        let mut candidates = Self::function_candidate_indices(
             &self
                 .lightweight_index
                 .read()
                 .expect("lightweight index lock poisoned"),
             name,
-        )
+        );
+        if candidates.is_empty() && self.uses_gnu_pub_index() {
+            if let Err(error) = self.ensure_all_debug_info_for_gnu_index() {
+                tracing::warn!(
+                    "Failed to exhaust GNU-indexed DWARF for function '{}' in {}: {}",
+                    name,
+                    self.module_path().display(),
+                    error
+                );
+            }
+            candidates = Self::function_candidate_indices(
+                &self
+                    .lightweight_index
+                    .read()
+                    .expect("lightweight index lock poisoned"),
+                name,
+            );
+        }
+        candidates
     }
 
     pub(super) fn matching_variable_candidate_indices(&self, name: &str) -> Vec<usize> {
@@ -279,13 +297,31 @@ impl LoadedObjfile {
                 error
             );
         }
-        Self::variable_candidate_indices(
+        let mut candidates = Self::variable_candidate_indices(
             &self
                 .lightweight_index
                 .read()
                 .expect("lightweight index lock poisoned"),
             name,
-        )
+        );
+        if candidates.is_empty() && self.uses_gnu_pub_index() {
+            if let Err(error) = self.ensure_all_debug_info_for_gnu_index() {
+                tracing::warn!(
+                    "Failed to exhaust GNU-indexed DWARF for variable '{}' in {}: {}",
+                    name,
+                    self.module_path().display(),
+                    error
+                );
+            }
+            candidates = Self::variable_candidate_indices(
+                &self
+                    .lightweight_index
+                    .read()
+                    .expect("lightweight index lock poisoned"),
+                name,
+            );
+        }
+        candidates
     }
 
     fn resolve_function_ranges(&self, entry: &crate::core::IndexEntry) -> Result<Vec<(u64, u64)>> {

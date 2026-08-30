@@ -7,9 +7,9 @@ use crate::{
         DwarfReader, MappedFile,
     },
     core::{mapping::ModuleMapping, DebugInfoSource, Result},
-    index::{BlockIndex, GdbIndex, TypeNameIndex},
+    index::{BlockIndex, GdbIndex, GnuPubIndex, TypeNameIndex},
     objfile::ModuleUnwindInfo,
-    parser::DetailedParser,
+    parser::{DebugParseResult, DetailedParser, DwarfParser, GnuPubSections},
 };
 use ghostscope_debuginfod::{build_id_to_hex, DebuginfodClient};
 use gimli::{Reader, Section};
@@ -27,6 +27,75 @@ enum InitialIndexSelection {
     FullScan { rejection: Option<String> },
     DebugNames,
     GdbIndex,
+    GnuPubNames(GnuPubIndex),
+}
+
+fn append_index_rejection(current: Option<String>, next: String) -> Option<String> {
+    Some(match current {
+        Some(current) => format!("{current}; {next}"),
+        None => next,
+    })
+}
+
+fn select_fallback_index(
+    parser: &DwarfParser<'_>,
+    module_path: &str,
+    has_gdb_index: bool,
+    mapped_file: &Arc<MappedFile>,
+    mut rejection: Option<String>,
+) -> Result<(DebugParseResult, InitialIndexSelection)> {
+    if has_gdb_index {
+        return Ok((
+            parser.initialize_lazy_debug_info(),
+            InitialIndexSelection::GdbIndex,
+        ));
+    }
+
+    let gnu_pub_sections = match LoadedObjfile::load_gnu_pub_sections(mapped_file) {
+        Ok(Some(sections)) => {
+            tracing::info!(
+                "Found .debug_gnu_pubnames and .debug_gnu_pubtypes in {}",
+                mapped_file.path.display()
+            );
+            Some(sections)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(
+                "Ignoring unusable GNU pubnames sections in {}: {}",
+                mapped_file.path.display(),
+                error
+            );
+            rejection = append_index_rejection(
+                rejection,
+                format!("GNU pubnames sections could not be loaded: {error}"),
+            );
+            None
+        }
+    };
+
+    if let Some(sections) = gnu_pub_sections.as_ref() {
+        match parser.parse_gnu_pubnames(sections, module_path) {
+            Ok((index, gnu_pub_index)) => {
+                return Ok((index, InitialIndexSelection::GnuPubNames(gnu_pub_index)));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Ignoring unusable GNU pubnames index for {}: {}",
+                    module_path,
+                    error
+                );
+                rejection = append_index_rejection(
+                    rejection,
+                    format!("GNU pubnames index could not be used: {error}"),
+                );
+            }
+        }
+    }
+
+    parser
+        .parse_debug_info(module_path)
+        .map(|index| (index, InitialIndexSelection::FullScan { rejection }))
 }
 
 impl LoadedObjfile {
@@ -202,7 +271,8 @@ impl LoadedObjfile {
             }
         };
         let has_gdb_index = gdb_index.is_some();
-        let initial_rejection = gdb_index_rejection.clone();
+        let initial_rejection =
+            gdb_index_rejection.map(|reason| format!(".gdb_index could not be used: {reason}"));
 
         tracing::debug!(
             "Starting parallel DWARF parsing with true debug_line || debug_info parallelism..."
@@ -211,6 +281,7 @@ impl LoadedObjfile {
         let (pair_result, unwind_info) = tokio::try_join!(
             tokio::task::spawn_blocking({
                 let dwarf = Arc::clone(&dwarf);
+                let mapped_file_for_index = Arc::clone(&mapped_file);
                 let module_path = module_mapping.path.to_string_lossy().to_string();
                 move || -> Result<(
                     crate::parser::LineParseResult,
@@ -226,56 +297,30 @@ impl LoadedObjfile {
                             let parser = crate::parser::DwarfParser::new(&dwarf);
                             match parser.parse_debug_names(&module_path) {
                                 Ok(Some(index)) => Ok((index, InitialIndexSelection::DebugNames)),
-                                Ok(None) if has_gdb_index => {
-                                    Ok((
-                                        parser.initialize_lazy_debug_info(),
-                                        InitialIndexSelection::GdbIndex,
-                                    ))
-                                }
-                                Ok(None) => parser
-                                    .parse_debug_info(&module_path)
-                                    .map(|index| {
-                                        (
-                                            index,
-                                            InitialIndexSelection::FullScan {
-                                                rejection: initial_rejection,
-                                            },
-                                        )
-                                    }),
+                                Ok(None) => select_fallback_index(
+                                    &parser,
+                                    &module_path,
+                                    has_gdb_index,
+                                    &mapped_file_for_index,
+                                    initial_rejection,
+                                ),
                                 Err(error) => {
                                     tracing::warn!(
                                         "Ignoring unusable .debug_names for {}: {}",
                                         module_path,
                                         error
                                     );
-                                    if has_gdb_index {
-                                        Ok((
-                                            parser.initialize_lazy_debug_info(),
-                                            InitialIndexSelection::GdbIndex,
-                                        ))
-                                    } else {
-                                        let debug_names_rejection = format!(
-                                            ".debug_names could not be used: {error}"
-                                        );
-                                        let rejection = initial_rejection.map_or(
-                                            debug_names_rejection.clone(),
-                                            |gdb_rejection| {
-                                                format!(
-                                                    ".gdb_index could not be used: {gdb_rejection}; {debug_names_rejection}"
-                                                )
-                                            },
-                                        );
-                                        parser
-                                            .parse_debug_info(&module_path)
-                                            .map(|index| {
-                                                (
-                                                    index,
-                                                    InitialIndexSelection::FullScan {
-                                                        rejection: Some(rejection),
-                                                    },
-                                                )
-                                            })
-                                    }
+                                    let rejection = append_index_rejection(
+                                        initial_rejection,
+                                        format!(".debug_names could not be used: {error}"),
+                                    );
+                                    select_fallback_index(
+                                        &parser,
+                                        &module_path,
+                                        has_gdb_index,
+                                        &mapped_file_for_index,
+                                        rejection,
+                                    )
                                 }
                             }
                         },
@@ -298,20 +343,23 @@ impl LoadedObjfile {
 
         let (line_result, info_result, index_selection) = pair_result?;
         let lazy_debug_info = !matches!(index_selection, InitialIndexSelection::FullScan { .. });
-        let (gdb_index, dwarf_index_status) = match index_selection {
+        let (gdb_index, gnu_pub_index, dwarf_index_status) = match index_selection {
             InitialIndexSelection::FullScan { rejection } => {
                 let status = rejection.map_or(DwarfIndexStatus::FullScan, |reason| {
                     DwarfIndexStatus::Rejected { reason }
                 });
-                (None, status)
+                (None, None, status)
             }
-            InitialIndexSelection::DebugNames => (None, DwarfIndexStatus::DebugNames),
+            InitialIndexSelection::DebugNames => (None, None, DwarfIndexStatus::DebugNames),
             InitialIndexSelection::GdbIndex => {
                 let index = gdb_index.expect("selected GDB index must be loaded");
                 let status = DwarfIndexStatus::GdbIndex {
                     version: index.version(),
                 };
-                (Some(index), status)
+                (Some(index), None, status)
+            }
+            InitialIndexSelection::GnuPubNames(index) => {
+                (None, Some(index), DwarfIndexStatus::GnuPubNames)
             }
         };
 
@@ -392,6 +440,7 @@ impl LoadedObjfile {
             block_index: std::sync::RwLock::new(BlockIndex::new()),
             type_name_index: RwLock::new(type_name_index),
             gdb_index,
+            gnu_pub_index,
             dwarf_index_status,
             lazy_debug_info,
             indexed_debug_info_cus: Mutex::new(HashSet::new()),
@@ -729,6 +778,54 @@ impl LoadedObjfile {
         index.validate_unit_headers(dwarf)?;
         index.validate_symbol_data()?;
         Ok(Some(index))
+    }
+
+    fn load_gnu_pub_sections(file_data: &Arc<MappedFile>) -> Result<Option<GnuPubSections>> {
+        let object = file_data.parse_object()?;
+        let endian = dwarf_endian_from_object(&object);
+        let load_section = |id: gimli::SectionId| -> Result<Option<DwarfReader>> {
+            let Some(section) = object.section_by_name(id.name()) else {
+                return Ok(None);
+            };
+            let compressed_range = section.compressed_file_range()?;
+            if compressed_range.format != object::read::CompressionFormat::None {
+                let data = section.uncompressed_data().map_err(|error| {
+                    anyhow::anyhow!(
+                        "Failed to decompress DWARF section {} in {}: {}",
+                        id.name(),
+                        file_data.path.display(),
+                        error
+                    )
+                })?;
+                let bytes: Arc<[u8]> = match data {
+                    Cow::Borrowed(bytes) => Arc::from(bytes),
+                    Cow::Owned(bytes) => Arc::from(bytes),
+                };
+                return Ok(Some(dwarf_reader_from_arc_with_endian(bytes, endian)));
+            }
+
+            let (start, size) = section
+                .file_range()
+                .ok_or_else(|| anyhow::anyhow!("Invalid DWARF section range for {}", id.name()))?;
+            let reader = MappedFile::dwarf_reader_range(Arc::clone(file_data), start, size, endian)
+                .ok_or_else(|| anyhow::anyhow!("Invalid DWARF section range for {}", id.name()))?;
+            Ok(Some(reader))
+        };
+
+        let pub_names = load_section(gimli::SectionId::DebugGnuPubNames)?;
+        let pub_types = load_section(gimli::SectionId::DebugGnuPubTypes)?;
+        match (pub_names, pub_types) {
+            (None, None) => Ok(None),
+            (Some(pub_names), Some(pub_types)) => {
+                Ok(Some(GnuPubSections::new(pub_names, pub_types)))
+            }
+            (Some(_), None) => {
+                anyhow::bail!(".debug_gnu_pubnames is present without .debug_gnu_pubtypes")
+            }
+            (None, Some(_)) => {
+                anyhow::bail!(".debug_gnu_pubtypes is present without .debug_gnu_pubnames")
+            }
+        }
     }
 
     fn load_dwarf_sections(file_data: &Arc<MappedFile>) -> Result<DwarfData> {

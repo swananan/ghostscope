@@ -12,6 +12,7 @@ fi
 OUT_DIR=$1
 QUERY_OUT_DIR="$OUT_DIR/query-hotspot"
 PARSE_OUT_DIR="$OUT_DIR/parse-stress"
+GNU_PUBNAMES_PARSE_OUT_DIR="$OUT_DIR/gnu-pubnames-stress"
 RUST_PARSE_OUT_DIR="$OUT_DIR/rust-parse-stress"
 CPP_TEMPLATE_OUT_DIR="$OUT_DIR/cpp-template-stress"
 RUST_GENERIC_OUT_DIR="$OUT_DIR/rust-generic-stress"
@@ -19,6 +20,7 @@ CPP_NAMESPACE_OUT_DIR="$OUT_DIR/cpp-deep-namespace"
 WORK_DIR="$OUT_DIR/_build"
 PARSE_SRC_DIR="$WORK_DIR/parse-stress-src"
 PARSE_OBJ_DIR="$WORK_DIR/parse-stress-obj"
+GNU_PUBNAMES_PARSE_OBJ_DIR="$WORK_DIR/gnu-pubnames-stress-obj"
 RUST_PARSE_SRC_DIR="$WORK_DIR/rust-parse-stress-src"
 CPP_TEMPLATE_SRC_DIR="$WORK_DIR/cpp-template-stress-src"
 CPP_TEMPLATE_OBJ_DIR="$WORK_DIR/cpp-template-stress-obj"
@@ -118,6 +120,7 @@ fi
 mkdir -p \
     "$QUERY_OUT_DIR" \
     "$PARSE_OUT_DIR" \
+    "$GNU_PUBNAMES_PARSE_OUT_DIR" \
     "$RUST_PARSE_OUT_DIR" \
     "$CPP_TEMPLATE_OUT_DIR" \
     "$RUST_GENERIC_OUT_DIR" \
@@ -125,6 +128,7 @@ mkdir -p \
 rm -rf \
     "$PARSE_SRC_DIR" \
     "$PARSE_OBJ_DIR" \
+    "$GNU_PUBNAMES_PARSE_OBJ_DIR" \
     "$RUST_PARSE_SRC_DIR" \
     "$CPP_TEMPLATE_SRC_DIR" \
     "$CPP_TEMPLATE_OBJ_DIR" \
@@ -134,6 +138,7 @@ rm -rf \
 mkdir -p \
     "$PARSE_SRC_DIR" \
     "$PARSE_OBJ_DIR" \
+    "$GNU_PUBNAMES_PARSE_OBJ_DIR" \
     "$RUST_PARSE_SRC_DIR" \
     "$CPP_TEMPLATE_SRC_DIR" \
     "$CPP_TEMPLATE_OBJ_DIR" \
@@ -166,6 +171,38 @@ compile_cpp_corpus() {
         -fno-pie \
         -no-pie \
         "${cpp_objects[@]}" \
+        -o "$out_bin" \
+        "${COMMON_LDFLAGS[@]}" \
+        "${EXTRA_LDFLAGS[@]}"
+}
+
+compile_c_corpus() {
+    local src_dir=$1
+    local obj_dir=$2
+    local out_bin=$3
+    shift 3
+    local -a corpus_cflags=("$@")
+    local -a c_objects=()
+
+    mapfile -t c_sources < <(find "$src_dir" -name '*.c' -print | sort)
+    for source_path in "${c_sources[@]}"; do
+        local source_name
+        local object_path
+        source_name=$(basename "$source_path" .c)
+        object_path="$obj_dir/${source_name}.o"
+        "$CC" \
+            "${COMMON_CFLAGS[@]}" \
+            "${EXTRA_CFLAGS[@]}" \
+            "${corpus_cflags[@]}" \
+            -I"$src_dir" \
+            -c \
+            -o "$object_path" \
+            "$source_path"
+        c_objects+=("$object_path")
+    done
+
+    "$CC" \
+        "${c_objects[@]}" \
         -o "$out_bin" \
         "${COMMON_LDFLAGS[@]}" \
         "${EXTRA_LDFLAGS[@]}"
@@ -216,28 +253,14 @@ PARSE_STRESS_HISTORY_LEN=$(jq -r '.history_len' "$PARSE_CONFIG_PATH")
 PARSE_STRESS_GENERATED_C_FILES=$(jq -r '.generated_c_files' "$PARSE_CONFIG_PATH")
 PARSE_STRESS_GENERATED_HEADER_FILES=$(jq -r '.generated_header_files' "$PARSE_CONFIG_PATH")
 
-mapfile -t parse_sources < <(find "$PARSE_SRC_DIR" -name '*.c' -print | sort)
-parse_objects=()
-
-for source_path in "${parse_sources[@]}"; do
-    source_name=$(basename "$source_path" .c)
-    object_path="$PARSE_OBJ_DIR/${source_name}.o"
-    "$CC" \
-        "${COMMON_CFLAGS[@]}" \
-        "${EXTRA_CFLAGS[@]}" \
-        -I"$PARSE_SRC_DIR" \
-        -c \
-        -o "$object_path" \
-        "$source_path"
-    parse_objects+=("$object_path")
-done
-
 PARSE_BIN="$PARSE_OUT_DIR/parse_stress"
-"$CC" \
-    "${parse_objects[@]}" \
-    -o "$PARSE_BIN" \
-    "${COMMON_LDFLAGS[@]}" \
-    "${EXTRA_LDFLAGS[@]}"
+GNU_PUBNAMES_PARSE_BIN="$GNU_PUBNAMES_PARSE_OUT_DIR/gnu_pubnames_stress"
+compile_c_corpus "$PARSE_SRC_DIR" "$PARSE_OBJ_DIR" "$PARSE_BIN"
+compile_c_corpus \
+    "$PARSE_SRC_DIR" \
+    "$GNU_PUBNAMES_PARSE_OBJ_DIR" \
+    "$GNU_PUBNAMES_PARSE_BIN" \
+    -ggnu-pubnames
 
 rust_generator_args=(
     --output-dir "$RUST_PARSE_SRC_DIR"
@@ -386,12 +409,14 @@ compile_cpp_corpus "$CPP_NAMESPACE_SRC_DIR" "$CPP_NAMESPACE_OBJ_DIR" "$CPP_NAMES
 
 query_sha=$(sha256sum "$QUERY_BIN" | awk '{print $1}')
 parse_sha=$(sha256sum "$PARSE_BIN" | awk '{print $1}')
+gnu_pubnames_parse_sha=$(sha256sum "$GNU_PUBNAMES_PARSE_BIN" | awk '{print $1}')
 rust_parse_sha=$(sha256sum "$RUST_PARSE_BIN" | awk '{print $1}')
 cpp_template_sha=$(sha256sum "$CPP_TEMPLATE_BIN" | awk '{print $1}')
 rust_generic_sha=$(sha256sum "$RUST_GENERIC_BIN" | awk '{print $1}')
 cpp_namespace_sha=$(sha256sum "$CPP_NAMESPACE_BIN" | awk '{print $1}')
 query_size=$(stat -c '%s' "$QUERY_BIN")
 parse_size=$(stat -c '%s' "$PARSE_BIN")
+gnu_pubnames_parse_size=$(stat -c '%s' "$GNU_PUBNAMES_PARSE_BIN")
 rust_parse_size=$(stat -c '%s' "$RUST_PARSE_BIN")
 cpp_template_size=$(stat -c '%s' "$CPP_TEMPLATE_BIN")
 rust_generic_size=$(stat -c '%s' "$RUST_GENERIC_BIN")
@@ -409,6 +434,8 @@ jq -n \
     --arg query_marker "DWARF_PERF_QUERY_HOTSPOT" \
     --arg parse_path "parse-stress/parse_stress" \
     --arg parse_sha "$parse_sha" \
+    --arg gnu_pubnames_parse_path "gnu-pubnames-stress/gnu_pubnames_stress" \
+    --arg gnu_pubnames_parse_sha "$gnu_pubnames_parse_sha" \
     --arg parse_generator "scripts/dwarf-perf/generate_parse_stress.py" \
     --arg parse_preset "$PARSE_STRESS_PRESET" \
     --arg rust_parse_path "rust-parse-stress/rust_parse_stress" \
@@ -431,6 +458,7 @@ jq -n \
     --argjson query_line "$QUERY_MARKER_LINE" \
     --argjson query_size "$query_size" \
     --argjson parse_size "$parse_size" \
+    --argjson gnu_pubnames_parse_size "$gnu_pubnames_parse_size" \
     --argjson rust_parse_size "$rust_parse_size" \
     --argjson cpp_template_size "$cpp_template_size" \
     --argjson rust_generic_size "$rust_generic_size" \
@@ -493,6 +521,25 @@ jq -n \
                 relative_path: $parse_path,
                 sha256: $parse_sha,
                 size_bytes: $parse_size,
+                generator: {
+                    script: $parse_generator,
+                    preset: $parse_preset,
+                    units: $parse_units,
+                    types_per_unit: $parse_types_per_unit,
+                    functions_per_unit: $parse_functions_per_unit,
+                    history_len: $parse_history_len,
+                    generated_c_files: $parse_generated_c_files,
+                    generated_header_files: $parse_generated_header_files
+                }
+            },
+            {
+                name: "gnu-pubnames-stress",
+                kind: "fast-parse",
+                language: "c",
+                index: "gnu-pubnames",
+                relative_path: $gnu_pubnames_parse_path,
+                sha256: $gnu_pubnames_parse_sha,
+                size_bytes: $gnu_pubnames_parse_size,
                 generator: {
                     script: $parse_generator,
                     preset: $parse_preset,
@@ -581,6 +628,7 @@ jq -n \
 echo "Built DWARF perf corpus into $OUT_DIR"
 echo "  query-hotspot: $QUERY_BIN"
 echo "  parse-stress:  $PARSE_BIN"
+echo "  gnu-pubnames-stress: $GNU_PUBNAMES_PARSE_BIN"
 echo "  rust-parse-stress: $RUST_PARSE_BIN"
 echo "  cpp-template-stress: $CPP_TEMPLATE_BIN"
 echo "  rust-generic-stress: $RUST_GENERIC_BIN"

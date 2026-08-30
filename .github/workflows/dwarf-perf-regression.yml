@@ -125,6 +125,7 @@ jobs:
           manifest="$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out/manifest.json"
           parse_targets=(
             parse-stress
+            gnu-pubnames-stress
             rust-parse-stress
             cpp-template-stress
             rust-generic-stress
@@ -150,6 +151,7 @@ jobs:
           manifest="$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out/manifest.json"
           parse_targets=(
             parse-stress
+            gnu-pubnames-stress
             rust-parse-stress
             cpp-template-stress
             rust-generic-stress
@@ -179,6 +181,7 @@ jobs:
           manifest="$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out/manifest.json"
           parse_targets=(
             parse-stress
+            gnu-pubnames-stress
             rust-parse-stress
             cpp-template-stress
             rust-generic-stress
@@ -218,6 +221,7 @@ jobs:
           base_manifest="$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out/manifest.json"
           parse_targets=(
             parse-stress
+            gnu-pubnames-stress
             rust-parse-stress
             cpp-template-stress
             rust-generic-stress
@@ -309,6 +313,7 @@ jobs:
 
           parse_targets=(
             parse-stress
+            gnu-pubnames-stress
             rust-parse-stress
             cpp-template-stress
             rust-generic-stress
@@ -357,7 +362,7 @@ jobs:
             printf '%s\n' "- Head: \`${HEAD_SHA::12}\`"
             printf '%s\n' '- Note: The base revision does not contain the DWARF perf baseline tooling yet, so regression gating was skipped.'
             printf '\n'
-            printf '%s\n' 'Head-only baselines for `parse-stress`, `rust-parse-stress`, `cpp-template-stress`, `rust-generic-stress`, and `cpp-deep-namespace` were generated and uploaded as artifacts for inspection.'
+            printf '%s\n' 'Head-only baselines for `parse-stress`, `gnu-pubnames-stress`, `rust-parse-stress`, `cpp-template-stress`, `rust-generic-stress`, and `cpp-deep-namespace` were generated and uploaded as artifacts for inspection.'
           } > "$DWARF_PERF_RESULTS_DIR/summary.md"
 
       - name: Publish summary

@@ -269,9 +269,11 @@ ghostscope bpffs prune --dry-run --json
 
 ### 原生 DWARF 索引
 
-当包含 DWARF 的 ELF 文件同时带有 `.debug_names` 或 `.gdb_index` 时，
-GhostScope 会使用该原生索引选择 CU，并按需调用 fast parser。否则执行原有
-的完整 DWARF 扫描。索引不可用时，CLI/TUI 启动状态会显示回退原因。
+当包含 DWARF 的 ELF 文件带有 `.debug_names`、`.gdb_index`，或完整的
+`.debug_gnu_pubnames` / `.debug_gnu_pubtypes` 组合时，GhostScope 会使用原生
+索引选择 CU，并按需调用 fast parser。优先级依次为 `.debug_names`、
+`.gdb_index`、GNU pubnames 组合；否则执行原有的完整 DWARF 扫描。索引
+不可用或覆盖不完整时，CLI/TUI 启动状态会显示回退原因。
 
 ### 完整命令参考
 

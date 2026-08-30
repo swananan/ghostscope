@@ -54,6 +54,7 @@ The build writes artifacts under `scripts/dwarf-perf/corpus/out/`:
 
 - `query-hotspot/query_hotspot`
 - `parse-stress/parse_stress`
+- `gnu-pubnames-stress/gnu_pubnames_stress`
 - `rust-parse-stress/rust_parse_stress`
 - `cpp-template-stress/cpp_template_stress`
 - `rust-generic-stress/rust_generic_stress`
@@ -85,6 +86,7 @@ To run only one parse corpus:
 Other built-in parse targets include:
 
 - `parse-stress`
+- `gnu-pubnames-stress`
 - `rust-parse-stress`
 - `cpp-template-stress`
 - `rust-generic-stress`
@@ -213,6 +215,10 @@ The Rust parse corpus is intentionally tuned for DWARF density rather than runti
 performance. It keeps debug info in the binary, references a broad slice of `std`,
 and compiles with `-C link-dead-code=yes` so it is useful for fast-index pressure
 tests.
+
+`gnu-pubnames-stress` recompiles the same generated sources as `parse-stress` with
+`-ggnu-pubnames`. Keeping the program and DWARF density aligned makes it a focused
+regression target for the `.debug_gnu_pubnames` / `.debug_gnu_pubtypes` fast path.
 
 The new comparison groups focus on mangled-symbol coverage from three angles:
 

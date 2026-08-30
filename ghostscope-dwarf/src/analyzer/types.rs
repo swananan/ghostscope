@@ -6,6 +6,7 @@ pub enum DwarfIndexStatus {
     FullScan,
     DebugNames,
     GdbIndex { version: u32 },
+    GnuPubNames,
     Rejected { reason: String },
 }
 
@@ -15,6 +16,7 @@ impl DwarfIndexStatus {
             Self::FullScan => "full-scan".to_string(),
             Self::DebugNames => ".debug_names".to_string(),
             Self::GdbIndex { version } => format!(".gdb_index-v{version}"),
+            Self::GnuPubNames => ".debug_gnu_pubnames".to_string(),
             Self::Rejected { .. } => "full-scan (index rejected)".to_string(),
         }
     }
