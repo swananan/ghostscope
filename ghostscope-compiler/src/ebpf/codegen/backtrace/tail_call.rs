@@ -709,6 +709,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         plan: &crate::ebpf::context::PendingBacktraceTailCall,
     ) -> Result<()> {
         self.create_tail_call_function(&plan.step_program_name)?;
+        let accum_buffer = self.initialize_event_accumulation_buffer_or_return_zero()?;
         let current_fn = self.current_function("generate bt tail-call step")?;
         let return_block = self
             .context
@@ -716,9 +717,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let state_ok_block = self
             .context
             .append_basic_block(current_fn, "bt_step_state_ok");
-        let accum_ok_block = self
-            .context
-            .append_basic_block(current_fn, "bt_step_accum_ok");
         let bounds_ok_block = self
             .context
             .append_basic_block(current_fn, "bt_step_bounds_ok");
@@ -757,16 +755,6 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         self.builder.position_at_end(active_state_ok_block);
-        let accum_buffer = self.lookup_percpu_value_ptr("event_accum_buffer", 0)?;
-        let accum_is_null = self
-            .builder
-            .build_is_null(accum_buffer, "bt_step_accum_null")
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        self.builder
-            .build_conditional_branch(accum_is_null, return_block, accum_ok_block)
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
-        self.builder.position_at_end(accum_ok_block);
         let inst_offset = self.load_state_i32(
             state_ptr,
             crate::BACKTRACE_TAIL_STATE_INST_OFFSET_OFFSET,

@@ -159,6 +159,10 @@ pub struct EbpfContext<'ctx, 'dw> {
     pub(super) tls_scratch_alloca: Option<inkwell::values::PointerValue<'ctx>>,
     // Per-invocation event accumulation offset (u32) stored on stack (entry block)
     pub event_offset_alloca: Option<inkwell::values::PointerValue<'ctx>>,
+    // Per-program SSA pointer returned by the entry-block event_accum_buffer lookup.
+    // Function-local storage prevents main and tail-call programs from sharing a pointer.
+    pub(crate) event_accumulation_buffers:
+        HashMap<FunctionValue<'ctx>, inkwell::values::PointerValue<'ctx>>,
     // Sequence numbers keep verifier-oriented llvm.bpf.passthrough calls
     // distinct while LLVM optimizes the generated module.
     pub(super) next_bpf_passthrough_sequence: u32,
@@ -298,6 +302,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             pm_key_alloca: None,
             tls_scratch_alloca: None,
             event_offset_alloca: None,
+            event_accumulation_buffers: HashMap::new(),
             next_bpf_passthrough_sequence: 0,
             compile_time_event_bytes_upper_bound: 0,
             compile_options: compile_options.clone(),
@@ -779,6 +784,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         if let Some(spec) = pid_filter_spec {
             self.add_pid_filter(spec)?;
         }
+        self.initialize_event_accumulation_buffer_or_return_zero()?;
 
         // Use new staged transmission system for all statements
         let program = crate::script::ast::Program {
@@ -982,20 +988,21 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let i32_type = self.context.i32_type();
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let key_arr_ty = i32_type.array_type(4);
+        let key_alloca = self.pm_key_alloca.ok_or_else(|| {
+            CodeGenError::LLVMError("pm_key not allocated in entry block".to_string())
+        })?;
 
-        // Stack-allocate bpf_pidns_info-compatible storage: [pid:u32, tgid:u32].
-        let pidns_info_ty = i32_type.array_type(2);
-        let pidns_info_alloca = self
-            .builder
-            .build_alloca(pidns_info_ty, "pidns_info")
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        // Reuse the entry-block map-key storage. The namespace helper needs only
+        // the first 8 bytes for [pid:u32, tgid:u32], and later map lookups may
+        // overwrite it after this filter has consumed the result.
         self.builder
-            .build_store(pidns_info_alloca, pidns_info_ty.const_zero())
+            .build_store(key_alloca, key_arr_ty.const_zero())
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         let pidns_info_ptr = self
             .builder
-            .build_bit_cast(pidns_info_alloca, ptr_type, "pidns_info_ptr")
+            .build_bit_cast(key_alloca, ptr_type, "pidns_info_ptr")
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         let helper_args = [
@@ -1033,12 +1040,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
 
         self.builder.position_at_end(helper_ok_block);
-        // SAFETY: pidns_info_alloca has the pid namespace helper result layout
-        // [pid, tgid], so [0, 1] addresses the tgid field.
+        // SAFETY: key_alloca temporarily holds the pid namespace helper result,
+        // so [0, 1] addresses the tgid field.
         let tgid_ptr = unsafe {
             self.builder.build_gep(
-                pidns_info_ty,
-                pidns_info_alloca,
+                key_arr_ty,
+                key_alloca,
                 &[i32_type.const_zero(), i32_type.const_int(1, false)],
                 "pidns_tgid_ptr",
             )
