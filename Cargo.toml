@@ -61,7 +61,7 @@ toml = "0.8"
 dirs = "5.0"
 object = "0.36"
 
-gimli = "0.33.0"
+gimli = "0.34.0"
 aya = "0.14"
 aya-obj = "0.3"
 aya-ebpf-bindings = "0.2"
