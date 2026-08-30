@@ -49,7 +49,7 @@ pub(super) struct TraceActorConfig {
 
 enum TraceCommand {
     Enable(oneshot::Sender<Result<()>>),
-    Disable(oneshot::Sender<Result<()>>),
+    Disable(oneshot::Sender<Result<u64>>),
     ReadLossStats(oneshot::Sender<Result<TraceActorLossStats>>),
     AppendBacktraceRows {
         modules: Arc<Vec<(u64, Vec<BacktraceUnwindRow>)>>,
@@ -76,7 +76,7 @@ impl TraceActorHandle {
         self.request(TraceCommand::Enable).await
     }
 
-    pub async fn disable(&self) -> Result<()> {
+    pub async fn disable(&self) -> Result<u64> {
         self.request(TraceCommand::Disable).await
     }
 
@@ -261,10 +261,10 @@ fn handle_command(
             CommandOutcome::Continue
         }
         TraceCommand::Disable(response) => {
-            let result = disable_loader(loader, config, *is_enabled);
-            if result.is_ok() {
+            let result = disable_loader(loader, config, *is_enabled).map(|()| {
                 *is_enabled = false;
-            }
+                advance_event_generation(event_generation)
+            });
             let _ = response.send(result);
             CommandOutcome::Continue
         }
@@ -283,16 +283,13 @@ fn handle_command(
             let result = loader
                 .append_backtrace_unwind_rows_for_modules(modules.as_slice())
                 .map(|stats| {
-                    if stats.modules > 0 {
-                        // Batches already queued were captured with the previous
-                        // unwind tables. Advancing the generation lets the
-                        // manager discard those stale batches without blocking
-                        // newly captured events behind a hot trace's backlog.
-                        *event_generation = event_generation.saturating_add(1);
-                    }
+                    // Shared pinned unwind maps may have been populated by a
+                    // different actor, in which case this loader reports zero
+                    // inserted modules but its queued batches are still stale.
+                    let event_generation = advance_event_generation(event_generation);
                     TraceActorBacktraceUpdate {
                         stats,
-                        event_generation: *event_generation,
+                        event_generation,
                     }
                 })
                 .map_err(Into::into);
@@ -306,6 +303,11 @@ fn handle_command(
             CommandOutcome::Delete { response, result }
         }
     }
+}
+
+fn advance_event_generation(event_generation: &mut u64) -> u64 {
+    *event_generation = event_generation.saturating_add(1);
+    *event_generation
 }
 
 fn enable_loader(

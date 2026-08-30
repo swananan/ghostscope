@@ -81,10 +81,10 @@ impl TraceInstance {
     }
 
     /// Disable this trace instance
-    pub(super) async fn disable(&mut self) -> Result<()> {
+    pub(super) async fn disable(&mut self) -> Result<Option<u64>> {
         if !self.is_enabled {
             info!("Trace {} is already disabled", self.trace_id);
-            return Ok(());
+            return Ok(None);
         }
 
         info!(
@@ -93,16 +93,16 @@ impl TraceInstance {
         );
 
         if let Some(actor) = &self.actor {
-            actor.disable().await?;
+            let event_generation = actor.disable().await?;
             self.is_enabled = false;
-            Ok(())
+            Ok(Some(event_generation))
         } else {
             warn!(
                 "No trace actor available for trace {}, marking as disabled",
                 self.trace_id
             );
             self.is_enabled = false;
-            Ok(())
+            Ok(None)
         }
     }
 
