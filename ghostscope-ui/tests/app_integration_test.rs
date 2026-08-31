@@ -320,6 +320,7 @@ mod tests {
 
         // Add trace events
         let event1 = ParsedTraceEvent {
+            generation: 0,
             timestamp: 1000,
             trace_id: 1,
             pid: 12345,
@@ -330,6 +331,7 @@ mod tests {
         };
 
         let event2 = ParsedTraceEvent {
+            generation: 0,
             timestamp: 2000,
             trace_id: 2,
             pid: 12345,
@@ -410,6 +412,7 @@ mod tests {
         // 3. Receive trace events
         for i in 0u64..5 {
             let event = ParsedTraceEvent {
+                generation: 0,
                 timestamp: 1000 + i * 100,
                 trace_id: i,
                 pid: 99999,

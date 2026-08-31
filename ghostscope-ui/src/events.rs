@@ -50,6 +50,7 @@ mod tests {
     #[test]
     fn protocol_event_preserves_structured_print_items() {
         let event = ParsedTraceEvent {
+            generation: 0,
             trace_id: 7,
             timestamp: 11,
             pid: 42,
@@ -130,6 +131,7 @@ mod tests {
     #[test]
     fn legacy_escaped_braces_match_protocol_output() {
         let event = ParsedTraceEvent {
+            generation: 0,
             trace_id: 8,
             timestamp: 12,
             pid: 44,

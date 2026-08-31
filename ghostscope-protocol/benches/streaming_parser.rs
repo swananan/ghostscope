@@ -39,6 +39,8 @@ fn build_event(instruction_count: usize) -> Vec<u8> {
     event.extend_from_slice(
         TraceEventHeader {
             magic: ghostscope_protocol::consts::MAGIC,
+            reserved: 0,
+            generation: 0,
         }
         .as_bytes(),
     );

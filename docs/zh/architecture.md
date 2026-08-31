@@ -323,8 +323,10 @@ GhostScope 使用**基于指令的协议**实现灵活的追踪事件表示：
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ TraceEventHeader (4 字节)                           │
+│ TraceEventHeader (16 字节)                          │
 │   - magic: u32 (0x43484C53 "CHLS")                  │
+│   - reserved: u32                                   │
+│   - generation: u64（由 eBPF 在事件产生时固定）     │
 ├─────────────────────────────────────────────────────┤
 │ TraceEventMessage (24 字节)                         │
 │   - trace_id: u64                                   │

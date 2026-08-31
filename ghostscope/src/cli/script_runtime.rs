@@ -660,6 +660,7 @@ mod tests {
 
     fn event_with_instructions(instructions: Vec<ParsedInstruction>) -> ParsedTraceEvent {
         ParsedTraceEvent {
+            generation: 0,
             trace_id: 1,
             timestamp: 0,
             pid: 1,

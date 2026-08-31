@@ -645,6 +645,22 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 CodeGenError::LLVMError(format!("Failed to create event_loss_counters map: {e}"))
             })?;
 
+        // Userspace advances this single-entry map at lifecycle barriers. Each
+        // eBPF invocation snapshots it into the event header before emitting
+        // any instructions, so buffered records retain their source epoch.
+        self.map_manager
+            .create_array_map(
+                &self.module,
+                &self.di_builder,
+                &self.compile_unit,
+                "event_generation",
+                1,
+                std::mem::size_of::<u64>() as u64,
+            )
+            .map_err(|e| {
+                CodeGenError::LLVMError(format!("Failed to create event_generation map: {e}"))
+            })?;
+
         // Create per-CPU accumulation maps for single-record event emission
         //  - event_accum_buffer: value size = max_trace_event_size bytes, entries = 1
         //  - event_accum_offset: value size = 4 bytes (u32), entries = 1
