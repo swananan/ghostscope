@@ -198,13 +198,14 @@ impl SemanticType {
 
 /// Identity for a type that may combine an exact DWARF DIE with script-created
 /// pointer, array, or qualifier wrappers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TypeIdentity {
     Dwarf(TypeId),
     Synthetic {
         kind: SyntheticTypeKind,
         inner: Box<TypeIdentity>,
     },
+    #[default]
     Unknown,
 }
 
@@ -281,12 +282,6 @@ impl TypeIdentity {
                 VariableAccessSegment::Field(_) | VariableAccessSegment::TupleIndex(_) => None,
             },
         }
-    }
-}
-
-impl Default for TypeIdentity {
-    fn default() -> Self {
-        Self::Unknown
     }
 }
 

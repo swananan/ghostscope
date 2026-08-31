@@ -2,7 +2,7 @@
 
 ## 前置要求
 
-- Rust 1.88.0（通过 `rust-toolchain.toml` 强制指定）
+- Rust 1.98.0（通过 `rust-toolchain.toml` 强制指定）
 - Linux 内核 4.4+
 - LLVM 22（包括 Polly 库：`libpolly-22-dev`）
 

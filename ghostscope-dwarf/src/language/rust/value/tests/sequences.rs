@@ -146,9 +146,9 @@ fn recognizes_c_str_references_and_boxes_across_dwarf_generations() {
     let TypeInfo::PointerType { target_type, .. } = &mut members[0].member_type else {
         unreachable!("test CStr data_ptr is a pointer")
     };
-    *target_type = Box::new(TypeInfo::UnknownType {
+    **target_type = TypeInfo::UnknownType {
         name: "CStr".to_string(),
-    });
+    };
     assert!(resolve_value_layout(&opaque, None).is_some());
 }
 

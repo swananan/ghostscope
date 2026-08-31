@@ -678,10 +678,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let mut index = index;
         let mut visited = std::collections::HashSet::new();
 
-        loop {
-            let Expr::Variable(name) = &base else {
-                break;
-            };
+        while let Expr::Variable(name) = &base {
             if !self.alias_variable_exists(name) {
                 break;
             }

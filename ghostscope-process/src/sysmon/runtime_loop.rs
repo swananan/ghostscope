@@ -238,6 +238,6 @@ pub(super) fn run_sysmon_loop(
             );
         }
     } else {
-        return Err(anyhow::anyhow!("No sysmon events map found (ringbuf/perf)"));
+        Err(anyhow::anyhow!("No sysmon events map found (ringbuf/perf)"))
     }
 }

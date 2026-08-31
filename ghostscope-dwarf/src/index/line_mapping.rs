@@ -299,8 +299,8 @@ impl LineMappingTable {
         let capacity = compact_entries.len() + self.incremental_entry_count;
         let mut compact_entries = compact_entries.into_iter().peekable();
         let mut incremental_entries = std::mem::take(&mut self.incremental_entries)
-            .into_iter()
-            .flat_map(|(_, entries)| entries)
+            .into_values()
+            .flatten()
             .peekable();
         let mut merged = Vec::with_capacity(capacity);
 

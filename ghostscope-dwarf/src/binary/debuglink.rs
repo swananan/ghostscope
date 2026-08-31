@@ -675,7 +675,7 @@ mod tests {
         note.extend_from_slice(&object::elf::NT_GNU_BUILD_ID.to_le_bytes());
         note.extend_from_slice(b"GNU\0");
         note.extend_from_slice(build_id);
-        while note.len() % 4 != 0 {
+        while !note.len().is_multiple_of(4) {
             note.push(0);
         }
         note
@@ -684,7 +684,7 @@ mod tests {
     fn debuglink_section(filename: &str, crc: u32) -> Vec<u8> {
         let mut data = filename.as_bytes().to_vec();
         data.push(0);
-        while data.len() % 4 != 0 {
+        while !data.len().is_multiple_of(4) {
             data.push(0);
         }
         data.extend_from_slice(&crc.to_le_bytes());

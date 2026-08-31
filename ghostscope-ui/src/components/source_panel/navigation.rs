@@ -185,7 +185,7 @@ impl SourceNavigation {
                         }
                     } else {
                         // Stay at end of last line
-                        state.cursor_col = chars.len().saturating_sub(1).max(0);
+                        state.cursor_col = chars.len().saturating_sub(1);
                     }
                 } else {
                     state.cursor_col = pos;
@@ -686,8 +686,7 @@ impl SourceNavigation {
             // Ensure we don't scroll beyond reasonable bounds if line is shorter
             if line_char_count <= available_width && state.horizontal_scroll_offset > 0 {
                 // Line fits entirely but we have scrolled - only allow minimal scroll for short lines
-                let max_scroll_for_short_line =
-                    line_char_count.saturating_sub(available_width / 2).max(0);
+                let max_scroll_for_short_line = line_char_count.saturating_sub(available_width / 2);
                 state.horizontal_scroll_offset = state
                     .horizontal_scroll_offset
                     .min(max_scroll_for_short_line);

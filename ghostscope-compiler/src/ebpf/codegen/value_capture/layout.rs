@@ -298,13 +298,12 @@ pub(in crate::ebpf::codegen) fn sequence_capture_limits(
             "sequence element DWARF size {element_stride} does not fit this host"
         ))
     })?;
-    let (max_elements, max_len) = if stride == 0 {
+    let (max_elements, max_len) = if let Some(max_elements) = cap.checked_div(stride) {
+        (max_elements, max_elements * stride)
+    } else {
         // A byte cap cannot bound a ZST payload, so use the configured value
         // as its logical element-count cap.
         (cap, 0)
-    } else {
-        let max_elements = cap / stride;
-        (max_elements, max_elements * stride)
     };
     let data_len = ghostscope_protocol::INDIRECT_SEQUENCE_HEADER_SIZE.saturating_add(max_len);
     Ok((max_elements, max_len, data_len))

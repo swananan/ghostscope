@@ -185,6 +185,7 @@ fn implicit_value_display(bytes: &[u8]) -> String {
 }
 
 /// A memory read requested by a future runtime lowering pass.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserMemoryRead {
     pub address: AddressExpr,

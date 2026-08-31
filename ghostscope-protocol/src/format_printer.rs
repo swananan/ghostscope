@@ -918,8 +918,7 @@ impl FormatPrinter {
                     return "<INVALID_NESTED_SEQUENCE_PAYLOAD>".to_string();
                 };
                 let minimum_slot = NESTED_VALUE_CHILD_HEADER_SIZE
-                    .checked_add(usize::try_from(element.payload_len).unwrap_or(usize::MAX))
-                    .unwrap_or(usize::MAX);
+                    .saturating_add(usize::try_from(element.payload_len).unwrap_or(usize::MAX));
                 if slot_stride < minimum_slot {
                     return "<INVALID_NESTED_SEQUENCE_PAYLOAD>".to_string();
                 }

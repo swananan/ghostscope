@@ -782,7 +782,7 @@ impl DetailedParser {
                                     if avail > 0 {
                                         let elem_sz = element_type.size();
                                         let mut new_count: Option<u64> = None;
-                                        if elem_sz > 0 && avail % elem_sz == 0 {
+                                        if elem_sz > 0 && avail.is_multiple_of(elem_sz) {
                                             new_count = Some(avail / elem_sz);
                                         }
                                         m.member_type = TypeInfo::ArrayType {

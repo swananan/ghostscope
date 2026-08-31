@@ -71,14 +71,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             bytes.push(0); // NUL terminate for display convenience
                             self.set_string_variable_bytes(name, bytes);
                         }
-                        crate::script::Expr::Variable(ref nm) => {
+                        crate::script::Expr::Variable(ref nm)
                             if self
                                 .get_variable_type(nm)
-                                .is_some_and(|t| matches!(t, crate::script::VarType::String))
-                            {
-                                if let Some(b) = self.get_string_variable_bytes(nm).cloned() {
-                                    self.set_string_variable_bytes(name, b);
-                                }
+                                .is_some_and(|t| matches!(t, crate::script::VarType::String)) =>
+                        {
+                            if let Some(b) = self.get_string_variable_bytes(nm).cloned() {
+                                self.set_string_variable_bytes(name, b);
                             }
                         }
                         _ => {}

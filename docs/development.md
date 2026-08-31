@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.88.0 (enforced via `rust-toolchain.toml`)
+- Rust 1.98.0 (enforced via `rust-toolchain.toml`)
 - Linux kernel 4.4+
 - LLVM 22 (including Polly library: `libpolly-22-dev`)
 

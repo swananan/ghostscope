@@ -6,7 +6,7 @@ ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
 ARG LLVM_MAJOR=18
-ARG RUST_TOOLCHAIN=1.88.0
+ARG RUST_TOOLCHAIN=1.98.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
