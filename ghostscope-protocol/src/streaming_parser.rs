@@ -70,6 +70,8 @@ pub struct ParsedBacktraceFrame {
 /// Parsed trace event containing header, message, and instructions
 #[derive(Debug, Clone)]
 pub struct ParsedTraceEvent {
+    /// Generation captured in the kernel when event production began.
+    pub generation: u64,
     pub trace_id: u64,
     pub timestamp: u64,
     pub pid: u32,
@@ -329,6 +331,7 @@ impl StreamingTraceParser {
 
                                 // Complete trace event
                                 let complete_event = ParsedTraceEvent {
+                                    generation: header.generation,
                                     trace_id: message.trace_id,
                                     timestamp: message.timestamp,
                                     pid: message.pid,
@@ -915,6 +918,8 @@ mod tests {
         let mut event = Vec::new();
         let header = TraceEventHeader {
             magic: crate::consts::MAGIC,
+            reserved: 0,
+            generation: trace_id,
         };
         event.extend_from_slice(zerocopy::IntoBytes::as_bytes(&header));
 
@@ -956,6 +961,8 @@ mod tests {
         // Create test segments
         let header = TraceEventHeader {
             magic: crate::consts::MAGIC,
+            reserved: 0,
+            generation: 0,
         };
 
         let message = TraceEventMessage {
@@ -996,6 +1003,8 @@ mod tests {
         // Header
         let header = TraceEventHeader {
             magic: crate::consts::MAGIC,
+            reserved: 0,
+            generation: 17,
         };
         let header_bytes = zerocopy::IntoBytes::as_bytes(&header);
         assert!(parser
@@ -1044,6 +1053,7 @@ mod tests {
             .process_segment(&inst, &trace_context)
             .unwrap()
             .expect("complete event");
+        assert_eq!(event.generation, 17);
         assert_eq!(event.trace_id, 1);
         assert_eq!(event.pid, 123);
         assert_eq!(event.tid, 456);
@@ -1081,6 +1091,8 @@ mod tests {
 
         let header = TraceEventHeader {
             magic: crate::consts::MAGIC,
+            reserved: 0,
+            generation: 0,
         };
         parser
             .process_segment(zerocopy::IntoBytes::as_bytes(&header), &trace_context)
@@ -1194,6 +1206,7 @@ mod tests {
             .expect("parse concatenated events")
             .expect("first event completes");
         assert_eq!(first.trace_id, 1);
+        assert_eq!(first.generation, 1);
         assert_eq!(parser.buffer, second);
 
         let second = parser
@@ -1201,12 +1214,14 @@ mod tests {
             .expect("parse buffered event")
             .expect("second event completes");
         assert_eq!(second.trace_id, 2);
+        assert_eq!(second.generation, 2);
         assert!(parser.buffer.is_empty());
     }
 
     #[test]
     fn test_format_string_only_consumes_contiguous_variables() {
         let event = ParsedTraceEvent {
+            generation: 0,
             trace_id: 1,
             timestamp: 0,
             pid: 10,
@@ -1244,6 +1259,7 @@ mod tests {
     #[test]
     fn escaped_braces_do_not_consume_following_variables() {
         let event = ParsedTraceEvent {
+            generation: 0,
             trace_id: 1,
             timestamp: 0,
             pid: 10,
@@ -1274,6 +1290,7 @@ mod tests {
     #[test]
     fn escaped_braces_do_not_hide_real_placeholders() {
         let event = ParsedTraceEvent {
+            generation: 0,
             trace_id: 1,
             timestamp: 0,
             pid: 10,

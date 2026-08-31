@@ -7,10 +7,17 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 pub struct TraceEventHeader {
     pub magic: u32,
+    pub reserved: u32,
+    /// Event generation captured by eBPF when this event starts.
+    pub generation: u64,
 }
 
 pub const TRACE_EVENT_HEADER_SIZE: usize = std::mem::size_of::<TraceEventHeader>();
 pub const TRACE_EVENT_HEADER_MAGIC_OFFSET: usize = std::mem::offset_of!(TraceEventHeader, magic);
+pub const TRACE_EVENT_HEADER_RESERVED_OFFSET: usize =
+    std::mem::offset_of!(TraceEventHeader, reserved);
+pub const TRACE_EVENT_HEADER_GENERATION_OFFSET: usize =
+    std::mem::offset_of!(TraceEventHeader, generation);
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -405,8 +412,10 @@ mod tests {
 
     #[test]
     fn protocol_layout_constants_match_wire_format() {
-        assert_eq!(TRACE_EVENT_HEADER_SIZE, 4);
+        assert_eq!(TRACE_EVENT_HEADER_SIZE, 16);
         assert_eq!(TRACE_EVENT_HEADER_MAGIC_OFFSET, 0);
+        assert_eq!(TRACE_EVENT_HEADER_RESERVED_OFFSET, 4);
+        assert_eq!(TRACE_EVENT_HEADER_GENERATION_OFFSET, 8);
         assert_eq!(TRACE_EVENT_MESSAGE_SIZE, 24);
         assert_eq!(TRACE_EVENT_MESSAGE_TRACE_ID_OFFSET, 0);
         assert_eq!(TRACE_EVENT_MESSAGE_TIMESTAMP_OFFSET, 8);

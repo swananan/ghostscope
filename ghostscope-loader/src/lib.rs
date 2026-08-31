@@ -486,7 +486,7 @@ impl GhostScopeLoader {
         match loader.load(bytecode) {
             Ok(bpf) => {
                 info!("Successfully loaded eBPF program");
-                Ok(Self {
+                let mut loader = Self {
                     bpf,
                     event_map: None,
                     event_loss_counters: None,
@@ -499,7 +499,9 @@ impl GhostScopeLoader {
                     backtrace_unwind_row_count: 0,
                     backtrace_module_row_cookies: HashSet::new(),
                     shared_backtrace_maps,
-                })
+                };
+                loader.set_event_generation(0)?;
+                Ok(loader)
             }
             Err(e) => {
                 error!("Failed to load BPF program: {:?}", e);
@@ -538,6 +540,20 @@ impl GhostScopeLoader {
     /// Set PerfEventArray page count override (applies when using Perf backend)
     pub fn set_perf_page_count(&mut self, pages: u32) {
         self.perf_page_count = Some(pages as usize);
+    }
+
+    /// Set the generation that new eBPF events snapshot into their headers.
+    pub fn set_event_generation(&mut self, generation: u64) -> Result<()> {
+        let map = self
+            .bpf
+            .map_mut("event_generation")
+            .ok_or_else(|| LoaderError::MapNotFound("event_generation".to_string()))?;
+        let mut generations: Array<_, u64> = map.try_into().map_err(|e| {
+            LoaderError::Generic(format!("Failed to convert event_generation map: {e}"))
+        })?;
+        generations.set(0, generation, 0).map_err(|e| {
+            LoaderError::Generic(format!("Failed to set event generation {generation}: {e}"))
+        })
     }
 
     /// Load and register optional bt tail-call programs before the entry uprobe is attached.

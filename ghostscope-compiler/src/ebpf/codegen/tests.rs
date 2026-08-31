@@ -143,6 +143,31 @@ fn event_accumulation_buffer_is_looked_up_once_per_program() {
 }
 
 #[test]
+fn event_generation_is_snapshotted_into_each_event_header() {
+    let context = inkwell::context::Context::create();
+    let opts = CompileOptions::default();
+    let mut ctx =
+        EbpfContext::new(&context, "test_mod", Some(0), &opts).expect("create EbpfContext");
+    let program = crate::script::Program::new();
+
+    let (function, _) = ctx
+        .compile_program(&program, "generation_header", &[], None, None, None)
+        .expect("compile program");
+    ctx.module.verify().expect("verify generated LLVM IR");
+    let ir = function.print_to_string().to_string();
+
+    assert_eq!(
+        ir.matches("@event_generation").count(),
+        1,
+        "generated program must read event_generation once:\n{ir}"
+    );
+    assert!(
+        ir.contains("event_generation_ptr"),
+        "generated program must store the generation in its header:\n{ir}"
+    );
+}
+
+#[test]
 fn namespace_pid_filter_reuses_entry_stack_before_accumulation_buffer_lookup() {
     let context = inkwell::context::Context::create();
     let opts = CompileOptions {

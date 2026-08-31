@@ -209,6 +209,7 @@ impl BacktraceRenderer {
         }
 
         ParsedTraceEvent {
+            generation: event.generation,
             trace_id: event.trace_id,
             timestamp: event.timestamp,
             pid: event.pid,
@@ -586,6 +587,7 @@ fn flush_text_chunk(
     }
 
     let chunk_event = ParsedTraceEvent {
+        generation: event.generation,
         trace_id: event.trace_id,
         timestamp: event.timestamp,
         pid: event.pid,
@@ -810,6 +812,7 @@ mod tests {
     #[test]
     fn renders_raw_backtrace_without_dwarf_context() {
         let event = ParsedTraceEvent {
+            generation: 0,
             trace_id: 1,
             timestamp: 0,
             pid: 10,
@@ -881,6 +884,7 @@ mod tests {
     #[test]
     fn renders_backtrace_as_structured_tui_item() {
         let event = ParsedTraceEvent {
+            generation: 0,
             trace_id: 1,
             timestamp: 0,
             pid: 10,

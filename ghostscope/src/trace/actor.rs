@@ -14,7 +14,6 @@ const TRACE_COMMAND_CHANNEL_CAPACITY: usize = 8;
 pub(super) enum TraceActorEvent {
     Events {
         trace_id: u32,
-        generation: u64,
         events: Vec<ParsedTraceEvent>,
     },
 }
@@ -202,7 +201,6 @@ pub(super) fn spawn_trace_actor(
                             let event_count = events.len() as u64;
                             match event_sender.try_send(TraceActorEvent::Events {
                                 trace_id: config.trace_id,
-                                generation: event_generation,
                                 events,
                             }) {
                                 Ok(()) => {}
@@ -261,9 +259,9 @@ fn handle_command(
             CommandOutcome::Continue
         }
         TraceCommand::Disable(response) => {
-            let result = disable_loader(loader, config, *is_enabled).map(|()| {
+            let result = disable_loader(loader, config, *is_enabled).and_then(|()| {
                 *is_enabled = false;
-                advance_event_generation(event_generation)
+                advance_event_generation(loader, event_generation)
             });
             let _ = response.send(result);
             CommandOutcome::Continue
@@ -282,17 +280,18 @@ fn handle_command(
         TraceCommand::AppendBacktraceRows { modules, response } => {
             let result = loader
                 .append_backtrace_unwind_rows_for_modules(modules.as_slice())
-                .map(|stats| {
+                .map_err(anyhow::Error::from)
+                .and_then(|stats| {
                     // Shared pinned unwind maps may have been populated by a
                     // different actor, in which case this loader reports zero
                     // inserted modules but its queued batches are still stale.
-                    let event_generation = advance_event_generation(event_generation);
-                    TraceActorBacktraceUpdate {
-                        stats,
-                        event_generation,
-                    }
-                })
-                .map_err(Into::into);
+                    advance_event_generation(loader, event_generation).map(|event_generation| {
+                        TraceActorBacktraceUpdate {
+                            stats,
+                            event_generation,
+                        }
+                    })
+                });
             let _ = response.send(result);
             CommandOutcome::Continue
         }
@@ -305,9 +304,16 @@ fn handle_command(
     }
 }
 
-fn advance_event_generation(event_generation: &mut u64) -> u64 {
-    *event_generation = event_generation.saturating_add(1);
-    *event_generation
+fn advance_event_generation(
+    loader: &mut GhostScopeLoader,
+    event_generation: &mut u64,
+) -> Result<u64> {
+    let next_generation = event_generation.saturating_add(1);
+    loader
+        .set_event_generation(next_generation)
+        .map_err(|err| anyhow::anyhow!("Failed to publish event generation: {err}"))?;
+    *event_generation = next_generation;
+    Ok(next_generation)
 }
 
 fn enable_loader(

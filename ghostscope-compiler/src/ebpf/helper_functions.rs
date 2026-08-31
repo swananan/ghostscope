@@ -1729,7 +1729,62 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
-    /// Lookup per-CPU map value pointer for a given map name and u32 key constant
+    /// Load the lifecycle generation shared with userspace.
+    ///
+    /// Array key zero should always exist, but the verifier requires the map
+    /// lookup's nullable pointer to be checked before dereferencing it. Falling
+    /// back to zero keeps the generated program safe if the lookup ever misses.
+    pub(crate) fn load_event_generation(&mut self) -> Result<IntValue<'ctx>> {
+        let value_ptr = self.lookup_percpu_value_ptr("event_generation", 0)?;
+        let current_fn = self.current_function("load event generation")?;
+        let present_block = self
+            .context
+            .append_basic_block(current_fn, "event_generation_present");
+        let missing_block = self
+            .context
+            .append_basic_block(current_fn, "event_generation_missing");
+        let done_block = self
+            .context
+            .append_basic_block(current_fn, "event_generation_done");
+
+        let is_null = self
+            .builder
+            .build_is_null(value_ptr, "event_generation_is_null")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(is_null, missing_block, present_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+
+        self.builder.position_at_end(present_block);
+        let generation = self
+            .builder
+            .build_load(self.context.i64_type(), value_ptr, "event_generation")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        self.builder
+            .build_unconditional_branch(done_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let present_end = self.current_insert_block("finish event generation present block")?;
+
+        self.builder.position_at_end(missing_block);
+        self.builder
+            .build_unconditional_branch(done_block)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        let missing_end = self.current_insert_block("finish event generation missing block")?;
+
+        self.builder.position_at_end(done_block);
+        let generation_phi = self
+            .builder
+            .build_phi(self.context.i64_type(), "event_generation_phi")
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        generation_phi.add_incoming(&[
+            (&generation, present_end),
+            (&self.context.i64_type().const_zero(), missing_end),
+        ]);
+        Ok(generation_phi.as_basic_value().into_int_value())
+    }
+
+    /// Lookup map value pointer for a given map name and u32 key constant.
     pub fn lookup_percpu_value_ptr(
         &mut self,
         map_name: &str,

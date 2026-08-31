@@ -582,6 +582,7 @@ mod tests {
 
     fn sample_event() -> ParsedTraceEvent {
         ParsedTraceEvent {
+            generation: 0,
             trace_id: 7,
             timestamp: 1_234_567_890,
             pid: 4321,
@@ -603,6 +604,7 @@ mod tests {
 
     fn sample_expr_error_event() -> ParsedTraceEvent {
         ParsedTraceEvent {
+            generation: 0,
             trace_id: 8,
             timestamp: 2_000_000_000,
             pid: 5001,
@@ -624,6 +626,7 @@ mod tests {
 
     fn sample_backtrace_event() -> ParsedTraceEvent {
         ParsedTraceEvent {
+            generation: 0,
             trace_id: 9,
             timestamp: 3_000_000_000,
             pid: 6001,

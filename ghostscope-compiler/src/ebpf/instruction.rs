@@ -323,6 +323,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub fn send_trace_event_header(&mut self) -> Result<()> {
         info!("Sending TraceEventHeader segment");
         self.compile_time_event_bytes_upper_bound = 0;
+        let event_generation = self.load_event_generation()?;
 
         // For PerfEventArray: Reset accumulation buffer offset to 0
         if matches!(
@@ -341,8 +342,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .reserve_instruction_region_or_return_zero(header_size)?
             .into_value_after_runtime_returns();
 
-        // Write TraceEventHeader
-        // magic at offset 0 (only field needed)
+        // Write TraceEventHeader magic at offset 0.
         let magic_ptr = header_buffer;
         let magic_u32_ptr = self
             .builder
@@ -359,6 +359,56 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_store(magic_u32_ptr, magic_val)
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store magic: {e}")))?;
+
+        // The explicit reserved word keeps generation naturally aligned in
+        // both the wire format and generated BPF map-value accesses.
+        // SAFETY: header_buffer points at a complete reserved header and the
+        // reserved field lies within that region.
+        let reserved_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    header_buffer,
+                    &[self.context.i32_type().const_int(
+                        ghostscope_protocol::TRACE_EVENT_HEADER_RESERVED_OFFSET as u64,
+                        false,
+                    )],
+                    "event_header_reserved_ptr",
+                )
+                .map_err(|e| CodeGenError::LLVMError(format!("Failed to get reserved GEP: {e}")))?
+        };
+        self.builder
+            .build_store(reserved_ptr, self.context.i32_type().const_zero())
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store reserved word: {e}")))?;
+
+        // SAFETY: header_buffer points at a complete reserved header and the
+        // generation field lies within that region.
+        let generation_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    header_buffer,
+                    &[self.context.i32_type().const_int(
+                        ghostscope_protocol::TRACE_EVENT_HEADER_GENERATION_OFFSET as u64,
+                        false,
+                    )],
+                    "event_generation_ptr",
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to get generation GEP: {e}"))
+                })?
+        };
+        let generation_u64_ptr = self
+            .builder
+            .build_pointer_cast(
+                generation_ptr,
+                self.context.ptr_type(AddressSpace::default()),
+                "event_generation_u64_ptr",
+            )
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to cast generation ptr: {e}")))?;
+        self.builder
+            .build_store(generation_u64_ptr, event_generation)
+            .map_err(|e| CodeGenError::LLVMError(format!("Failed to store generation: {e}")))?;
 
         // Already wrote into the accumulation buffer; no copy needed
 

@@ -539,8 +539,7 @@ impl TraceManager {
         match event {
             TraceActorEvent::Events {
                 trace_id,
-                generation,
-                events,
+                mut events,
             } => {
                 // Delete waits for the actor to tear down its loader, but batches
                 // sent before that acknowledgement may still be queued.
@@ -550,13 +549,13 @@ impl TraceManager {
                 if !trace.is_enabled {
                     return;
                 }
-                if generation
-                    < self
-                        .minimum_event_generations
-                        .get(&trace_id)
-                        .copied()
-                        .unwrap_or_default()
-                {
+                let minimum_generation = self
+                    .minimum_event_generations
+                    .get(&trace_id)
+                    .copied()
+                    .unwrap_or_default();
+                events.retain(|event| event.generation >= minimum_generation);
+                if events.is_empty() {
                     return;
                 }
                 *deferred_by_batch_limit += append_with_limit(
@@ -641,7 +640,12 @@ mod tests {
     use std::collections::VecDeque;
 
     fn event(trace_id: u64) -> ParsedTraceEvent {
+        event_with_generation(trace_id, 0)
+    }
+
+    fn event_with_generation(trace_id: u64, generation: u64) -> ParsedTraceEvent {
         ParsedTraceEvent {
+            generation,
             trace_id,
             timestamp: 0,
             pid: 0,
@@ -735,7 +739,6 @@ mod tests {
             .event_sender
             .send(TraceActorEvent::Events {
                 trace_id: 7,
-                generation: 0,
                 events: vec![event(7), event(7)],
             })
             .await
@@ -744,7 +747,6 @@ mod tests {
             .event_sender
             .send(TraceActorEvent::Events {
                 trace_id: 7,
-                generation: 0,
                 events: vec![event(7)],
             })
             .await
@@ -764,7 +766,6 @@ mod tests {
             .event_sender
             .send(TraceActorEvent::Events {
                 trace_id: 7,
-                generation: 0,
                 events: vec![event(7)],
             })
             .await
@@ -774,7 +775,6 @@ mod tests {
             .event_sender
             .send(TraceActorEvent::Events {
                 trace_id: 8,
-                generation: 0,
                 events: vec![event(8)],
             })
             .await
@@ -793,7 +793,6 @@ mod tests {
             .event_sender
             .send(TraceActorEvent::Events {
                 trace_id: 7,
-                generation: 0,
                 events: vec![event(7)],
             })
             .await
@@ -806,8 +805,7 @@ mod tests {
             .event_sender
             .send(TraceActorEvent::Events {
                 trace_id: 7,
-                generation: 1,
-                events: vec![event(7)],
+                events: vec![event_with_generation(7, 1)],
             })
             .await
             .unwrap();
@@ -815,6 +813,7 @@ mod tests {
         let events = manager.wait_for_all_events_async().await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].trace_id, 7);
+        assert_eq!(events[0].generation, 1);
     }
 
     #[tokio::test]
@@ -826,7 +825,6 @@ mod tests {
             .event_sender
             .send(TraceActorEvent::Events {
                 trace_id: 7,
-                generation: 0,
                 events: vec![event(7)],
             })
             .await
@@ -836,7 +834,6 @@ mod tests {
             .event_sender
             .send(TraceActorEvent::Events {
                 trace_id: 8,
-                generation: 0,
                 events: vec![event(8)],
             })
             .await
@@ -896,17 +893,7 @@ mod tests {
             .event_sender
             .send(TraceActorEvent::Events {
                 trace_id: 7,
-                generation: 0,
-                events: vec![event(7)],
-            })
-            .await
-            .unwrap();
-        manager
-            .event_sender
-            .send(TraceActorEvent::Events {
-                trace_id: 7,
-                generation: 1,
-                events: vec![event(7)],
+                events: vec![event(7), event_with_generation(7, 1)],
             })
             .await
             .unwrap();
@@ -918,6 +905,7 @@ mod tests {
         let events = manager.wait_for_all_events_async().await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].trace_id, 7);
+        assert_eq!(events[0].generation, 1);
     }
 
     #[tokio::test]
@@ -928,7 +916,6 @@ mod tests {
             .event_sender
             .send(TraceActorEvent::Events {
                 trace_id: 7,
-                generation: 0,
                 events: vec![event(7)],
             })
             .await
@@ -957,7 +944,6 @@ mod tests {
             .event_sender
             .send(TraceActorEvent::Events {
                 trace_id: 7,
-                generation: 0,
                 events: vec![event(7)],
             })
             .await
@@ -977,7 +963,6 @@ mod tests {
             .event_sender
             .send(TraceActorEvent::Events {
                 trace_id: 8,
-                generation: 0,
                 events: vec![event(8)],
             })
             .await
