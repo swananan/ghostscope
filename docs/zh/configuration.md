@@ -549,7 +549,7 @@ mem_dump_cap = 256
 # 默认：64 字节。
 compare_cap = 64
 
-# 单条 trace 事件的最大大小（字节）。协议封装至少需要 36 字节，
+# 单条 trace 事件的最大大小（字节）。协议封装至少需要 48 字节，
 # 每个脚本的指令还需要额外空间。
 max_trace_event_size = 32768
 
@@ -806,7 +806,7 @@ GhostScope 在启动时验证配置：
    - **proc_module_offsets_max_entries**：必须在 64-65536 范围内
    - **backtrace_depth**：必须在 1-128 栈帧范围内
    - **backtrace_unwind_rows_max_entries**：必须在 1024-1048576 rows 范围内
-   - **max_trace_event_size**：必须至少为 36 字节；具体脚本可能需要更多空间。
+   - **max_trace_event_size**：必须至少为 48 字节；具体脚本可能需要更多空间。
    - **mem_dump_cap**、**compare_cap** 和 **max_trace_event_size** 是运行时上限；`max_trace_event_size` 可能会根据实际事件传输方式被 clamp。
 
 无效配置将产生清晰的错误消息和修复建议。

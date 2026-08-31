@@ -564,7 +564,7 @@ mem_dump_cap = 256
 compare_cap = 64
 
 # Maximum size of a single trace event (bytes). The protocol envelope requires
-# at least 36 bytes; each script's instructions require additional space.
+# at least 48 bytes; each script's instructions require additional space.
 max_trace_event_size = 32768
 
 # Recommended values:
@@ -832,7 +832,7 @@ GhostScope validates configuration at startup:
    - **proc_module_offsets_max_entries**: Must be in range 64-65536
    - **backtrace_depth**: Must be in range 1-128 frames
    - **backtrace_unwind_rows_max_entries**: Must be in range 1024-1048576 rows
-   - **max_trace_event_size**: Must be at least 36 bytes; individual scripts may require more.
+   - **max_trace_event_size**: Must be at least 48 bytes; individual scripts may require more.
    - **mem_dump_cap**, **compare_cap**, and **max_trace_event_size** are runtime caps; `max_trace_event_size` may be clamped by the selected event transport.
 
 Invalid configuration will produce clear error messages with suggestions for fixes.
