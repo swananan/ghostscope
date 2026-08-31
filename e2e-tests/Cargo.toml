@@ -26,6 +26,8 @@ object = { workspace = true }
 aya = { workspace = true }
 ghostscope-compiler = { version = "0.1.6", path = "../ghostscope-compiler" }
 ghostscope-dwarf = { version = "0.1.6", path = "../ghostscope-dwarf" }
+ghostscope-loader = { version = "0.1.6", path = "../ghostscope-loader" }
 ghostscope-process = { version = "0.1.6", path = "../ghostscope-process" }
+ghostscope-protocol = { version = "0.1.6", path = "../ghostscope-protocol" }
 libc = "0.2"
 regex = "1"

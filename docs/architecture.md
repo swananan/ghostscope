@@ -330,8 +330,10 @@ GhostScope uses an **instruction-based protocol** for flexible trace event repre
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ TraceEventHeader (4 bytes)                          │
+│ TraceEventHeader (16 bytes)                         │
 │   - magic: u32 (0x43484C53 "CHLS")                  │
+│   - reserved: u32                                   │
+│   - generation: u64 (captured in eBPF)              │
 ├─────────────────────────────────────────────────────┤
 │ TraceEventMessage (24 bytes)                        │
 │   - trace_id: u64                                   │

@@ -76,6 +76,8 @@ mod tests {
         use ghostscope_protocol::{consts, TraceEventHeader};
         let test_header = TraceEventHeader {
             magic: consts::MAGIC,
+            reserved: 0,
+            generation: 0,
         };
 
         // Convert header to bytes
