@@ -97,7 +97,7 @@ rm -rf /tmp/llvm /tmp/llvm-build /tmp/llvm.tar.xz
 SHELL
 
 # Install Rust toolchain in image to avoid per-run bootstrap downloads
-ARG RUST_TOOLCHAIN=1.88.0
+ARG RUST_TOOLCHAIN=1.98.0
 RUN <<SHELL
 set -eux
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none

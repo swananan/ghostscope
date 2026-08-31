@@ -416,7 +416,7 @@ impl BacktraceRenderer {
         }
 
         let resolved = analyzer
-            .and_then(|analyzer| module.as_ref().map(|module| (analyzer, module)))
+            .zip(module.as_ref())
             .and_then(|(analyzer, module)| {
                 let lookup_pc = if index == 0 {
                     module.pc
@@ -507,7 +507,7 @@ impl BacktraceRenderer {
         }
 
         let resolved = analyzer
-            .and_then(|analyzer| module.as_ref().map(|module| (analyzer, module)))
+            .zip(module.as_ref())
             .and_then(|(analyzer, module)| {
                 let lookup_pc = if index == 0 {
                     module.pc

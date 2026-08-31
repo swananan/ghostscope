@@ -31,7 +31,7 @@ default-members = [
 [workspace.package]
 version = "0.1.6"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.98"
 authors = ["swananan <jt26wzz@gmail.com>"]
 license = "GPL-3.0-only"
 description = "GhostScope brings DWARF-aware eBPF tracing to user-space binaries with a printf-like experience."

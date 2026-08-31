@@ -71,7 +71,7 @@ pub fn current_task_fsbase_offset() -> Result<u64, TlsLayoutError> {
     let task_thread_bits = find_member_bit_offset(&records, "task_struct", "thread")?;
     let thread_fsbase_bits = find_member_bit_offset(&records, "thread_struct", "fsbase")?;
 
-    if task_thread_bits % 8 != 0 || thread_fsbase_bits % 8 != 0 {
+    if !task_thread_bits.is_multiple_of(8) || !thread_fsbase_bits.is_multiple_of(8) {
         return Err(TlsLayoutError::Invalid(
             "task_struct.thread.fsbase is not byte-aligned",
         ));

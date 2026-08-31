@@ -10,7 +10,7 @@ ENV DWARF_PERF_WORKDIR=/workspace
 ENV DWARF_PERF_DEBUG_PREFIX_MAP=-fdebug-prefix-map=/workspace=/workspace
 
 ARG LLVM_MAJOR=18
-ARG RUST_TOOLCHAIN=1.88.0
+ARG RUST_TOOLCHAIN=1.98.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \

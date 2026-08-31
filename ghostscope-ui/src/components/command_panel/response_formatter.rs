@@ -825,7 +825,7 @@ impl ResponseFormatter {
 
         response.push_str("\n📊 File Type Summary:\n");
         let mut sorted_types: Vec<_> = file_types.into_iter().collect();
-        sorted_types.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted_types.sort_by_key(|a| std::cmp::Reverse(a.1));
 
         for (ext, count) in sorted_types.into_iter().take(10) {
             let icon = UISymbols::get_file_icon(&ext, use_ascii);

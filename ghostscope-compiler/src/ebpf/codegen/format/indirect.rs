@@ -426,11 +426,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         "sequence element DWARF size {element_stride} does not fit this host"
                     ))
                 })?;
-                let payload_elements = if stride == 0 {
-                    max_elements
-                } else {
-                    capture_capacity / stride
-                };
+                let payload_elements = capture_capacity.checked_div(stride).unwrap_or(max_elements);
                 (stride, max_elements.min(payload_elements))
             }
         };

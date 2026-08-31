@@ -110,11 +110,11 @@ fn rust_c_str_type_64(
     } else {
         byte
     };
-    *target_type = Box::new(TypeInfo::StructType {
+    **target_type = TypeInfo::StructType {
         name: "CStr".to_string(),
         size: 0,
         members: vec![member("inner", storage, 0)],
-    });
+    };
     current
 }
 
@@ -140,9 +140,9 @@ fn rust_path_ref_type_64(name: &str, language: SourceLanguage) -> ResolvedType {
     let TypeInfo::PointerType { target_type, .. } = &mut members[0].member_type else {
         unreachable!("test Path data_ptr is a pointer")
     };
-    *target_type = Box::new(TypeInfo::UnknownType {
+    **target_type = TypeInfo::UnknownType {
         name: "Path".to_string(),
-    });
+    };
     current
 }
 
@@ -154,11 +154,11 @@ fn rust_slice_type_64(name: &str, language: SourceLanguage) -> ResolvedType {
     let TypeInfo::PointerType { target_type, .. } = &mut members[0].member_type else {
         unreachable!("test slice data_ptr is a pointer")
     };
-    *target_type = Box::new(TypeInfo::BaseType {
+    **target_type = TypeInfo::BaseType {
         name: "i32".to_string(),
         size: 4,
         encoding: gimli::DW_ATE_signed.0 as u16,
-    });
+    };
     current
 }
 

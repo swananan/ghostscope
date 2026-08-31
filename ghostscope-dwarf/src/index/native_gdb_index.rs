@@ -429,16 +429,16 @@ impl GdbIndex {
         if layout.constant_pool > length {
             anyhow::bail!(".gdb_index constant pool is outside the section");
         }
-        if (layout.type_cu_list - layout.cu_list) % CU_RECORD_SIZE != 0 {
+        if !(layout.type_cu_list - layout.cu_list).is_multiple_of(CU_RECORD_SIZE) {
             anyhow::bail!(".gdb_index CU list has a partial record");
         }
-        if (layout.address_area - layout.type_cu_list) % TYPE_CU_RECORD_SIZE != 0 {
+        if !(layout.address_area - layout.type_cu_list).is_multiple_of(TYPE_CU_RECORD_SIZE) {
             anyhow::bail!(".gdb_index type CU list has a partial record");
         }
-        if (layout.symbol_table - layout.address_area) % ADDRESS_RECORD_SIZE != 0 {
+        if !(layout.symbol_table - layout.address_area).is_multiple_of(ADDRESS_RECORD_SIZE) {
             anyhow::bail!(".gdb_index address area has a partial record");
         }
-        if (layout.shortcut_table - layout.symbol_table) % SYMBOL_SLOT_SIZE != 0 {
+        if !(layout.shortcut_table - layout.symbol_table).is_multiple_of(SYMBOL_SLOT_SIZE) {
             anyhow::bail!(".gdb_index symbol table has a partial slot");
         }
         if version == 9 && layout.constant_pool - layout.shortcut_table < SYMBOL_SLOT_SIZE {

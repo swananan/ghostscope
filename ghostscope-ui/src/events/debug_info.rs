@@ -168,7 +168,7 @@ impl ModuleDebugInfo {
         let mut result = String::new();
 
         // Module header with full path and source info
-        result.push_str(&format!("📦 {}", &self.binary_path));
+        result.push_str(&format!("📦 {}", self.binary_path));
 
         // Add source information if available
         if let Some(ref file) = source_file {

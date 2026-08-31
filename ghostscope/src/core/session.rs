@@ -171,8 +171,8 @@ impl GhostSession {
             } else {
                 info!("Sysmon started (-p map-change mode)");
             }
-        } else if s.target_binary.is_some() {
-            let tpath = PathBuf::from(s.target_binary.as_ref().unwrap());
+        } else if let Some(target_binary) = &s.target_binary {
+            let tpath = PathBuf::from(target_binary);
             if config.ebpf_config.enable_sysmon_for_target {
                 let cfg = SysmonConfig {
                     target_module: Some(tpath.clone()),

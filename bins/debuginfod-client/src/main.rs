@@ -140,7 +140,7 @@ fn parse_build_id_hex(raw: &str) -> Result<Vec<u8>> {
     if raw.is_empty() {
         bail!("build-id must not be empty");
     }
-    if raw.len() % 2 != 0 {
+    if !raw.len().is_multiple_of(2) {
         bail!("build-id hex must contain an even number of digits");
     }
 

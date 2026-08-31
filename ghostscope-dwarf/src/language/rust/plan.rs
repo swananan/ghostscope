@@ -432,7 +432,7 @@ impl BTreePlanner<'_> {
         else {
             return Ok(None);
         };
-        if edge_count != node_capacity.checked_add(1).unwrap_or(u64::MAX) {
+        if edge_count != node_capacity.saturating_add(1) {
             return Ok(None);
         }
         let edges_offset = member_projection_offset(&edges)?;

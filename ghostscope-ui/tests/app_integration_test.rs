@@ -87,15 +87,15 @@ impl TestableApp {
                     state.command_input.pop();
                 }
             }
-            KeyCode::Enter => {
-                if state.current_panel == PanelType::Command && !state.command_input.is_empty() {
-                    // Process command
-                    let _cmd = state.command_input.clone();
-                    state.command_input.clear();
+            KeyCode::Enter
+                if state.current_panel == PanelType::Command && !state.command_input.is_empty() =>
+            {
+                // Process command
+                let _cmd = state.command_input.clone();
+                state.command_input.clear();
 
-                    // Send as RuntimeCommand (mock)
-                    // In real implementation, this would parse and send the actual command
-                }
+                // Send as RuntimeCommand (mock)
+                // In real implementation, this would parse and send the actual command
             }
             _ => {}
         }

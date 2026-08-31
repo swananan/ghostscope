@@ -558,8 +558,8 @@ async fn load_analyzer_with_breakdown(
 
 async fn load_analyzer_and_execute(cli: Cli) -> Result<std::time::Duration> {
     if !cli.command.quiet() && !cli.command.json() {
-        if cli.pid.is_some() {
-            println!("Loading modules from PID {}...", cli.pid.unwrap());
+        if let Some(pid) = cli.pid {
+            println!("Loading modules from PID {pid}...");
         } else if let Some(ref target) = cli.target {
             println!("Loading target file {target}...");
         }

@@ -817,7 +817,7 @@ impl ExpressionEvaluator {
                     },
                 ));
             }
-            if size_in_bits % 8 != 0 {
+            if !size_in_bits.is_multiple_of(8) {
                 return Err(anyhow::anyhow!(
                     "DW_OP_piece size {size_in_bits} is not byte-aligned"
                 ));
