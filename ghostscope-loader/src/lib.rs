@@ -104,6 +104,7 @@ enum EventMap {
     PerfEventArray {
         _map: PerfEventArray<MapData>,
         cpu_buffers: Vec<PerfEventCpuBuffer>,
+        next_cpu: usize,
     },
 }
 
@@ -165,29 +166,103 @@ struct PerfEventCpuBuffer {
     buffer: aya::maps::perf::PerfEventArrayBuffer<MapData>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PerfDrainStats {
+    samples_read: usize,
+    events_produced: usize,
+}
+
+fn round_robin_cpu_indices(cpu_count: usize, next_cpu: usize) -> impl Iterator<Item = usize> {
+    let next_cpu = if cpu_count == 0 {
+        0
+    } else {
+        next_cpu % cpu_count
+    };
+    (0..cpu_count).map(move |offset| (next_cpu + offset) % cpu_count)
+}
+
+fn drain_perf_cpu_indices_fairly<E>(
+    cpu_count: usize,
+    readable_indices: &[usize],
+    next_cpu: &mut usize,
+    event_capacity: usize,
+    mut drain: impl FnMut(usize, usize) -> std::result::Result<PerfDrainStats, E>,
+) -> std::result::Result<bool, E> {
+    if cpu_count == 0 || readable_indices.is_empty() || event_capacity == 0 {
+        return Ok(false);
+    }
+
+    debug_assert!(readable_indices.iter().all(|&index| index < cpu_count));
+
+    // Give every readable CPU a share of the output batch before allowing any
+    // one CPU to consume the remaining capacity. The cursor rotates whichever
+    // CPU receives the final sample to the back of the next batch.
+    let first_pass_quota = (event_capacity / readable_indices.len()).clamp(1, PERF_READ_BATCH_SIZE);
+    let mut samples_read = vec![0usize; readable_indices.len()];
+    let mut remaining_events = event_capacity;
+    let mut made_progress = false;
+
+    for (position, &index) in readable_indices.iter().enumerate() {
+        if remaining_events == 0 {
+            break;
+        }
+
+        let sample_limit = first_pass_quota.min(remaining_events);
+        let stats = drain(index, sample_limit)?;
+        debug_assert!(stats.samples_read <= sample_limit);
+        samples_read[position] = stats.samples_read;
+        remaining_events = remaining_events.saturating_sub(stats.events_produced);
+        if stats.samples_read > 0 {
+            made_progress = true;
+            *next_cpu = (index + 1) % cpu_count;
+        }
+    }
+
+    // Spend unused capacity in the same round-robin order, while preserving
+    // the existing per-CPU sample limit across both passes.
+    for (position, &index) in readable_indices.iter().enumerate() {
+        if remaining_events == 0 {
+            break;
+        }
+
+        let sample_limit = PERF_READ_BATCH_SIZE
+            .saturating_sub(samples_read[position])
+            .min(remaining_events);
+        if sample_limit == 0 {
+            continue;
+        }
+
+        let stats = drain(index, sample_limit)?;
+        debug_assert!(stats.samples_read <= sample_limit);
+        remaining_events = remaining_events.saturating_sub(stats.events_produced);
+        if stats.samples_read > 0 {
+            made_progress = true;
+            *next_cpu = (index + 1) % cpu_count;
+        }
+    }
+
+    Ok(made_progress)
+}
+
 fn drain_perf_cpu_buffer(
     entry: &mut PerfEventCpuBuffer,
     parser: &mut StreamingTraceParser,
     trace_context: &TraceContext,
     events: &mut Vec<ParsedTraceEvent>,
-) -> Result<bool> {
-    let mut produced = false;
-    if events.len() >= MAX_EVENTS_PER_WAIT {
-        return Ok(false);
+    max_samples: usize,
+) -> Result<PerfDrainStats> {
+    if events.len() >= MAX_EVENTS_PER_WAIT || max_samples == 0 {
+        return Ok(PerfDrainStats::default());
     }
 
+    let initial_event_count = events.len();
     let cpu = entry.cpu_id;
     let drain_result = entry.buffer.try_fold(
         (0usize, 0u64),
         |(mut read_count, mut lost_count), event| {
-            if events.len() >= MAX_EVENTS_PER_WAIT || read_count >= PERF_READ_BATCH_SIZE {
-                return ControlFlow::Break(Ok((read_count, lost_count)));
-            }
-
             match event {
                 PerfEvent::Sample { head, tail } => {
                     read_count += 1;
-                    produced = true;
                     debug!(
                         "PerfEvent {}: {} bytes - {:02x?}",
                         read_count - 1,
@@ -215,7 +290,11 @@ fn drain_perf_cpu_buffer(
                 }
             }
 
-            ControlFlow::Continue((read_count, lost_count))
+            if events.len() >= MAX_EVENTS_PER_WAIT || read_count >= max_samples {
+                ControlFlow::Break(Ok((read_count, lost_count)))
+            } else {
+                ControlFlow::Continue((read_count, lost_count))
+            }
         },
     );
 
@@ -226,7 +305,7 @@ fn drain_perf_cpu_buffer(
 
     if read_count > 0 {
         info!(
-            "Read {} events from CPU {} buffer",
+            "Read {} perf samples from CPU {} buffer",
             read_count, entry.cpu_id
         );
     }
@@ -237,7 +316,38 @@ fn drain_perf_cpu_buffer(
         );
     }
 
-    Ok(produced)
+    Ok(PerfDrainStats {
+        samples_read: read_count,
+        events_produced: events.len().saturating_sub(initial_event_count),
+    })
+}
+
+fn drain_readable_perf_cpu_buffers(
+    cpu_buffers: &mut [PerfEventCpuBuffer],
+    next_cpu: &mut usize,
+    parser: &mut StreamingTraceParser,
+    trace_context: &TraceContext,
+    events: &mut Vec<ParsedTraceEvent>,
+) -> Result<bool> {
+    let cpu_count = cpu_buffers.len();
+    let readable_indices: Vec<_> = round_robin_cpu_indices(cpu_count, *next_cpu)
+        .filter(|&index| cpu_buffers[index].buffer.readable())
+        .collect();
+    let event_capacity = MAX_EVENTS_PER_WAIT.saturating_sub(events.len());
+
+    drain_perf_cpu_indices_fairly(
+        cpu_count,
+        &readable_indices,
+        next_cpu,
+        event_capacity,
+        |index, max_samples| {
+            let entry = &mut cpu_buffers[index];
+            if !entry.buffer.readable() {
+                return Ok(PerfDrainStats::default());
+            }
+            drain_perf_cpu_buffer(entry, parser, trace_context, events, max_samples)
+        },
+    )
 }
 
 /// Compatibility shim that mimics Aya's newer attach location helper so we can keep
@@ -880,6 +990,7 @@ impl GhostScopeLoader {
             EventMap::PerfEventArray {
                 _map: perf_array,
                 cpu_buffers,
+                next_cpu: 0,
             }
         } else {
             return Err(LoaderError::MapNotFound(
@@ -1152,33 +1263,37 @@ impl GhostScopeLoader {
                     );
                 }
             }
-            EventMap::PerfEventArray { cpu_buffers, .. } => {
+            EventMap::PerfEventArray {
+                cpu_buffers,
+                next_cpu,
+                ..
+            } => {
                 let parser = &mut self.parser;
 
                 loop {
                     // Drain any buffers that already report data without waiting.
-                    let mut made_progress = false;
-                    for entry in cpu_buffers.iter_mut() {
-                        if events.len() >= MAX_EVENTS_PER_WAIT {
-                            break;
-                        }
-                        if entry.buffer.readable() {
-                            made_progress |=
-                                drain_perf_cpu_buffer(entry, parser, trace_context, &mut events)?;
-                        }
-                    }
+                    let mut made_progress = drain_readable_perf_cpu_buffers(
+                        cpu_buffers,
+                        next_cpu,
+                        parser,
+                        trace_context,
+                        &mut events,
+                    )?;
 
                     if made_progress {
                         break;
                     }
 
                     // Wait for at least one buffer to become readable.
-                    let ready_idx = poll_fn(|cx| {
-                        for (idx, entry) in cpu_buffers.iter().enumerate() {
+                    let poll_start = *next_cpu;
+                    let cpu_count = cpu_buffers.len();
+                    poll_fn(|cx| {
+                        for idx in round_robin_cpu_indices(cpu_count, poll_start) {
+                            let entry = &cpu_buffers[idx];
                             match entry.readiness.poll_read_ready(cx) {
                                 Poll::Ready(Ok(mut guard)) => {
                                     guard.clear_ready();
-                                    return Poll::Ready(Ok(idx));
+                                    return Poll::Ready(Ok(()));
                                 }
                                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                                 Poll::Pending => {}
@@ -1193,27 +1308,15 @@ impl GhostScopeLoader {
                         ))
                     })?;
 
-                    // Drain the buffer that triggered readiness.
-                    made_progress |= drain_perf_cpu_buffer(
-                        cpu_buffers
-                            .get_mut(ready_idx)
-                            .expect("ready index should be valid"),
+                    // Drain every buffer now advertising data using the same
+                    // fair allocation as the non-waiting path.
+                    made_progress |= drain_readable_perf_cpu_buffers(
+                        cpu_buffers,
+                        next_cpu,
                         parser,
                         trace_context,
                         &mut events,
                     )?;
-
-                    // Drain any other buffers now advertising data.
-                    for (idx, entry) in cpu_buffers.iter_mut().enumerate() {
-                        if events.len() >= MAX_EVENTS_PER_WAIT {
-                            break;
-                        }
-                        if idx == ready_idx || !entry.buffer.readable() {
-                            continue;
-                        }
-                        made_progress |=
-                            drain_perf_cpu_buffer(entry, parser, trace_context, &mut events)?;
-                    }
 
                     if made_progress {
                         if events.len() == MAX_EVENTS_PER_WAIT {
@@ -1541,5 +1644,114 @@ impl GhostScopeLoader {
             .programs()
             .map(|(name, _prog)| format!("Program: {name}"))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perf_drain_shares_batch_before_draining_surplus() {
+        let mut next_cpu = 0;
+        let readable_indices: Vec<_> = round_robin_cpu_indices(3, next_cpu).collect();
+        let mut calls = Vec::new();
+        let mut samples_by_cpu = [0usize; 3];
+
+        let made_progress = drain_perf_cpu_indices_fairly(
+            3,
+            &readable_indices,
+            &mut next_cpu,
+            MAX_EVENTS_PER_WAIT,
+            |index, limit| {
+                calls.push((index, limit));
+                samples_by_cpu[index] += limit;
+                Ok::<_, ()>(PerfDrainStats {
+                    samples_read: limit,
+                    events_produced: limit,
+                })
+            },
+        )
+        .expect("simulated perf drain should succeed");
+
+        assert!(made_progress);
+        assert_eq!(calls, [(0, 42), (1, 42), (2, 42), (0, 2)]);
+        assert_eq!(samples_by_cpu, [44, 42, 42]);
+        assert_eq!(next_cpu, 1);
+
+        let readable_indices: Vec<_> = round_robin_cpu_indices(3, next_cpu).collect();
+        calls.clear();
+        samples_by_cpu.fill(0);
+        drain_perf_cpu_indices_fairly(
+            3,
+            &readable_indices,
+            &mut next_cpu,
+            MAX_EVENTS_PER_WAIT,
+            |index, limit| {
+                calls.push((index, limit));
+                samples_by_cpu[index] += limit;
+                Ok::<_, ()>(PerfDrainStats {
+                    samples_read: limit,
+                    events_produced: limit,
+                })
+            },
+        )
+        .expect("simulated perf drain should succeed");
+
+        assert_eq!(calls, [(1, 42), (2, 42), (0, 42), (1, 2)]);
+        assert_eq!(samples_by_cpu, [42, 44, 42]);
+        assert_eq!(next_cpu, 2);
+    }
+
+    #[test]
+    fn perf_drain_continues_after_batch_when_cpus_outnumber_capacity() {
+        let cpu_count = 200;
+        let mut next_cpu = 0;
+        let mut samples_by_cpu = vec![0usize; cpu_count];
+
+        for _ in 0..2 {
+            let readable_indices: Vec<_> = round_robin_cpu_indices(cpu_count, next_cpu).collect();
+            drain_perf_cpu_indices_fairly(
+                cpu_count,
+                &readable_indices,
+                &mut next_cpu,
+                MAX_EVENTS_PER_WAIT,
+                |index, limit| {
+                    samples_by_cpu[index] += limit;
+                    Ok::<_, ()>(PerfDrainStats {
+                        samples_read: limit,
+                        events_produced: limit,
+                    })
+                },
+            )
+            .expect("simulated perf drain should succeed");
+        }
+
+        assert!(samples_by_cpu.iter().all(|&samples| samples > 0));
+        assert_eq!(next_cpu, 56);
+    }
+
+    #[test]
+    fn perf_drain_preserves_per_cpu_sample_limit_across_passes() {
+        let mut next_cpu = 0;
+        let readable_indices = [0];
+        let mut samples_read = 0;
+
+        drain_perf_cpu_indices_fairly(
+            1,
+            &readable_indices,
+            &mut next_cpu,
+            MAX_EVENTS_PER_WAIT,
+            |_index, limit| {
+                samples_read += limit;
+                Ok::<_, ()>(PerfDrainStats {
+                    samples_read: limit,
+                    events_produced: limit,
+                })
+            },
+        )
+        .expect("simulated perf drain should succeed");
+
+        assert_eq!(samples_read, PERF_READ_BATCH_SIZE);
     }
 }
