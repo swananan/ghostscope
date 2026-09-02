@@ -129,34 +129,35 @@ impl FunctionBlocks {
 
     /// Return node indices from root to the innermost block containing PC
     pub fn block_path_for_pc(&self, pc: u64) -> Vec<usize> {
-        let mut path = vec![0usize];
         if self.nodes[0].children.is_empty() {
-            return path;
+            return vec![0];
         }
 
-        let mut stack = vec![(0usize, 0usize)]; // (node, child_iter_index)
-        let mut best_path = path.clone();
-        while let Some((node_idx, mut child_idx)) = stack.pop() {
-            // Try children depth-first
-            while child_idx < self.nodes[node_idx].children.len() {
-                let child = self.nodes[node_idx].children[child_idx];
-                child_idx += 1;
-                // Push back current with advanced iterator
-                stack.push((node_idx, child_idx));
-                // Descend into child
+        let mut parents = vec![None; self.nodes.len()];
+        let mut stack = vec![(0usize, 0usize)]; // (node, depth)
+        let mut innermost = (0usize, 0usize);
+
+        while let Some((node_idx, depth)) = stack.pop() {
+            for &child in self.nodes[node_idx].children.iter().rev() {
                 if self.nodes[child].contains_pc(pc) {
-                    // Extend path
-                    let mut cur = path.clone();
-                    cur.push(child);
-                    path = cur.clone();
-                    best_path = path.clone();
-                    // Descend further from this child
-                    stack.push((child, 0));
-                    break;
+                    let child_depth = depth + 1;
+                    parents[child] = Some(node_idx);
+                    if child_depth > innermost.1 {
+                        innermost = (child, child_depth);
+                    }
+                    stack.push((child, child_depth));
                 }
             }
         }
-        best_path
+
+        let mut path = Vec::with_capacity(innermost.1 + 1);
+        let mut current = Some(innermost.0);
+        while let Some(node_idx) = current {
+            path.push(node_idx);
+            current = parents[node_idx];
+        }
+        path.reverse();
+        path
     }
 
     /// Enumerate all VarRefs visible at PC with their lexical path depth.
@@ -651,6 +652,52 @@ mod tests {
     };
     use gimli::{BigEndian, Format, LittleEndian, Register};
     use std::sync::Arc;
+
+    #[test]
+    fn block_path_for_pc_ignores_non_containing_siblings() {
+        const PC: u64 = 0x2000;
+        const NON_MATCHING_SIBLINGS: usize = 8;
+
+        let mut function = FunctionBlocks::new(gimli::DebugInfoOffset(0), gimli::UnitOffset(0));
+        for index in 0..NON_MATCHING_SIBLINGS {
+            let mut sibling = BlockNode::new();
+            let start = 0x1000 + index as u64 * 2;
+            sibling.ranges.push((start, start + 1));
+            function.nodes.push(sibling);
+            function.nodes[0].children.push(index + 1);
+        }
+
+        let mut matching_sibling = BlockNode::new();
+        matching_sibling.ranges.push((PC, PC + 1));
+        function.nodes.push(matching_sibling);
+        let matching_index = function.nodes.len() - 1;
+        function.nodes[0].children.push(matching_index);
+
+        assert_eq!(function.block_path_for_pc(PC), vec![0, matching_index]);
+    }
+
+    #[test]
+    fn block_path_for_pc_selects_the_deepest_overlapping_branch() {
+        const PC: u64 = 0x2000;
+
+        let mut function = FunctionBlocks::new(gimli::DebugInfoOffset(0), gimli::UnitOffset(0));
+        let mut shallow = BlockNode::new();
+        shallow.ranges.push((PC, PC + 1));
+        function.nodes.push(shallow);
+        function.nodes[0].children.push(1);
+
+        let mut outer = BlockNode::new();
+        outer.ranges.push((PC, PC + 1));
+        function.nodes.push(outer);
+        function.nodes[0].children.push(2);
+
+        let mut inner = BlockNode::new();
+        inner.ranges.push((PC, PC + 1));
+        function.nodes.push(inner);
+        function.nodes[2].children.push(3);
+
+        assert_eq!(function.block_path_for_pc(PC), vec![0, 2, 3]);
+    }
 
     fn build_call_site_fixture(
         call_site_tag: gimli::DwTag,
