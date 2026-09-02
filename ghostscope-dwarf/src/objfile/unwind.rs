@@ -99,15 +99,16 @@ impl ModuleUnwindInfo {
         Ok(Some(table))
     }
 
-    pub(crate) fn compact_unwind_table_with_max_rows(
+    pub(crate) fn compact_unwind_table_with_max_rows_and_check(
         &self,
         module: ModuleId,
         max_rows: usize,
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<Option<CompactUnwindTable>> {
         let Some(cfi) = &self.cfi_index else {
             return Ok(None);
         };
-        cfi.compact_unwind_table_with_max_rows(module, max_rows)
+        cfi.compact_unwind_table_with_max_rows_and_check(module, max_rows, check)
             .map(Some)
     }
 

@@ -77,6 +77,10 @@ pub struct BacktraceUnwindRowsAppendStats {
     pub rows: usize,
 }
 
+fn backtrace_rows_that_fit(start: u32, capacity: u32, requested: usize) -> usize {
+    requested.min(capacity.saturating_sub(start) as usize)
+}
+
 // Export kernel capabilities detection
 mod kernel_caps;
 pub use kernel_caps::{KernelCapabilities, KernelCapabilityError};
@@ -1541,11 +1545,36 @@ impl GhostScopeLoader {
             return Ok(None);
         }
 
+        let Some(map) = self.bpf.map_mut("bt_unwind_rows") else {
+            return Ok(None);
+        };
+        let mut array: Array<_, BacktraceUnwindRow> = map.try_into().map_err(|e| {
+            LoaderError::Generic(format!("Failed to convert bt_unwind_rows map: {e}"))
+        })?;
         let start = self.backtrace_unwind_row_count;
-        let row_count = u32::try_from(rows.len()).map_err(|_| {
+        let retained_count = backtrace_rows_that_fit(start, array.len(), rows.len());
+        if retained_count == 0 {
+            warn!(
+                cookie = format_args!("0x{cookie:016x}"),
+                requested_rows = rows.len(),
+                capacity = array.len(),
+                "No bt unwind row capacity remains for runtime module"
+            );
+            return Ok(None);
+        }
+        if retained_count < rows.len() {
+            warn!(
+                cookie = format_args!("0x{cookie:016x}"),
+                requested_rows = rows.len(),
+                retained_rows = retained_count,
+                capacity = array.len(),
+                "Truncating runtime module unwind rows to remaining bt map capacity"
+            );
+        }
+        let retained_rows = &rows[..retained_count];
+        let row_count = u32::try_from(retained_count).map_err(|_| {
             LoaderError::Generic(format!(
-                "Too many unwind rows for module cookie 0x{cookie:016x}: {}",
-                rows.len()
+                "Too many unwind rows for module cookie 0x{cookie:016x}: {retained_count}"
             ))
         })?;
         let end = start.checked_add(row_count).ok_or_else(|| {
@@ -1554,22 +1583,7 @@ impl GhostScopeLoader {
             ))
         })?;
 
-        let Some(map) = self.bpf.map_mut("bt_unwind_rows") else {
-            return Ok(None);
-        };
-        let mut array: Array<_, BacktraceUnwindRow> = map.try_into().map_err(|e| {
-            LoaderError::Generic(format!("Failed to convert bt_unwind_rows map: {e}"))
-        })?;
-        if end > array.len() {
-            return Err(LoaderError::Generic(format!(
-                "bt_unwind_rows capacity exceeded while appending module \
-                 0x{cookie:016x}: need end row {}, capacity {}",
-                end,
-                array.len()
-            )));
-        }
-
-        for (offset, row) in rows.iter().copied().enumerate() {
+        for (offset, row) in retained_rows.iter().copied().enumerate() {
             let row_index = start + offset as u32;
             array.set(row_index, row, 0).map_err(|e| {
                 LoaderError::Generic(format!("Failed to append unwind row {row_index}: {e}"))
@@ -1597,7 +1611,7 @@ impl GhostScopeLoader {
         self.backtrace_module_row_cookies.insert(cookie);
         debug!(
             cookie = format_args!("0x{cookie:016x}"),
-            rows = rows.len(),
+            rows = retained_rows.len(),
             row_start = range.row_start,
             row_end = range.row_end,
             "Appended DWARF unwind rows for bt module"
@@ -1615,12 +1629,11 @@ impl GhostScopeLoader {
             self.sync_shared_backtrace_row_state()?;
         }
         for (cookie, rows) in modules {
-            if self
-                .append_backtrace_unwind_rows_for_module_after_sync(*cookie, rows)?
-                .is_some()
+            if let Some(range) =
+                self.append_backtrace_unwind_rows_for_module_after_sync(*cookie, rows)?
             {
                 stats.modules += 1;
-                stats.rows += rows.len();
+                stats.rows += range.row_end.saturating_sub(range.row_start) as usize;
             }
         }
         Ok(stats)
@@ -1753,5 +1766,12 @@ mod tests {
         .expect("simulated perf drain should succeed");
 
         assert_eq!(samples_read, PERF_READ_BATCH_SIZE);
+    }
+
+    #[test]
+    fn runtime_backtrace_rows_are_bounded_by_remaining_capacity() {
+        assert_eq!(backtrace_rows_that_fit(10, 16, 20), 6);
+        assert_eq!(backtrace_rows_that_fit(16, 16, 20), 0);
+        assert_eq!(backtrace_rows_that_fit(20, 16, 20), 0);
     }
 }

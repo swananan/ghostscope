@@ -31,7 +31,8 @@ pub use analyzer::{
 };
 pub use loader::ExplicitDebugFile;
 pub use runtime_unwind::{
-    load_runtime_backtrace_metadata, RuntimeBacktraceMetadata, RuntimeTextSymbol,
+    load_runtime_backtrace_metadata, RuntimeBacktraceLoadBudget, RuntimeBacktraceMetadata,
+    RuntimeTextSymbol,
 };
 
 // Re-export essential core and semantic support types.

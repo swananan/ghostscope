@@ -531,14 +531,6 @@ fn report_tui_backtrace_runtime_schedule(
                 warning: false,
             })
         }
-        BacktraceRuntimeRefreshSchedule::LimitReached { limit } => {
-            Some(RuntimeStatus::BacktraceModuleRefresh {
-                message: format!(
-                    "Backtrace runtime module limit ({limit}) reached; continuing with available symbols or raw addresses"
-                ),
-                warning: true,
-            })
-        }
         _ => None,
     };
     if let Some(status) = status {
@@ -586,9 +578,7 @@ async fn report_tui_backtrace_runtime_refresh(
                 )
             } else if modules == 0 {
                 (
-                    format!(
-                        "Refreshed backtrace module mappings{next}; tracing remained active"
-                    ),
+                    format!("Refreshed backtrace module mappings{next}; tracing remained active"),
                     false,
                 )
             } else {
@@ -601,6 +591,7 @@ async fn report_tui_backtrace_runtime_refresh(
             }
         }
         BacktraceRuntimeRefreshOutcome::ModuleNotFound { next_started } => {
+            *renderer = crate::trace::backtrace::BacktraceRenderer::default();
             let next = if next_started {
                 "; trying the next requested module"
             } else {
@@ -617,6 +608,7 @@ async fn report_tui_backtrace_runtime_refresh(
             error,
             next_started,
         } => {
+            *renderer = crate::trace::backtrace::BacktraceRenderer::default();
             let next = if next_started {
                 "; trying the next requested module"
             } else {
@@ -629,13 +621,25 @@ async fn report_tui_backtrace_runtime_refresh(
                 true,
             )
         }
-        BacktraceRuntimeRefreshOutcome::TimedOut { timeout } => (
-            format!(
-                "Backtrace runtime module resolution exceeded {} ms; automatic runtime module loading is disabled for this session and tracing continues with raw addresses",
-                timeout.as_millis()
-            ),
-            true,
-        ),
+        BacktraceRuntimeRefreshOutcome::TimedOut { timeout } => {
+            *renderer = crate::trace::backtrace::BacktraceRenderer::default();
+            (
+                format!(
+                    "Backtrace runtime module resolution exceeded {} ms; automatic runtime module loading is disabled for this session and tracing continues with raw addresses",
+                    timeout.as_millis()
+                ),
+                true,
+            )
+        }
+        BacktraceRuntimeRefreshOutcome::LimitReached { limit } => {
+            *renderer = crate::trace::backtrace::BacktraceRenderer::default();
+            (
+                format!(
+                    "Backtrace runtime module limit ({limit}) reached; continuing with available symbols or raw addresses"
+                ),
+                true,
+            )
+        }
     };
     let _ = status_sender.send(RuntimeStatus::BacktraceModuleRefresh { message, warning });
     Ok(())

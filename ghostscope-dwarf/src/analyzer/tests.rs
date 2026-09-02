@@ -167,7 +167,7 @@ fn global_plan_selection_rejects_ambiguous_current_module_matches() {
 fn runtime_text_symbols_resolve_without_loading_module_dwarf() {
     let mut analyzer = DwarfAnalyzer::from_modules(0, Vec::new());
     analyzer.add_runtime_text_symbols(
-        PathBuf::from("/tmp/liblate.so"),
+        0x1234,
         vec![RuntimeTextSymbol {
             name: "late_callback".to_string(),
             address: 0x120,
@@ -177,11 +177,14 @@ fn runtime_text_symbols_resolve_without_loading_module_dwarf() {
 
     assert_eq!(
         analyzer
-            .find_runtime_function_name_for_display("/tmp/liblate.so", 0x13f, false)
+            .find_runtime_function_name_for_display(0x1234, 0x13f, false)
             .as_deref(),
         Some("late_callback")
     );
     assert!(analyzer
-        .find_runtime_function_name_for_display("/tmp/liblate.so", 0x150, false)
+        .find_runtime_function_name_for_display(0x1234, 0x150, false)
+        .is_none());
+    assert!(analyzer
+        .find_runtime_function_name_for_display(0x5678, 0x13f, false)
         .is_none());
 }

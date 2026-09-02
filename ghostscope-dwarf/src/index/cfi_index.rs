@@ -225,6 +225,17 @@ impl CfiIndex {
         module: ModuleId,
         max_rows: usize,
     ) -> Result<CompactUnwindTable> {
+        self.compact_unwind_table_with_max_rows_and_check(module, max_rows, &|| Ok(()))
+    }
+
+    /// Compile at most `max_rows` FDE rows while allowing a runtime caller to
+    /// cooperatively stop long-running parsing.
+    pub fn compact_unwind_table_with_max_rows_and_check(
+        &self,
+        module: ModuleId,
+        max_rows: usize,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<CompactUnwindTable> {
         let started_at = Instant::now();
         let mut rows = Vec::new();
         let mut diagnostics = Vec::new();
@@ -233,6 +244,7 @@ impl CfiIndex {
         let mut truncated = false;
 
         while let Some(entry) = entries.next().context("Failed to iterate FDE entries")? {
+            check()?;
             if rows.len() >= max_rows {
                 truncated = true;
                 break;
@@ -243,7 +255,14 @@ impl CfiIndex {
                     let fde = partial_fde
                         .parse(|_, bases, offset| self.eh_frame.cie_from_offset(bases, offset))
                         .context("Failed to parse FDE")?;
-                    self.append_compact_rows(module, &fde, max_rows, &mut rows, &mut diagnostics)?;
+                    self.append_compact_rows(
+                        module,
+                        &fde,
+                        max_rows,
+                        &mut rows,
+                        &mut diagnostics,
+                        check,
+                    )?;
                 }
                 CieOrFde::Cie(_) => {}
             }
@@ -342,6 +361,7 @@ impl CfiIndex {
         max_rows: usize,
         rows: &mut Vec<CompactUnwindRow>,
         diagnostics: &mut Vec<UnwindDiagnostic>,
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         let return_address_register = fde.cie().return_address_register().0;
         let mut ctx = UnwindContext::new();
@@ -350,6 +370,7 @@ impl CfiIndex {
             .context("Failed to build unwind rows")?;
 
         while let Some(row) = table.next_row().context("Failed to evaluate unwind row")? {
+            check()?;
             if rows.len() >= max_rows {
                 break;
             }

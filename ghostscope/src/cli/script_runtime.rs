@@ -520,13 +520,6 @@ fn report_cli_backtrace_runtime_schedule(
             "ghostscope: resolving a backtrace module in the background ({} ms timeout); events continue with available symbols or raw addresses",
             timeout.as_millis()
         ),
-        BacktraceRuntimeRefreshSchedule::LimitReached { limit } => {
-            let message = format!(
-                "backtrace runtime module limit ({limit}) reached; continuing with available symbols or raw addresses"
-            );
-            warn!("{message}");
-            eprintln!("ghostscope: warning: {message}");
-        }
         _ => {}
     }
 }
@@ -577,6 +570,7 @@ async fn report_cli_backtrace_runtime_refresh(
             }
         }
         BacktraceRuntimeRefreshOutcome::ModuleNotFound { next_started } => {
+            *renderer = crate::trace::backtrace::BacktraceRenderer::default();
             let next = if next_started {
                 "; trying the next requested module"
             } else {
@@ -592,6 +586,7 @@ async fn report_cli_backtrace_runtime_refresh(
             error,
             next_started,
         } => {
+            *renderer = crate::trace::backtrace::BacktraceRenderer::default();
             let next = if next_started {
                 "; trying the next requested module"
             } else {
@@ -604,9 +599,18 @@ async fn report_cli_backtrace_runtime_refresh(
             eprintln!("ghostscope: warning: {message}");
         }
         BacktraceRuntimeRefreshOutcome::TimedOut { timeout } => {
+            *renderer = crate::trace::backtrace::BacktraceRenderer::default();
             let message = format!(
                 "backtrace runtime module resolution exceeded {} ms; automatic runtime module loading is disabled for this session and tracing continues with raw addresses",
                 timeout.as_millis()
+            );
+            warn!("{message}");
+            eprintln!("ghostscope: warning: {message}");
+        }
+        BacktraceRuntimeRefreshOutcome::LimitReached { limit } => {
+            *renderer = crate::trace::backtrace::BacktraceRenderer::default();
+            let message = format!(
+                "backtrace runtime module limit ({limit}) reached; continuing with available symbols or raw addresses"
             );
             warn!("{message}");
             eprintln!("ghostscope: warning: {message}");
