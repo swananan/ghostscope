@@ -63,7 +63,7 @@ GhostScope 能识别 `DW_OP_form_tls_address`，但运行时 TLS 地址解析目
 GhostScope 默认严格检查独立调试文件所有可用的 `.gnu_debuglink` CRC 和可比较 Build ID。启用 `--allow-loose-debug-match` 后，可以在 warning 提示下使用不匹配的调试文件，但这会削弱源码语义所依赖的证据保证。显式指定的调试文件如果既没有可用 CRC，也没有可比较的 Build ID，同样会在 warning 后继续使用，但此时文件身份属于用户提供的信任假设，而不是经过验证的匹配。
 
 ### 6. 栈回溯覆盖范围
-`bt` 只使用 DWARF CFI。GhostScope 不会回退到内核 stack helper 或 frame pointer walking；当 CFI 不可用、无法转换为 compact eBPF fast path，或读取用户栈内存失败时，会输出明确的停止状态。只要进程模块映射可用，跨模块栈帧可以通过 raw IP 做正确符号化；运行时模块刷新也可以为新映射模块追加 compact DWARF rows，直到达到 `backtrace_unwind_rows_max_entries`。如果某个 trace 事件早于 map-change 刷新抵达用户态，它仍可能先停在新加载模块，后续事件才能看到已追加的 rows。深栈 DWARF unwind 已经通过 eBPF tail-call step program 分段执行，因此默认 `backtrace_depth = 128` 不会触发 LLVM 分支距离和 verifier 程序大小限制；`status=truncated` 表示达到配置深度或 tail-call unwind 预算后仍未自然停止。
+`bt` 只使用 DWARF CFI。GhostScope 不会回退到内核 stack helper 或 frame pointer walking；当 CFI 不可用、无法转换为 compact eBPF fast path，或读取用户栈内存失败时，会输出明确的停止状态。只要进程模块映射可用，跨模块栈帧就能通过 raw IP 匹配模块偏移。对于事件实际引用的新映射模块，GhostScope 只在后台逐个加载 compact CFI，不会构建或常驻这些模块的完整调试/源码索引；相关工作受 `backtrace_runtime_modules_max`、`backtrace_runtime_module_timeout_ms` 和 `backtrace_unwind_rows_max_entries` 限制，当前事件会继续使用已有符号、模块偏移或裸地址输出。如果某个 trace 事件早于 map-change 刷新抵达用户态，它仍可能先停在新加载模块，后续事件才能看到已追加的 rows。深栈 DWARF unwind 已经通过 eBPF tail-call step program 分段执行，因此默认 `backtrace_depth = 128` 不会触发 LLVM 分支距离和 verifier 程序大小限制；`status=truncated` 表示达到配置深度或 tail-call unwind 预算后仍未自然停止。
 
 运行模式也会影响 `bt` 的覆盖面。`-p <pid>` 是进程级视图，GhostScope 会从该 PID 的 `/proc/<pid>/maps` 加载已映射模块，因此跨模块 unwind 和符号化通常最完整。独立 `-t <path>` 是目标文件级、多进程 trace 视图，主要保证目标模块内的探针和变量；调用栈跨出目标模块后属于 best-effort，依赖运行时模块映射、`proc_module_offsets` 维护结果以及相关模块是否有可用 compact DWARF CFI。若既需要限定 trace 目标模块，又需要更完整的单进程 backtrace，优先使用 `-t <path> -p <pid>`。
 
@@ -71,7 +71,7 @@ GhostScope 默认严格检查独立调试文件所有可用的 `.gnu_debuglink` 
 编译器优化（-O2、-O3）会导致变量被优化掉或生成复杂的 DWARF 表达式。GhostScope 会尽力解析，包括内联函数的支持，但部分变量可能无法访问（显示为 OptimizedOut），这是因为编译器优化掉了。
 
 ### 8. 动态加载库（dlopen）
-GhostScope 启动时会扫描进程的 `/proc/PID/maps` 获取已加载的动态库信息；现在在 `-p <pid>` 和启用 sysmon 的独立 `-t <path>` 下，也会通过运行时 map-change 监控刷新模块映射。对 `bt`/`backtrace` 来说，这可以为后续通过 `dlopen` 加载的库追加 compact DWARF CFI rows 和模块偏移，但仍受 `backtrace_unwind_rows_max_entries` 以及上文提到的 map-change 竞态限制。
+GhostScope 启动时会扫描进程的 `/proc/PID/maps` 获取已加载的动态库信息；在 `-p <pid>` 和启用 sysmon 的独立 `-t <path>` 下，也会通过运行时 map-change 监控刷新模块映射。对 `bt`/`backtrace` 来说，后续事件只会按需请求实际触达的 `dlopen` 模块的 compact CFI，而不是预先索引所有新映射或常驻其完整 DWARF；该行为受运行时模块数量/时间限制、`backtrace_unwind_rows_max_entries` 以及上文提到的 map-change 竞态限制。可设置 `backtrace_runtime_modules = false` 或传入 `--no-backtrace-runtime-modules`，关闭自动 CFI 加载并保留模块偏移/裸地址降级输出。
 
 `-p <pid>` 有一个启动边界：trace setup 会先快照该 PID 当前的
 `/proc/<pid>/maps`，再解析函数名目标。如果 GhostScope 紧贴进程启动，而

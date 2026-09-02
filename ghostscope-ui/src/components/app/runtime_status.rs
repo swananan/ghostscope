@@ -1230,6 +1230,9 @@ impl App {
                 };
                 let _ = self.handle_action(action);
             }
+            RuntimeStatus::BacktraceModuleRefresh { message, warning } => {
+                self.show_backtrace_module_refresh_status(message, warning);
+            }
             RuntimeStatus::TraceBackpressure {
                 dropped_since_last,
                 dropped_total,
@@ -1337,6 +1340,33 @@ impl App {
         }
 
         self.state.ebpf_panel.add_trace_event(event);
+    }
+
+    fn show_backtrace_module_refresh_status(&mut self, message: String, warning: bool) {
+        let content = if warning {
+            format!("⚠ {message}")
+        } else {
+            format!("ℹ {message}")
+        };
+        let styled_lines =
+            crate::components::command_panel::ResponseFormatter::style_generic_message_lines(
+                &content,
+            );
+        crate::components::command_panel::ResponseFormatter::upsert_runtime_alert_with_style(
+            &mut self.state.command_panel,
+            content,
+            Some(styled_lines),
+            if warning {
+                crate::action::ResponseType::Warning
+            } else {
+                crate::action::ResponseType::Info
+            },
+        );
+        self.state.command_renderer.mark_pending_updates();
+
+        if warning {
+            self.add_ebpf_runtime_warning(format!("Warning: {message}"));
+        }
     }
 
     fn show_trace_backpressure_alert(

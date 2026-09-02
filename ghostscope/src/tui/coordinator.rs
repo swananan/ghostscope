@@ -1,5 +1,8 @@
 use crate::config::ResolvedConfig;
-use crate::core::GhostSession;
+use crate::core::{
+    BacktraceRuntimeModuleRequest, BacktraceRuntimeRefreshOutcome, BacktraceRuntimeRefreshSchedule,
+    GhostSession,
+};
 use crate::tui::{dwarf_loader, info_handlers, source_handlers, trace_handlers};
 use anyhow::Result;
 use ghostscope_ui::{EventRegistry, RuntimeChannels, RuntimeCommand, RuntimeStatus, UiTraceEvent};
@@ -48,33 +51,6 @@ fn forward_trace_event(
         }
         Err(TrySendError::Closed(_)) => TraceForwardResult::ChannelClosed,
     }
-}
-
-fn events_include_backtrace(events: &[ghostscope_protocol::ParsedTraceEvent]) -> bool {
-    events.iter().any(|event| {
-        event.instructions.iter().any(|instruction| {
-            matches!(
-                instruction,
-                ghostscope_protocol::ParsedInstruction::Backtrace { .. }
-            )
-        })
-    })
-}
-
-fn target_mode_event_pids(
-    session: &GhostSession,
-    events: &[ghostscope_protocol::ParsedTraceEvent],
-) -> Vec<u32> {
-    if session.proc_pid().is_some() {
-        return Vec::new();
-    }
-    events
-        .iter()
-        .map(|event| event.pid)
-        .filter(|pid| *pid != 0)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
 }
 
 /// Run GhostScope in TUI mode with merged configuration
@@ -171,6 +147,7 @@ async fn run_runtime_coordinator(
     let trace_sender = runtime_channels.create_trace_sender();
     let trace_channel_capacity = runtime_channels.trace_channel_capacity;
     let mut backtrace_renderer = crate::trace::backtrace::BacktraceRenderer::default();
+    let fallback_coordinator = ghostscope_process::ProcessManager::new();
     let mut backpressure_state = TraceBackpressureState::default();
     let mut backpressure_report_ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
     backpressure_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -190,45 +167,28 @@ async fn run_runtime_coordinator(
                 match result {
                     Ok(events) => {
                         if let Some(ref mut session) = session {
-                            if !events.is_empty() {
-                                let runtime_pids = target_mode_event_pids(session, &events);
-                                let refresh_result = if events_include_backtrace(&events) {
-                                    session
-                                        .refresh_pid_runtime_modules_before_rendering_for_runtime_pids(
-                                            &runtime_pids,
-                                        )
-                                        .await
-                                } else {
-                                    session
-                                        .refresh_pid_runtime_modules_if_needed_for_runtime_pids(
-                                            &runtime_pids,
-                                        )
-                                        .await
-                                };
-                                match refresh_result {
-                                    Ok(loaded) if loaded > 0 => {
-                                        backtrace_renderer =
-                                            crate::trace::backtrace::BacktraceRenderer::default();
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => warn!(
-                                        "Failed to refresh PID runtime modules after sysmon map-change event: {e:#}"
-                                    ),
-                                }
-                                tracing::debug!("Forwarding {} trace events to UI", events.len());
-                            }
+                            let runtime_refresh_request =
+                                BacktraceRuntimeModuleRequest::from_events(&events);
+                            tracing::debug!("Forwarding {} trace events to UI", events.len());
                             for event_data in events {
-                                let event_data = {
-                                    let coordinator = session
-                                        .coordinator
-                                        .lock()
-                                        .expect("coordinator mutex poisoned");
-                                    backtrace_renderer.render_event_for_tui(
+                                let event_data = match session.coordinator.try_lock() {
+                                    Ok(coordinator) => backtrace_renderer.render_event_for_tui(
                                         &event_data,
                                         session.process_analyzer.as_ref(),
                                         &coordinator,
                                         session.proc_pid(),
-                                    )
+                                    ),
+                                    Err(std::sync::TryLockError::WouldBlock) => {
+                                        backtrace_renderer.render_event_for_tui(
+                                            &event_data,
+                                            session.process_analyzer.as_ref(),
+                                            &fallback_coordinator,
+                                            session.proc_pid(),
+                                        )
+                                    }
+                                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                                        panic!("coordinator mutex poisoned")
+                                    }
                                 };
                                 match forward_trace_event(
                                     &trace_sender,
@@ -246,6 +206,38 @@ async fn run_runtime_coordinator(
                                         return Ok(());
                                     }
                                 }
+                            }
+                            match session.schedule_backtrace_runtime_module_refresh(
+                                runtime_refresh_request,
+                            ) {
+                                Ok(schedule) => report_tui_backtrace_runtime_schedule(
+                                    schedule,
+                                    &runtime_channels.status_sender,
+                                ),
+                                Err(error) => {
+                                    warn!("Failed to schedule backtrace runtime module refresh: {error:#}");
+                                    report_tui_backtrace_runtime_error(
+                                        "Failed to schedule backtrace runtime module resolution",
+                                        &error,
+                                        &runtime_channels.status_sender,
+                                    );
+                                }
+                            }
+                            // Complete background CFI work only after this batch has
+                            // reached the UI, so unrelated events cannot be held behind it.
+                            if let Err(error) = report_tui_backtrace_runtime_refresh(
+                                session,
+                                &mut backtrace_renderer,
+                                &runtime_channels.status_sender,
+                            )
+                            .await
+                            {
+                                warn!("Failed to finish backtrace runtime module refresh: {error:#}");
+                                report_tui_backtrace_runtime_error(
+                                    "Failed to finish backtrace runtime module resolution",
+                                    &error,
+                                    &runtime_channels.status_sender,
+                                );
                             }
                         }
                     }
@@ -502,12 +494,150 @@ async fn run_runtime_coordinator(
                             },
                         );
                     }
+                    if let Err(error) = report_tui_backtrace_runtime_refresh(
+                        session,
+                        &mut backtrace_renderer,
+                        &runtime_channels.status_sender,
+                    )
+                    .await
+                    {
+                        warn!("Failed to finish backtrace runtime module refresh: {error:#}");
+                        report_tui_backtrace_runtime_error(
+                            "Failed to finish backtrace runtime module resolution",
+                            &error,
+                            &runtime_channels.status_sender,
+                        );
+                    }
                 }
             }
         }
     }
 
     info!("Runtime coordinator shutting down");
+    Ok(())
+}
+
+fn report_tui_backtrace_runtime_schedule(
+    schedule: BacktraceRuntimeRefreshSchedule,
+    status_sender: &tokio::sync::mpsc::UnboundedSender<RuntimeStatus>,
+) {
+    let status = match schedule {
+        BacktraceRuntimeRefreshSchedule::Started { timeout } => {
+            Some(RuntimeStatus::BacktraceModuleRefresh {
+                message: format!(
+                    "Resolving a backtrace module in the background ({} ms timeout); events continue with available symbols or raw addresses",
+                    timeout.as_millis()
+                ),
+                warning: false,
+            })
+        }
+        BacktraceRuntimeRefreshSchedule::LimitReached { limit } => {
+            Some(RuntimeStatus::BacktraceModuleRefresh {
+                message: format!(
+                    "Backtrace runtime module limit ({limit}) reached; continuing with available symbols or raw addresses"
+                ),
+                warning: true,
+            })
+        }
+        _ => None,
+    };
+    if let Some(status) = status {
+        let _ = status_sender.send(status);
+    }
+}
+
+fn report_tui_backtrace_runtime_error(
+    context: &str,
+    error: &anyhow::Error,
+    status_sender: &tokio::sync::mpsc::UnboundedSender<RuntimeStatus>,
+) {
+    let _ = status_sender.send(RuntimeStatus::BacktraceModuleRefresh {
+        message: format!("{context}: {error:#}; continuing with raw addresses"),
+        warning: true,
+    });
+}
+
+async fn report_tui_backtrace_runtime_refresh(
+    session: &mut GhostSession,
+    renderer: &mut crate::trace::backtrace::BacktraceRenderer,
+    status_sender: &tokio::sync::mpsc::UnboundedSender<RuntimeStatus>,
+) -> Result<()> {
+    let Some(outcome) = session.poll_backtrace_runtime_module_refresh().await? else {
+        return Ok(());
+    };
+    let (message, warning) = match outcome {
+        BacktraceRuntimeRefreshOutcome::Loaded {
+            modules,
+            unwind_rows,
+            next_started,
+        } => {
+            *renderer = crate::trace::backtrace::BacktraceRenderer::default();
+            let next = if next_started {
+                "; resolving the next requested module"
+            } else {
+                ""
+            };
+            if modules > 0 && unwind_rows == 0 {
+                (
+                    format!(
+                        "Resolved a backtrace runtime module but found no usable unwind rows{next}; continuing with raw addresses"
+                    ),
+                    true,
+                )
+            } else if modules == 0 {
+                (
+                    format!(
+                        "Refreshed backtrace module mappings{next}; tracing remained active"
+                    ),
+                    false,
+                )
+            } else {
+                (
+                    format!(
+                        "Resolved {modules} backtrace runtime module(s) with {unwind_rows} compact unwind row(s){next}; tracing remained active"
+                    ),
+                    false,
+                )
+            }
+        }
+        BacktraceRuntimeRefreshOutcome::ModuleNotFound { next_started } => {
+            let next = if next_started {
+                "; trying the next requested module"
+            } else {
+                ""
+            };
+            (
+                format!(
+                    "Could not match a requested backtrace module to refreshed process maps{next}; continuing with raw addresses"
+                ),
+                true,
+            )
+        }
+        BacktraceRuntimeRefreshOutcome::Failed {
+            error,
+            next_started,
+        } => {
+            let next = if next_started {
+                "; trying the next requested module"
+            } else {
+                ""
+            };
+            (
+                format!(
+                    "Failed to resolve a backtrace runtime module: {error}{next}; continuing with raw addresses"
+                ),
+                true,
+            )
+        }
+        BacktraceRuntimeRefreshOutcome::TimedOut { timeout } => (
+            format!(
+                "Backtrace runtime module resolution exceeded {} ms; automatic runtime module loading is disabled for this session and tracing continues with raw addresses",
+                timeout.as_millis()
+            ),
+            true,
+        ),
+    };
+    let _ = status_sender.send(RuntimeStatus::BacktraceModuleRefresh { message, warning });
     Ok(())
 }
 

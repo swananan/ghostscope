@@ -98,6 +98,17 @@ search_paths = [
 # ad-hoc environments; may cause inaccurate symbol/line info.
 allow_loose_debug_match = false
 
+# Resolve compact CFI for newly mapped bt/backtrace modules on demand in the
+# background. Full debug indexes are not retained for these runtime modules.
+# Events continue with available symbols, module offsets, or raw addresses.
+backtrace_runtime_modules = true
+
+# Bound the number of distinct runtime modules GhostScope will try to resolve.
+backtrace_runtime_modules_max = 32
+
+# Stop automatic runtime CFI loading after one module exceeds this budget.
+backtrace_runtime_module_timeout_ms = 5000
+
 [dwarf.debuginfod]
 # debuginfod fallback for separate debug information.
 # This follows GDB-style modes:

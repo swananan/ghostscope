@@ -2,18 +2,29 @@
 
 use crate::{
     core::{
-        demangle::RustSymbolHashDisplay, mapping::ModuleMapping, CallerFrameRecovery,
-        DebugInfoSource, ModuleAddress, Result, SectionType, SourceLocation,
+        demangle::{demangle_by_lang_for_display, RustSymbolHashDisplay},
+        mapping::ModuleMapping,
+        CallerFrameRecovery, DebugInfoSource, ModuleAddress, Result, SectionType, SourceLocation,
     },
     loader::ExplicitDebugFile,
     objfile::LoadedObjfile,
     semantics::{CompactUnwindRow, CompactUnwindTable, PcContext},
+    RuntimeTextSymbol,
 };
 use ghostscope_debuginfod::DebuginfodClient;
 use object::{Object, ObjectSection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+
+const RUNTIME_TEXT_SYMBOLS_MAX_TOTAL: usize = 131_072;
+const RUNTIME_TEXT_SYMBOL_BYTES_MAX_TOTAL: usize = 16 * 1024 * 1024;
+
+fn runtime_text_symbol_storage_bytes(symbols: &[RuntimeTextSymbol]) -> usize {
+    symbols.iter().fold(0usize, |total, symbol| {
+        total.saturating_add(std::mem::size_of::<RuntimeTextSymbol>() + symbol.name.len())
+    })
+}
 
 mod cache;
 mod module_resolution;
@@ -39,6 +50,8 @@ pub struct DwarfAnalyzer {
     pid: u32,
     /// Module path -> module data mapping
     modules: HashMap<PathBuf, LoadedObjfile>,
+    /// Bounded ELF symbol indexes for runtime modules loaded without full DWARF.
+    runtime_text_symbols: HashMap<PathBuf, Vec<RuntimeTextSymbol>>,
     /// Cached PC semantic contexts for repeated symbol/source lookups.
     pc_context_cache: RwLock<PcContextCache>,
 }
@@ -690,6 +703,7 @@ impl DwarfAnalyzer {
         let mut analyzer = Self {
             pid: 0, // No specific PID in exec mode
             modules: HashMap::new(),
+            runtime_text_symbols: HashMap::new(),
             pc_context_cache: RwLock::new(PcContextCache::default()),
         };
 
@@ -775,6 +789,7 @@ impl DwarfAnalyzer {
         let mut analyzer = Self {
             pid,
             modules: HashMap::new(),
+            runtime_text_symbols: HashMap::new(),
             pc_context_cache: RwLock::new(PcContextCache::default()),
         };
 
@@ -957,6 +972,106 @@ impl DwarfAnalyzer {
             .collect();
         modules.sort_by(|left, right| left.module_path.cmp(&right.module_path));
         modules
+    }
+
+    /// Add a lightweight ELF text-symbol index for a runtime backtrace module.
+    pub fn add_runtime_text_symbols(
+        &mut self,
+        module_path: PathBuf,
+        mut symbols: Vec<RuntimeTextSymbol>,
+    ) {
+        if symbols.is_empty() {
+            return;
+        }
+        let module_path = self
+            .runtime_text_symbols
+            .keys()
+            .find(|path| Self::module_paths_equivalent(path, &module_path))
+            .cloned()
+            .unwrap_or(module_path);
+        let existing_len = self
+            .runtime_text_symbols
+            .get(&module_path)
+            .map_or(0, Vec::len);
+        let existing_bytes = self
+            .runtime_text_symbols
+            .get(&module_path)
+            .map_or(0, |symbols| runtime_text_symbol_storage_bytes(symbols));
+        let retained_elsewhere = self
+            .runtime_text_symbols
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+            .saturating_sub(existing_len);
+        let retained_bytes_elsewhere = self
+            .runtime_text_symbols
+            .values()
+            .map(|symbols| runtime_text_symbol_storage_bytes(symbols))
+            .sum::<usize>()
+            .saturating_sub(existing_bytes);
+        let remaining_count = RUNTIME_TEXT_SYMBOLS_MAX_TOTAL.saturating_sub(retained_elsewhere);
+        let remaining_bytes =
+            RUNTIME_TEXT_SYMBOL_BYTES_MAX_TOTAL.saturating_sub(retained_bytes_elsewhere);
+        let mut retained_bytes = 0usize;
+        let retained_count = symbols
+            .iter()
+            .take(remaining_count)
+            .take_while(|symbol| {
+                let symbol_bytes = runtime_text_symbol_storage_bytes(std::slice::from_ref(*symbol));
+                let Some(next_bytes) = retained_bytes.checked_add(symbol_bytes) else {
+                    return false;
+                };
+                if next_bytes > remaining_bytes {
+                    return false;
+                }
+                retained_bytes = next_bytes;
+                true
+            })
+            .count();
+        if retained_count < symbols.len() {
+            tracing::warn!(
+                module = %module_path.display(),
+                requested = symbols.len(),
+                retained = retained_count,
+                total_count_limit = RUNTIME_TEXT_SYMBOLS_MAX_TOTAL,
+                total_bytes_limit = RUNTIME_TEXT_SYMBOL_BYTES_MAX_TOTAL,
+                "Truncating the process-wide runtime ELF text symbol index"
+            );
+            symbols.truncate(retained_count);
+        }
+        if symbols.is_empty() {
+            return;
+        }
+        self.runtime_text_symbols.insert(module_path, symbols);
+    }
+
+    /// Resolve a runtime-only module PC without retaining its full DWARF index.
+    pub fn find_runtime_function_name_for_display<P: AsRef<Path>>(
+        &self,
+        module_path: P,
+        address: u64,
+        full: bool,
+    ) -> Option<String> {
+        let module_path = module_path.as_ref();
+        let symbols = self.runtime_text_symbols.get(module_path).or_else(|| {
+            self.runtime_text_symbols
+                .iter()
+                .find(|(path, _)| Self::module_paths_equivalent(path, module_path))
+                .map(|(_, symbols)| symbols)
+        })?;
+        let upper = symbols.partition_point(|symbol| symbol.address <= address);
+        let symbol = symbols[..upper].iter().rev().find(|symbol| {
+            symbol.size == 0 || address < symbol.address.saturating_add(symbol.size)
+        })?;
+        let rust_hashes = if full {
+            RustSymbolHashDisplay::Shown
+        } else {
+            RustSymbolHashDisplay::Hidden
+        };
+        Some(
+            demangle_by_lang_for_display(None, &symbol.name, rust_hashes)
+                .unwrap_or_else(|| symbol.name.clone()),
+        )
     }
 
     /// Get the ELF entry address for a loaded module, when present.

@@ -2,6 +2,7 @@ use super::DwarfAnalyzer;
 use crate::{
     core::{AddressExpr, Availability, Provenance, VariableLocation},
     semantics::{VariableReadPlan, VisibleVariable},
+    RuntimeTextSymbol,
 };
 use std::path::{Path, PathBuf};
 
@@ -160,4 +161,27 @@ fn global_plan_selection_rejects_ambiguous_current_module_matches() {
     assert!(err.to_string().contains("2 matches"));
     assert!(err.to_string().contains("/tmp/current"));
     assert!(!err.to_string().contains("/tmp/other"));
+}
+
+#[test]
+fn runtime_text_symbols_resolve_without_loading_module_dwarf() {
+    let mut analyzer = DwarfAnalyzer::from_modules(0, Vec::new());
+    analyzer.add_runtime_text_symbols(
+        PathBuf::from("/tmp/liblate.so"),
+        vec![RuntimeTextSymbol {
+            name: "late_callback".to_string(),
+            address: 0x120,
+            size: 0x30,
+        }],
+    );
+
+    assert_eq!(
+        analyzer
+            .find_runtime_function_name_for_display("/tmp/liblate.so", 0x13f, false)
+            .as_deref(),
+        Some("late_callback")
+    );
+    assert!(analyzer
+        .find_runtime_function_name_for_display("/tmp/liblate.so", 0x150, false)
+        .is_none());
 }

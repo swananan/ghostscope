@@ -61,6 +61,9 @@ pub struct UProbeConfig {
     /// Optional eBPF tail-call step program used by the `bt` unwinder.
     pub backtrace_tail_call_program: Option<crate::ebpf::context::BacktraceTailCallProgram>,
 
+    /// Whether this trace body contains a bt/backtrace instruction.
+    pub uses_backtrace: bool,
+
     /// Global 1-based index of this address within the resolved target list (if applicable)
     pub resolved_address_index: Option<usize>,
 }
@@ -81,6 +84,24 @@ pub struct FailedTarget {
     pub target_name: String,
     pub pc_address: u64,
     pub error_message: String,
+}
+
+fn statement_uses_backtrace(statement: &Statement) -> bool {
+    match statement {
+        Statement::Backtrace(_) => true,
+        Statement::TracePoint { body, .. } | Statement::Block(body) => {
+            body.iter().any(statement_uses_backtrace)
+        }
+        Statement::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            then_body.iter().any(statement_uses_backtrace)
+                || else_body.as_deref().is_some_and(statement_uses_backtrace)
+        }
+        _ => false,
+    }
 }
 
 /// Unified AST compiler that performs DWARF queries and code generation in single pass
@@ -794,6 +815,7 @@ impl<'a> AstCompiler<'a> {
                 .map(|entry| (entry.cookie, entry.range))
                 .collect(),
             backtrace_tail_call_program: codegen.backtrace_tail_call_program(),
+            uses_backtrace: statements.iter().any(statement_uses_backtrace),
             resolved_address_index,
         })
     }

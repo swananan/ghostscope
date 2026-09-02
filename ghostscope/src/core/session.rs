@@ -6,16 +6,107 @@ use anyhow::Result;
 use ghostscope_debuginfod::{DebuginfodClient, DebuginfodConfig};
 use ghostscope_dwarf::{DwarfAnalyzer, ExplicitDebugFile, ModuleStats};
 use ghostscope_process::{
-    PidFilterSpec, PidNamespaceId, ProcessManager, ProcessSysmon, SysEventKind, SysmonConfig,
-    SysmonEventMask,
+    PidFilterSpec, PidNamespaceId, ProcessManager, ProcessSysmon, SysmonConfig, SysmonEventMask,
 };
+use ghostscope_protocol::{ParsedInstruction, ParsedTraceEvent};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{info, warn};
 
-const SYSMON_MAP_CHANGE_RENDER_GRACE: Duration = Duration::from_millis(20);
-const SYSMON_MAP_CHANGE_DRAIN_POLL: Duration = Duration::from_millis(2);
+const BACKTRACE_RUNTIME_MODULE_DISCOVERY_GRACE: Duration = Duration::from_millis(500);
+const BACKTRACE_RUNTIME_PID_REQUEST_MAX: usize = 1_024;
+
+#[derive(Debug, Clone, Default)]
+pub struct BacktraceRuntimeModuleRequest {
+    pub cookies: BTreeSet<u64>,
+    pub raw_ips: BTreeSet<u64>,
+    pub runtime_pids: BTreeSet<u32>,
+}
+
+impl BacktraceRuntimeModuleRequest {
+    pub fn from_events(events: &[ParsedTraceEvent]) -> Self {
+        let mut request = Self::default();
+        for event in events {
+            for instruction in &event.instructions {
+                let ParsedInstruction::Backtrace { status, frames, .. } = instruction else {
+                    continue;
+                };
+                request.runtime_pids.insert(event.pid);
+                let raw_ip_fallback = matches!(
+                    status,
+                    ghostscope_protocol::trace_event::BacktraceStatus::DwarfUnavailable
+                        | ghostscope_protocol::trace_event::BacktraceStatus::UnsupportedCfi
+                        | ghostscope_protocol::trace_event::BacktraceStatus::OffsetsUnavailable
+                        | ghostscope_protocol::trace_event::BacktraceStatus::NoUnwindRowsForPc
+                );
+                for (index, frame) in frames.iter().enumerate() {
+                    let is_stopping_frame = index + 1 == frames.len();
+                    if raw_ip_fallback && is_stopping_frame && frame.raw_ip != 0 {
+                        request.raw_ips.insert(frame.raw_ip);
+                    } else if frame.module_cookie != 0 {
+                        request.cookies.insert(frame.module_cookie);
+                    }
+                }
+            }
+        }
+        request.runtime_pids.remove(&0);
+        request
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cookies.is_empty() && self.raw_ips.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BacktraceRuntimeRefreshSchedule {
+    NotNeeded,
+    Disabled,
+    Queued { modules: usize },
+    Started { timeout: Duration },
+    LimitReached { limit: u32 },
+}
+
+#[derive(Debug)]
+pub enum BacktraceRuntimeRefreshOutcome {
+    Loaded {
+        modules: usize,
+        unwind_rows: usize,
+        next_started: bool,
+    },
+    ModuleNotFound {
+        next_started: bool,
+    },
+    Failed {
+        error: String,
+        next_started: bool,
+    },
+    TimedOut {
+        timeout: Duration,
+    },
+}
+
+#[derive(Debug)]
+enum BacktraceRuntimeRefreshTaskOutcome {
+    Loaded {
+        runtime_modules: Vec<ghostscope_dwarf::LoadedModuleRuntimeInfo>,
+        runtime_symbols: Vec<ghostscope_dwarf::RuntimeTextSymbol>,
+        append_result: crate::trace::manager::BacktraceUnwindRowsAppendResult,
+    },
+    AlreadyLoaded(Vec<ghostscope_dwarf::LoadedModuleRuntimeInfo>),
+    ModuleNotFound,
+    TimedOut,
+}
+
+#[derive(Debug)]
+struct BacktraceRuntimeRefreshTask {
+    requested_cookies: BTreeSet<u64>,
+    requested_raw_ips: BTreeSet<u64>,
+    timeout: Duration,
+    handle: tokio::task::JoinHandle<Result<BacktraceRuntimeRefreshTaskOutcome>>,
+}
 
 fn sysmon_watch_from_config(
     config: &ResolvedConfig,
@@ -85,6 +176,17 @@ pub struct GhostSession {
     pub coordinator: Arc<Mutex<ProcessManager>>, // Manages PID/module offsets prefill and application
     pub sysmon: Option<Arc<Mutex<ProcessSysmon>>>, // Realtime process monitor (exec/fork/exit)
     target_backtrace_runtime_modules_enabled: bool,
+    backtrace_runtime_known_cookies: BTreeSet<u64>,
+    backtrace_runtime_known_ranges: BTreeSet<(u64, u64)>,
+    backtrace_runtime_known_cookies_initialized: bool,
+    backtrace_runtime_attempted_cookies: BTreeSet<u64>,
+    backtrace_runtime_attempted_raw_ips: BTreeSet<u64>,
+    backtrace_runtime_queued_cookies: BTreeSet<u64>,
+    backtrace_runtime_queued_raw_ips: BTreeSet<u64>,
+    backtrace_runtime_queued_pids: BTreeSet<u32>,
+    backtrace_runtime_refresh_task: Option<BacktraceRuntimeRefreshTask>,
+    backtrace_runtime_refresh_timed_out: bool,
+    backtrace_runtime_limit_reported: bool,
 }
 
 impl GhostSession {
@@ -107,6 +209,17 @@ impl GhostSession {
             coordinator: Arc::new(Mutex::new(ProcessManager::new())),
             sysmon: None,
             target_backtrace_runtime_modules_enabled: false,
+            backtrace_runtime_known_cookies: BTreeSet::new(),
+            backtrace_runtime_known_ranges: BTreeSet::new(),
+            backtrace_runtime_known_cookies_initialized: false,
+            backtrace_runtime_attempted_cookies: BTreeSet::new(),
+            backtrace_runtime_attempted_raw_ips: BTreeSet::new(),
+            backtrace_runtime_queued_cookies: BTreeSet::new(),
+            backtrace_runtime_queued_raw_ips: BTreeSet::new(),
+            backtrace_runtime_queued_pids: BTreeSet::new(),
+            backtrace_runtime_refresh_task: None,
+            backtrace_runtime_refresh_timed_out: false,
+            backtrace_runtime_limit_reported: false,
         };
 
         if let Some(pid_views) = s.pid_views() {
@@ -140,6 +253,12 @@ impl GhostSession {
             if let Some(filter) = cfg.runtime.pid_filter_spec {
                 info!("Session PID filter spec: {:?}", filter);
             }
+            info!(
+                enabled = cfg.dwarf_backtrace_runtime_modules,
+                max_modules = cfg.dwarf_backtrace_runtime_modules_max,
+                timeout_ms = cfg.dwarf_backtrace_runtime_module_timeout_ms,
+                "Backtrace runtime module loading policy"
+            );
         }
 
         // Start sysmon for standalone -t lifecycle tracking, or for -p module
@@ -226,6 +345,17 @@ impl GhostSession {
             coordinator: Arc::new(Mutex::new(ProcessManager::new())),
             sysmon: None,
             target_backtrace_runtime_modules_enabled: false,
+            backtrace_runtime_known_cookies: BTreeSet::new(),
+            backtrace_runtime_known_ranges: BTreeSet::new(),
+            backtrace_runtime_known_cookies_initialized: false,
+            backtrace_runtime_attempted_cookies: BTreeSet::new(),
+            backtrace_runtime_attempted_raw_ips: BTreeSet::new(),
+            backtrace_runtime_queued_cookies: BTreeSet::new(),
+            backtrace_runtime_queued_raw_ips: BTreeSet::new(),
+            backtrace_runtime_queued_pids: BTreeSet::new(),
+            backtrace_runtime_refresh_task: None,
+            backtrace_runtime_refresh_timed_out: false,
+            backtrace_runtime_limit_reported: false,
         };
         if let Some(pid_context) = s.pid_context.as_ref() {
             info!(
@@ -359,203 +489,470 @@ impl GhostSession {
         Ok(DwarfAnalyzer::runtime_modules_from_pid_offsets(entries))
     }
 
-    fn drain_sysmon_refresh_events(&self, grace: Duration, include_target_events: bool) -> bool {
-        let Some(sysmon) = self.sysmon.as_ref() else {
+    fn backtrace_runtime_modules_configured(&self) -> bool {
+        self.config
+            .as_ref()
+            .map(|config| config.dwarf_backtrace_runtime_modules)
+            .unwrap_or(true)
+    }
+
+    fn backtrace_runtime_modules_max(&self) -> u32 {
+        self.config
+            .as_ref()
+            .map(|config| config.dwarf_backtrace_runtime_modules_max)
+            .unwrap_or(32)
+    }
+
+    fn backtrace_runtime_module_timeout(&self) -> Duration {
+        Duration::from_millis(
+            self.config
+                .as_ref()
+                .map(|config| config.dwarf_backtrace_runtime_module_timeout_ms)
+                .unwrap_or(5_000),
+        )
+    }
+
+    fn backtrace_runtime_unwind_rows_max(&self) -> usize {
+        self.config
+            .as_ref()
+            .map(|config| config.ebpf_config.backtrace_unwind_rows_max_entries)
+            .unwrap_or(ghostscope_compiler::DEFAULT_BACKTRACE_UNWIND_ROWS_MAX_ENTRIES)
+            as usize
+    }
+
+    fn backtrace_runtime_attempted_module_count(&self) -> usize {
+        self.backtrace_runtime_attempted_cookies.len()
+            + self.backtrace_runtime_attempted_raw_ips.len()
+    }
+
+    fn backtrace_runtime_queued_module_count(&self) -> usize {
+        self.backtrace_runtime_queued_cookies.len() + self.backtrace_runtime_queued_raw_ips.len()
+    }
+
+    fn backtrace_runtime_modules_allowed(&self) -> bool {
+        if !self.backtrace_runtime_modules_configured() || self.backtrace_runtime_refresh_timed_out
+        {
             return false;
+        }
+        self.proc_pid().is_some() || self.target_backtrace_runtime_modules_enabled
+    }
+
+    fn initialize_backtrace_runtime_known_cookies(&mut self) {
+        if self.backtrace_runtime_known_cookies_initialized {
+            return;
+        }
+        if let Some(analyzer) = self.process_analyzer.as_ref() {
+            let runtime_modules = analyzer.loaded_module_runtime_info();
+            self.backtrace_runtime_known_cookies
+                .extend(runtime_modules.iter().map(|module| {
+                    ghostscope_compiler::module_cookie_for_path(
+                        &module.module_path.to_string_lossy(),
+                    )
+                }));
+            self.record_backtrace_runtime_module_ranges(&runtime_modules);
+        }
+        self.backtrace_runtime_known_cookies_initialized = true;
+    }
+
+    fn record_backtrace_runtime_modules(
+        &mut self,
+        runtime_modules: &[ghostscope_dwarf::LoadedModuleRuntimeInfo],
+    ) {
+        let loaded_cookies = runtime_modules
+            .iter()
+            .map(|module| {
+                ghostscope_compiler::module_cookie_for_path(&module.module_path.to_string_lossy())
+            })
+            .collect::<BTreeSet<_>>();
+        self.backtrace_runtime_known_cookies
+            .extend(loaded_cookies.iter().copied());
+        self.record_backtrace_runtime_module_ranges(runtime_modules);
+        self.backtrace_runtime_queued_cookies
+            .retain(|cookie| !loaded_cookies.contains(cookie));
+        self.backtrace_runtime_queued_raw_ips.retain(|raw_ip| {
+            !runtime_modules.iter().any(|module| {
+                module.loaded_address.is_some_and(|base| {
+                    *raw_ip >= base && *raw_ip < base.saturating_add(module.size)
+                })
+            })
+        });
+    }
+
+    fn record_backtrace_runtime_module_ranges(
+        &mut self,
+        runtime_modules: &[ghostscope_dwarf::LoadedModuleRuntimeInfo],
+    ) {
+        self.backtrace_runtime_known_ranges
+            .extend(runtime_modules.iter().filter_map(|module| {
+                let base = module.loaded_address?;
+                let end = base.checked_add(module.size)?;
+                (base < end).then_some((base, end))
+            }));
+    }
+
+    fn backtrace_runtime_raw_ip_is_known(&self, raw_ip: u64) -> bool {
+        self.backtrace_runtime_known_ranges
+            .iter()
+            .any(|(start, end)| raw_ip >= *start && raw_ip < *end)
+    }
+
+    pub fn schedule_backtrace_runtime_module_refresh(
+        &mut self,
+        request: BacktraceRuntimeModuleRequest,
+    ) -> Result<BacktraceRuntimeRefreshSchedule> {
+        if request.is_empty() {
+            return Ok(BacktraceRuntimeRefreshSchedule::NotNeeded);
+        }
+        if !self.backtrace_runtime_modules_allowed() || self.process_analyzer.is_none() {
+            return Ok(BacktraceRuntimeRefreshSchedule::Disabled);
+        }
+
+        self.initialize_backtrace_runtime_known_cookies();
+        let limit = self.backtrace_runtime_modules_max();
+        let mut remaining_capacity = (limit as usize)
+            .saturating_sub(self.backtrace_runtime_attempted_module_count())
+            .saturating_sub(self.backtrace_runtime_queued_module_count());
+        let active_cookies = self
+            .backtrace_runtime_refresh_task
+            .as_ref()
+            .map(|task| &task.requested_cookies);
+        let active_raw_ips = self
+            .backtrace_runtime_refresh_task
+            .as_ref()
+            .map(|task| &task.requested_raw_ips);
+        let mut queued = 0usize;
+        let mut rejected_by_limit = false;
+        for raw_ip in request.raw_ips {
+            if self.backtrace_runtime_raw_ip_is_known(raw_ip)
+                || self.backtrace_runtime_attempted_raw_ips.contains(&raw_ip)
+                || self.backtrace_runtime_queued_raw_ips.contains(&raw_ip)
+                || active_raw_ips.is_some_and(|raw_ips| raw_ips.contains(&raw_ip))
+            {
+                continue;
+            }
+            if remaining_capacity == 0 {
+                rejected_by_limit = true;
+                continue;
+            }
+            self.backtrace_runtime_queued_raw_ips.insert(raw_ip);
+            queued += 1;
+            remaining_capacity -= 1;
+        }
+        for cookie in request.cookies {
+            if self.backtrace_runtime_known_cookies.contains(&cookie)
+                || self.backtrace_runtime_attempted_cookies.contains(&cookie)
+                || self.backtrace_runtime_queued_cookies.contains(&cookie)
+                || active_cookies.is_some_and(|cookies| cookies.contains(&cookie))
+            {
+                continue;
+            }
+            if remaining_capacity == 0 {
+                rejected_by_limit = true;
+                continue;
+            }
+            self.backtrace_runtime_queued_cookies.insert(cookie);
+            queued += 1;
+            remaining_capacity -= 1;
+        }
+        if queued > 0 || self.backtrace_runtime_queued_module_count() > 0 {
+            let remaining_pid_capacity = BACKTRACE_RUNTIME_PID_REQUEST_MAX
+                .saturating_sub(self.backtrace_runtime_queued_pids.len());
+            self.backtrace_runtime_queued_pids.extend(
+                request
+                    .runtime_pids
+                    .into_iter()
+                    .take(remaining_pid_capacity),
+            );
+        }
+
+        if rejected_by_limit && !self.backtrace_runtime_limit_reported {
+            self.backtrace_runtime_limit_reported = true;
+            if self.backtrace_runtime_refresh_task.is_none() {
+                let _ = self.start_next_backtrace_runtime_module_refresh()?;
+            }
+            return Ok(BacktraceRuntimeRefreshSchedule::LimitReached { limit });
+        }
+        if queued == 0 {
+            if self.backtrace_runtime_refresh_task.is_none()
+                && self.backtrace_runtime_queued_module_count() > 0
+            {
+                if let Some(timeout) = self.start_next_backtrace_runtime_module_refresh()? {
+                    return Ok(BacktraceRuntimeRefreshSchedule::Started { timeout });
+                }
+            }
+            return Ok(BacktraceRuntimeRefreshSchedule::NotNeeded);
+        }
+        if self.backtrace_runtime_refresh_task.is_some() {
+            return Ok(BacktraceRuntimeRefreshSchedule::Queued { modules: queued });
+        }
+
+        if self.backtrace_runtime_attempted_module_count() >= limit as usize {
+            self.backtrace_runtime_queued_cookies.clear();
+            self.backtrace_runtime_queued_raw_ips.clear();
+            self.backtrace_runtime_queued_pids.clear();
+            if self.backtrace_runtime_limit_reported {
+                return Ok(BacktraceRuntimeRefreshSchedule::NotNeeded);
+            }
+            self.backtrace_runtime_limit_reported = true;
+            return Ok(BacktraceRuntimeRefreshSchedule::LimitReached { limit });
+        }
+
+        let Some(timeout) = self.start_next_backtrace_runtime_module_refresh()? else {
+            return Ok(BacktraceRuntimeRefreshSchedule::NotNeeded);
         };
+        Ok(BacktraceRuntimeRefreshSchedule::Started { timeout })
+    }
 
-        let Ok(sysmon) = sysmon.lock() else {
-            return false;
-        };
+    fn start_next_backtrace_runtime_module_refresh(&mut self) -> Result<Option<Duration>> {
+        if self.backtrace_runtime_refresh_task.is_some() || self.backtrace_runtime_refresh_timed_out
+        {
+            return Ok(None);
+        }
+        if self.backtrace_runtime_queued_module_count() == 0 {
+            self.backtrace_runtime_queued_pids.clear();
+            return Ok(None);
+        }
+        if self.backtrace_runtime_attempted_module_count()
+            >= self.backtrace_runtime_modules_max() as usize
+        {
+            self.backtrace_runtime_queued_cookies.clear();
+            self.backtrace_runtime_queued_raw_ips.clear();
+            self.backtrace_runtime_queued_pids.clear();
+            return Ok(None);
+        }
 
-        let mut saw_refresh_event = false;
-        let deadline = Instant::now() + grace;
-        let mut timeout = Duration::ZERO;
+        let raw_ip = self.backtrace_runtime_queued_raw_ips.iter().next().copied();
+        let cookie = raw_ip.is_none().then(|| {
+            *self
+                .backtrace_runtime_queued_cookies
+                .iter()
+                .next()
+                .expect("checked non-empty runtime module queue")
+        });
+        let requested_cookies = cookie.into_iter().collect::<BTreeSet<_>>();
+        let requested_raw_ips = raw_ip.into_iter().collect::<BTreeSet<_>>();
+        let runtime_pids = self
+            .backtrace_runtime_queued_pids
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let coordinator = Arc::clone(&self.coordinator);
+        let proc_pid = self.proc_pid();
+        let target_binary = self.target_binary.clone();
+        let timeout = self.backtrace_runtime_module_timeout();
+        let max_unwind_rows = self.backtrace_runtime_unwind_rows_max();
+        let unwind_rows_appender = self.trace_manager.backtrace_unwind_rows_appender();
+        let task_cookies = requested_cookies.clone();
+        let task_raw_ips = requested_raw_ips.clone();
+        let known_cookies = self.backtrace_runtime_known_cookies.clone();
 
-        loop {
-            match sysmon.recv_timeout(timeout) {
-                Some(event) => {
-                    let refresh_event = match event.event_kind() {
-                        Some(SysEventKind::MapChange) => true,
-                        Some(SysEventKind::Exec | SysEventKind::Fork | SysEventKind::Exit) => {
-                            include_target_events
+        let handle = tokio::spawn(async move {
+            let load = async {
+                let discovery_deadline =
+                    tokio::time::Instant::now() + BACKTRACE_RUNTIME_MODULE_DISCOVERY_GRACE;
+                let mut refreshed_proc_pids = BTreeSet::new();
+                let runtime_modules = loop {
+                    let modules = {
+                        let mut coordinator =
+                            coordinator.lock().expect("coordinator mutex poisoned");
+                        if let Some(proc_pid) = proc_pid {
+                            BacktraceRuntimeRunner::refresh_pid_modules_for_requests(
+                                &mut coordinator,
+                                proc_pid,
+                                &task_cookies,
+                                &task_raw_ips,
+                                refreshed_proc_pids.insert(proc_pid),
+                            )
+                        } else if let Some(target_binary) = target_binary.as_deref() {
+                            BacktraceRuntimeRunner::refresh_target_modules_for_requests(
+                                &mut coordinator,
+                                target_binary,
+                                &runtime_pids,
+                                &task_cookies,
+                                &task_raw_ips,
+                                &mut refreshed_proc_pids,
+                            )
+                        } else {
+                            Vec::new()
                         }
-                        None => false,
                     };
-                    if refresh_event {
-                        saw_refresh_event = true;
+                    if !modules.is_empty() {
+                        break modules;
                     }
-                    timeout = Duration::ZERO;
+                    if tokio::time::Instant::now() >= discovery_deadline {
+                        break Vec::new();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+
+                if runtime_modules.is_empty() {
+                    return Ok(BacktraceRuntimeRefreshTaskOutcome::ModuleNotFound);
                 }
-                None => {
-                    if saw_refresh_event || grace == Duration::ZERO {
-                        break;
-                    }
+                if runtime_modules.iter().all(|module| {
+                    known_cookies.contains(&ghostscope_compiler::module_cookie_for_path(
+                        &module.module_path.to_string_lossy(),
+                    ))
+                }) {
+                    return Ok(BacktraceRuntimeRefreshTaskOutcome::AlreadyLoaded(
+                        runtime_modules,
+                    ));
+                }
 
-                    let now = Instant::now();
-                    if now >= deadline {
-                        break;
-                    }
-                    timeout = deadline
-                        .saturating_duration_since(now)
-                        .min(SYSMON_MAP_CHANGE_DRAIN_POLL);
+                let runtime_module = runtime_modules
+                    .into_iter()
+                    .next()
+                    .expect("runtime module lookup returned a non-empty list");
+                let module_path = runtime_module.module_path.clone();
+                let cookie =
+                    ghostscope_compiler::module_cookie_for_path(&module_path.to_string_lossy());
+                let metadata =
+                    ghostscope_dwarf::load_runtime_backtrace_metadata(module_path, max_unwind_rows)
+                        .await?;
+                let unwind_modules = metadata
+                    .unwind_table
+                    .map(|table| {
+                        let mut rows = table
+                            .rows
+                            .iter()
+                            .map(ghostscope_compiler::backtrace_unwind_row_from_compact)
+                            .collect::<Vec<_>>();
+                        rows.sort_by_key(|row| (row.pc_start, row.pc_end));
+                        (cookie, rows)
+                    })
+                    .filter(|(_, rows)| !rows.is_empty())
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let append_result = unwind_rows_appender.append(unwind_modules).await;
+                Ok(BacktraceRuntimeRefreshTaskOutcome::Loaded {
+                    runtime_modules: vec![runtime_module],
+                    runtime_symbols: metadata.text_symbols,
+                    append_result,
+                })
+            };
+
+            match tokio::time::timeout(timeout, load).await {
+                Ok(result) => result,
+                Err(_) => Ok(BacktraceRuntimeRefreshTaskOutcome::TimedOut),
+            }
+        });
+
+        if let Some(cookie) = cookie {
+            self.backtrace_runtime_queued_cookies.remove(&cookie);
+            self.backtrace_runtime_attempted_cookies.insert(cookie);
+        }
+        if let Some(raw_ip) = raw_ip {
+            self.backtrace_runtime_queued_raw_ips.remove(&raw_ip);
+            self.backtrace_runtime_attempted_raw_ips.insert(raw_ip);
+        }
+        self.backtrace_runtime_refresh_task = Some(BacktraceRuntimeRefreshTask {
+            requested_cookies,
+            requested_raw_ips,
+            timeout,
+            handle,
+        });
+        info!(
+            cookie = cookie.map(|cookie| format!("0x{cookie:016x}")),
+            raw_ip = raw_ip.map(|raw_ip| format!("0x{raw_ip:x}")),
+            timeout_ms = timeout.as_millis(),
+            "Resolving one backtrace runtime module in the background"
+        );
+        Ok(Some(timeout))
+    }
+
+    pub async fn poll_backtrace_runtime_module_refresh(
+        &mut self,
+    ) -> Result<Option<BacktraceRuntimeRefreshOutcome>> {
+        let Some(task) = self.backtrace_runtime_refresh_task.as_ref() else {
+            return Ok(None);
+        };
+        if !task.handle.is_finished() {
+            return Ok(None);
+        }
+
+        let task = self
+            .backtrace_runtime_refresh_task
+            .take()
+            .expect("runtime refresh task was present");
+        let _requested_cookies = task.requested_cookies;
+        let _requested_raw_ips = task.requested_raw_ips;
+        let timeout = task.timeout;
+        let task_result = match task.handle.await {
+            Ok(result) => result,
+            Err(error) => {
+                let next_started = self
+                    .start_next_backtrace_runtime_module_refresh()?
+                    .is_some();
+                return Ok(Some(BacktraceRuntimeRefreshOutcome::Failed {
+                    error: format!("backtrace runtime module task failed: {error}"),
+                    next_started,
+                }));
+            }
+        };
+
+        let outcome = match task_result {
+            Ok(BacktraceRuntimeRefreshTaskOutcome::Loaded {
+                runtime_modules,
+                runtime_symbols,
+                append_result,
+            }) => {
+                let modules = runtime_modules.len();
+                if let (Some(analyzer), Some(runtime_module)) =
+                    (self.process_analyzer.as_mut(), runtime_modules.first())
+                {
+                    analyzer.add_runtime_text_symbols(
+                        runtime_module.module_path.clone(),
+                        runtime_symbols,
+                    );
+                }
+                self.record_backtrace_runtime_modules(&runtime_modules);
+                let append_stats = self
+                    .trace_manager
+                    .apply_backtrace_unwind_rows_append(append_result);
+                let next_started = self
+                    .start_next_backtrace_runtime_module_refresh()?
+                    .is_some();
+                BacktraceRuntimeRefreshOutcome::Loaded {
+                    modules,
+                    unwind_rows: append_stats.rows,
+                    next_started,
                 }
             }
-        }
-
-        saw_refresh_event
-    }
-
-    pub async fn refresh_pid_runtime_modules_if_needed(&mut self) -> Result<usize> {
-        self.refresh_pid_runtime_modules_if_needed_for_runtime_pids(&[])
-            .await
-    }
-
-    pub async fn refresh_pid_runtime_modules_if_needed_for_runtime_pids(
-        &mut self,
-        extra_runtime_pids: &[u32],
-    ) -> Result<usize> {
-        if self.proc_pid().is_none() {
-            let saw_refresh_event = self.drain_sysmon_refresh_events(
-                Duration::ZERO,
-                self.target_backtrace_runtime_modules_enabled,
-            );
-            if saw_refresh_event && self.target_backtrace_runtime_modules_enabled {
-                return self
-                    .refresh_target_runtime_modules_for_runtime_pids(extra_runtime_pids)
-                    .await;
+            Ok(BacktraceRuntimeRefreshTaskOutcome::AlreadyLoaded(runtime_modules)) => {
+                self.record_backtrace_runtime_modules(&runtime_modules);
+                let next_started = self
+                    .start_next_backtrace_runtime_module_refresh()?
+                    .is_some();
+                BacktraceRuntimeRefreshOutcome::Loaded {
+                    modules: 0,
+                    unwind_rows: 0,
+                    next_started,
+                }
             }
-            return Ok(0);
-        }
-
-        if !self.drain_sysmon_refresh_events(Duration::ZERO, false) {
-            return Ok(0);
-        }
-
-        self.refresh_pid_runtime_modules().await
-    }
-
-    pub async fn refresh_pid_runtime_modules_before_rendering_for_runtime_pids(
-        &mut self,
-        extra_runtime_pids: &[u32],
-    ) -> Result<usize> {
-        if self.proc_pid().is_none() {
-            let saw_refresh_event = self.drain_sysmon_refresh_events(
-                SYSMON_MAP_CHANGE_RENDER_GRACE,
-                self.target_backtrace_runtime_modules_enabled,
-            );
-            if saw_refresh_event && self.target_backtrace_runtime_modules_enabled {
-                return self
-                    .refresh_target_runtime_modules_for_runtime_pids(extra_runtime_pids)
-                    .await;
+            Ok(BacktraceRuntimeRefreshTaskOutcome::ModuleNotFound) => {
+                let next_started = self
+                    .start_next_backtrace_runtime_module_refresh()?
+                    .is_some();
+                BacktraceRuntimeRefreshOutcome::ModuleNotFound { next_started }
             }
-            return Ok(0);
-        }
-
-        if !self.drain_sysmon_refresh_events(SYSMON_MAP_CHANGE_RENDER_GRACE, false) {
-            return Ok(0);
-        }
-
-        self.refresh_pid_runtime_modules().await
-    }
-
-    pub async fn refresh_pid_runtime_modules(&mut self) -> Result<usize> {
-        let Some(proc_pid) = self.proc_pid() else {
-            return Ok(0);
+            Ok(BacktraceRuntimeRefreshTaskOutcome::TimedOut) => {
+                self.backtrace_runtime_refresh_timed_out = true;
+                self.backtrace_runtime_queued_cookies.clear();
+                self.backtrace_runtime_queued_raw_ips.clear();
+                self.backtrace_runtime_queued_pids.clear();
+                BacktraceRuntimeRefreshOutcome::TimedOut { timeout }
+            }
+            Err(error) => {
+                let next_started = self
+                    .start_next_backtrace_runtime_module_refresh()?
+                    .is_some();
+                BacktraceRuntimeRefreshOutcome::Failed {
+                    error: format!("{error:#}"),
+                    next_started,
+                }
+            }
         };
 
-        let runtime_modules = {
-            let mut coordinator = self.coordinator.lock().expect("coordinator mutex poisoned");
-            BacktraceRuntimeRunner::refresh_pid_modules(&mut coordinator, proc_pid)?
-        };
-        if runtime_modules.is_empty() {
-            return Ok(0);
-        }
-
-        let debug_search_paths = self.get_debug_search_paths();
-        let allow_loose = self.get_allow_loose_debug_match();
-        let debuginfod_client = self.build_debuginfod_client()?;
-
-        let Some(analyzer) = self.process_analyzer.as_mut() else {
-            return Ok(0);
-        };
-
-        let loaded = BacktraceRuntimeRunner::refresh_analyzer_modules(
-            analyzer,
-            runtime_modules,
-            &debug_search_paths,
-            allow_loose,
-            debuginfod_client,
-        )
-        .await?;
-
-        if loaded > 0 {
-            BacktraceRuntimeRunner::append_loaded_module_cfi(analyzer, &mut self.trace_manager)
-                .await;
-            info!(
-                "Refreshed PID {} runtime module analysis with {} new module(s)",
-                proc_pid, loaded
-            );
-        }
-
-        Ok(loaded)
-    }
-
-    pub async fn refresh_target_runtime_modules(&mut self) -> Result<usize> {
-        self.refresh_target_runtime_modules_for_runtime_pids(&[])
-            .await
-    }
-
-    pub async fn refresh_target_runtime_modules_for_runtime_pids(
-        &mut self,
-        extra_runtime_pids: &[u32],
-    ) -> Result<usize> {
-        if self.proc_pid().is_some() {
-            return Ok(0);
-        }
-
-        let Some(target_binary) = self.target_binary.clone() else {
-            return Ok(0);
-        };
-        let runtime_modules = {
-            let mut coordinator = self.coordinator.lock().expect("coordinator mutex poisoned");
-            BacktraceRuntimeRunner::collect_target_modules(
-                &mut coordinator,
-                &target_binary,
-                extra_runtime_pids,
-            )?
-        };
-        if runtime_modules.is_empty() {
-            return Ok(0);
-        }
-
-        let debug_search_paths = self.get_debug_search_paths();
-        let allow_loose = self.get_allow_loose_debug_match();
-        let debuginfod_client = self.build_debuginfod_client()?;
-
-        let Some(analyzer) = self.process_analyzer.as_mut() else {
-            return Ok(0);
-        };
-
-        let loaded = BacktraceRuntimeRunner::refresh_analyzer_modules(
-            analyzer,
-            runtime_modules,
-            &debug_search_paths,
-            allow_loose,
-            debuginfod_client,
-        )
-        .await?;
-
-        if loaded > 0 {
-            BacktraceRuntimeRunner::append_loaded_module_cfi(analyzer, &mut self.trace_manager)
-                .await;
-            info!(
-                "Refreshed target-mode runtime module analysis with {} new module(s)",
-                loaded
-            );
-        }
-
-        Ok(loaded)
+        Ok(Some(outcome))
     }
 
     /// Load binary and perform DWARF analysis using parallel loading (TUI mode)
@@ -746,6 +1143,25 @@ impl GhostSession {
             self.target_backtrace_runtime_modules_enabled = true;
         }
     }
+
+    pub fn prepare_target_backtrace_module_mappings(&mut self) -> Result<usize> {
+        if !self.is_target_mode() {
+            return Ok(0);
+        }
+        let Some(target_binary) = self.target_binary.as_deref() else {
+            return Ok(0);
+        };
+        let mut coordinator = self.coordinator.lock().expect("coordinator mutex poisoned");
+        BacktraceRuntimeRunner::prepare_target_module_mappings(&mut coordinator, target_binary)
+    }
+}
+
+impl Drop for GhostSession {
+    fn drop(&mut self) {
+        if let Some(task) = self.backtrace_runtime_refresh_task.take() {
+            task.handle.abort();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -754,6 +1170,41 @@ mod tests {
     use crate::config::runtime::RuntimeContext;
     use crate::config::settings::{PathSubstitution, SourceConfig};
     use crate::config::UserConfig;
+
+    #[test]
+    fn backtrace_runtime_request_collects_nonzero_cookies_and_event_pids() {
+        let event = ParsedTraceEvent {
+            trace_id: 1,
+            timestamp: 2,
+            pid: 42,
+            tid: 43,
+            instructions: vec![ParsedInstruction::Backtrace {
+                requested_depth: 3,
+                flags: 0,
+                status: ghostscope_protocol::trace_event::BacktraceStatus::NoUnwindRowsForPc,
+                error_code: 0,
+                frames: vec![
+                    ghostscope_protocol::ParsedBacktraceFrame {
+                        module_cookie: 0x11,
+                        pc: 0x22,
+                        raw_ip: 0x33,
+                        flags: 0,
+                    },
+                    ghostscope_protocol::ParsedBacktraceFrame {
+                        module_cookie: 0x22,
+                        pc: 0x44,
+                        raw_ip: 0x55,
+                        flags: 0,
+                    },
+                ],
+            }],
+        };
+
+        let request = BacktraceRuntimeModuleRequest::from_events(&[event]);
+        assert_eq!(request.cookies, BTreeSet::from([0x11]));
+        assert_eq!(request.raw_ips, BTreeSet::from([0x55]));
+        assert_eq!(request.runtime_pids, BTreeSet::from([42]));
+    }
 
     #[test]
     fn test_new_with_config_sets_source_resolver() {
@@ -783,6 +1234,9 @@ mod tests {
             script_timestamp: None,
             script_output_events_per_sec: None,
             backtrace_depth: None,
+            no_backtrace_runtime_modules: false,
+            backtrace_runtime_modules_max: None,
+            backtrace_runtime_module_timeout_ms: None,
             should_save_llvm_ir: false,
             should_save_ebpf: false,
             should_save_ast: false,

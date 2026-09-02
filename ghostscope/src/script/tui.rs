@@ -8,7 +8,7 @@ use super::attach::{
 };
 use super::compile::{compile_script_with_session, main_executable_path, SessionCompileError};
 use super::runtime_maps::ensure_prefill_for_session_pid;
-use super::runtime_prep::refresh_runtime_modules_before_compile;
+use super::runtime_prep::prepare_runtime_modules_before_compile;
 
 /// Compile and load script specifically for TUI mode with detailed execution results.
 pub async fn compile_and_load_script_for_tui(
@@ -17,7 +17,7 @@ pub async fn compile_and_load_script_for_tui(
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<ScriptCompilationDetails> {
     let mut compile_options = compile_options.clone();
-    refresh_runtime_modules_before_compile(script, session, &mut compile_options).await?;
+    prepare_runtime_modules_before_compile(script, session, &mut compile_options)?;
 
     let binary_path = main_executable_path(session)?;
     // Compilation is synchronous and can be long-running. Mark the section as

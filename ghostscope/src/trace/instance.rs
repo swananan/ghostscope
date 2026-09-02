@@ -1,7 +1,5 @@
-use super::actor::{TraceActorBacktraceUpdate, TraceActorHandle, TraceActorLossStats};
+use super::actor::{TraceActorHandle, TraceActorLossStats};
 use anyhow::Result;
-use ghostscope_protocol::BacktraceUnwindRow;
-use std::sync::Arc;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -32,6 +30,7 @@ pub(super) struct TraceInstance {
     pub pid_context: TracePidContext,
     pub is_enabled: bool, // Whether the uprobe is currently enabled
     pub(super) actor: Option<TraceActorHandle>, // Owns the eBPF loader for this trace
+    pub supports_backtrace_runtime_updates: bool,
     pub ebpf_function_name: String, // eBPF function name for uprobe attachment
     pub address_global_index: Option<usize>, // Global 1-based index of the resolved address
 }
@@ -45,6 +44,7 @@ pub(super) struct TraceInstanceArgs {
     pub target_display: String,
     pub pid_context: TracePidContext,
     pub(super) actor: Option<TraceActorHandle>,
+    pub supports_backtrace_runtime_updates: bool,
     pub ebpf_function_name: String,
     pub address_global_index: Option<usize>,
 }
@@ -61,6 +61,7 @@ impl TraceInstance {
             pid_context: args.pid_context,
             is_enabled: false,
             actor: args.actor,
+            supports_backtrace_runtime_updates: args.supports_backtrace_runtime_updates,
             ebpf_function_name: args.ebpf_function_name,
             address_global_index: args.address_global_index,
         }
@@ -111,17 +112,6 @@ impl TraceInstance {
             actor.read_loss_stats().await
         } else {
             Ok(TraceActorLossStats::default())
-        }
-    }
-
-    pub(super) async fn append_backtrace_rows(
-        &self,
-        modules: Arc<Vec<(u64, Vec<BacktraceUnwindRow>)>>,
-    ) -> Result<TraceActorBacktraceUpdate> {
-        if let Some(actor) = &self.actor {
-            actor.append_backtrace_rows(modules).await
-        } else {
-            Ok(Default::default())
         }
     }
 

@@ -52,6 +52,7 @@ pub struct AddTraceParams {
     pub target_display: String,
     pub pid_context: TracePidContext,
     pub loader: Option<GhostScopeLoader>,
+    pub supports_backtrace_runtime_updates: bool,
     pub ebpf_function_name: String,
     pub address_global_index: Option<usize>,
 }
@@ -76,6 +77,39 @@ pub struct EventDeliveryLossReport {
 pub struct TraceLossReports {
     pub kernel: Vec<EventLossReport>,
     pub delivery: Vec<EventDeliveryLossReport>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BacktraceUnwindRowsAppender {
+    targets: Vec<(u32, crate::trace::actor::TraceActorHandle)>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BacktraceUnwindRowsAppendResult {
+    updates: Vec<(u32, Result<crate::trace::actor::TraceActorBacktraceUpdate>)>,
+}
+
+impl BacktraceUnwindRowsAppender {
+    pub async fn append(
+        self,
+        modules: Vec<(u64, Vec<BacktraceUnwindRow>)>,
+    ) -> BacktraceUnwindRowsAppendResult {
+        if modules.is_empty() {
+            return BacktraceUnwindRowsAppendResult::default();
+        }
+
+        let modules = Arc::new(modules);
+        let mut updates = Vec::with_capacity(self.targets.len());
+        // Shared pinned maps require ordered publication so actors do not race
+        // while inserting the same module rows.
+        for (trace_id, actor) in self.targets {
+            updates.push((
+                trace_id,
+                actor.append_backtrace_rows(Arc::clone(&modules)).await,
+            ));
+        }
+        BacktraceUnwindRowsAppendResult { updates }
+    }
 }
 
 impl TraceManager {
@@ -154,6 +188,7 @@ impl TraceManager {
             target_display: params.target_display,
             pid_context: params.pid_context,
             actor,
+            supports_backtrace_runtime_updates: params.supports_backtrace_runtime_updates,
             ebpf_function_name: params.ebpf_function_name,
             address_global_index: params.address_global_index,
         });
@@ -363,37 +398,38 @@ impl TraceManager {
         reports
     }
 
-    pub async fn append_backtrace_unwind_rows_for_modules(
+    pub(crate) fn backtrace_unwind_rows_appender(&self) -> BacktraceUnwindRowsAppender {
+        BacktraceUnwindRowsAppender {
+            targets: self
+                .traces
+                .iter()
+                .filter(|(_, trace)| trace.supports_backtrace_runtime_updates)
+                .filter_map(|(&trace_id, trace)| trace.actor.clone().map(|actor| (trace_id, actor)))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn apply_backtrace_unwind_rows_append(
         &mut self,
-        modules: &[(u64, Vec<BacktraceUnwindRow>)],
+        result: BacktraceUnwindRowsAppendResult,
     ) -> BacktraceUnwindRowsAppendStats {
         let mut total = BacktraceUnwindRowsAppendStats::default();
-        if modules.is_empty() {
-            return total;
-        }
-
-        let modules = Arc::new(modules.to_vec());
-        let trace_ids = self.get_all_trace_ids();
-        for trace_id in trace_ids {
-            let update = {
-                let Some(trace) = self.traces.get(&trace_id) else {
-                    continue;
-                };
-                trace.append_backtrace_rows(Arc::clone(&modules)).await
-            };
+        for (trace_id, update) in result.updates {
+            if !self.traces.contains_key(&trace_id) {
+                debug!(
+                    trace_id,
+                    "Ignoring completed runtime bt update for a deleted trace"
+                );
+                continue;
+            }
             match update {
-                Ok(update) => {
-                    self.record_backtrace_actor_update(trace_id, update, &mut total);
-                }
-                Err(err) => {
-                    warn!(
-                        trace_id,
-                        "Failed to append runtime DWARF bt unwind rows: {}", err
-                    );
-                }
+                Ok(update) => self.record_backtrace_actor_update(trace_id, update, &mut total),
+                Err(error) => warn!(
+                    trace_id,
+                    "Failed to append runtime DWARF bt unwind rows: {}", error
+                ),
             }
         }
-
         total
     }
 
@@ -403,10 +439,6 @@ impl TraceManager {
         update: crate::trace::actor::TraceActorBacktraceUpdate,
         total: &mut BacktraceUnwindRowsAppendStats,
     ) {
-        // Apply the generation even when this actor inserted no rows: another
-        // actor may have updated the shared pinned CFI maps first.
-        self.require_event_generation(trace_id, update.event_generation);
-
         let stats = update.stats;
         if stats.modules == 0 {
             return;
@@ -664,6 +696,7 @@ mod tests {
             target_display: format!("trace-{trace_id}"),
             pid_context: TracePidContext::default(),
             loader: None,
+            supports_backtrace_runtime_updates: true,
             ebpf_function_name: String::new(),
             address_global_index: None,
         });
@@ -845,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_cfi_updates_invalidate_batches_for_every_actor() {
+    fn runtime_cfi_updates_preserve_already_queued_events() {
         let mut manager = TraceManager::new();
         add_test_trace(&mut manager, 7);
         add_test_trace(&mut manager, 8);
@@ -860,7 +893,6 @@ mod tests {
                     modules: 1,
                     rows: 2,
                 },
-                event_generation: 1,
             },
             &mut total,
         );
@@ -868,14 +900,13 @@ mod tests {
             8,
             TraceActorBacktraceUpdate {
                 stats: BacktraceUnwindRowsAppendStats::default(),
-                event_generation: 1,
             },
             &mut total,
         );
 
-        assert_eq!(manager.minimum_event_generations.get(&7), Some(&1));
-        assert_eq!(manager.minimum_event_generations.get(&8), Some(&1));
-        assert!(manager.pending_events.is_empty());
+        assert_eq!(manager.minimum_event_generations.get(&7), Some(&0));
+        assert_eq!(manager.minimum_event_generations.get(&8), Some(&0));
+        assert_eq!(manager.pending_events.len(), 2);
         assert_eq!(total.modules, 1);
         assert_eq!(total.rows, 2);
     }

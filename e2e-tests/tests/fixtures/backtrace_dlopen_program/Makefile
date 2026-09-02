@@ -21,6 +21,7 @@ $(SHARED_OBJ): backtrace_dlopen_lib.c backtrace_dlopen_lib.h
 	$(CC) $(CFLAGS) -c -o $@ backtrace_dlopen_lib.c
 
 clean:
-	rm -f *.o backtrace_dlopen_program libbacktrace_dlopen_target.so dlopen.trigger
+	rm -f *.o backtrace_dlopen_program libbacktrace_dlopen_target.so dlopen.trigger \
+		dlopen.trigger.pending dlopen.after_limit.trigger
 
 .PHONY: all clean
