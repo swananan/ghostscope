@@ -33,6 +33,7 @@ pub(super) struct TraceActorLossStats {
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct TraceActorBacktraceUpdate {
     pub stats: BacktraceUnwindRowsAppendStats,
+    pub event_generation: u64,
 }
 
 #[derive(Debug)]

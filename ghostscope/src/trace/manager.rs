@@ -439,6 +439,10 @@ impl TraceManager {
         update: crate::trace::actor::TraceActorBacktraceUpdate,
         total: &mut BacktraceUnwindRowsAppendStats,
     ) {
+        // Apply the generation even when this actor inserted no rows: another
+        // actor may have updated the shared pinned CFI maps first.
+        self.require_event_generation(trace_id, update.event_generation);
+
         let stats = update.stats;
         if stats.modules == 0 {
             return;
@@ -878,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_cfi_updates_preserve_already_queued_events() {
+    fn shared_cfi_updates_invalidate_batches_for_every_actor() {
         let mut manager = TraceManager::new();
         add_test_trace(&mut manager, 7);
         add_test_trace(&mut manager, 8);
@@ -893,6 +897,7 @@ mod tests {
                     modules: 1,
                     rows: 2,
                 },
+                event_generation: 1,
             },
             &mut total,
         );
@@ -900,13 +905,14 @@ mod tests {
             8,
             TraceActorBacktraceUpdate {
                 stats: BacktraceUnwindRowsAppendStats::default(),
+                event_generation: 1,
             },
             &mut total,
         );
 
-        assert_eq!(manager.minimum_event_generations.get(&7), Some(&0));
-        assert_eq!(manager.minimum_event_generations.get(&8), Some(&0));
-        assert_eq!(manager.pending_events.len(), 2);
+        assert_eq!(manager.minimum_event_generations.get(&7), Some(&1));
+        assert_eq!(manager.minimum_event_generations.get(&8), Some(&1));
+        assert!(manager.pending_events.is_empty());
         assert_eq!(total.modules, 1);
         assert_eq!(total.rows, 2);
     }

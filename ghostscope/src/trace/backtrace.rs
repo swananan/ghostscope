@@ -432,11 +432,7 @@ impl BacktraceRenderer {
             if let Some(function) = analyzer
                 .zip(module.as_ref())
                 .and_then(|(analyzer, module)| {
-                    analyzer.find_runtime_function_name_for_display(
-                        &module.module_path,
-                        lookup_pc,
-                        full,
-                    )
+                    analyzer.find_runtime_function_name_for_display(module.cookie, lookup_pc, full)
                 })
             {
                 let module_text = module
@@ -541,11 +537,7 @@ impl BacktraceRenderer {
             if let Some(function) = analyzer
                 .zip(module.as_ref())
                 .and_then(|(analyzer, module)| {
-                    analyzer.find_runtime_function_name_for_display(
-                        &module.module_path,
-                        lookup_pc,
-                        full,
-                    )
+                    analyzer.find_runtime_function_name_for_display(module.cookie, lookup_pc, full)
                 })
             {
                 let module_text = module

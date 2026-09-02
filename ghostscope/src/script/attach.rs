@@ -274,6 +274,12 @@ pub(super) async fn register_attached_trace(
     config: &ghostscope_compiler::UProbeConfig,
     loader: GhostScopeLoader,
 ) -> bool {
+    session.record_backtrace_compiled_module_cookies(
+        config
+            .backtrace_module_row_ranges
+            .iter()
+            .map(|(cookie, _)| *cookie),
+    );
     let target_display = target_display(config);
     let _registered_trace_id =
         session

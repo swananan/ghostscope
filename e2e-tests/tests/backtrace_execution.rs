@@ -1963,9 +1963,17 @@ trace dlopen_main_after_limit_heartbeat {
     let refresh_count = stderr
         .matches("Resolving one backtrace runtime module in the background")
         .count();
+    let metadata_load_count = stderr
+        .matches("Loading metadata for one backtrace runtime module")
+        .count();
     assert!(
-        (1..=MODULE_LIMIT as usize).contains(&refresh_count),
-        "runtime module resolution should start without exceeding the configured limit, started {refresh_count}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        refresh_count >= metadata_load_count,
+        "each metadata load should have a corresponding identity resolution, got {metadata_load_count} loads and {refresh_count} resolutions\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert_eq!(
+        metadata_load_count,
+        MODULE_LIMIT as usize,
+        "runtime metadata loading should stop at the distinct-cookie limit\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
 
     let mut degraded_block = None;

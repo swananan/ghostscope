@@ -13,7 +13,7 @@ use std::path::Path;
 // no extra imports
 
 /// Per-module section offsets (runtime bias) computed from /proc/PID/maps
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SectionOffsets {
     pub text: u64,
     pub rodata: u64,
@@ -21,7 +21,7 @@ pub struct SectionOffsets {
     pub bss: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PidOffsetsEntry {
     pub module_path: String,
     pub cookie: u64,
@@ -367,6 +367,94 @@ impl ProcessManager {
         self.prefilled_pids.remove(&pid);
         self.pid_cache.remove(&pid);
         self.ensure_prefill_pid(pid)
+    }
+
+    /// Refresh only the module mapping that contains one runtime instruction pointer.
+    ///
+    /// Runtime backtrace recovery calls this instead of rebuilding every module in a
+    /// process. The selected `/proc/PID/maps` identity is validated against the file
+    /// that is opened for ELF probing, and an overlapping stale cache entry is
+    /// replaced so a later mapping can safely reuse the same virtual address range.
+    pub fn refresh_module_for_runtime_ip(
+        &mut self,
+        pid: u32,
+        raw_ip: u64,
+    ) -> Result<Option<PidOffsetsEntry>> {
+        if raw_ip == 0 {
+            return Ok(None);
+        }
+
+        let maps = read_proc_maps(pid)?;
+        let Some(containing) = maps.iter().find(|entry| {
+            entry.executable()
+                && raw_ip >= entry.start
+                && raw_ip < entry.end
+                && entry
+                    .path()
+                    .is_some_and(|path| !should_skip_mapped_module_path(path))
+        }) else {
+            self.remove_pid_offsets_containing(pid, raw_ip);
+            return Ok(None);
+        };
+        let Some(mapped_path) = containing.path().map(normalize_mapped_module_path) else {
+            return Ok(None);
+        };
+        let selected_identity = ModuleMapIdentityKey::from_entry(containing);
+        let mut summaries = ModulePathSummaries::default();
+        for entry in &maps {
+            if entry.path().map(normalize_mapped_module_path) == Some(mapped_path)
+                && ModuleMapIdentityKey::from_entry(entry) == selected_identity
+            {
+                summaries.observe(entry);
+            }
+        }
+        // The current maps snapshot is authoritative. Remove any cached
+        // identity for this address before opening the mapped file so a
+        // failure cannot revive an unloaded module through stale cache data.
+        self.remove_pid_offsets_containing(pid, raw_ip);
+
+        let Some((module_path, summary)) =
+            accessible_module_path_for_pid(pid, mapped_path, &summaries)
+        else {
+            return Ok(None);
+        };
+        let (cookie, offsets, base, size) = self.compute_section_offsets_from_candidates(
+            pid,
+            &module_path,
+            &summary.candidates,
+            summary.base(),
+            summary.size(),
+        )?;
+        let entry = PidOffsetsEntry {
+            module_path,
+            cookie,
+            offsets,
+            base,
+            size,
+        };
+        self.upsert_pid_offset(pid, entry.clone());
+        Ok(Some(entry))
+    }
+
+    fn remove_pid_offsets_containing(&mut self, pid: u32, raw_ip: u64) {
+        let Some(entries) = self.pid_cache.get_mut(&pid) else {
+            return;
+        };
+        entries
+            .retain(|entry| raw_ip < entry.base || raw_ip >= entry.base.saturating_add(entry.size));
+    }
+
+    fn upsert_pid_offset(&mut self, pid: u32, entry: PidOffsetsEntry) {
+        let entry_end = entry.base.saturating_add(entry.size);
+        let entries = self.pid_cache.entry(pid).or_default();
+        entries.retain(|existing| {
+            let existing_end = existing.base.saturating_add(existing.size);
+            let overlaps = entry.base < existing_end && existing.base < entry_end;
+            !overlaps && existing.module_path != entry.module_path
+        });
+        entries.push(entry);
+        entries.sort_by_key(|entry| (entry.base, entry.cookie));
+        self.prefilled_pids.insert(pid);
     }
 
     fn compute_section_offsets_for_process(
@@ -747,6 +835,63 @@ mod tests {
             mgr.candidate_proc_pids_for_runtime_pid(4242, None),
             vec![4242]
         );
+    }
+
+    #[test]
+    fn targeted_runtime_refresh_replaces_an_overlapping_stale_mapping() {
+        let mut mgr = ProcessManager::new();
+        let stale = PidOffsetsEntry {
+            module_path: "/tmp/old.so".to_string(),
+            cookie: 1,
+            offsets: SectionOffsets::default(),
+            base: 0x10_000,
+            size: 0x1_000,
+        };
+        let unrelated = PidOffsetsEntry {
+            module_path: "/tmp/other.so".to_string(),
+            // Byte-identical modules can legitimately share a cookie while
+            // occupying different mappings; only the stale overlap is removed.
+            cookie: 2,
+            offsets: SectionOffsets::default(),
+            base: 0x20_000,
+            size: 0x1_000,
+        };
+        mgr.pid_cache.insert(42, vec![stale, unrelated.clone()]);
+
+        let replacement = PidOffsetsEntry {
+            module_path: "/tmp/new.so".to_string(),
+            cookie: 2,
+            offsets: SectionOffsets::default(),
+            base: 0x10_000,
+            size: 0x2_000,
+        };
+        mgr.upsert_pid_offset(42, replacement.clone());
+
+        assert_eq!(
+            mgr.cached_offsets_with_paths_for_pid(42),
+            Some([replacement, unrelated].as_slice())
+        );
+    }
+
+    #[test]
+    fn missing_current_mapping_evicts_the_stale_cached_range() {
+        let mut mgr = ProcessManager::new();
+        mgr.pid_cache.insert(
+            42,
+            vec![PidOffsetsEntry {
+                module_path: "/tmp/unloaded.so".to_string(),
+                cookie: 1,
+                offsets: SectionOffsets::default(),
+                base: 0x10_000,
+                size: 0x1_000,
+            }],
+        );
+
+        mgr.remove_pid_offsets_containing(42, 0x10_123);
+
+        assert!(mgr
+            .cached_offsets_with_paths_for_pid(42)
+            .is_some_and(<[PidOffsetsEntry]>::is_empty));
     }
 
     #[test]

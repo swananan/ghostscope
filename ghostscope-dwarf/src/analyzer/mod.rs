@@ -51,7 +51,8 @@ pub struct DwarfAnalyzer {
     /// Module path -> module data mapping
     modules: HashMap<PathBuf, LoadedObjfile>,
     /// Bounded ELF symbol indexes for runtime modules loaded without full DWARF.
-    runtime_text_symbols: HashMap<PathBuf, Vec<RuntimeTextSymbol>>,
+    /// Cookies preserve reusable module identity across paths and PID roots.
+    runtime_text_symbols: HashMap<u64, Vec<RuntimeTextSymbol>>,
     /// Cached PC semantic contexts for repeated symbol/source lookups.
     pc_context_cache: RwLock<PcContextCache>,
 }
@@ -977,25 +978,19 @@ impl DwarfAnalyzer {
     /// Add a lightweight ELF text-symbol index for a runtime backtrace module.
     pub fn add_runtime_text_symbols(
         &mut self,
-        module_path: PathBuf,
+        module_cookie: u64,
         mut symbols: Vec<RuntimeTextSymbol>,
     ) {
         if symbols.is_empty() {
             return;
         }
-        let module_path = self
-            .runtime_text_symbols
-            .keys()
-            .find(|path| Self::module_paths_equivalent(path, &module_path))
-            .cloned()
-            .unwrap_or(module_path);
         let existing_len = self
             .runtime_text_symbols
-            .get(&module_path)
+            .get(&module_cookie)
             .map_or(0, Vec::len);
         let existing_bytes = self
             .runtime_text_symbols
-            .get(&module_path)
+            .get(&module_cookie)
             .map_or(0, |symbols| runtime_text_symbol_storage_bytes(symbols));
         let retained_elsewhere = self
             .runtime_text_symbols
@@ -1030,7 +1025,7 @@ impl DwarfAnalyzer {
             .count();
         if retained_count < symbols.len() {
             tracing::warn!(
-                module = %module_path.display(),
+                module_cookie = format_args!("0x{module_cookie:016x}"),
                 requested = symbols.len(),
                 retained = retained_count,
                 total_count_limit = RUNTIME_TEXT_SYMBOLS_MAX_TOTAL,
@@ -1042,23 +1037,17 @@ impl DwarfAnalyzer {
         if symbols.is_empty() {
             return;
         }
-        self.runtime_text_symbols.insert(module_path, symbols);
+        self.runtime_text_symbols.insert(module_cookie, symbols);
     }
 
     /// Resolve a runtime-only module PC without retaining its full DWARF index.
-    pub fn find_runtime_function_name_for_display<P: AsRef<Path>>(
+    pub fn find_runtime_function_name_for_display(
         &self,
-        module_path: P,
+        module_cookie: u64,
         address: u64,
         full: bool,
     ) -> Option<String> {
-        let module_path = module_path.as_ref();
-        let symbols = self.runtime_text_symbols.get(module_path).or_else(|| {
-            self.runtime_text_symbols
-                .iter()
-                .find(|(path, _)| Self::module_paths_equivalent(path, module_path))
-                .map(|(_, symbols)| symbols)
-        })?;
+        let symbols = self.runtime_text_symbols.get(&module_cookie)?;
         let upper = symbols.partition_point(|symbol| symbol.address <= address);
         let symbol = symbols[..upper].iter().rev().find(|symbol| {
             symbol.size == 0 || address < symbol.address.saturating_add(symbol.size)
