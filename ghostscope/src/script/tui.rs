@@ -17,7 +17,7 @@ pub async fn compile_and_load_script_for_tui(
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<ScriptCompilationDetails> {
     let mut compile_options = compile_options.clone();
-    prepare_runtime_modules_before_compile(script, session, &mut compile_options)?;
+    prepare_runtime_modules_before_compile(script, session, &mut compile_options).await?;
 
     let binary_path = main_executable_path(session)?;
     // Compilation is synchronous and can be long-running. Mark the section as

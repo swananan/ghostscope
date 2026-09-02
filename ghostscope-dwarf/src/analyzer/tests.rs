@@ -188,3 +188,39 @@ fn runtime_text_symbols_resolve_without_loading_module_dwarf() {
         .find_runtime_function_name_for_display(0x5678, 0x13f, false)
         .is_none());
 }
+
+#[test]
+fn zero_sized_runtime_text_symbol_stops_at_next_symbol() {
+    let mut analyzer = DwarfAnalyzer::from_modules(0, Vec::new());
+    analyzer.add_runtime_text_symbols(
+        0x1234,
+        vec![
+            RuntimeTextSymbol {
+                name: "zero_sized".to_string(),
+                address: 0x100,
+                size: 0,
+            },
+            RuntimeTextSymbol {
+                name: "next_function".to_string(),
+                address: 0x120,
+                size: 0x10,
+            },
+        ],
+    );
+
+    assert_eq!(
+        analyzer
+            .find_runtime_function_name_for_display(0x1234, 0x110, false)
+            .as_deref(),
+        Some("zero_sized")
+    );
+    assert_eq!(
+        analyzer
+            .find_runtime_function_name_for_display(0x1234, 0x125, false)
+            .as_deref(),
+        Some("next_function")
+    );
+    assert!(analyzer
+        .find_runtime_function_name_for_display(0x1234, 0x130, false)
+        .is_none());
+}
