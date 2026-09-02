@@ -679,6 +679,50 @@ impl GhostSession {
         Ok(DwarfAnalyzer::runtime_modules_from_pid_offsets(entries))
     }
 
+    /// Refresh the PID module snapshot and load newly mapped modules before
+    /// compiling another script in a long-lived session.
+    pub(crate) async fn refresh_pid_analyzer_before_compile(&mut self) -> Result<usize> {
+        let Some(proc_pid) = self.proc_pid() else {
+            return Ok(0);
+        };
+
+        let runtime_modules = {
+            let mut coordinator = self.coordinator.lock().expect("coordinator mutex poisoned");
+            coordinator.refresh_prefill_pid(proc_pid)?;
+            let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(proc_pid) else {
+                return Ok(0);
+            };
+            DwarfAnalyzer::runtime_modules_from_pid_offsets(entries)
+        };
+        if runtime_modules.is_empty() {
+            return Ok(0);
+        }
+
+        let debug_search_paths = self.get_debug_search_paths();
+        let allow_loose = self.get_allow_loose_debug_match();
+        let debuginfod_client = self.build_debuginfod_client()?;
+        let Some(analyzer) = self.process_analyzer.as_mut() else {
+            return Ok(0);
+        };
+
+        let loaded = analyzer
+            .refresh_pid_runtime_modules_with_config_and_debuginfod(
+                runtime_modules,
+                &debug_search_paths,
+                allow_loose,
+                debuginfod_client,
+                |_| {},
+            )
+            .await?;
+        if loaded > 0 {
+            info!(
+                "Refreshed PID {} analyzer with {} newly mapped module(s) before compilation",
+                proc_pid, loaded
+            );
+        }
+        Ok(loaded)
+    }
+
     fn backtrace_runtime_modules_configured(&self) -> bool {
         self.config
             .as_ref()

@@ -1049,9 +1049,22 @@ impl DwarfAnalyzer {
     ) -> Option<String> {
         let symbols = self.runtime_text_symbols.get(&module_cookie)?;
         let upper = symbols.partition_point(|symbol| symbol.address <= address);
-        let symbol = symbols[..upper].iter().rev().find(|symbol| {
-            symbol.size == 0 || address < symbol.address.saturating_add(symbol.size)
-        })?;
+        let symbol = symbols[..upper]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, symbol)| {
+                let end = if symbol.size == 0 {
+                    symbols[index + 1..]
+                        .iter()
+                        .find(|next| next.address > symbol.address)
+                        .map(|next| next.address)
+                } else {
+                    Some(symbol.address.saturating_add(symbol.size))
+                };
+                end.is_none_or(|end| address < end)
+            })
+            .map(|(_, symbol)| symbol)?;
         let rust_hashes = if full {
             RustSymbolHashDisplay::Shown
         } else {

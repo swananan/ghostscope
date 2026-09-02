@@ -1,4 +1,6 @@
-use ghostscope_dwarf::{DwarfAnalyzer, FunctionParameter, ModuleAddress, PcContext};
+use ghostscope_dwarf::{
+    DwarfAnalyzer, FunctionParameter, LoadedModuleRuntimeInfo, ModuleAddress, PcContext,
+};
 use ghostscope_process::ProcessManager;
 #[cfg(test)]
 use ghostscope_protocol::trace_event::backtrace_error_label;
@@ -19,6 +21,26 @@ struct ResolvedFrameModule {
     module_path: PathBuf,
     cookie: u64,
     pc: u64,
+}
+
+#[derive(Clone, Copy)]
+struct FrameRenderInput<'a> {
+    frame: &'a ParsedBacktraceFrame,
+    pc_is_normalized: bool,
+}
+
+impl<'a> FrameRenderInput<'a> {
+    fn new(
+        frame: &'a ParsedBacktraceFrame,
+        status: BacktraceStatus,
+        frame_index: usize,
+        frame_count: usize,
+    ) -> Self {
+        Self {
+            frame,
+            pc_is_normalized: backtrace_frame_pc_is_normalized(status, frame_index, frame_count),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -111,6 +133,7 @@ struct FrameRenderCacheKey {
     pc: u64,
     raw_ip: u64,
     frame_flags: u16,
+    pc_is_normalized: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -254,7 +277,14 @@ impl BacktraceRenderer {
         )];
 
         for (index, frame) in frames.iter().enumerate() {
-            lines.extend(self.format_frame(index, frame, *flags, analyzer, coordinator, &pids));
+            lines.extend(self.format_frame(
+                index,
+                FrameRenderInput::new(frame, *status, index, frames.len()),
+                *flags,
+                analyzer,
+                coordinator,
+                &pids,
+            ));
         }
 
         if display_status != BacktraceStatus::Complete {
@@ -309,7 +339,7 @@ impl BacktraceRenderer {
         for (index, frame) in frames.iter().enumerate() {
             display_frames.extend(self.display_frame(
                 index,
-                frame,
+                FrameRenderInput::new(frame, *status, index, frames.len()),
                 *flags,
                 analyzer,
                 coordinator,
@@ -364,8 +394,15 @@ impl BacktraceRenderer {
             return cached;
         }
 
-        let Some(module) = resolve_frame_module(coordinator, Some(analyzer), pids, last_frame)
-        else {
+        let pc_is_normalized =
+            backtrace_frame_pc_is_normalized(status, frames.len() - 1, frames.len());
+        let Some(module) = resolve_frame_module(
+            coordinator,
+            Some(analyzer),
+            pids,
+            last_frame,
+            pc_is_normalized,
+        ) else {
             return status;
         };
 
@@ -382,12 +419,16 @@ impl BacktraceRenderer {
     fn format_frame(
         &mut self,
         index: usize,
-        frame: &ParsedBacktraceFrame,
+        input: FrameRenderInput<'_>,
         flags: u8,
         analyzer: Option<&DwarfAnalyzer>,
         coordinator: &ProcessManager,
         pids: &[u32],
     ) -> Vec<String> {
+        let FrameRenderInput {
+            frame,
+            pc_is_normalized,
+        } = input;
         let cache_key = FrameRenderCacheKey {
             pids: PidCacheKey::from_pids(pids),
             analyzer_present: analyzer.is_some(),
@@ -397,6 +438,7 @@ impl BacktraceRenderer {
             pc: frame.pc,
             raw_ip: frame.raw_ip,
             frame_flags: frame.flags,
+            pc_is_normalized,
         };
         if let Some(cached) = self.frame_cache.get(&cache_key) {
             return cached;
@@ -405,7 +447,7 @@ impl BacktraceRenderer {
         let raw = (flags & BACKTRACE_FLAG_RAW) != 0;
         let full = (flags & BACKTRACE_FLAG_FULL) != 0;
         let inline = (flags & BACKTRACE_FLAG_INLINE) != 0;
-        let module = resolve_frame_module(coordinator, analyzer, pids, frame);
+        let module = resolve_frame_module(coordinator, analyzer, pids, frame, pc_is_normalized);
         let frame_pc = module.as_ref().map(|module| module.pc).unwrap_or(frame.pc);
         let lookup_pc = if index == 0 {
             frame_pc
@@ -487,12 +529,16 @@ impl BacktraceRenderer {
     fn display_frame(
         &mut self,
         index: usize,
-        frame: &ParsedBacktraceFrame,
+        input: FrameRenderInput<'_>,
         flags: u8,
         analyzer: Option<&DwarfAnalyzer>,
         coordinator: &ProcessManager,
         pids: &[u32],
     ) -> Vec<BacktraceDisplayFrame> {
+        let FrameRenderInput {
+            frame,
+            pc_is_normalized,
+        } = input;
         let cache_key = FrameRenderCacheKey {
             pids: PidCacheKey::from_pids(pids),
             analyzer_present: analyzer.is_some(),
@@ -502,6 +548,7 @@ impl BacktraceRenderer {
             pc: frame.pc,
             raw_ip: frame.raw_ip,
             frame_flags: frame.flags,
+            pc_is_normalized,
         };
         if let Some(cached) = self.frame_display_cache.get(&cache_key) {
             return cached;
@@ -510,7 +557,7 @@ impl BacktraceRenderer {
         let raw = (flags & BACKTRACE_FLAG_RAW) != 0;
         let full = (flags & BACKTRACE_FLAG_FULL) != 0;
         let inline = (flags & BACKTRACE_FLAG_INLINE) != 0;
-        let module = resolve_frame_module(coordinator, analyzer, pids, frame);
+        let module = resolve_frame_module(coordinator, analyzer, pids, frame, pc_is_normalized);
         let frame_pc = module.as_ref().map(|module| module.pc).unwrap_or(frame.pc);
         let lookup_pc = if index == 0 {
             frame_pc
@@ -683,6 +730,7 @@ fn resolve_frame_module(
     analyzer: Option<&DwarfAnalyzer>,
     pids: &[u32],
     frame: &ParsedBacktraceFrame,
+    pc_is_normalized: bool,
 ) -> Option<ResolvedFrameModule> {
     for pid in pids {
         if let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(*pid) {
@@ -707,12 +755,13 @@ fn resolve_frame_module(
             }
         }
     }
-    resolve_frame_module_from_analyzer(analyzer, frame)
+    resolve_frame_module_from_analyzer(analyzer, frame, pc_is_normalized)
 }
 
 fn resolve_frame_module_from_analyzer(
     analyzer: Option<&DwarfAnalyzer>,
     frame: &ParsedBacktraceFrame,
+    pc_is_normalized: bool,
 ) -> Option<ResolvedFrameModule> {
     let analyzer = analyzer?;
     analyzer
@@ -724,18 +773,40 @@ fn resolve_frame_module_from_analyzer(
             if cookie != frame.module_cookie {
                 return None;
             }
-            if module.loaded_address.is_none() && frame.raw_ip != 0 && frame.raw_ip == frame.pc {
-                return None;
-            }
-            if module.size != 0 && frame.pc >= module.size {
-                return None;
-            }
+            let pc = analyzer_module_pc(&module, frame, pc_is_normalized)?;
             Some(ResolvedFrameModule {
                 module_path: module.module_path,
                 cookie,
-                pc: frame.pc,
+                pc,
             })
         })
+}
+
+fn backtrace_frame_pc_is_normalized(
+    status: BacktraceStatus,
+    frame_index: usize,
+    frame_count: usize,
+) -> bool {
+    // OffsetsUnavailable describes the final stopping frame. Earlier frames
+    // were normalized before the unwinder reached the missing mapping.
+    status != BacktraceStatus::OffsetsUnavailable || frame_index < frame_count.saturating_sub(1)
+}
+
+fn analyzer_module_pc(
+    module: &LoadedModuleRuntimeInfo,
+    frame: &ParsedBacktraceFrame,
+    pc_is_normalized: bool,
+) -> Option<u64> {
+    // A path-only analyzer has no runtime bias with which to normalize an
+    // offsets-unavailable frame. Equality between raw_ip and pc cannot make
+    // that distinction because a non-PIE ET_EXEC legitimately has zero bias.
+    if !pc_is_normalized && module.loaded_address.is_none() {
+        return None;
+    }
+    if module.size != 0 && frame.pc >= module.size {
+        return None;
+    }
+    Some(frame.pc)
 }
 
 #[cfg(test)]
@@ -900,6 +971,44 @@ mod tests {
             format_backtrace_header(BacktraceStatus::NoUnwindRowsForPc, 1, 3),
             "backtrace: no unwind rows for PC, 1 frame (max 3)"
         );
+    }
+
+    #[test]
+    fn normalized_zero_bias_frame_matches_path_only_executable() {
+        let module = LoadedModuleRuntimeInfo {
+            module_path: PathBuf::from("/tmp/non-pie-executable"),
+            loaded_address: None,
+            load_bias: None,
+            size: 0,
+        };
+        let frame = ParsedBacktraceFrame {
+            module_cookie: 0x1234,
+            pc: 0x401000,
+            raw_ip: 0x401000,
+            flags: 0,
+        };
+
+        assert_eq!(analyzer_module_pc(&module, &frame, true), Some(frame.pc));
+        assert_eq!(analyzer_module_pc(&module, &frame, false), None);
+    }
+
+    #[test]
+    fn offsets_unavailable_marks_only_the_stopping_frame_as_unnormalized() {
+        assert!(backtrace_frame_pc_is_normalized(
+            BacktraceStatus::OffsetsUnavailable,
+            0,
+            2
+        ));
+        assert!(!backtrace_frame_pc_is_normalized(
+            BacktraceStatus::OffsetsUnavailable,
+            1,
+            2
+        ));
+        assert!(backtrace_frame_pc_is_normalized(
+            BacktraceStatus::Complete,
+            0,
+            1
+        ));
     }
 
     #[test]

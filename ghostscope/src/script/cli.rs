@@ -57,7 +57,7 @@ pub async fn compile_and_load_script_for_cli(
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<()> {
     let mut compile_options = compile_options.clone();
-    prepare_runtime_modules_before_compile(script, session, &mut compile_options)?;
+    prepare_runtime_modules_before_compile(script, session, &mut compile_options).await?;
 
     let compilation_result = compile_script_for_cli(script, session, &compile_options)?;
     ensure_prefill_for_session_pid(session);

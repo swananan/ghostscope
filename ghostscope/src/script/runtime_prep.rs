@@ -33,11 +33,15 @@ fn script_contains_backtrace(script: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub(super) fn prepare_runtime_modules_before_compile(
+pub(super) async fn prepare_runtime_modules_before_compile(
     script: &str,
     session: &mut GhostSession,
     compile_options: &mut ghostscope_compiler::CompileOptions,
 ) -> Result<()> {
+    if let Err(error) = session.refresh_pid_analyzer_before_compile().await {
+        warn!("Failed to refresh PID runtime modules before compilation: {error:#}");
+    }
+
     if session.is_target_mode() && script_contains_backtrace(script) {
         session.enable_target_backtrace_runtime_modules();
         if let Err(error) = session.prepare_target_backtrace_module_mappings() {
