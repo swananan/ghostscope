@@ -6,6 +6,7 @@ use crate::trace::backtrace_runtime::{
 };
 use crate::trace::TraceManager;
 use anyhow::Result;
+use futures::FutureExt;
 use ghostscope_debuginfod::{DebuginfodClient, DebuginfodConfig};
 use ghostscope_dwarf::{DwarfAnalyzer, ExplicitDebugFile, ModuleStats, RuntimeBacktraceLoadBudget};
 use ghostscope_process::{
@@ -21,6 +22,58 @@ use tracing::{info, warn};
 const BACKTRACE_RUNTIME_MODULE_DISCOVERY_GRACE: Duration = Duration::from_millis(500);
 const BACKTRACE_RUNTIME_OBSERVATION_REQUEST_MAX: usize = 1_024;
 const BACKTRACE_RUNTIME_OBSERVATION_RETRY_DELAY: Duration = Duration::from_secs(1);
+const BACKTRACE_RUNTIME_OBSERVATION_MAX_ATTEMPTS: u8 = 3;
+
+#[derive(Debug)]
+struct BacktraceObservationState {
+    mapping: Option<(u32, ghostscope_process::PidOffsetsEntry)>,
+    attempts: u8,
+    retry_at: Option<Instant>,
+}
+
+impl BacktraceObservationState {
+    fn should_retry(
+        &self,
+        mapping: &Option<(u32, ghostscope_process::PidOffsetsEntry)>,
+        now: Instant,
+    ) -> bool {
+        self.mapping != *mapping || self.retry_at.is_some_and(|retry_at| now >= retry_at)
+    }
+
+    fn finish(&mut self, terminal: bool, now: Instant) {
+        self.retry_at = if terminal || self.attempts >= BACKTRACE_RUNTIME_OBSERVATION_MAX_ATTEMPTS {
+            None
+        } else {
+            Some(now + BACKTRACE_RUNTIME_OBSERVATION_RETRY_DELAY * (1 << (self.attempts - 1)))
+        };
+    }
+}
+
+fn observation_mapping(
+    coordinator: &ProcessManager,
+    proc_pid: Option<u32>,
+    observation: BacktraceRuntimeModuleObservation,
+) -> Option<(u32, ghostscope_process::PidOffsetsEntry)> {
+    for pid in coordinator.candidate_proc_pids_for_runtime_pid(observation.runtime_pid, proc_pid) {
+        if let Some(entry) =
+            coordinator
+                .cached_offsets_with_paths_for_pid(pid)
+                .and_then(|entries| {
+                    entries.iter().find(|entry| {
+                        if observation.raw_ip == 0 {
+                            entry.cookie == observation.cookie_hint
+                        } else {
+                            observation.raw_ip >= entry.base
+                                && observation.raw_ip < entry.base.saturating_add(entry.size)
+                        }
+                    })
+                })
+        {
+            return Some((pid, entry.clone()));
+        }
+    }
+    None
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct BacktraceRuntimeModuleRequest {
@@ -45,24 +98,34 @@ impl BacktraceRuntimeModuleRequest {
                 if !requests_runtime_module {
                     continue;
                 }
-                let Some(frame) = frames.last() else {
+                let Some(stopping_frame_index) = frames.len().checked_sub(1) else {
                     continue;
                 };
-                let observation = BacktraceRuntimeModuleObservation {
-                    runtime_pid: event.pid,
-                    raw_ip: frame.raw_ip,
-                    cookie_hint: frame.module_cookie,
-                    // When offsets are unavailable, the eBPF unwinder can only
-                    // retain the previous frame's cookie. In all other runtime
-                    // module failure modes the stopping cookie identifies the
-                    // address-space mapping that produced the raw IP.
-                    cookie_is_authoritative: !matches!(
-                        status,
-                        ghostscope_protocol::trace_event::BacktraceStatus::OffsetsUnavailable
-                    ),
-                };
-                if !observation.is_empty() {
-                    request.observations.insert(observation);
+                let offsets_unavailable = matches!(
+                    status,
+                    ghostscope_protocol::trace_event::BacktraceStatus::OffsetsUnavailable
+                );
+                for (frame_index, frame) in frames.iter().enumerate() {
+                    let is_stopping_frame = frame_index == stopping_frame_index;
+                    // Missing offsets can leave earlier, otherwise unwindable
+                    // frames without a published runtime mapping. Preserve
+                    // their exact PID/raw-IP/cookie tuples so each module can
+                    // be recovered without mixing identities across frames.
+                    if !offsets_unavailable && !is_stopping_frame {
+                        continue;
+                    }
+                    let observation = BacktraceRuntimeModuleObservation {
+                        runtime_pid: event.pid,
+                        raw_ip: frame.raw_ip,
+                        cookie_hint: frame.module_cookie,
+                        // For an offsets failure only the stopping frame may
+                        // retain the previous frame's cookie. Earlier frames,
+                        // and all other failure modes, carry their own cookie.
+                        cookie_is_authoritative: !offsets_unavailable || !is_stopping_frame,
+                    };
+                    if !observation.is_empty() {
+                        request.observations.insert(observation);
+                    }
                 }
             }
         }
@@ -106,23 +169,11 @@ pub enum BacktraceRuntimeRefreshOutcome {
 
 #[derive(Debug)]
 enum BacktraceRuntimeRefreshTaskOutcome {
-    Loaded {
+    Prepared(BacktraceRuntimePreparedOutcome),
+    Published {
         resolved: ResolvedBacktraceRuntimeModule,
         runtime_symbols: Vec<ghostscope_dwarf::RuntimeTextSymbol>,
         append_result: crate::trace::manager::BacktraceUnwindRowsAppendResult,
-    },
-    AlreadyLoaded(ResolvedBacktraceRuntimeModule),
-    AlreadyAttempted,
-    ModuleNotFound,
-    Failed {
-        attempted_cookie: Option<u64>,
-        error: String,
-    },
-    TimedOut {
-        attempted_cookie: Option<u64>,
-    },
-    LimitReached {
-        limit: u32,
     },
 }
 
@@ -134,7 +185,7 @@ enum BacktraceRuntimePreparedOutcome {
         unwind_modules: Vec<(u64, Vec<ghostscope_protocol::BacktraceUnwindRow>)>,
     },
     AlreadyLoaded(ResolvedBacktraceRuntimeModule),
-    AlreadyAttempted,
+    AlreadyAttempted(ResolvedBacktraceRuntimeModule),
     ModuleNotFound,
     Failed {
         attempted_cookie: Option<u64>,
@@ -178,12 +229,14 @@ struct BacktraceRuntimeRefreshTask {
     observation: BacktraceRuntimeModuleObservation,
     timeout: Duration,
     budget: RuntimeBacktraceLoadBudget,
+    baseline: Arc<ProcessManager>,
     handle: tokio::task::JoinHandle<BacktraceRuntimeRefreshTaskOutcome>,
+    result: Option<BacktraceRuntimeRefreshTaskOutcome>,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_backtrace_runtime_module(
-    coordinator: Arc<Mutex<ProcessManager>>,
+    mut coordinator: ProcessManager,
     proc_pid: Option<u32>,
     target_binary: Option<&str>,
     observation: BacktraceRuntimeModuleObservation,
@@ -194,7 +247,7 @@ fn prepare_backtrace_runtime_module(
     budget: &RuntimeBacktraceLoadBudget,
 ) -> BacktraceRuntimePreparedOutcome {
     let discovery_deadline = Instant::now() + BACKTRACE_RUNTIME_MODULE_DISCOVERY_GRACE;
-    let resolved = loop {
+    let mut resolved = loop {
         if budget.check().is_err() {
             return BacktraceRuntimePreparedOutcome::TimedOut {
                 attempted_cookie: None,
@@ -202,7 +255,6 @@ fn prepare_backtrace_runtime_module(
         }
 
         let resolution = {
-            let mut coordinator = coordinator.lock().expect("coordinator mutex poisoned");
             if let Some(proc_pid) = proc_pid {
                 BacktraceRuntimeRunner::resolve_pid_module_for_observation(
                     &mut coordinator,
@@ -260,7 +312,7 @@ fn prepare_backtrace_runtime_module(
             return BacktraceRuntimePreparedOutcome::AlreadyLoaded(resolved);
         }
         BacktraceRuntimeModuleLoadDecision::AlreadyAttempted => {
-            return BacktraceRuntimePreparedOutcome::AlreadyAttempted;
+            return BacktraceRuntimePreparedOutcome::AlreadyAttempted(resolved);
         }
         BacktraceRuntimeModuleLoadDecision::LimitReached => {
             return BacktraceRuntimePreparedOutcome::LimitReached {
@@ -277,6 +329,10 @@ fn prepare_backtrace_runtime_module(
     );
     match ghostscope_dwarf::load_runtime_backtrace_metadata(
         resolved.module.module_path.clone(),
+        *resolved
+            .probe
+            .take()
+            .expect("resolution retained a validated ELF mapping"),
         max_unwind_rows,
         budget,
     ) {
@@ -308,6 +364,38 @@ fn prepare_backtrace_runtime_module(
             error: format!("{error:#}"),
         },
     }
+}
+
+/// A timed-out filesystem call must not keep Tokio's blocking pool alive at shutdown.
+/// The detached worker owns only private discovery state and cannot publish anything.
+/// A timeout disables further discovery for this session, bounding abandoned work to one.
+fn spawn_backtrace_discovery(
+    timeout: Duration,
+    budget: RuntimeBacktraceLoadBudget,
+    work: impl FnOnce() -> BacktraceRuntimePreparedOutcome + Send + 'static,
+) -> Result<tokio::task::JoinHandle<BacktraceRuntimeRefreshTaskOutcome>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("backtrace-discovery".into())
+        .spawn(move || {
+            let _ = sender.send(work());
+        })?;
+    Ok(tokio::spawn(async move {
+        let outcome = match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(prepared)) if !budget.expired_or_cancelled() => prepared,
+            Ok(Err(error)) => BacktraceRuntimePreparedOutcome::Failed {
+                attempted_cookie: None,
+                error: format!("backtrace runtime worker stopped: {error}"),
+            },
+            _ => {
+                budget.cancel();
+                BacktraceRuntimePreparedOutcome::TimedOut {
+                    attempted_cookie: None,
+                }
+            }
+        };
+        BacktraceRuntimeRefreshTaskOutcome::Prepared(outcome)
+    }))
 }
 
 fn sysmon_watch_from_config(
@@ -381,7 +469,9 @@ pub struct GhostSession {
     backtrace_runtime_known_cookies: BTreeSet<u64>,
     backtrace_runtime_attempted_cookies: BTreeSet<u64>,
     backtrace_runtime_queued_observations: BTreeSet<BacktraceRuntimeModuleObservation>,
-    backtrace_runtime_recent_observations: BTreeMap<BacktraceRuntimeModuleObservation, Instant>,
+    backtrace_runtime_observations:
+        BTreeMap<BacktraceRuntimeModuleObservation, BacktraceObservationState>,
+    backtrace_runtime_unwind_modules: Vec<(u64, Vec<ghostscope_protocol::BacktraceUnwindRow>)>,
     backtrace_runtime_refresh_task: Option<BacktraceRuntimeRefreshTask>,
     backtrace_runtime_refresh_timed_out: bool,
     backtrace_runtime_limit_reported: bool,
@@ -410,7 +500,8 @@ impl GhostSession {
             backtrace_runtime_known_cookies: BTreeSet::new(),
             backtrace_runtime_attempted_cookies: BTreeSet::new(),
             backtrace_runtime_queued_observations: BTreeSet::new(),
-            backtrace_runtime_recent_observations: BTreeMap::new(),
+            backtrace_runtime_observations: BTreeMap::new(),
+            backtrace_runtime_unwind_modules: Vec::new(),
             backtrace_runtime_refresh_task: None,
             backtrace_runtime_refresh_timed_out: false,
             backtrace_runtime_limit_reported: false,
@@ -542,7 +633,8 @@ impl GhostSession {
             backtrace_runtime_known_cookies: BTreeSet::new(),
             backtrace_runtime_attempted_cookies: BTreeSet::new(),
             backtrace_runtime_queued_observations: BTreeSet::new(),
-            backtrace_runtime_recent_observations: BTreeMap::new(),
+            backtrace_runtime_observations: BTreeMap::new(),
+            backtrace_runtime_unwind_modules: Vec::new(),
             backtrace_runtime_refresh_task: None,
             backtrace_runtime_refresh_timed_out: false,
             backtrace_runtime_limit_reported: false,
@@ -759,7 +851,9 @@ impl GhostSession {
     }
 
     fn backtrace_runtime_modules_allowed(&self) -> bool {
-        if !self.backtrace_runtime_modules_configured() || self.backtrace_runtime_refresh_timed_out
+        if !self.backtrace_runtime_modules_configured()
+            || self.backtrace_runtime_refresh_timed_out
+            || self.backtrace_runtime_limit_reported
         {
             return false;
         }
@@ -777,6 +871,14 @@ impl GhostSession {
         self.backtrace_runtime_known_cookies.insert(cookie);
     }
 
+    pub(crate) fn seed_backtrace_runtime_rows(
+        &self,
+        loader: &mut ghostscope_loader::GhostScopeLoader,
+    ) -> Result<()> {
+        loader.append_backtrace_unwind_rows_for_modules(&self.backtrace_runtime_unwind_modules)?;
+        Ok(())
+    }
+
     pub fn schedule_backtrace_runtime_module_refresh(
         &mut self,
         request: BacktraceRuntimeModuleRequest,
@@ -789,10 +891,10 @@ impl GhostSession {
         }
 
         let now = Instant::now();
-        self.backtrace_runtime_recent_observations
-            .retain(|_, seen_at| {
-                now.saturating_duration_since(*seen_at) < BACKTRACE_RUNTIME_OBSERVATION_RETRY_DELAY
-            });
+        let coordinator = Arc::clone(&self.coordinator);
+        let Ok(coordinator) = coordinator.try_lock() else {
+            return Ok(BacktraceRuntimeRefreshSchedule::NotNeeded);
+        };
         let active_observation = self
             .backtrace_runtime_refresh_task
             .as_ref()
@@ -804,25 +906,41 @@ impl GhostSession {
                 || self
                     .backtrace_runtime_queued_observations
                     .contains(&observation)
-                || self
-                    .backtrace_runtime_recent_observations
-                    .contains_key(&observation)
             {
                 continue;
             }
-            if self
-                .backtrace_runtime_queued_observations
-                .len()
-                .saturating_add(self.backtrace_runtime_recent_observations.len())
+            let mapping = observation_mapping(&coordinator, self.proc_pid(), observation);
+            if let Some(state) = self.backtrace_runtime_observations.get(&observation) {
+                if !state.should_retry(&mapping, now) {
+                    continue;
+                }
+            }
+            if self.backtrace_runtime_observations.len()
                 >= BACKTRACE_RUNTIME_OBSERVATION_REQUEST_MAX
+                && !self
+                    .backtrace_runtime_observations
+                    .contains_key(&observation)
             {
                 dropped += 1;
                 continue;
+            }
+            let state = self
+                .backtrace_runtime_observations
+                .entry(observation)
+                .or_insert(BacktraceObservationState {
+                    mapping: mapping.clone(),
+                    attempts: 0,
+                    retry_at: Some(now),
+                });
+            if state.mapping != mapping {
+                state.mapping = mapping;
+                state.attempts = 0;
             }
             self.backtrace_runtime_queued_observations
                 .insert(observation);
             queued += 1;
         }
+        drop(coordinator);
         if dropped > 0 {
             warn!(
                 dropped,
@@ -852,13 +970,23 @@ impl GhostSession {
     }
 
     fn start_next_backtrace_runtime_module_refresh(&mut self) -> Result<Option<Duration>> {
-        if self.backtrace_runtime_refresh_task.is_some() || self.backtrace_runtime_refresh_timed_out
+        if self.backtrace_runtime_refresh_task.is_some()
+            || self.backtrace_runtime_refresh_timed_out
+            || self.backtrace_runtime_limit_reported
         {
             return Ok(None);
         }
         if self.backtrace_runtime_queued_module_count() == 0 {
             return Ok(None);
         }
+
+        let baseline = match self.coordinator.try_lock() {
+            Ok(coordinator) => Arc::new(coordinator.fork_for_runtime_discovery()),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                anyhow::bail!("coordinator mutex poisoned")
+            }
+        };
 
         let observation = self
             .backtrace_runtime_queued_observations
@@ -868,98 +996,42 @@ impl GhostSession {
             .expect("checked non-empty runtime module queue");
         self.backtrace_runtime_queued_observations
             .remove(&observation);
-        self.backtrace_runtime_recent_observations
-            .insert(observation, Instant::now());
+        if let Some(state) = self.backtrace_runtime_observations.get_mut(&observation) {
+            state.attempts += 1;
+            state.retry_at = None;
+        }
 
-        let coordinator = Arc::clone(&self.coordinator);
+        let worker_baseline = Arc::clone(&baseline);
         let proc_pid = self.proc_pid();
         let target_binary = self.target_binary.clone();
         let timeout = self.backtrace_runtime_module_timeout();
         let max_unwind_rows = self.backtrace_runtime_unwind_rows_max();
-        let unwind_rows_appender = self.trace_manager.backtrace_unwind_rows_appender();
         let known_cookies = self.backtrace_runtime_known_cookies.clone();
         let attempted_cookies = self.backtrace_runtime_attempted_cookies.clone();
         let module_limit = self.backtrace_runtime_modules_max();
         let budget = RuntimeBacktraceLoadBudget::new(timeout);
         let worker_budget = budget.clone();
-        let timeout_budget = budget.clone();
-
-        let handle = tokio::spawn(async move {
-            let mut worker = tokio::task::spawn_blocking(move || {
-                prepare_backtrace_runtime_module(
-                    coordinator,
-                    proc_pid,
-                    target_binary.as_deref(),
-                    observation,
-                    &known_cookies,
-                    &attempted_cookies,
-                    module_limit,
-                    max_unwind_rows,
-                    &worker_budget,
-                )
-            });
-            let prepared = tokio::select! {
-                result = &mut worker => match result {
-                    Ok(prepared) => prepared,
-                    Err(error) => BacktraceRuntimePreparedOutcome::Failed {
-                        attempted_cookie: None,
-                        error: format!("backtrace runtime blocking worker failed: {error}"),
-                    },
-                },
-                () = tokio::time::sleep(timeout) => {
-                    timeout_budget.cancel();
-                    // Drain the cooperative worker before reporting the timeout so
-                    // no parsing continues invisibly after the warning is shown.
-                    let _ = worker.await;
-                    BacktraceRuntimePreparedOutcome::TimedOut {
-                        attempted_cookie: None,
-                    }
-                }
-            };
-
-            match prepared {
-                BacktraceRuntimePreparedOutcome::Loaded {
-                    resolved,
-                    runtime_symbols,
-                    unwind_modules,
-                } => {
-                    let append_result = unwind_rows_appender.append(unwind_modules).await;
-                    BacktraceRuntimeRefreshTaskOutcome::Loaded {
-                        resolved,
-                        runtime_symbols,
-                        append_result,
-                    }
-                }
-                BacktraceRuntimePreparedOutcome::AlreadyLoaded(resolved) => {
-                    BacktraceRuntimeRefreshTaskOutcome::AlreadyLoaded(resolved)
-                }
-                BacktraceRuntimePreparedOutcome::AlreadyAttempted => {
-                    BacktraceRuntimeRefreshTaskOutcome::AlreadyAttempted
-                }
-                BacktraceRuntimePreparedOutcome::ModuleNotFound => {
-                    BacktraceRuntimeRefreshTaskOutcome::ModuleNotFound
-                }
-                BacktraceRuntimePreparedOutcome::Failed {
-                    attempted_cookie,
-                    error,
-                } => BacktraceRuntimeRefreshTaskOutcome::Failed {
-                    attempted_cookie,
-                    error,
-                },
-                BacktraceRuntimePreparedOutcome::TimedOut { attempted_cookie } => {
-                    BacktraceRuntimeRefreshTaskOutcome::TimedOut { attempted_cookie }
-                }
-                BacktraceRuntimePreparedOutcome::LimitReached { limit } => {
-                    BacktraceRuntimeRefreshTaskOutcome::LimitReached { limit }
-                }
-            }
-        });
+        let handle = spawn_backtrace_discovery(timeout, budget.clone(), move || {
+            prepare_backtrace_runtime_module(
+                worker_baseline.fork_for_runtime_discovery(),
+                proc_pid,
+                target_binary.as_deref(),
+                observation,
+                &known_cookies,
+                &attempted_cookies,
+                module_limit,
+                max_unwind_rows,
+                &worker_budget,
+            )
+        })?;
 
         self.backtrace_runtime_refresh_task = Some(BacktraceRuntimeRefreshTask {
             observation,
             timeout,
             budget,
+            baseline,
             handle,
+            result: None,
         });
         info!(
             runtime_pid = observation.runtime_pid,
@@ -974,40 +1046,160 @@ impl GhostSession {
     pub async fn poll_backtrace_runtime_module_refresh(
         &mut self,
     ) -> Result<Option<BacktraceRuntimeRefreshOutcome>> {
-        let Some(task) = self.backtrace_runtime_refresh_task.as_ref() else {
+        let Some(task) = self.backtrace_runtime_refresh_task.as_mut() else {
             return Ok(None);
         };
-        if !task.handle.is_finished() {
-            return Ok(None);
+        if task.result.is_none() {
+            if !task.handle.is_finished() {
+                return Ok(None);
+            }
+            task.result = Some(
+                match (&mut task.handle).now_or_never().expect("finished worker") {
+                    Ok(result) => result,
+                    Err(error) => BacktraceRuntimeRefreshTaskOutcome::Prepared(
+                        BacktraceRuntimePreparedOutcome::Failed {
+                            attempted_cookie: None,
+                            error: format!("backtrace runtime task failed: {error}"),
+                        },
+                    ),
+                },
+            );
         }
-
+        let coordinator = Arc::clone(&self.coordinator);
+        let needs_mapping = matches!(
+            task.result,
+            Some(BacktraceRuntimeRefreshTaskOutcome::Prepared(
+                BacktraceRuntimePreparedOutcome::Loaded { .. }
+                    | BacktraceRuntimePreparedOutcome::AlreadyLoaded(_)
+                    | BacktraceRuntimePreparedOutcome::AlreadyAttempted(_)
+            ))
+        );
+        let mut coordinator = if needs_mapping {
+            match coordinator.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    anyhow::bail!("coordinator mutex poisoned")
+                }
+            }
+        } else {
+            None
+        };
         let task = self
             .backtrace_runtime_refresh_task
             .take()
             .expect("runtime refresh task was present");
-        let _observation = task.observation;
+        let observation = task.observation;
         let timeout = task.timeout;
-        let task_result = match task.handle.await {
-            Ok(result) => result,
-            Err(error) => {
-                let next_started = self
-                    .start_next_backtrace_runtime_module_refresh()?
-                    .is_some();
-                return Ok(Some(BacktraceRuntimeRefreshOutcome::Failed {
-                    error: format!("backtrace runtime module task failed: {error}"),
-                    next_started,
-                }));
+        let task_result = task.result.expect("completed worker result");
+        let mut mapping_published = true;
+        if let BacktraceRuntimeRefreshTaskOutcome::Prepared(
+            BacktraceRuntimePreparedOutcome::Loaded { resolved, .. }
+            | BacktraceRuntimePreparedOutcome::AlreadyLoaded(resolved)
+            | BacktraceRuntimePreparedOutcome::AlreadyAttempted(resolved),
+        ) = &task_result
+        {
+            let coordinator = coordinator.as_mut().expect("mapping publication guard");
+            if coordinator.apply_runtime_pid_snapshot(
+                resolved.proc_pid,
+                task.baseline
+                    .cached_offsets_with_paths_for_pid(resolved.proc_pid),
+                &resolved.entries,
+            ) {
+                BacktraceRuntimeRunner::publish_observation_pid_snapshot(
+                    coordinator,
+                    resolved.proc_pid,
+                    observation,
+                    &resolved.entries,
+                );
+                if let Some(state) = self.backtrace_runtime_observations.get_mut(&observation) {
+                    state.mapping =
+                        observation_mapping(coordinator, Some(resolved.proc_pid), observation);
+                }
+            } else {
+                // A newer PID snapshot wins, but CFI from the validated mapping
+                // remains valid under its cookie. Retain it and charge the load
+                // budget; a bounded retry can refresh offsets without parsing again.
+                mapping_published = false;
             }
-        };
+        }
+        drop(coordinator);
+
+        if let Some(state) = self
+            .backtrace_runtime_observations
+            .get_mut(&observation)
+            .filter(|_| {
+                !matches!(
+                    task_result,
+                    BacktraceRuntimeRefreshTaskOutcome::Published { .. }
+                )
+            })
+        {
+            state.finish(
+                mapping_published
+                    && !matches!(
+                        task_result,
+                        BacktraceRuntimeRefreshTaskOutcome::Prepared(
+                            BacktraceRuntimePreparedOutcome::ModuleNotFound
+                                | BacktraceRuntimePreparedOutcome::Failed { .. }
+                        )
+                    ),
+                Instant::now(),
+            );
+        }
 
         let outcome = match task_result {
-            BacktraceRuntimeRefreshTaskOutcome::Loaded {
+            BacktraceRuntimeRefreshTaskOutcome::Prepared(
+                BacktraceRuntimePreparedOutcome::Loaded {
+                    resolved,
+                    runtime_symbols,
+                    mut unwind_modules,
+                },
+            ) => {
+                self.backtrace_runtime_attempted_cookies
+                    .insert(resolved.cookie);
+                // Retain a bounded set of completed rows to seed traces attached later,
+                // including replacements attached while this publication is in flight.
+                let retained: usize = self
+                    .backtrace_runtime_unwind_modules
+                    .iter()
+                    .map(|(_, rows)| rows.len())
+                    .sum();
+                let mut remaining = self
+                    .backtrace_runtime_unwind_rows_max()
+                    .saturating_sub(retained);
+                for (_, rows) in &mut unwind_modules {
+                    rows.truncate(remaining);
+                    remaining -= rows.len();
+                }
+                self.backtrace_runtime_unwind_modules
+                    .extend(unwind_modules.clone());
+                let appender = self.trace_manager.backtrace_unwind_rows_appender();
+                let handle = tokio::spawn(async move {
+                    let append_result = appender.append(unwind_modules).await;
+                    BacktraceRuntimeRefreshTaskOutcome::Published {
+                        resolved,
+                        runtime_symbols,
+                        append_result,
+                    }
+                });
+                self.backtrace_runtime_refresh_task = Some(BacktraceRuntimeRefreshTask {
+                    observation,
+                    timeout,
+                    budget: task.budget,
+                    baseline: task.baseline,
+                    handle,
+                    result: None,
+                });
+                return Ok(None);
+            }
+            BacktraceRuntimeRefreshTaskOutcome::Published {
                 resolved,
                 runtime_symbols,
                 append_result,
             } => {
-                self.backtrace_runtime_attempted_cookies
-                    .insert(resolved.cookie);
+                // Make symbols visible with the Loaded notification that clears
+                // renderer caches, never between CFI publication phases.
                 if let Some(analyzer) = self.process_analyzer.as_mut() {
                     analyzer.add_runtime_text_symbols(resolved.cookie, runtime_symbols);
                 }
@@ -1024,7 +1216,9 @@ impl GhostSession {
                     next_started,
                 }
             }
-            BacktraceRuntimeRefreshTaskOutcome::AlreadyLoaded(resolved) => {
+            BacktraceRuntimeRefreshTaskOutcome::Prepared(
+                BacktraceRuntimePreparedOutcome::AlreadyLoaded(resolved),
+            ) => {
                 self.record_backtrace_runtime_module(resolved.cookie);
                 let next_started = self
                     .start_next_backtrace_runtime_module_refresh()?
@@ -1035,7 +1229,9 @@ impl GhostSession {
                     next_started,
                 }
             }
-            BacktraceRuntimeRefreshTaskOutcome::AlreadyAttempted => {
+            BacktraceRuntimeRefreshTaskOutcome::Prepared(
+                BacktraceRuntimePreparedOutcome::AlreadyAttempted(_),
+            ) => {
                 let next_started = self
                     .start_next_backtrace_runtime_module_refresh()?
                     .is_some();
@@ -1045,23 +1241,29 @@ impl GhostSession {
                     next_started,
                 }
             }
-            BacktraceRuntimeRefreshTaskOutcome::ModuleNotFound => {
+            BacktraceRuntimeRefreshTaskOutcome::Prepared(
+                BacktraceRuntimePreparedOutcome::ModuleNotFound,
+            ) => {
                 let next_started = self
                     .start_next_backtrace_runtime_module_refresh()?
                     .is_some();
                 BacktraceRuntimeRefreshOutcome::ModuleNotFound { next_started }
             }
-            BacktraceRuntimeRefreshTaskOutcome::TimedOut { attempted_cookie } => {
+            BacktraceRuntimeRefreshTaskOutcome::Prepared(
+                BacktraceRuntimePreparedOutcome::TimedOut { attempted_cookie },
+            ) => {
                 self.backtrace_runtime_attempted_cookies
                     .extend(attempted_cookie);
                 self.backtrace_runtime_refresh_timed_out = true;
                 self.backtrace_runtime_queued_observations.clear();
                 BacktraceRuntimeRefreshOutcome::TimedOut { timeout }
             }
-            BacktraceRuntimeRefreshTaskOutcome::Failed {
-                attempted_cookie,
-                error,
-            } => {
+            BacktraceRuntimeRefreshTaskOutcome::Prepared(
+                BacktraceRuntimePreparedOutcome::Failed {
+                    attempted_cookie,
+                    error,
+                },
+            ) => {
                 self.backtrace_runtime_attempted_cookies
                     .extend(attempted_cookie);
                 let next_started = self
@@ -1072,15 +1274,15 @@ impl GhostSession {
                     next_started,
                 }
             }
-            BacktraceRuntimeRefreshTaskOutcome::LimitReached { limit } => {
-                let next_started = self
-                    .start_next_backtrace_runtime_module_refresh()?
-                    .is_some();
+            BacktraceRuntimeRefreshTaskOutcome::Prepared(
+                BacktraceRuntimePreparedOutcome::LimitReached { limit },
+            ) => {
+                self.backtrace_runtime_queued_observations.clear();
                 if self.backtrace_runtime_limit_reported {
                     BacktraceRuntimeRefreshOutcome::Loaded {
                         modules: 0,
                         unwind_rows: 0,
-                        next_started,
+                        next_started: false,
                     }
                 } else {
                     self.backtrace_runtime_limit_reported = true;
@@ -1310,6 +1512,85 @@ mod tests {
     use crate::config::UserConfig;
 
     #[test]
+    fn terminal_observations_only_retry_after_the_mapping_changes() {
+        let now = Instant::now();
+        let mut state = BacktraceObservationState {
+            mapping: None,
+            attempts: 1,
+            retry_at: Some(now),
+        };
+        state.finish(true, now);
+        assert!(!state.should_retry(&None, now + Duration::from_secs(3600)));
+        let changed = Some((
+            42,
+            ghostscope_process::PidOffsetsEntry {
+                module_path: "late.so".into(),
+                cookie: 1,
+                offsets: Default::default(),
+                base: 0x1000,
+                size: 0x100,
+            },
+        ));
+        assert!(state.should_retry(&changed, now));
+    }
+
+    #[test]
+    fn unresolved_observations_have_bounded_exponential_retries() {
+        let now = Instant::now();
+        let mut state = BacktraceObservationState {
+            mapping: None,
+            attempts: 1,
+            retry_at: None,
+        };
+        state.finish(false, now);
+        assert!(!state.should_retry(&None, now));
+        assert!(state.should_retry(&None, now + Duration::from_secs(1)));
+        state.attempts = 2;
+        state.finish(false, now);
+        assert!(!state.should_retry(&None, now + Duration::from_secs(1)));
+        assert!(state.should_retry(&None, now + Duration::from_secs(2)));
+        state.attempts = 3;
+        state.finish(false, now);
+        assert!(!state.should_retry(&None, now + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn runtime_timeout_and_shutdown_do_not_join_a_blocked_discovery_worker() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let supervisor = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(async {
+                let timeout = Duration::from_millis(20);
+                let budget = RuntimeBacktraceLoadBudget::new(timeout);
+                spawn_backtrace_discovery(timeout, budget, move || {
+                    let _ = blocked.recv();
+                    BacktraceRuntimePreparedOutcome::ModuleNotFound
+                })
+                .unwrap()
+                .await
+                .unwrap()
+            });
+            drop(runtime);
+            finished
+                .send(matches!(
+                    result,
+                    BacktraceRuntimeRefreshTaskOutcome::Prepared(
+                        BacktraceRuntimePreparedOutcome::TimedOut { .. }
+                    )
+                ))
+                .unwrap();
+        });
+        let completed_before_release = completion.recv_timeout(Duration::from_secs(2));
+        let _ = release.send(());
+        supervisor.join().unwrap();
+        assert!(completed_before_release.unwrap());
+    }
+
+    #[test]
     fn backtrace_runtime_request_preserves_stopping_frame_identity() {
         let event = ParsedTraceEvent {
             generation: 0,
@@ -1348,6 +1629,56 @@ mod tests {
                 cookie_hint: 0x22,
                 cookie_is_authoritative: true,
             }])
+        );
+    }
+
+    #[test]
+    fn offsets_unavailable_requests_each_frame_with_only_stopping_cookie_relaxed() {
+        let event = ParsedTraceEvent {
+            generation: 0,
+            trace_id: 1,
+            timestamp: 2,
+            pid: 42,
+            tid: 43,
+            instructions: vec![ParsedInstruction::Backtrace {
+                requested_depth: 3,
+                flags: 0,
+                status: ghostscope_protocol::trace_event::BacktraceStatus::OffsetsUnavailable,
+                error_code: 0,
+                frames: vec![
+                    ghostscope_protocol::ParsedBacktraceFrame {
+                        module_cookie: 0x11,
+                        pc: 0x22,
+                        raw_ip: 0x33,
+                        flags: 0,
+                    },
+                    ghostscope_protocol::ParsedBacktraceFrame {
+                        module_cookie: 0x11,
+                        pc: 0x44,
+                        raw_ip: 0x55,
+                        flags: 0,
+                    },
+                ],
+            }],
+        };
+
+        let request = BacktraceRuntimeModuleRequest::from_events(&[event]);
+        assert_eq!(
+            request.observations,
+            BTreeSet::from([
+                BacktraceRuntimeModuleObservation {
+                    runtime_pid: 42,
+                    raw_ip: 0x33,
+                    cookie_hint: 0x11,
+                    cookie_is_authoritative: true,
+                },
+                BacktraceRuntimeModuleObservation {
+                    runtime_pid: 42,
+                    raw_ip: 0x55,
+                    cookie_hint: 0x11,
+                    cookie_is_authoritative: false,
+                },
+            ])
         );
     }
 
@@ -1408,8 +1739,186 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_new_with_config_sets_source_resolver() {
+    #[tokio::test]
+    async fn runtime_symbols_wait_for_the_cache_invalidation_outcome() {
+        let mut session = test_session();
+        session.process_analyzer = Some(
+            DwarfAnalyzer::from_pid_runtime_modules_with_config_and_debuginfod(
+                0,
+                Vec::new(),
+                &[],
+                false,
+                None,
+                |_| {},
+            )
+            .await
+            .unwrap(),
+        );
+        let observation = BacktraceRuntimeModuleObservation {
+            runtime_pid: 42,
+            raw_ip: 0x1010,
+            cookie_hint: 2,
+            cookie_is_authoritative: true,
+        };
+        let prepared = BacktraceRuntimePreparedOutcome::Loaded {
+            resolved: ResolvedBacktraceRuntimeModule {
+                observation,
+                proc_pid: 42,
+                cookie: 2,
+                module: ghostscope_dwarf::LoadedModuleRuntimeInfo {
+                    module_path: "runtime.so".into(),
+                    loaded_address: Some(0x1000),
+                    load_bias: Some(0x1000),
+                    size: 0x100,
+                },
+                entries: Vec::new(),
+                probe: None,
+            },
+            runtime_symbols: vec![ghostscope_dwarf::RuntimeTextSymbol {
+                name: "late_symbol".into(),
+                address: 0x10,
+                size: 0x10,
+            }],
+            unwind_modules: Vec::new(),
+        };
+        let timeout = Duration::from_secs(2);
+        session.backtrace_runtime_refresh_task = Some(BacktraceRuntimeRefreshTask {
+            observation,
+            timeout,
+            budget: RuntimeBacktraceLoadBudget::new(timeout),
+            baseline: Arc::new(ProcessManager::new()),
+            handle: tokio::spawn(
+                async move { BacktraceRuntimeRefreshTaskOutcome::Prepared(prepared) },
+            ),
+            result: None,
+        });
+        let published = tokio::time::timeout(timeout, async {
+            loop {
+                let outcome = session
+                    .poll_backtrace_runtime_module_refresh()
+                    .await
+                    .unwrap();
+                let symbol = session
+                    .process_analyzer
+                    .as_ref()
+                    .unwrap()
+                    .find_runtime_function_name_for_display(2, 0x10, false);
+                if let Some(outcome) = outcome {
+                    assert_eq!(symbol.as_deref(), Some("late_symbol"));
+                    break outcome;
+                }
+                // None does not invalidate renderer caches, even if parsing has
+                // finished and publication to the current actors has started.
+                assert!(symbol.is_none());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            published,
+            BacktraceRuntimeRefreshOutcome::Loaded { modules: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_cfi_survives_a_newer_mapping_and_consumes_the_load_budget() {
+        let mut session = test_session();
+        let entry = |cookie| ghostscope_process::PidOffsetsEntry {
+            module_path: "runtime.so".into(),
+            cookie,
+            offsets: Default::default(),
+            base: 0x1000,
+            size: 0x100,
+        };
+        let observation = BacktraceRuntimeModuleObservation {
+            runtime_pid: 42,
+            raw_ip: 0x1010,
+            cookie_hint: 0,
+            cookie_is_authoritative: false,
+        };
+        let baseline = Arc::new(ProcessManager::new());
+        // Sysmon has published a newer mapping before the prepared result is consumed.
+        assert!(session
+            .coordinator
+            .lock()
+            .unwrap()
+            .apply_runtime_pid_snapshot(42, None, &[entry(3)]));
+        session.backtrace_runtime_observations.insert(
+            observation,
+            BacktraceObservationState {
+                mapping: None,
+                attempts: 1,
+                retry_at: None,
+            },
+        );
+        let resolved = ResolvedBacktraceRuntimeModule {
+            observation,
+            proc_pid: 42,
+            cookie: 2,
+            module: ghostscope_dwarf::LoadedModuleRuntimeInfo {
+                module_path: "runtime.so".into(),
+                loaded_address: Some(0x1000),
+                load_bias: Some(0x1000),
+                size: 0x100,
+            },
+            entries: vec![entry(2)],
+            probe: None,
+        };
+        let timeout = Duration::from_secs(2);
+        let handle = tokio::spawn(async move {
+            BacktraceRuntimeRefreshTaskOutcome::Prepared(BacktraceRuntimePreparedOutcome::Loaded {
+                resolved,
+                runtime_symbols: Vec::new(),
+                unwind_modules: vec![(2, vec![Default::default()])],
+            })
+        });
+        session.backtrace_runtime_refresh_task = Some(BacktraceRuntimeRefreshTask {
+            observation,
+            timeout,
+            budget: RuntimeBacktraceLoadBudget::new(timeout),
+            baseline,
+            handle,
+            result: None,
+        });
+        tokio::time::timeout(timeout, async {
+            while session.backtrace_runtime_refresh_task.is_some() {
+                tokio::task::yield_now().await;
+                session
+                    .poll_backtrace_runtime_module_refresh()
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(session.backtrace_runtime_known_cookies.contains(&2));
+        assert_eq!(session.backtrace_runtime_unwind_modules.len(), 1);
+        assert_eq!(
+            backtrace_runtime_module_load_decision(
+                4,
+                &session.backtrace_runtime_known_cookies,
+                &session.backtrace_runtime_attempted_cookies,
+                1,
+            ),
+            BacktraceRuntimeModuleLoadDecision::LimitReached
+        );
+        assert!(session.backtrace_runtime_observations[&observation]
+            .retry_at
+            .is_some());
+        assert_eq!(
+            session
+                .coordinator
+                .lock()
+                .unwrap()
+                .cached_offsets_with_paths_for_pid(42)
+                .unwrap()[0]
+                .cookie,
+            3
+        );
+    }
+
+    fn test_session() -> GhostSession {
         // Create a merged config with source settings
         let args = ParsedArgs {
             binary_path: None,
@@ -1486,8 +1995,12 @@ mod tests {
             },
         };
 
-        // Create session with config - should automatically set resolver
-        let session = GhostSession::new_with_config(&resolved_config);
+        GhostSession::new_with_config(&resolved_config)
+    }
+
+    #[test]
+    fn test_new_with_config_sets_source_resolver() {
+        let session = test_session();
 
         // Verify resolver was set correctly from config
         let rules = session.source_path_resolver.get_all_rules();

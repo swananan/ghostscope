@@ -170,6 +170,9 @@ pub(super) async fn create_and_attach_loader(
             &config.backtrace_module_row_ranges,
         )
         .context("Failed to populate DWARF backtrace unwind rows")?;
+    session
+        .seed_backtrace_runtime_rows(&mut loader)
+        .context("Failed to seed completed runtime backtrace modules")?;
     loader
         .register_backtrace_tail_call_program(
             config

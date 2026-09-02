@@ -100,8 +100,9 @@ impl BacktraceUnwindRowsAppender {
 
         let modules = Arc::new(modules);
         let mut updates = Vec::with_capacity(self.targets.len());
-        // Shared pinned maps require ordered publication so actors do not race
-        // while inserting the same module rows.
+        // Loaders serialize all shared-map publishers, including initialization
+        // of newly attached traces. Visit actors in order to advance each source
+        // generation after the maps have been updated.
         for (trace_id, actor) in self.targets {
             updates.push((
                 trace_id,
@@ -709,6 +710,27 @@ mod tests {
             .get_mut(&trace_id)
             .expect("test trace should exist")
             .is_enabled = true;
+    }
+
+    #[tokio::test]
+    async fn completed_module_publication_uses_replacement_actors() {
+        use crate::trace::actor::TraceActorHandle;
+        let mut manager = TraceManager::new();
+        add_test_trace(&mut manager, 1);
+        let (old_actor, mut old_records) = TraceActorHandle::recording_backtrace_actor();
+        manager.traces.get_mut(&1).unwrap().actor = Some(old_actor);
+        // Loading starts here. All of its original traces disappear before it completes.
+        manager.delete_trace(1).await.unwrap();
+        add_test_trace(&mut manager, 2);
+        let (replacement, mut records) = TraceActorHandle::recording_backtrace_actor();
+        manager.traces.get_mut(&2).unwrap().actor = Some(replacement);
+        let result = manager
+            .backtrace_unwind_rows_appender()
+            .append(vec![(0x42, vec![Default::default()])])
+            .await;
+        manager.apply_backtrace_unwind_rows_append(result);
+        assert_eq!(records.recv().await, Some(vec![0x42]));
+        assert!(old_records.recv().await.is_none());
     }
 
     #[test]

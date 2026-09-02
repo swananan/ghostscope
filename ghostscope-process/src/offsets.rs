@@ -190,6 +190,54 @@ impl ProcessManager {
         }
     }
 
+    /// Private working copy for discovery that may outlive its caller's deadline.
+    /// It shares neither mutable caches nor snapshot publication with this manager.
+    pub fn fork_for_runtime_discovery(&self) -> Self {
+        Self {
+            module_cache: self.module_cache.clone(),
+            prefilled_modules: self.prefilled_modules.clone(),
+            pid_cache: self.pid_cache.clone(),
+            prefilled_pids: self.prefilled_pids.clone(),
+            runtime_pid_aliases: self.runtime_pid_aliases.clone(),
+        }
+    }
+
+    /// Apply discovery only if sysmon has not replaced this PID's mapping meanwhile.
+    pub fn apply_runtime_pid_snapshot(
+        &mut self,
+        pid: u32,
+        before: Option<&[PidOffsetsEntry]>,
+        after: &[PidOffsetsEntry],
+    ) -> bool {
+        if self.cached_offsets_with_paths_for_pid(pid) != before {
+            return false;
+        }
+        self.pid_cache.insert(pid, after.to_vec());
+        self.prefilled_pids.insert(pid);
+        true
+    }
+
+    /// Retain the ELF mapping after validating the opened descriptor against /proc.
+    pub fn probe_runtime_module(pid: u32, entry: &PidOffsetsEntry) -> Result<ModuleProbe> {
+        let maps = read_proc_maps(pid)?;
+        let probe = ModuleProbe::open(&entry.module_path)?;
+        let opened = ModuleMapIdentityKey::from_metadata(probe.metadata());
+        let matches = maps
+            .iter()
+            .any(|mapped| runtime_module_matches_map(pid, entry, &opened, mapped));
+        anyhow::ensure!(
+            matches && probe.cookie() == entry.cookie,
+            "runtime module identity changed while opening {}: opened {:?}, \
+             mapping_match={}, expected_cookie={:#x}, opened_cookie={:#x}",
+            entry.module_path,
+            opened,
+            matches,
+            entry.cookie,
+            probe.cookie()
+        );
+        Ok(probe)
+    }
+
     pub fn ensure_prefill_module(&mut self, module_path: &str) -> Result<usize> {
         if self.prefilled_modules.contains(module_path) {
             return Ok(0);
@@ -711,6 +759,29 @@ fn proc_root_module_path(pid: u32, mapped_path: &str) -> Option<String> {
         .then(|| format!("/proc/{pid}/root{mapped_path}"))
 }
 
+fn runtime_module_matches_map(
+    pid: u32,
+    entry: &PidOffsetsEntry,
+    opened: &ModuleMapIdentityKey,
+    mapped: &OwnedProcMapEntry,
+) -> bool {
+    let identity = ModuleMapIdentityKey::from_entry(mapped);
+    // The access path can be rooted through /proc even though maps contains the
+    // target's absolute path. Strip only this exact PID's root for the existing
+    // overlayfs same-inode/path fallback; never relax inode or cookie checks.
+    let proc_root = format!("/proc/{pid}/root");
+    let mapped_path = entry
+        .module_path
+        .strip_prefix(&proc_root)
+        .filter(|path| path.starts_with('/'))
+        .unwrap_or(&entry.module_path);
+    mapped.executable()
+        && mapped.start >= entry.base
+        && mapped.start < entry.base.saturating_add(entry.size)
+        && (identity == *opened
+            || (identity.inode == opened.inode && mapped.normalized_path() == Some(mapped_path)))
+}
+
 fn is_same_executable_as_current(pid: u32) -> bool {
     // Strongest signal: dev+ino equality on /proc/*/exe
     let self_meta = fs::metadata("/proc/self/exe");
@@ -748,6 +819,59 @@ fn is_same_executable_as_current(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn detached_discovery_cannot_publish_or_overwrite_newer_pid_mappings() {
+        let entry = |cookie| PidOffsetsEntry {
+            module_path: "module.so".into(),
+            cookie,
+            offsets: Default::default(),
+            base: 0x1000,
+            size: 0x100,
+        };
+        let mut manager = ProcessManager::new();
+        manager.upsert_pid_offset(42, entry(1));
+        let baseline = manager.fork_for_runtime_discovery();
+        let mut worker = baseline.fork_for_runtime_discovery();
+        worker.upsert_pid_offset(42, entry(2));
+        assert_eq!(
+            manager.cached_offsets_with_paths_for_pid(42).unwrap()[0].cookie,
+            1
+        );
+        manager.upsert_pid_offset(42, entry(3));
+        assert!(!manager.apply_runtime_pid_snapshot(
+            42,
+            baseline.cached_offsets_with_paths_for_pid(42),
+            worker.cached_offsets_with_paths_for_pid(42).unwrap(),
+        ));
+        assert_eq!(
+            manager.cached_offsets_with_paths_for_pid(42).unwrap()[0].cookie,
+            3
+        );
+    }
+
+    #[test]
+    fn runtime_probe_rejects_a_replacement_with_the_same_build_id() {
+        let pid = std::process::id();
+        let executable = std::env::current_exe().unwrap();
+        let mut manager = ProcessManager::new();
+        manager.ensure_prefill_pid(pid).unwrap();
+        let mut entry = manager
+            .cached_offsets_with_paths_for_pid(pid)
+            .unwrap()
+            .iter()
+            .find(|entry| Path::new(&entry.module_path) == executable)
+            .unwrap()
+            .clone();
+        let temp = tempfile::tempdir().unwrap();
+        let replacement = temp.path().join("replacement");
+        fs::copy(&executable, &replacement).unwrap();
+        entry.module_path = replacement.to_str().unwrap().into();
+        assert_eq!(
+            ModuleProbe::open(&entry.module_path).unwrap().cookie(),
+            entry.cookie
+        );
+        assert!(ProcessManager::probe_runtime_module(pid, &entry).is_err());
+    }
     use crate::proc_maps::parse_maps_line;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1035,6 +1159,37 @@ mod tests {
         assert_eq!(summary.size(), 0x4000);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn runtime_probe_accepts_proc_root_overlay_identity_without_accepting_replacements() {
+        let mapped: OwnedProcMapEntry =
+            parse_maps_line("1000-2000 r-xp 00000000 00:01 42 /usr/lib/libc.so.6")
+                .unwrap()
+                .into();
+        let mut opened = ModuleMapIdentityKey {
+            dev_major: 0,
+            dev_minor: 2,
+            inode: 42,
+        };
+        let mut entry = PidOffsetsEntry {
+            module_path: "/proc/123/root/usr/lib/libc.so.6".into(),
+            cookie: 1,
+            offsets: Default::default(),
+            base: 0x1000,
+            size: 0x1000,
+        };
+        assert!(runtime_module_matches_map(123, &entry, &opened, &mapped));
+        assert!(!runtime_module_matches_map(124, &entry, &opened, &mapped));
+        opened.inode = 43;
+        assert!(!runtime_module_matches_map(123, &entry, &opened, &mapped));
+        opened.inode = 42;
+        entry.module_path = "/proc/123/root/usr/lib/replacement.so".into();
+        assert!(!runtime_module_matches_map(123, &entry, &opened, &mapped));
+        entry.module_path = "/proc/123/rooted/usr/lib/libc.so.6".into();
+        assert!(!runtime_module_matches_map(123, &entry, &opened, &mapped));
+        entry.module_path = "/usr/lib/libc.so.6".into();
+        assert!(runtime_module_matches_map(123, &entry, &opened, &mapped));
     }
 
     #[test]

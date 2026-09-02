@@ -4,46 +4,41 @@ use memmap2::{Mmap, MmapOptions};
 use object::Object;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
 
+#[derive(Debug)]
 pub struct ModuleProbe {
     metadata_cookie: u64,
-    mmap: Mmap,
-}
-
-struct ValidatedModulePath {
-    resolved_path: PathBuf,
     metadata: fs::Metadata,
+    mmap: Mmap,
 }
 
 impl ModuleProbe {
     pub fn open(module_path: &str) -> Result<Self> {
         let normalized_path = normalize_cookie_path(module_path);
         let validated = validate_module_path(&normalized_path)?;
+        Self::from_validated_file(validated)
+    }
 
-        // Open the resolved regular file so common launcher symlinks like
-        // `/bin/sh` and `/usr/bin/python3` continue to probe correctly.
-        // `O_NOFOLLOW` still protects the final open against a symlink swap
-        // after resolution.
+    fn from_validated_file(validated: fs::File) -> Result<Self> {
+        // Reopen the retained O_PATH descriptor, not a canonicalized pathname:
+        // resolving /proc/<pid>/root in userspace can select a host-side file
+        // instead of the target's file in another mount namespace. The retained
+        // descriptor also prevents replacement or symlink swaps after validation.
+        let validated_metadata = validated.metadata()?;
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&validated.resolved_path)?;
+            .custom_flags(libc::O_CLOEXEC)
+            .open(format!("/proc/self/fd/{}", validated.as_raw_fd()))?;
         let meta = file.metadata()?;
-        if !meta.file_type().is_file() {
-            anyhow::bail!(
-                "refusing to read non-regular file {}",
-                validated.resolved_path.display()
-            );
-        }
-        if meta.dev() != validated.metadata.dev() || meta.ino() != validated.metadata.ino() {
-            anyhow::bail!(
-                "module path changed while opening {}",
-                validated.resolved_path.display()
-            );
-        }
+        anyhow::ensure!(
+            meta.file_type().is_file()
+                && meta.dev() == validated_metadata.dev()
+                && meta.ino() == validated_metadata.ino(),
+            "module identity changed while reopening validated descriptor"
+        );
 
         let dev = meta.dev();
         let ino = meta.ino();
@@ -56,8 +51,18 @@ impl ModuleProbe {
 
         Ok(Self {
             metadata_cookie,
+            metadata: meta,
             mmap,
         })
+    }
+
+    /// Identity of the descriptor backing this mapping, not a later path lookup.
+    pub fn metadata(&self) -> &fs::Metadata {
+        &self.metadata
+    }
+
+    pub fn into_mmap(self) -> Mmap {
+        self.mmap
     }
 
     pub fn object(&self) -> Result<object::File<'_>> {
@@ -89,30 +94,42 @@ pub fn cookie_for_path(module_path: &str) -> u64 {
         .unwrap_or_else(|_| stable_hash(&normalize_cookie_path(module_path)))
 }
 
-fn validate_module_path(path: &str) -> Result<ValidatedModulePath> {
+fn validate_module_path(path: &str) -> Result<fs::File> {
     // `/proc/<pid>/maps` is not a trustworthy module list. Reject procfs/sysfs
-    // paths up front, then resolve symlinks to the final target and insist that
-    // the resolved object is a regular file before it reaches the ELF path.
+    // paths up front. O_PATH follows launcher symlinks without opening devices
+    // or blocking on FIFOs; inspect the retained object before reading any data.
     let input_is_proc_root = is_safe_proc_root_path(path);
     if is_filtered_module_prefix(path) && !input_is_proc_root {
         anyhow::bail!("refusing to read pseudo-filesystem path {path}");
     }
 
-    let resolved_path = fs::canonicalize(path)?;
-    let resolved_str = resolved_path.to_string_lossy();
-    let resolved_is_safe_proc_root = input_is_proc_root && is_safe_proc_root_path(&resolved_str);
-    if is_filtered_module_prefix(&resolved_str) && !resolved_is_safe_proc_root {
-        anyhow::bail!("refusing to read pseudo-filesystem path {resolved_str}");
-    }
-    let meta = fs::metadata(&resolved_path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(path)?;
+    let meta = file.metadata()?;
     if !meta.file_type().is_file() {
-        anyhow::bail!("refusing to read non-regular file {resolved_str}");
+        anyhow::bail!("refusing to read non-regular file {path}");
     }
 
-    Ok(ValidatedModulePath {
-        resolved_path,
-        metadata: meta,
-    })
+    // Check the actual filesystem too: symlinks and proc-root paths can conceal
+    // a procfs/sysfs file behind an otherwise ordinary pathname.
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: file owns a live descriptor and filesystem points to writable
+    // storage of the exact type and size expected by fstatfs.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: successful fstatfs initialized the entire output structure.
+    let filesystem = unsafe { filesystem.assume_init() };
+    if matches!(
+        filesystem.f_type,
+        libc::PROC_SUPER_MAGIC | libc::SYSFS_MAGIC
+    ) {
+        anyhow::bail!("refusing to read pseudo-filesystem path {path}");
+    }
+
+    Ok(file)
 }
 
 fn is_safe_proc_root_path(path: &str) -> bool {
@@ -220,5 +237,40 @@ mod tests {
 
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn retains_validated_file_after_path_replacement() {
+        let base = std::env::temp_dir().join(format!(
+            "ghostscope-module-probe-replacement-{}",
+            std::process::id()
+        ));
+        let replaced = base.with_extension("replaced");
+        std::fs::write(&base, b"original module").unwrap();
+        let validated = validate_module_path(base.to_str().unwrap()).unwrap();
+        std::fs::rename(&base, &replaced).unwrap();
+        std::fs::write(&base, b"replacement module").unwrap();
+
+        let probe = ModuleProbe::from_validated_file(validated).unwrap();
+        assert_eq!(&probe.mmap[..], b"original module");
+        assert_ne!(
+            probe.metadata().ino(),
+            std::fs::metadata(&base).unwrap().ino()
+        );
+
+        std::fs::remove_file(&base).unwrap();
+        std::fs::remove_file(&replaced).unwrap();
+    }
+
+    #[test]
+    fn rejects_symlinks_to_pseudo_filesystems() {
+        let link = std::env::temp_dir().join(format!(
+            "ghostscope-module-probe-proc-link-{}",
+            std::process::id()
+        ));
+        symlink("/proc/self/maps", &link).unwrap();
+        let err = ModuleProbe::open(link.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("pseudo-filesystem path"));
+        std::fs::remove_file(&link).unwrap();
     }
 }
