@@ -2117,30 +2117,19 @@ trace dlopen_lib_leaf {
     }
     anyhow::ensure!(exit_code == 0, "stderr={stderr} stdout={stdout}");
 
-    let blocks = backtrace_blocks_after(&stdout, "T_MODE_DLOPEN_SHARED_LIBRARY_STACK", 6)?;
-    let refreshed_block = blocks
-        .iter()
-        .find(|block| {
-            block.contains("dlopen_lib_driver")
-                && block.contains("[backtrace_dlopen_program+")
-                && !block.contains("<proc offsets unavailable>")
-                && !block.contains("stopped: offsets unavailable")
-                && !block.contains("stopped: no unwind rows for PC")
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "expected a shared-library target dlopen backtrace block to unwind into the main executable\n\
-                 STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-            )
-        })?;
-    assert_ordered_patterns(
-        refreshed_block,
-        &[
-            "#0 dlopen_lib_leaf",
-            "#1 dlopen_lib_middle",
-            "#2 dlopen_lib_driver",
-            "#3 main",
-        ],
+    let expected_frames = [
+        "#0 dlopen_lib_leaf",
+        "#1 dlopen_lib_middle",
+        "#2 dlopen_lib_driver",
+        "#3 main",
+    ];
+    let refreshed_block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "T_MODE_DLOPEN_SHARED_LIBRARY_STACK",
+        6,
+        "a shared-library target dlopen backtrace symbolized through the main executable",
+        &expected_frames,
     )?;
     assert!(
         !refreshed_block.contains("<proc offsets unavailable>")
