@@ -40,6 +40,7 @@ use std::num::NonZeroU32;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 use std::task::Poll;
 use std::time::Instant;
 use std::{io, ops::ControlFlow};
@@ -51,6 +52,20 @@ const MAX_EVENTS_PER_WAIT: usize = 128;
 const MAX_RINGBUF_RECORDS_PER_WAIT: usize = 256;
 const PERF_READ_BATCH_SIZE: usize = 64;
 const EVENT_LOSS_OUTPUT_FAILURES_KEY: u32 = 0;
+
+// The pinned CFI maps are scoped to this GhostScope process, not to one loader.
+// Hold this across reading row_end, allocating rows, and publishing their range.
+static BACKTRACE_CFI_PUBLICATION: Mutex<()> = Mutex::new(());
+
+fn backtrace_cfi_publication_guard(shared: bool) -> Result<Option<MutexGuard<'static, ()>>> {
+    shared
+        .then(|| {
+            BACKTRACE_CFI_PUBLICATION.lock().map_err(|_| {
+                LoaderError::Generic("shared backtrace CFI publication lock poisoned".into())
+            })
+        })
+        .transpose()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EventLossStats {
@@ -1412,12 +1427,18 @@ impl GhostScopeLoader {
             return Ok(());
         }
 
-        if ranges.is_empty() || !self.shared_backtrace_maps {
+        if !self.shared_backtrace_maps {
             self.populate_backtrace_unwind_rows(rows)?;
             self.populate_backtrace_module_row_ranges(ranges)?;
             return Ok(());
         }
 
+        if ranges.is_empty() {
+            return Err(LoaderError::Generic(
+                "shared backtrace rows require module ranges for atomic publication".into(),
+            ));
+        }
+        let _publication = backtrace_cfi_publication_guard(true)?;
         self.sync_shared_backtrace_row_state()?;
         for (cookie, range) in ranges.iter().copied() {
             if self.backtrace_module_row_cookies.contains(&cookie) {
@@ -1456,6 +1477,11 @@ impl GhostScopeLoader {
     }
 
     pub fn populate_backtrace_unwind_rows(&mut self, rows: &[BacktraceUnwindRow]) -> Result<()> {
+        if self.shared_backtrace_maps {
+            return Err(LoaderError::Generic(
+                "use combined row and range publication for shared backtrace maps".into(),
+            ));
+        }
         if rows.is_empty() {
             return Ok(());
         }
@@ -1490,6 +1516,11 @@ impl GhostScopeLoader {
         &mut self,
         ranges: &[(u64, BacktraceModuleRowRange)],
     ) -> Result<()> {
+        if self.shared_backtrace_maps {
+            return Err(LoaderError::Generic(
+                "use combined row and range publication for shared backtrace maps".into(),
+            ));
+        }
         if ranges.is_empty() {
             return Ok(());
         }
@@ -1524,6 +1555,7 @@ impl GhostScopeLoader {
         cookie: u64,
         rows: &[BacktraceUnwindRow],
     ) -> Result<Option<BacktraceModuleRowRange>> {
+        let _publication = backtrace_cfi_publication_guard(self.shared_backtrace_maps)?;
         if self.shared_backtrace_maps {
             self.sync_shared_backtrace_row_state()?;
         }
@@ -1624,6 +1656,7 @@ impl GhostScopeLoader {
         &mut self,
         modules: &[(u64, Vec<BacktraceUnwindRow>)],
     ) -> Result<BacktraceUnwindRowsAppendStats> {
+        let _publication = backtrace_cfi_publication_guard(self.shared_backtrace_maps)?;
         let mut stats = BacktraceUnwindRowsAppendStats::default();
         if self.shared_backtrace_maps {
             self.sync_shared_backtrace_row_state()?;

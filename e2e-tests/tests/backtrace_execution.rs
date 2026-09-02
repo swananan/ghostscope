@@ -1970,6 +1970,14 @@ trace dlopen_main_after_limit_heartbeat {
         refresh_count >= metadata_load_count,
         "each metadata load should have a corresponding identity resolution, got {metadata_load_count} loads and {refresh_count} resolutions\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
+    let stderr_after_limit = stderr
+        .split_once(&warning)
+        .map(|(_, remainder)| remainder)
+        .expect("the limit warning count was checked above");
+    assert!(
+        !stderr_after_limit.contains("Resolving one backtrace runtime module in the background"),
+        "runtime module discovery should stop after the terminal limit warning\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
     assert_eq!(
         metadata_load_count,
         MODULE_LIMIT as usize,

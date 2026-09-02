@@ -1,7 +1,7 @@
 //! Lightweight runtime unwind loading for modules discovered after tracing starts.
 
 use crate::{binary::MappedFile, objfile::ModuleUnwindInfo, CompactUnwindTable, ModuleId, Result};
-use anyhow::Context;
+use ghostscope_process::module_probe::ModuleProbe;
 use object::{Object, ObjectSymbol, SymbolKind};
 use std::{
     path::PathBuf,
@@ -68,14 +68,17 @@ impl RuntimeBacktraceLoadBudget {
 /// after the compact rows and bounded symbol list have been built.
 pub fn load_runtime_backtrace_metadata(
     module_path: PathBuf,
+    probe: ModuleProbe,
     max_rows: usize,
     budget: &RuntimeBacktraceLoadBudget,
 ) -> Result<RuntimeBacktraceMetadata> {
     budget.check()?;
-    let mapped_file = Arc::new(
-        MappedFile::open(&module_path)
-            .with_context(|| format!("Failed to map runtime module {}", module_path.display()))?,
-    );
+    // Keep the exact descriptor-backed mapping validated during discovery.
+    // Reopening module_path here could parse a replacement under the old cookie.
+    let mapped_file = Arc::new(MappedFile {
+        data: probe.into_mmap(),
+        path: module_path.clone(),
+    });
     budget.check()?;
     let text_symbols = collect_text_symbols(&mapped_file, budget)?;
     budget.check()?;
@@ -170,10 +173,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pathname_replacement_does_not_replace_the_validated_elf_mapping() {
+        fn elf_with_symbol(name: &str) -> Vec<u8> {
+            let mut object = object::write::Object::new(
+                object::BinaryFormat::Elf,
+                object::Architecture::X86_64,
+                object::Endianness::Little,
+            );
+            let text = object.section_id(object::write::StandardSection::Text);
+            object.append_section_data(text, &[0x90; 16], 1);
+            object.add_symbol(object::write::Symbol {
+                name: name.as_bytes().to_vec(),
+                value: 1,
+                size: 1,
+                kind: object::SymbolKind::Text,
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section: object::write::SymbolSection::Section(text),
+                flags: object::SymbolFlags::None,
+            });
+            object.write().unwrap()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("module.so");
+        let replacement = dir.path().join("replacement.so");
+        std::fs::write(&path, elf_with_symbol("original_function")).unwrap();
+        let probe = ModuleProbe::open(path.to_str().unwrap()).unwrap();
+        std::fs::write(&replacement, elf_with_symbol("replacement_function")).unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert_ne!(
+            probe.cookie(),
+            ModuleProbe::open(path.to_str().unwrap()).unwrap().cookie()
+        );
+        let budget = RuntimeBacktraceLoadBudget::new(Duration::from_secs(5));
+        let metadata = load_runtime_backtrace_metadata(path, probe, 16, &budget).unwrap();
+        assert!(metadata
+            .text_symbols
+            .iter()
+            .any(|s| s.name == "original_function"));
+        assert!(!metadata
+            .text_symbols
+            .iter()
+            .any(|s| s.name == "replacement_function"));
+    }
+
+    #[test]
     fn loads_bounded_backtrace_metadata_without_a_full_dwarf_analyzer() {
         let executable = std::env::current_exe().expect("test executable path");
         let budget = RuntimeBacktraceLoadBudget::new(Duration::from_secs(5));
-        let metadata = load_runtime_backtrace_metadata(executable, 1, &budget)
+        let probe = ModuleProbe::open(executable.to_str().unwrap()).unwrap();
+        let metadata = load_runtime_backtrace_metadata(executable, probe, 1, &budget)
             .expect("runtime backtrace metadata load");
         let table = metadata
             .unwind_table
@@ -185,12 +234,13 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_budget_stops_before_mapping_a_module() {
+    fn cancelled_budget_stops_before_parsing_a_module() {
         let executable = std::env::current_exe().expect("test executable path");
         let budget = RuntimeBacktraceLoadBudget::new(Duration::from_secs(5));
         budget.cancel();
 
-        let error = load_runtime_backtrace_metadata(executable, 1, &budget)
+        let probe = ModuleProbe::open(executable.to_str().unwrap()).unwrap();
+        let error = load_runtime_backtrace_metadata(executable, probe, 1, &budget)
             .expect_err("cancelled runtime load should fail");
 
         assert!(error.to_string().contains("cancelled"));

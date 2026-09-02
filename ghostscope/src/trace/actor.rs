@@ -71,6 +71,28 @@ pub(super) struct TraceActorHandle {
 }
 
 impl TraceActorHandle {
+    #[cfg(test)]
+    pub(super) fn recording_backtrace_actor() -> (Self, mpsc::UnboundedReceiver<Vec<u64>>) {
+        let (command_sender, mut commands) = mpsc::channel(TRACE_COMMAND_CHANNEL_CAPACITY);
+        let (record, records) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                match command {
+                    TraceCommand::AppendBacktraceRows { modules, response } => {
+                        let _ = record.send(modules.iter().map(|(cookie, _)| *cookie).collect());
+                        let _ = response.send(Ok(TraceActorBacktraceUpdate::default()));
+                    }
+                    TraceCommand::Delete(response) => {
+                        let _ = response.send(Ok(()));
+                        break;
+                    }
+                    _ => panic!("unexpected test actor command"),
+                }
+            }
+        });
+        (Self { command_sender }, records)
+    }
+
     pub async fn enable(&self) -> Result<()> {
         self.request(TraceCommand::Enable).await
     }

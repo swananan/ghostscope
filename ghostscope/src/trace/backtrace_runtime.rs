@@ -21,16 +21,18 @@ impl BacktraceRuntimeModuleObservation {
 }
 
 /// A stopping-frame observation resolved against one exact process snapshot.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ResolvedBacktraceRuntimeModule {
     pub observation: BacktraceRuntimeModuleObservation,
     pub proc_pid: u32,
     pub cookie: u64,
     pub module: LoadedModuleRuntimeInfo,
+    pub entries: Vec<PidOffsetsEntry>,
+    pub probe: Option<Box<ghostscope_process::module_probe::ModuleProbe>>,
 }
 
 /// Result of matching an observation to a current process mapping.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum BacktraceRuntimeModuleResolution {
     Resolved(ResolvedBacktraceRuntimeModule),
     Unavailable,
@@ -88,16 +90,6 @@ impl BacktraceRuntimeRunner {
             match coordinator.refresh_module_for_runtime_ip(proc_pid, observation.raw_ip) {
                 Ok(Some(entry)) => Some(entry),
                 Ok(None) => {
-                    let entries = coordinator
-                        .cached_offsets_with_paths_for_pid(proc_pid)
-                        .unwrap_or_default()
-                        .to_vec();
-                    Self::publish_observation_pid_snapshot(
-                        coordinator,
-                        proc_pid,
-                        observation,
-                        &entries,
-                    );
                     return BacktraceRuntimeModuleResolution::Unavailable;
                 }
                 Err(error) => {
@@ -106,16 +98,6 @@ impl BacktraceRuntimeRunner {
                         proc_pid,
                         observation.raw_ip,
                         error
-                    );
-                    let entries = coordinator
-                        .cached_offsets_with_paths_for_pid(proc_pid)
-                        .unwrap_or_default()
-                        .to_vec();
-                    Self::publish_observation_pid_snapshot(
-                        coordinator,
-                        proc_pid,
-                        observation,
-                        &entries,
                     );
                     return BacktraceRuntimeModuleResolution::Unavailable;
                 }
@@ -142,7 +124,6 @@ impl BacktraceRuntimeRunner {
             }
             None => runtime_entry_for_observation(&entries, observation).cloned(),
         };
-        Self::publish_observation_pid_snapshot(coordinator, proc_pid, observation, &entries);
         let Some(entry) = entry else {
             return BacktraceRuntimeModuleResolution::Unavailable;
         };
@@ -156,11 +137,20 @@ impl BacktraceRuntimeRunner {
             return BacktraceRuntimeModuleResolution::IdentityChanged;
         }
 
+        let probe = match ProcessManager::probe_runtime_module(proc_pid, &entry) {
+            Ok(probe) => probe,
+            Err(error) => {
+                tracing::debug!("Could not retain validated runtime module: {error:#}");
+                return BacktraceRuntimeModuleResolution::IdentityChanged;
+            }
+        };
         BacktraceRuntimeModuleResolution::Resolved(ResolvedBacktraceRuntimeModule {
             observation,
             proc_pid,
             cookie: entry.cookie,
             module: runtime_module_from_entry(&entry),
+            entries,
+            probe: Some(Box::new(probe)),
         })
     }
 
@@ -222,7 +212,7 @@ impl BacktraceRuntimeRunner {
         }
     }
 
-    fn publish_observation_pid_snapshot(
+    pub(crate) fn publish_observation_pid_snapshot(
         coordinator: &mut ProcessManager,
         proc_pid: u32,
         observation: BacktraceRuntimeModuleObservation,
