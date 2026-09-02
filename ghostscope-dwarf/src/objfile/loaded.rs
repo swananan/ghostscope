@@ -180,6 +180,20 @@ impl LoadedObjfile {
             .collect()
     }
 
+    /// Return every function name that can seed an address lookup.
+    ///
+    /// DWARF/GDB indexes provide source-aware names, while the ELF symbol cache
+    /// keeps exact tracing available for stripped modules. Prefix lookup must
+    /// consider both sources so it has the same attachability semantics as an
+    /// exact function lookup.
+    pub(crate) fn get_attachable_function_names(&self) -> Vec<String> {
+        let mut names = self.get_function_names();
+        names.extend(self.text_symbol_starts_by_name.keys().cloned());
+        names.sort();
+        names.dedup();
+        names
+    }
+
     pub(crate) fn get_variable_names(&self) -> Vec<String> {
         if let Some(index) = &self.gdb_index {
             match index.symbol_names(GdbSymbolKind::Variable) {

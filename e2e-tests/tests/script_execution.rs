@@ -677,6 +677,202 @@ async fn run_ghostscope_with_script(
 }
 
 #[tokio::test]
+async fn test_wildcard_function_tracing_compiles_prefix() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("sample_program")?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load DWARF for sample_program: {e}"))?;
+    let script_content = r#"
+trace get_* {
+    print "WILDCARD_COMPILE";
+}
+"#;
+    let binary_path_string = binary_path.to_string_lossy().into_owned();
+    let compile_options = ghostscope_compiler::CompileOptions {
+        binary_path_hint: Some(binary_path_string.clone()),
+        target_binary_path: Some(binary_path_string),
+        ..Default::default()
+    };
+    let result = ghostscope_compiler::compile_script(
+        script_content,
+        &analyzer,
+        None,
+        Some(1),
+        &compile_options,
+    )
+    .map_err(|e| anyhow::anyhow!("wildcard compile_script failed: {e}"))?;
+
+    let function_names: std::collections::HashSet<_> = result
+        .uprobe_configs
+        .iter()
+        .filter_map(|config| config.function_name.as_deref())
+        .collect();
+    assert!(function_names.contains("get_random_value"));
+    assert!(function_names.contains("get_string_length"));
+    assert!(function_names.iter().all(|name| name.starts_with("get_")));
+    assert!(result.uprobe_configs.iter().all(|config| matches!(
+        &config.trace_pattern,
+        ghostscope_compiler::script::TracePattern::Wildcard(pattern) if pattern == "get_*"
+    )));
+
+    let mut next_index_by_function = std::collections::HashMap::new();
+    for config in &result.uprobe_configs {
+        let function_name = config
+            .function_name
+            .as_deref()
+            .expect("wildcard config should keep its concrete function name");
+        let expected_index = next_index_by_function
+            .entry(function_name)
+            .or_insert(1usize);
+        assert_eq!(config.resolved_address_index, Some(*expected_index));
+        *expected_index += 1;
+
+        // TUI persistence rewrites an expanded wildcard probe to its concrete
+        // function and reloads it with this index. Verify that round trip picks
+        // the same module address instead of applying a wildcard-global index.
+        let replay_script = format!("trace {function_name} {{ print \"WILDCARD_REPLAY\"; }}");
+        let replay_options = ghostscope_compiler::CompileOptions {
+            selected_index: config.resolved_address_index,
+            ..compile_options.clone()
+        };
+        let replayed = ghostscope_compiler::compile_script(
+            &replay_script,
+            &analyzer,
+            None,
+            Some(1),
+            &replay_options,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("failed to replay wildcard target {function_name}: {error}")
+        })?;
+        assert_eq!(replayed.uprobe_configs.len(), 1);
+        assert_eq!(
+            replayed.uprobe_configs[0].function_address,
+            config.function_address
+        );
+        assert_eq!(replayed.uprobe_configs[0].binary_path, config.binary_path);
+    }
+
+    let bounded = analyzer.lookup_function_addresses_by_prefix("get_", Some(&binary_path), 1);
+    assert_eq!(bounded.len(), 1, "prefix lookup must honor its bound");
+
+    let indexed_options = ghostscope_compiler::CompileOptions {
+        selected_index: Some(2),
+        ..compile_options.clone()
+    };
+    let indexed_error = ghostscope_compiler::compile_script(
+        script_content,
+        &analyzer,
+        None,
+        Some(1),
+        &indexed_options,
+    )
+    .expect_err("an indexed wildcard must be rejected");
+    let indexed_message = indexed_error.user_message();
+    assert!(indexed_message.contains("does not support an address index"));
+    assert!(indexed_message.contains("exact function name"));
+
+    let error = ghostscope_compiler::compile_script(
+        r#"trace wildcard_target_that_does_not_exist_* { print "UNREACHABLE"; }"#,
+        &analyzer,
+        None,
+        Some(1),
+        &compile_options,
+    )
+    .expect_err("a wildcard without matching functions must fail cleanly");
+    let message = error.user_message();
+    assert!(message.contains("wildcard_target_that_does_not_exist_*"));
+    assert!(message.contains("No addresses resolved for wildcard"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_wildcard_function_tracing_matches_elf_only_symbols() -> anyhow::Result<()> {
+    init();
+    common::ensure_test_program_compiled_with_opt(OptimizationLevel::Stripped)?;
+
+    let stripped =
+        FIXTURES.get_test_binary_with_opt("sample_program", OptimizationLevel::Stripped)?;
+    let tempdir = tempfile::tempdir()?;
+    let symbol_only_binary = tempdir.path().join("sample_program_symbol_only");
+    std::fs::copy(&stripped, &symbol_only_binary)?;
+
+    // The copied binary keeps its ELF symbols, but its .gnu_debuglink target is
+    // deliberately absent from the temporary directory.
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&symbol_only_binary)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to load symbol-only fixture: {error}"))?;
+    assert!(
+        !analyzer
+            .get_all_function_names()
+            .iter()
+            .any(|name| name.starts_with("get_")),
+        "fixture unexpectedly loaded DWARF function names"
+    );
+    assert!(
+        !analyzer
+            .lookup_function_addresses("get_string_length")
+            .is_empty(),
+        "exact tracing should resolve the ELF text symbol"
+    );
+
+    let matches =
+        analyzer.lookup_function_addresses_by_prefix("get_", Some(&symbol_only_binary), 65);
+    let function_names: std::collections::HashSet<_> = matches
+        .iter()
+        .map(|matched| matched.function_name.as_str())
+        .collect();
+    assert!(function_names.contains("get_random_value"));
+    assert!(function_names.contains("get_string_length"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_wildcard_function_tracing_expands_prefix() -> anyhow::Result<()> {
+    init();
+    ensure_global_cleanup_registered();
+
+    let script_content = r#"
+trace get_* {
+    print "WILDCARD_PC={:p}", cast($pc, "unsigned char *");
+}
+"#;
+    let target = get_global_test_target_with_opt(OptimizationLevel::Debug).await?;
+    let binary_path = FIXTURES.get_test_binary("sample_program")?;
+    let (exit_code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(script_content)
+        .with_target(binary_path)
+        .attach_to(&target)
+        .timeout_secs(6)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await?;
+    assert_eq!(
+        exit_code, 0,
+        "wildcard tracing failed: stderr={stderr}\nstdout={stdout}"
+    );
+
+    let pcs: std::collections::HashSet<String> = stdout
+        .lines()
+        .filter_map(|line| line.split_once("WILDCARD_PC=").map(|(_, value)| value))
+        .map(|value| {
+            value
+                .chars()
+                .take_while(|ch| ch.is_ascii_hexdigit() || *ch == 'x')
+                .collect::<String>()
+        })
+        .filter(|pc| !pc.is_empty())
+        .collect();
+    assert!(
+        pcs.len() >= 2,
+        "expected events from at least two get_* functions, got {pcs:?}; stdout={stdout}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_capture_len_uses_scalar_script_var_from_dwarf_expr() -> anyhow::Result<()> {
     init();
 

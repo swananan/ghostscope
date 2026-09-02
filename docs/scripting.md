@@ -70,6 +70,7 @@ trace <pattern> {
 ### Trace Patterns
 
 #### Function Name
+
 ```ghostscope
 trace main {
     print "Main called";
@@ -80,7 +81,29 @@ trace calculate_something {
 }
 ```
 
+#### Function-Name Prefix Wildcard
+
+```ghostscope
+trace get_* {
+    print "A get_ function was called";
+}
+```
+
+The wildcard syntax is a literal function-name prefix followed by one trailing
+`*`. For example, `get_*` matches `get_random_value` and
+`get_string_length`; it is not a general glob or regular expression. GhostScope
+creates one probe for every concrete resolved address, ordered by function
+name, module path, and address. Aliases at the same module address are attached
+only once. Candidate names come from both DWARF/GDB function indexes and ELF
+text symbols, so prefix matching remains available for symbol-only modules.
+
+A wildcard can expand to at most 64 concrete addresses. Narrow the prefix or
+use an exact function name if it exceeds that safety limit. In PID-only mode,
+matching covers all modules known when tracing starts; add `-t <binary>` to
+scope a broad prefix to one module.
+
 #### Source Line
+
 ```ghostscope
 // Trace a specific file and line
 trace sample.c:42 {
@@ -94,6 +117,7 @@ trace /home/user/project/src/utils.c:100 {
 ```
 
 #### Address
+
 ```ghostscope
 // Module-relative virtual address (DWARF/symbol PC)
 trace 0x401234 {
@@ -107,7 +131,7 @@ trace libc.so.6:0x1234 {
 ```
 
 Notes:
-- When `-t` and `-p` are both present, all trace patterns (function, source line, bare address, and module-qualified address) are resolved inside the `-t` target. `-p` only limits runtime events to that process.
+- When `-t` and `-p` are both present, all trace patterns (function, function-name wildcard, source line, bare address, and module-qualified address) are resolved inside the `-t` target. `-p` only limits runtime events to that process.
 - For `0xADDR`, the default module depends on startup mode: `-t <binary>` uses `<binary>`; `-p <pid>` uses the main executable. If `-t` and `-p` are both present, `-t` wins and `-p` only limits runtime events to that PID.
 - `module_suffix:0xADDR` allows selecting a module by full path or unique suffix; ambiguous suffixes will list candidates. In `-t -p` sessions, the module must match the `-t` target.
 - Address trace targets always use the module's DWARF/symbol virtual address. Do not pass a raw ELF file offset or a runtime ASLR-adjusted address from `/proc/<pid>/maps`; GhostScope converts the virtual address to the uprobe file offset internally.
