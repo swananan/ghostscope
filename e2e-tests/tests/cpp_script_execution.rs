@@ -5,6 +5,7 @@ mod common;
 use common::{init, FIXTURES};
 
 const CPP_NESTED_MEMBER_TRACE_LINE: u32 = 44;
+const CPP_SIBLING_BLOCK_MEMBER_TRACE_LINE: u32 = 72;
 
 async fn compile_cpp_complex_script(
     script: &str,
@@ -95,6 +96,35 @@ trace {}:{CPP_NESTED_MEMBER_TRACE_LINE} {{
             "expected at least one failed target for invalid o.shadow access"
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cpp_member_access_after_many_sibling_blocks_compiles() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
+    let source_path = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cpp_complex_program has no parent directory"))?
+        .join("main.cpp");
+    let script = format!(
+        r#"
+trace {}:{CPP_SIBLING_BLOCK_MEMBER_TRACE_LINE} {{
+    print "m={{}}", b.m;
+}}
+"#,
+        source_path.display()
+    );
+
+    let result = compile_cpp_complex_script(&script).await?;
+    assert!(
+        !result.uprobe_configs.is_empty(),
+        "expected b.m in the last sibling block to compile; target_info={} failed_targets={:?}",
+        result.target_info,
+        result.failed_targets
+    );
 
     Ok(())
 }
