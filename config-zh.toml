@@ -93,6 +93,16 @@ search_paths = [
 # 也会继续使用该独立调试文件（会记录警告日志）。仅建议在排障或环境不规范时短期启用。
 allow_loose_debug_match = false
 
+# 在后台按需解析 bt/backtrace 新映射模块的 compact CFI；不会为这些运行时
+# 模块常驻完整调试索引。解析期间继续使用已有符号、模块偏移或裸地址输出。
+backtrace_runtime_modules = true
+
+# 限制单次会话尝试解析的不同运行时模块总数。
+backtrace_runtime_modules_max = 32
+
+# 单个模块超过此时间预算后，停止本次会话的自动运行时 CFI 加载。
+backtrace_runtime_module_timeout_ms = 5000
+
 [dwarf.debuginfod]
 # debuginfod 调试信息回退。
 # 模式参考 GDB：

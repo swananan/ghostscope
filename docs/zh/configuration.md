@@ -286,6 +286,9 @@ ghostscope bpffs prune --dry-run --json
 | `--script-help` | | 输出内嵌的脚本语言参考并退出 | 关 |
 | `--script-output <MODE>` | | 脚本事件 stdout 模式：pretty, plain | pretty |
 | `--backtrace-depth <N>` | | 每条 `bt`/`backtrace` 指令最多采集的 DWARF unwind 栈帧数（`1..=128`） | 128 |
+| `--no-backtrace-runtime-modules` | | 禁止为 `bt`/`backtrace` 新映射模块加载 compact CFI；事件仍使用已有符号、模块偏移或裸地址输出 | 关 |
+| `--backtrace-runtime-modules-max <N>` | | 最多尝试解析 CFI 的不同运行时模块数（`1..=1024`） | 32 |
+| `--backtrace-runtime-module-timeout-ms <MS>` | | 单模块运行时 CFI 加载超时（`100..=600000`） | 5000 |
 | `--dry-run` | | 编译脚本、解析 trace 目标，然后退出，不 attach uprobe。需要与真实运行相同的 eBPF 权限和内核能力。 | 关 |
 | `--dry-run-details` | | 在 dry-run 输出中包含源码、inline 和变量诊断；需要同时使用 `--dry-run` | 关 |
 | `--status` | | 启用交互式 DWARF/脚本/attach stderr 状态提示 | 开 |
@@ -417,6 +420,18 @@ search_paths = [
 # 也会继续使用该独立调试文件（会记录警告日志）。loose 模式接受的 debuglink
 # 候选只要包含可用 .debug_info，仍会报告为 debuglink。仅建议在排障或环境不规范时短期启用。
 allow_loose_debug_match = false
+
+# 仅在 bt/backtrace 事件实际引用模块时后台按需加载 compact CFI；不会为这些
+# 模块常驻完整调试索引，当前事件也不会等待 CFI 加载完成。
+backtrace_runtime_modules = true
+
+# 限制不同运行时模块的解析尝试数。达到上限后继续使用已有符号、模块偏移
+# 或裸地址。
+backtrace_runtime_modules_max = 32
+
+# 单模块时间预算。超时会关闭本次会话后续的自动运行时 CFI 加载，
+# tracing 和裸地址输出仍会继续。
+backtrace_runtime_module_timeout_ms = 5000
 
 [dwarf.debuginfod]
 # 可选的 debuginfod 调试信息回退。

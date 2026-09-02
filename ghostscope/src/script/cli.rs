@@ -8,7 +8,7 @@ use super::attach::{
 };
 use super::compile::{compile_script_with_session, SessionCompileError};
 use super::runtime_maps::ensure_prefill_for_session_pid;
-use super::runtime_prep::refresh_runtime_modules_before_compile;
+use super::runtime_prep::prepare_runtime_modules_before_compile;
 
 /// Compile a script for command line mode without attaching uprobes.
 pub fn compile_script_for_cli(
@@ -57,7 +57,7 @@ pub async fn compile_and_load_script_for_cli(
     compile_options: &ghostscope_compiler::CompileOptions,
 ) -> Result<()> {
     let mut compile_options = compile_options.clone();
-    refresh_runtime_modules_before_compile(script, session, &mut compile_options).await?;
+    prepare_runtime_modules_before_compile(script, session, &mut compile_options)?;
 
     let compilation_result = compile_script_for_cli(script, session, &compile_options)?;
     ensure_prefill_for_session_pid(session);

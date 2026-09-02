@@ -3,4 +3,7 @@
 pub mod session;
 
 // Re-export main types for convenience
-pub use session::GhostSession;
+pub use session::{
+    BacktraceRuntimeModuleRequest, BacktraceRuntimeRefreshOutcome, BacktraceRuntimeRefreshSchedule,
+    GhostSession,
+};

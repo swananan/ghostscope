@@ -407,6 +407,11 @@ impl BacktraceRenderer {
         let inline = (flags & BACKTRACE_FLAG_INLINE) != 0;
         let module = resolve_frame_module(coordinator, analyzer, pids, frame);
         let frame_pc = module.as_ref().map(|module| module.pc).unwrap_or(frame.pc);
+        let lookup_pc = if index == 0 {
+            frame_pc
+        } else {
+            frame_pc.saturating_sub(1)
+        };
 
         if raw {
             let lines = vec![format_raw_frame(index, frame, module.as_ref(), true)];
@@ -419,16 +424,29 @@ impl BacktraceRenderer {
         let resolved = analyzer
             .zip(module.as_ref())
             .and_then(|(analyzer, module)| {
-                let lookup_pc = if index == 0 {
-                    module.pc
-                } else {
-                    module.pc.saturating_sub(1)
-                };
                 let address = ModuleAddress::new(module.module_path.clone(), lookup_pc);
                 analyzer.resolve_pc_for_display(&address, full).ok()
             });
 
         let Some(ctx) = resolved else {
+            if let Some(function) = analyzer
+                .zip(module.as_ref())
+                .and_then(|(analyzer, module)| {
+                    analyzer.find_runtime_function_name_for_display(
+                        &module.module_path,
+                        lookup_pc,
+                        full,
+                    )
+                })
+            {
+                let module_text = module
+                    .as_ref()
+                    .map(|module| format_module_offset(&module.module_path, frame_pc))
+                    .unwrap_or_else(|| format!("0x{:x}", frame.pc));
+                let lines = vec![format!("  #{index} {function} at ?? [{module_text}]")];
+                self.frame_cache.insert(cache_key, lines.clone());
+                return lines;
+            }
             let lines = vec![format_raw_frame(index, frame, module.as_ref(), false)];
             if module.is_some() {
                 self.frame_cache.insert(cache_key, lines.clone());
@@ -498,6 +516,11 @@ impl BacktraceRenderer {
         let inline = (flags & BACKTRACE_FLAG_INLINE) != 0;
         let module = resolve_frame_module(coordinator, analyzer, pids, frame);
         let frame_pc = module.as_ref().map(|module| module.pc).unwrap_or(frame.pc);
+        let lookup_pc = if index == 0 {
+            frame_pc
+        } else {
+            frame_pc.saturating_sub(1)
+        };
 
         if raw {
             let frames = vec![raw_display_frame(index, frame, module.as_ref(), true)];
@@ -510,16 +533,40 @@ impl BacktraceRenderer {
         let resolved = analyzer
             .zip(module.as_ref())
             .and_then(|(analyzer, module)| {
-                let lookup_pc = if index == 0 {
-                    module.pc
-                } else {
-                    module.pc.saturating_sub(1)
-                };
                 let address = ModuleAddress::new(module.module_path.clone(), lookup_pc);
                 analyzer.resolve_pc_for_display(&address, full).ok()
             });
 
         let Some(ctx) = resolved else {
+            if let Some(function) = analyzer
+                .zip(module.as_ref())
+                .and_then(|(analyzer, module)| {
+                    analyzer.find_runtime_function_name_for_display(
+                        &module.module_path,
+                        lookup_pc,
+                        full,
+                    )
+                })
+            {
+                let module_text = module
+                    .as_ref()
+                    .map(|module| format_module_offset(&module.module_path, frame_pc))
+                    .unwrap_or_else(|| format!("0x{:x}", frame.pc));
+                let frames = vec![BacktraceDisplayFrame {
+                    index,
+                    inline: false,
+                    function: Some(function),
+                    parameters: Vec::new(),
+                    address: None,
+                    location: None,
+                    module: module_text,
+                    raw_ip: None,
+                    cookie: None,
+                    flags: None,
+                }];
+                self.frame_display_cache.insert(cache_key, frames.clone());
+                return frames;
+            }
             let frames = vec![raw_display_frame(index, frame, module.as_ref(), false)];
             if module.is_some() {
                 self.frame_display_cache.insert(cache_key, frames.clone());
@@ -683,6 +730,9 @@ fn resolve_frame_module_from_analyzer(
             let module_path = module.module_path.to_string_lossy();
             let cookie = ghostscope_compiler::module_cookie_for_path(&module_path);
             if cookie != frame.module_cookie {
+                return None;
+            }
+            if module.loaded_address.is_none() && frame.raw_ip != 0 && frame.raw_ip == frame.pc {
                 return None;
             }
             if module.size != 0 && frame.pc >= module.size {

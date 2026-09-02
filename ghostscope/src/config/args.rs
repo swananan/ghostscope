@@ -269,6 +269,18 @@ pub struct Args {
     #[arg(long = "backtrace-depth", value_name = "N", value_parser = clap::value_parser!(u8).range(1..=128))]
     pub backtrace_depth: Option<u8>,
 
+    /// Keep rendering bt/backtrace with available symbols, module offsets, or raw addresses, but do not load compact CFI for newly mapped modules.
+    #[arg(long = "no-backtrace-runtime-modules", action = clap::ArgAction::SetTrue)]
+    pub no_backtrace_runtime_modules: bool,
+
+    /// Maximum number of newly mapped modules whose CFI is attempted for bt/backtrace during this run.
+    #[arg(long = "backtrace-runtime-modules-max", value_name = "N", value_parser = clap::value_parser!(u32).range(1..=1024))]
+    pub backtrace_runtime_modules_max: Option<u32>,
+
+    /// Per-module timeout in milliseconds for runtime bt/backtrace CFI loading.
+    #[arg(long = "backtrace-runtime-module-timeout-ms", value_name = "MS", value_parser = clap::value_parser!(u64).range(100..=600_000))]
+    pub backtrace_runtime_module_timeout_ms: Option<u64>,
+
     /// Save LLVM IR files for each trace pattern (debug: true, release: false)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub save_llvm_ir: bool,
@@ -358,6 +370,9 @@ pub struct ParsedArgs {
     pub script_timestamp: Option<ScriptTimestampFormat>,
     pub script_output_events_per_sec: Option<u64>,
     pub backtrace_depth: Option<u8>,
+    pub no_backtrace_runtime_modules: bool,
+    pub backtrace_runtime_modules_max: Option<u32>,
+    pub backtrace_runtime_module_timeout_ms: Option<u64>,
     pub should_save_llvm_ir: bool,
     pub should_save_ebpf: bool,
     pub should_save_ast: bool,
@@ -541,6 +556,9 @@ impl Args {
             script_timestamp: parsed.script_timestamp,
             script_output_events_per_sec: parsed.script_output_events_per_sec,
             backtrace_depth: parsed.backtrace_depth,
+            no_backtrace_runtime_modules: parsed.no_backtrace_runtime_modules,
+            backtrace_runtime_modules_max: parsed.backtrace_runtime_modules_max,
+            backtrace_runtime_module_timeout_ms: parsed.backtrace_runtime_module_timeout_ms,
             should_save_llvm_ir,
             should_save_ebpf,
             should_save_ast,
@@ -919,6 +937,31 @@ mod tests {
         match parsed {
             ParsedCommand::Trace(args) => {
                 assert_eq!(args.backtrace_depth, Some(64));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_backtrace_runtime_module_controls() {
+        let parsed = Args::parse_args_from(vec![
+            "ghostscope".to_string(),
+            "--pid".to_string(),
+            "1234".to_string(),
+            "--script-file".to_string(),
+            "trace.gs".to_string(),
+            "--no-backtrace-runtime-modules".to_string(),
+            "--backtrace-runtime-modules-max".to_string(),
+            "7".to_string(),
+            "--backtrace-runtime-module-timeout-ms".to_string(),
+            "900".to_string(),
+        ]);
+
+        match parsed {
+            ParsedCommand::Trace(args) => {
+                assert!(args.no_backtrace_runtime_modules);
+                assert_eq!(args.backtrace_runtime_modules_max, Some(7));
+                assert_eq!(args.backtrace_runtime_module_timeout_ms, Some(900));
             }
             other => panic!("unexpected parse result: {other:?}"),
         }

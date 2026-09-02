@@ -216,20 +216,34 @@ impl CfiIndex {
 
     /// Compile all FDE rows into a compact unwind table for userspace/BPF planning.
     pub fn compact_unwind_table(&self, module: ModuleId) -> Result<CompactUnwindTable> {
+        self.compact_unwind_table_with_max_rows(module, usize::MAX)
+    }
+
+    /// Compile at most `max_rows` FDE rows into a compact unwind table.
+    pub fn compact_unwind_table_with_max_rows(
+        &self,
+        module: ModuleId,
+        max_rows: usize,
+    ) -> Result<CompactUnwindTable> {
         let started_at = Instant::now();
         let mut rows = Vec::new();
         let mut diagnostics = Vec::new();
         let mut entries = self.eh_frame.entries(&self.bases);
         let mut fde_count = 0usize;
+        let mut truncated = false;
 
         while let Some(entry) = entries.next().context("Failed to iterate FDE entries")? {
+            if rows.len() >= max_rows {
+                truncated = true;
+                break;
+            }
             match entry {
                 CieOrFde::Fde(partial_fde) => {
                     fde_count += 1;
                     let fde = partial_fde
                         .parse(|_, bases, offset| self.eh_frame.cie_from_offset(bases, offset))
                         .context("Failed to parse FDE")?;
-                    self.append_compact_rows(module, &fde, &mut rows, &mut diagnostics)?;
+                    self.append_compact_rows(module, &fde, max_rows, &mut rows, &mut diagnostics)?;
                 }
                 CieOrFde::Cie(_) => {}
             }
@@ -241,6 +255,7 @@ impl CfiIndex {
             fdes = fde_count,
             rows = rows.len(),
             diagnostics = diagnostics.len(),
+            truncated,
             elapsed_ms = started_at.elapsed().as_millis(),
             "Built compact DWARF unwind table for bt"
         );
@@ -324,6 +339,7 @@ impl CfiIndex {
         &self,
         module: ModuleId,
         fde: &FrameDescriptionEntry<DwarfReader, usize>,
+        max_rows: usize,
         rows: &mut Vec<CompactUnwindRow>,
         diagnostics: &mut Vec<UnwindDiagnostic>,
     ) -> Result<()> {
@@ -334,6 +350,9 @@ impl CfiIndex {
             .context("Failed to build unwind rows")?;
 
         while let Some(row) = table.next_row().context("Failed to evaluate unwind row")? {
+            if rows.len() >= max_rows {
+                break;
+            }
             let pc_start = row.start_address();
             let pc_end = row.end_address();
             if pc_start >= pc_end {

@@ -149,6 +149,15 @@ pub struct DwarfConfig {
     /// Default: false (strict). When true, CRC/Build-ID mismatches are allowed with WARN logs.
     #[serde(default)]
     pub allow_loose_debug_match: bool,
+    /// Incrementally load compact CFI for newly observed bt/backtrace modules.
+    #[serde(default = "default_backtrace_runtime_modules")]
+    pub backtrace_runtime_modules: bool,
+    /// Maximum number of distinct modules whose runtime bt/backtrace CFI may be attempted.
+    #[serde(default = "default_backtrace_runtime_modules_max")]
+    pub backtrace_runtime_modules_max: u32,
+    /// Per-module time budget for runtime bt/backtrace CFI loading.
+    #[serde(default = "default_backtrace_runtime_module_timeout_ms")]
+    pub backtrace_runtime_module_timeout_ms: u64,
     /// debuginfod client configuration.
     #[serde(default)]
     pub debuginfod: DwarfDebuginfodConfig,
@@ -428,6 +437,18 @@ fn default_enable_sysmon_for_target() -> bool {
     true
 }
 
+fn default_backtrace_runtime_modules() -> bool {
+    true
+}
+
+fn default_backtrace_runtime_modules_max() -> u32 {
+    32
+}
+
+fn default_backtrace_runtime_module_timeout_ms() -> u64 {
+    5_000
+}
+
 fn default_save_option() -> SaveOption {
     SaveOption {
         debug: true,
@@ -497,8 +518,31 @@ impl Default for DwarfConfig {
         Self {
             search_paths: default_debug_search_paths(),
             allow_loose_debug_match: false,
+            backtrace_runtime_modules: default_backtrace_runtime_modules(),
+            backtrace_runtime_modules_max: default_backtrace_runtime_modules_max(),
+            backtrace_runtime_module_timeout_ms: default_backtrace_runtime_module_timeout_ms(),
             debuginfod: DwarfDebuginfodConfig::default(),
         }
+    }
+}
+
+impl DwarfConfig {
+    pub fn validate(&self, file_path: &str) -> Result<()> {
+        if !(1..=1_024).contains(&self.backtrace_runtime_modules_max) {
+            return Err(anyhow::anyhow!(
+                "Invalid DWARF configuration in '{}': backtrace_runtime_modules_max must be in range 1 to 1024, got {}",
+                file_path,
+                self.backtrace_runtime_modules_max
+            ));
+        }
+        if !(100..=600_000).contains(&self.backtrace_runtime_module_timeout_ms) {
+            return Err(anyhow::anyhow!(
+                "Invalid DWARF configuration in '{}': backtrace_runtime_module_timeout_ms must be in range 100 to 600000, got {}",
+                file_path,
+                self.backtrace_runtime_module_timeout_ms
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -782,6 +826,9 @@ impl Config {
         // Validate eBPF configuration
         config.ebpf.validate(&path.display().to_string())?;
 
+        // Validate runtime DWARF loading limits.
+        config.dwarf.validate(&path.display().to_string())?;
+
         // Validate source-language value adapter limits
         config
             .value_adapters
@@ -992,6 +1039,34 @@ mod tests {
             ghostscope_compiler::DEFAULT_VALUE_ADAPTER_SEQUENCE_ELEMENTS
         );
         config.validate("test.toml").unwrap();
+    }
+
+    #[test]
+    fn dwarf_runtime_backtrace_defaults_are_bounded() {
+        let config = Config::default().dwarf;
+        assert!(config.backtrace_runtime_modules);
+        assert_eq!(config.backtrace_runtime_modules_max, 32);
+        assert_eq!(config.backtrace_runtime_module_timeout_ms, 5_000);
+        config.validate("test.toml").unwrap();
+    }
+
+    #[test]
+    fn dwarf_runtime_backtrace_limits_reject_zero_and_short_timeout() {
+        let mut config = Config::default().dwarf;
+        config.backtrace_runtime_modules_max = 0;
+        assert!(config
+            .validate("test.toml")
+            .unwrap_err()
+            .to_string()
+            .contains("backtrace_runtime_modules_max"));
+
+        let mut config = Config::default().dwarf;
+        config.backtrace_runtime_module_timeout_ms = 99;
+        assert!(config
+            .validate("test.toml")
+            .unwrap_err()
+            .to_string()
+            .contains("backtrace_runtime_module_timeout_ms"));
     }
 
     #[test]

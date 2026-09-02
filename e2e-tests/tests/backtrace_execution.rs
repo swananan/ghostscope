@@ -4,7 +4,9 @@ mod common;
 
 use common::{init, targets::TargetHandle, FIXTURES};
 use ghostscope_dwarf::{CfaRulePlan, ModuleAddress, RegisterRecoveryPlan};
+use object::Object;
 use serial_test::serial;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -318,6 +320,8 @@ async fn spawn_backtrace_dlopen_program() -> anyhow::Result<(TargetHandle, PathB
         .ok_or_else(|| anyhow::anyhow!("backtrace_dlopen_program has no parent directory"))?;
     let trigger_path = bin_dir.join("dlopen.trigger");
     let _ = fs::remove_file(&trigger_path);
+    let _ = fs::remove_file(bin_dir.join("dlopen.trigger.pending"));
+    let _ = fs::remove_file(bin_dir.join("dlopen.after_limit.trigger"));
     let target = common::targets::TargetLauncher::binary(&binary_path)
         .current_dir(bin_dir)
         .spawn()
@@ -339,6 +343,91 @@ fn touch_dlopen_trigger_in_target_sandbox(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    Ok(())
+}
+
+fn prepare_backtrace_dlopen_module_copies(
+    module_count: usize,
+) -> anyhow::Result<(tempfile::TempDir, Vec<PathBuf>)> {
+    let binary_path = FIXTURES.get_test_binary("backtrace_dlopen_program")?;
+    let bin_dir = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("backtrace_dlopen_program has no parent directory"))?;
+    let source = bin_dir.join("libbacktrace_dlopen_target.so");
+    anyhow::ensure!(
+        source.exists(),
+        "backtrace dlopen shared library does not exist: {}",
+        source.display()
+    );
+
+    let directory = tempfile::Builder::new()
+        .prefix(".backtrace-dlopen-modules-")
+        .tempdir_in(bin_dir)?;
+    let mut module_paths = Vec::with_capacity(module_count);
+    for index in 0..module_count {
+        let path = directory
+            .path()
+            .join(format!("libbacktrace_dlopen_runtime_{index:03}.so"));
+        fs::copy(&source, &path)?;
+        stamp_unique_build_id(&path, index)?;
+        module_paths.push(path);
+    }
+
+    let cookies = module_paths
+        .iter()
+        .map(|path| ghostscope_process::module_probe::cookie_for_path(&path.to_string_lossy()))
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        cookies.len() == module_count,
+        "expected {module_count} unique runtime module cookies, got {}",
+        cookies.len()
+    );
+
+    Ok((directory, module_paths))
+}
+
+fn stamp_unique_build_id(path: &Path, index: usize) -> anyhow::Result<()> {
+    let mut image = fs::read(path)?;
+    let (build_id_offset, build_id_len) = {
+        let object = object::File::parse(image.as_slice())?;
+        let build_id = object
+            .build_id()?
+            .ok_or_else(|| anyhow::anyhow!("{} has no GNU build-id", path.display()))?;
+        let offset = (build_id.as_ptr() as usize)
+            .checked_sub(image.as_ptr() as usize)
+            .ok_or_else(|| anyhow::anyhow!("invalid build-id range in {}", path.display()))?;
+        (offset, build_id.len())
+    };
+    anyhow::ensure!(
+        build_id_len >= std::mem::size_of::<u64>(),
+        "GNU build-id in {} is too short: {build_id_len} bytes",
+        path.display()
+    );
+
+    // Runtime module cookies prefer GNU build-id, so byte-for-byte copies
+    // would otherwise collapse into one logical module despite distinct paths.
+    let unique_suffix = (index as u64 + 1).to_le_bytes();
+    let suffix_offset = build_id_offset + build_id_len - unique_suffix.len();
+    image[suffix_offset..suffix_offset + unique_suffix.len()].copy_from_slice(&unique_suffix);
+    fs::write(path, image)?;
+    Ok(())
+}
+
+fn publish_dlopen_module_manifest(
+    target: &TargetHandle,
+    trigger_path: &Path,
+    module_paths: &[PathBuf],
+) -> anyhow::Result<()> {
+    let mut manifest = String::new();
+    for path in module_paths {
+        let sandbox_path = target.sandbox().path_in_sandbox(path)?;
+        manifest.push_str(&sandbox_path.display().to_string());
+        manifest.push('\n');
+    }
+
+    let pending_path = trigger_path.with_file_name("dlopen.trigger.pending");
+    fs::write(&pending_path, manifest)?;
+    fs::rename(&pending_path, trigger_path)?;
     Ok(())
 }
 
@@ -1754,16 +1843,12 @@ trace dlopen_main_callback {
         .first()
         .ok_or_else(|| anyhow::anyhow!("expected a dlopen callback backtrace block"))?;
     assert!(
-        dlopen_block.contains("[libbacktrace_dlopen_target.so+"),
-        "expected first backtrace block to include a frame from dlopen-loaded library\nBLOCK:\n{dlopen_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    );
-    assert!(
         dlopen_block.contains("dlopen_main_callback"),
         "expected traced callback frame from main executable\nBLOCK:\n{dlopen_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
     assert!(
-        !dlopen_block.contains("<proc offsets unavailable>"),
-        "dlopen backtrace should refresh proc maps before rendering the library frame\nBLOCK:\n{dlopen_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        dlopen_block.contains("#1 "),
+        "the first dlopen backtrace should render the unresolved caller as a raw or module-offset frame while runtime metadata loads in the background\nBLOCK:\n{dlopen_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
 
     let refreshed_block = blocks
@@ -1789,6 +1874,119 @@ trace dlopen_main_callback {
         !refreshed_block.contains("stopped: no unwind rows for PC"),
         "dlopen backtrace should append CFI rows for the loaded library\n\
          BLOCK:\n{refreshed_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(backtrace_execution)]
+async fn test_pid_backtrace_many_dlopen_modules_remains_live_at_runtime_limit() -> anyhow::Result<()>
+{
+    init();
+
+    const MODULE_COUNT: usize = 48;
+    const MODULE_LIMIT: u32 = 4;
+    const BACKTRACE_DEPTH: u8 = 6;
+
+    let (_module_directory, module_paths) = prepare_backtrace_dlopen_module_copies(MODULE_COUNT)?;
+    let (target, trigger_path) = spawn_backtrace_dlopen_program().await?;
+    let after_limit_trigger_path = trigger_path.with_file_name("dlopen.after_limit.trigger");
+    let script = r#"
+trace dlopen_main_callback {
+    print "MANY_DLOPEN_BT";
+    bt full;
+}
+
+trace dlopen_main_heartbeat {
+    print "MANY_DLOPEN_HEARTBEAT";
+}
+
+trace dlopen_main_after_limit_heartbeat {
+    print "MANY_DLOPEN_AFTER_LIMIT";
+}
+"#;
+
+    let trigger_target = target.clone();
+    let trigger_for_callback = trigger_path.clone();
+    let after_limit_target = target.clone();
+    let after_limit_for_callback = after_limit_trigger_path.clone();
+    let result = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .attach_to(&target)
+        .timeout_secs(4)
+        .enable_sysmon_for_target(false)
+        .with_log_level("info")
+        .with_cli_args([
+            OsString::from("--script-output-events-per-sec"),
+            OsString::from("1000"),
+            OsString::from("--backtrace-depth"),
+            OsString::from(BACKTRACE_DEPTH.to_string()),
+            OsString::from("--backtrace-runtime-modules-max"),
+            OsString::from(MODULE_LIMIT.to_string()),
+        ])
+        .run_after_ready(move || async move {
+            publish_dlopen_module_manifest(&trigger_target, &trigger_for_callback, &module_paths)?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            touch_dlopen_trigger_in_target_sandbox(&after_limit_target, &after_limit_for_callback)
+        })
+        .await;
+
+    target.terminate().await?;
+    let _ = fs::remove_file(&trigger_path);
+    let _ = fs::remove_file(&after_limit_trigger_path);
+    let (exit_code, stdout, stderr, ()) = result?;
+    if exit_code != 0 && stderr.contains("BPF_PROG_LOAD") {
+        return Ok(());
+    }
+    anyhow::ensure!(exit_code == 0, "stderr={stderr} stdout={stdout}");
+
+    let heartbeat_count = stdout.matches("MANY_DLOPEN_HEARTBEAT").count();
+    assert!(
+        heartbeat_count >= 20,
+        "unrelated heartbeat events should continue while runtime backtrace modules resolve, got {heartbeat_count}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    let after_limit_count = stdout.matches("MANY_DLOPEN_AFTER_LIMIT").count();
+    assert!(
+        after_limit_count >= 5,
+        "unrelated events should continue after the runtime module limit is reached, got {after_limit_count}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    let warning =
+        format!("ghostscope: warning: backtrace runtime module limit ({MODULE_LIMIT}) reached");
+    assert_eq!(
+        stderr.matches(&warning).count(),
+        1,
+        "the runtime module limit should be reported exactly once\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    let refresh_count = stderr
+        .matches("Resolving one backtrace runtime module in the background")
+        .count();
+    assert!(
+        (1..=MODULE_LIMIT as usize).contains(&refresh_count),
+        "runtime module resolution should start without exceeding the configured limit, started {refresh_count}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    let mut degraded_block = None;
+    for chunk in event_chunks_with_marker(&stdout, "MANY_DLOPEN_BT") {
+        for block in backtrace_blocks_after(chunk, "MANY_DLOPEN_BT", BACKTRACE_DEPTH)? {
+            let has_raw_caller = block
+                .lines()
+                .any(|line| line.trim_start().starts_with("#1 0x"));
+            let has_runtime_module = block.contains("libbacktrace_dlopen_runtime_");
+            if has_raw_caller && has_runtime_module {
+                degraded_block = Some(block);
+                break;
+            }
+        }
+        if degraded_block.is_some() {
+            break;
+        }
+    }
+    assert!(
+        degraded_block.is_some(),
+        "a module beyond the limit should still render as a raw/module-offset frame instead of suppressing the event\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
 
     Ok(())

@@ -335,6 +335,11 @@ pub enum RuntimeStatus {
         current: usize,
         total: usize,
     },
+    /// Background runtime module resolution for bt/backtrace.
+    BacktraceModuleRefresh {
+        message: String,
+        warning: bool,
+    },
     SrcPathInfo {
         info: SourcePathInfo,
     },

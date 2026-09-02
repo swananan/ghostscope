@@ -292,6 +292,9 @@ index is reported in CLI/TUI startup status before falling back.
 | `--script-help` | | Print the embedded script language reference and exit | Off |
 | `--script-output <MODE>` | | Script event stdout mode: pretty, plain | pretty |
 | `--backtrace-depth <N>` | | Max DWARF-unwound frames captured by each `bt`/`backtrace` instruction (`1..=128`) | 128 |
+| `--no-backtrace-runtime-modules` | | Disable compact-CFI loading for newly mapped `bt`/`backtrace` modules; events still render with available symbols, module offsets, or raw addresses | Off |
+| `--backtrace-runtime-modules-max <N>` | | Maximum distinct runtime modules whose CFI GhostScope will try to resolve (`1..=1024`) | 32 |
+| `--backtrace-runtime-module-timeout-ms <MS>` | | Per-module runtime CFI loading timeout (`100..=600000`) | 5000 |
 | `--dry-run` | | Compile the script, resolve trace targets, and exit without attaching uprobes. Requires the same eBPF privileges and kernel capabilities as a real run. | Off |
 | `--dry-run-details` | | Include source, inline, and variable diagnostics in dry-run output; requires `--dry-run` | Off |
 | `--status` | | Enable interactive DWARF/script/attach stderr status prompts | On |
@@ -427,6 +430,19 @@ search_paths = [
 # symbols, but may cause inaccurate symbol/line information. Prefer leaving
 # this off unless you know what you are doing.
 allow_loose_debug_match = false
+
+# Load compact CFI only for modules referenced by observed bt/backtrace frames,
+# in the background. Full debug indexes are not retained for these modules, and
+# current events are never held while CFI is loaded.
+backtrace_runtime_modules = true
+
+# Bound distinct runtime-module attempts. Once reached, backtraces keep
+# rendering with available symbols, module offsets, or raw addresses.
+backtrace_runtime_modules_max = 32
+
+# Per-module time budget. A timeout disables further automatic runtime CFI
+# loading for the session, while tracing and raw-address rendering continue.
+backtrace_runtime_module_timeout_ms = 5000
 
 [dwarf.debuginfod]
 # Optional debuginfod fallback for separate debug information.

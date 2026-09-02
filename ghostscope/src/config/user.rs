@@ -52,6 +52,9 @@ pub struct UserConfig {
     // DWARF configuration
     pub dwarf_search_paths: Vec<String>,
     pub dwarf_allow_loose_debug_match: bool,
+    pub dwarf_backtrace_runtime_modules: bool,
+    pub dwarf_backtrace_runtime_modules_max: u32,
+    pub dwarf_backtrace_runtime_module_timeout_ms: u64,
     pub dwarf_debuginfod: ResolvedDebuginfodConfig,
 
     // Source-language value adapter configuration
@@ -194,6 +197,17 @@ impl UserConfig {
             } else {
                 config.dwarf.allow_loose_debug_match
             },
+            dwarf_backtrace_runtime_modules: if args.no_backtrace_runtime_modules {
+                false
+            } else {
+                config.dwarf.backtrace_runtime_modules
+            },
+            dwarf_backtrace_runtime_modules_max: args
+                .backtrace_runtime_modules_max
+                .unwrap_or(config.dwarf.backtrace_runtime_modules_max),
+            dwarf_backtrace_runtime_module_timeout_ms: args
+                .backtrace_runtime_module_timeout_ms
+                .unwrap_or(config.dwarf.backtrace_runtime_module_timeout_ms),
             dwarf_debuginfod,
             value_adapter_config: config.value_adapters,
             ebpf_config: {

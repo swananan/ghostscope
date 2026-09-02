@@ -1,7 +1,10 @@
 //! CLI script-mode runtime orchestration.
 
 use crate::config::ResolvedConfig;
-use crate::core::GhostSession;
+use crate::core::{
+    BacktraceRuntimeModuleRequest, BacktraceRuntimeRefreshOutcome, BacktraceRuntimeRefreshSchedule,
+    GhostSession,
+};
 use anyhow::Result;
 use ghostscope_dwarf::ModuleLoadingEvent;
 use std::io::{self, IsTerminal, Write};
@@ -118,33 +121,6 @@ fn decide_script_output_rate(
     } else {
         ScriptOutputRateDecision::Suppress
     }
-}
-
-fn events_include_backtrace(events: &[ghostscope_protocol::ParsedTraceEvent]) -> bool {
-    events.iter().any(|event| {
-        event.instructions.iter().any(|instruction| {
-            matches!(
-                instruction,
-                ghostscope_protocol::ParsedInstruction::Backtrace { .. }
-            )
-        })
-    })
-}
-
-fn target_mode_event_pids(
-    session: &GhostSession,
-    events: &[ghostscope_protocol::ParsedTraceEvent],
-) -> Vec<u32> {
-    if session.proc_pid().is_some() {
-        return Vec::new();
-    }
-    events
-        .iter()
-        .map(|event| event.pid)
-        .filter(|pid| *pid != 0)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
 }
 
 /// Run GhostScope in command line mode with merged configuration
@@ -415,6 +391,7 @@ async fn run_cli_with_session(
     let stdout = io::stdout();
     let mut stdout = io::BufWriter::new(stdout.lock());
     let mut backtrace_renderer = crate::trace::backtrace::BacktraceRenderer::default();
+    let fallback_coordinator = ghostscope_process::ProcessManager::new();
     let mut output_rate_limiter = ScriptOutputRateLimiter::new(config.script_output_events_per_sec);
     let mut ebpf_loss_report_ticker = tokio::time::interval(Duration::from_secs(1));
     ebpf_loss_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -426,32 +403,8 @@ async fn run_cli_with_session(
             result = session.trace_manager.wait_for_all_events_async() => {
                 match result {
                     Ok(events) => {
-                        if !events.is_empty() {
-                            let runtime_pids = target_mode_event_pids(&session, &events);
-                            let refresh_result = if events_include_backtrace(&events) {
-                                session
-                                    .refresh_pid_runtime_modules_before_rendering_for_runtime_pids(
-                                        &runtime_pids,
-                                    )
-                                    .await
-                            } else {
-                                session
-                                    .refresh_pid_runtime_modules_if_needed_for_runtime_pids(
-                                        &runtime_pids,
-                                    )
-                                    .await
-                            };
-                            match refresh_result {
-                                Ok(loaded) if loaded > 0 => {
-                                    backtrace_renderer =
-                                        crate::trace::backtrace::BacktraceRenderer::default();
-                                }
-                                Ok(_) => {}
-                                Err(e) => warn!(
-                                    "Failed to refresh PID runtime modules after sysmon map-change event: {e:#}"
-                                ),
-                            }
-                        }
+                        let runtime_refresh_request =
+                            BacktraceRuntimeModuleRequest::from_events(&events);
 
                         let mut wrote_output = false;
                         let mut suppressed_output = false;
@@ -463,17 +416,24 @@ async fn run_cli_with_session(
                             ) {
                                 ScriptOutputRateDecision::Silent => {}
                                 ScriptOutputRateDecision::Render => {
-                                    let display_event = {
-                                        let coordinator = session
-                                            .coordinator
-                                            .lock()
-                                            .expect("coordinator mutex poisoned");
-                                        backtrace_renderer.render_event_for_tui(
+                                    let display_event = match session.coordinator.try_lock() {
+                                        Ok(coordinator) => backtrace_renderer.render_event_for_tui(
                                             &event,
                                             session.process_analyzer.as_ref(),
                                             &coordinator,
                                             session.proc_pid(),
-                                        )
+                                        ),
+                                        Err(std::sync::TryLockError::WouldBlock) => {
+                                            backtrace_renderer.render_event_for_tui(
+                                                &event,
+                                                session.process_analyzer.as_ref(),
+                                                &fallback_coordinator,
+                                                session.proc_pid(),
+                                            )
+                                        }
+                                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                                            panic!("coordinator mutex poisoned")
+                                        }
                                     };
                                     match output_renderer.write_display_event(&display_event, &mut stdout) {
                                         Ok(wrote) => wrote_output |= wrote,
@@ -495,6 +455,26 @@ async fn run_cli_with_session(
                                 warn!("Failed to flush event output: {e}");
                             }
                         }
+                        match session
+                            .schedule_backtrace_runtime_module_refresh(runtime_refresh_request)
+                        {
+                            Ok(schedule) => {
+                                report_cli_backtrace_runtime_schedule(schedule, show_cli_status)
+                            }
+                            Err(error) => report_cli_backtrace_runtime_error(
+                                "failed to schedule backtrace runtime module resolution",
+                                &error,
+                            ),
+                        }
+                        // Finish background resolution only after this whole batch has
+                        // been rendered and flushed. Runtime CFI work must never hold
+                        // unrelated events behind a backtrace event.
+                        report_cli_backtrace_runtime_refresh(
+                            &mut session,
+                            &mut backtrace_renderer,
+                            show_cli_status,
+                        )
+                        .await;
                         if suppressed_output {
                             tokio::time::sleep(SCRIPT_OUTPUT_BACKPRESSURE_SLEEP).await;
                         } else {
@@ -510,6 +490,12 @@ async fn run_cli_with_session(
 
             _ = ebpf_loss_report_ticker.tick() => {
                 report_ebpf_output_loss_reports(&mut session.trace_manager).await;
+                report_cli_backtrace_runtime_refresh(
+                    &mut session,
+                    &mut backtrace_renderer,
+                    show_cli_status,
+                )
+                .await;
             }
 
             signal = &mut shutdown_signal => {
@@ -523,6 +509,115 @@ async fn run_cli_with_session(
     }
 
     Ok(())
+}
+
+fn report_cli_backtrace_runtime_schedule(
+    schedule: BacktraceRuntimeRefreshSchedule,
+    show_cli_status: bool,
+) {
+    match schedule {
+        BacktraceRuntimeRefreshSchedule::Started { timeout } if show_cli_status => eprintln!(
+            "ghostscope: resolving a backtrace module in the background ({} ms timeout); events continue with available symbols or raw addresses",
+            timeout.as_millis()
+        ),
+        BacktraceRuntimeRefreshSchedule::LimitReached { limit } => {
+            let message = format!(
+                "backtrace runtime module limit ({limit}) reached; continuing with available symbols or raw addresses"
+            );
+            warn!("{message}");
+            eprintln!("ghostscope: warning: {message}");
+        }
+        _ => {}
+    }
+}
+
+async fn report_cli_backtrace_runtime_refresh(
+    session: &mut GhostSession,
+    renderer: &mut crate::trace::backtrace::BacktraceRenderer,
+    show_cli_status: bool,
+) {
+    let outcome = match session.poll_backtrace_runtime_module_refresh().await {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return,
+        Err(error) => {
+            report_cli_backtrace_runtime_error(
+                "failed to finish backtrace runtime module resolution",
+                &error,
+            );
+            return;
+        }
+    };
+
+    match outcome {
+        BacktraceRuntimeRefreshOutcome::Loaded {
+            modules,
+            unwind_rows,
+            next_started,
+        } => {
+            *renderer = crate::trace::backtrace::BacktraceRenderer::default();
+            let next = if next_started {
+                "; resolving the next requested module"
+            } else {
+                ""
+            };
+            if modules > 0 && unwind_rows == 0 {
+                let message = format!(
+                    "resolved a backtrace runtime module but found no usable unwind rows{next}; continuing with raw addresses"
+                );
+                warn!("{message}");
+                eprintln!("ghostscope: warning: {message}");
+            } else if modules == 0 && show_cli_status {
+                eprintln!(
+                    "ghostscope: refreshed backtrace module mappings{next}; tracing remained active"
+                );
+            } else if show_cli_status {
+                eprintln!(
+                    "ghostscope: resolved {modules} backtrace runtime module(s) with {unwind_rows} compact unwind row(s){next}; tracing remained active"
+                );
+            }
+        }
+        BacktraceRuntimeRefreshOutcome::ModuleNotFound { next_started } => {
+            let next = if next_started {
+                "; trying the next requested module"
+            } else {
+                ""
+            };
+            let message = format!(
+                "could not match a requested backtrace module to the refreshed process maps{next}; continuing with raw addresses"
+            );
+            warn!("{message}");
+            eprintln!("ghostscope: warning: {message}");
+        }
+        BacktraceRuntimeRefreshOutcome::Failed {
+            error,
+            next_started,
+        } => {
+            let next = if next_started {
+                "; trying the next requested module"
+            } else {
+                ""
+            };
+            let message = format!(
+                "failed to resolve a backtrace runtime module: {error}{next}; continuing with raw addresses"
+            );
+            warn!("{message}");
+            eprintln!("ghostscope: warning: {message}");
+        }
+        BacktraceRuntimeRefreshOutcome::TimedOut { timeout } => {
+            let message = format!(
+                "backtrace runtime module resolution exceeded {} ms; automatic runtime module loading is disabled for this session and tracing continues with raw addresses",
+                timeout.as_millis()
+            );
+            warn!("{message}");
+            eprintln!("ghostscope: warning: {message}");
+        }
+    }
+}
+
+fn report_cli_backtrace_runtime_error(context: &str, error: &anyhow::Error) {
+    let message = format!("{context}: {error:#}; continuing with raw addresses");
+    warn!("{message}");
+    eprintln!("ghostscope: warning: {message}");
 }
 
 async fn report_ebpf_output_loss_reports(trace_manager: &mut crate::trace::TraceManager) {
@@ -734,6 +829,9 @@ mod tests {
                 ebpf_max_messages: 1000,
                 dwarf_search_paths: Vec::new(),
                 dwarf_allow_loose_debug_match: false,
+                dwarf_backtrace_runtime_modules: true,
+                dwarf_backtrace_runtime_modules_max: 32,
+                dwarf_backtrace_runtime_module_timeout_ms: 5_000,
                 dwarf_debuginfod: Default::default(),
                 value_adapter_config: Default::default(),
                 ebpf_config: EbpfConfig::default(),

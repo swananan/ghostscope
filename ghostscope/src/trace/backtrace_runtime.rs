@@ -1,56 +1,28 @@
-use crate::trace::TraceManager;
-use anyhow::Result;
-use ghostscope_debuginfod::DebuginfodClient;
-use ghostscope_dwarf::{DwarfAnalyzer, LoadedModuleRuntimeInfo};
-use ghostscope_loader::BacktraceUnwindRowsAppendStats;
+use ghostscope_dwarf::LoadedModuleRuntimeInfo;
 use ghostscope_process::pinned_bpf_maps::ProcModuleOffsetsValue;
 use ghostscope_process::{runtime_pid_candidates_for_proc, PidOffsetsEntry, ProcessManager};
-use ghostscope_protocol::BacktraceUnwindRow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::warn;
 
 /// Coordinates runtime module refreshes with backtrace CFI publication.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BacktraceRuntimeRunner;
 
 impl BacktraceRuntimeRunner {
-    pub fn refresh_pid_modules(
-        coordinator: &mut ProcessManager,
-        proc_pid: u32,
-    ) -> Result<Vec<LoadedModuleRuntimeInfo>> {
-        coordinator.refresh_prefill_pid(proc_pid)?;
-
-        let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(proc_pid) else {
-            return Ok(Vec::new());
-        };
-        let entries = entries.to_vec();
-
-        Self::record_runtime_pid_alias(coordinator, proc_pid, &[]);
-        Self::write_pinned_offsets_for_pid("PID-mode", proc_pid, &entries, &[]);
-        Ok(DwarfAnalyzer::runtime_modules_from_pid_offsets(&entries))
-    }
-
-    pub fn collect_target_modules(
+    pub fn prepare_target_module_mappings(
         coordinator: &mut ProcessManager,
         target_binary: &str,
-        extra_runtime_pids: &[u32],
-    ) -> Result<Vec<LoadedModuleRuntimeInfo>> {
+    ) -> anyhow::Result<usize> {
         coordinator.refresh_prefill_module(target_binary)?;
-
         let target_pids = coordinator
             .cached_offsets_for_module(target_binary)
             .into_iter()
             .map(|(pid, _, _, _, _)| pid)
             .filter(|pid| *pid != std::process::id())
             .collect::<BTreeSet<_>>();
-        if target_pids.is_empty() {
-            return Ok(Vec::new());
-        }
 
-        let target_pid_count = target_pids.len();
-        let mut modules_by_cookie = BTreeMap::new();
+        let mut mapped_modules = BTreeSet::new();
         for pid in target_pids {
             if let Err(error) = coordinator.refresh_prefill_pid(pid) {
                 warn!(
@@ -59,93 +31,113 @@ impl BacktraceRuntimeRunner {
                 );
                 continue;
             }
-
             let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(pid) else {
                 continue;
             };
             let entries = entries.to_vec();
+            Self::record_runtime_pid_alias(coordinator, pid, &[]);
+            Self::write_pinned_offsets_for_pid("target-mode", pid, &entries, &[]);
+            mapped_modules.extend(entries.iter().map(|entry| entry.cookie));
+        }
+        Ok(mapped_modules.len())
+    }
 
+    pub fn refresh_pid_modules_for_requests(
+        coordinator: &mut ProcessManager,
+        proc_pid: u32,
+        requested_cookies: &BTreeSet<u64>,
+        requested_raw_ips: &BTreeSet<u64>,
+        refresh: bool,
+    ) -> Vec<LoadedModuleRuntimeInfo> {
+        if refresh {
+            if let Err(error) = coordinator.refresh_prefill_pid(proc_pid) {
+                tracing::debug!(
+                    "Failed to refresh module offsets for backtrace PID {}: {}",
+                    proc_pid,
+                    error
+                );
+            }
+        }
+        let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(proc_pid) else {
+            return Vec::new();
+        };
+        let entries = entries.to_vec();
+        let modules = runtime_modules_for_requests(&entries, requested_cookies, requested_raw_ips);
+        if modules.is_empty() {
+            return modules;
+        }
+
+        Self::record_runtime_pid_alias(coordinator, proc_pid, &[]);
+        Self::write_pinned_offsets_for_pid("PID-mode", proc_pid, &entries, &[]);
+        modules
+    }
+
+    pub fn refresh_target_modules_for_requests(
+        coordinator: &mut ProcessManager,
+        target_binary: &str,
+        extra_runtime_pids: &[u32],
+        requested_cookies: &BTreeSet<u64>,
+        requested_raw_ips: &BTreeSet<u64>,
+        refreshed_proc_pids: &mut BTreeSet<u32>,
+    ) -> Vec<LoadedModuleRuntimeInfo> {
+        let mut target_pids = coordinator
+            .cached_offsets_for_module(target_binary)
+            .into_iter()
+            .map(|(pid, _, _, _, _)| pid)
+            .filter(|pid| *pid != std::process::id())
+            .collect::<BTreeSet<_>>();
+        for runtime_pid in extra_runtime_pids.iter().copied().filter(|pid| *pid != 0) {
+            if let Some(proc_pid) = coordinator.resolve_runtime_proc_pid(runtime_pid) {
+                if proc_pid != std::process::id() {
+                    target_pids.insert(proc_pid);
+                }
+            }
+            if proc_pid_visible(runtime_pid) && runtime_pid != std::process::id() {
+                target_pids.insert(runtime_pid);
+            }
+        }
+        let target_pid_count = target_pids.len();
+        let mut modules_by_cookie = BTreeMap::new();
+
+        for pid in target_pids {
+            if refreshed_proc_pids.insert(pid) {
+                if let Err(error) = coordinator.refresh_prefill_pid(pid) {
+                    tracing::debug!(
+                        "Failed to refresh module offsets for target-mode backtrace PID {}: {}",
+                        pid,
+                        error
+                    );
+                }
+            }
+            let Some(entries) = coordinator.cached_offsets_with_paths_for_pid(pid) else {
+                continue;
+            };
+            let entries = entries.to_vec();
             let pid_runtime_pids =
                 runtime_pids_for_target_pid(coordinator, pid, target_pid_count, extra_runtime_pids);
+            let empty_raw_ips = BTreeSet::new();
+            let pid_requested_raw_ips = if pid_runtime_pids.is_empty() {
+                &empty_raw_ips
+            } else {
+                requested_raw_ips
+            };
+            let modules =
+                runtime_modules_for_requests(&entries, requested_cookies, pid_requested_raw_ips);
+            if modules.is_empty() {
+                continue;
+            }
             Self::record_runtime_pid_alias(coordinator, pid, &pid_runtime_pids);
             Self::write_pinned_offsets_for_pid("target-mode", pid, &entries, &pid_runtime_pids);
-            for entry in &entries {
-                modules_by_cookie
-                    .entry(entry.cookie)
-                    .or_insert_with(|| LoadedModuleRuntimeInfo {
-                        module_path: PathBuf::from(&entry.module_path),
-                        loaded_address: Some(entry.base),
-                        load_bias: Some(entry.offsets.text),
-                        size: entry.size,
-                    });
+
+            for module in modules {
+                let cookie = ghostscope_compiler::module_cookie_for_path(
+                    &module.module_path.to_string_lossy(),
+                );
+                modules_by_cookie.entry(cookie).or_insert(module);
             }
         }
 
-        Ok(modules_by_cookie.into_values().collect())
-    }
-
-    pub async fn refresh_analyzer_modules(
-        analyzer: &mut DwarfAnalyzer,
-        runtime_modules: Vec<LoadedModuleRuntimeInfo>,
-        debug_search_paths: &[String],
-        allow_loose_debug_match: bool,
-        debuginfod_client: Option<Arc<DebuginfodClient>>,
-    ) -> Result<usize> {
-        analyzer
-            .refresh_pid_runtime_modules_with_config_and_debuginfod(
-                runtime_modules,
-                debug_search_paths,
-                allow_loose_debug_match,
-                debuginfod_client,
-                |_| {},
-            )
-            .await
-    }
-
-    pub async fn append_loaded_module_cfi(
-        analyzer: &DwarfAnalyzer,
-        trace_manager: &mut TraceManager,
-    ) -> BacktraceUnwindRowsAppendStats {
-        let modules = Self::collect_backtrace_unwind_rows(analyzer);
-        let stats = trace_manager
-            .append_backtrace_unwind_rows_for_modules(&modules)
-            .await;
-        if stats.modules > 0 {
-            info!(
-                modules = stats.modules,
-                rows = stats.rows,
-                "Appended runtime DWARF bt unwind rows to active traces"
-            );
-        }
-        stats
-    }
-
-    fn collect_backtrace_unwind_rows(
-        analyzer: &DwarfAnalyzer,
-    ) -> Vec<(u64, Vec<BacktraceUnwindRow>)> {
-        let mut modules_by_cookie = BTreeMap::<u64, Vec<BacktraceUnwindRow>>::new();
-        for module in analyzer.loaded_module_runtime_info() {
-            let Some(module_id) = analyzer.module_id_for_path(&module.module_path) else {
-                continue;
-            };
-            let Ok(Some(table)) = analyzer.compact_unwind_table_for_module(module_id) else {
-                continue;
-            };
-            let mut rows = table
-                .rows
-                .iter()
-                .map(ghostscope_compiler::backtrace_unwind_row_from_compact)
-                .collect::<Vec<_>>();
-            if rows.is_empty() {
-                continue;
-            }
-            rows.sort_by_key(|row| (row.pc_start, row.pc_end));
-            let module_path = module.module_path.to_string_lossy();
-            let cookie = ghostscope_compiler::module_cookie_for_path(&module_path);
-            modules_by_cookie.entry(cookie).or_insert(rows);
-        }
-
-        modules_by_cookie.into_iter().collect()
+        modules_by_cookie.into_values().take(1).collect()
     }
 
     fn record_runtime_pid_alias(
@@ -229,6 +221,31 @@ impl BacktraceRuntimeRunner {
     }
 }
 
+fn runtime_modules_for_requests(
+    entries: &[PidOffsetsEntry],
+    requested_cookies: &BTreeSet<u64>,
+    requested_raw_ips: &BTreeSet<u64>,
+) -> Vec<LoadedModuleRuntimeInfo> {
+    let mut seen = BTreeSet::new();
+    entries
+        .iter()
+        .filter(|entry| {
+            let requested_by_cookie = requested_cookies.contains(&entry.cookie);
+            let requested_by_ip = requested_raw_ips.iter().any(|raw_ip| {
+                *raw_ip >= entry.base && *raw_ip < entry.base.saturating_add(entry.size)
+            });
+            (requested_by_cookie || requested_by_ip) && seen.insert(entry.cookie)
+        })
+        .take(1)
+        .map(|entry| LoadedModuleRuntimeInfo {
+            module_path: PathBuf::from(&entry.module_path),
+            loaded_address: Some(entry.base),
+            load_bias: Some(entry.offsets.text),
+            size: entry.size,
+        })
+        .collect()
+}
+
 fn runtime_pid_keys_for_proc(proc_pid: u32, extra_runtime_pids: &[u32]) -> Vec<u32> {
     let mut pids = runtime_pid_candidates_for_proc(proc_pid)
         .into_iter()
@@ -262,4 +279,40 @@ fn runtime_pids_for_target_pid(
 
 fn proc_pid_visible(pid: u32) -> bool {
     std::path::Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ghostscope_process::SectionOffsets;
+
+    fn entry(path: &str, cookie: u64, base: u64) -> PidOffsetsEntry {
+        PidOffsetsEntry {
+            module_path: path.to_string(),
+            cookie,
+            offsets: SectionOffsets {
+                text: base + 0x100,
+                ..Default::default()
+            },
+            base,
+            size: 0x1_000,
+        }
+    }
+
+    #[test]
+    fn runtime_module_selection_is_demand_driven_and_single_module() {
+        let entries = vec![
+            entry("/tmp/one.so", 1, 0x10_000),
+            entry("/tmp/two.so", 2, 0x20_000),
+        ];
+        let requested_cookies = BTreeSet::from([2]);
+        let requested_raw_ips = BTreeSet::from([0x10_123]);
+
+        let selected =
+            runtime_modules_for_requests(&entries, &requested_cookies, &requested_raw_ips);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].module_path, PathBuf::from("/tmp/one.so"));
+        assert_eq!(selected[0].loaded_address, Some(0x10_000));
+    }
 }

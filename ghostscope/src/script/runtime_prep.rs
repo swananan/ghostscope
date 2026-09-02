@@ -33,24 +33,16 @@ fn script_contains_backtrace(script: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub(super) async fn refresh_runtime_modules_before_compile(
+pub(super) fn prepare_runtime_modules_before_compile(
     script: &str,
     session: &mut GhostSession,
     compile_options: &mut ghostscope_compiler::CompileOptions,
 ) -> Result<()> {
-    if let Err(e) = session.refresh_pid_runtime_modules_if_needed().await {
-        warn!(
-            "Failed to refresh PID runtime modules after sysmon map-change event: {:#}",
-            e
-        );
-    }
-
     if session.is_target_mode() && script_contains_backtrace(script) {
         session.enable_target_backtrace_runtime_modules();
-        if let Err(e) = session.refresh_target_runtime_modules().await {
+        if let Err(error) = session.prepare_target_backtrace_module_mappings() {
             warn!(
-                "Failed to refresh target-mode runtime modules before backtrace compilation: {:#}",
-                e
+                "Failed to prepare target-mode runtime module mappings before backtrace compilation: {error:#}"
             );
         }
         configure_target_mode_backtrace_pid_namespace(session, compile_options);

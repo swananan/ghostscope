@@ -15,6 +15,7 @@ pub(crate) mod loader;
 pub(crate) mod objfile;
 pub(crate) mod parser;
 pub(crate) mod path_match;
+mod runtime_unwind;
 pub(crate) mod semantics;
 pub(crate) mod type_syntax;
 
@@ -29,6 +30,9 @@ pub use analyzer::{
     SimpleFileInfo, SourceLineAddressSearch, SourceLineQuerySearch, TypeLookupAmbiguity,
 };
 pub use loader::ExplicitDebugFile;
+pub use runtime_unwind::{
+    load_runtime_backtrace_metadata, RuntimeBacktraceMetadata, RuntimeTextSymbol,
+};
 
 // Re-export essential core and semantic support types.
 pub use core::{

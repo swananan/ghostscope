@@ -291,6 +291,7 @@ pub(super) async fn register_attached_trace(
                     proc_pid: session.proc_pid(),
                 },
                 loader: Some(loader),
+                supports_backtrace_runtime_updates: config.uses_backtrace,
                 ebpf_function_name: format!(
                     "gs_{}_{}_{}",
                     session.host_pid().unwrap_or(0),
