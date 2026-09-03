@@ -4,7 +4,8 @@ use super::{variables::complete_aggregate_declaration_entry, LoadedObjfile};
 use crate::{
     core::Result,
     semantics::{
-        resolve_attr_with_unit_origins, resolve_name_with_origins, resolve_type_ref_with_origins,
+        resolve_attr_with_unit_origins, resolve_name_with_origins, resolve_type_definition_loc,
+        resolve_type_definition_ref_with_origins, resolve_type_ref_with_origins,
         CompilationUnitMetadata, ProducerInfo, SourceLanguage, TypeLoc, VariableAccessSegment,
     },
     CuId, ModuleId, TypeId,
@@ -123,6 +124,10 @@ fn normalize_type_loc(
 ) -> Result<Option<TypeLoc>> {
     let mut visited = HashSet::new();
     for _ in 0..MAX_TYPE_REFERENCE_DEPTH {
+        let Some(definition_loc) = resolve_type_definition_loc(dwarf, loc)? else {
+            return Ok(None);
+        };
+        loc = definition_loc;
         if !visited.insert((loc.cu_off.0, loc.die_off.0)) {
             return Err(anyhow::anyhow!(
                 "cycle while resolving type DIE at {:?}:{:?}",
@@ -198,6 +203,35 @@ fn projected_member_type_loc(
         };
     }
 
+    projected_aggregate_member_type_loc(
+        dwarf,
+        type_name_index,
+        aggregate_loc,
+        field,
+        &HashSet::new(),
+        0,
+    )
+}
+
+fn projected_aggregate_member_type_loc(
+    dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+    type_name_index: &crate::index::TypeNameIndex,
+    loc: TypeLoc,
+    field: &str,
+    visited: &HashSet<(usize, usize)>,
+    inheritance_depth: usize,
+) -> Result<Option<TypeLoc>> {
+    if inheritance_depth >= MAX_TYPE_REFERENCE_DEPTH {
+        return Ok(None);
+    }
+    let Some(aggregate_loc) = normalize_type_loc(dwarf, type_name_index, loc)? else {
+        return Ok(None);
+    };
+    let mut current_path = visited.clone();
+    if !current_path.insert((aggregate_loc.cu_off.0, aggregate_loc.die_off.0)) {
+        return Ok(None);
+    }
+
     let header = dwarf.unit_header(aggregate_loc.cu_off)?;
     let unit = dwarf.unit(header)?;
     let entry = unit.entry(aggregate_loc.die_off)?;
@@ -211,23 +245,51 @@ fn projected_member_type_loc(
     let mut tree = unit.entries_tree(Some(entry.offset()))?;
     let root = tree.root()?;
     let mut children = root.children();
+    let mut base_classes = Vec::new();
     while let Some(child) = children.next()? {
         let member = child.entry();
-        if member.tag() != gimli::DW_TAG_member {
-            continue;
+        if member.tag() == gimli::DW_TAG_member {
+            if resolve_name_with_origins(dwarf, &unit, member)?.as_deref() == Some(field) {
+                return resolve_type_ref_with_origins(dwarf, member, &unit);
+            }
+        } else if member.tag() == gimli::DW_TAG_inheritance {
+            if let Some(base_class) =
+                resolve_type_definition_ref_with_origins(dwarf, member, &unit)?
+            {
+                base_classes.push(base_class);
+            }
         }
-        let Some(name_attribute) = member.attr(gimli::DW_AT_name) else {
-            continue;
-        };
-        let name_reader = dwarf.attr_string(&unit, name_attribute.value())?;
-        let name = name_reader.to_string_lossy()?;
-        if name.as_ref() != field {
-            continue;
-        }
-        return resolve_type_ref_with_origins(dwarf, member, &unit);
     }
 
-    Ok(None)
+    let mut inherited_member = None;
+    for base_class in base_classes {
+        if let Some(member) = projected_aggregate_member_type_loc(
+            dwarf,
+            type_name_index,
+            base_class,
+            field,
+            &current_path,
+            inheritance_depth + 1,
+        )? {
+            if inherited_member.is_some() {
+                let kind = match entry.tag() {
+                    gimli::DW_TAG_class_type => "class",
+                    gimli::DW_TAG_union_type => "union",
+                    _ => "struct",
+                };
+                let type_name = resolve_name_with_origins(dwarf, &unit, &entry)?
+                    .unwrap_or_else(|| "<anonymous>".to_string());
+                return Err(crate::TypeLayoutError::AmbiguousMember {
+                    kind,
+                    type_name,
+                    field: field.to_string(),
+                }
+                .into());
+            }
+            inherited_member = Some(member);
+        }
+    }
+    Ok(inherited_member)
 }
 
 fn variant_member_type_loc(
@@ -569,6 +631,8 @@ mod tests {
         int: TypeLoc,
         pair_pointer: TypeLoc,
         int_array: TypeLoc,
+        derived: TypeLoc,
+        ambiguous_derived: TypeLoc,
     }
 
     fn build_fixture() -> Fixture {
@@ -640,6 +704,84 @@ mod tests {
             let int_array = unit.add(root, gimli::DW_TAG_array_type);
             unit.get_mut(int_array)
                 .set(gimli::DW_AT_type, WriteAttributeValue::UnitRef(int));
+
+            let base = unit.add(root, gimli::DW_TAG_structure_type);
+            unit.get_mut(base).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"Base".to_vec()),
+            );
+            unit.get_mut(base)
+                .set(gimli::DW_AT_byte_size, WriteAttributeValue::Data1(8));
+            let inherited = unit.add(base, gimli::DW_TAG_member);
+            unit.get_mut(inherited).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"inherited".to_vec()),
+            );
+            unit.get_mut(inherited)
+                .set(gimli::DW_AT_type, WriteAttributeValue::UnitRef(int));
+            unit.get_mut(inherited).set(
+                gimli::DW_AT_data_member_location,
+                WriteAttributeValue::Udata(4),
+            );
+
+            let derived = unit.add(root, gimli::DW_TAG_class_type);
+            unit.get_mut(derived).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"Derived".to_vec()),
+            );
+            unit.get_mut(derived)
+                .set(gimli::DW_AT_byte_size, WriteAttributeValue::Data1(20));
+            let inheritance = unit.add(derived, gimli::DW_TAG_inheritance);
+            unit.get_mut(inheritance)
+                .set(gimli::DW_AT_type, WriteAttributeValue::UnitRef(base));
+            unit.get_mut(inheritance).set(
+                gimli::DW_AT_data_member_location,
+                WriteAttributeValue::Udata(8),
+            );
+            let own = unit.add(derived, gimli::DW_TAG_member);
+            unit.get_mut(own).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"own".to_vec()),
+            );
+            unit.get_mut(own)
+                .set(gimli::DW_AT_type, WriteAttributeValue::UnitRef(int));
+            unit.get_mut(own).set(
+                gimli::DW_AT_data_member_location,
+                WriteAttributeValue::Udata(16),
+            );
+
+            let other_base = unit.add(root, gimli::DW_TAG_structure_type);
+            unit.get_mut(other_base).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"OtherBase".to_vec()),
+            );
+            unit.get_mut(other_base)
+                .set(gimli::DW_AT_byte_size, WriteAttributeValue::Data1(4));
+            let other_inherited = unit.add(other_base, gimli::DW_TAG_member);
+            unit.get_mut(other_inherited).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"inherited".to_vec()),
+            );
+            unit.get_mut(other_inherited)
+                .set(gimli::DW_AT_type, WriteAttributeValue::UnitRef(int));
+
+            let ambiguous_derived = unit.add(root, gimli::DW_TAG_class_type);
+            unit.get_mut(ambiguous_derived).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(b"AmbiguousDerived".to_vec()),
+            );
+            unit.get_mut(ambiguous_derived)
+                .set(gimli::DW_AT_byte_size, WriteAttributeValue::Data1(12));
+            let first_inheritance = unit.add(ambiguous_derived, gimli::DW_TAG_inheritance);
+            unit.get_mut(first_inheritance)
+                .set(gimli::DW_AT_type, WriteAttributeValue::UnitRef(base));
+            let second_inheritance = unit.add(ambiguous_derived, gimli::DW_TAG_inheritance);
+            unit.get_mut(second_inheritance)
+                .set(gimli::DW_AT_type, WriteAttributeValue::UnitRef(other_base));
+            unit.get_mut(second_inheritance).set(
+                gimli::DW_AT_data_member_location,
+                WriteAttributeValue::Udata(8),
+            );
         }
 
         let mut sections = Sections::new(EndianVec::new(LittleEndian));
@@ -663,6 +805,7 @@ mod tests {
         let mut int = None;
         let mut pair_pointer = None;
         let mut int_array = None;
+        let mut classes = Vec::new();
         let mut entries = unit.entries();
         while let Some(entry) = entries.next_dfs().unwrap() {
             let loc = TypeLoc {
@@ -674,11 +817,13 @@ mod tests {
                 gimli::DW_TAG_structure_type => structures.push(loc),
                 gimli::DW_TAG_pointer_type => pair_pointer = Some(loc),
                 gimli::DW_TAG_array_type => int_array = Some(loc),
+                gimli::DW_TAG_class_type => classes.push(loc),
                 _ => {}
             }
         }
 
-        assert_eq!(structures.len(), 2);
+        assert_eq!(structures.len(), 4);
+        assert_eq!(classes.len(), 2);
         Fixture {
             dwarf,
             cu: CuId(cu_off.0 as u32),
@@ -687,6 +832,8 @@ mod tests {
             int: int.unwrap(),
             pair_pointer: pair_pointer.unwrap(),
             int_array: int_array.unwrap(),
+            derived: classes[0],
+            ambiguous_derived: classes[1],
         }
     }
 
@@ -925,6 +1072,86 @@ mod tests {
         assert_eq!(pointer_member, Some(fixture.int));
         assert_eq!(dereferenced, Some(fixture.pair));
         assert_eq!(element, Some(fixture.int));
+    }
+
+    #[test]
+    fn follows_inheritance_for_member_type_and_layout() {
+        let fixture = build_fixture();
+        let types = TypeNameIndex::default();
+
+        let inherited = projected_type_loc(
+            &fixture.dwarf,
+            &types,
+            fixture.derived,
+            &VariableAccessSegment::Field("inherited".to_string()),
+        )
+        .unwrap();
+        assert_eq!(inherited, Some(fixture.int));
+
+        let header = fixture.dwarf.unit_header(fixture.derived.cu_off).unwrap();
+        let unit = fixture.dwarf.unit(header).unwrap();
+        let summary = crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+            &fixture.dwarf,
+            &unit,
+            fixture.derived.die_off,
+            SourceLanguage::Cpp,
+        )
+        .unwrap();
+        let crate::TypeInfo::StructType { members, .. } = summary else {
+            panic!("expected derived class summary");
+        };
+
+        assert_eq!(
+            members
+                .iter()
+                .find(|member| member.name == "inherited")
+                .map(|member| member.offset),
+            Some(12)
+        );
+        assert_eq!(
+            members
+                .iter()
+                .find(|member| member.name == "own")
+                .map(|member| member.offset),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_inherited_member_paths() {
+        let fixture = build_fixture();
+        let types = TypeNameIndex::default();
+
+        let projected_error = projected_type_loc(
+            &fixture.dwarf,
+            &types,
+            fixture.ambiguous_derived,
+            &VariableAccessSegment::Field("inherited".to_string()),
+        )
+        .expect_err("two inherited paths should be ambiguous");
+        assert!(matches!(
+            projected_error.downcast_ref::<crate::TypeLayoutError>(),
+            Some(crate::TypeLayoutError::AmbiguousMember { field, .. })
+                if field == "inherited"
+        ));
+
+        let header = fixture
+            .dwarf
+            .unit_header(fixture.ambiguous_derived.cu_off)
+            .unwrap();
+        let unit = fixture.dwarf.unit(header).unwrap();
+        let summary = crate::parser::DetailedParser::resolve_type_shallow_at_offset(
+            &fixture.dwarf,
+            &unit,
+            fixture.ambiguous_derived.die_off,
+            SourceLanguage::Cpp,
+        )
+        .unwrap();
+        assert!(matches!(
+            crate::member_layout(&summary, "inherited"),
+            Err(crate::TypeLayoutError::AmbiguousMember { field, .. })
+                if field == "inherited"
+        ));
     }
 
     #[test]

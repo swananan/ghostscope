@@ -12,7 +12,8 @@ use crate::{
     index::{CfiIndex, FunctionBlocks},
     parser::ExpressionEvaluator,
     semantics::{
-        resolve_name_with_origins, resolve_type_ref_in_same_unit_with_origins, VisibleVariable,
+        resolve_name_with_origins, resolve_type_definition_ref_with_origins,
+        resolve_type_ref_in_same_unit_with_origins, VisibleVariable,
     },
     TypeInfo,
 };
@@ -169,6 +170,66 @@ impl DetailedParser {
             bit_offset,
             bit_size,
         })
+    }
+
+    fn static_data_member_offset(
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        reason: &'static str,
+    ) -> Option<u64> {
+        let Some(location) = entry.attr(gimli::DW_AT_data_member_location) else {
+            return Some(0);
+        };
+
+        match location.value() {
+            gimli::AttributeValue::Exprloc(expression) => expr_errors::downgrade_optional_to_none(
+                DwarfExprMode::ConstOffset,
+                crate::dwarf_expr::const_eval::eval_const_offset(&expression, unit.encoding()),
+                reason,
+            ),
+            value => attr_u64(value),
+        }
+    }
+
+    fn parse_inherited_members(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        inheritance: &gimli::DebuggingInformationEntry<DwarfReader>,
+        inheritance_depth: usize,
+    ) -> Option<Vec<crate::StructMember>> {
+        if inheritance
+            .attr(gimli::DW_AT_virtuality)
+            .is_some_and(|attribute| {
+                !matches!(
+                    attribute.value(),
+                    gimli::AttributeValue::Virtuality(gimli::DW_VIRTUALITY_none)
+                )
+            })
+        {
+            return None;
+        }
+
+        let base_offset =
+            Self::static_data_member_offset(inheritance, unit, "non-virtual base class layout")?;
+        let base_loc = resolve_type_definition_ref_with_origins(dwarf, inheritance, unit)
+            .ok()
+            .flatten()?;
+        let base_header = dwarf.unit_header(base_loc.cu_off).ok()?;
+        let base_unit = dwarf.unit(base_header).ok()?;
+        let base_type = Self::resolve_type_shallow_at_offset_impl_with_depth(
+            dwarf,
+            &base_unit,
+            base_loc.die_off,
+            inheritance_depth + 1,
+        )?;
+        let mut members = match base_type {
+            TypeInfo::StructType { members, .. } | TypeInfo::VariantType { members, .. } => members,
+            _ => return None,
+        };
+        for member in &mut members {
+            member.offset = base_offset.checked_add(member.offset)?;
+        }
+        Some(members)
     }
 
     fn discriminant_is_unsigned(type_info: &TypeInfo) -> bool {
@@ -414,8 +475,24 @@ impl DetailedParser {
     fn resolve_type_shallow_at_offset_impl(
         dwarf: &gimli::Dwarf<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
-        mut type_offset: gimli::UnitOffset,
+        type_offset: gimli::UnitOffset,
     ) -> Option<TypeInfo> {
+        Self::resolve_type_shallow_at_offset_impl_with_depth(dwarf, unit, type_offset, 0)
+    }
+
+    fn resolve_type_shallow_at_offset_impl_with_depth(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        mut type_offset: gimli::UnitOffset,
+        inheritance_depth: usize,
+    ) -> Option<TypeInfo> {
+        const MAX_INHERITANCE_DEPTH: usize = 64;
+        if inheritance_depth >= MAX_INHERITANCE_DEPTH {
+            return Some(TypeInfo::UnknownType {
+                name: "<inheritance_depth_limit>".to_string(),
+            });
+        }
+
         let mut visited = std::collections::HashSet::new();
         // Strip typedef/qualifiers chain but keep last typedef name if it's the canonical alias
         let mut alias_name: Option<String> = None;
@@ -629,8 +706,9 @@ impl DetailedParser {
                             byte_size = sz;
                         }
                     }
-                    // Collect only direct member DIEs
+                    // Direct members shadow inherited members, regardless of DIE order.
                     let mut members: Vec<crate::StructMember> = Vec::new();
+                    let mut inherited_members: Vec<crate::StructMember> = Vec::new();
                     let mut variant_parts: Vec<crate::VariantPart> = Vec::new();
                     if let Ok(mut tree) = unit.entries_tree(Some(entry.offset())) {
                         if let Ok(root) = tree.root() {
@@ -745,6 +823,15 @@ impl DetailedParser {
                                         bit_offset,
                                         bit_size,
                                     });
+                                } else if ce.tag() == gimli::DW_TAG_inheritance {
+                                    if let Some(base_members) = Self::parse_inherited_members(
+                                        dwarf,
+                                        unit,
+                                        ce,
+                                        inheritance_depth,
+                                    ) {
+                                        inherited_members.extend(base_members);
+                                    }
                                 } else if ce.tag() == DW_TAG_VARIANT_PART {
                                     if let Some(part) =
                                         Self::parse_variant_part_at_offset(dwarf, unit, ce.offset())
@@ -755,6 +842,14 @@ impl DetailedParser {
                             }
                         }
                     }
+                    let direct_member_names = members
+                        .iter()
+                        .map(|member| member.name.as_str())
+                        .collect::<HashSet<_>>();
+                    inherited_members
+                        .retain(|member| !direct_member_names.contains(member.name.as_str()));
+                    // Keep duplicate inherited names so lookup can reject ambiguous base paths.
+                    members.extend(inherited_members);
                     // Post-process: infer array total_size/element_count when missing (from next member offset or struct size)
                     if !members.is_empty() {
                         // Pre-build sorted offsets

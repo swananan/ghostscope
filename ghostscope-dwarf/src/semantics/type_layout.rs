@@ -24,6 +24,13 @@ pub enum TypeLayoutError {
         members: String,
     },
 
+    #[error("Ambiguous member '{field}' in {kind} '{type_name}'")]
+    AmbiguousMember {
+        kind: &'static str,
+        type_name: String,
+        field: String,
+    },
+
     #[error("member access requires struct or union type, got '{type_name}'")]
     InvalidMemberBase { type_name: String },
 }
@@ -60,26 +67,39 @@ pub fn is_pointer_or_array_type(ty: &TypeInfo) -> bool {
 
 pub fn member_layout(ty: &TypeInfo, field: &str) -> Result<MemberLayout, TypeLayoutError> {
     match strip_type_aliases(ty) {
-        TypeInfo::StructType { name, members, .. } => members
-            .iter()
-            .find(|member| member.name == field)
-            .map(|member| MemberLayout {
-                offset: member.offset,
-                member_type: member.member_type.clone(),
-            })
-            .ok_or_else(|| unknown_member_error("struct", name, field, members)),
-        TypeInfo::UnionType { name, members, .. } => members
-            .iter()
-            .find(|member| member.name == field)
-            .map(|member| MemberLayout {
-                offset: member.offset,
-                member_type: member.member_type.clone(),
-            })
-            .ok_or_else(|| unknown_member_error("union", name, field, members)),
+        TypeInfo::StructType { name, members, .. } => {
+            unique_member_layout("struct", name, field, members)
+        }
+        TypeInfo::UnionType { name, members, .. } => {
+            unique_member_layout("union", name, field, members)
+        }
         other => Err(TypeLayoutError::InvalidMemberBase {
             type_name: other.type_name(),
         }),
     }
+}
+
+fn unique_member_layout(
+    kind: &'static str,
+    type_name: &str,
+    field: &str,
+    members: &[crate::StructMember],
+) -> Result<MemberLayout, TypeLayoutError> {
+    let mut matches = members.iter().filter(|member| member.name == field);
+    let Some(member) = matches.next() else {
+        return Err(unknown_member_error(kind, type_name, field, members));
+    };
+    if matches.next().is_some() {
+        return Err(TypeLayoutError::AmbiguousMember {
+            kind,
+            type_name: type_name.to_string(),
+            field: field.to_string(),
+        });
+    }
+    Ok(MemberLayout {
+        offset: member.offset,
+        member_type: member.member_type.clone(),
+    })
 }
 
 pub fn indexable_element_layout(ty: &TypeInfo) -> Option<IndexableElementLayout> {
@@ -180,5 +200,38 @@ mod tests {
         };
         let element = indexable_element_layout(&pointer_type).expect("pointer element layout");
         assert_eq!(element.stride, 4);
+    }
+
+    #[test]
+    fn duplicate_member_names_are_ambiguous() {
+        let duplicate = TypeInfo::StructType {
+            name: "Derived".to_string(),
+            size: 8,
+            members: vec![
+                StructMember {
+                    name: "value".to_string(),
+                    member_type: signed_int(),
+                    offset: 0,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+                StructMember {
+                    name: "value".to_string(),
+                    member_type: signed_int(),
+                    offset: 4,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+            ],
+        };
+
+        assert!(matches!(
+            member_layout(&duplicate, "value"),
+            Err(TypeLayoutError::AmbiguousMember {
+                kind: "struct",
+                type_name,
+                field,
+            }) if type_name == "Derived" && field == "value"
+        ));
     }
 }

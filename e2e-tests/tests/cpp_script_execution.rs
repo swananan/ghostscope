@@ -6,6 +6,8 @@ use common::{init, FIXTURES};
 
 const CPP_NESTED_MEMBER_TRACE_LINE: u32 = 44;
 const CPP_SIBLING_BLOCK_MEMBER_TRACE_LINE: u32 = 72;
+const CPP_INHERITED_MEMBER_TRACE_LINE: u32 = 81;
+const CPP_AMBIGUOUS_INHERITED_MEMBER_TRACE_LINE: u32 = 90;
 
 async fn compile_cpp_complex_script(
     script: &str,
@@ -124,6 +126,90 @@ trace {}:{CPP_SIBLING_BLOCK_MEMBER_TRACE_LINE} {{
         "expected b.m in the last sibling block to compile; target_info={} failed_targets={:?}",
         result.target_info,
         result.failed_targets
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cpp_inherited_member_access() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
+    let source_path = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cpp_complex_program has no parent directory"))?
+        .join("main.cpp");
+    let script = format!(
+        r#"
+trace {}:{CPP_INHERITED_MEMBER_TRACE_LINE} {{
+    print "INHERITED:{{}}", d.inherited;
+}}
+"#,
+        source_path.display()
+    );
+
+    let compiled = compile_cpp_complex_script(&script).await?;
+    assert!(
+        !compiled.uprobe_configs.is_empty(),
+        "expected inherited d.inherited access to compile; target_info={} failed_targets={:?}",
+        compiled.target_info,
+        compiled.failed_targets
+    );
+
+    let target = spawn_cpp_complex_program().await?;
+    let (exit_code, stdout, stderr) =
+        run_ghostscope_with_script_for_target(&script, 4, &target).await?;
+    target.terminate().await?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.contains("INHERITED:222"),
+        "Expected inherited base member value. STDOUT: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cpp_ambiguous_inherited_member_access_is_rejected() -> anyhow::Result<()> {
+    init();
+
+    let binary_path = FIXTURES.get_test_binary("cpp_complex_program")?;
+    let source_path = binary_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cpp_complex_program has no parent directory"))?
+        .join("main.cpp");
+    let script = format!(
+        r#"
+trace {}:{CPP_AMBIGUOUS_INHERITED_MEMBER_TRACE_LINE} {{
+    print d.conflict;
+}}
+"#,
+        source_path.display()
+    );
+
+    let message = match compile_cpp_complex_script(&script).await {
+        Ok(compiled) => {
+            assert!(
+                compiled.uprobe_configs.is_empty(),
+                "ambiguous inherited member access should not compile: {compiled:?}"
+            );
+            assert!(
+                !compiled.failed_targets.is_empty(),
+                "ambiguous inherited member access should report a failed target: {compiled:?}"
+            );
+            compiled
+                .failed_targets
+                .iter()
+                .map(|target| target.error_message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        message.contains("Ambiguous member 'conflict'"),
+        "unexpected compile error: {message}"
     );
 
     Ok(())

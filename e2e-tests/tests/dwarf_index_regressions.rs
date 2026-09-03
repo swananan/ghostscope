@@ -117,6 +117,36 @@ fn assert_native_index_queries(
     Ok(())
 }
 
+fn assert_type_unit_inherited_member_queries(
+    analyzer: &ghostscope_dwarf::DwarfAnalyzer,
+    target: &Path,
+    producer: &str,
+) -> anyhow::Result<()> {
+    let derived = analyzer
+        .resolve_c_style_semantic_type_spec_in_module(target, "Derived")
+        .with_context(|| format!("{producer} type units did not resolve Derived"))?;
+    let layout = ghostscope_dwarf::member_layout(&derived.summary, "inherited")
+        .with_context(|| format!("{producer} type units dropped Base::inherited"))?;
+    assert_eq!(layout.offset, 0, "unexpected {producer} inherited offset");
+
+    let projection = analyzer.project_resolved_type(
+        &derived,
+        &ghostscope_dwarf::VariableAccessSegment::Field("inherited".to_string()),
+        Some(target),
+    )?;
+    assert_eq!(
+        projection.layout,
+        ghostscope_dwarf::TypeProjectionLayout::Member { offset: 0 },
+        "unexpected {producer} inherited projection"
+    );
+    assert_eq!(
+        projection.resolved_type.summary.type_name(),
+        "int",
+        "unexpected {producer} inherited member type"
+    );
+    Ok(())
+}
+
 async fn spawn_inline_callsite_program(
     binary_path: &Path,
 ) -> anyhow::Result<common::targets::TargetHandle> {
@@ -905,6 +935,11 @@ async fn test_gdb_index_resolves_function_type_and_global_lazily() -> anyhow::Re
                 .resolve_struct_type_shallow_by_name("Outer")
                 .context(".debug_names did not resolve Outer from its type unit")?;
             assert_eq!(outer_type.size(), 16, "unexpected Outer size");
+            assert_type_unit_inherited_member_queries(
+                &debug_names_type_analyzer,
+                &debug_names_type_units,
+                "clang++",
+            )?;
 
             let gdb_type_units = temp_dir.path().join("cpp-complex.gdb-type-units");
             fs::copy(&debug_names_type_units, &gdb_type_units)?;
@@ -934,6 +969,29 @@ async fn test_gdb_index_resolves_function_type_and_global_lazily() -> anyhow::Re
                 .context(".gdb_index did not resolve Outer from its type unit")?;
             assert_eq!(outer_type.size(), 16, "unexpected indexed Outer size");
         }
+    }
+
+    if command_available("g++") {
+        let cpp_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cpp_complex_program/main.cpp");
+        let gcc_type_units = temp_dir.path().join("cpp-complex.gcc-type-units");
+        run_command(
+            StdCommand::new("g++")
+                .arg("-gdwarf-5")
+                .arg("-fdebug-types-section")
+                .arg("-O0")
+                .arg(&cpp_source)
+                .arg("-o")
+                .arg(&gcc_type_units),
+            "g++ type-unit build",
+        )?;
+        anyhow::ensure!(
+            dwarf_has_type_unit(&gcc_type_units)?,
+            "g++ did not emit a DWARF5 type unit"
+        );
+        let gcc_type_analyzer =
+            ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&gcc_type_units).await?;
+        assert_type_unit_inherited_member_queries(&gcc_type_analyzer, &gcc_type_units, "g++")?;
     }
 
     if command_available("gcc") && command_available("objcopy") {

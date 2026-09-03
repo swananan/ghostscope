@@ -32,6 +32,7 @@ pub use type_layout::{
     strip_type_aliases, IndexableElementLayout, MemberLayout, TypeLayoutError,
 };
 pub(crate) use types::{
+    resolve_type_definition_loc, resolve_type_definition_ref_with_origins,
     resolve_type_ref_in_same_unit_with_origins, resolve_type_ref_with_origins, TypeLoc,
 };
 pub use unwind_plan::{
