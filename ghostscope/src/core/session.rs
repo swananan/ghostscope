@@ -10,7 +10,8 @@ use futures::FutureExt;
 use ghostscope_debuginfod::{DebuginfodClient, DebuginfodConfig};
 use ghostscope_dwarf::{DwarfAnalyzer, ExplicitDebugFile, ModuleStats, RuntimeBacktraceLoadBudget};
 use ghostscope_process::{
-    PidFilterSpec, PidNamespaceId, ProcessManager, ProcessSysmon, SysmonConfig, SysmonEventMask,
+    PidFilterSpec, PidNamespaceId, ProcessManager, ProcessManagerSnapshot,
+    ProcessManagerSnapshotReader, ProcessSysmon, SysmonConfig, SysmonEventMask,
 };
 use ghostscope_protocol::{ParsedInstruction, ParsedTraceEvent};
 use std::collections::{BTreeMap, BTreeSet};
@@ -73,6 +74,12 @@ fn observation_mapping(
         }
     }
     None
+}
+
+fn new_process_manager_state() -> (Arc<Mutex<ProcessManager>>, ProcessManagerSnapshotReader) {
+    let coordinator = ProcessManager::new();
+    let snapshot_reader = coordinator.snapshot_reader();
+    (Arc::new(Mutex::new(coordinator)), snapshot_reader)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -464,6 +471,7 @@ pub struct GhostSession {
     pub debug_file: Option<String>, // Optional debug file path
     pub config: Option<ResolvedConfig>, // Holds the resolved configuration
     pub coordinator: Arc<Mutex<ProcessManager>>, // Manages PID/module offsets prefill and application
+    coordinator_snapshot: ProcessManagerSnapshotReader,
     pub sysmon: Option<Arc<Mutex<ProcessSysmon>>>, // Realtime process monitor (exec/fork/exit)
     target_backtrace_runtime_modules_enabled: bool,
     backtrace_runtime_known_cookies: BTreeSet<u64>,
@@ -481,6 +489,7 @@ impl GhostSession {
     /// Create a new ghost session with merged configuration
     pub fn new_with_config(config: &ResolvedConfig) -> Self {
         info!("Creating ghost session with merged configuration");
+        let (coordinator, coordinator_snapshot) = new_process_manager_state();
 
         let mut s = Self {
             process_analyzer: None,
@@ -494,7 +503,8 @@ impl GhostSession {
             trace_manager: TraceManager::new(),
             source_path_resolver: SourcePathResolver::new(&config.source),
             config: Some(config.clone()),
-            coordinator: Arc::new(Mutex::new(ProcessManager::new())),
+            coordinator,
+            coordinator_snapshot,
             sysmon: None,
             target_backtrace_runtime_modules_enabled: false,
             backtrace_runtime_known_cookies: BTreeSet::new(),
@@ -614,6 +624,7 @@ impl GhostSession {
     #[allow(dead_code)]
     pub fn new(args: &ParsedArgs) -> Self {
         info!("Creating ghost session");
+        let (coordinator, coordinator_snapshot) = new_process_manager_state();
 
         let mut s = Self {
             process_analyzer: None,
@@ -627,7 +638,8 @@ impl GhostSession {
             trace_manager: TraceManager::new(),
             source_path_resolver: SourcePathResolver::new(&Default::default()),
             config: None,
-            coordinator: Arc::new(Mutex::new(ProcessManager::new())),
+            coordinator,
+            coordinator_snapshot,
             sysmon: None,
             target_backtrace_runtime_modules_enabled: false,
             backtrace_runtime_known_cookies: BTreeSet::new(),
@@ -1449,6 +1461,11 @@ impl GhostSession {
         self.pid_context
             .as_ref()
             .map(|pid_context| pid_context.proc_pid)
+    }
+
+    /// Last complete process-module view published by the mutable coordinator.
+    pub(crate) fn process_manager_snapshot(&self) -> Arc<ProcessManagerSnapshot> {
+        self.coordinator_snapshot.load()
     }
 
     /// Host-view PID kept for logs, UI display, and host-TGID fallback paths.

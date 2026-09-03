@@ -1,7 +1,9 @@
 use ghostscope_dwarf::{
     DwarfAnalyzer, FunctionParameter, LoadedModuleRuntimeInfo, ModuleAddress, PcContext,
 };
+#[cfg(test)]
 use ghostscope_process::ProcessManager;
+use ghostscope_process::ProcessManagerSnapshot;
 #[cfg(test)]
 use ghostscope_protocol::trace_event::backtrace_error_label;
 use ghostscope_protocol::trace_event::{
@@ -125,6 +127,7 @@ impl PidCacheKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FrameRenderCacheKey {
+    mapping_generation: u64,
     pids: PidCacheKey,
     analyzer_present: bool,
     index: u16,
@@ -138,6 +141,7 @@ struct FrameRenderCacheKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct StatusCacheKey {
+    mapping_generation: u64,
     pids: PidCacheKey,
     analyzer_present: bool,
     module_cookie: u64,
@@ -153,7 +157,7 @@ impl BacktraceRenderer {
         &mut self,
         event: &ParsedTraceEvent,
         analyzer: Option<&DwarfAnalyzer>,
-        coordinator: &ProcessManager,
+        coordinator: &ProcessManagerSnapshot,
         proc_pid_hint: Option<u32>,
     ) -> UiTraceEvent {
         let mut items = Vec::new();
@@ -203,7 +207,7 @@ impl BacktraceRenderer {
         &mut self,
         event: &ParsedTraceEvent,
         analyzer: Option<&DwarfAnalyzer>,
-        coordinator: &ProcessManager,
+        coordinator: &ProcessManagerSnapshot,
         proc_pid_hint: Option<u32>,
     ) -> ParsedTraceEvent {
         let mut changed = false;
@@ -247,7 +251,7 @@ impl BacktraceRenderer {
         instruction: &ParsedInstruction,
         event_pid: u32,
         analyzer: Option<&DwarfAnalyzer>,
-        coordinator: &ProcessManager,
+        coordinator: &ProcessManagerSnapshot,
         proc_pid_hint: Option<u32>,
     ) -> Vec<String> {
         let ParsedInstruction::Backtrace {
@@ -304,7 +308,7 @@ impl BacktraceRenderer {
         instruction: &ParsedInstruction,
         event_pid: u32,
         analyzer: Option<&DwarfAnalyzer>,
-        coordinator: &ProcessManager,
+        coordinator: &ProcessManagerSnapshot,
         proc_pid_hint: Option<u32>,
     ) -> BacktraceDisplay {
         let ParsedInstruction::Backtrace {
@@ -363,7 +367,7 @@ impl BacktraceRenderer {
         error_code: u16,
         frames: &[ParsedBacktraceFrame],
         analyzer: Option<&DwarfAnalyzer>,
-        coordinator: &ProcessManager,
+        coordinator: &ProcessManagerSnapshot,
         pids: &[u32],
     ) -> BacktraceStatus {
         if !matches!(
@@ -381,6 +385,7 @@ impl BacktraceRenderer {
         };
 
         let cache_key = StatusCacheKey {
+            mapping_generation: coordinator.generation(),
             pids: PidCacheKey::from_pids(pids),
             analyzer_present: true,
             module_cookie: last_frame.module_cookie,
@@ -422,7 +427,7 @@ impl BacktraceRenderer {
         input: FrameRenderInput<'_>,
         flags: u8,
         analyzer: Option<&DwarfAnalyzer>,
-        coordinator: &ProcessManager,
+        coordinator: &ProcessManagerSnapshot,
         pids: &[u32],
     ) -> Vec<String> {
         let FrameRenderInput {
@@ -430,6 +435,7 @@ impl BacktraceRenderer {
             pc_is_normalized,
         } = input;
         let cache_key = FrameRenderCacheKey {
+            mapping_generation: coordinator.generation(),
             pids: PidCacheKey::from_pids(pids),
             analyzer_present: analyzer.is_some(),
             index: index.min(u16::MAX as usize) as u16,
@@ -532,7 +538,7 @@ impl BacktraceRenderer {
         input: FrameRenderInput<'_>,
         flags: u8,
         analyzer: Option<&DwarfAnalyzer>,
-        coordinator: &ProcessManager,
+        coordinator: &ProcessManagerSnapshot,
         pids: &[u32],
     ) -> Vec<BacktraceDisplayFrame> {
         let FrameRenderInput {
@@ -540,6 +546,7 @@ impl BacktraceRenderer {
             pc_is_normalized,
         } = input;
         let cache_key = FrameRenderCacheKey {
+            mapping_generation: coordinator.generation(),
             pids: PidCacheKey::from_pids(pids),
             analyzer_present: analyzer.is_some(),
             index: index.min(u16::MAX as usize) as u16,
@@ -708,7 +715,7 @@ fn is_process_entry_frame(
 fn candidate_pids(
     event_pid: u32,
     proc_pid_hint: Option<u32>,
-    coordinator: &ProcessManager,
+    coordinator: &ProcessManagerSnapshot,
 ) -> Vec<u32> {
     coordinator.candidate_proc_pids_for_runtime_pid(event_pid, proc_pid_hint)
 }
@@ -726,7 +733,7 @@ fn format_backtrace_header(status: BacktraceStatus, frames: usize, requested_dep
 }
 
 fn resolve_frame_module(
-    coordinator: &ProcessManager,
+    coordinator: &ProcessManagerSnapshot,
     analyzer: Option<&DwarfAnalyzer>,
     pids: &[u32],
     frame: &ParsedBacktraceFrame,
@@ -952,8 +959,9 @@ mod tests {
             ],
         };
         let coordinator = ProcessManager::new();
+        let snapshot = coordinator.snapshot_reader().load();
         let rendered =
-            BacktraceRenderer::default().render_event_backtraces(&event, None, &coordinator, None);
+            BacktraceRenderer::default().render_event_backtraces(&event, None, &snapshot, None);
         let output = rendered.to_formatted_output();
 
         assert_eq!(output[0], "before");
@@ -1015,12 +1023,10 @@ mod tests {
     fn candidate_pids_include_runtime_alias_before_event_pid() {
         let mut coordinator = ProcessManager::new();
         coordinator.record_runtime_pid_alias(4242, 42);
+        let snapshot = coordinator.snapshot_reader().load();
 
-        assert_eq!(candidate_pids(4242, None, &coordinator), vec![42, 4242]);
-        assert_eq!(
-            candidate_pids(4242, Some(7), &coordinator),
-            vec![7, 42, 4242]
-        );
+        assert_eq!(candidate_pids(4242, None, &snapshot), vec![42, 4242]);
+        assert_eq!(candidate_pids(4242, Some(7), &snapshot), vec![7, 42, 4242]);
         assert_eq!(
             PidCacheKey::from_pids(&[7, 42, 4242]),
             PidCacheKey {
@@ -1062,8 +1068,9 @@ mod tests {
             ],
         };
         let coordinator = ProcessManager::new();
+        let snapshot = coordinator.snapshot_reader().load();
         let rendered =
-            BacktraceRenderer::default().render_event_for_tui(&event, None, &coordinator, None);
+            BacktraceRenderer::default().render_event_for_tui(&event, None, &snapshot, None);
 
         assert_eq!(rendered.items.len(), 3);
         assert!(matches!(
