@@ -3,7 +3,7 @@ use crate::{
     offsets::{PidOffsetsEntry, ProcessManager},
     pid::{
         resolve_event_pid_for_proc, resolve_proc_pid_for_event, runtime_pid_candidates_for_proc,
-        PidNamespaceId,
+        EventProcPidResolver, PidNamespaceId,
     },
     pinned_bpf_maps,
     proc_maps::{
@@ -129,7 +129,7 @@ impl Default for SysmonEventMask {
 /// Keep repr(C), field order and sizes identical on both sides. Current
 /// layout (12 bytes): { tgid: u32, host_tgid: u32, kind: u32 }.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct SysEvent {
     /// Runtime TGID in the configured sysmon event namespace when available.
     pub tgid: u32,
@@ -149,6 +149,16 @@ const PENDING_MAX_ATTEMPTS: u32 = 20;
 const MAP_CHANGE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(75);
 const MODULE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const SYSMON_EVENT_QUEUE_CAPACITY: usize = 1024;
+#[cfg(feature = "sysmon-ebpf")]
+const SYSMON_RING_DRAIN_EVENT_LIMIT: usize = 4096;
+#[cfg(feature = "sysmon-ebpf")]
+const SYSMON_RING_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(2);
+#[cfg(feature = "sysmon-ebpf")]
+const SYSMON_MAP_CHANGE_PROCESS_LIMIT: usize = 8;
+#[cfg(feature = "sysmon-ebpf")]
+const SYSMON_MAP_CHANGE_PROCESS_TIME_BUDGET: Duration = Duration::from_millis(5);
+#[cfg(feature = "sysmon-ebpf")]
+const SYSMON_MAP_CHANGE_QUEUE_CAPACITY: usize = 16_384;
 
 #[cfg(feature = "sysmon-ebpf")]
 const SYSMON_EVENT_MASK_EXEC: u32 = 1 << 0;
