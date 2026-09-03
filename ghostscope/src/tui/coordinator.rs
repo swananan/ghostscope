@@ -147,7 +147,6 @@ async fn run_runtime_coordinator(
     let trace_sender = runtime_channels.create_trace_sender();
     let trace_channel_capacity = runtime_channels.trace_channel_capacity;
     let mut backtrace_renderer = crate::trace::backtrace::BacktraceRenderer::default();
-    let fallback_coordinator = ghostscope_process::ProcessManager::new();
     let mut backpressure_state = TraceBackpressureState::default();
     let mut backpressure_report_ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
     backpressure_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -169,27 +168,15 @@ async fn run_runtime_coordinator(
                         if let Some(ref mut session) = session {
                             let runtime_refresh_request =
                                 BacktraceRuntimeModuleRequest::from_events(&events);
+                            let process_snapshot = session.process_manager_snapshot();
                             tracing::debug!("Forwarding {} trace events to UI", events.len());
                             for event_data in events {
-                                let event_data = match session.coordinator.try_lock() {
-                                    Ok(coordinator) => backtrace_renderer.render_event_for_tui(
-                                        &event_data,
-                                        session.process_analyzer.as_ref(),
-                                        &coordinator,
-                                        session.proc_pid(),
-                                    ),
-                                    Err(std::sync::TryLockError::WouldBlock) => {
-                                        backtrace_renderer.render_event_for_tui(
-                                            &event_data,
-                                            session.process_analyzer.as_ref(),
-                                            &fallback_coordinator,
-                                            session.proc_pid(),
-                                        )
-                                    }
-                                    Err(std::sync::TryLockError::Poisoned(_)) => {
-                                        panic!("coordinator mutex poisoned")
-                                    }
-                                };
+                                let event_data = backtrace_renderer.render_event_for_tui(
+                                    &event_data,
+                                    session.process_analyzer.as_ref(),
+                                    &process_snapshot,
+                                    session.proc_pid(),
+                                );
                                 match forward_trace_event(
                                     &trace_sender,
                                     event_data,

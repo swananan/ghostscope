@@ -10,7 +10,7 @@ use std::fs;
 use std::ops::ControlFlow;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-// no extra imports
+use std::sync::{Arc, RwLock};
 
 /// Per-module section offsets (runtime bias) computed from /proc/PID/maps
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,6 +38,79 @@ pub struct ProcessManager {
     pid_cache: HashMap<u32, Vec<PidOffsetsEntry>>,
     prefilled_pids: HashSet<u32>,
     runtime_pid_aliases: HashMap<u32, u32>,
+    render_pid_cache: HashMap<u32, Arc<[PidOffsetsEntry]>>,
+    render_snapshot: ProcessManagerSnapshotReader,
+    render_generation: u64,
+}
+
+/// Immutable process-module state used by backtrace rendering.
+///
+/// The mutable manager can spend noticeable time reading `/proc` and probing
+/// ELF files. Renderers consume this separately published view so that work
+/// never forces an event to fall back to an empty module map.
+#[derive(Debug, Default)]
+pub struct ProcessManagerSnapshot {
+    generation: u64,
+    pid_cache: HashMap<u32, Arc<[PidOffsetsEntry]>>,
+    runtime_pid_aliases: HashMap<u32, u32>,
+}
+
+impl ProcessManagerSnapshot {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn cached_offsets_with_paths_for_pid(&self, pid: u32) -> Option<&[PidOffsetsEntry]> {
+        self.pid_cache.get(&pid).map(|entries| entries.as_ref())
+    }
+
+    pub fn resolve_runtime_proc_pid(&self, runtime_pid: u32) -> Option<u32> {
+        self.runtime_pid_aliases.get(&runtime_pid).copied()
+    }
+
+    pub fn candidate_proc_pids_for_runtime_pid(
+        &self,
+        runtime_pid: u32,
+        proc_pid_hint: Option<u32>,
+    ) -> Vec<u32> {
+        let mut pids = Vec::with_capacity(3);
+        push_unique_pid(&mut pids, proc_pid_hint);
+        push_unique_pid(&mut pids, self.resolve_runtime_proc_pid(runtime_pid));
+        push_unique_pid(&mut pids, Some(runtime_pid));
+        pids
+    }
+}
+
+/// Cheap reader for the most recently published immutable process-module view.
+#[derive(Debug, Clone)]
+pub struct ProcessManagerSnapshotReader {
+    current: Arc<RwLock<Arc<ProcessManagerSnapshot>>>,
+}
+
+impl Default for ProcessManagerSnapshotReader {
+    fn default() -> Self {
+        Self {
+            current: Arc::new(RwLock::new(Arc::new(ProcessManagerSnapshot::default()))),
+        }
+    }
+}
+
+impl ProcessManagerSnapshotReader {
+    pub fn load(&self) -> Arc<ProcessManagerSnapshot> {
+        let snapshot = self
+            .current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(&snapshot)
+    }
+
+    fn publish(&self, snapshot: ProcessManagerSnapshot) {
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Arc::new(snapshot);
+    }
 }
 
 impl Default for ProcessManager {
@@ -187,7 +260,14 @@ impl ProcessManager {
             pid_cache: HashMap::new(),
             prefilled_pids: HashSet::new(),
             runtime_pid_aliases: HashMap::new(),
+            render_pid_cache: HashMap::new(),
+            render_snapshot: ProcessManagerSnapshotReader::default(),
+            render_generation: 0,
         }
+    }
+
+    pub fn snapshot_reader(&self) -> ProcessManagerSnapshotReader {
+        self.render_snapshot.clone()
     }
 
     /// Private working copy for discovery that may outlive its caller's deadline.
@@ -199,6 +279,7 @@ impl ProcessManager {
             pid_cache: self.pid_cache.clone(),
             prefilled_pids: self.prefilled_pids.clone(),
             runtime_pid_aliases: self.runtime_pid_aliases.clone(),
+            ..Self::new()
         }
     }
 
@@ -214,6 +295,7 @@ impl ProcessManager {
         }
         self.pid_cache.insert(pid, after.to_vec());
         self.prefilled_pids.insert(pid);
+        self.publish_render_pid_snapshot(pid);
         true
     }
 
@@ -236,6 +318,35 @@ impl ProcessManager {
             probe.cookie()
         );
         Ok(probe)
+    }
+
+    fn publish_render_snapshot(&mut self) {
+        self.render_generation = self.render_generation.wrapping_add(1);
+        self.render_snapshot.publish(ProcessManagerSnapshot {
+            generation: self.render_generation,
+            pid_cache: self.render_pid_cache.clone(),
+            runtime_pid_aliases: self.runtime_pid_aliases.clone(),
+        });
+    }
+
+    fn publish_render_pid_snapshot(&mut self, pid: u32) {
+        match self.pid_cache.get(&pid) {
+            Some(entries)
+                if self
+                    .render_pid_cache
+                    .get(&pid)
+                    .is_some_and(|published| published.as_ref() == entries.as_slice()) =>
+            {
+                return;
+            }
+            Some(entries) => {
+                self.render_pid_cache
+                    .insert(pid, Arc::from(entries.clone()));
+            }
+            None if self.render_pid_cache.remove(&pid).is_none() => return,
+            None => {}
+        }
+        self.publish_render_snapshot();
     }
 
     pub fn ensure_prefill_module(&mut self, module_path: &str) -> Result<usize> {
@@ -407,6 +518,7 @@ impl ProcessManager {
         }
         self.pid_cache.insert(pid, list);
         self.prefilled_pids.insert(pid);
+        self.publish_render_pid_snapshot(pid);
         Ok(self.pid_cache.get(&pid).map(|v| v.len()).unwrap_or(0))
     }
 
@@ -414,7 +526,11 @@ impl ProcessManager {
     pub fn refresh_prefill_pid(&mut self, pid: u32) -> Result<usize> {
         self.prefilled_pids.remove(&pid);
         self.pid_cache.remove(&pid);
-        self.ensure_prefill_pid(pid)
+        let result = self.ensure_prefill_pid(pid);
+        if result.is_err() {
+            self.publish_render_pid_snapshot(pid);
+        }
+        result
     }
 
     /// Refresh only the module mapping that contains one runtime instruction pointer.
@@ -441,7 +557,9 @@ impl ProcessManager {
                     .path()
                     .is_some_and(|path| !should_skip_mapped_module_path(path))
         }) else {
-            self.remove_pid_offsets_containing(pid, raw_ip);
+            if self.remove_pid_offsets_containing(pid, raw_ip) {
+                self.publish_render_pid_snapshot(pid);
+            }
             return Ok(None);
         };
         let Some(mapped_path) = containing.path().map(normalize_mapped_module_path) else {
@@ -459,20 +577,32 @@ impl ProcessManager {
         // The current maps snapshot is authoritative. Remove any cached
         // identity for this address before opening the mapped file so a
         // failure cannot revive an unloaded module through stale cache data.
-        self.remove_pid_offsets_containing(pid, raw_ip);
+        let removed_stale_entry = self.remove_pid_offsets_containing(pid, raw_ip);
 
         let Some((module_path, summary)) =
             accessible_module_path_for_pid(pid, mapped_path, &summaries)
         else {
+            if removed_stale_entry {
+                self.publish_render_pid_snapshot(pid);
+            }
             return Ok(None);
         };
-        let (cookie, offsets, base, size) = self.compute_section_offsets_from_candidates(
+        let computed = self.compute_section_offsets_from_candidates(
             pid,
             &module_path,
             &summary.candidates,
             summary.base(),
             summary.size(),
-        )?;
+        );
+        let (cookie, offsets, base, size) = match computed {
+            Ok(computed) => computed,
+            Err(error) => {
+                if removed_stale_entry {
+                    self.publish_render_pid_snapshot(pid);
+                }
+                return Err(error);
+            }
+        };
         let entry = PidOffsetsEntry {
             module_path,
             cookie,
@@ -484,12 +614,14 @@ impl ProcessManager {
         Ok(Some(entry))
     }
 
-    fn remove_pid_offsets_containing(&mut self, pid: u32, raw_ip: u64) {
+    fn remove_pid_offsets_containing(&mut self, pid: u32, raw_ip: u64) -> bool {
         let Some(entries) = self.pid_cache.get_mut(&pid) else {
-            return;
+            return false;
         };
+        let previous_len = entries.len();
         entries
             .retain(|entry| raw_ip < entry.base || raw_ip >= entry.base.saturating_add(entry.size));
+        entries.len() != previous_len
     }
 
     fn upsert_pid_offset(&mut self, pid: u32, entry: PidOffsetsEntry) {
@@ -503,6 +635,7 @@ impl ProcessManager {
         entries.push(entry);
         entries.sort_by_key(|entry| (entry.base, entry.cookie));
         self.prefilled_pids.insert(pid);
+        self.publish_render_pid_snapshot(pid);
     }
 
     fn compute_section_offsets_for_process(
@@ -687,10 +820,13 @@ impl ProcessManager {
     }
 
     pub fn record_runtime_pid_alias(&mut self, runtime_pid: u32, proc_pid: u32) {
-        if runtime_pid == proc_pid {
-            self.runtime_pid_aliases.remove(&runtime_pid);
+        let changed = if runtime_pid == proc_pid {
+            self.runtime_pid_aliases.remove(&runtime_pid).is_some()
         } else {
-            self.runtime_pid_aliases.insert(runtime_pid, proc_pid);
+            self.runtime_pid_aliases.insert(runtime_pid, proc_pid) != Some(proc_pid)
+        };
+        if changed {
+            self.publish_render_snapshot();
         }
     }
 
@@ -716,9 +852,11 @@ impl ProcessManager {
         self.pid_cache.remove(&pid);
         self.runtime_pid_aliases
             .retain(|runtime_pid, proc_pid| *runtime_pid != pid && *proc_pid != pid);
+        self.render_pid_cache.remove(&pid);
         for entries in self.module_cache.values_mut() {
             entries.retain(|entry| entry.pid != pid);
         }
+        self.publish_render_snapshot();
     }
 }
 
@@ -819,6 +957,7 @@ fn is_same_executable_as_current(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn detached_discovery_cannot_publish_or_overwrite_newer_pid_mappings() {
         let entry = |cookie| PidOffsetsEntry {
@@ -830,11 +969,16 @@ mod tests {
         };
         let mut manager = ProcessManager::new();
         manager.upsert_pid_offset(42, entry(1));
+        let snapshots = manager.snapshot_reader();
         let baseline = manager.fork_for_runtime_discovery();
         let mut worker = baseline.fork_for_runtime_discovery();
         worker.upsert_pid_offset(42, entry(2));
         assert_eq!(
-            manager.cached_offsets_with_paths_for_pid(42).unwrap()[0].cookie,
+            snapshots
+                .load()
+                .cached_offsets_with_paths_for_pid(42)
+                .unwrap()[0]
+                .cookie,
             1
         );
         manager.upsert_pid_offset(42, entry(3));
@@ -958,6 +1102,63 @@ mod tests {
         assert_eq!(
             mgr.candidate_proc_pids_for_runtime_pid(4242, None),
             vec![4242]
+        );
+    }
+
+    #[test]
+    fn render_snapshots_remain_available_and_immutable_during_manager_updates() {
+        let mut mgr = ProcessManager::new();
+        mgr.pid_cache.insert(
+            42,
+            vec![PidOffsetsEntry {
+                module_path: "/tmp/old.so".to_string(),
+                cookie: 1,
+                offsets: SectionOffsets::default(),
+                base: 0x1000,
+                size: 0x100,
+            }],
+        );
+        mgr.record_runtime_pid_alias(4242, 42);
+        mgr.publish_render_pid_snapshot(42);
+        let snapshots = mgr.snapshot_reader();
+        let mgr = Arc::new(std::sync::Mutex::new(mgr));
+
+        let old_snapshot = {
+            let _coordinator = mgr.lock().unwrap();
+            snapshots.load()
+        };
+        assert_eq!(
+            old_snapshot.candidate_proc_pids_for_runtime_pid(4242, None),
+            vec![42, 4242]
+        );
+        assert_eq!(
+            old_snapshot.cached_offsets_with_paths_for_pid(42).unwrap()[0].module_path,
+            "/tmp/old.so"
+        );
+
+        let mut coordinator = mgr.lock().unwrap();
+        coordinator.pid_cache.insert(
+            42,
+            vec![PidOffsetsEntry {
+                module_path: "/tmp/new.so".to_string(),
+                cookie: 2,
+                offsets: SectionOffsets::default(),
+                base: 0x2000,
+                size: 0x100,
+            }],
+        );
+        coordinator.publish_render_pid_snapshot(42);
+        drop(coordinator);
+
+        let new_snapshot = snapshots.load();
+        assert!(new_snapshot.generation() > old_snapshot.generation());
+        assert_eq!(
+            old_snapshot.cached_offsets_with_paths_for_pid(42).unwrap()[0].module_path,
+            "/tmp/old.so"
+        );
+        assert_eq!(
+            new_snapshot.cached_offsets_with_paths_for_pid(42).unwrap()[0].module_path,
+            "/tmp/new.so"
         );
     }
 

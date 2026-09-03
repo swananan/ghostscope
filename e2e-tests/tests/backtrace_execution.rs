@@ -2050,19 +2050,14 @@ trace dlopen_main_callback {
     }
     anyhow::ensure!(exit_code == 0, "stderr={stderr} stdout={stdout}");
 
-    let blocks = backtrace_blocks_after(&stdout, "T_MODE_DLOPEN_CALLBACK_STACK", 6)?;
-    let refreshed_block = blocks
-        .iter()
-        .find(|block| block.contains("dlopen_lib_middle") && block.contains("dlopen_lib_driver"))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "expected a target-mode dlopen backtrace block to unwind inside the library\n\
-                 STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-            )
-        })?;
-    assert_ordered_patterns(
-        refreshed_block,
+    let refreshed_block = matching_backtrace_block_with_ordered_patterns_after(
+        &stdout,
+        &stderr,
+        "T_MODE_DLOPEN_CALLBACK_STACK",
+        6,
+        "a fully symbolized target-mode dlopen backtrace",
         &[
+            "backtrace: truncated, 6 frames (max 6)",
             "#0 dlopen_main_callback",
             "#1 dlopen_lib_leaf",
             "#2 dlopen_lib_middle",
@@ -2126,6 +2121,7 @@ trace dlopen_lib_leaf {
     anyhow::ensure!(exit_code == 0, "stderr={stderr} stdout={stdout}");
 
     let expected_frames = [
+        "backtrace: truncated, 6 frames (max 6)",
         "#0 dlopen_lib_leaf",
         "#1 dlopen_lib_middle",
         "#2 dlopen_lib_driver",
@@ -2145,6 +2141,13 @@ trace dlopen_lib_leaf {
         "shared-library target dlopen backtrace should publish the first target mapping refresh\n\
          BLOCK:\n{refreshed_block}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
+    // The target-only periodic refresh must not undo a completed process range
+    // snapshot. Check steady-state output, not just the first successful event.
+    let blocks = backtrace_blocks_after(&stdout, "T_MODE_DLOPEN_SHARED_LIBRARY_STACK", 6)?;
+    assert!(blocks.len() >= 10, "expected steady-state backtrace events");
+    for block in blocks.iter().rev().take(10) {
+        assert_ordered_patterns(block, &expected_frames)?;
+    }
 
     Ok(())
 }

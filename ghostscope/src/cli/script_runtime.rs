@@ -391,7 +391,6 @@ async fn run_cli_with_session(
     let stdout = io::stdout();
     let mut stdout = io::BufWriter::new(stdout.lock());
     let mut backtrace_renderer = crate::trace::backtrace::BacktraceRenderer::default();
-    let fallback_coordinator = ghostscope_process::ProcessManager::new();
     let mut output_rate_limiter = ScriptOutputRateLimiter::new(config.script_output_events_per_sec);
     let mut ebpf_loss_report_ticker = tokio::time::interval(Duration::from_secs(1));
     ebpf_loss_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -405,6 +404,7 @@ async fn run_cli_with_session(
                     Ok(events) => {
                         let runtime_refresh_request =
                             BacktraceRuntimeModuleRequest::from_events(&events);
+                        let process_snapshot = session.process_manager_snapshot();
 
                         let mut wrote_output = false;
                         let mut suppressed_output = false;
@@ -416,25 +416,12 @@ async fn run_cli_with_session(
                             ) {
                                 ScriptOutputRateDecision::Silent => {}
                                 ScriptOutputRateDecision::Render => {
-                                    let display_event = match session.coordinator.try_lock() {
-                                        Ok(coordinator) => backtrace_renderer.render_event_for_tui(
-                                            &event,
-                                            session.process_analyzer.as_ref(),
-                                            &coordinator,
-                                            session.proc_pid(),
-                                        ),
-                                        Err(std::sync::TryLockError::WouldBlock) => {
-                                            backtrace_renderer.render_event_for_tui(
-                                                &event,
-                                                session.process_analyzer.as_ref(),
-                                                &fallback_coordinator,
-                                                session.proc_pid(),
-                                            )
-                                        }
-                                        Err(std::sync::TryLockError::Poisoned(_)) => {
-                                            panic!("coordinator mutex poisoned")
-                                        }
-                                    };
+                                    let display_event = backtrace_renderer.render_event_for_tui(
+                                        &event,
+                                        session.process_analyzer.as_ref(),
+                                        &process_snapshot,
+                                        session.proc_pid(),
+                                    );
                                     match output_renderer.write_display_event(&display_event, &mut stdout) {
                                         Ok(wrote) => wrote_output |= wrote,
                                         Err(e) => warn!("Failed to write event output: {e}"),
