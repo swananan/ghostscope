@@ -9,6 +9,11 @@ use serial_test::serial;
 use std::env;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use tempfile::Builder;
 
@@ -52,11 +57,64 @@ fn prepare_late_start_launcher(
     common::targets::ensure_target_binary_ready_for_default_sandbox(binary_path)
 }
 
-fn ghostscope_log_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve workspace root for ghostscope.log"))?
-        .join("ghostscope.log"))
+fn ghostscope_log_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("ghostscope.log")
+}
+
+struct MapChangeChurn {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl MapChangeChurn {
+    fn start() -> Self {
+        const MAPS_PER_BATCH: usize = 64;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if page_size <= 0 {
+                return;
+            }
+            while !worker_stop.load(Ordering::Relaxed) {
+                for _ in 0..MAPS_PER_BATCH {
+                    // SAFETY: The anonymous mapping is private to this worker and is unmapped
+                    // immediately without exposing the pointer to Rust references.
+                    let mapped = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            page_size as usize,
+                            libc::PROT_NONE,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        )
+                    };
+                    if mapped != libc::MAP_FAILED {
+                        // SAFETY: `mapped` and the length exactly match the successful mmap above.
+                        unsafe {
+                            libc::munmap(mapped, page_size as usize);
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for MapChangeChurn {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn workspace_root() -> anyhow::Result<PathBuf> {
@@ -559,6 +617,9 @@ async fn test_t_mode_library_late_start_globals_prints() -> anyhow::Result<()> {
     // only after GhostScope reports its late-start hooks are ready.
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let _target_sandbox_guard = prepare_late_start_launcher(&binary_path)?;
+    // Keep unrelated mmap traffic flowing while GhostScope discovers the late-start target. This
+    // guards against sysmon maintenance becoming dependent on a globally quiet event stream.
+    let _map_change_churn = MapChangeChurn::start();
     let bin_dir = binary_path.parent().unwrap().to_path_buf();
     let lib_path = bin_dir.join("libgvars.so");
     let script = r#"
@@ -603,14 +664,14 @@ trace lib_tick {
             "Late-start: LIB_STATE.counter should +2 per tick. STDOUT: {stdout}"
         );
     } else {
-        let log_dump = tokio::fs::read_to_string(ghostscope_log_path()?)
+        let log_dump = tokio::fs::read_to_string(ghostscope_log_path())
             .await
             .unwrap_or_else(|_| "<ghostscope.log unavailable>".to_string());
         let msg =
             format!("Late-start: No events for our PID {pid}. STDOUT: {stdout}. LOG: {log_dump}");
         assert!(!uniq.is_empty(), "{}", msg);
     }
-    let _ = tokio::fs::remove_file(ghostscope_log_path()?).await;
+    let _ = tokio::fs::remove_file(ghostscope_log_path()).await;
     Ok(())
 }
 
@@ -779,7 +840,7 @@ trace lib_tick {
         "Should not surface raw read_user errors for PID {pid}. STDOUT: {stdout}"
     );
 
-    let _ = tokio::fs::remove_file(ghostscope_log_path()?).await;
+    let _ = tokio::fs::remove_file(ghostscope_log_path()).await;
 
     Ok(())
 }

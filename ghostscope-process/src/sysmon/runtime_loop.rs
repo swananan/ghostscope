@@ -5,6 +5,107 @@ use super::pid_alias::*;
 use super::*;
 
 #[cfg(feature = "sysmon-ebpf")]
+struct SysmonLoopContext<'a, F, M> {
+    mgr: &'a Arc<Mutex<ProcessManager>>,
+    target: &'a Option<PathBuf>,
+    pending: &'a Arc<Mutex<PendingOffsets>>,
+    pending_map_refreshes: &'a Arc<Mutex<PendingMapRefreshes>>,
+    proc_pid_for_event: &'a F,
+    proc_pid_for_map_change: &'a M,
+    tx: &'a mpsc::SyncSender<SysEvent>,
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+fn enqueue_or_dispatch_sysmon_event<F: Fn(u32) -> u32, M: Fn(u32) -> u32>(
+    context: &SysmonLoopContext<'_, F, M>,
+    map_changes: &mut CoalescedMapChanges,
+    map_change_queue_overflow_reported: &mut bool,
+    ev: SysEvent,
+) {
+    if ev.event_kind() == Some(SysEventKind::MapChange) {
+        if !map_changes.enqueue(ev, Instant::now()) && !*map_change_queue_overflow_reported {
+            warn!(
+                "Sysmon: coalesced map-change queue reached capacity {}; relying on periodic reconciliation",
+                SYSMON_MAP_CHANGE_QUEUE_CAPACITY
+            );
+            *map_change_queue_overflow_reported = true;
+        }
+        return;
+    }
+
+    let matched = dispatch_sysmon_event(
+        context.mgr,
+        context.target,
+        context.pending,
+        context.pending_map_refreshes,
+        context.proc_pid_for_event,
+        &ev,
+    );
+    if matched {
+        try_publish_sys_event(context.tx, ev);
+    }
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+fn process_coalesced_map_changes<F: Fn(u32) -> u32, M: Fn(u32) -> u32>(
+    context: &SysmonLoopContext<'_, F, M>,
+    map_changes: &mut CoalescedMapChanges,
+) -> usize {
+    let started_at = Instant::now();
+    let mut processed = 0;
+    while processed < SYSMON_MAP_CHANGE_PROCESS_LIMIT {
+        let Some(ev) = map_changes.pop_ready(Instant::now()) else {
+            break;
+        };
+        let matched = dispatch_sysmon_event(
+            context.mgr,
+            context.target,
+            context.pending,
+            context.pending_map_refreshes,
+            context.proc_pid_for_map_change,
+            &ev,
+        );
+        if matched {
+            try_publish_sys_event(context.tx, ev);
+        }
+        processed += 1;
+        if started_at.elapsed() >= SYSMON_MAP_CHANGE_PROCESS_TIME_BUDGET {
+            break;
+        }
+    }
+    processed
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+fn service_sysmon_maintenance<F: Fn(u32) -> u32, M: Fn(u32) -> u32>(
+    context: &SysmonLoopContext<'_, F, M>,
+    map_changes: &mut CoalescedMapChanges,
+    last_module_refresh: &mut Instant,
+    target_pid_map_signatures: &mut HashMap<u32, PidMapsSignature>,
+) -> usize {
+    // Reconciliation is the correctness fallback when lifecycle or map-change events are delayed
+    // or dropped. Service it before lower-priority per-PID map work so event pressure cannot defer
+    // the refresh past its deadline.
+    refresh_target_module_offsets(
+        context.mgr,
+        context.target.as_deref(),
+        last_module_refresh,
+        target_pid_map_signatures,
+        context.tx,
+    );
+    poll_pending_offsets(context.mgr, context.pending, context.proc_pid_for_event);
+    let processed = process_coalesced_map_changes(context, map_changes);
+    poll_pending_map_refreshes(
+        context.mgr,
+        context.target.as_deref(),
+        context.pending_map_refreshes,
+        context.pending,
+        context.tx,
+    );
+    processed
+}
+
+#[cfg(feature = "sysmon-ebpf")]
 pub(super) fn run_sysmon_loop(
     mgr: Arc<Mutex<ProcessManager>>,
     cfg: SysmonConfig,
@@ -38,6 +139,11 @@ pub(super) fn run_sysmon_loop(
         cfg!(debug_assertions) || log_enabled!(LogLevel::Trace) || log_enabled!(LogLevel::Debug);
     let mut bpf = load_and_attach_sysmon_bpf(obj, &cfg, use_verbose)?;
     let proc_pid_for_event = sysmon_proc_pid_resolver(cfg.watched_pid, cfg.watched_proc_pid);
+    // Only noisy map-change handling uses a short-lived `/proc` index snapshot. Lifecycle events
+    // keep fresh resolution semantics so a newly visible short-lived process cannot hit a cached
+    // miss from an earlier unrelated event.
+    let proc_pid_for_map_change =
+        cached_sysmon_proc_pid_resolver(cfg.watched_pid, cfg.watched_proc_pid);
 
     // Using allowlist-based gating in kernel; userspace decides allow on exec.
 
@@ -118,50 +224,58 @@ pub(super) fn run_sysmon_loop(
     // scan here can delay a short-lived target past its only probe.
     let mut last_module_refresh = Instant::now();
     let mut target_pid_map_signatures = HashMap::<u32, PidMapsSignature>::new();
+    let context = SysmonLoopContext {
+        mgr: &mgr,
+        target: &target,
+        pending: &pending,
+        pending_map_refreshes: &pending_map_refreshes,
+        proc_pid_for_event: &proc_pid_for_event,
+        proc_pid_for_map_change: &proc_pid_for_map_change,
+        tx: &tx,
+    };
 
     // Event loop: prefer ringbuf; fallback to perf
     if let Some(map) = bpf.take_map("sysmon_events") {
         let mut rb: RingBuf<MapData> = map.try_into()?;
+        let mut map_changes = CoalescedMapChanges::new(
+            SYSMON_MAP_CHANGE_QUEUE_CAPACITY,
+            MAP_CHANGE_DEBOUNCE_INTERVAL,
+        );
+        let mut map_change_queue_overflow_reported = false;
         loop {
             let mut had_event = false;
-            // Drain queued lifecycle events before periodic refresh. In the
-            // short-lived `-t executable` path, sched_process_exec must be
-            // handled promptly so offsets are ready before the first uprobe.
-            while let Some(item) = rb.next() {
+            let drain_started_at = Instant::now();
+            let mut drained = 0;
+            // Keep lifecycle handling prompt without requiring the ring buffer to become empty.
+            // Map-change processing is deferred and coalesced so draining it remains O(1).
+            while drained < SYSMON_RING_DRAIN_EVENT_LIMIT {
+                let Some(item) = rb.next() else {
+                    break;
+                };
                 had_event = true;
+                drained += 1;
                 if item.len() == core::mem::size_of::<SysEvent>() {
                     // SAFETY: The ring buffer sample length was checked to match SysEvent;
                     // read_unaligned handles any alignment from the byte slice.
                     let ev = unsafe { core::ptr::read_unaligned(item.as_ptr() as *const SysEvent) };
-                    let matched = dispatch_sysmon_event(
-                        &mgr,
-                        &target,
-                        &pending,
-                        &pending_map_refreshes,
-                        &proc_pid_for_event,
-                        &ev,
+                    enqueue_or_dispatch_sysmon_event(
+                        &context,
+                        &mut map_changes,
+                        &mut map_change_queue_overflow_reported,
+                        ev,
                     );
-                    if matched {
-                        try_publish_sys_event(&tx, ev);
-                    }
+                }
+                if drain_started_at.elapsed() >= SYSMON_RING_DRAIN_TIME_BUDGET {
+                    break;
                 }
             }
-            poll_pending_offsets(&mgr, &pending, &proc_pid_for_event);
-            poll_pending_map_refreshes(
-                &mgr,
-                target.as_deref(),
-                &pending_map_refreshes,
-                &pending,
-                &tx,
-            );
-            refresh_target_module_offsets(
-                &mgr,
-                target.as_deref(),
+            let processed_map_changes = service_sysmon_maintenance(
+                &context,
+                &mut map_changes,
                 &mut last_module_refresh,
                 &mut target_pid_map_signatures,
-                &tx,
             );
-            if !had_event {
+            if !had_event && processed_map_changes == 0 {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
@@ -178,8 +292,14 @@ pub(super) fn run_sysmon_loop(
         if bufs.is_empty() {
             return Err(anyhow::anyhow!("No perf buffers opened"));
         }
+        let mut map_changes = CoalescedMapChanges::new(
+            SYSMON_MAP_CHANGE_QUEUE_CAPACITY,
+            MAP_CHANGE_DEBOUNCE_INTERVAL,
+        );
+        let mut map_change_queue_overflow_reported = false;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(10));
+            let mut had_event = false;
             for buf in bufs.iter_mut() {
                 if !buf.readable() {
                     continue;
@@ -198,22 +318,18 @@ pub(super) fn run_sysmon_loop(
                             copied += take;
                         }
                         if copied == raw.len() {
+                            had_event = true;
                             // SAFETY: raw is exactly the size of SysEvent and read_unaligned
                             // handles the byte array's alignment.
                             let ev = unsafe {
                                 core::ptr::read_unaligned(raw.as_ptr() as *const SysEvent)
                             };
-                            let matched = dispatch_sysmon_event(
-                                &mgr,
-                                &target,
-                                &pending,
-                                &pending_map_refreshes,
-                                &proc_pid_for_event,
-                                &ev,
+                            enqueue_or_dispatch_sysmon_event(
+                                &context,
+                                &mut map_changes,
+                                &mut map_change_queue_overflow_reported,
+                                ev,
                             );
-                            if matched {
-                                try_publish_sys_event(&tx, ev);
-                            }
                         }
                     }
                     PerfEvent::Lost { count } => {
@@ -221,21 +337,15 @@ pub(super) fn run_sysmon_loop(
                     }
                 });
             }
-            poll_pending_offsets(&mgr, &pending, &proc_pid_for_event);
-            poll_pending_map_refreshes(
-                &mgr,
-                target.as_deref(),
-                &pending_map_refreshes,
-                &pending,
-                &tx,
-            );
-            refresh_target_module_offsets(
-                &mgr,
-                target.as_deref(),
+            let processed_map_changes = service_sysmon_maintenance(
+                &context,
+                &mut map_changes,
                 &mut last_module_refresh,
                 &mut target_pid_map_signatures,
-                &tx,
             );
+            if !had_event && processed_map_changes == 0 && !map_changes.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
     } else {
         Err(anyhow::anyhow!("No sysmon events map found (ringbuf/perf)"))

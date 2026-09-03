@@ -2,6 +2,109 @@ use super::offset_refresh::*;
 use super::pending::*;
 use super::pid_alias::*;
 use super::*;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MapChangeKey {
+    event_pid: u32,
+    host_pid: u32,
+}
+
+impl MapChangeKey {
+    fn from_event(ev: SysEvent) -> Self {
+        Self {
+            event_pid: ev.tgid,
+            host_pid: sys_event_host_pid(&ev),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueuedMapChange {
+    event: SysEvent,
+    ready_at: Instant,
+}
+
+/// Coalesces noisy map-change events by process before any `/proc` work is performed.
+///
+/// An entry remains queued during the debounce window, so a process repeatedly calling mmap does
+/// not make sysmon rescan the same maps on every syscall. Queue overflow is safe because the
+/// periodic target-module reconciliation remains the correctness fallback.
+#[derive(Debug)]
+pub(super) struct CoalescedMapChanges {
+    entries: HashMap<MapChangeKey, QueuedMapChange>,
+    order: VecDeque<MapChangeKey>,
+    last_processed: HashMap<MapChangeKey, Instant>,
+    capacity: usize,
+    debounce_interval: Duration,
+}
+
+impl CoalescedMapChanges {
+    pub(super) fn new(capacity: usize, debounce_interval: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            last_processed: HashMap::new(),
+            capacity,
+            debounce_interval,
+        }
+    }
+
+    pub(super) fn enqueue(&mut self, event: SysEvent, now: Instant) -> bool {
+        let key = MapChangeKey::from_event(event);
+        if let Some(queued) = self.entries.get_mut(&key) {
+            queued.event = event;
+            return true;
+        }
+        if self.entries.len() >= self.capacity {
+            return false;
+        }
+
+        if self.last_processed.len() >= self.capacity {
+            self.last_processed.retain(|_, processed_at| {
+                now.saturating_duration_since(*processed_at) < self.debounce_interval
+            });
+        }
+        let ready_at = self
+            .last_processed
+            .get(&key)
+            .and_then(|processed_at| processed_at.checked_add(self.debounce_interval))
+            .unwrap_or(now);
+        self.entries
+            .insert(key, QueuedMapChange { event, ready_at });
+        self.order.push_back(key);
+        true
+    }
+
+    pub(super) fn pop_ready(&mut self, now: Instant) -> Option<SysEvent> {
+        let queued_len = self.order.len();
+        for _ in 0..queued_len {
+            let key = self.order.pop_front()?;
+            let Some(queued) = self.entries.get(&key).copied() else {
+                continue;
+            };
+            if queued.ready_at > now {
+                self.order.push_back(key);
+                continue;
+            }
+
+            self.entries.remove(&key);
+            self.last_processed.insert(key, now);
+            return Some(queued.event);
+        }
+        None
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 pub(super) fn try_publish_sys_event(tx: &mpsc::SyncSender<SysEvent>, ev: SysEvent) -> bool {
     match tx.try_send(ev) {
@@ -307,10 +410,78 @@ pub(super) fn sysmon_proc_pid_resolver(
     }
 }
 
+pub(super) fn cached_sysmon_proc_pid_resolver(
+    watched_event_pid: Option<u32>,
+    watched_proc_pid: Option<u32>,
+) -> impl Fn(u32) -> u32 {
+    let resolver = RefCell::new(EventProcPidResolver::new());
+    move |event_pid| {
+        if watched_event_pid == Some(event_pid) {
+            if let Some(proc_pid) = watched_proc_pid {
+                return proc_pid;
+            }
+        }
+
+        resolver.borrow_mut().resolve(event_pid)
+    }
+}
+
 pub(super) fn sys_event_host_pid(ev: &SysEvent) -> u32 {
     if ev.host_tgid != 0 {
         ev.host_tgid
     } else {
         ev.tgid
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map_change(event_pid: u32, host_pid: u32) -> SysEvent {
+        SysEvent {
+            tgid: event_pid,
+            host_tgid: host_pid,
+            kind: SysEventKind::MapChange.as_u32(),
+        }
+    }
+
+    #[test]
+    fn coalesced_map_changes_keep_one_entry_per_pid() {
+        let now = Instant::now();
+        let mut changes = CoalescedMapChanges::new(4, Duration::from_millis(75));
+
+        assert!(changes.enqueue(map_change(10, 20), now));
+        assert!(changes.enqueue(map_change(10, 20), now));
+        assert_eq!(changes.len(), 1);
+
+        let event = changes.pop_ready(now).expect("coalesced event");
+        assert_eq!(event.tgid, 10);
+        assert_eq!(event.host_tgid, 20);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn coalesced_map_changes_debounce_repeated_pid() {
+        let now = Instant::now();
+        let debounce = Duration::from_millis(75);
+        let mut changes = CoalescedMapChanges::new(4, debounce);
+
+        assert!(changes.enqueue(map_change(10, 10), now));
+        assert!(changes.pop_ready(now).is_some());
+        assert!(changes.enqueue(map_change(10, 10), now));
+        assert!(changes.pop_ready(now + debounce / 2).is_none());
+        assert!(changes.pop_ready(now + debounce).is_some());
+    }
+
+    #[test]
+    fn coalesced_map_changes_bound_unique_pid_queue() {
+        let now = Instant::now();
+        let mut changes = CoalescedMapChanges::new(1, Duration::from_millis(75));
+
+        assert!(changes.enqueue(map_change(10, 10), now));
+        assert!(changes.enqueue(map_change(10, 10), now));
+        assert!(!changes.enqueue(map_change(11, 11), now));
+        assert_eq!(changes.len(), 1);
     }
 }
