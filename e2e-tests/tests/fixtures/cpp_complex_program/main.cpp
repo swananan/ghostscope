@@ -74,6 +74,23 @@ __attribute__((noinline)) int sibling_block_member_probe(int x) {
     return block_path_sink;
 }
 
+struct Base { int inherited; };
+struct Derived : Base { int own; };
+
+__attribute__((noinline)) int inherited_member_probe(Derived* d) {
+    volatile int sink = d->inherited + d->own;
+    return sink;
+}
+
+struct LeftBase { int conflict; };
+struct RightBase { int conflict; };
+struct AmbiguousDerived : LeftBase, RightBase {};
+
+__attribute__((noinline)) int ambiguous_inherited_member_probe(AmbiguousDerived* d) {
+    volatile int sink = d->LeftBase::conflict + d->RightBase::conflict;
+    return sink;
+}
+
 // Variables purposely ending with ::h and ::h264 to validate demangled leaf handling
 int h = 5;
 int h264 = 7;
@@ -87,6 +104,12 @@ static void touch_globals() {
 
 int main() {
     ns1::Foo f;
+    ns1::Derived derived;
+    derived.inherited = 222;
+    derived.own = 333;
+    ns1::AmbiguousDerived ambiguous;
+    ambiguous.LeftBase::conflict = 444;
+    ambiguous.RightBase::conflict = 555;
     int acc = 0;
     for (int i = 0; i < 50000; ++i) {
         acc += f.bar(i);
@@ -94,6 +117,8 @@ int main() {
         acc += ns1::add(1.5, 2.5);
         acc += ns1::nested_member_probe(i);
         acc += ns1::sibling_block_member_probe(i);
+        acc += ns1::inherited_member_probe(&derived);
+        acc += ns1::ambiguous_inherited_member_probe(&ambiguous);
         touch_globals();
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }

@@ -40,6 +40,34 @@ fn resolve_debug_info_ref(
     Ok(None)
 }
 
+fn type_unit_loc_by_signature(
+    dwarf: &gimli::Dwarf<DwarfReader>,
+    signature: gimli::DebugTypeSignature,
+) -> crate::core::Result<Option<TypeLoc>> {
+    let mut units = dwarf.units();
+    while let Some(header) = units.next()? {
+        let type_offset = match header.type_() {
+            gimli::UnitType::Type {
+                type_signature,
+                type_offset,
+            }
+            | gimli::UnitType::SplitType {
+                type_signature,
+                type_offset,
+            } if type_signature == signature => type_offset,
+            _ => continue,
+        };
+        let cu_off = header
+            .debug_info_offset()
+            .ok_or_else(|| anyhow::anyhow!("type unit missing debug_info offset"))?;
+        return Ok(Some(TypeLoc {
+            cu_off,
+            die_off: type_offset,
+        }));
+    }
+    Ok(None)
+}
+
 fn type_loc_from_attr_value(
     dwarf: &gimli::Dwarf<DwarfReader>,
     unit: &gimli::Unit<DwarfReader>,
@@ -57,8 +85,56 @@ fn type_loc_from_attr_value(
             }
             Ok(resolve_debug_info_ref(dwarf, debug_info_off)?.map(|(_, loc)| loc))
         }
+        gimli::AttributeValue::DebugTypesRef(signature) => {
+            type_unit_loc_by_signature(dwarf, signature)
+        }
         _ => Ok(None),
     }
+}
+
+/// Follow a declaration DIE's `DW_AT_signature` to its DWARF5 type-unit definition.
+///
+/// A producer may use a unit-relative reference to a signature-bearing declaration
+/// instead of referencing the type-unit signature directly with `DW_FORM_ref_sig8`.
+pub(crate) fn resolve_type_definition_loc(
+    dwarf: &gimli::Dwarf<DwarfReader>,
+    mut loc: TypeLoc,
+) -> crate::core::Result<Option<TypeLoc>> {
+    const MAX_SIGNATURE_DEPTH: usize = 64;
+    let mut visited = std::collections::HashSet::new();
+
+    for _ in 0..MAX_SIGNATURE_DEPTH {
+        if !visited.insert((loc.cu_off.0, loc.die_off.0)) {
+            return Ok(None);
+        }
+
+        let header = dwarf.unit_header(loc.cu_off)?;
+        let unit = dwarf.unit(header)?;
+        let entry = unit.entry(loc.die_off)?;
+        let Some(value) = entry.attr_value(gimli::constants::DW_AT_signature) else {
+            return Ok(Some(loc));
+        };
+        let gimli::AttributeValue::DebugTypesRef(signature) = value else {
+            return Ok(Some(loc));
+        };
+        let Some(definition) = type_unit_loc_by_signature(dwarf, signature)? else {
+            return Ok(None);
+        };
+        loc = definition;
+    }
+
+    Ok(None)
+}
+
+pub(crate) fn resolve_type_definition_ref_with_origins(
+    dwarf: &gimli::Dwarf<DwarfReader>,
+    entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+    unit: &gimli::Unit<DwarfReader>,
+) -> crate::core::Result<Option<TypeLoc>> {
+    let Some(loc) = resolve_type_ref_with_origins(dwarf, entry, unit)? else {
+        return Ok(None);
+    };
+    resolve_type_definition_loc(dwarf, loc)
 }
 
 pub(crate) fn resolve_type_ref_with_origins(

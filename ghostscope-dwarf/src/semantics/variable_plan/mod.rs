@@ -269,6 +269,13 @@ pub enum PlanError {
         members: String,
     },
 
+    #[error("Ambiguous member '{field}' in {kind} '{type_name}'")]
+    AmbiguousMember {
+        kind: &'static str,
+        type_name: String,
+        field: String,
+    },
+
     #[error("Tuple index '.{index}' requires DWARF type identity for language dispatch")]
     TupleIndexMissingTypeIdentity { index: u32 },
 
@@ -569,6 +576,16 @@ impl VariableReadPlan {
                 type_name,
                 field,
                 members,
+            }
+            .into(),
+            TypeLayoutError::AmbiguousMember {
+                kind,
+                type_name,
+                field,
+            } => PlanError::AmbiguousMember {
+                kind,
+                type_name,
+                field,
             }
             .into(),
             TypeLayoutError::InvalidMemberBase { type_name } => {
