@@ -113,7 +113,7 @@ impl PendingOffsets {
 
 #[derive(Debug, Clone)]
 pub(super) struct PendingMapRefreshEntry {
-    pub(super) last_seen: Instant,
+    pub(super) ready_at: Instant,
     pub(super) event_pid: u32,
     pub(super) host_pid: u32,
 }
@@ -145,34 +145,77 @@ impl PendingMapRefreshes {
     }
 
     pub(super) fn register(&mut self, event_pid: u32, host_pid: u32, proc_pid: u32) {
-        self.entries.insert(
-            proc_pid,
-            PendingMapRefreshEntry {
-                last_seen: Instant::now(),
-                event_pid,
-                host_pid,
-            },
-        );
+        self.register_at(event_pid, host_pid, proc_pid, Instant::now());
     }
 
     pub(super) fn take_due(&mut self) -> Vec<PendingMapRefreshDue> {
-        let now = Instant::now();
+        self.take_due_at(Instant::now())
+    }
+
+    fn register_at(&mut self, event_pid: u32, host_pid: u32, proc_pid: u32, now: Instant) {
+        self.entries
+            .entry(proc_pid)
+            .and_modify(|entry| {
+                // Keep the original deadline so continuous mmap traffic cannot
+                // postpone this PID's refresh forever. The latest PID aliases
+                // are still used when the work becomes due.
+                entry.event_pid = event_pid;
+                entry.host_pid = host_pid;
+            })
+            .or_insert_with(|| PendingMapRefreshEntry {
+                ready_at: now.checked_add(MAP_CHANGE_DEBOUNCE_INTERVAL).unwrap_or(now),
+                event_pid,
+                host_pid,
+            });
+    }
+
+    fn take_due_at(&mut self, now: Instant) -> Vec<PendingMapRefreshDue> {
         let due: Vec<PendingMapRefreshDue> = self
             .entries
             .iter()
             .filter_map(|(&proc_pid, entry)| {
-                (now.duration_since(entry.last_seen) >= MAP_CHANGE_DEBOUNCE_INTERVAL).then_some(
-                    PendingMapRefreshDue {
-                        event_pid: entry.event_pid,
-                        host_pid: entry.host_pid,
-                        proc_pid,
-                    },
-                )
+                (now >= entry.ready_at).then_some(PendingMapRefreshDue {
+                    event_pid: entry.event_pid,
+                    host_pid: entry.host_pid,
+                    proc_pid,
+                })
             })
             .collect();
         for entry in &due {
             self.entries.remove(&entry.proc_pid);
         }
         due
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_map_changes_do_not_postpone_the_first_refresh_deadline() {
+        let started_at = Instant::now();
+        let mut pending = PendingMapRefreshes::new();
+        pending.register_at(10, 20, 30, started_at);
+        pending.register_at(11, 21, 30, started_at + MAP_CHANGE_DEBOUNCE_INTERVAL / 2);
+
+        let due = pending.take_due_at(started_at + MAP_CHANGE_DEBOUNCE_INTERVAL);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].event_pid, 11);
+        assert_eq!(due[0].host_pid, 21);
+        assert_eq!(due[0].proc_pid, 30);
+        assert!(pending.entries.is_empty());
+    }
+
+    #[test]
+    fn map_refresh_waits_for_its_debounce_deadline() {
+        let started_at = Instant::now();
+        let mut pending = PendingMapRefreshes::new();
+        pending.register_at(10, 20, 30, started_at);
+
+        assert!(pending
+            .take_due_at(started_at + MAP_CHANGE_DEBOUNCE_INTERVAL / 2)
+            .is_empty());
+        assert_eq!(pending.entries.len(), 1);
     }
 }

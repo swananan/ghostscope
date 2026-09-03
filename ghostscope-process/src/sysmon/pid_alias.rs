@@ -103,6 +103,29 @@ pub(super) fn publish_offsets_for_runtime_pid_keys(
     items: &[(u64, crate::pinned_bpf_maps::ProcModuleOffsetsValue)],
     log_context: &str,
 ) -> anyhow::Result<usize> {
+    write_offsets_for_runtime_pid_keys(proc_pid, event_pid, runtime_pids, items, log_context, true)
+}
+
+/// A target-only update is not a complete process map snapshot. Keep the
+/// existing ranges until a full refresh can replace them, including unloads.
+pub(super) fn publish_target_offsets_for_runtime_pid_keys(
+    proc_pid: u32,
+    event_pid: u32,
+    runtime_pids: &[u32],
+    items: &[(u64, crate::pinned_bpf_maps::ProcModuleOffsetsValue)],
+    log_context: &str,
+) -> anyhow::Result<usize> {
+    write_offsets_for_runtime_pid_keys(proc_pid, event_pid, runtime_pids, items, log_context, false)
+}
+
+fn write_offsets_for_runtime_pid_keys(
+    proc_pid: u32,
+    event_pid: u32,
+    runtime_pids: &[u32],
+    items: &[(u64, crate::pinned_bpf_maps::ProcModuleOffsetsValue)],
+    log_context: &str,
+    complete_snapshot: bool,
+) -> anyhow::Result<usize> {
     use crate::pinned_bpf_maps::{insert_offsets_for_pid, replace_ranges_for_pid};
 
     let mut total_inserted = 0usize;
@@ -121,6 +144,9 @@ pub(super) fn publish_offsets_for_runtime_pid_keys(
                     continue;
                 }
                 total_inserted += inserted;
+                if !complete_snapshot {
+                    continue;
+                }
                 if let Err(e) = replace_ranges_for_pid(*runtime_pid, items) {
                     tracing::warn!(
                         "Sysmon: failed to replace module ranges for {} runtime pid {} (event pid {}, proc pid {}): {}",
