@@ -557,7 +557,7 @@ pub(super) fn refresh_target_module_offsets(
                 false
             }
         };
-        match publish_offsets_for_runtime_pid_keys(
+        match publish_target_offsets_for_runtime_pid_keys(
             pid,
             event_pid,
             &runtime_pids,
@@ -602,10 +602,9 @@ pub(super) fn refresh_target_module_offsets(
         if target_pid_map_signatures.get(pid) == Some(&maps_signature) {
             continue;
         }
-        target_pid_map_signatures.insert(*pid, maps_signature);
-
         match refresh_full_offsets_for_pid(mgr, *pid, event_pid) {
             Ok(true) => {
+                target_pid_map_signatures.insert(*pid, maps_signature);
                 newly_allowed_event_pids.insert(event_pid);
             }
             Ok(false) => {}

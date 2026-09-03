@@ -40,6 +40,76 @@ pub(super) struct CoalescedMapChanges {
     debounce_interval: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SysmonWorkEnqueueResult {
+    Queued,
+    LifecycleQueueFull,
+    MapChangeQueueFull,
+}
+
+/// Bounded handoff between the eBPF event reader and the sysmon work thread.
+///
+/// Lifecycle events retain FIFO order in their own queue. Map changes use the
+/// existing per-process coalescer, so mmap-heavy workloads cannot crowd exec,
+/// fork, or exit work out of the handoff queue.
+#[derive(Debug)]
+pub(super) struct SysmonWorkQueue {
+    lifecycle_events: VecDeque<SysEvent>,
+    map_changes: CoalescedMapChanges,
+    lifecycle_capacity: usize,
+}
+
+impl SysmonWorkQueue {
+    pub(super) fn new(
+        lifecycle_capacity: usize,
+        map_change_capacity: usize,
+        map_change_debounce_interval: Duration,
+    ) -> Self {
+        Self {
+            lifecycle_events: VecDeque::new(),
+            map_changes: CoalescedMapChanges::new(
+                map_change_capacity,
+                map_change_debounce_interval,
+            ),
+            lifecycle_capacity,
+        }
+    }
+
+    pub(super) fn enqueue(&mut self, event: SysEvent, now: Instant) -> SysmonWorkEnqueueResult {
+        if event.event_kind() == Some(SysEventKind::MapChange) {
+            return if self.map_changes.enqueue(event, now) {
+                SysmonWorkEnqueueResult::Queued
+            } else {
+                SysmonWorkEnqueueResult::MapChangeQueueFull
+            };
+        }
+
+        if self.lifecycle_events.len() >= self.lifecycle_capacity {
+            return SysmonWorkEnqueueResult::LifecycleQueueFull;
+        }
+        self.lifecycle_events.push_back(event);
+        SysmonWorkEnqueueResult::Queued
+    }
+
+    pub(super) fn pop_lifecycle(&mut self) -> Option<SysEvent> {
+        self.lifecycle_events.pop_front()
+    }
+
+    pub(super) fn pop_ready_map_change(&mut self, now: Instant) -> Option<SysEvent> {
+        self.map_changes.pop_ready(now)
+    }
+
+    #[cfg(test)]
+    fn lifecycle_len(&self) -> usize {
+        self.lifecycle_events.len()
+    }
+
+    #[cfg(test)]
+    fn map_change_len(&self) -> usize {
+        self.map_changes.len()
+    }
+}
+
 impl CoalescedMapChanges {
     pub(super) fn new(capacity: usize, debounce_interval: Duration) -> Self {
         Self {
@@ -96,7 +166,8 @@ impl CoalescedMapChanges {
         None
     }
 
-    pub(super) fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -483,5 +554,58 @@ mod tests {
         assert!(changes.enqueue(map_change(10, 10), now));
         assert!(!changes.enqueue(map_change(11, 11), now));
         assert_eq!(changes.len(), 1);
+    }
+
+    #[test]
+    fn work_queue_keeps_lifecycle_events_separate_from_map_churn() {
+        let now = Instant::now();
+        let mut queue = SysmonWorkQueue::new(2, 1, Duration::from_millis(75));
+        let exec = SysEvent {
+            tgid: 30,
+            host_tgid: 30,
+            kind: SysEventKind::Exec.as_u32(),
+        };
+
+        assert_eq!(
+            queue.enqueue(map_change(10, 10), now),
+            SysmonWorkEnqueueResult::Queued
+        );
+        assert_eq!(
+            queue.enqueue(map_change(11, 11), now),
+            SysmonWorkEnqueueResult::MapChangeQueueFull
+        );
+        assert_eq!(queue.enqueue(exec, now), SysmonWorkEnqueueResult::Queued);
+
+        assert_eq!(queue.lifecycle_len(), 1);
+        assert_eq!(queue.map_change_len(), 1);
+        assert_eq!(queue.pop_lifecycle().map(|event| event.tgid), Some(30));
+        assert_eq!(
+            queue.pop_ready_map_change(now).map(|event| event.tgid),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn work_queue_bounds_lifecycle_events() {
+        let now = Instant::now();
+        let mut queue = SysmonWorkQueue::new(1, 1, Duration::from_millis(75));
+        let lifecycle = |pid, kind| SysEvent {
+            tgid: pid,
+            host_tgid: pid,
+            kind: SysEventKind::from_u32(kind)
+                .expect("valid lifecycle kind")
+                .as_u32(),
+        };
+
+        assert_eq!(
+            queue.enqueue(lifecycle(10, 1), now),
+            SysmonWorkEnqueueResult::Queued
+        );
+        assert_eq!(
+            queue.enqueue(lifecycle(11, 2), now),
+            SysmonWorkEnqueueResult::LifecycleQueueFull
+        );
+        assert_eq!(queue.lifecycle_len(), 1);
+        assert_eq!(queue.pop_lifecycle().map(|event| event.tgid), Some(10));
     }
 }
