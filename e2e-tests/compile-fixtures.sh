@@ -103,7 +103,7 @@ run_make_fixture partitioned_ranges_program all
 run_make_fixture partitioned_ranges_program \
     all \
     "CC=${GCC_BIN}" \
-    "CFLAGS=-Wall -Wextra -gdwarf-5 -O3 -DNDEBUG -ffunction-sections -freorder-blocks-and-partition" \
+    "CFLAGS=-Wall -Wextra -gdwarf-5 -gcolumn-info -O3 -DNDEBUG -ffunction-sections -freorder-blocks-and-partition" \
     "BINARY=partitioned_ranges_program_gcc_dwarf5_sections" \
     "OBJ=partitioned_ranges_program_gcc_dwarf5_sections.o"
 run_make_fixture partitioned_ranges_program \

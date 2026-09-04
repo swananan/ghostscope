@@ -1879,7 +1879,7 @@ fn compile_partitioned_ranges_program(compiler: FixtureCompiler) -> anyhow::Resu
         FixtureCompiler::GccDwarf5FunctionSections => compile_c_make_fixture(
             "partitioned_ranges_program",
             compiler,
-            "-Wall -Wextra -gdwarf-5 -O3 -DNDEBUG -ffunction-sections -freorder-blocks-and-partition",
+            "-Wall -Wextra -gdwarf-5 -gcolumn-info -O3 -DNDEBUG -ffunction-sections -freorder-blocks-and-partition",
         ),
         FixtureCompiler::ClangDwarf5Rnglistx => compile_c_make_fixture(
             "partitioned_ranges_program",

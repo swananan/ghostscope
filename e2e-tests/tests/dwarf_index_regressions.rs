@@ -9,7 +9,7 @@ use gimli::write::{
 use gimli::Reader;
 use gimli::{Format, LineEncoding, SectionId};
 use object::{Object, ObjectSection, ObjectSymbol};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -84,6 +84,34 @@ fn find_symbol_address(binary_path: &std::path::Path, symbol_name: &str) -> anyh
                 binary_path.display()
             )
         })
+}
+
+fn find_symbol_range(
+    binary_path: &std::path::Path,
+    symbol_name: &str,
+) -> anyhow::Result<std::ops::Range<u64>> {
+    let bytes = std::fs::read(binary_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", binary_path.display(), e))?;
+    let file = object::File::parse(&*bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", binary_path.display(), e))?;
+
+    let symbol = file
+        .symbols()
+        .find(|symbol| symbol.name().is_ok_and(|name| name == symbol_name))
+        .with_context(|| {
+            format!(
+                "Symbol '{}' not found in {}",
+                symbol_name,
+                binary_path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        symbol.size() > 0,
+        "Symbol '{}' has no size in {}",
+        symbol_name,
+        binary_path.display()
+    );
+    Ok(symbol.address()..symbol.address() + symbol.size())
 }
 
 fn assert_native_index_queries(
@@ -1125,6 +1153,47 @@ fn load_dwarf_from_binary(path: &Path) -> anyhow::Result<gimli::Dwarf<TestReader
     Ok(dwarf)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LineRowFlags {
+    is_stmt: bool,
+    prologue_end: bool,
+}
+
+fn line_row_flags_in_range(
+    binary_path: &Path,
+    address_range: std::ops::Range<u64>,
+) -> anyhow::Result<BTreeMap<u64, Vec<LineRowFlags>>> {
+    let dwarf = load_dwarf_from_binary(binary_path)?;
+    let mut rows_by_address = BTreeMap::<u64, Vec<LineRowFlags>>::new();
+    let mut units = dwarf.units();
+
+    while let Some(header) = units.next()? {
+        let unit = dwarf.unit(header)?;
+        let Some(ref line_program) = unit.line_program else {
+            continue;
+        };
+        let (line_program, sequences) = line_program.clone().sequences()?;
+
+        for sequence in sequences {
+            let mut rows = line_program.resume_from(&sequence);
+            while let Some((_, row)) = rows.next_row()? {
+                if row.end_sequence() || !address_range.contains(&row.address()) {
+                    continue;
+                }
+                rows_by_address
+                    .entry(row.address())
+                    .or_default()
+                    .push(LineRowFlags {
+                        is_stmt: row.is_stmt(),
+                        prologue_end: row.prologue_end(),
+                    });
+            }
+        }
+    }
+
+    Ok(rows_by_address)
+}
+
 fn dwarf_has_type_unit(path: &Path) -> anyhow::Result<bool> {
     let dwarf = load_dwarf_from_binary(path)?;
     let mut units = dwarf.units();
@@ -1708,7 +1777,7 @@ async fn assert_partitioned_ranges_lookup_resolves_primary_entry(
     binary_path: PathBuf,
     scenario: &str,
 ) -> anyhow::Result<()> {
-    let hot_addr = find_symbol_address(&binary_path, "partitioned_target")?;
+    let hot_range = find_symbol_range(&binary_path, "partitioned_target")?;
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
     let addrs = analyzer.lookup_function_addresses("partitioned_target");
 
@@ -1721,9 +1790,11 @@ async fn assert_partitioned_ranges_lookup_resolves_primary_entry(
         addrs[0].module_path, binary_path,
         "Resolved module should point at the partitioned fixture for {scenario}"
     );
-    assert_eq!(
-        addrs[0].address, hot_addr,
-        "lookup_function_addresses should resolve to the primary entry address for {scenario}"
+    assert!(
+        hot_range.contains(&addrs[0].address),
+        "lookup_function_addresses should resolve inside the primary/hot range for {scenario}. \
+         Hot range: {hot_range:x?}, result: {:?}",
+        addrs[0]
     );
 
     Ok(())
@@ -2091,7 +2162,7 @@ async fn test_partitioned_ranges_lookup_prefers_hot_entry_over_cold_partition() 
     init();
 
     let binary_path = FIXTURES.get_test_binary("partitioned_ranges_program")?;
-    let hot_addr = find_symbol_address(&binary_path, "partitioned_target")?;
+    let hot_range = find_symbol_range(&binary_path, "partitioned_target")?;
     let cold_addr = find_symbol_address(&binary_path, "partitioned_target.cold")?;
 
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
@@ -2106,13 +2177,67 @@ async fn test_partitioned_ranges_lookup_prefers_hot_entry_over_cold_partition() 
         addrs[0].module_path, binary_path,
         "Resolved module should point at the partitioned fixture"
     );
-    assert_eq!(
-        addrs[0].address, hot_addr,
-        "lookup_function_addresses should resolve to the entry/hot range"
+    assert!(
+        hot_range.contains(&addrs[0].address),
+        "lookup_function_addresses should resolve inside the hot range. \
+         Hot range: {hot_range:x?}, result: {:?}",
+        addrs[0]
     );
     assert_ne!(
         addrs[0].address, cold_addr,
         "lookup_function_addresses must not resolve to the .cold partition"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_gcc_o3_duplicate_pc_rows_preserve_first_statement_address() -> anyhow::Result<()> {
+    init();
+
+    if !fixture_compiler_available(FixtureCompiler::GccDwarf5FunctionSections) {
+        eprintln!("Skipping GCC O3 line-row regression: gcc is unavailable");
+        return Ok(());
+    }
+
+    let binary_path = FIXTURES.get_test_binary_with_compiler(
+        "partitioned_ranges_program",
+        FixtureCompiler::GccDwarf5FunctionSections,
+    )?;
+    let main_range = find_symbol_range(&binary_path, "main")?;
+    let rows_by_address = line_row_flags_in_range(&binary_path, main_range.clone())?;
+
+    assert!(
+        rows_by_address
+            .values()
+            .flatten()
+            .all(|row| !row.prologue_end),
+        "fixture should exercise the is_stmt fallback without DW_LNS_set_prologue_end"
+    );
+
+    let (&expected_address, expected_rows) = rows_by_address
+        .range(main_range.start.saturating_add(1)..main_range.end)
+        .find(|(_, rows)| rows.iter().any(|row| row.is_stmt))
+        .context("main has no statement row after its entry address")?;
+    assert!(
+        expected_rows.len() > 1
+            && expected_rows.iter().any(|row| row.is_stmt)
+            && !expected_rows.last().is_some_and(|row| row.is_stmt),
+        "fixture must keep an is_stmt row hidden before a non-statement row at the same PC: \
+         address=0x{expected_address:x}, rows={expected_rows:?}"
+    );
+
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let addrs = analyzer.lookup_function_addresses("main");
+    assert_eq!(
+        addrs.len(),
+        1,
+        "Expected a single resolved address for main. Results: {addrs:?}"
+    );
+    assert_eq!(addrs[0].module_path, binary_path);
+    assert_eq!(
+        addrs[0].address, expected_address,
+        "function lookup must consider every line row at a PC when selecting the first statement"
     );
 
     Ok(())
