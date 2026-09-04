@@ -136,7 +136,7 @@ impl LineMappingTable {
         }
 
         // Stable sorting preserves insertion order for duplicate-address rows,
-        // including the "last row is representative" behavior.
+        // including the source-location lookup's preference for the last row.
         entries.sort_by_key(|entry| entry.address);
         let (address_group_addresses, address_group_starts, address_group_prefix_max_ends) =
             Self::build_address_groups(&entries);
@@ -227,16 +227,18 @@ impl LineMappingTable {
             .chain(self.incremental_entries.get(&address).into_iter().flatten())
     }
 
-    fn representative_entries_from(
-        &self,
-        address: u64,
-        inclusive: bool,
-    ) -> impl Iterator<Item = (u64, &LineEntry)> {
-        let mut compact_group = self.address_group_addresses.partition_point(|&candidate| {
+    /// Iterate every row in address order, including duplicate-PC rows.
+    ///
+    /// Statement and prologue markers belong to individual DWARF line rows.
+    /// GCC column information commonly emits a marked row followed by an
+    /// unmarked row at the same PC, so choosing one representative row would
+    /// discard the marker.
+    fn entries_from(&self, address: u64, inclusive: bool) -> impl Iterator<Item = &LineEntry> {
+        let compact_start = self.entries.partition_point(|entry| {
             if inclusive {
-                candidate < address
+                entry.address < address
             } else {
-                candidate <= address
+                entry.address <= address
             }
         });
         let lower_bound = if inclusive {
@@ -244,48 +246,24 @@ impl LineMappingTable {
         } else {
             Bound::Excluded(address)
         };
+        let mut compact = self.entries[compact_start..].iter().peekable();
         let mut incremental = self
             .incremental_entries
             .range((lower_bound, Bound::Unbounded))
+            .flat_map(|(_, entries)| entries)
             .peekable();
 
-        std::iter::from_fn(move || loop {
-            let compact_address = self.address_group_addresses.get(compact_group).copied();
-            let incremental_address = incremental.peek().map(|(address, _)| **address);
-
-            match (compact_address, incremental_address) {
-                (Some(compact_address), Some(incremental_address))
-                    if compact_address < incremental_address =>
-                {
-                    let entries = self.group_entries(compact_group);
-                    compact_group += 1;
-                    if let Some(entry) = Self::representative_entry(entries) {
-                        return Some((compact_address, entry));
-                    }
-                }
-                (Some(compact_address), Some(incremental_address))
-                    if compact_address == incremental_address =>
-                {
-                    compact_group += 1;
-                    let (_, entries) = incremental.next().expect("peeked incremental line group");
-                    if let Some(entry) = Self::representative_entry(entries) {
-                        return Some((incremental_address, entry));
-                    }
-                }
-                (_, Some(incremental_address)) => {
-                    let (_, entries) = incremental.next().expect("peeked incremental line group");
-                    if let Some(entry) = Self::representative_entry(entries) {
-                        return Some((incremental_address, entry));
-                    }
-                }
-                (Some(compact_address), None) => {
-                    let entries = self.group_entries(compact_group);
-                    compact_group += 1;
-                    if let Some(entry) = Self::representative_entry(entries) {
-                        return Some((compact_address, entry));
-                    }
-                }
+        std::iter::from_fn(move || {
+            let take_compact = match (compact.peek(), incremental.peek()) {
+                (Some(compact), Some(incremental)) => compact.address <= incremental.address,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
                 (None, None) => return None,
+            };
+            if take_compact {
+                compact.next()
+            } else {
+                incremental.next()
             }
         })
     }
@@ -308,7 +286,7 @@ impl LineMappingTable {
             (compact_entries.peek(), incremental_entries.peek())
         {
             // Rows already present precede later lazy additions at duplicate
-            // addresses, preserving the representative-row ordering.
+            // addresses, preserving duplicate-row ordering.
             if compact.address <= incremental.address {
                 merged.push(compact_entries.next().expect("peeked compact line entry"));
             } else {
@@ -380,10 +358,6 @@ impl LineMappingTable {
                 self.incremental_group_prefix_max_ends,
             ) = Self::build_incremental_address_groups(&self.incremental_entries);
         }
-    }
-
-    fn representative_entry(entries: &[LineEntry]) -> Option<&LineEntry> {
-        entries.last()
     }
 
     fn active_representative_entry(entries: &[LineEntry], address: u64) -> Option<&LineEntry> {
@@ -708,14 +682,24 @@ impl LineMappingTable {
     /// Find the first executable instruction address after function prologue
     /// Assumes the input address is a real function (not inlined)
     /// Returns the best breakpoint location for the function
-    pub fn find_first_executable_address(&self, function_start: u64) -> u64 {
+    pub fn find_first_executable_address(&self, function_start: u64, function_end: u64) -> u64 {
         tracing::debug!(
-            "LineMappingTable: finding first executable address for function at 0x{:x}",
-            function_start
+            "LineMappingTable: finding first executable address for function range [0x{:x}, 0x{:x})",
+            function_start,
+            function_end
         );
 
+        if function_start >= function_end {
+            tracing::debug!(
+                "LineMappingTable: invalid or empty function range [0x{:x}, 0x{:x}), using its start",
+                function_start,
+                function_end
+            );
+            return function_start;
+        }
+
         // 1. Try DWARF prologue_end flag first
-        if let Some(addr) = self.find_prologue_end_from_dwarf(function_start) {
+        if let Some(addr) = self.find_prologue_end_from_dwarf(function_start, function_end) {
             tracing::info!(
                 "LineMappingTable: found prologue_end at 0x{:x} (offset +{})",
                 addr,
@@ -725,7 +709,7 @@ impl LineMappingTable {
         }
 
         // 2. Fall back to is_stmt=true search
-        if let Some(addr) = self.find_next_stmt_address(function_start) {
+        if let Some(addr) = self.find_next_stmt_address(function_start, function_end) {
             tracing::info!(
                 "LineMappingTable: using is_stmt=true address at 0x{:x} (offset +{})",
                 addr,
@@ -743,27 +727,31 @@ impl LineMappingTable {
     }
 
     /// Find prologue end using DWARF prologue_end flag
-    fn find_prologue_end_from_dwarf(&self, function_start: u64) -> Option<u64> {
+    fn find_prologue_end_from_dwarf(&self, function_start: u64, function_end: u64) -> Option<u64> {
         tracing::debug!(
             "LineMappingTable: searching for prologue_end=true after 0x{:x}",
             function_start
         );
 
-        // Iterate through addresses starting from function_start
-        for (address, entry) in self.representative_entries_from(function_start, true) {
+        // A neighboring function can begin immediately after this range. Do
+        // not borrow its prologue marker when this function has none.
+        for entry in self
+            .entries_from(function_start, true)
+            .take_while(|entry| entry.address < function_end)
+        {
             if entry.prologue_end {
                 tracing::debug!(
                     "LineMappingTable: found prologue_end=true at 0x{:x} (line {}, file {})",
-                    address,
+                    entry.address,
                     entry.line,
                     entry.file_path
                 );
                 tracing::debug!(
                     "LineMappingTable: found prologue_end at 0x{:x} (offset +{})",
-                    address,
-                    address - function_start
+                    entry.address,
+                    entry.address - function_start
                 );
-                return Some(address);
+                return Some(entry.address);
             }
         }
 
@@ -776,28 +764,32 @@ impl LineMappingTable {
 
     /// This is used for prologue detection following GDB's approach
     /// Find the next is_stmt=true address after the given function start address
-    fn find_next_stmt_address(&self, function_start: u64) -> Option<u64> {
+    fn find_next_stmt_address(&self, function_start: u64, function_end: u64) -> Option<u64> {
         tracing::debug!(
             "LineMappingTable: searching for next is_stmt=true address after 0x{:x}",
             function_start
         );
 
-        // Look for the first is_stmt=true address after function_start
-        for (address, entry) in self.representative_entries_from(function_start, false) {
+        // Look for the first is_stmt=true address after function_start, but
+        // never cross into a neighboring function.
+        for entry in self
+            .entries_from(function_start, false)
+            .take_while(|entry| entry.address < function_end)
+        {
             if entry.is_stmt {
                 tracing::debug!(
                     "LineMappingTable: found is_stmt=true at 0x{:x} (line {}, file {})",
-                    address,
+                    entry.address,
                     entry.line,
                     entry.file_path
                 );
-                return Some(address);
+                return Some(entry.address);
             } else {
                 // Extra diagnostics to understand why we didn't pick nearer addresses
                 tracing::debug!(
                     "LineMappingTable: skipping non-is_stmt at 0x{:x} (offset +{}, line {}, file {}, prologue_end={})",
-                    address,
-                    address.saturating_sub(function_start),
+                    entry.address,
+                    entry.address.saturating_sub(function_start),
                     entry.line,
                     entry.file_path,
                     entry.prologue_end
@@ -1207,6 +1199,40 @@ mod tests {
     }
 
     #[test]
+    fn prologue_search_checks_every_row_at_same_address() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let mut prologue_end = line_entry(0x1010, "/src/main.c", 11, true);
+        prologue_end.prologue_end = true;
+        let table = LineMappingTable::from_entries_with_scoped_manager(
+            vec![
+                line_entry(0x1000, "/src/main.c", 10, false),
+                prologue_end,
+                line_entry(0x1010, "/src/main.c", 11, false),
+                line_entry(0x1020, "/src/main.c", 12, true),
+            ],
+            &scoped,
+        );
+
+        assert_eq!(table.find_first_executable_address(0x1000, 0x1030), 0x1010);
+    }
+
+    #[test]
+    fn statement_search_checks_every_row_at_same_address() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let table = LineMappingTable::from_entries_with_scoped_manager(
+            vec![
+                line_entry(0x1000, "/src/main.c", 10, false),
+                line_entry(0x1010, "/src/main.c", 11, true),
+                line_entry(0x1010, "/src/main.c", 11, false),
+                line_entry(0x1020, "/src/main.c", 12, true),
+            ],
+            &scoped,
+        );
+
+        assert_eq!(table.find_first_executable_address(0x1000, 0x1030), 0x1010);
+    }
+
+    #[test]
     fn prologue_search_merges_compact_and_incremental_addresses() {
         let scoped = crate::index::ScopedFileIndexManager::new();
         let mut compact_prologue = line_entry(0x3000, "/src/base.c", 30, true);
@@ -1225,6 +1251,24 @@ mod tests {
             &scoped,
         ));
 
-        assert_eq!(table.find_first_executable_address(0x1000), 0x2000);
+        assert_eq!(table.find_first_executable_address(0x1000, 0x4000), 0x2000);
+    }
+
+    #[test]
+    fn prologue_search_does_not_cross_the_function_range() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let mut next_function_prologue = line_entry(0x1100, "/src/main.c", 20, true);
+        next_function_prologue.prologue_end = true;
+        let table = LineMappingTable::from_entries_with_scoped_manager(
+            vec![
+                line_entry(0x1000, "/src/main.c", 10, false),
+                line_entry(0x1050, "/src/main.c", 11, false),
+                next_function_prologue,
+            ],
+            &scoped,
+        );
+
+        assert_eq!(table.find_first_executable_address(0x1000, 0x1100), 0x1000);
+        assert_eq!(table.find_first_executable_address(0x1100, 0x1100), 0x1100);
     }
 }

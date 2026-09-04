@@ -462,7 +462,7 @@ impl LoadedObjfile {
                             .line_mapping
                             .read()
                             .expect("line mapping lock poisoned")
-                            .find_first_executable_address(*start);
+                            .find_first_executable_address(*start, *end);
                         Self::selected_non_inline_probe_address(*start, *end, first_exec)
                     };
                     let prefer_entry = self

@@ -44,7 +44,7 @@ fn compiler_specific_builds_keep_sibling_fixture_outputs() -> anyhow::Result<()>
         (
             "partitioned_ranges_program",
             FixtureCompiler::GccDwarf5FunctionSections,
-            "-Wall -Wextra -gdwarf-5 -O3 -DNDEBUG -ffunction-sections -freorder-blocks-and-partition",
+            "-Wall -Wextra -gdwarf-5 -gcolumn-info -O3 -DNDEBUG -ffunction-sections -freorder-blocks-and-partition",
         ),
         (
             "partitioned_ranges_program",
