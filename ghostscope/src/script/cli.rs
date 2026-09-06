@@ -75,7 +75,7 @@ pub async fn compile_and_load_script_for_cli(
     prepare_runtime_modules_before_compile(script, session, &mut compile_options).await?;
 
     let compilation_result = compile_script_for_cli(script, session, &compile_options)?;
-    ensure_prefill_for_session_pid(session);
+    ensure_prefill_for_session_pid(session)?;
 
     let ghostscope_compiler::CompilationResult {
         uprobe_configs,

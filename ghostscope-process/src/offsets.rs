@@ -12,6 +12,26 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+/// The current `(pid, module cookie)` map cannot identify separate loads of one ELF.
+#[derive(Debug)]
+pub struct MultipleLoadInstances {
+    pub pid: u32,
+    pub module_path: String,
+    pub count: usize,
+}
+
+impl std::fmt::Display for MultipleLoadInstances {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "multiple load instances are not supported: PID {} has {} incompatible load biases for {}",
+            self.pid, self.count, self.module_path
+        )
+    }
+}
+
+impl std::error::Error for MultipleLoadInstances {}
+
 /// Per-module section offsets (runtime bias) computed from /proc/PID/maps
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SectionOffsets {
@@ -126,11 +146,14 @@ struct CachedEntry {
     offsets: SectionOffsets,
     base: u64,
     size: u64,
+    /// Full executable mapping identity for the last successful cookie check.
+    executable_maps: Vec<OwnedProcMapEntry>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ModuleMapSummary {
     candidates: Vec<(u64, u64)>,
+    executable_candidates: Vec<(u64, u64)>,
     min_start: Option<u64>,
     max_end: Option<u64>,
 }
@@ -140,6 +163,9 @@ impl ModuleMapSummary {
         self.min_start = Some(self.min_start.map_or(entry.start, |v| v.min(entry.start)));
         self.max_end = Some(self.max_end.map_or(entry.end, |v| v.max(entry.end)));
         self.candidates.push((entry.offset, entry.start));
+        if entry.executable() {
+            self.executable_candidates.push((entry.offset, entry.start));
+        }
     }
 
     fn base(&self) -> u64 {
@@ -153,6 +179,8 @@ impl ModuleMapSummary {
 
     fn merge(&mut self, other: &Self) {
         self.candidates.extend(other.candidates.iter().copied());
+        self.executable_candidates
+            .extend(other.executable_candidates.iter().copied());
         if let Some(start) = other.min_start {
             self.min_start = Some(self.min_start.map_or(start, |v| v.min(start)));
         }
@@ -350,6 +378,14 @@ impl ProcessManager {
     }
 
     pub fn ensure_prefill_module(&mut self, module_path: &str) -> Result<usize> {
+        self.prefill_module(module_path, |error| Err(error.into()))
+    }
+
+    fn prefill_module(
+        &mut self,
+        module_path: &str,
+        mut reject_pid: impl FnMut(MultipleLoadInstances) -> Result<()>,
+    ) -> Result<usize> {
         if self.prefilled_modules.contains(module_path) {
             return Ok(0);
         }
@@ -408,8 +444,8 @@ impl ProcessManager {
                 }
             }
         }
-        let mut cached: Vec<CachedEntry> = Vec::new();
-        let mut new_count = 0usize;
+        let mut cached = Vec::new();
+        let mut rejected_any = false;
         // Intentionally keep PID list silent to avoid noisy logs in normal runs
         for pid in pids {
             match self.compute_section_offsets_for_process_with_retry(
@@ -418,15 +454,18 @@ impl ProcessManager {
                 3,
                 std::time::Duration::from_millis(75),
             ) {
-                Ok((cookie, offsets, base, size)) => {
-                    cached.push(CachedEntry {
-                        pid,
-                        cookie,
-                        offsets,
-                        base,
-                        size,
-                    });
-                    new_count += 1;
+                Ok(entry) => cached.push(entry),
+                Err(e) if e.is::<MultipleLoadInstances>() => {
+                    self.forget_pid(pid);
+                    self.prefilled_modules.remove(module_path);
+                    rejected_any = true;
+                    if let Err(error) = reject_pid(
+                        e.downcast::<MultipleLoadInstances>()
+                            .expect("error type matched above"),
+                    ) {
+                        self.module_cache.remove(module_path);
+                        return Err(error);
+                    }
                 }
                 Err(e) => tracing::debug!(
                     "ProcessManager: skip pid {} for module {} (offsets failed: {})",
@@ -436,8 +475,11 @@ impl ProcessManager {
                 ),
             }
         }
+        let new_count = cached.len();
         self.module_cache.insert(module_path.to_string(), cached);
-        self.prefilled_modules.insert(module_path.to_string());
+        if !rejected_any {
+            self.prefilled_modules.insert(module_path.to_string());
+        }
         Ok(new_count)
     }
 
@@ -461,13 +503,47 @@ impl ProcessManager {
         self.ensure_prefill_module(module_path)
     }
 
+    /// Reconcile supported PIDs while letting the publisher invalidate rejected ones.
+    /// A partial scan never satisfies a later strict setup prefill.
+    pub(crate) fn refresh_prefill_module_with_rejections(
+        &mut self,
+        module_path: &str,
+        reject_pid: impl FnMut(MultipleLoadInstances) -> Result<()>,
+    ) -> Result<usize> {
+        self.prefilled_modules.remove(module_path);
+        self.prefill_module(module_path, reject_pid)
+    }
+
     pub fn ensure_prefill_pid(&mut self, pid: u32) -> Result<usize> {
         if self.prefilled_pids.contains(&pid) {
             return Ok(0);
         }
         let maps = read_proc_maps(pid)?;
+        let list = match self.collect_pid_offsets(pid, &maps) {
+            Ok(list) => list,
+            Err(error) => {
+                if error.is::<MultipleLoadInstances>() {
+                    self.forget_pid(pid);
+                }
+                return Err(error);
+            }
+        };
+        self.pid_cache.insert(pid, list);
+        self.prefilled_pids.insert(pid);
+        self.publish_render_pid_snapshot(pid);
+        Ok(self.pid_cache.get(&pid).map(|v| v.len()).unwrap_or(0))
+    }
+
+    /// Validate one coherent maps snapshot without publishing it as PID prefill.
+    /// Target-mode cookie checks reuse this path, but must leave the initial full
+    /// PID publication to sysmon rather than marking its work already complete.
+    fn collect_pid_offsets(
+        &self,
+        pid: u32,
+        maps: &[OwnedProcMapEntry],
+    ) -> Result<Vec<PidOffsetsEntry>> {
         let mut module_summaries: BTreeMap<String, ModulePathSummaries> = BTreeMap::new();
-        for entry in &maps {
+        for entry in maps {
             let Some(path) = entry.path() else {
                 continue;
             };
@@ -492,21 +568,44 @@ impl ProcessManager {
                 );
                 continue;
             };
+            if summary.executable_candidates.is_empty() {
+                // Reading an ELF through mmap does not load it as a runtime module.
+                continue;
+            }
             match self.compute_section_offsets_from_candidates(
                 pid,
                 &module_path,
                 &summary.candidates,
+                &summary.executable_candidates,
                 summary.base(),
                 summary.size(),
             ) {
-                Ok((cookie, off, base, size)) => list.push(PidOffsetsEntry {
-                    module_path,
-                    cookie,
-                    offsets: off,
-                    base,
-                    size,
-                }),
+                Ok((cookie, off, base, size)) => {
+                    // Cookies prefer Build ID. Hard links and separate copies can
+                    // therefore collide even when proc maps lists different paths.
+                    if list
+                        .iter()
+                        .any(|entry| entry.cookie == cookie && entry.offsets.text != off.text)
+                    {
+                        return Err(MultipleLoadInstances {
+                            pid,
+                            module_path,
+                            count: 2,
+                        }
+                        .into());
+                    }
+                    list.push(PidOffsetsEntry {
+                        module_path,
+                        cookie,
+                        offsets: off,
+                        base,
+                        size,
+                    });
+                }
                 Err(e) => {
+                    if e.is::<MultipleLoadInstances>() {
+                        return Err(e);
+                    }
                     tracing::debug!(
                         "ProcessManager: skip module {} for pid {}: {}",
                         module_path,
@@ -516,10 +615,7 @@ impl ProcessManager {
                 }
             }
         }
-        self.pid_cache.insert(pid, list);
-        self.prefilled_pids.insert(pid);
-        self.publish_render_pid_snapshot(pid);
-        Ok(self.pid_cache.get(&pid).map(|v| v.len()).unwrap_or(0))
+        Ok(list)
     }
 
     /// Force-refresh per-PID cache (used when exec-time prefill raced with module mapping).
@@ -591,13 +687,16 @@ impl ProcessManager {
             pid,
             &module_path,
             &summary.candidates,
+            &summary.executable_candidates,
             summary.base(),
             summary.size(),
         );
         let (cookie, offsets, base, size) = match computed {
             Ok(computed) => computed,
             Err(error) => {
-                if removed_stale_entry {
+                if error.is::<MultipleLoadInstances>() {
+                    self.forget_pid(pid);
+                } else if removed_stale_entry {
                     self.publish_render_pid_snapshot(pid);
                 }
                 return Err(error);
@@ -610,6 +709,19 @@ impl ProcessManager {
             base,
             size,
         };
+        if self.pid_cache.get(&pid).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|existing| existing.cookie == cookie && existing.offsets.text != offsets.text)
+        }) {
+            self.forget_pid(pid);
+            return Err(MultipleLoadInstances {
+                pid,
+                module_path: entry.module_path,
+                count: 2,
+            }
+            .into());
+        }
         self.upsert_pid_offset(pid, entry.clone());
         Ok(Some(entry))
     }
@@ -642,24 +754,62 @@ impl ProcessManager {
         &self,
         pid: u32,
         module_path: &str,
-    ) -> Result<(u64, SectionOffsets, u64, u64)> {
+    ) -> Result<CachedEntry> {
         let module_path = normalize_mapped_module_path(module_path);
         let mut candidates: Vec<(u64, u64)> = Vec::new();
+        let mut executable_candidates = Vec::new();
+        let mut maps = Vec::new();
         let mut min_start: Option<u64> = None;
         let mut max_end: Option<u64> = None;
         let target = ModuleIdentity::from_path(Path::new(module_path));
         visit_proc_maps(pid, |entry| {
+            maps.push(OwnedProcMapEntry::from(entry));
             if !target.matches(&entry) {
                 return ControlFlow::Continue(());
             }
             min_start = Some(min_start.map_or(entry.start, |v| v.min(entry.start)));
             max_end = Some(max_end.map_or(entry.end, |v| v.max(entry.end)));
             candidates.push((entry.offset, entry.start));
+            if entry.executable() {
+                executable_candidates.push((entry.offset, entry.start));
+            }
             ControlFlow::Continue(())
         })?;
+        let executable_maps = maps
+            .iter()
+            .filter(|entry| entry.executable() && entry.path().is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let cookie_check_is_current = self
+            .module_cache
+            .get(module_path)
+            .and_then(|entries| entries.iter().find(|entry| entry.pid == pid))
+            .is_some_and(|entry| entry.executable_maps == executable_maps);
+        if !cookie_check_is_current {
+            // An inode-only target scan misses another file with the same Build
+            // ID. Check every loaded cookie using the PID-mode identity rules.
+            // Reuse successful checks while the executable mappings are stable
+            // so periodic target polling does not reparse every ELF every time.
+            self.collect_pid_offsets(pid, &maps)?;
+        }
         let base = min_start.unwrap_or(0);
         let size = max_end.unwrap_or(base).saturating_sub(base);
-        self.compute_section_offsets_from_candidates(pid, module_path, &candidates, base, size)
+        let (cookie, offsets, base, size) = self.compute_section_offsets_from_candidates(
+            pid,
+            module_path,
+            &candidates,
+            &executable_candidates,
+            base,
+            size,
+        )?;
+        Ok(CachedEntry {
+            pid,
+            cookie,
+            offsets,
+            base,
+            size,
+            executable_maps,
+        })
     }
 
     fn compute_section_offsets_from_candidates(
@@ -667,12 +817,56 @@ impl ProcessManager {
         pid: u32,
         module_path: &str,
         candidates: &[(u64, u64)],
+        executable_candidates: &[(u64, u64)],
         base: u64,
         size: u64,
     ) -> Result<(u64, SectionOffsets, u64, u64)> {
         let probe = ModuleProbe::open(module_path)?;
         let obj = probe.object()?;
         let page_mask: u64 = !0xfffu64;
+        // Only executable mappings establish a loaded image. An ordinary read-only
+        // mmap of the ELF (e.g. by a symbol reader) must not create another instance.
+        // Intersect across executable segments: two segments can share a file page,
+        // so a union would mistake cross-segment matches for additional instances.
+        let mut executable_biases: Option<BTreeSet<u64>> = None;
+        let mut observed_executable_biases = BTreeSet::new();
+        for seg in obj.segments().filter(|seg| {
+            matches!(seg.flags(), object::SegmentFlags::Elf { p_flags }
+                if p_flags & object::elf::PF_X != 0)
+        }) {
+            let key = seg.file_range().0 & page_mask;
+            let biases: BTreeSet<_> = executable_candidates
+                .iter()
+                .filter(|(offset, _)| offset & page_mask == key)
+                .filter_map(|(_, start)| start.checked_sub(seg.address() & page_mask))
+                .collect();
+            if biases.is_empty() {
+                continue;
+            }
+            observed_executable_biases.extend(biases.iter().copied());
+            executable_biases = Some(match executable_biases {
+                None => biases,
+                Some(previous) => previous.intersection(&biases).copied().collect(),
+            });
+        }
+        if let Some(biases) = &executable_biases {
+            if biases.len() != 1 {
+                return Err(MultipleLoadInstances {
+                    pid,
+                    module_path: module_path.to_string(),
+                    // An empty intersection is contradictory evidence, not a
+                    // reason to fall back to the first readable mapping. It can
+                    // occur when mprotect leaves different executable segments
+                    // active in separate instances of the same ELF.
+                    count: if biases.is_empty() {
+                        observed_executable_biases.len()
+                    } else {
+                        biases.len()
+                    },
+                }
+                .into());
+            }
+        }
         let mut seg_bias: Vec<(u64, u64, u64)> = Vec::new();
         for seg in obj.segments() {
             let (file_off, _sz) = seg.file_range();
@@ -733,8 +927,10 @@ impl ProcessManager {
         // G_COUNTER). To rebase it we only need the ASLR bias `module_base`, not per-section
         // runtime starts. Derive that bias from whichever segment we could match, then store it for
         // all four slots so the eBPF helper can simply do `link_addr + bias`.
-        let module_base = text_addr
-            .and_then(find_bias_for)
+        let module_base = executable_biases
+            .as_ref()
+            .and_then(|biases| biases.first().copied())
+            .or_else(|| text_addr.and_then(find_bias_for))
             .or_else(|| rodata_addr.and_then(find_bias_for))
             .or_else(|| data_addr.and_then(find_bias_for))
             .or_else(|| bss_addr.and_then(find_bias_for))
@@ -797,11 +993,12 @@ impl ProcessManager {
         module_path: &str,
         attempts: usize,
         backoff: std::time::Duration,
-    ) -> Result<(u64, SectionOffsets, u64, u64)> {
+    ) -> Result<CachedEntry> {
         let mut last_err: Option<anyhow::Error> = None;
         for i in 0..attempts {
             match self.compute_section_offsets_for_process(pid, module_path) {
                 Ok(v) => return Ok(v),
+                Err(e) if e.is::<MultipleLoadInstances>() => return Err(e),
                 Err(e) => {
                     last_err = Some(e);
                     if i + 1 < attempts {
@@ -964,15 +1161,24 @@ mod tests {
 
     /// Build an ELF with a controlled PT_LOAD layout, independent of the host linker.
     fn write_load_bias_fixture(path: &Path, file_offset: u64, vaddr: u64) {
+        write_load_bias_segments_fixture(path, &[(file_offset, vaddr)]);
+    }
+
+    fn write_load_bias_segments_fixture(path: &Path, segments: &[(u64, u64)]) {
         use object::write::elf::{FileHeader, ProgramHeader, SectionHeader, Writer};
         use object::{elf, Endianness};
 
+        let (file_offset, vaddr) = segments[0];
+        let file_end = segments
+            .iter()
+            .map(|(offset, _)| offset + 16)
+            .max()
+            .unwrap();
         let mut bytes = Vec::new();
         let mut writer = Writer::new(Endianness::Little, true, &mut bytes);
         writer.reserve_file_header();
-        writer.reserve_program_headers(1);
-        writer.reserve_until(file_offset as usize);
-        writer.reserve(16, 1);
+        writer.reserve_program_headers(segments.len() as u32);
+        writer.reserve_until(file_end as usize);
         writer.reserve_section_index();
         let text_name = writer.add_section_name(b".text");
         writer.reserve_shstrtab_section_index();
@@ -989,18 +1195,19 @@ mod tests {
             })
             .unwrap();
         writer.write_align_program_headers();
-        writer.write_program_header(&ProgramHeader {
-            p_type: elf::PT_LOAD,
-            p_flags: elf::PF_R | elf::PF_X,
-            p_offset: file_offset,
-            p_vaddr: vaddr,
-            p_paddr: vaddr,
-            p_filesz: 16,
-            p_memsz: 16,
-            p_align: 0x1000,
-        });
-        writer.pad_until(file_offset as usize);
-        writer.write(&[0; 16]);
+        for &(offset, address) in segments {
+            writer.write_program_header(&ProgramHeader {
+                p_type: elf::PT_LOAD,
+                p_flags: elf::PF_R | elf::PF_X,
+                p_offset: offset,
+                p_vaddr: address,
+                p_paddr: address,
+                p_filesz: 16,
+                p_memsz: 16,
+                p_align: 0x1000,
+            });
+        }
+        writer.pad_until(file_end as usize);
         writer.write_shstrtab();
         writer.write_null_section_header();
         writer.write_section_header(&SectionHeader {
@@ -1032,6 +1239,7 @@ mod tests {
                 42,
                 path.to_str().unwrap(),
                 &[(0x27000, expected_bias + 0x28000)],
+                &[(0x27000, expected_bias + 0x28000)],
                 expected_bias,
                 0x30000,
             )
@@ -1058,14 +1266,109 @@ mod tests {
                 42,
                 path.to_str().unwrap(),
                 &[(0x1000, 0x401000)],
+                &[(0x1000, 0x401000)],
                 0x400000,
                 0x2000,
             )
             .unwrap();
         assert_eq!(offsets, SectionOffsets::default());
         assert!(manager
-            .compute_section_offsets_from_candidates(42, path.to_str().unwrap(), &[], 0, 0)
+            .compute_section_offsets_from_candidates(42, path.to_str().unwrap(), &[], &[], 0, 0)
             .is_err());
+    }
+
+    #[test]
+    fn executable_load_instances_are_rejected_but_read_only_copies_are_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("multiple.elf");
+        write_load_bias_fixture(&path, 0x1000, 0x1000);
+        let manager = ProcessManager::new();
+        let candidates = [(0x1000, 0x501000), (0x1000, 0x701000)];
+        let error = manager
+            .compute_section_offsets_from_candidates(
+                42,
+                path.to_str().unwrap(),
+                &candidates,
+                &candidates,
+                0x500000,
+                0x202000,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<MultipleLoadInstances>().unwrap().count,
+            2
+        );
+        let (_, offsets, _, _) = manager
+            .compute_section_offsets_from_candidates(
+                42,
+                path.to_str().unwrap(),
+                &candidates,
+                &candidates[1..],
+                0x500000,
+                0x202000,
+            )
+            .unwrap();
+        assert_eq!(offsets.text, 0x700000);
+    }
+
+    #[test]
+    fn executable_segments_sharing_a_file_page_keep_the_unique_load_bias() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("shared-page.elf");
+        write_load_bias_segments_fixture(&path, &[(0x1000, 0x1000), (0x1800, 0x2800)]);
+        let expected_bias = 0x500000;
+        let candidates = [
+            (0x1000, expected_bias + 0x1000),
+            (0x1000, expected_bias + 0x2000),
+        ];
+        let (_, offsets, _, _) = ProcessManager::new()
+            .compute_section_offsets_from_candidates(
+                42,
+                path.to_str().unwrap(),
+                &candidates,
+                &candidates,
+                expected_bias,
+                0x3000,
+            )
+            .unwrap();
+        assert_eq!(offsets.text, expected_bias);
+    }
+
+    #[test]
+    fn contradictory_executable_segments_do_not_fall_back_to_one_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("contradictory.elf");
+        write_load_bias_segments_fixture(&path, &[(0x1000, 0x1000), (0x2000, 0x3000)]);
+        let manager = ProcessManager::new();
+        let first_bias = 0x500000;
+        for second_bias in [first_bias, 0x700000] {
+            // mprotect can leave only the first executable segment in one
+            // instance and only the second executable segment in another.
+            let candidates = [
+                (0x1000, first_bias + 0x1000),
+                (0x2000, second_bias + 0x3000),
+            ];
+            let result = manager.compute_section_offsets_from_candidates(
+                42,
+                path.to_str().unwrap(),
+                &candidates,
+                &candidates,
+                first_bias,
+                second_bias + 0x4000 - first_bias,
+            );
+            if second_bias == first_bias {
+                assert_eq!(result.unwrap().1.text, first_bias);
+            } else {
+                assert_eq!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<MultipleLoadInstances>()
+                        .unwrap()
+                        .count,
+                    2
+                );
+            }
+        }
     }
 
     #[test]
@@ -1167,6 +1470,7 @@ mod tests {
                     offsets: SectionOffsets::default(),
                     base: 0,
                     size: 0,
+                    executable_maps: Vec::new(),
                 },
                 CachedEntry {
                     pid: 7,
@@ -1174,6 +1478,7 @@ mod tests {
                     offsets: SectionOffsets::default(),
                     base: 0,
                     size: 0,
+                    executable_maps: Vec::new(),
                 },
             ],
         );

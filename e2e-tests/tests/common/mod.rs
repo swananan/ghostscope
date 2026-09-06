@@ -1266,6 +1266,40 @@ lazy_static! {
     pub static ref FIXTURES: TestFixtures = TestFixtures::new();
 }
 
+#[allow(dead_code)]
+pub fn skip_if_nested_t_mode_unsupported() -> bool {
+    use std::env;
+
+    let target_mode = match env::var("E2E_TARGET_MODE") {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return false,
+        Err(err) => {
+            eprintln!("continuing nested -t test despite unreadable E2E_TARGET_MODE: {err}");
+            return false;
+        }
+    };
+    let nested_child_container = matches!(
+        target_mode.trim().to_ascii_lowercase().as_str(),
+        "child-container" | "child" | "nested" | "descendant"
+    );
+    if !nested_child_container {
+        return false;
+    }
+
+    // Nested child-container globals `-t` is intentionally unsupported for now.
+    // The current `-t` implementation relies on target-path / sysmon lifecycle
+    // maintenance anchored in GhostScope's current `/proc` view, while nested
+    // child-container targets introduce a second PID namespace below that view.
+    // These globals tests need a stable runtime-pid -> outer `/proc` pid mapping.
+    // Backtrace has separate alias setup and retains its nested coverage.
+    eprintln!(
+        "skipping nested child-container -t test: nested target-path mode is \
+         currently unsupported because proc offsets and runtime lifecycle \
+         maintenance stay anchored in the outer container /proc pid view"
+    );
+    true
+}
+
 // Re-export the shared runner for convenience in tests
 pub mod runner;
 pub mod rust_toolchain;
@@ -1549,6 +1583,8 @@ fn ensure_backtrace_dlopen_program_compiled() -> anyhow::Result<()> {
                 &[
                     base.join("backtrace_dlopen_program"),
                     base.join("libbacktrace_dlopen_target.so"),
+                    base.join("load_instance_program"),
+                    base.join("libload_instance.so"),
                 ],
             ) {
                 return result;

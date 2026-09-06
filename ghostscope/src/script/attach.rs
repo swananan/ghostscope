@@ -188,9 +188,13 @@ pub(super) async fn create_and_attach_loader(
                 .coordinator
                 .lock()
                 .expect("coordinator mutex poisoned");
-            let prefilled = coordinator
-                .ensure_prefill_module(&config.binary_path)
-                .unwrap_or(0);
+            let prefilled = match coordinator.ensure_prefill_module(&config.binary_path) {
+                Ok(count) => count,
+                Err(error) if error.is::<ghostscope_process::MultipleLoadInstances>() => {
+                    return Err(error);
+                }
+                Err(_) => 0,
+            };
             let entries = coordinator.cached_offsets_for_module(&config.binary_path);
             (prefilled, entries)
         };

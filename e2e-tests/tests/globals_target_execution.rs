@@ -3,10 +3,9 @@
 
 mod common;
 
-use common::{init, FIXTURES};
+use common::{init, skip_if_nested_t_mode_unsupported, FIXTURES};
 use regex::Regex;
 use serial_test::serial;
-use std::env;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -122,38 +121,6 @@ fn workspace_root() -> anyhow::Result<PathBuf> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow::anyhow!("failed to resolve workspace root"))
-}
-
-fn skip_if_nested_t_mode_unsupported() -> bool {
-    let target_mode = match env::var("E2E_TARGET_MODE") {
-        Ok(value) => value,
-        Err(env::VarError::NotPresent) => return false,
-        Err(err) => {
-            eprintln!("continuing nested -t test despite unreadable E2E_TARGET_MODE: {err}");
-            return false;
-        }
-    };
-    let nested_child_container = matches!(
-        target_mode.trim().to_ascii_lowercase().as_str(),
-        "child-container" | "child" | "nested" | "descendant"
-    );
-    if !nested_child_container {
-        return false;
-    }
-
-    // Nested child-container `-t` is intentionally unsupported for now.
-    // The current `-t` implementation relies on target-path / sysmon lifecycle
-    // maintenance anchored in GhostScope's current `/proc` view, while nested
-    // child-container targets introduce a second PID namespace below that view.
-    // Without a stable, shared runtime-pid -> outer `/proc` pid mapping source,
-    // these tests are not a reliable correctness signal, so skip the entire
-    // nested `-t` suite instead of depending on CLI-only heuristics.
-    eprintln!(
-        "skipping nested child-container -t test: nested target-path mode is \
-         currently unsupported because proc offsets and runtime lifecycle \
-         maintenance stay anchored in the outer container /proc pid view"
-    );
-    true
 }
 
 // Late-start helper: run GhostScope first, wait until the CLI reports it has

@@ -5,8 +5,8 @@ pub mod pinned_bpf_maps;
 pub mod proc_maps;
 pub mod target_arch;
 pub use offsets::{
-    PidOffsetsEntry, ProcessManager, ProcessManagerSnapshot, ProcessManagerSnapshotReader,
-    SectionOffsets,
+    MultipleLoadInstances, PidOffsetsEntry, ProcessManager, ProcessManagerSnapshot,
+    ProcessManagerSnapshotReader, SectionOffsets,
 };
 pub use pid::{
     build_runtime_pid_plan, detect_runtime_environment, host_pid_for_proc_pid,

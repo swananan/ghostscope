@@ -6,7 +6,13 @@ OBJ ?= $(BINARY).o
 SHARED_LIB ?= libbacktrace_dlopen_target.so
 SHARED_OBJ ?= backtrace_dlopen_lib.o
 
-all: $(BINARY) $(SHARED_LIB)
+all: $(BINARY) $(SHARED_LIB) load_instance_program libload_instance.so
+
+load_instance_program: load_instance_program.c
+	$(CC) $(BASE_CFLAGS) -O0 -o $@ $< -ldl
+
+libload_instance.so: load_instance_lib.c
+	$(CC) $(BASE_CFLAGS) -O0 -fPIC -shared -Wl,--build-id -o $@ $<
 
 $(BINARY): $(OBJ)
 	$(CC) $(BASE_CFLAGS) -O0 -fomit-frame-pointer -o $@ $(OBJ) -ldl
@@ -22,6 +28,6 @@ $(SHARED_OBJ): backtrace_dlopen_lib.c backtrace_dlopen_lib.h
 
 clean:
 	rm -f *.o backtrace_dlopen_program libbacktrace_dlopen_target.so dlopen.trigger \
-		dlopen.trigger.pending dlopen.after_limit.trigger
+		dlopen.trigger.pending dlopen.after_limit.trigger load_instance_program libload_instance.so
 
 .PHONY: all clean

@@ -52,7 +52,7 @@ pub async fn compile_and_load_script_for_tui(
         success_count, failed_count
     );
 
-    ensure_prefill_for_session_pid(session);
+    ensure_prefill_for_session_pid(session)?;
 
     if !compilation_result.uprobe_configs.is_empty() {
         let uprobe_configs = compilation_result.uprobe_configs;

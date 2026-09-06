@@ -115,6 +115,44 @@ pub(super) fn pid_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
+fn invalidate_ambiguous_offsets<T>(
+    result: anyhow::Result<T>,
+    runtime_pids: &[u32],
+) -> anyhow::Result<T> {
+    match result {
+        Err(error) if error.is::<crate::MultipleLoadInstances>() => {
+            // A failed refresh must also remove the previously published single
+            // instance. Otherwise future probes continue reading its stale offsets.
+            if let Err(purge_error) = purge_offsets_for_runtime_pid_keys(runtime_pids) {
+                // Keep the typed rejection so callers cannot reinterpret a purge
+                // failure as a recoverable lookup miss and republish offsets.
+                return Err(error.context(format!(
+                    "failed to invalidate ambiguous process offsets: {purge_error}"
+                )));
+            }
+            Err(error)
+        }
+        result => result,
+    }
+}
+
+fn refresh_module_offsets(
+    manager: &mut ProcessManager,
+    module_path: &str,
+) -> anyhow::Result<usize> {
+    manager.refresh_prefill_module_with_rejections(module_path, |error| {
+        let event_pid = resolve_event_pid_for_proc(error.pid);
+        let runtime_pids = runtime_pid_keys_for_proc_event(error.pid, event_pid, []);
+        if let Err(purge_error) = purge_offsets_for_runtime_pid_keys(&runtime_pids) {
+            return Err(anyhow::Error::new(error).context(format!(
+                "failed to invalidate ambiguous process offsets: {purge_error}"
+            )));
+        }
+        tracing::warn!("Sysmon: invalidated offsets for rejected process: {error}");
+        Ok(())
+    })
+}
+
 pub(super) fn filter_entries_for_target<'a>(
     entries: &'a [PidOffsetsEntry],
     target: Option<&Path>,
@@ -192,12 +230,17 @@ pub(super) fn write_offsets_for_pid(
             );
             return Ok(false);
         }
-        let prefilled = match if force_refresh {
-            guard.refresh_prefill_pid(proc_pid)
-        } else {
-            guard.ensure_prefill_pid(proc_pid)
-        } {
+        let prefill_result = invalidate_ambiguous_offsets(
+            if force_refresh {
+                guard.refresh_prefill_pid(proc_pid)
+            } else {
+                guard.ensure_prefill_pid(proc_pid)
+            },
+            &runtime_pids,
+        );
+        let prefilled = match prefill_result {
             Ok(v) => v,
+            Err(e) if e.is::<crate::MultipleLoadInstances>() => return Err(e),
             Err(e) => {
                 // In private PID namespaces, sysmon event PID may be in the initial namespace
                 // and not resolvable via /proc/<event_pid>. Fall back to module-wide refresh.
@@ -210,7 +253,7 @@ pub(super) fn write_offsets_for_pid(
                         e,
                         module_path
                     );
-                    let refreshed = guard.refresh_prefill_module(&module_path)?;
+                    let refreshed = refresh_module_offsets(&mut guard, &module_path)?;
                     if refreshed > 0 {
                         tracing::info!(
                             "Sysmon: module refresh cached {} pid(s) for {}",
@@ -261,7 +304,8 @@ pub(super) fn write_offsets_for_pid(
         let mut target_match_count = filter_entries_for_target(&entries, target).len();
 
         if target_match_count == 0 && target.is_some() {
-            let refreshed = guard.refresh_prefill_pid(proc_pid)?;
+            let refreshed =
+                invalidate_ambiguous_offsets(guard.refresh_prefill_pid(proc_pid), &runtime_pids)?;
             if refreshed > 0 {
                 tracing::debug!(
                     "Sysmon: refreshed {} cached entries for event pid {} (proc pid {})",
@@ -353,7 +397,8 @@ pub(super) fn prefill_full_offsets_for_pid_if_new(
         let Ok(mut guard) = mgr.lock() else {
             return Ok(false);
         };
-        let prefilled = guard.ensure_prefill_pid(proc_pid)?;
+        let prefilled =
+            invalidate_ambiguous_offsets(guard.ensure_prefill_pid(proc_pid), &runtime_pids)?;
         if prefilled == 0 {
             return Ok(false);
         }
@@ -435,7 +480,7 @@ pub(super) fn refresh_full_offsets_for_pid(
         let Ok(mut guard) = mgr.lock() else {
             return Ok(false);
         };
-        guard.refresh_prefill_pid(proc_pid)?;
+        invalidate_ambiguous_offsets(guard.refresh_prefill_pid(proc_pid), &runtime_pids)?;
         let Some(entries) = guard.cached_offsets_with_paths_for_pid(proc_pid) else {
             return Ok(false);
         };
@@ -516,7 +561,7 @@ pub(super) fn refresh_target_module_offsets(
     let mut by_pid: HashMap<u32, Vec<(u64, ProcModuleOffsetsValue)>> = HashMap::new();
     let mut target_pids: BTreeSet<u32> = BTreeSet::new();
     if let Ok(mut guard) = mgr.lock() {
-        if let Err(e) = guard.refresh_prefill_module(&module_path) {
+        if let Err(e) = refresh_module_offsets(&mut guard, &module_path) {
             tracing::debug!(
                 "Sysmon: periodic module refresh failed for {}: {}",
                 module_path,

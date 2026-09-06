@@ -808,6 +808,63 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     ) -> Result<(IntValue<'ctx>, IntValue<'ctx>)> {
         let i32_type = self.context.i32_type();
         let offsets = self.lookup_proc_module_offsets_value(module_cookie, "offset")?;
+        let mut found = offsets.found;
+        if let Ok(compile_context) = self.get_compile_time_context().cloned() {
+            let probe_cookie = self.cookie_for_module_or_fallback(&compile_context.module_path);
+            let probe_offsets;
+            let probe = if probe_cookie == module_cookie {
+                &offsets
+            } else {
+                probe_offsets =
+                    self.lookup_proc_module_offsets_value(probe_cookie, "probe_offset")?;
+                &probe_offsets
+            };
+            // Uprobes attach to an inode and offset, so another dlmopen instance
+            // also runs this program. Userspace may not have observed the new maps
+            // yet. Verify the actual probe PC, not the module's broad VMA range:
+            // unrelated read-only mappings can enlarge that range across a new
+            // instance. The context retains the probe PC for cross-module reads.
+            let regs = self.get_pt_regs_parameter()?;
+            let ip = self.load_register_value(16, regs)?.into_int_value();
+            let link_pc = self
+                .context
+                .i64_type()
+                .const_int(compile_context.pc_address, false);
+            let after_link_pc = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::UGE,
+                    ip,
+                    link_pc,
+                    "probe_after_link_pc",
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let actual_bias = self
+                .builder
+                .build_int_sub(ip, link_pc, "probe_actual_bias")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let matching_bias = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    actual_bias,
+                    probe.text,
+                    "probe_matching_bias",
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let matching_instance = self
+                .builder
+                .build_and(after_link_pc, matching_bias, "probe_matching_instance")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let probe_valid = self
+                .builder
+                .build_and(probe.found, matching_instance, "probe_offsets_valid")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            found = self
+                .builder
+                .build_and(found, probe_valid, "instance_offsets_found")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        }
 
         // Build a bottom-up cascade to preserve earlier choices:
         // tmp  = (section==data)   ? off_data   : off_bss
@@ -866,7 +923,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let final_addr = self
             .builder
             .build_select::<BasicValueEnum<'ctx>, _>(
-                offsets.found,
+                found,
                 rt_addr.into(),
                 link_addr.into(),
                 "addr_or_link",
@@ -874,7 +931,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .into_int_value();
 
-        Ok((final_addr, offsets.found))
+        Ok((final_addr, found))
     }
     /// Load a register value from pt_regs
     pub fn load_register_value(

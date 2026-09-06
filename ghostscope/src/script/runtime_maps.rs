@@ -57,7 +57,7 @@ pub(super) fn apply_pid_alias_for_session(
     }
 }
 
-pub(super) fn ensure_prefill_for_session_pid(session: &GhostSession) {
+pub(super) fn ensure_prefill_for_session_pid(session: &GhostSession) -> anyhow::Result<()> {
     if let Some(proc_pid) = session.proc_pid() {
         let result = {
             let mut coordinator = session
@@ -71,12 +71,14 @@ pub(super) fn ensure_prefill_for_session_pid(session: &GhostSession) {
                 "Coordinator cached {} module offset entries for PID {}",
                 count, proc_pid
             ),
+            Err(e) if e.is::<ghostscope_process::MultipleLoadInstances>() => return Err(e),
             Err(e) => warn!(
                 "Failed to compute section offsets via coordinator: {} (globals may show OffsetsUnavailable)",
                 e
             ),
         }
     }
+    Ok(())
 }
 
 pub(super) fn apply_cached_offsets_for_session_pid(session: &GhostSession) {
