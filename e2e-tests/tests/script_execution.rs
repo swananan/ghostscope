@@ -10,6 +10,36 @@
 
 mod common;
 
+#[tokio::test]
+async fn test_partial_compilation_failures_are_visible_without_logging() -> anyhow::Result<()> {
+    init();
+    let target = common::targets::TargetLauncher::sample_program_with_opt(OptimizationLevel::Debug)
+        .spawn()
+        .await?;
+    let (code, stdout, stderr) = common::runner::GhostscopeRunner::new()
+        .with_script(
+            r#"
+trace process_record { print "PARTIAL_GOOD"; }
+trace no_such_partial_failure_target { print "PARTIAL_BAD"; }
+"#,
+        )
+        .attach_to(&target)
+        .with_cli_args(["--no-log", "--no-status"])
+        .timeout_secs(3)
+        .run()
+        .await?;
+    target.terminate().await?;
+    assert_eq!(code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(stdout.contains("PARTIAL_GOOD"), "{stdout}");
+    assert!(!stdout.contains("PARTIAL_BAD"), "{stdout}");
+    assert!(
+        stderr.contains("no_such_partial_failure_target"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("failed to compile"), "{stderr}");
+    Ok(())
+}
+
 use common::{init, OptimizationLevel, FIXTURES};
 use lazy_static::lazy_static;
 use std::collections::HashMap;

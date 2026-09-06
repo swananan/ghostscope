@@ -45,6 +45,21 @@ pub fn compile_script_for_cli(
                 failed.target_name, failed.pc_address, failed.error_message
             );
         }
+        // Partial success still produces a runnable script. These diagnostics
+        // must remain visible when script mode disables logging and status UI.
+        if !compilation_result.uprobe_configs.is_empty() {
+            eprintln!(
+                "Warning: {} trace target(s) failed to compile; {} probe(s) compiled successfully:",
+                compilation_result.failed_targets.len(),
+                compilation_result.uprobe_configs.len()
+            );
+            for failed in &compilation_result.failed_targets {
+                eprintln!(
+                    "  {} at 0x{:x}: {}",
+                    failed.target_name, failed.pc_address, failed.error_message
+                );
+            }
+        }
     }
 
     Ok(compilation_result)
