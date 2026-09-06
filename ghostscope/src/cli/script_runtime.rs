@@ -7,12 +7,13 @@ use crate::core::{
 };
 use anyhow::Result;
 use ghostscope_dwarf::ModuleLoadingEvent;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{error, info, trace, warn};
 
 const SCRIPT_OUTPUT_BACKPRESSURE_SLEEP: Duration = Duration::from_millis(10);
+const SCRIPT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> io::Result<&'static str> {
@@ -388,8 +389,7 @@ async fn run_cli_with_session(
             color_enabled: should_use_script_stdout_color(config),
         },
     );
-    let stdout = io::stdout();
-    let mut stdout = io::BufWriter::new(stdout.lock());
+    let mut output_writer = super::script_output_writer::ScriptOutputWriter::stdout()?;
     let mut backtrace_renderer = crate::trace::backtrace::BacktraceRenderer::default();
     let mut output_rate_limiter = ScriptOutputRateLimiter::new(config.script_output_events_per_sec);
     let mut ebpf_loss_report_ticker = tokio::time::interval(Duration::from_secs(1));
@@ -397,8 +397,30 @@ async fn run_cli_with_session(
 
     let shutdown_signal = wait_for_shutdown_signal();
     tokio::pin!(shutdown_signal);
-    loop {
+    let mut output_interrupted = false;
+    'monitor: loop {
         tokio::select! {
+            biased;
+
+            signal = &mut shutdown_signal => {
+                report_shutdown_signal(signal);
+                break;
+            }
+
+            result = output_writer.completed() => {
+                return handle_script_output_completion(result);
+            }
+
+            _ = ebpf_loss_report_ticker.tick() => {
+                report_ebpf_output_loss_reports(&mut session.trace_manager).await;
+                report_cli_backtrace_runtime_refresh(
+                    &mut session,
+                    &mut backtrace_renderer,
+                    show_cli_status,
+                )
+                .await;
+            }
+
             result = session.trace_manager.wait_for_all_events_async() => {
                 match result {
                     Ok(events) => {
@@ -406,7 +428,7 @@ async fn run_cli_with_session(
                             BacktraceRuntimeModuleRequest::from_events(&events);
                         let process_snapshot = session.process_manager_snapshot();
 
-                        let mut wrote_output = false;
+                        let mut output = Vec::new();
                         let mut suppressed_output = false;
                         for event in events {
                             match decide_script_output_rate(
@@ -422,10 +444,7 @@ async fn run_cli_with_session(
                                         &process_snapshot,
                                         session.proc_pid(),
                                     );
-                                    match output_renderer.write_display_event(&display_event, &mut stdout) {
-                                        Ok(wrote) => wrote_output |= wrote,
-                                        Err(e) => warn!("Failed to write event output: {e}"),
-                                    }
+                                    output_renderer.write_display_event(&display_event, &mut output)?;
                                 }
                                 ScriptOutputRateDecision::Suppress => {
                                     suppressed_output = true;
@@ -435,11 +454,21 @@ async fn run_cli_with_session(
                             trace!("Raw trace event: {:?}", event);
                         }
                         output_rate_limiter.maybe_report(Instant::now());
-                        // When stdout is piped (as in tests), Rust switches to block buffering.
-                        // Flush once per bounded event batch instead of once per event.
-                        if wrote_output {
-                            if let Err(e) = stdout.flush() {
-                                warn!("Failed to flush event output: {e}");
+                        if !output.is_empty() {
+                            // This branch has already won the outer select. Keep signals
+                            // observable while waiting for the bounded output queue too.
+                            tokio::select! {
+                                biased;
+                                signal = &mut shutdown_signal => {
+                                    report_shutdown_signal(signal);
+                                    output_interrupted = true;
+                                    break 'monitor;
+                                }
+                                result = output_writer.write(&output) => {
+                                    if result.is_err() {
+                                        return handle_script_output_completion(result);
+                                    }
+                                }
                             }
                         }
                         match session
@@ -454,7 +483,7 @@ async fn run_cli_with_session(
                             ),
                         }
                         // Finish background resolution only after this whole batch has
-                        // been rendered and flushed. Runtime CFI work must never hold
+                        // been rendered and queued. Runtime CFI work must never hold
                         // unrelated events behind a backtrace event.
                         report_cli_backtrace_runtime_refresh(
                             &mut session,
@@ -475,27 +504,52 @@ async fn run_cli_with_session(
                 }
             }
 
-            _ = ebpf_loss_report_ticker.tick() => {
-                report_ebpf_output_loss_reports(&mut session.trace_manager).await;
-                report_cli_backtrace_runtime_refresh(
-                    &mut session,
-                    &mut backtrace_renderer,
-                    show_cli_status,
-                )
-                .await;
-            }
 
-            signal = &mut shutdown_signal => {
-                match signal {
-                    Ok(signal_name) => info!("Received {signal_name}, shutting down..."),
-                    Err(err) => warn!("Failed to listen for shutdown signal: {err}"),
-                }
-                break;
-            }
         }
     }
 
+    // Release the session before waiting on the consumer. Closing the actor
+    // handles starts probe teardown independently of the output worker.
+    drop(session);
+    let output_abandoned =
+        match tokio::time::timeout(SCRIPT_OUTPUT_DRAIN_TIMEOUT, output_writer.finish()).await {
+            Ok(result) => {
+                handle_script_output_completion(result)?;
+                // Even if accepted chunks drained, an interrupted send discarded
+                // the rest of the rendered batch before it reached the queue.
+                output_interrupted
+            }
+            Err(_) => true,
+        };
+    if output_abandoned {
+        // stderr may share the blocked stdout pipe (2>&1), so abandonment
+        // reporting must use the same bounded delivery and shutdown rules.
+        if let Ok(mut diagnostics) = super::script_output_writer::ScriptOutputWriter::stderr() {
+            let report = async move {
+                diagnostics
+                    .write(b"ghostscope: shutdown is discarding pending script output\n")
+                    .await?;
+                diagnostics.finish().await
+            };
+            let _ = tokio::time::timeout(SCRIPT_OUTPUT_DRAIN_TIMEOUT, report).await;
+        }
+    }
     Ok(())
+}
+
+fn report_shutdown_signal(signal: io::Result<&str>) {
+    match signal {
+        Ok(signal_name) => info!("Received {signal_name}, shutting down..."),
+        Err(err) => warn!("Failed to listen for shutdown signal: {err}"),
+    }
+}
+
+fn handle_script_output_completion(result: io::Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(anyhow::anyhow!("Failed to write script output: {error}")),
+    }
 }
 
 fn report_cli_backtrace_runtime_schedule(

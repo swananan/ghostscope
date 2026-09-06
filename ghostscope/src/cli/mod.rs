@@ -5,6 +5,7 @@ mod docs;
 mod dry_run;
 mod loading_reporter;
 pub mod script_output;
+mod script_output_writer;
 pub mod script_runtime;
 
 use crate::config::BpffsPruneArgs;
