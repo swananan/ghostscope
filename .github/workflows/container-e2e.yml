@@ -103,6 +103,14 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}/e2e-tests/tests/fixtures"
           bash ./e2e-tests/cache-fixtures.sh pack
 
+      # Rebuild even when the archive was produced by an older compiler image.
+      - name: Build Rust globals fixture with current toolchain
+        working-directory: e2e-tests/tests/fixtures/rust_global_program
+        run: |
+          rustc --version
+          cargo build --locked
+          readelf --program-headers --wide target/debug/rust_global_program
+
       - name: Build GhostScope CLI and dwarf-tool
         run: cargo build -p ghostscope -p dwarf-tool --all-features
 

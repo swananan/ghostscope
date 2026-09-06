@@ -30,6 +30,7 @@ aya-build = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+object = { workspace = true, features = ["write"] }
 
 [features]
 default = ["sysmon-ebpf"]

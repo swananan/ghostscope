@@ -228,6 +228,15 @@ jobs:
         if: steps.fixture-cache.outputs.cache-hit != 'true'
         run: bash ./e2e-tests/cache-fixtures.sh pack
 
+      # The pinned compiler image and archive can contain an older Rust target.
+      # Exercise the current toolchain's DWARF and ELF layout on every run.
+      - name: Build Rust globals fixture with current toolchain
+        working-directory: e2e-tests/tests/fixtures/rust_global_program
+        run: |
+          rustc --version
+          cargo build --locked
+          readelf --program-headers --wide target/debug/rust_global_program
+
       - name: Build GhostScope CLI and dwarf-tool
         run: cargo build -p ghostscope -p dwarf-tool --all-features
 

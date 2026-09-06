@@ -683,7 +683,11 @@ impl ProcessManager {
                 .find(|(fo, _)| (*fo & page_mask) == key)
                 .copied()
             {
-                let bias = start.saturating_sub(vaddr);
+                // proc maps describes the page containing the start of PT_LOAD,
+                // not p_vaddr itself. Both addresses must refer to that page;
+                // otherwise an unaligned segment subtracts its in-page offset
+                // twice when a DW_OP_addr is rebased at runtime.
+                let bias = start.saturating_sub(vaddr & page_mask);
                 seg_bias.push((key, vaddr, bias));
             }
         }
@@ -957,6 +961,112 @@ fn is_same_executable_as_current(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build an ELF with a controlled PT_LOAD layout, independent of the host linker.
+    fn write_load_bias_fixture(path: &Path, file_offset: u64, vaddr: u64) {
+        use object::write::elf::{FileHeader, ProgramHeader, SectionHeader, Writer};
+        use object::{elf, Endianness};
+
+        let mut bytes = Vec::new();
+        let mut writer = Writer::new(Endianness::Little, true, &mut bytes);
+        writer.reserve_file_header();
+        writer.reserve_program_headers(1);
+        writer.reserve_until(file_offset as usize);
+        writer.reserve(16, 1);
+        writer.reserve_section_index();
+        let text_name = writer.add_section_name(b".text");
+        writer.reserve_shstrtab_section_index();
+        writer.reserve_shstrtab();
+        writer.reserve_section_headers();
+        writer
+            .write_file_header(&FileHeader {
+                os_abi: elf::ELFOSABI_NONE,
+                abi_version: 0,
+                e_type: elf::ET_DYN,
+                e_machine: elf::EM_X86_64,
+                e_entry: vaddr,
+                e_flags: 0,
+            })
+            .unwrap();
+        writer.write_align_program_headers();
+        writer.write_program_header(&ProgramHeader {
+            p_type: elf::PT_LOAD,
+            p_flags: elf::PF_R | elf::PF_X,
+            p_offset: file_offset,
+            p_vaddr: vaddr,
+            p_paddr: vaddr,
+            p_filesz: 16,
+            p_memsz: 16,
+            p_align: 0x1000,
+        });
+        writer.pad_until(file_offset as usize);
+        writer.write(&[0; 16]);
+        writer.write_shstrtab();
+        writer.write_null_section_header();
+        writer.write_section_header(&SectionHeader {
+            name: Some(text_name),
+            sh_type: elf::SHT_PROGBITS,
+            sh_flags: (elf::SHF_ALLOC | elf::SHF_EXECINSTR) as u64,
+            sh_addr: vaddr,
+            sh_offset: file_offset,
+            sh_size: 16,
+            sh_link: 0,
+            sh_info: 0,
+            sh_addralign: 1,
+            sh_entsize: 0,
+        });
+        writer.write_shstrtab_section_header();
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn load_bias_rebases_non_page_aligned_load_segments() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("unaligned.elf");
+        // The executable segment starts 0xf50 bytes into its first mapped page.
+        // Its file offset also differs from its link-time address by one page.
+        write_load_bias_fixture(&path, 0x27f50, 0x28f50);
+        let expected_bias = 0x5555_0000;
+        let (_, offsets, _, _) = ProcessManager::new()
+            .compute_section_offsets_from_candidates(
+                42,
+                path.to_str().unwrap(),
+                &[(0x27000, expected_bias + 0x28000)],
+                expected_bias,
+                0x30000,
+            )
+            .unwrap();
+        assert_eq!(
+            offsets,
+            SectionOffsets {
+                text: expected_bias,
+                rodata: expected_bias,
+                data: expected_bias,
+                bss: expected_bias,
+            }
+        );
+    }
+
+    #[test]
+    fn load_bias_preserves_zero_bias_and_rejects_missing_mappings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fixed.elf");
+        write_load_bias_fixture(&path, 0x1000, 0x401000);
+        let manager = ProcessManager::new();
+        let (_, offsets, _, _) = manager
+            .compute_section_offsets_from_candidates(
+                42,
+                path.to_str().unwrap(),
+                &[(0x1000, 0x401000)],
+                0x400000,
+                0x2000,
+            )
+            .unwrap();
+        assert_eq!(offsets, SectionOffsets::default());
+        assert!(manager
+            .compute_section_offsets_from_candidates(42, path.to_str().unwrap(), &[], 0, 0)
+            .is_err());
+    }
 
     #[test]
     fn detached_discovery_cannot_publish_or_overwrite_newer_pid_mappings() {
