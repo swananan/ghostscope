@@ -255,9 +255,41 @@ __attribute__((noinline)) static void scalar_probe(int iter)
         &format_len);
 }
 
+volatile int promotion_negative = -1;
+volatile struct {
+    unsigned int u24:24;
+    unsigned int u25:25;
+    unsigned int u31:31;
+    unsigned int u32:32;
+} promotion_fields = {1, 1, 1, 1};
+volatile _Bool promotion_expected24, promotion_expected25;
+volatile _Bool promotion_expected31, promotion_expected32;
+volatile int64_t promotion_expected_bitnot[4];
+volatile int64_t promotion_expected_division[4];
+volatile int64_t promotion_expected_remainder[4];
+
 int main(void)
 {
     int iter = 0;
+    /* The native C compiler supplies an independent promotion oracle. */
+    promotion_expected24 = promotion_negative < promotion_fields.u24;
+    promotion_expected25 = promotion_negative < promotion_fields.u25;
+    promotion_expected31 = promotion_negative < promotion_fields.u31;
+    promotion_expected32 = promotion_negative < promotion_fields.u32;
+
+    /* Widen only the results so the operands retain native integer promotions. */
+    promotion_expected_bitnot[0] = ~promotion_fields.u24;
+    promotion_expected_bitnot[1] = ~promotion_fields.u25;
+    promotion_expected_bitnot[2] = ~promotion_fields.u31;
+    promotion_expected_bitnot[3] = ~promotion_fields.u32;
+    promotion_expected_division[0] = promotion_fields.u24 / promotion_negative;
+    promotion_expected_division[1] = promotion_fields.u25 / promotion_negative;
+    promotion_expected_division[2] = promotion_fields.u31 / promotion_negative;
+    promotion_expected_division[3] = promotion_fields.u32 / promotion_negative;
+    promotion_expected_remainder[0] = promotion_fields.u24 % promotion_negative;
+    promotion_expected_remainder[1] = promotion_fields.u25 % promotion_negative;
+    promotion_expected_remainder[2] = promotion_fields.u31 % promotion_negative;
+    promotion_expected_remainder[3] = promotion_fields.u32 % promotion_negative;
 
     while (iter < 20000) {
         scalar_probe(iter++);

@@ -7,6 +7,60 @@ use common::{init, OptimizationLevel, FIXTURES};
 use std::path::Path;
 use std::time::Duration;
 
+#[tokio::test]
+async fn test_c_bitfield_integer_promotions_match_the_native_compiler() -> anyhow::Result<()> {
+    init();
+    let binary = FIXTURES.get_test_binary("scalar_types_program")?;
+    let target = spawn_scalar_types_binary(&binary).await?;
+    let script = r#"
+trace scalar_anchor {
+    print "PROMOTED:{}:{}:{}:{}", promotion_negative < promotion_fields.u24, promotion_negative < promotion_fields.u25, promotion_negative < promotion_fields.u31, promotion_negative < promotion_fields.u32;
+    print "NATIVE:{}:{}:{}:{}", promotion_expected24, promotion_expected25, promotion_expected31, promotion_expected32;
+}
+"#;
+    let (code, stdout, stderr) = run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
+    assert_eq!(code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(stdout.contains("NATIVE:true:true:true:false"), "{stdout}");
+    assert!(stdout.contains("PROMOTED:true:true:true:false"), "{stdout}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_c_bitfield_integer_operators_match_the_native_compiler() -> anyhow::Result<()> {
+    init();
+    let binary = FIXTURES.get_test_binary("scalar_types_program")?;
+    let target = spawn_scalar_types_binary(&binary).await?;
+    let script = r#"
+trace scalar_anchor {
+    print "PROMOTED_BITNOT:{}:{}:{}:{}", ~promotion_fields.u24, ~promotion_fields.u25, ~promotion_fields.u31, ~promotion_fields.u32;
+    print "NATIVE_BITNOT:{}:{}:{}:{}", promotion_expected_bitnot[0], promotion_expected_bitnot[1], promotion_expected_bitnot[2], promotion_expected_bitnot[3];
+    print "PROMOTED_DIVISION:{}:{}:{}:{}", promotion_fields.u24 / promotion_negative, promotion_fields.u25 / promotion_negative, promotion_fields.u31 / promotion_negative, promotion_fields.u32 / promotion_negative;
+    print "NATIVE_DIVISION:{}:{}:{}:{}", promotion_expected_division[0], promotion_expected_division[1], promotion_expected_division[2], promotion_expected_division[3];
+    print "PROMOTED_REMAINDER:{}:{}:{}:{}", promotion_fields.u24 % promotion_negative, promotion_fields.u25 % promotion_negative, promotion_fields.u31 % promotion_negative, promotion_fields.u32 % promotion_negative;
+    print "NATIVE_REMAINDER:{}:{}:{}:{}", promotion_expected_remainder[0], promotion_expected_remainder[1], promotion_expected_remainder[2], promotion_expected_remainder[3];
+}
+"#;
+    let (code, stdout, stderr) = run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
+    assert_eq!(code, 0, "stderr={stderr} stdout={stdout}");
+    for expected in [
+        "BITNOT:-2:-2:-2:4294967294",
+        "DIVISION:-1:-1:-1:0",
+        "REMAINDER:0:0:0:1",
+    ] {
+        assert!(
+            stdout.contains(&format!("NATIVE_{expected}")),
+            "Expected native result {expected}. STDOUT: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("PROMOTED_{expected}")),
+            "Expected traced result {expected}. STDOUT: {stdout}"
+        );
+    }
+    Ok(())
+}
+
 async fn run_ghostscope_with_script_for_target(
     script_content: &str,
     timeout_secs: u64,

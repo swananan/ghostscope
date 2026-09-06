@@ -9,6 +9,8 @@ use crate::TypeInfo;
 pub struct CIntegerComparisonType {
     pub size: u64,
     pub is_unsigned: bool,
+    /// Effective value width for bitfields; storage bytes alone lose promotion rules.
+    pub bitfield_width: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,10 +21,14 @@ pub struct CIntegerComparisonPlan {
 
 impl CIntegerComparisonType {
     pub fn promoted(self) -> Self {
-        if self.size < 4 {
+        let fits_int = self.bitfield_width.map_or(self.size < 4, |width| {
+            width < 32 || (width == 32 && !self.is_unsigned)
+        });
+        if fits_int {
             Self {
                 size: 4,
                 is_unsigned: false,
+                bitfield_width: None,
             }
         } else {
             self
@@ -33,6 +39,7 @@ impl CIntegerComparisonType {
         Self {
             size: 8,
             is_unsigned: false,
+            bitfield_width: None,
         }
     }
 }
@@ -48,6 +55,7 @@ pub fn c_integer_comparison_type(ty: &TypeInfo) -> Option<CIntegerComparisonType
             (is_unsigned || is_signed).then_some(CIntegerComparisonType {
                 size: *size,
                 is_unsigned,
+                bitfield_width: None,
             })
         }
         TypeInfo::EnumType {
@@ -67,6 +75,7 @@ pub fn c_integer_comparison_type(ty: &TypeInfo) -> Option<CIntegerComparisonType
             ..
         } => c_integer_comparison_type(underlying_type).map(|mut ty| {
             ty.size = (*bit_size as u64).max(1).div_ceil(8);
+            ty.bitfield_width = Some(*bit_size);
             ty
         }),
         TypeInfo::TypedefType {
@@ -146,6 +155,36 @@ mod tests {
     }
 
     #[test]
+    fn bitfield_promotions_use_value_width_at_the_int_boundary() {
+        for unsigned in [false, true] {
+            for width in [1, 24, 25, 31, 32] {
+                let bitfield = TypeInfo::BitfieldType {
+                    underlying_type: Box::new(int_type(
+                        if unsigned { "unsigned int" } else { "int" },
+                        4,
+                        if unsigned {
+                            crate::constants::DW_ATE_unsigned.0 as u16
+                        } else {
+                            crate::constants::DW_ATE_signed.0 as u16
+                        },
+                    )),
+                    bit_offset: 0,
+                    bit_size: width,
+                };
+                let ty = c_integer_comparison_type(&bitfield).unwrap();
+                assert_eq!(ty.is_unsigned, unsigned, "storage signedness is unchanged");
+                let plan = usual_c_arithmetic_comparison_plan(
+                    c_integer_comparison_type(&signed_int()).unwrap(),
+                    ty,
+                );
+                assert_eq!(plan.size, 4);
+                assert_eq!(plan.is_unsigned, unsigned && width == 32);
+                assert_eq!(ty.promoted().promoted(), ty.promoted());
+            }
+        }
+    }
+
+    #[test]
     fn integer_comparison_type_handles_enums_and_bitfields() {
         let enum_type = TypeInfo::EnumType {
             name: "Mode".to_string(),
@@ -162,6 +201,7 @@ mod tests {
             Some(CIntegerComparisonType {
                 size: 4,
                 is_unsigned: true,
+                bitfield_width: None,
             })
         );
 
@@ -175,6 +215,7 @@ mod tests {
             Some(CIntegerComparisonType {
                 size: 2,
                 is_unsigned: false,
+                bitfield_width: Some(9),
             })
         );
     }
@@ -187,6 +228,7 @@ mod tests {
             Some(CIntegerComparisonType {
                 size: 1,
                 is_unsigned: false,
+                bitfield_width: None,
             })
         );
         assert!(!is_c_signed_integer_type(&bool_type));
@@ -198,10 +240,12 @@ mod tests {
         let u8_type = CIntegerComparisonType {
             size: 1,
             is_unsigned: true,
+            bitfield_width: None,
         };
         let i8_type = CIntegerComparisonType {
             size: 1,
             is_unsigned: false,
+            bitfield_width: None,
         };
 
         assert_eq!(
@@ -218,10 +262,12 @@ mod tests {
         let u64_type = CIntegerComparisonType {
             size: 8,
             is_unsigned: true,
+            bitfield_width: None,
         };
         let i32_type = CIntegerComparisonType {
             size: 4,
             is_unsigned: false,
+            bitfield_width: None,
         };
 
         assert_eq!(
