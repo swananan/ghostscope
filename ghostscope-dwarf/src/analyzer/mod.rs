@@ -50,6 +50,9 @@ pub struct DwarfAnalyzer {
     pid: u32,
     /// Module path -> module data mapping
     modules: HashMap<PathBuf, LoadedObjfile>,
+    /// The explicit target, or the loaded module identified by /proc/PID/exe.
+    /// Keep this identity stable as shared libraries are discovered later.
+    main_module: Option<PathBuf>,
     /// Bounded ELF symbol indexes for runtime modules loaded without full DWARF.
     /// Cookies preserve reusable module identity across paths and PID roots.
     runtime_text_symbols: HashMap<u64, Vec<RuntimeTextSymbol>>,
@@ -465,6 +468,7 @@ impl DwarfAnalyzer {
         }
 
         if new_runtime_modules.is_empty() {
+            self.resolve_main_module_if_missing();
             return Ok(0);
         }
 
@@ -501,6 +505,7 @@ impl DwarfAnalyzer {
             let module_path = module.module_path().clone();
             self.modules.insert(module_path, module);
         }
+        self.resolve_main_module_if_missing();
 
         if loaded_count > 0 {
             self.clear_pc_context_cache();
@@ -704,6 +709,7 @@ impl DwarfAnalyzer {
         let mut analyzer = Self {
             pid: 0, // No specific PID in exec mode
             modules: HashMap::new(),
+            main_module: Some(exec_path.clone()),
             runtime_text_symbols: HashMap::new(),
             pc_context_cache: RwLock::new(PcContextCache::default()),
         };
@@ -790,6 +796,7 @@ impl DwarfAnalyzer {
         let mut analyzer = Self {
             pid,
             modules: HashMap::new(),
+            main_module: None,
             runtime_text_symbols: HashMap::new(),
             pc_context_cache: RwLock::new(PcContextCache::default()),
         };
@@ -799,6 +806,8 @@ impl DwarfAnalyzer {
             analyzer.modules.insert(module_path, module);
         }
 
+        analyzer.resolve_main_module_if_missing();
+
         tracing::info!(
             "Created DWARF analyzer for PID {} with {} pre-loaded modules",
             pid,
@@ -806,6 +815,16 @@ impl DwarfAnalyzer {
         );
 
         analyzer
+    }
+
+    /// Retry unresolved PID identity while preserving an already selected target.
+    fn resolve_main_module_if_missing(&mut self) {
+        if self.pid == 0 || self.main_module.is_some() {
+            return;
+        }
+
+        let executable = PathBuf::from(format!("/proc/{}/exe", self.pid));
+        self.main_module = self.loaded_module_path_for(&executable).cloned();
     }
 
     fn clear_pc_context_cache(&self) {
@@ -1273,32 +1292,16 @@ impl DwarfAnalyzer {
         }
     }
 
-    /// Get main executable module information
+    /// Get the process executable, or the explicitly selected target in -t mode.
     pub fn get_main_executable(&self) -> Option<MainExecutableInfo> {
-        // Find the main executable module (usually the first non-library module)
-        for module_path in self.modules.keys() {
-            if self.is_main_executable_module(module_path) {
-                return Some(MainExecutableInfo {
-                    path: module_path.to_string_lossy().to_string(),
-                });
-            }
-        }
-        None
+        self.main_module.as_ref().map(|path| MainExecutableInfo {
+            path: path.to_string_lossy().to_string(),
+        })
     }
 
-    /// Check if a module is the main executable (not a shared library)
+    /// Check the identity captured at construction, without guessing from names.
     fn is_main_executable_module(&self, module_path: &Path) -> bool {
-        // Heuristic: main executable usually doesn't have .so extension and contains the process name
-        let filename = module_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-
-        // Not a shared library
-        !filename.contains(".so") &&
-        // Not a system library path
-        !module_path.to_string_lossy().starts_with("/lib") &&
-        !module_path.to_string_lossy().starts_with("/usr/lib")
+        self.main_module.as_deref() == Some(module_path)
     }
 
     /// Get list of all function names across all modules
@@ -1371,13 +1374,8 @@ impl DwarfAnalyzer {
 
     /// Get executable file information (for "info file" command)
     pub fn get_executable_file_info(&self) -> Option<ExecutableFileInfo> {
-        // Find the primary executable (not a shared library)
-        let executable = self
-            .modules
-            .iter()
-            .find(|(path, _)| !self.is_shared_library(path))?;
-
-        let (exe_path, module_data) = executable;
+        let exe_path = self.main_module.as_ref()?;
+        let module_data = self.modules.get(exe_path)?;
         let file_path = exe_path.to_string_lossy().to_string();
 
         // Parse the ELF file to get detailed information
@@ -1411,7 +1409,7 @@ impl DwarfAnalyzer {
 
         // Load bias for PID mode from module mapping (if available)
         let load_bias = if self.pid != 0 {
-            module_data.module_mapping().loaded_address.unwrap_or(0)
+            module_data.module_mapping().load_bias.unwrap_or(0)
         } else {
             0
         };
@@ -1463,17 +1461,9 @@ impl DwarfAnalyzer {
 
     // NOTE: Runtime section offsets are handled by ghostscope-coordinator.
 
-    /// Check if a module is a shared library
+    /// Modules other than the selected target are displayed as dependencies.
     fn is_shared_library(&self, module_path: &Path) -> bool {
-        let filename = module_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-
-        // Shared libraries typically have .so extension or contain .so
-        filename.contains(".so")
-            || module_path.to_string_lossy().starts_with("/lib")
-            || module_path.to_string_lossy().starts_with("/usr/lib")
+        !self.is_main_executable_module(module_path)
     }
 
     /// Get grouped file info by module (compatibility method)
