@@ -4,6 +4,62 @@ use common::{fixture_compiler_available, init, FixtureCompiler, FIXTURES};
 use std::path::Path;
 use std::time::Duration;
 
+#[tokio::test]
+async fn test_static_global_binding_uses_the_current_compilation_unit() -> anyhow::Result<()> {
+    init();
+    let binary = FIXTURES.get_test_binary("static_scope_program")?;
+    let target = spawn_static_scope_program(&binary).await?;
+    let script = r#"
+trace binding_scope_one { print "FIRST_CU:{}:{}:{}", cfg.own, cfg.common, binding_state; }
+trace binding_scope_two { print "SECOND_CU:{}:{}", cfg.other, cfg.common; }
+trace binding_scope_unrelated { print "LOCAL_SCOPE:{}:{}:{}", cfg.own, cfg.common, binding_state; }
+"#;
+    let (code, stdout, stderr) = run_ghostscope_with_script_for_target(script, 3, &target).await?;
+    target.terminate().await?;
+    assert_eq!(code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(stdout.contains("FIRST_CU:11:1:11"), "{stdout}");
+    assert!(stdout.contains("SECOND_CU:99:2"), "{stdout}");
+    assert!(stdout.contains("LOCAL_SCOPE:777:778:999"), "{stdout}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_global_binding_rejects_static_local_outside_its_scope() -> anyhow::Result<()> {
+    init();
+    let binary = FIXTURES.get_test_binary("static_scope_program")?;
+    let target = spawn_static_scope_program(&binary).await?;
+    let (code, stdout, stderr) = run_ghostscope_with_script_for_target(
+        r#"trace binding_scope_one { print "WRONG_LOCAL:{}", function_scope_static_counter; }"#,
+        3,
+        &target,
+    )
+    .await?;
+    target.terminate().await?;
+    assert_ne!(code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(!stdout.contains("WRONG_LOCAL:"), "{stdout}");
+    assert!(stderr.contains("function_scope_static_counter"), "{stderr}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_invalid_static_field_cannot_bind_a_different_compilation_unit() -> anyhow::Result<()>
+{
+    init();
+    let binary = FIXTURES.get_test_binary("static_scope_program")?;
+    let target = spawn_static_scope_program(&binary).await?;
+    let (code, stdout, stderr) = run_ghostscope_with_script_for_target(
+        r#"trace binding_scope_one { print "WRONG_SCOPE:{}", cfg.other; }"#,
+        3,
+        &target,
+    )
+    .await?;
+    target.terminate().await?;
+    assert_ne!(code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(!stdout.contains("WRONG_SCOPE:"), "{stdout}");
+    assert!(stderr.contains("other"), "{stderr}");
+    Ok(())
+}
+
 async fn run_ghostscope_with_script_for_target(
     script_content: &str,
     timeout_secs: u64,

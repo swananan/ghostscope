@@ -20,13 +20,32 @@ static int bump_counters(int seed) {
     return function_scope_static_counter + file_scope_static_counter + regular_local;
 }
 
+static int binding_scope_one(void);
+static int binding_scope_unrelated(void);
+extern int binding_scope_two(void);
+extern int binding_state;
+
 int main(void) {
     while (1) {
         int snapshot = bump_counters(2);
+        snapshot += binding_scope_one() + binding_scope_two();
+        snapshot += binding_scope_unrelated();
         if (snapshot == -1) {
             return 1;
         }
         usleep(10000);
     }
     return 0;
+}
+
+static struct { int own; int common; } cfg = {11, 1};
+
+__attribute__((noinline)) static int binding_scope_one(void) {
+    return cfg.own + cfg.common + binding_state;
+}
+
+__attribute__((noinline)) static int binding_scope_unrelated(void) {
+    static int binding_state = 999;
+    static struct { int own; int common; } cfg = {777, 778};
+    return binding_state + cfg.own + cfg.common;
 }

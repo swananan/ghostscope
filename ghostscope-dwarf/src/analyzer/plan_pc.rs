@@ -2,9 +2,8 @@ use super::DwarfAnalyzer;
 use crate::{
     core::{demangle::RustSymbolHashDisplay, ModuleAddress, Provenance, Result},
     semantics::{
-        AddressSpaceInfo, FunctionParameter, PcContext, PcLineInfo, PcRange, PlanError,
-        VariableAccessPath, VariableAccessSegment, VariableReadPlan, VisibleVariable,
-        VisibleVariablesResult,
+        AddressSpaceInfo, FunctionParameter, PcContext, PcLineInfo, PcRange, VariableAccessPath,
+        VariableAccessSegment, VariableReadPlan, VisibleVariable, VisibleVariablesResult,
     },
 };
 use std::path::Path;
@@ -191,11 +190,6 @@ impl DwarfAnalyzer {
             module_path.to_path_buf(),
             ctx.normalized_pc,
         ))
-    }
-
-    pub(super) fn is_value_backed_aggregate_access_error(err: &anyhow::Error) -> bool {
-        err.downcast_ref::<PlanError>()
-            .is_some_and(PlanError::is_value_backed_aggregate_access)
     }
 
     pub(super) fn read_plan_from_variable(

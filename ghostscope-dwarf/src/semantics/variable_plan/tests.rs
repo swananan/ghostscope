@@ -714,7 +714,7 @@ fn field_access_rejects_value_backed_aggregates() {
             .expect_err("value-backed aggregate field access should fail");
         assert!(
             err.downcast_ref::<PlanError>()
-                .is_some_and(PlanError::is_value_backed_aggregate_access),
+                .is_some_and(|error| matches!(error, PlanError::ValueBackedAggregateOffset { .. })),
             "unexpected error: {err}"
         );
     }
@@ -745,7 +745,7 @@ fn array_index_rejects_value_backed_aggregates() {
             .expect_err("value-backed aggregate array access should fail");
         assert!(
             err.downcast_ref::<PlanError>()
-                .is_some_and(PlanError::is_value_backed_aggregate_access),
+                .is_some_and(|error| matches!(error, PlanError::ValueBackedAggregateOffset { .. })),
             "unexpected error: {err}"
         );
     }

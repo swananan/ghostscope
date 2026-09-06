@@ -1522,7 +1522,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         if let Some((_global_module, plan)) = analyzer
-            .plan_global_access_read_plan(&prefer_module, var_name, &VariableAccessPath::default())
+            .plan_global_access_read_plan_at_address(
+                &module_address,
+                var_name,
+                &VariableAccessPath::default(),
+            )
             .map_err(|err| CodeGenError::DwarfError(err.to_string()))?
         {
             debug!("Found DWARF global '{}' via variable read plan", var_name);
@@ -1608,7 +1612,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
 
         if let Some((_module_path, plan)) = analyzer
-            .plan_global_access_read_plan(&prefer_module, base_name, access_path)
+            .plan_global_access_read_plan_at_address(&module_address, base_name, access_path)
             .map_err(|err| CodeGenError::DwarfError(err.to_string()))?
         {
             debug!("Found DWARF global access '{path_text}' via variable read plan");

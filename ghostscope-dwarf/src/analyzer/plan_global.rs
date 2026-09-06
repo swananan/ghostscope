@@ -1,27 +1,28 @@
 use super::DwarfAnalyzer;
 use crate::{
     core::{GlobalVariableInfo, Provenance, Result},
-    semantics::{VariableAccessPath, VariableReadPlan},
+    semantics::{PcContext, VariableAccessPath, VariableReadPlan},
 };
 use std::path::{Path, PathBuf};
 
 impl DwarfAnalyzer {
-    pub(super) fn select_unambiguous_global_plan(
+    pub(super) fn select_unambiguous_global_binding(
         base: &str,
-        mut candidates: Vec<(PathBuf, VariableReadPlan)>,
-    ) -> Result<Option<(PathBuf, VariableReadPlan)>> {
+        mut candidates: Vec<(PathBuf, GlobalVariableInfo)>,
+    ) -> Result<Option<(PathBuf, GlobalVariableInfo)>> {
         match candidates.len() {
             0 => Ok(None),
             1 => Ok(candidates.pop()),
             count => {
                 let details = candidates
                     .iter()
-                    .map(|(module_path, plan)| {
-                        let declaration = plan
-                            .declaration
-                            .map(|die| format!(" cu={} die=0x{:x}", die.cu.0, die.offset))
-                            .unwrap_or_default();
-                        format!("{}{}", module_path.display(), declaration)
+                    .map(|(module_path, info)| {
+                        format!(
+                            "{} cu={} die=0x{:x}",
+                            module_path.display(),
+                            info.unit_offset.0,
+                            info.die_offset.0
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -32,19 +33,19 @@ impl DwarfAnalyzer {
         }
     }
 
-    pub(super) fn select_global_plan_with_preferred_module(
+    pub(super) fn select_global_binding_with_preferred_module(
         base: &str,
         prefer_module: &Path,
-        candidates: Vec<(PathBuf, VariableReadPlan)>,
-    ) -> Result<Option<(PathBuf, VariableReadPlan)>> {
+        candidates: Vec<(PathBuf, GlobalVariableInfo)>,
+    ) -> Result<Option<(PathBuf, GlobalVariableInfo)>> {
         let (preferred, fallback): (Vec<_>, Vec<_>) = candidates
             .into_iter()
             .partition(|(module_path, _)| module_path == prefer_module);
         if !preferred.is_empty() {
-            return Self::select_unambiguous_global_plan(base, preferred);
+            return Self::select_unambiguous_global_binding(base, preferred);
         }
 
-        Self::select_unambiguous_global_plan(base, fallback)
+        Self::select_unambiguous_global_binding(base, fallback)
     }
 
     /// Find global/static variables by name across all loaded modules
@@ -74,71 +75,82 @@ impl DwarfAnalyzer {
         results
     }
 
-    /// Plan a global/static source-level access path as a neutral read plan.
+    /// Bind a global/static declaration before projecting its access path.
+    /// Without a PC, duplicate declarations in the preferred module are ambiguous.
     pub fn plan_global_access_read_plan(
         &self,
-        prefer_module: &PathBuf,
+        prefer_module: &Path,
         base: &str,
         path: &VariableAccessPath,
     ) -> Result<Option<(PathBuf, VariableReadPlan)>> {
-        let matches = self.find_global_variables_by_name(base);
-        if matches.is_empty() {
-            return Ok(None);
-        }
+        self.plan_global_access_read_plan_in_scope(prefer_module, None, base, path)
+    }
 
-        let mut ordered: Vec<(PathBuf, GlobalVariableInfo)> = Vec::new();
-        for (module_path, info) in matches.iter() {
-            if *module_path == *prefer_module {
-                ordered.push((module_path.clone(), info.clone()));
-            }
-        }
-        for (module_path, info) in matches.into_iter() {
-            if module_path != *prefer_module {
-                ordered.push((module_path, info));
-            }
-        }
+    /// Resolve global names in the compilation unit of the traced instruction.
+    /// An invalid field on that declaration must not select another CU's variable.
+    pub fn plan_global_access_read_plan_at_address(
+        &self,
+        address: &crate::ModuleAddress,
+        base: &str,
+        path: &VariableAccessPath,
+    ) -> Result<Option<(PathBuf, VariableReadPlan)>> {
+        let context = self.resolve_pc(address)?;
+        self.plan_global_access_read_plan_in_scope(&address.module_path, Some(&context), base, path)
+    }
 
-        let mut direct_matches = Vec::new();
-        let mut last_error = None;
-        for (module_path, info) in ordered {
-            let base_plan = match self.resolve_variable_read_plan_by_offsets_in_module(
-                &module_path,
-                info.unit_offset,
-                info.die_offset,
-                Provenance::Synthesized {
-                    detail: "global access".to_string(),
-                },
-            ) {
-                Ok(plan) => plan,
-                Err(err) => {
-                    last_error = Some(err);
-                    continue;
-                }
+    fn plan_global_access_read_plan_in_scope(
+        &self,
+        prefer_module: &Path,
+        context: Option<&PcContext>,
+        base: &str,
+        path: &VariableAccessPath,
+    ) -> Result<Option<(PathBuf, VariableReadPlan)>> {
+        let mut matches = self.find_global_variables_by_name(base);
+        let mut has_unknown_scope = false;
+        if let Some(context) = context {
+            // The global index also lists static locals. A CU preference must not
+            // promote a declaration belonging to another function or lexical block.
+            matches.retain(|(module_path, info)| {
+                let visibility = self.module_id_for_path(module_path).and_then(|module| {
+                    self.modules
+                        .get(module_path)?
+                        .global_variable_visibility(info, module, context)
+                });
+                has_unknown_scope |= visibility.is_none();
+                visibility != Some(false)
+            });
+        }
+        let prefer_cu = context.filter(|_| !has_unknown_scope).and_then(|context| {
+            context
+                .inline_chain
+                .last()
+                .map(|frame| frame.abstract_origin.unwrap_or(frame.concrete_die).cu)
+                .or(context.cu)
+        });
+        if let Some(cu) = prefer_cu {
+            let in_scope = |(module_path, info): &(PathBuf, GlobalVariableInfo)| {
+                Self::module_paths_equivalent(module_path, prefer_module)
+                    && info.unit_offset.0 as u64 == u64::from(cu.0)
             };
-
-            match self.plan_access_path_with_type_completion(&module_path, base_plan, path) {
-                Ok(plan) => direct_matches.push((module_path, plan)),
-                Err(primary_error) => {
-                    if Self::is_value_backed_aggregate_access_error(&primary_error) {
-                        return Err(primary_error);
-                    }
-                    last_error = Some(primary_error);
-                }
+            if matches.iter().any(in_scope) {
+                matches.retain(in_scope);
             }
         }
-
-        if !direct_matches.is_empty() {
-            return Self::select_global_plan_with_preferred_module(
-                base,
-                prefer_module,
-                direct_matches,
-            );
-        }
-
-        if let Some(err) = last_error {
-            return Err(err);
-        }
-        Ok(None)
+        let Some((module_path, info)) =
+            Self::select_global_binding_with_preferred_module(base, prefer_module, matches)?
+        else {
+            return Ok(None);
+        };
+        let base_plan = self.resolve_variable_read_plan_by_offsets_in_module(
+            &module_path,
+            info.unit_offset,
+            info.die_offset,
+            Provenance::Synthesized {
+                detail: "global access".to_string(),
+            },
+        )?;
+        let plan = self.plan_access_path_with_type_completion(&module_path, base_plan, path)?;
+        Ok(Some((module_path, plan)))
     }
 
     fn resolve_variable_read_plan_by_offsets_in_module<P: AsRef<Path>>(

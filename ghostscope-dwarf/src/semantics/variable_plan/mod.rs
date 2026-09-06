@@ -312,12 +312,6 @@ pub enum PlanError {
     UnsupportedDereference { location: VariableLocation },
 }
 
-impl PlanError {
-    pub fn is_value_backed_aggregate_access(&self) -> bool {
-        matches!(self, PlanError::ValueBackedAggregateOffset { .. })
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ElementIndexContext {
     AccessPath,

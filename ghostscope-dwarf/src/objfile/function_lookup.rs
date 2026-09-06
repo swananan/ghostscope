@@ -932,6 +932,7 @@ mod tests {
             name: Arc::from("CGPsend"),
             die_offset: gimli::UnitOffset(0),
             unit_offset: gimli::DebugInfoOffset(0),
+            lexical_scope: None,
             tag: constants::DW_TAG_subprogram,
             flags: IndexFlags::default(),
             language: None,
@@ -1514,6 +1515,7 @@ mod tests {
                 name: Arc::<str>::from(mangled.as_str()),
                 die_offset: gimli::UnitOffset(0),
                 unit_offset: gimli::DebugInfoOffset(0),
+                lexical_scope: None,
                 tag: constants::DW_TAG_subprogram,
                 flags: IndexFlags {
                     is_linkage: true,
@@ -1552,6 +1554,7 @@ mod tests {
                 name: Arc::<str>::from(mangled.as_str()),
                 die_offset: gimli::UnitOffset(0),
                 unit_offset: gimli::DebugInfoOffset(0),
+                lexical_scope: None,
                 tag: constants::DW_TAG_subprogram,
                 flags: IndexFlags {
                     is_linkage: true,
@@ -1578,6 +1581,7 @@ mod tests {
             name: Arc::<str>::from(name),
             die_offset: gimli::UnitOffset(0),
             unit_offset: gimli::DebugInfoOffset(0),
+            lexical_scope: None,
             tag: constants::DW_TAG_subprogram,
             flags: IndexFlags {
                 is_linkage: true,
@@ -1677,6 +1681,7 @@ mod tests {
                 name: Arc::<str>::from(mangled.as_str()),
                 die_offset: gimli::UnitOffset(0),
                 unit_offset: gimli::DebugInfoOffset(0),
+                lexical_scope: None,
                 tag: constants::DW_TAG_subprogram,
                 flags: IndexFlags {
                     is_linkage: true,

@@ -2,13 +2,17 @@ CC ?= gcc
 CFLAGS ?= -Wall -Wextra -g -O0
 BINARY ?= static_scope_program
 OBJ ?= $(BINARY).o
+EXTRA_OBJ = $(OBJ:.o=_other.o)
 
 all: $(BINARY)
 
-$(BINARY): $(OBJ)
+$(BINARY): $(OBJ) $(EXTRA_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(OBJ): static_scope_program.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(EXTRA_OBJ): other.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:

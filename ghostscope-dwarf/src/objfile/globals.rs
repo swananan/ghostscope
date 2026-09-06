@@ -43,6 +43,7 @@ impl LoadedObjfile {
             let section = link_address.and_then(|addr| self.classify_section(&obj, addr));
             out.push(GlobalVariableInfo {
                 name: name.to_string(),
+                lexical_scope: entry.lexical_scope,
                 link_address,
                 section,
                 die_offset: entry.die_offset,
@@ -101,6 +102,7 @@ impl LoadedObjfile {
                     let link_address = e.representative_addr;
                     out.push(GlobalVariableInfo {
                         name: e.name.to_string(),
+                        lexical_scope: e.lexical_scope,
                         link_address,
                         section: None,
                         die_offset: e.die_offset,
@@ -121,6 +123,7 @@ impl LoadedObjfile {
 
             out.push(GlobalVariableInfo {
                 name: e.name.to_string(),
+                lexical_scope: e.lexical_scope,
                 link_address,
                 section,
                 die_offset: e.die_offset,

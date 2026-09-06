@@ -304,7 +304,7 @@ impl<'a> DwarfParser<'a> {
         let mut shard = InfoShard::default();
         let mut entries = unit.entries_raw(None)?;
         let mut metadata_cache: HashMap<gimli::DebugInfoOffset, FunctionMetadata> = HashMap::new();
-        let mut tag_stack: Vec<gimli::DwTag> = Vec::new();
+        let mut tag_stack: Vec<(gimli::DwTag, gimli::UnitOffset)> = Vec::new();
         while !entries.is_empty() {
             let d: usize = entries.next_depth() as usize;
             let entry_offset = entries.next_offset();
@@ -331,7 +331,7 @@ impl<'a> DwarfParser<'a> {
                 // Most DIEs are not indexable. Skip their attributes without materializing
                 // a full DebuggingInformationEntry so template-heavy CUs stay cheaper.
                 entries.skip_attributes(abbrev.attributes())?;
-                tag_stack.push(tag);
+                tag_stack.push((tag, entry_offset));
                 continue;
             }
 
@@ -437,7 +437,7 @@ impl<'a> DwarfParser<'a> {
                     let var_addr = self.extract_variable_address_from_raw(unit, &raw_attrs)?;
                     let is_static_symbol =
                         Self::is_static_variable_symbol_from_raw(&raw_attrs, var_addr);
-                    let in_function_scope = tag_stack.iter().any(|t| {
+                    let in_function_scope = tag_stack.iter().any(|(t, _)| {
                         *t == gimli::constants::DW_TAG_subprogram
                             || *t == gimli::constants::DW_TAG_inlined_subroutine
                     });
@@ -448,7 +448,7 @@ impl<'a> DwarfParser<'a> {
                             tag_stack
                         );
                         // Skip local variables
-                        tag_stack.push(tag);
+                        tag_stack.push((tag, entry_offset));
                         continue;
                     } else if in_function_scope {
                         // Rust (and some C compilers) sometimes nest file-scoped statics under the
@@ -466,7 +466,7 @@ impl<'a> DwarfParser<'a> {
                             "Skipping variable at {:?} (declaration-only DIE)",
                             entry_offset
                         );
-                        tag_stack.push(tag);
+                        tag_stack.push((tag, entry_offset));
                         continue;
                     }
                     let mut collected_names: Vec<(Arc<str>, bool)> = Vec::new();
@@ -500,7 +500,7 @@ impl<'a> DwarfParser<'a> {
                             entry_offset,
                             cu_language
                         );
-                        tag_stack.push(tag);
+                        tag_stack.push((tag, entry_offset));
                         continue;
                     }
 
@@ -508,6 +508,19 @@ impl<'a> DwarfParser<'a> {
                         is_static: is_static_symbol,
                         ..Default::default()
                     };
+                    let lexical_scope = in_function_scope
+                        .then(|| {
+                            tag_stack.iter().rev().find_map(|(tag, offset)| {
+                                matches!(
+                                    *tag,
+                                    gimli::DW_TAG_subprogram
+                                        | gimli::DW_TAG_inlined_subroutine
+                                        | gimli::DW_TAG_lexical_block
+                                )
+                                .then_some(*offset)
+                            })
+                        })
+                        .flatten();
 
                     for (name, is_linkage_alias) in collected_names {
                         let mut entry_flags = flags;
@@ -516,6 +529,7 @@ impl<'a> DwarfParser<'a> {
                             name: Arc::clone(&name),
                             die_offset: entry_offset,
                             unit_offset,
+                            lexical_scope,
                             tag,
                             flags: entry_flags,
                             language: cu_language,
@@ -551,6 +565,7 @@ impl<'a> DwarfParser<'a> {
                             name: Arc::clone(&name),
                             die_offset: entry_offset,
                             unit_offset,
+                            lexical_scope: None,
                             tag,
                             flags,
                             language: cu_language,
@@ -563,7 +578,7 @@ impl<'a> DwarfParser<'a> {
                 }
                 _ => {}
             }
-            tag_stack.push(tag);
+            tag_stack.push((tag, entry_offset));
         }
         Ok(shard)
     }
@@ -594,6 +609,7 @@ impl<'a> DwarfParser<'a> {
             name,
             die_offset: seed.die_offset,
             unit_offset: seed.unit_offset,
+            lexical_scope: None,
             tag: seed.tag,
             flags: seed.flags,
             language: seed.language,
@@ -1557,6 +1573,7 @@ impl<'a> DwarfParser<'a> {
                         name: Arc::from(name.as_str()),
                         die_offset,
                         unit_offset,
+                        lexical_scope: None,
                         tag,
                         flags: crate::core::IndexFlags {
                             is_main: name == "main" || name == "_main",

@@ -55,6 +55,8 @@ pub struct IndexEntry {
     pub die_offset: gimli::UnitOffset,
     /// Compilation unit offset (gimli native type)
     pub unit_offset: gimli::DebugInfoOffset,
+    /// Nearest function/inline/lexical-block owner for a function-local variable.
+    pub lexical_scope: Option<gimli::UnitOffset>,
     /// DWARF tag (gimli native type)
     pub tag: gimli::DwTag,
     /// Index flags (inspired by GDB's cooked_index_flag)
@@ -173,6 +175,8 @@ pub enum SectionType {
 #[derive(Debug, Clone)]
 pub struct GlobalVariableInfo {
     pub name: String,
+    /// Nearest function/inline/lexical-block owner, when nested in a function.
+    pub lexical_scope: Option<gimli::UnitOffset>,
     /// Link-time address from DWARF location (if available)
     pub link_address: Option<u64>,
     /// Best-effort section classification based on ELF section headers

@@ -250,6 +250,73 @@ impl LoadedObjfile {
         Some(false)
     }
 
+    /// Check lexical ownership without evaluating storage. `None` means DWARF
+    /// does not provide enough scope identity to establish visibility.
+    pub(crate) fn global_variable_visibility(
+        &self,
+        info: &crate::GlobalVariableInfo,
+        module: crate::ModuleId,
+        context: &crate::PcContext,
+    ) -> Option<bool> {
+        let Some(scope_offset) = info.lexical_scope else {
+            return Some(true);
+        };
+        let scope = die_ref(module, info.unit_offset, scope_offset);
+        let active_scopes = context
+            .function
+            .map(|function| function.declaration)
+            .into_iter()
+            .chain(context.lexical_scopes.iter().map(|scope| scope.die))
+            .chain(context.inline_chain.iter().flat_map(|frame| {
+                std::iter::once(frame.concrete_die).chain(frame.abstract_origin)
+            }));
+        for active in active_scopes.filter(|active| active.module == module) {
+            if active == scope {
+                return Some(true);
+            }
+            // Optimized scopes can leave their variables on an abstract DIE.
+            let unit = self
+                .unit(gimli::DebugInfoOffset(active.cu.0 as usize))
+                .ok()?;
+            let entry = unit.entry(gimli::UnitOffset(active.offset as usize)).ok()?;
+            for attr in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
+                if let Some(value) = entry.attr_value(attr) {
+                    if let Some((_, origin_unit, origin_entry)) =
+                        resolve_origin_entry(self.dwarf(), &unit, value).ok()?
+                    {
+                        if origin_unit.header.debug_info_offset() == Some(info.unit_offset)
+                            && origin_entry.offset() == scope_offset
+                        {
+                            return Some(true);
+                        }
+                    }
+                }
+            }
+        }
+
+        let unit = self.unit(info.unit_offset).ok()?;
+        let owner = unit.entry(scope_offset).ok()?;
+        let has_pc = [
+            gimli::DW_AT_low_pc,
+            gimli::DW_AT_ranges,
+            gimli::DW_AT_entry_pc,
+        ]
+        .iter()
+        .any(|attr| owner.attr_value(*attr).is_some());
+        // Clang can place an inline static under an anonymous, addressless
+        // subprogram with no link to the inline origin. Keep it as an unresolved
+        // candidate; its CU alone must not make it win a name collision.
+        if !has_pc
+            && (owner.tag() == gimli::DW_TAG_lexical_block
+                || resolve_name_with_origins(self.dwarf(), &unit, &owner)
+                    .ok()?
+                    .is_none())
+        {
+            return None;
+        }
+        Some(false)
+    }
+
     pub(crate) fn resolve_pc_scopes(
         &self,
         module: crate::ModuleId,
@@ -1012,6 +1079,7 @@ mod tests {
                 name: Arc::from("Foo"),
                 die_offset: full_struct_off,
                 unit_offset: full_cu_off,
+                lexical_scope: None,
                 tag: constants::DW_TAG_structure_type,
                 flags: IndexFlags::default(),
                 language: None,
