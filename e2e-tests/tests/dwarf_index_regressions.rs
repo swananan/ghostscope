@@ -360,6 +360,114 @@ fn test_read_uleb128_rejects_values_that_overflow_u64() {
 }
 
 #[tokio::test]
+async fn test_dwarf_lookup_errors_do_not_fall_back_to_globals() -> anyhow::Result<()> {
+    init();
+    let Some(cc) = preferred_c_compiler() else {
+        eprintln!("Skipping DWARF lookup regression: no C compiler is available");
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let source = dir.path().join("lookup.c");
+    let binary = dir.path().join("lookup");
+    fs::write(
+        &source,
+        "int state = 11;\n\
+         struct { int field; } cfg = {13};\n\
+         int probe(void) { return state + cfg.field; }\n\
+         int local_probe(int state) { return state; }\n\
+         int main(void) { return probe() + local_probe(7); }\n",
+    )?;
+    run_command(
+        StdCommand::new(cc)
+            .args(["-g", "-O0"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary),
+        "compile DWARF lookup fixture",
+    )?;
+
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary).await?;
+    let probe = analyzer.lookup_function_addresses("probe").remove(0);
+    let probe_context = analyzer.resolve_pc(&probe)?;
+    assert!(analyzer
+        .plan_variable_by_name(&probe_context, "state")?
+        .is_none());
+    let local_probe = analyzer.lookup_function_addresses("local_probe").remove(0);
+    let local_context = analyzer.resolve_pc(&local_probe)?;
+    assert!(analyzer
+        .plan_variable_by_name(&local_context, "state")?
+        .is_some());
+
+    // The CRT entry point is executable but has no local DWARF scope in this
+    // fixture. Its failed local query must not bind the file-scope `state`.
+    let bytes = fs::read(&binary)?;
+    let object = object::File::parse(bytes.as_slice())?;
+    let entry_pc = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("_start"))
+        .context("fixture has no CRT entry point")?
+        .address();
+    let entry = ghostscope_dwarf::ModuleAddress::new(binary.clone(), entry_pc);
+    let entry_context = analyzer.resolve_pc(&entry)?;
+    let error = analyzer
+        .plan_variable_by_name(&entry_context, "state")
+        .expect_err("a failed scope query must not report a missing binding");
+    assert!(matches!(
+        error,
+        ghostscope_dwarf::VariableLookupError::QueryFailed(_)
+    ));
+
+    let options = ghostscope_compiler::CompileOptions {
+        binary_path_hint: Some(binary.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    for (expression, base, path) in [
+        (
+            "state",
+            "state",
+            ghostscope_dwarf::VariableAccessPath::default(),
+        ),
+        (
+            "cfg.field",
+            "cfg",
+            ghostscope_dwarf::VariableAccessPath::fields(["field"]),
+        ),
+    ] {
+        // Prove that a global fallback would succeed, so the failure below
+        // specifically exercises the compiler's local-query error boundary.
+        assert!(analyzer
+            .plan_global_access_read_plan_at_address(&entry, base, &path)?
+            .is_some());
+
+        let valid = ghostscope_compiler::compile_script(
+            &format!("trace probe {{ print {expression}; }}"),
+            &analyzer,
+            None,
+            Some(1),
+            &options,
+        )?;
+        assert_eq!(valid.uprobe_configs.len(), 1);
+        assert!(valid.failed_targets.is_empty());
+
+        let invalid = ghostscope_compiler::compile_script(
+            &format!("trace 0x{entry_pc:x} {{ print {expression}; }}"),
+            &analyzer,
+            None,
+            Some(1),
+            &options,
+        )
+        .expect_err("a local-query failure must reject scalar and member global fallback");
+        assert!(
+            invalid
+                .to_string()
+                .contains("StrictIndex: no function found"),
+            "{expression}: {invalid}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 #[serial_test::serial]
 async fn test_gnu_pubnames_resolve_symbols_lazily_and_reject_corruption() -> anyhow::Result<()> {
     init();

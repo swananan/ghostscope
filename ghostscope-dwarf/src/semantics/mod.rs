@@ -52,7 +52,7 @@ pub(crate) use variable_plan::PlanError;
 pub use variable_plan::{
     AddressOrigin, LvalueAddressPlan, PlannedAddress, PlannedAddressKind, PlannedValue,
     RuntimeComputedExpr, RuntimeComputedKind, VariableAccessPath, VariableAccessSegment,
-    VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
+    VariableLookupError, VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
     VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
     VisibleVariable, VisibleVariablesResult,
 };

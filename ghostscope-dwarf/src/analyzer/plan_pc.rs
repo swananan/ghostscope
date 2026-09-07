@@ -3,7 +3,8 @@ use crate::{
     core::{demangle::RustSymbolHashDisplay, ModuleAddress, Provenance, Result},
     semantics::{
         AddressSpaceInfo, FunctionParameter, PcContext, PcLineInfo, PcRange, VariableAccessPath,
-        VariableAccessSegment, VariableReadPlan, VisibleVariable, VisibleVariablesResult,
+        VariableAccessSegment, VariableLookupError, VariableReadPlan, VisibleVariable,
+        VisibleVariablesResult,
     },
 };
 use std::path::Path;
@@ -240,11 +241,13 @@ impl DwarfAnalyzer {
     /// Plan a visible variable by source name at a previously resolved PC context.
     ///
     /// Exact names are preferred over producer-synthesized names like `name@...`.
+    /// `Ok(None)` means no local binding was found and allows a global lookup.
+    /// Unavailable or ambiguous bindings and failed queries must not fall back.
     pub fn plan_variable_by_name(
         &self,
         ctx: &PcContext,
         name: &str,
-    ) -> Result<Option<VariableReadPlan>> {
+    ) -> std::result::Result<Option<VariableReadPlan>, VariableLookupError> {
         let VisibleVariablesResult {
             variables: visible_variables,
             diagnostics,
@@ -271,7 +274,7 @@ impl DwarfAnalyzer {
         name: &str,
         visible_variables: Vec<VisibleVariable>,
         diagnostics: &[crate::semantics::VariableQueryDiagnostic],
-    ) -> Result<Option<VisibleVariable>> {
+    ) -> std::result::Result<Option<VisibleVariable>, VariableLookupError> {
         let synthesized_prefix = format!("{name}@");
         let matching_diagnostics = diagnostics
             .iter()
@@ -302,11 +305,11 @@ impl DwarfAnalyzer {
                 .iter()
                 .max_by_key(|diagnostic| diagnostic.scope_depth)
             {
-                return Err(anyhow::anyhow!(
-                    "Unavailable variable '{name}' at PC 0x{:x}: {}",
+                return Err(VariableLookupError::Unavailable {
+                    name: name.to_string(),
                     pc,
-                    diagnostic.detail
-                ));
+                    detail: diagnostic.detail.clone(),
+                });
             }
             return Ok(None);
         }
@@ -321,11 +324,11 @@ impl DwarfAnalyzer {
             .filter(|diagnostic| diagnostic.scope_depth > max_scope_depth)
             .max_by_key(|diagnostic| diagnostic.scope_depth)
         {
-            return Err(anyhow::anyhow!(
-                "Unavailable variable '{name}' at PC 0x{:x}: {}",
+            return Err(VariableLookupError::Unavailable {
+                name: name.to_string(),
                 pc,
-                diagnostic.detail
-            ));
+                detail: diagnostic.detail.clone(),
+            });
         }
         candidates.retain(|variable| variable.scope_depth == max_scope_depth);
 
@@ -335,14 +338,14 @@ impl DwarfAnalyzer {
 
         candidates.dedup();
         if candidates.len() > 1 {
-            let names = candidates
-                .iter()
-                .map(|variable| variable.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(anyhow::anyhow!(
-                "Ambiguous variable '{name}' at PC 0x{pc:x}: candidates [{names}]"
-            ));
+            return Err(VariableLookupError::Ambiguous {
+                name: name.to_string(),
+                pc,
+                candidates: candidates
+                    .into_iter()
+                    .map(|variable| variable.name)
+                    .collect(),
+            });
         }
 
         Ok(candidates.into_iter().next())

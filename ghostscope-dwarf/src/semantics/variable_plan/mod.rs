@@ -26,6 +26,29 @@ pub struct VisibleVariable {
     pub is_artificial: bool,
 }
 
+/// Failure to establish which local variable a source name denotes at a PC.
+/// Only a successful lookup returning `None` permits global-name fallback.
+#[derive(Debug, thiserror::Error)]
+pub enum VariableLookupError {
+    #[error("Unavailable variable '{name}' at PC 0x{pc:x}: {detail}")]
+    Unavailable {
+        name: String,
+        pc: u64,
+        detail: String,
+    },
+    #[error(
+        "Ambiguous variable '{name}' at PC 0x{pc:x}: candidates [{candidates}]",
+        candidates = .candidates.join(", ")
+    )]
+    Ambiguous {
+        name: String,
+        pc: u64,
+        candidates: Vec<String>,
+    },
+    #[error(transparent)]
+    QueryFailed(#[from] anyhow::Error),
+}
+
 /// Diagnostic produced while answering a PC-sensitive variable query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VariableQueryDiagnostic {
