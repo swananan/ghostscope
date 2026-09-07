@@ -61,10 +61,10 @@ pub use semantics::{
     ValueAdapterReport, ValueAdapterStage, ValueCapturePlan, ValueHashTableField,
     ValueNestedFieldPlan, ValueNestedHashTableFieldPlan, ValueNestedPlan,
     ValueNestedVariantCondition, ValueNestedVariantFieldPlan, ValueReadPlan, ValueReadPlanOptions,
-    VariableAccessPath, VariableAccessSegment, VariableLoweringKind, VariableLoweringPlan,
-    VariableMaterialization, VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic,
-    VariableReadPlan, VisibleVariable, VisibleVariablesResult, DEFAULT_VALUE_ADAPTER_NESTING_DEPTH,
-    MAX_VALUE_ADAPTER_NESTING_DEPTH,
+    VariableAccessPath, VariableAccessSegment, VariableLookupError, VariableLoweringKind,
+    VariableLoweringPlan, VariableMaterialization, VariableMaterializationPlan, VariablePlan,
+    VariableQueryDiagnostic, VariableReadPlan, VisibleVariable, VisibleVariablesResult,
+    DEFAULT_VALUE_ADAPTER_NESTING_DEPTH, MAX_VALUE_ADAPTER_NESTING_DEPTH,
 };
 
 pub use semantics::{

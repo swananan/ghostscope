@@ -1481,46 +1481,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let module_address =
             ghostscope_dwarf::ModuleAddress::new(prefer_module.clone(), pc_address);
 
-        let pc_plan = match analyzer.resolve_pc(&module_address) {
-            Ok(pc_context) => match analyzer.plan_variable_by_name(&pc_context, var_name) {
-                Ok(Some(plan)) => {
-                    debug!("Found DWARF variable '{}' via PC variable plan", var_name);
-                    Some(plan)
-                }
-                Ok(None) => {
-                    debug!(
-                        "Variable '{}' not found in PC variable plan; trying global read plan",
-                        var_name
-                    );
-                    None
-                }
-                Err(err) => {
-                    let message = err.to_string();
-                    if message.starts_with("Ambiguous variable")
-                        || message.starts_with("Unavailable variable")
-                    {
-                        return Err(CodeGenError::DwarfError(message));
-                    }
-                    debug!(
-                        "PC variable plan lookup error for '{}': {message}; trying global read plan",
-                        var_name
-                    );
-                    None
-                }
-            },
-            Err(err) => {
-                debug!(
-                    "PC context resolution failed for '{}': {err}; trying global read plan",
-                    var_name
-                );
-                None
-            }
-        };
-
-        if pc_plan.is_some() {
-            return Ok(pc_plan);
+        let pc_context = analyzer
+            .resolve_pc(&module_address)
+            .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
+        if let Some(plan) = analyzer
+            .plan_variable_by_name(&pc_context, var_name)
+            .map_err(|err| CodeGenError::DwarfError(err.to_string()))?
+        {
+            debug!("Found DWARF variable '{}' via PC variable plan", var_name);
+            return Ok(Some(plan));
         }
 
+        // Only a successful local lookup with no binding permits global fallback.
         if let Some((_global_module, plan)) = analyzer
             .plan_global_access_read_plan_at_address(
                 &module_address,
@@ -1587,28 +1559,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let module_address =
             ghostscope_dwarf::ModuleAddress::new(prefer_module.clone(), pc_address);
 
-        match analyzer.resolve_pc(&module_address) {
-            Ok(pc_context) => {
-                match analyzer.plan_variable_access_by_name(&pc_context, base_name, access_path) {
-                    Ok(Some(plan)) => {
-                        debug!("Found DWARF access '{path_text}' via PC variable access plan");
-                        return Ok(Some(plan));
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        let message = err.to_string();
-                        debug!(
-                            "PC variable access plan lookup failed for '{path_text}': {message}"
-                        );
-                        return Err(CodeGenError::DwarfError(message));
-                    }
-                }
-            }
-            Err(err) => {
-                debug!(
-                    "PC context resolution failed for '{path_text}': {err}; trying global read plan"
-                );
-            }
+        let pc_context = analyzer
+            .resolve_pc(&module_address)
+            .map_err(|err| CodeGenError::DwarfError(err.to_string()))?;
+        if let Some(plan) = analyzer
+            .plan_variable_access_by_name(&pc_context, base_name, access_path)
+            .map_err(|err| CodeGenError::DwarfError(err.to_string()))?
+        {
+            debug!("Found DWARF access '{path_text}' via PC variable access plan");
+            return Ok(Some(plan));
         }
 
         if let Some((_module_path, plan)) = analyzer

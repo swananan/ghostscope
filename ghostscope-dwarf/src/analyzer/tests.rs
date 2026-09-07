@@ -1,7 +1,7 @@
 use super::DwarfAnalyzer;
 use crate::{
     core::{Availability, VariableLocation},
-    semantics::VisibleVariable,
+    semantics::{VariableLookupError, VisibleVariable},
     RuntimeTextSymbol,
 };
 use std::path::{Path, PathBuf};
@@ -62,8 +62,58 @@ fn variable_selection_rejects_inner_diagnostic_over_outer_match() {
     )
     .expect_err("inner unavailable variable should block outer fallback");
 
-    assert!(err.to_string().contains("Unavailable variable 'state'"));
-    assert!(err.to_string().contains("DW_OP_bad is unsupported"));
+    assert!(matches!(
+        err,
+        VariableLookupError::Unavailable { name, pc: 0x1234, detail }
+            if name == "state" && detail == "DW_OP_bad is unsupported"
+    ));
+}
+
+#[test]
+fn variable_selection_rejects_unavailable_binding_without_an_outer_match() {
+    let err = DwarfAnalyzer::select_visible_variable_by_name(
+        0x1234,
+        "state",
+        Vec::new(),
+        &[diagnostic("state", 2, "location cannot be evaluated")],
+    )
+    .expect_err("an unavailable binding must not be treated as absent");
+
+    assert!(matches!(
+        err,
+        VariableLookupError::Unavailable { name, pc: 0x1234, detail }
+            if name == "state" && detail == "location cannot be evaluated"
+    ));
+}
+
+#[test]
+fn variable_selection_reports_ambiguous_bindings() {
+    let err = DwarfAnalyzer::select_visible_variable_by_name(
+        0x1234,
+        "state",
+        vec![visible_var("state@one", 1), visible_var("state@two", 1)],
+        &[],
+    )
+    .expect_err("multiple visible bindings must not permit global fallback");
+
+    assert!(matches!(
+        err,
+        VariableLookupError::Ambiguous { name, pc: 0x1234, candidates }
+            if name == "state" && candidates == ["state@one", "state@two"]
+    ));
+}
+
+#[test]
+fn variable_selection_returns_none_for_a_missing_binding() {
+    let selected = DwarfAnalyzer::select_visible_variable_by_name(
+        0x1234,
+        "state",
+        vec![visible_var("other", 1)],
+        &[diagnostic("unrelated", 2, "location cannot be evaluated")],
+    )
+    .expect("unrelated bindings and diagnostics must not block global lookup");
+
+    assert!(selected.is_none());
 }
 
 #[test]
