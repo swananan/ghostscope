@@ -296,11 +296,14 @@ jobs:
       - name: Build debug
         run: cargo build --all-features
 
-      - name: Verify embedded script help matches docs
+      - name: Verify embedded help matches docs
         run: |
           tmpfile="$(mktemp)"
+          trap 'rm -f "$tmpfile"' EXIT
           target/debug/ghostscope --script-help > "$tmpfile"
           diff -u docs/scripting.md "$tmpfile"
+          target/debug/ghostscope --value-diagnostics-help > "$tmpfile"
+          diff -u docs/value-diagnostics.md "$tmpfile"
 
       - name: Build release
         run: cargo build --release --all-features

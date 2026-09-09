@@ -6,14 +6,18 @@ use crate::{
     TypeLayoutError, TypeOrigin, TypeProjection, TypeProjectionLayout, ValueAdapterOutcome,
     ValueAdapterReport, ValueAdapterStage, ValueCapturePlan, ValueNestedFieldPlan,
     ValueNestedHashTableFieldPlan, ValueNestedPlan, ValueReadPlan, ValueReadPlanOptions,
-    VariableAccessSegment, VariableReadPlan,
+    ValueReadPlanResolution, VariableAccessSegment, VariableReadPlan,
 };
+use ghostscope_protocol::{ValueDiagnostic, ValueDiagnosticReason};
 use std::path::Path;
 
 enum ShallowValueReadPlan {
     Applied(Box<ValueReadPlan>),
     NotApplicable,
-    Rejected,
+    Rejected {
+        reason: ValueDiagnosticReason,
+        detail: String,
+    },
 }
 
 impl DwarfAnalyzer {
@@ -329,25 +333,48 @@ impl DwarfAnalyzer {
         )
     }
 
-    /// Build a semantic capture plan with explicit nesting limits.
+    /// Build a semantic capture plan with explicit nesting limits. Consumers
+    /// that also need notes when no plan applies should use
+    /// [`Self::resolve_value_read_plan_with_options`].
     pub fn value_read_plan_with_options(
         &self,
         current: &ResolvedType,
         type_module_path: Option<&Path>,
         options: ValueReadPlanOptions,
     ) -> Result<Option<ValueReadPlan>> {
+        let mut resolution =
+            self.resolve_value_read_plan_with_options(current, type_module_path, options)?;
+        if let Some(plan) = &mut resolution.plan {
+            plan.diagnostics = resolution.diagnostics;
+        }
+        Ok(resolution.plan)
+    }
+
+    /// Resolve capture and static notes separately. Diagnostic-only aggregates
+    /// keep `plan = None`, preserving ordinary address and register reads.
+    pub fn resolve_value_read_plan_with_options(
+        &self,
+        current: &ResolvedType,
+        type_module_path: Option<&Path>,
+        options: ValueReadPlanOptions,
+    ) -> Result<ValueReadPlanResolution> {
         let report =
             self.explain_value_read_plan_with_options(current, type_module_path, options)?;
-        match report.outcome {
-            ValueAdapterOutcome::NotApplicable => Ok(self.aggregate_value_read_plan(
+        let mut diagnostics = Vec::new();
+        let mut plan = match report.outcome {
+            ValueAdapterOutcome::NotApplicable => self.aggregate_value_read_plan(
                 current,
                 type_module_path,
                 0,
                 options.max_nesting_depth,
                 &mut Vec::new(),
-            )),
-            ValueAdapterOutcome::Applied { plan } => Ok(Some(*plan)),
-            ValueAdapterOutcome::Rejected { stage, reason } => {
+                &mut diagnostics,
+            ),
+            ValueAdapterOutcome::Applied { plan } => Some(*plan),
+            ValueAdapterOutcome::Rejected {
+                ref stage,
+                ref reason,
+            } => {
                 tracing::debug!(
                     target: "ghostscope_dwarf::value_adapter",
                     adapter = report.adapter.as_deref().unwrap_or("unknown"),
@@ -361,9 +388,21 @@ impl DwarfAnalyzer {
                     %reason,
                     "Source-language value adapter rejected target DWARF; using DWARF presentation"
                 );
-                Ok(None)
+                return Ok(ValueReadPlanResolution {
+                    plan: None,
+                    diagnostics,
+                    rejection: Some(report),
+                });
             }
+        };
+        if let Some(plan) = &mut plan {
+            diagnostics.append(&mut plan.diagnostics);
         }
+        Ok(ValueReadPlanResolution {
+            plan,
+            diagnostics,
+            rejection: None,
+        })
     }
 
     /// Explain whether a source-language adapter can present this value.
@@ -479,14 +518,20 @@ impl DwarfAnalyzer {
             crate::language::ValueLayoutResolution::NotApplicable => {
                 return Ok(ShallowValueReadPlan::NotApplicable);
             }
-            crate::language::ValueLayoutResolution::Rejected { .. } => {
-                return Ok(ShallowValueReadPlan::Rejected);
+            crate::language::ValueLayoutResolution::Rejected { reason, .. } => {
+                return Ok(ShallowValueReadPlan::Rejected {
+                    reason: ValueDiagnosticReason::LayoutUnsupported,
+                    detail: reason.to_string(),
+                });
             }
         };
         Ok(
             match crate::language::build_value_read_plan(self, current, type_module_path, layout)? {
                 Some(plan) => ShallowValueReadPlan::Applied(Box::new(plan)),
-                None => ShallowValueReadPlan::Rejected,
+                None => ShallowValueReadPlan::Rejected {
+                    reason: ValueDiagnosticReason::ReadPlanUnsupported,
+                    detail: "Dependent debug information could not form a capture plan".to_string(),
+                },
             },
         )
     }
@@ -498,6 +543,7 @@ impl DwarfAnalyzer {
         depth: usize,
         max_nesting_depth: usize,
         ancestors: &mut Vec<TypeId>,
+        diagnostics: &mut Vec<ValueDiagnostic>,
     ) -> Option<ValueReadPlan> {
         let plan = match self.value_read_plan_shallow(current, type_module_path) {
             Ok(ShallowValueReadPlan::Applied(plan)) => *plan,
@@ -508,9 +554,18 @@ impl DwarfAnalyzer {
                     depth,
                     max_nesting_depth,
                     ancestors,
+                    diagnostics,
                 );
             }
-            Ok(ShallowValueReadPlan::Rejected) => return None,
+            Ok(ShallowValueReadPlan::Rejected { reason, detail }) => {
+                diagnostics.push(ValueDiagnostic {
+                    path: String::new(),
+                    type_name: current.summary.type_name(),
+                    reason,
+                    detail,
+                });
+                return None;
+            }
             Err(error) => {
                 tracing::debug!(
                     target: "ghostscope_dwarf::value_adapter",
@@ -518,6 +573,12 @@ impl DwarfAnalyzer {
                     %error,
                     "Nested value adapter could not form a child plan; using DWARF presentation"
                 );
+                diagnostics.push(ValueDiagnostic {
+                    path: String::new(),
+                    type_name: current.summary.type_name(),
+                    reason: ValueDiagnosticReason::ReadPlanUnsupported,
+                    detail: error.to_string(),
+                });
                 return None;
             }
         };
@@ -538,6 +599,7 @@ impl DwarfAnalyzer {
         depth: usize,
         max_nesting_depth: usize,
         ancestors: &mut Vec<TypeId>,
+        diagnostics: &mut Vec<ValueDiagnostic>,
     ) -> Option<ValueReadPlan> {
         let plan =
             crate::language::build_aggregate_value_read_plan(self, current, type_module_path)?;
@@ -549,7 +611,80 @@ impl DwarfAnalyzer {
             max_nesting_depth,
             ancestors,
         );
-        plan.nested.is_some().then_some(plan)
+        if plan.nested.is_some() {
+            Some(plan)
+        } else {
+            diagnostics.extend(plan.diagnostics);
+            None
+        }
+    }
+
+    /// Bounded diagnostic-only lookahead. Ordinary structs containing only
+    /// physical fields must not acquire a spurious "depth limit" warning.
+    /// This never adds a read or follows the runtime pointer graph.
+    fn has_semantic_display_descendant(
+        &self,
+        current: &ResolvedType,
+        type_module_path: Option<&Path>,
+        remaining: &mut usize,
+        visited: &mut Vec<TypeId>,
+    ) -> bool {
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        if let Some(id) = current.identity.layout_dwarf_id() {
+            if visited.contains(&id) {
+                return false;
+            }
+            visited.push(id);
+        }
+        match self.value_read_plan_shallow(current, type_module_path) {
+            Ok(ShallowValueReadPlan::Applied(_) | ShallowValueReadPlan::Rejected { .. }) => true,
+            Ok(ShallowValueReadPlan::NotApplicable) => {
+                let Some(plan) = crate::language::build_aggregate_value_read_plan(
+                    self,
+                    current,
+                    type_module_path,
+                ) else {
+                    return false;
+                };
+                let mut found = false;
+                let mut inspect = |child: &ResolvedType, _: &str| {
+                    if !found {
+                        found = self.has_semantic_display_descendant(
+                            child,
+                            type_module_path,
+                            remaining,
+                            visited,
+                        );
+                    }
+                    None
+                };
+                let _ = crate::language::build_nested_value_read_plan(
+                    self,
+                    current,
+                    &plan.capture,
+                    type_module_path,
+                    &mut inspect,
+                );
+                if found {
+                    return true;
+                }
+                if let ValueCapturePlan::InlineView { fields, .. } = &plan.capture {
+                    return fields.iter().any(|field| {
+                        self.has_semantic_display_descendant(
+                            &field.resolved_type,
+                            type_module_path,
+                            remaining,
+                            visited,
+                        )
+                    });
+                }
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     fn enrich_nested_value_read_plan(
@@ -561,63 +696,84 @@ impl DwarfAnalyzer {
         max_nesting_depth: usize,
         ancestors: &mut Vec<TypeId>,
     ) -> ValueReadPlan {
-        if depth >= max_nesting_depth {
-            return plan;
-        }
         let current_id = current.identity.layout_dwarf_id();
-        if current_id.is_some_and(|type_id| ancestors.contains(&type_id)) {
-            return plan;
-        }
+        let repeated = current_id.is_some_and(|type_id| ancestors.contains(&type_id));
+        let limit = if depth >= max_nesting_depth {
+            Some(ValueDiagnosticReason::DepthLimit)
+        } else if repeated {
+            Some(ValueDiagnosticReason::RecursiveType)
+        } else {
+            None
+        };
         if let Some(type_id) = current_id {
             ancestors.push(type_id);
         }
-
-        let language_nested = {
-            let mut resolve_nested = |child: &ResolvedType| {
-                self.try_nested_value_read_plan(
+        let mut diagnostics = Vec::new();
+        let mut resolve_nested = |child: &ResolvedType, path: &str| {
+            let mut child_diagnostics = Vec::new();
+            if let Some(reason) = limit {
+                // Use bounded type-only lookahead to avoid warning about plain
+                // structs. No additional runtime capture is planned.
+                let candidate = self.has_semantic_display_descendant(
                     child,
                     type_module_path,
-                    depth + 1,
-                    max_nesting_depth,
-                    ancestors,
-                )
-            };
-            crate::language::build_nested_value_read_plan(
-                self,
-                current,
-                &plan.capture,
+                    &mut 64,
+                    &mut Vec::new(),
+                );
+                if candidate {
+                    diagnostics.push(ValueDiagnostic {
+                        path: path.to_string(), type_name: child.summary.type_name(), reason,
+                        detail: if reason == ValueDiagnosticReason::DepthLimit {
+                            format!("value_adapters.max_nesting_depth = {max_nesting_depth}; deeper contents keep their existing field representation")
+                        } else { "Expansion stopped at a repeated DWARF type; deeper contents keep their existing field representation".to_string() },
+                    });
+                }
+                return None;
+            }
+            let child_plan = self.try_nested_value_read_plan(
+                child,
                 type_module_path,
-                &mut resolve_nested,
-            )
+                depth + 1,
+                max_nesting_depth,
+                ancestors,
+                &mut child_diagnostics,
+            );
+            if let Some(plan) = &child_plan {
+                child_diagnostics.extend(plan.diagnostics.clone());
+            }
+            diagnostics.extend(
+                child_diagnostics
+                    .into_iter()
+                    .map(|note| note.prefixed(path)),
+            );
+            child_plan
         };
-
+        let language_nested = crate::language::build_nested_value_read_plan(
+            self,
+            current,
+            &plan.capture,
+            type_module_path,
+            &mut resolve_nested,
+        );
         let mut build_generic_nested = || match &plan.capture {
-            ValueCapturePlan::ProjectedValue { value } => self
-                .try_nested_value_read_plan(
-                    &value.resolved_type,
-                    type_module_path,
-                    depth + 1,
-                    max_nesting_depth,
-                    ancestors,
-                )
-                .map(|value| ValueNestedPlan::ProjectedValue {
-                    value: Box::new(value),
-                }),
+            ValueCapturePlan::ProjectedValue { value } => {
+                resolve_nested(&value.resolved_type, ".value").map(|value| {
+                    ValueNestedPlan::ProjectedValue {
+                        value: Box::new(value),
+                    }
+                })
+            }
             ValueCapturePlan::InlineView { fields, .. } => {
                 let nested_fields = fields
                     .iter()
                     .enumerate()
                     .filter_map(|(field_index, field)| {
-                        self.try_nested_value_read_plan(
-                            &field.resolved_type,
-                            type_module_path,
-                            depth + 1,
-                            max_nesting_depth,
-                            ancestors,
-                        )
-                        .map(|value| ValueNestedFieldPlan {
-                            field_index,
-                            value: Box::new(value),
+                        let path = plan.field_path(field_index);
+                        resolve_nested(&field.resolved_type, &path).map(|value| {
+                            ValueNestedFieldPlan {
+                                field_index,
+                                value: Box::new(value),
+                            }
                         })
                     })
                     .collect::<Vec<_>>();
@@ -631,16 +787,12 @@ impl DwarfAnalyzer {
                     .enumerate()
                     .filter(|(_, field)| field.capture == crate::ProjectedViewFieldCapture::Value)
                     .filter_map(|(field_index, field)| {
-                        self.try_nested_value_read_plan(
-                            &field.value.resolved_type,
-                            type_module_path,
-                            depth + 1,
-                            max_nesting_depth,
-                            ancestors,
-                        )
-                        .map(|value| ValueNestedFieldPlan {
-                            field_index,
-                            value: Box::new(value),
+                        let path = plan.field_path(field_index);
+                        resolve_nested(&field.value.resolved_type, &path).map(|value| {
+                            ValueNestedFieldPlan {
+                                field_index,
+                                value: Box::new(value),
+                            }
                         })
                     })
                     .collect::<Vec<_>>();
@@ -652,15 +804,7 @@ impl DwarfAnalyzer {
             | ValueCapturePlan::IndirectRingSequence { .. } => plan
                 .sequence_element
                 .as_ref()
-                .and_then(|element| {
-                    self.try_nested_value_read_plan(
-                        element,
-                        type_module_path,
-                        depth + 1,
-                        max_nesting_depth,
-                        ancestors,
-                    )
-                })
+                .and_then(|element| resolve_nested(element, "[]"))
                 .map(|element| ValueNestedPlan::Sequence {
                     element: Box::new(element),
                 }),
@@ -669,16 +813,12 @@ impl DwarfAnalyzer {
                     .hash_table_fields
                     .iter()
                     .filter_map(|field| {
-                        self.try_nested_value_read_plan(
-                            &field.resolved_type,
-                            type_module_path,
-                            depth + 1,
-                            max_nesting_depth,
-                            ancestors,
-                        )
-                        .map(|value| ValueNestedHashTableFieldPlan {
-                            field_index: field.field_index,
-                            value: Box::new(value),
+                        let path = plan.hash_field_path(field.field_index);
+                        resolve_nested(&field.resolved_type, path).map(|value| {
+                            ValueNestedHashTableFieldPlan {
+                                field_index: field.field_index,
+                                value: Box::new(value),
+                            }
                         })
                     })
                     .collect::<Vec<_>>();
@@ -686,17 +826,17 @@ impl DwarfAnalyzer {
                     fields: nested_fields,
                 })
             }
-            ValueCapturePlan::IndirectBytes { .. } | ValueCapturePlan::IndirectBTree { .. } => None,
+            _ => None,
         };
         let nested = match language_nested {
-            crate::language::NestedValuePlanResolution::Handled(nested) => nested,
             crate::language::NestedValuePlanResolution::NotApplicable => build_generic_nested(),
+            crate::language::NestedValuePlanResolution::Handled(plan) => plan,
         };
-
         if current_id.is_some() {
             ancestors.pop();
         }
         plan.nested = nested;
+        plan.diagnostics = diagnostics;
         plan
     }
 

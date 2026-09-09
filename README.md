@@ -226,6 +226,10 @@ See [Limitations](docs/limitations.md) for unsupported and explicitly degraded s
 - [**Limitations**](docs/limitations.md)
   Known limitations and constraints
 
+- [**Value Diagnostics**](docs/value-diagnostics.md)
+  Understand unavailable values, read failures, display fallbacks, and capture limits;
+  read offline with `ghostscope --value-diagnostics-help`
+
 </td>
 <td width="33%" valign="top">
 
@@ -242,7 +246,7 @@ See [Limitations](docs/limitations.md) for unsupported and explicitly degraded s
   All available commands for Input Mode
 
 - [**Script Language**](docs/scripting.md)
-  Write powerful trace scripts
+  Write trace scripts; read offline with `ghostscope --script-help`
 
 </td>
 <td width="33%" valign="top">

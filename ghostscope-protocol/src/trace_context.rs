@@ -82,9 +82,39 @@ pub struct TraceContext {
 
     /// Variable names for debugging and display
     pub variable_names: Vec<String>,
+    /// Compile-time display limits, retained even when logging is disabled.
+    #[serde(default)]
+    pub value_diagnostics: Vec<crate::TraceValueDiagnostic>,
 }
 
 impl TraceContext {
+    pub fn add_value_diagnostic(&mut self, note: crate::TraceValueDiagnostic) {
+        if !self.value_diagnostics.contains(&note) {
+            self.value_diagnostics.push(note);
+        }
+    }
+
+    pub fn resolved_value_diagnostics(&self) -> Vec<crate::ValueDiagnostic> {
+        let mut diagnostics = Vec::new();
+        for note in &self.value_diagnostics {
+            let note = note.diagnostic.clone().prefixed(
+                self.get_variable_name(note.variable_index)
+                    .unwrap_or("<value>"),
+            );
+            if !diagnostics.contains(&note) {
+                diagnostics.push(note);
+            }
+        }
+        diagnostics
+    }
+
+    pub fn value_diagnostic_messages(&self) -> Vec<String> {
+        self.resolved_value_diagnostics()
+            .iter()
+            .map(|note| note.message(""))
+            .collect()
+    }
+
     /// Create a new empty trace context
     pub fn new() -> Self {
         Self {
@@ -92,6 +122,7 @@ impl TraceContext {
             types: Vec::new(),
             value_presentations: Vec::new(),
             variable_names: Vec::new(),
+            value_diagnostics: Vec::new(),
         }
     }
 
@@ -206,6 +237,7 @@ impl TraceContext {
         self.types.clear();
         self.value_presentations.clear();
         self.variable_names.clear();
+        self.value_diagnostics.clear();
     }
 
     /// Get total memory usage estimate in bytes
@@ -217,7 +249,17 @@ impl TraceContext {
         // (this is a rough estimate since TypeInfo can vary significantly in size)
         let types_size = self.types.len() * 100;
 
-        strings_size + variable_names_size + types_size
+        let diagnostic_size: usize = self
+            .value_diagnostics
+            .iter()
+            .map(|note| {
+                std::mem::size_of_val(note)
+                    + note.diagnostic.path.len()
+                    + note.diagnostic.type_name.len()
+                    + note.diagnostic.detail.len()
+            })
+            .sum();
+        strings_size + variable_names_size + types_size + diagnostic_size
     }
 }
 
@@ -592,5 +634,73 @@ mod tests {
 
         assert_eq!(err.table(), TraceContextTable::VariableNames);
         assert_eq!(err.attempted_index(), usize::from(u16::MAX) + 1);
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use crate::format_printer::FormatPrinter;
+    use crate::{TraceValueDiagnostic, ValueDiagnostic, ValueDiagnosticReason, VariableStatus};
+
+    #[test]
+    fn display_notes_survive_serialization_and_do_not_hide_runtime_errors() {
+        let mut context = TraceContext::new();
+        let variable = context.add_variable_name("value".to_string()).unwrap();
+        let type_index = context
+            .add_type(TypeInfo::BaseType {
+                name: "u64".to_string(),
+                size: 8,
+                encoding: gimli::DW_ATE_unsigned.0 as u16,
+            })
+            .unwrap();
+        let note = TraceValueDiagnostic {
+            variable_index: variable,
+            type_index,
+            diagnostic: ValueDiagnostic {
+                path: String::new(),
+                type_name: "Example".to_string(),
+                reason: ValueDiagnosticReason::LayoutUnsupported,
+                detail: "unrecognized field layout".to_string(),
+            },
+        };
+        context.add_value_diagnostic(note.clone());
+        context.add_value_diagnostic(note);
+        let context: TraceContext =
+            serde_json::from_str(&serde_json::to_string(&context).unwrap()).unwrap();
+        assert_eq!(context.value_diagnostics.len(), 1);
+        let mut multiple = context.clone();
+        let second_type = multiple
+            .add_type(multiple.get_type(type_index).unwrap().clone())
+            .unwrap();
+        let mut second_note = multiple.value_diagnostics[0].clone();
+        second_note.type_index = second_type;
+        multiple.add_value_diagnostic(second_note);
+        assert_eq!(multiple.resolved_value_diagnostics().len(), 1);
+        assert_eq!(multiple.value_diagnostic_messages().len(), 1);
+        multiple.clear();
+        assert!(multiple.value_diagnostics.is_empty());
+        assert!(multiple.resolved_value_diagnostics().is_empty());
+        let rendered = FormatPrinter::format_complex_variable_with_status(
+            variable,
+            type_index,
+            "",
+            &42_u64.to_le_bytes(),
+            VariableStatus::Ok as u8,
+            &context,
+        );
+        assert_eq!(rendered, "value = 42 <internal fields: layout unsupported>");
+        let failed = FormatPrinter::format_complex_variable_with_status(
+            variable,
+            type_index,
+            "",
+            &[],
+            VariableStatus::ReadError as u8,
+            &context,
+        );
+        assert!(failed.contains("<unreadable: memory read failed>"));
+        assert!(!failed.contains("internal fields"));
+        assert!(context.value_diagnostic_messages()[0]
+            .contains("docs/value-diagnostics.md#layout-unsupported"));
     }
 }

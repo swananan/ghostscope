@@ -303,6 +303,8 @@ i                   # 缩写形式
 
 ### info trace - 查看追踪状态
 
+单个 trace 的详情也会显示静态值展示限制，包括受影响路径、原因和文档入口，详见[值诊断](value-diagnostics.md)。
+
 **语法：**
 ```
 info trace [id]

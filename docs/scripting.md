@@ -134,6 +134,8 @@ Practical guidance:
 
 ### Rust Value Presentation
 
+For unavailable values, read failures, display fallbacks, and capture limits, see [value diagnostics](value-diagnostics.md), also available offline with `ghostscope --value-diagnostics-help`. CLI prints static display notes by default; TUI retains them in `info trace <id>`.
+
 Rust value support does not add Rust-specific syntax to the DSL. After the DSL
 resolves an expression, the DWARF layer may select a bounded semantic read plan
 for its root type. If the concrete type identity or layout does not validate,
@@ -220,13 +222,14 @@ trace do_stuff {
   explicit memory-read behavior.
 - `ebpf.mem_dump_cap` bounds each indirect argument and defaults to 256 bytes.
   A semantic value whose logical length exceeds the captured prefix is marked
-  `<truncated>`.
+  `<truncated: byte limit>`, `<truncated: element limit>`, or the more general
+  `<truncated: capture limit>`, depending on the available evidence.
 
 For example, with `mem_dump_cap = 3`, an `&str` containing
 `"hello from rust"` is rendered as:
 
 ```text
-"hel" <truncated>
+"hel" <truncated: byte limit>
 ```
 
 The value can also be read explicitly when its target DWARF exposes known
@@ -376,7 +379,7 @@ DWARF variables include locals, parameters, and globals from the traced program.
 | Enum | `enum E` | Enum (via base int) | Printed as `Type::Variant`; arithmetic/compare uses base integer |
 | Bitfield | `int flags:3` | Bitfield → integer view | Extracted integer; mixes with script ints/bools |
 | Typedef/Qualified | `typedef`, `const`, `volatile` | Typedef/QualifiedType | Treated as underlying type |
-| Optimized‑out | variable optimized away | OptimizedOut | Read fails; renders `<OPTIMIZED_OUT>`; operations follow failure semantics |
+| Optimized‑out | variable optimized away | OptimizedOut | No recoverable value at this location; renders `<unavailable: optimized out>`; operations follow failure semantics |
 | Unknown | unsupported/unknown | Unknown | Renders `<UNKNOWN_TYPE_N_BYTES>` |
 
 #### Supported Complex Access
@@ -532,7 +535,7 @@ Notes:
 - Reads are type-sensitive. For `{:x}`, the DWARF/script type controls the captured value size and how the value is materialized. For `{:x.N}`/`{:s.N}`, pointers use the pointer value as the read address, arrays/aggregates use their base address, and addressable scalar DWARF variables use their storage address. A pure script integer is not addressable and will be rejected unless you explicitly cast it to a pointer type.
 - Kernel performs bounded reads for memory-dump forms; user space renders hex/ASCII. For `{:s}` ASCII, rendering stops at first NUL; non‑printables show as `\xNN`.
 - Per‑argument read cap is controlled by `ebpf.mem_dump_cap` (default 256 bytes). Requests beyond cap are truncated; if event payload is exceeded, output may also truncate with `…`.
-- On read failure (e.g., null deref, offsets unavailable, permission), extended specifiers print `<MISSING_ARG>`.
+- Extended specifiers preserve runtime read-failure messages (such as null dereference or unavailable offsets). `<MISSING_ARG>` means a formatting argument is missing. See [value diagnostics](value-diagnostics.md).
 
 Example:
 

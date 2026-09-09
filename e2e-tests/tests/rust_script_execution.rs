@@ -501,6 +501,11 @@ async fn test_rust_nested_value_plans_recurse_into_semantic_children() -> anyhow
         element.nested.is_none(),
         "max_nesting_depth=1 must stop before the String adapter: {depth_one:#?}"
     );
+    assert!(
+        depth_one.diagnostics.iter().any(|note| note.path == "[][]"
+            && note.reason == ghostscope_protocol::ValueDiagnosticReason::DepthLimit),
+        "missing field-specific depth diagnostic: {depth_one:#?}"
+    );
 
     Ok(())
 }
@@ -1929,7 +1934,9 @@ trace observe_nested_owners {
         stdout.lines().any(|line| {
             line.contains(r#"RNESTED:Cell { value: "cell nested" }"#)
                 && line.contains(r#"RefCell(borrow=0) { value: "refcell nested", borrow: 0 }"#)
-                && line.contains(r#"["alpha", "nested rust", "omega", "delta"] <truncated>"#)
+                && line.contains(
+                    r#"["alpha", "nested rust", "omega", "delta"] <truncated: element limit>"#,
+                )
                 && line.contains("[[1, 2], [3, 5, 8], [-13]]")
                 && line.contains(r#"[["deep alpha"], ["deep beta"]]"#)
         }),
@@ -1937,7 +1944,7 @@ trace observe_nested_owners {
     );
     assert!(
         stdout.lines().any(|line| {
-            line.contains(r#"RNESTED_C:["alpha c", "beta c", "gamma c", "delta c"] <truncated>"#)
+            line.contains(r#"RNESTED_C:["alpha c", "beta c", "gamma c", "delta c"] <truncated: element limit>"#)
         }),
         "Expected nested Rust CString output: {stdout}"
     );
@@ -2100,7 +2107,7 @@ max_sequence_elements = 2
         .find(|line| line.contains("RNESTED_LIMIT:"))
         .ok_or_else(|| anyhow::anyhow!("missing nested sequence limit output: {stdout}"))?;
     assert!(
-        line.contains(r#"RNESTED_LIMIT:["alpha", "nested rust"] <truncated>"#),
+        line.contains(r#"RNESTED_LIMIT:["alpha", "nested rust"] <truncated: element limit>"#),
         "Unexpected nested sequence limit output: {line}"
     );
     assert!(
@@ -2145,7 +2152,7 @@ max_trace_event_size = 32768
     assert!(
         stdout
             .lines()
-            .any(|line| line.contains("RNESTED_BUDGET:<truncated>")),
+            .any(|line| line.contains("RNESTED_BUDGET:<truncated: capture limit>")),
         "Expected an emitted truncated nested value: {stdout}"
     );
     assert!(
@@ -2189,9 +2196,9 @@ max_trace_event_size = 256
 
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     assert!(
-        stdout
-            .lines()
-            .any(|line| line.contains("RNESTED_EVENT_BUDGET:<truncated>:<truncated>")),
+        stdout.lines().any(|line| line.contains(
+            "RNESTED_EVENT_BUDGET:<truncated: capture limit>:<truncated: capture limit>"
+        )),
         "Expected structurally valid nested truncation output: {stdout}"
     );
     assert!(
@@ -2698,7 +2705,7 @@ mem_dump_cap = 9
         .find(|line| line.contains("RHASH_CAP:"))
         .ok_or_else(|| anyhow::anyhow!("missing capped Rust HashMap output: {stdout}"))?;
     assert!(line.contains("HashMap(size=2)"), "{line}");
-    assert!(line.contains("<truncated>"), "{line}");
+    assert!(line.contains("<truncated: capture limit>"), "{line}");
     assert!(!line.contains("<INVALID_"), "{line}");
     assert!(
         !stdout.contains("ExprError"),
@@ -2875,7 +2882,7 @@ mem_dump_cap = 450
         "Expected complete internal Rust BTreeSet output: {stdout}"
     );
     assert!(
-        !stdout.contains("<truncated>"),
+        !stdout.contains("<truncated:"),
         "Unexpected truncation: {stdout}"
     );
     assert!(!stdout.contains("<INVALID_"), "Invalid payload: {stdout}");
@@ -2905,7 +2912,7 @@ trace observe_deep_btree_collections {
             .find(|line| line.contains(marker))
             .ok_or_else(|| anyhow::anyhow!("missing {marker} output: {stdout}"))?;
         assert!(line.contains("size=160"), "{line}");
-        assert!(line.contains("<truncated>"), "{line}");
+        assert!(line.contains("<truncated: capture limit>"), "{line}");
         assert!(!line.contains("<INVALID_"), "{line}");
     }
     assert!(
@@ -2945,7 +2952,7 @@ mem_dump_cap = 9
     assert!(
         stdout
             .lines()
-            .any(|line| line.contains("RDEQUE_CAP:[10, 20] <truncated>")),
+            .any(|line| line.contains("RDEQUE_CAP:[10, 20] <truncated: capture limit>")),
         "Expected capped Rust VecDeque output: {stdout}"
     );
     assert!(
@@ -2985,7 +2992,7 @@ mem_dump_cap = 9
     assert!(
         stdout
             .lines()
-            .any(|line| line.contains("RVEC_CAP:[10, -20] <truncated>")),
+            .any(|line| line.contains("RVEC_CAP:[10, -20] <truncated: capture limit>")),
         "Expected element-aligned capped Rust Vec output: {stdout}"
     );
     assert!(
@@ -3189,7 +3196,7 @@ mem_dump_cap = 3
         .find(|line| line.contains("RSTR_CAP:"))
         .ok_or_else(|| anyhow::anyhow!("Expected capped Rust str output: {stdout}"))?;
     assert!(
-        cap_line.contains(r#"RSTR_CAP:"hel" <truncated>"#),
+        cap_line.contains(r#"RSTR_CAP:"hel" <truncated: byte limit>"#),
         "Unexpected capped Rust str output: {cap_line}"
     );
     assert!(
@@ -3201,7 +3208,9 @@ mem_dump_cap = 3
         .find(|line| line.contains("RSTR_CAP_RAW:"))
         .ok_or_else(|| anyhow::anyhow!("Expected raw capped Rust str output: {stdout}"))?;
     assert!(
-        cap_raw_line.contains("RSTR_CAP_RAW:hel <truncated>:68 65 6c <truncated>"),
+        cap_raw_line.contains(
+            "RSTR_CAP_RAW:hel <truncated: capture limit>:68 65 6c <truncated: capture limit>"
+        ),
         "Unexpected raw capped Rust str output: {cap_raw_line}"
     );
     assert!(

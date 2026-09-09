@@ -307,6 +307,8 @@ Displays list of available info subcommands.
 
 ### info trace - View Trace Status
 
+Individual trace details also retain static value-display limits, affected paths, reasons, and documentation links. See [value diagnostics](value-diagnostics.md).
+
 **Syntax:**
 ```
 info trace [id]

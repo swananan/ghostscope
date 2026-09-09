@@ -84,7 +84,7 @@ pub(crate) fn build_nested_value_read_plan(
     current: &crate::ResolvedType,
     capture: &crate::ValueCapturePlan,
     type_module_path: Option<&Path>,
-    resolve_nested: &mut dyn FnMut(&crate::ResolvedType) -> Option<crate::ValueReadPlan>,
+    resolve_nested: &mut dyn FnMut(&crate::ResolvedType, &str) -> Option<crate::ValueReadPlan>,
 ) -> NestedValuePlanResolution {
     let crate::ValueCapturePlan::InlineView { output_type, .. } = capture else {
         return NestedValuePlanResolution::NotApplicable;
@@ -297,8 +297,9 @@ mod tests {
             build_aggregate_value_read_plan(&context, &current, None),
             None
         );
-        let mut resolve_nested =
-            |_child: &ResolvedType| panic!("non-Rust composition must not resolve nested values");
+        let mut resolve_nested = |_child: &ResolvedType, _path: &str| {
+            panic!("non-Rust composition must not resolve nested values")
+        };
         assert_eq!(
             build_nested_value_read_plan(
                 &context,
@@ -326,8 +327,9 @@ mod tests {
             Some(origin(SourceLanguage::Rust)),
         );
         let context = PanicValueAdapterContext;
-        let mut resolve_nested =
-            |_child: &ResolvedType| panic!("ordinary inline views use generic recursion");
+        let mut resolve_nested = |_child: &ResolvedType, _path: &str| {
+            panic!("ordinary inline views use generic recursion")
+        };
 
         assert_eq!(
             build_nested_value_read_plan(
@@ -357,8 +359,9 @@ mod tests {
             Some(origin(SourceLanguage::C)),
         );
         let context = PanicValueAdapterContext;
-        let mut resolve_nested =
-            |_child: &ResolvedType| panic!("non-Rust variants must not resolve nested values");
+        let mut resolve_nested = |_child: &ResolvedType, _path: &str| {
+            panic!("non-Rust variants must not resolve nested values")
+        };
 
         assert_eq!(
             build_nested_value_read_plan(

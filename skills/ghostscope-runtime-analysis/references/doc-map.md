@@ -95,6 +95,20 @@ Useful search patterns:
 rg -n "^## Trace Statements|^## Variables|^## Special Variables|^## Examples|trace <pattern>" docs/scripting.md
 ```
 
+### Value diagnostics
+
+For unavailable values, memory-read failures, raw internal fields, or partial
+captures, prefer `ghostscope --value-diagnostics-help` after confirming the flag in
+`ghostscope --help`. It reads the guide shipped with the installed version
+without a target, privileges, a source checkout, or network access.
+
+Repository sources, or fallback for older binaries:
+- `docs/value-diagnostics.md`
+- `docs/zh/value-diagnostics.md`
+- `docs/input-commands.md` or `docs/zh/input-commands.md` for `info trace <id>`
+
+Keep the binary version and docs version distinct when using a fallback.
+
 ### Caveats and troubleshooting
 
 Use these when the user hits runtime issues or asks about unsupported cases:

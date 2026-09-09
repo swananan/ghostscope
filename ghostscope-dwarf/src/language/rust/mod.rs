@@ -46,7 +46,7 @@ pub(super) fn build_variant_nested_plan(
     context: &dyn crate::language::adapter::ValueAdapterContext,
     current: &crate::ResolvedType,
     type_module_path: Option<&std::path::Path>,
-    resolve_nested: &mut dyn FnMut(&crate::ResolvedType) -> Option<crate::ValueReadPlan>,
+    resolve_nested: &mut dyn FnMut(&crate::ResolvedType, &str) -> Option<crate::ValueReadPlan>,
 ) -> Option<crate::ValueNestedPlan> {
     composition::build_variant_nested_plan(context, current, type_module_path, resolve_nested)
 }

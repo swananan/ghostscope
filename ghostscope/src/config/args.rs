@@ -39,6 +39,7 @@ pub enum ParsedCommand {
     Trace(Box<ParsedArgs>),
     Bpffs(BpffsCommand),
     ScriptHelp,
+    ValueDiagnosticsHelp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +230,10 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub script_help: bool,
 
+    /// Print the embedded guide to value failures, display fallbacks, and capture limits and exit
+    #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "script_help")]
+    pub value_diagnostics_help: bool,
+
     /// Start in TUI mode (default behavior when no script provided)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub tui: bool,
@@ -407,10 +412,10 @@ impl Args {
     fn parse_args_from(args: Vec<String>) -> ParsedCommand {
         let bpffs_prune_invocation = Self::is_bpffs_prune_invocation(&args);
         let args_pos = args.iter().position(|arg| arg == "--args");
-        let script_help_invocation = Self::is_script_help_invocation(&args, args_pos);
-
-        if script_help_invocation {
-            return Self::try_parse_dispatch(&args).unwrap_or_else(|e| e.exit());
+        if Self::is_reference_help_invocation(&args, args_pos) {
+            // Documentation requests do not inspect the target's arguments.
+            return Self::try_parse_dispatch(&args[..args_pos.unwrap_or(args.len())])
+                .unwrap_or_else(|e| e.exit());
         }
 
         if let Some(args_pos) = args_pos {
@@ -446,10 +451,10 @@ impl Args {
         )
     }
 
-    fn is_script_help_invocation(args: &[String], args_pos: Option<usize>) -> bool {
+    fn is_reference_help_invocation(args: &[String], args_pos: Option<usize>) -> bool {
         args[..args_pos.unwrap_or(args.len())]
             .iter()
-            .any(|arg| arg == "--script-help")
+            .any(|arg| matches!(arg.as_str(), "--script-help" | "--value-diagnostics-help"))
     }
 
     fn parse_trace_args(args: Vec<String>) -> ParsedArgs {
@@ -492,6 +497,13 @@ impl Args {
     fn try_parse_dispatch(args: &[String]) -> std::result::Result<ParsedCommand, clap::Error> {
         let matches = Self::command_with_bpffs().try_get_matches_from(args.iter().cloned())?;
 
+        if matches.get_flag("script_help") {
+            return Ok(ParsedCommand::ScriptHelp);
+        }
+        if matches.get_flag("value_diagnostics_help") {
+            return Ok(ParsedCommand::ValueDiagnosticsHelp);
+        }
+
         if let Some(("bpffs", sub_matches)) = matches.subcommand() {
             let bpffs = BpffsArgs::from_arg_matches(sub_matches)?;
             return Ok(ParsedCommand::Bpffs(match bpffs.command {
@@ -500,9 +512,6 @@ impl Args {
         }
 
         let parsed = Args::from_arg_matches(&matches)?;
-        if parsed.script_help {
-            return Ok(ParsedCommand::ScriptHelp);
-        }
         let binary_path = parsed.binary.clone();
         let binary_args = parsed.remaining.clone();
         Ok(ParsedCommand::Trace(Box::new(
@@ -800,6 +809,7 @@ mod tests {
         let help = Args::command_with_bpffs().render_long_help().to_string();
         assert!(help.contains("bpffs"));
         assert!(help.contains("--script-help"));
+        assert!(help.contains("--value-diagnostics-help"));
         assert!(help.contains("--args"));
     }
 
@@ -857,15 +867,68 @@ mod tests {
     }
 
     #[test]
-    fn ignores_script_help_after_args_for_detection() {
-        let args = vec![
-            "ghostscope".to_string(),
-            "--args".to_string(),
-            "demo-program".to_string(),
-            "--script-help".to_string(),
-        ];
+    fn reference_help_respects_target_argument_boundary() {
+        for flag in ["--script-help", "--value-diagnostics-help"] {
+            let args = vec![
+                "ghostscope".to_string(),
+                "--args".to_string(),
+                "demo-program".to_string(),
+                flag.to_string(),
+            ];
+            assert!(!Args::is_reference_help_invocation(&args, Some(1)));
+            let ParsedCommand::Trace(parsed) = Args::parse_args_from(args) else {
+                panic!("target help flag must remain a target argument");
+            };
+            assert_eq!(parsed.binary_args, vec![flag]);
 
-        assert!(!Args::is_script_help_invocation(&args, Some(1)));
+            let parsed = Args::parse_args_from(vec![
+                "ghostscope".to_string(),
+                flag.to_string(),
+                "--args".to_string(),
+                "demo-program".to_string(),
+                "--target-only-flag".to_string(),
+            ]);
+            assert!(matches!(
+                (flag, parsed),
+                ("--script-help", ParsedCommand::ScriptHelp)
+                    | (
+                        "--value-diagnostics-help",
+                        ParsedCommand::ValueDiagnosticsHelp
+                    )
+            ));
+        }
+    }
+
+    #[test]
+    fn value_diagnostics_help_bypasses_trace_and_maintenance_actions() {
+        for args in [
+            vec!["ghostscope", "--value-diagnostics-help"],
+            vec![
+                "ghostscope",
+                "--value-diagnostics-help",
+                "--config",
+                "/missing/config.toml",
+            ],
+            vec![
+                "ghostscope",
+                "--value-diagnostics-help",
+                "bpffs",
+                "prune",
+                "--all",
+            ],
+        ] {
+            assert!(matches!(
+                Args::try_parse_dispatch(&args.into_iter().map(String::from).collect::<Vec<_>>()),
+                Ok(ParsedCommand::ValueDiagnosticsHelp)
+            ));
+        }
+        let error = Args::try_parse_dispatch(&[
+            "ghostscope".to_string(),
+            "--script-help".to_string(),
+            "--value-diagnostics-help".to_string(),
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

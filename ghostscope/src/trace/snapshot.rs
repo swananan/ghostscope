@@ -15,6 +15,7 @@ pub struct TraceSnapshot {
     #[allow(dead_code)]
     pub ebpf_function_name: String,
     pub address_global_index: Option<usize>,
+    pub value_diagnostics: Vec<ghostscope_protocol::ValueDiagnostic>,
 }
 
 /// Summary statistics for all traces

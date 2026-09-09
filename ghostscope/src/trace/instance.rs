@@ -32,7 +32,8 @@ pub(super) struct TraceInstance {
     pub(super) actor: Option<TraceActorHandle>, // Owns the eBPF loader for this trace
     pub supports_backtrace_runtime_updates: bool,
     pub ebpf_function_name: String, // eBPF function name for uprobe attachment
-    pub address_global_index: Option<usize>, // Global 1-based index of the resolved address
+    pub address_global_index: Option<usize>,
+    pub value_diagnostics: Vec<ghostscope_protocol::ValueDiagnostic>, // Global 1-based index of the resolved address
 }
 
 pub(super) struct TraceInstanceArgs {
@@ -47,6 +48,7 @@ pub(super) struct TraceInstanceArgs {
     pub supports_backtrace_runtime_updates: bool,
     pub ebpf_function_name: String,
     pub address_global_index: Option<usize>,
+    pub value_diagnostics: Vec<ghostscope_protocol::ValueDiagnostic>,
 }
 
 impl TraceInstance {
@@ -64,6 +66,7 @@ impl TraceInstance {
             supports_backtrace_runtime_updates: args.supports_backtrace_runtime_updates,
             ebpf_function_name: args.ebpf_function_name,
             address_global_index: args.address_global_index,
+            value_diagnostics: args.value_diagnostics,
         }
     }
 

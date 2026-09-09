@@ -629,6 +629,7 @@ impl App {
                 binary,
                 script_preview,
                 pc,
+                value_diagnostics,
             } => {
                 self.clear_waiting_state();
 
@@ -695,6 +696,12 @@ impl App {
                 if let Some(ref preview) = script_preview {
                     response.push_str(&format!("  Script:\n{preview}\n"));
                 }
+                for note in &value_diagnostics {
+                    response.push_str(&format!("  Display note: {}\n", note.message("")));
+                }
+                response.push_str(
+                    "  Value status help: ghostscope --value-diagnostics-help (docs/value-diagnostics.md)\n",
+                );
                 // Also create styled version
                 let styled_lines = {
                     let temp = crate::events::RuntimeStatus::TraceInfo {
@@ -706,6 +713,7 @@ impl App {
                         binary: binary.clone(),
                         script_preview: None,
                         pc,
+                        value_diagnostics: value_diagnostics.clone(),
                     };
                     if let Some(mut base) = temp.format_trace_info_styled() {
                         if let Some(ref preview) = script_preview {
@@ -1130,6 +1138,11 @@ impl App {
                     }
                 }
 
+                for detail in &details {
+                    for message in detail.value_diagnostic_messages() {
+                        response.push_str(&format!("  {message}\n"));
+                    }
+                }
                 // Styled version
                 let mut styled = Vec::new();
                 use crate::components::command_panel::style_builder::{
@@ -1208,6 +1221,13 @@ impl App {
                     }
                 }
 
+                for detail in &details {
+                    for message in detail.value_diagnostic_messages() {
+                        for line in message.lines() {
+                            styled.push(ratatui::text::Line::from(format!("  {line}")));
+                        }
+                    }
+                }
                 let action = Action::AddResponseWithStyle {
                     content: response,
                     styled_lines: Some(styled),

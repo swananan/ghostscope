@@ -68,19 +68,19 @@ mem_dump_cap = 16
     for expected in [
         concat!(
             "R188_PATH:\"borrowed/path\":\"owned/path\":\"\":",
-            "\"abcdefghijklmnop\" <truncated>"
+            "\"abcdefghijklmnop\" <truncated: byte limit>"
         ),
         concat!(
             "R188_PATH:\"borrowed/path\":\"bad/\\xff/path\":\"\":",
-            "\"abcdefghijklmnop\" <truncated>"
+            "\"abcdefghijklmnop\" <truncated: byte limit>"
         ),
         concat!(
             "R188_PATH_RAW:borrowed/path:",
             "62 61 64 2f ff 2f 70 61 74 68"
         ),
         concat!(
-            "R188_PATH_LONG_RAW:abcdefghijklmnop <truncated>:",
-            "61 62 63 64 65 66 67 68 69 6a 6b 6c 6d 6e 6f 70 <truncated>"
+            "R188_PATH_LONG_RAW:abcdefghijklmnop <truncated: capture limit>:",
+            "61 62 63 64 65 66 67 68 69 6a 6b 6c 6d 6e 6f 70 <truncated: capture limit>"
         ),
     ] {
         assert!(stdout.contains(expected), "missing '{expected}': {stdout}");

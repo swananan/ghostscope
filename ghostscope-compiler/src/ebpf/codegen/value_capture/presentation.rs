@@ -2,6 +2,7 @@ use super::*;
 
 pub(in crate::ebpf::codegen) fn nested_value_presentation(
     value: &NestedValueSource,
+    max_sequence_elements: usize,
 ) -> Result<ghostscope_dwarf::ValuePresentation> {
     let children = match &value.children {
         NestedValueChildrenSource::None => return Ok(value.presentation.clone()),
@@ -13,7 +14,7 @@ pub(in crate::ebpf::codegen) fn nested_value_presentation(
                             "nested child slot offset does not fit the protocol".to_string(),
                         )
                     })?,
-                    value: Box::new(nested_child_presentation(child)?),
+                    value: Box::new(nested_child_presentation(child, max_sequence_elements)?),
                 }),
             }
         }
@@ -35,7 +36,10 @@ pub(in crate::ebpf::codegen) fn nested_value_presentation(
                                             .to_string(),
                                     )
                                 })?,
-                                value: Box::new(nested_child_presentation(&field.child)?),
+                                value: Box::new(nested_child_presentation(
+                                    &field.child,
+                                    max_sequence_elements,
+                                )?),
                             },
                         })
                     })
@@ -80,7 +84,10 @@ pub(in crate::ebpf::codegen) fn nested_value_presentation(
                                     .to_string(),
                             )
                         })?,
-                        value: Box::new(nested_child_presentation(&field.child)?),
+                        value: Box::new(nested_child_presentation(
+                            &field.child,
+                            max_sequence_elements,
+                        )?),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -114,7 +121,10 @@ pub(in crate::ebpf::codegen) fn nested_value_presentation(
                                         )
                                     },
                                 )?,
-                                value: Box::new(nested_child_presentation(&field.field.child)?),
+                                value: Box::new(nested_child_presentation(
+                                    &field.field.child,
+                                    max_sequence_elements,
+                                )?),
                             },
                         })
                     })
@@ -143,7 +153,8 @@ pub(in crate::ebpf::codegen) fn nested_value_presentation(
                     "nested sequence count does not fit the protocol".to_string(),
                 )
             })?,
-            element: Box::new(nested_child_presentation(element)?),
+            element_limit: Some(max_sequence_elements as u64),
+            element: Box::new(nested_child_presentation(element, max_sequence_elements)?),
         },
     };
     Ok(ghostscope_dwarf::ValuePresentation::Nested {
@@ -159,6 +170,7 @@ pub(in crate::ebpf::codegen) fn nested_value_presentation(
 
 pub(in crate::ebpf::codegen) fn nested_child_presentation(
     value: &NestedValueSource,
+    max_sequence_elements: usize,
 ) -> Result<ghostscope_protocol::NestedValuePresentation> {
     Ok(ghostscope_protocol::NestedValuePresentation {
         payload_len: u64::try_from(value.total_len).map_err(|_| {
@@ -167,6 +179,6 @@ pub(in crate::ebpf::codegen) fn nested_child_presentation(
             )
         })?,
         type_info: Box::new(value.output_type.clone()),
-        presentation: Box::new(nested_value_presentation(value)?),
+        presentation: Box::new(nested_value_presentation(value, max_sequence_elements)?),
     })
 }

@@ -55,6 +55,7 @@ pub struct AddTraceParams {
     pub supports_backtrace_runtime_updates: bool,
     pub ebpf_function_name: String,
     pub address_global_index: Option<usize>,
+    pub value_diagnostics: Vec<ghostscope_protocol::ValueDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +193,7 @@ impl TraceManager {
             supports_backtrace_runtime_updates: params.supports_backtrace_runtime_updates,
             ebpf_function_name: params.ebpf_function_name,
             address_global_index: params.address_global_index,
+            value_diagnostics: params.value_diagnostics,
         });
 
         self.traces.insert(params.trace_id, trace_instance);
@@ -329,6 +331,7 @@ impl TraceManager {
             pc: trace.pc,
             ebpf_function_name: trace.ebpf_function_name.clone(),
             address_global_index: trace.address_global_index,
+            value_diagnostics: trace.value_diagnostics.clone(),
         })
     }
 
@@ -704,6 +707,7 @@ mod tests {
             supports_backtrace_runtime_updates: true,
             ebpf_function_name: String::new(),
             address_global_index: None,
+            value_diagnostics: Vec::new(),
         });
         manager
             .traces

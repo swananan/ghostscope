@@ -68,6 +68,9 @@ ghostscope --script-file trace.gs
 # Print the embedded script language reference and exit
 ghostscope --script-help
 
+# Explain value failures, display fallbacks, and capture limits offline
+ghostscope --value-diagnostics-help
+
 # Choose script-mode event stdout rendering
 ghostscope --script-output pretty   # default: formatted stdout
 ghostscope --script-output plain    # payload-only stdout
@@ -290,6 +293,7 @@ index is reported in CLI/TUI startup status before falling back.
 | `--script <SCRIPT>` | `-s` | Inline script to execute | None |
 | `--script-file <PATH>` | | Script file to execute | None |
 | `--script-help` | | Print the embedded script language reference and exit | Off |
+| `--value-diagnostics-help` | | Print the embedded value diagnostics guide and exit | Off |
 | `--script-output <MODE>` | | Script event stdout mode: pretty, plain | pretty |
 | `--backtrace-depth <N>` | | Max DWARF-unwound frames captured by each `bt`/`backtrace` instruction (`1..=128`) | 128 |
 | `--no-backtrace-runtime-modules` | | Disable compact-CFI loading for newly mapped `bt`/`backtrace` modules; events still render with available symbols, module offsets, or raw addresses | Off |

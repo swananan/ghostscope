@@ -127,6 +127,8 @@ GhostScope 的脚本语法本身与源语言无关，但实际效果取决于被
 
 ### Rust 值展示
 
+值不可用、读取失败、展示降级和采集限制的提示见[值诊断](value-diagnostics.md)，也可用 `ghostscope --value-diagnostics-help` 离线查看。CLI 默认会输出静态展示提示；TUI 可用 `info trace <id>` 再次查看。
+
 Rust 值支持不会给 DSL 增加 Rust 专用语法。DSL 解析表达式后，DWARF 层
 可以为根类型选择一个有界的语义读取计划。如果具体类型的身份或布局未通过
 验证，GhostScope 会保留原生 DWARF 展示，而不会猜测 Rust ABI。
@@ -200,13 +202,14 @@ trace do_stuff {
 - `{:s.16}`、`{:x.*}` 和 `{:s.n$}` 等带长度形式仍保留通用的显式内存
   读取语义。
 - `ebpf.mem_dump_cap` 限制每个间接参数，默认值为 256 字节。若语义值的
-  逻辑长度超过已采集的前缀，输出会标记 `<truncated>`。
+  逻辑长度超过已采集的前缀，输出会根据已知原因标记 `<truncated: byte limit>`、
+  `<truncated: element limit>`，或更宽泛的 `<truncated: capture limit>`。
 
 例如，当 `mem_dump_cap = 3` 时，内容为 `"hello from rust"` 的 `&str`
 会显示为：
 
 ```text
-"hel" <truncated>
+"hel" <truncated: byte limit>
 ```
 
 如果目标 DWARF 暴露了已知成员，也可以显式读取：
@@ -348,7 +351,7 @@ DWARF 变量其实就是被跟踪的程序里面定义的**局部变量、参数
 | 枚举 | `enum E` | Enum（按底层整型） | 打印为枚举名；在运算/比较时按底层整数处理 |
 | 位域 | `int flags:3` | Bitfield → 整数视图 | 抽取为整数；可与“脚本变量”的整数/布尔混用比较与算术 |
 | 类型别名/限定 | `typedef`/`const`/`volatile` | Typedef/QualifiedType | 按底层类型处理（行为与底层类型一致） |
-| 优化移除 | 变量被优化掉 | OptimizedOut | 读取失败；打印为 `<OPTIMIZED_OUT>`；运算/比较按失败语义处理 |
+| 优化移除 | 变量被优化掉 | OptimizedOut | 当前追踪位置没有可恢复值；打印为 `<unavailable: optimized out>`；运算/比较按失败语义处理 |
 | 未知 | 不支持或未知 | Unknown | 打印为 `<UNKNOWN_TYPE_N_BYTES>` |
 
 #### GhostScope 支持对复杂的 DWARF 变量访问：
@@ -509,7 +512,7 @@ print "tail={:s.n$}", p;          // 长度来自变量 n
 - 读取方式会受类型影响。对于 `{:x}`，DWARF/脚本类型决定捕获值的大小，以及这个值如何被 materialize。对于 `{:x.N}`/`{:s.N}`，指针使用指针值作为读取地址，数组/聚合使用基地址，可取地址的 DWARF 标量变量使用自己的存储地址。纯脚本整数不是地址，除非显式 cast 成指针类型，否则会被拒绝。
 - 内核侧会为内存转储形式做有界读取；用户态负责十六进制/ASCII 渲染。`{:s}` 的 ASCII 渲染遇到首个 NUL 字节即停止；不可打印字节显示为 `\xNN`。
 - 内存转储的单参数上限由配置项 `ebpf.mem_dump_cap` 控制（默认 256 字节）。若请求长度超过该上限，将被截断；若超过事件负载上限，输出也可能被截断并以 `…` 表示。
-- 读取失败（如空指针、偏移不可用、权限等）时，扩展占位符会输出 `<MISSING_ARG>`。
+- 扩展占位符会保留运行时读取失败的提示，例如空指针或进程偏移缺失。`<MISSING_ARG>` 表示格式化实参缺失。详见[值诊断](value-diagnostics.md)。
 
 示例：
 

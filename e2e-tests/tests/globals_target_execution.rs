@@ -803,7 +803,7 @@ trace lib_tick {
         "memcmp should not succeed without offsets. STDOUT: {stdout}"
     );
     assert!(
-        !target_stdout.contains("read_user failed"),
+        !target_stdout.contains("memory read failed"),
         "Should not surface raw read_user errors for PID {pid}. STDOUT: {stdout}"
     );
 

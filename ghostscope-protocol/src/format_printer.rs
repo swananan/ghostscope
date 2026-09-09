@@ -541,7 +541,7 @@ impl FormatPrinter {
             if !output.is_empty() {
                 output.push(' ');
             }
-            output.push_str("<truncated>");
+            output.push_str("<truncated: capture limit>");
         }
     }
 
@@ -581,6 +581,80 @@ impl FormatPrinter {
         status: u8,
         trace_context: &TraceContext,
     ) -> String {
+        let mut output = Self::format_complex_variable_status_impl(
+            var_name_index,
+            type_index,
+            access_path,
+            data,
+            status,
+            trace_context,
+        );
+        if matches!(status, s if s == VariableStatus::Ok as u8 || s == VariableStatus::ZeroLength as u8 || (s == VariableStatus::Truncated as u8 && !data.is_empty()))
+        {
+            let mut nested_limits = Vec::new();
+            for note in trace_context.value_diagnostics.iter().filter(|note| {
+                note.variable_index == var_name_index && note.type_index == type_index
+            }) {
+                if note.diagnostic.path.is_empty() {
+                    output.push(' ');
+                    output.push_str(note.diagnostic.reason.marker());
+                } else if !nested_limits.contains(&note.diagnostic.reason) {
+                    nested_limits.push(note.diagnostic.reason);
+                }
+            }
+            // These are static limits, including possible enum branches. Do
+            // not claim an inactive branch failed a runtime read.
+            if !nested_limits.is_empty() {
+                let reasons = nested_limits
+                    .iter()
+                    .map(|reason| reason.short_label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!(
+                    " <nested display limits: {reasons}; see trace details>"
+                ));
+            }
+        }
+        output
+    }
+
+    fn truncation_marker(data: &[u8], presentation: &ValuePresentation) -> &'static str {
+        match presentation {
+            ValuePresentation::Utf8String | ValuePresentation::ByteString => {
+                "<truncated: byte limit>"
+            }
+            ValuePresentation::Nested { root, children, .. } => {
+                if let (
+                    ValuePresentation::Sequence { element_stride, .. },
+                    NestedValueChildrenPresentation::Sequence {
+                        element_limit: Some(limit),
+                        slot_count,
+                        ..
+                    },
+                ) = (root.as_ref(), children.as_ref())
+                {
+                    if let Some((original, captured, _)) =
+                        Self::parse_sequence_payload(data, *element_stride)
+                    {
+                        if original > captured && captured == *slot_count && captured == *limit {
+                            return "<truncated: element limit>";
+                        }
+                    }
+                }
+                Self::truncation_marker(data, root)
+            }
+            _ => "<truncated: capture limit>",
+        }
+    }
+
+    fn format_complex_variable_status_impl(
+        var_name_index: u16,
+        type_index: u16,
+        access_path: &str,
+        data: &[u8],
+        status: u8,
+        trace_context: &TraceContext,
+    ) -> String {
         let var_name = trace_context
             .get_variable_name(var_name_index)
             .unwrap_or("<INVALID_VAR_NAME>");
@@ -601,12 +675,13 @@ impl FormatPrinter {
             let payload_omitted = status == VariableStatus::Truncated as u8
                 && Self::presentation_payload_bytes(data, presentation).is_none();
             let mut formatted_data = if payload_omitted {
-                "<truncated>".to_string()
+                "<truncated: capture limit>".to_string()
             } else {
                 Self::format_data_with_presentation(data, type_info, presentation)
             };
             if status == VariableStatus::Truncated as u8 && !payload_omitted {
-                formatted_data.push_str(" <truncated>");
+                formatted_data.push(' ');
+                formatted_data.push_str(Self::truncation_marker(data, presentation));
             }
             return if access_path.is_empty() {
                 format!("{var_name} = {formatted_data}")
@@ -654,9 +729,9 @@ impl FormatPrinter {
             }
             s if s == VariableStatus::ReadError as u8 => match (errno, addr) {
                 (Some(e), Some(a)) => {
-                    format!("<read_user failed errno={e} at 0x{a:x}> ({type_suffix}*)")
+                    format!("<unreadable: memory read failed; errno={e}; address=0x{a:x}> ({type_suffix}*)")
                 }
-                _ => format!("<read_user failed> ({type_suffix}*)"),
+                _ => format!("<unreadable: memory read failed> ({type_suffix}*)"),
             },
             s if s == VariableStatus::AccessError as u8 => {
                 format!("<address compute failed> ({type_suffix}*)")
@@ -664,7 +739,9 @@ impl FormatPrinter {
             s if s == VariableStatus::OffsetsUnavailable as u8 => {
                 format!("<proc offsets unavailable> ({type_suffix}*)")
             }
-            s if s == VariableStatus::Truncated as u8 => format!("<truncated> ({type_suffix}*)"),
+            s if s == VariableStatus::Truncated as u8 => {
+                format!("<truncated: capture limit> ({type_suffix}*)")
+            }
             s if s == VariableStatus::ZeroLength as u8 => format!("<len<=0> ({type_suffix})"),
             _ => format!("<error status={status}> ({type_suffix}*)"),
         };
@@ -896,6 +973,7 @@ impl FormatPrinter {
                 slot_stride,
                 slot_count,
                 element,
+                ..
             } => {
                 let ValuePresentation::Sequence { element_stride, .. } = root else {
                     return "<INVALID_NESTED_SEQUENCE>".to_string();
@@ -998,7 +1076,8 @@ impl FormatPrinter {
         ) {
             let mut value = Self::format_data_with_presentation(data, type_info, presentation);
             if status == VariableStatus::Truncated as u8 {
-                value.push_str(" <truncated>");
+                value.push(' ');
+                value.push_str(Self::truncation_marker(data, presentation));
             }
             return value;
         }
@@ -1026,9 +1105,9 @@ impl FormatPrinter {
                             addr.try_into()
                                 .expect("nested read-error address length checked"),
                         );
-                        format!("<read_user failed errno={errno} at 0x{addr:x}> ({type_name}*)")
+                        format!("<unreadable: memory read failed; errno={errno}; address=0x{addr:x}> ({type_name}*)")
                     }
-                    _ => format!("<read_user failed> ({type_name}*)"),
+                    _ => format!("<unreadable: memory read failed> ({type_name}*)"),
                 }
             }
             s if s == VariableStatus::AccessError as u8 => {
@@ -2292,7 +2371,7 @@ impl FormatPrinter {
             TypeInfo::UnknownType { name } => {
                 format!("<UNKNOWN_TYPE_{name}_{}_BYTES>", data.len())
             }
-            TypeInfo::OptimizedOut { .. } => "<optimized out>".to_string(),
+            TypeInfo::OptimizedOut { .. } => "<unavailable: optimized out>".to_string(),
         }
     }
 
@@ -3332,7 +3411,7 @@ mod tests {
                 },
                 &presentation,
             ),
-            "HashMap(size=1) {\"alpha\" <truncated>: [3, 5, 8]}"
+            "HashMap(size=1) {\"alpha\" <truncated: byte limit>: [3, 5, 8]}"
         );
     }
 
@@ -3572,7 +3651,7 @@ mod tests {
                 &[huge_count],
                 &trace_context,
             ),
-            "34 12 <truncated>"
+            "34 12 <truncated: capture limit>"
         );
     }
 
@@ -3624,7 +3703,7 @@ mod tests {
                 VariableStatus::Truncated as u8,
                 &trace_context,
             ),
-            "set = HashSet(size=2) {5} <truncated>"
+            "set = HashSet(size=2) {5} <truncated: capture limit>"
         );
     }
 
@@ -3716,7 +3795,7 @@ mod tests {
                 VariableStatus::Truncated as u8,
                 &trace_context,
             ),
-            "set = BTreeSet(size=3) {1, 10} <truncated>"
+            "set = BTreeSet(size=3) {1, 10} <truncated: capture limit>"
         );
 
         let empty_prefix = btree_set_payload(3, 0, 2, 0, &[]);
@@ -3729,7 +3808,7 @@ mod tests {
                 VariableStatus::Truncated as u8,
                 &trace_context,
             ),
-            "set = BTreeSet(size=3) {} <truncated>"
+            "set = BTreeSet(size=3) {} <truncated: capture limit>"
         );
         assert_eq!(
             FormatPrinter::format_complex_variable_with_status(
@@ -3740,7 +3819,7 @@ mod tests {
                 VariableStatus::Truncated as u8,
                 &trace_context,
             ),
-            "set = <truncated>"
+            "set = <truncated: capture limit>"
         );
         let raw_format = trace_context.add_string("{:x}".to_string()).unwrap();
         let variable = ParsedComplexVariable {
@@ -3752,7 +3831,7 @@ mod tests {
         };
         assert_eq!(
             FormatPrinter::format_complex_print_data(raw_format, &[variable], &trace_context,),
-            "01 00 00 00 0a 00 00 00 <truncated>"
+            "01 00 00 00 0a 00 00 00 <truncated: capture limit>"
         );
         let omitted_raw = ParsedComplexVariable {
             var_name_index: name_index,
@@ -3763,7 +3842,7 @@ mod tests {
         };
         assert_eq!(
             FormatPrinter::format_complex_print_data(raw_format, &[omitted_raw], &trace_context,),
-            "<truncated>"
+            "<truncated: capture limit>"
         );
 
         let mut malformed = data;
@@ -4095,7 +4174,7 @@ mod tests {
                 &trace_context,
             ),
             "cell = RefCell(borrow=<unavailable>) { value: 17, borrow: <OUT_OF_BOUNDS> } \
-             <truncated>"
+             <truncated: capture limit>"
         );
     }
 
@@ -4116,7 +4195,7 @@ mod tests {
                 VariableStatus::Truncated as u8,
                 &trace_context,
             ),
-            "path = \"a\\xff\" <truncated>"
+            "path = \"a\\xff\" <truncated: byte limit>"
         );
     }
 
@@ -4222,7 +4301,7 @@ mod tests {
                 &[variable.clone(), variable],
                 &trace_context,
             ),
-            "abc <truncated>|61 62 63 <truncated>"
+            "abc <truncated: capture limit>|61 62 63 <truncated: capture limit>"
         );
     }
 
@@ -4254,7 +4333,7 @@ mod tests {
         );
 
         assert_eq!(empty, "message = \"\"");
-        assert_eq!(truncated, "message = \"abc\" <truncated>");
+        assert_eq!(truncated, "message = \"abc\" <truncated: byte limit>");
     }
 
     #[test]
@@ -4283,7 +4362,7 @@ mod tests {
                 VariableStatus::ReadError as u8,
                 &trace_context,
             ),
-            "message = <read_user failed errno=-14 at 0x1234> (struct &str*)"
+            "message = <unreadable: memory read failed; errno=-14; address=0x1234> (struct &str*)"
         );
     }
 
@@ -4540,7 +4619,7 @@ mod tests {
                 &[truncated.clone(), truncated],
                 &trace_context,
             ),
-            "nested!! <truncated>|6e 65 73 74 65 64 21 21 <truncated>"
+            "nested!! <truncated: capture limit>|6e 65 73 74 65 64 21 21 <truncated: capture limit>"
         );
 
         let mut error_payload = vec![0; VARIABLE_READ_ERROR_PAYLOAD_LEN];
@@ -4570,8 +4649,8 @@ mod tests {
                 &trace_context,
             ),
             concat!(
-                "<read_user failed errno=-14 at 0x1234> (struct String*)|",
-                "<read_user failed errno=-14 at 0x1234> (struct String*)"
+                "<unreadable: memory read failed; errno=-14; address=0x1234> (struct String*)|",
+                "<unreadable: memory read failed; errno=-14; address=0x1234> (struct String*)"
             )
         );
     }
@@ -4607,6 +4686,7 @@ mod tests {
                 first_slot_offset: root_payload_len as u64,
                 slot_stride: child_slot_len as u64,
                 slot_count: 2,
+                element_limit: None,
                 element: Box::new(NestedValuePresentation {
                     payload_len: child_payload_len as u64,
                     type_info: Box::new(string_type.clone()),
@@ -4617,7 +4697,7 @@ mod tests {
 
         assert_eq!(
             FormatPrinter::format_data_with_presentation(&data, &string_type, &presentation),
-            r#"["alpha", "betatron" <truncated>]"#
+            r#"["alpha", "betatron" <truncated: byte limit>]"#
         );
     }
 
@@ -4689,7 +4769,7 @@ mod tests {
         );
 
         assert_eq!(empty, "values = []");
-        assert_eq!(truncated, "values = [10, 20] <truncated>");
+        assert_eq!(truncated, "values = [10, 20] <truncated: capture limit>");
         assert_eq!(zst, "values = [(), (), ()]");
     }
 
@@ -4752,7 +4832,7 @@ mod tests {
                 VariableStatus::Truncated as u8,
                 &trace_context,
             ),
-            "values = <truncated>"
+            "values = <truncated: capture limit>"
         );
     }
 
@@ -5048,7 +5128,7 @@ mod tests {
 
         let out = FormatPrinter::format_complex_print_data(fmt_idx, &vars, &trace_context);
         assert!(
-            out.contains("read_user failed errno=-14"),
+            out.contains("memory read failed; errno=-14"),
             "unexpected: {out}"
         );
         assert!(out.contains("0x123456789abcdef0"), "missing addr: {out}");

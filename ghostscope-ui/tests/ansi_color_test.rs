@@ -19,6 +19,7 @@ fn test_trace_results_success_color() {
             source_file: None,
             source_line: None,
             is_inline: None,
+            value_diagnostics: Vec::new(),
         }],
         trace_ids: vec![0],
     };
@@ -65,6 +66,7 @@ fn test_trace_results_failed_color() {
             source_file: None,
             source_line: None,
             is_inline: None,
+            value_diagnostics: Vec::new(),
         }],
         trace_ids: vec![],
     };
@@ -112,6 +114,7 @@ fn test_trace_results_mixed_colors() {
                 source_file: None,
                 source_line: None,
                 is_inline: None,
+                value_diagnostics: Vec::new(),
             },
             ScriptExecutionResult {
                 target_name: "test.c:20".to_string(),
@@ -121,6 +124,7 @@ fn test_trace_results_mixed_colors() {
                 source_file: None,
                 source_line: None,
                 is_inline: None,
+                value_diagnostics: Vec::new(),
             },
             ScriptExecutionResult {
                 target_name: "test.c:30".to_string(),
@@ -130,6 +134,7 @@ fn test_trace_results_mixed_colors() {
                 source_file: None,
                 source_line: None,
                 is_inline: None,
+                value_diagnostics: Vec::new(),
             },
         ],
         trace_ids: vec![0, 1],
@@ -175,6 +180,7 @@ fn test_trace_results_preserve_multiline_failure_diagnostics() {
             source_file: None,
             source_line: None,
             is_inline: None,
+            value_diagnostics: Vec::new(),
         }],
         trace_ids: vec![],
     };
@@ -189,4 +195,75 @@ fn test_trace_results_preserve_multiline_failure_diagnostics() {
         result.contains(error),
         "multiline diagnostic was lost: {result}"
     );
+}
+
+#[test]
+fn display_limits_remain_successful_and_are_visible_in_trace_details() {
+    let note = ghostscope_protocol::ValueDiagnostic {
+        path: "request.name".to_string(),
+        type_name: "String".to_string(),
+        reason: ghostscope_protocol::ValueDiagnosticReason::LayoutUnsupported,
+        detail: "missing pointer and length".to_string(),
+    };
+    let details = ScriptCompilationDetails {
+        trace_ids: vec![3],
+        total_count: 1,
+        success_count: 1,
+        failed_count: 0,
+        results: vec![ScriptExecutionResult {
+            target_name: "handle_request".to_string(),
+            binary_path: "/app".to_string(),
+            pc_address: 0x1234,
+            status: ExecutionStatus::Success,
+            source_file: None,
+            source_line: None,
+            is_inline: None,
+            value_diagnostics: vec![note.clone()],
+        }],
+    };
+    let output = ScriptEditor::format_compilation_results(&details, None, &EmojiConfig::new(false));
+    assert!(output.contains("1 successful"));
+    assert!(output.contains("request.name: contents unavailable"));
+    assert!(output.contains("docs/value-diagnostics.md#layout-unsupported"));
+    let loaded = ghostscope_ui::events::TraceLoadDetail {
+        target: "handle_request".to_string(),
+        trace_id: Some(3),
+        status: ghostscope_ui::events::LoadStatus::Created,
+        error: None,
+        value_diagnostics: vec![note.clone()],
+    };
+    assert!(loaded.value_diagnostic_messages()[0]
+        .contains("trace #3 (handle_request): request.name: contents unavailable"));
+    let batch = ghostscope_ui::components::command_panel::ResponseFormatter::format_batch_load_summary_styled(
+        "traces.gs", 1, 1, 0, 0, &[loaded],
+    )
+    .iter()
+    .map(|line| line.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(batch.find("trace #3").unwrap() < batch.find("request.name").unwrap());
+    let status = ghostscope_ui::events::RuntimeStatus::TraceInfo {
+        trace_id: 3,
+        target: "handle_request".to_string(),
+        status: ghostscope_ui::events::TraceStatus::Active,
+        pid: Some(1),
+        host_pid: None,
+        binary: "/app".to_string(),
+        script_preview: None,
+        pc: 0x1234,
+        value_diagnostics: vec![note],
+    };
+    let plain = status.format_trace_info().unwrap();
+    let styled = status
+        .format_trace_info_styled()
+        .unwrap()
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for output in [plain, styled] {
+        assert!(output.contains("request.name: contents unavailable"));
+        assert!(output.contains("missing pointer and length"));
+        assert!(output.contains("docs/value-diagnostics.md#layout-unsupported"));
+    }
 }

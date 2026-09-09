@@ -115,9 +115,8 @@ pub(crate) async fn terminate_tokio_child_with_escalation(
         .context("child process does not have an OS pid for SIGTERM")?;
     send_sigterm(pid, label)?;
 
-    match tokio::time::timeout(graceful_timeout, child.wait()).await {
-        Ok(result) => return result.map(Some).map_err(Into::into),
-        Err(_) => {}
+    if let Ok(result) = tokio::time::timeout(graceful_timeout, child.wait()).await {
+        return result.map(Some).map_err(Into::into);
     }
 
     child

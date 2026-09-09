@@ -341,6 +341,7 @@ fn string_value_plan() -> ValueReadPlan {
             excluded_tail_bytes: 0,
         },
         sequence_element: None,
+        diagnostics: Vec::new(),
         hash_table_fields: Vec::new(),
         nested: None,
     }
@@ -360,6 +361,7 @@ fn nested_string_sequence_plan() -> ValueReadPlan {
             element_stride: 24,
         },
         sequence_element: Some(string.root_type.clone()),
+        diagnostics: Vec::new(),
         hash_table_fields: Vec::new(),
         nested: Some(ValueNestedPlan::Sequence {
             element: Box::new(string),
@@ -405,6 +407,7 @@ fn many_variant_strings_plan(variant_count: usize) -> ValueReadPlan {
             fields: Vec::new(),
         },
         sequence_element: None,
+        diagnostics: Vec::new(),
         hash_table_fields: Vec::new(),
         nested: Some(ValueNestedPlan::Variant { fields }),
     }
@@ -441,6 +444,7 @@ fn nested_string_hash_map_plan() -> ValueReadPlan {
             bucket_order: HashTableBucketOrder::Reverse,
         },
         sequence_element: None,
+        diagnostics: Vec::new(),
         hash_table_fields: Vec::new(),
         nested: Some(ValueNestedPlan::HashTable {
             fields: vec![
@@ -557,4 +561,29 @@ fn nested_hash_table_capture_reuses_field_plans_for_bounded_buckets() {
         panic!("expected nested hash-table source");
     };
     assert_eq!(bucket_count, 2);
+}
+
+#[test]
+fn unlowerable_variant_condition_is_not_reported_as_a_capture_budget() {
+    let mut plan = many_variant_strings_plan(2);
+    let Some(ValueNestedPlan::Variant { fields }) = &mut plan.nested else {
+        panic!("expected variant plan");
+    };
+    let ValueNestedVariantCondition::Discriminant { member, .. } = &mut fields[0].condition else {
+        panic!("expected discriminant condition");
+    };
+    member.member_type = TypeInfo::BaseType {
+        name: "unsupported-width".to_string(),
+        size: 3,
+        encoding: ghostscope_dwarf::constants::DW_ATE_unsigned.0 as u16,
+    };
+    let source = compile_nested_value_source(&plan, 256, 4).unwrap().unwrap();
+    let mut diagnostics = Vec::new();
+    collect_capture_diagnostics(&plan, &source, "", 256, &mut diagnostics);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(
+        diagnostics[0].reason,
+        ghostscope_protocol::ValueDiagnosticReason::ReadPlanUnsupported
+    );
+    assert!(diagnostics[0].path.contains("variant0"));
 }
