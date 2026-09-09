@@ -505,7 +505,7 @@ async fn test_non_inline_entry_value_recovers_touch_parameters_at_runtime() -> a
         "Expected exact non-inline entry_value recovery inside touch(). STDOUT: {ghostscope_stdout}\nSTDERR: {ghostscope_stderr}"
     );
     assert!(
-        !ghostscope_stdout.contains("<optimized out>"),
+        !ghostscope_stdout.contains("<unavailable: optimized out>"),
         "touch() parameters should not be optimized out. STDOUT: {ghostscope_stdout}\nSTDERR: {ghostscope_stderr}"
     );
 
@@ -665,7 +665,7 @@ async fn test_post_call_entry_value_recovers_state_members_at_runtime() -> anyho
 STDERR: {ghostscope_stderr}"
     );
     assert!(
-        !ghostscope_stdout.contains("<optimized out>"),
+        !ghostscope_stdout.contains("<unavailable: optimized out>"),
         "Post-call entry_value should not be optimized out. STDOUT: {ghostscope_stdout}
 STDERR: {ghostscope_stderr}"
     );
@@ -854,7 +854,7 @@ async fn test_entry_value_breg_stack_parameter_recovers_at_runtime() -> anyhow::
         "Expected entry_value(breg7 + 8) stack recovery. STDOUT: {ghostscope_stdout}\nSTDERR: {ghostscope_stderr}"
     );
     assert!(
-        !ghostscope_stdout.contains("<optimized out>"),
+        !ghostscope_stdout.contains("<unavailable: optimized out>"),
         "entry_value(breg7 + 8) stack parameter should not be optimized out. STDOUT: {ghostscope_stdout}\nSTDERR: {ghostscope_stderr}"
     );
 

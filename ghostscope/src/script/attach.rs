@@ -312,6 +312,7 @@ pub(super) async fn register_attached_trace(
                     config.assigned_trace_id
                 ),
                 address_global_index: config.resolved_address_index,
+                value_diagnostics: config.trace_context.resolved_value_diagnostics(),
             });
 
     if let Err(e) = session

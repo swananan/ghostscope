@@ -26,6 +26,10 @@ async fn main() -> Result<()> {
             cli::print_script_help();
             return Ok(());
         }
+        config::ParsedCommand::ValueDiagnosticsHelp => {
+            cli::print_value_diagnostics_help();
+            return Ok(());
+        }
     };
 
     // Load and merge configuration

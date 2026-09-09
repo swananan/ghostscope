@@ -127,7 +127,7 @@ mem_dump_cap = 90
         );
         assert!(!stdout.contains("<INVALID_"), "invalid payload: {stdout}");
         assert!(
-            !stdout.contains("<truncated>"),
+            !stdout.contains("<truncated:"),
             "truncated payload: {stdout}"
         );
     }

@@ -1,6 +1,6 @@
 ---
 name: ghostscope-runtime-analysis
-description: Explain GhostScope and turn the project docs into concrete tracing commands, trace scripts, privilege setup, and issue-report workflows for source-aware runtime analysis. Use when the user asks how to install GhostScope, provide source tree and DWARF inputs, handle eBPF privileges, attach to a PID or binary, choose between `-p` and `-t`, inspect variables or source-aware call stacks, write GhostScope trace scripts, use Input Mode commands, work through container or PID-namespace CLI scenarios, or triage GhostScope failures, crashes, and GitHub issue reports.
+description: Explain GhostScope and turn the project docs into concrete tracing commands, trace scripts, privilege setup, and issue-report workflows for source-aware runtime analysis. Use when the user asks how to install GhostScope, provide source tree and DWARF inputs, handle eBPF privileges, attach to a PID or binary, choose between `-p` and `-t`, inspect variables or source-aware call stacks, explain value-display diagnostics, write GhostScope trace scripts, use Input Mode commands, work through container or PID-namespace CLI scenarios, or triage GhostScope failures, crashes, and GitHub issue reports.
 ---
 
 # GhostScope Runtime Analysis
@@ -30,6 +30,13 @@ copy of GhostScope behavior. When the user is writing in Chinese, prefer the
 - Exact CLI flags or launch syntax: run `ghostscope --help` first, and use subcommand help such as `ghostscope bpffs prune --help` when relevant. If `ghostscope` is unavailable but the shared workspace is the GhostScope repo, fall back to `references/cli-cookbook.md`, then `docs/configuration.md` or `docs/zh/configuration.md`.
 - TUI commands such as `trace`, `info`, `source`, `save traces`, or `srcpath`: read `references/cli-cookbook.md`, then `docs/input-commands.md` or `docs/zh/input-commands.md`.
 - Trace script authoring: run `ghostscope --script-help` first and treat its output as the source of truth for the current installed DSL. If `ghostscope` is unavailable but the shared workspace is the GhostScope repo, fall back to `docs/scripting.md` or `docs/zh/scripting.md`.
+- Value unavailable, unreadable memory, internal fields, or partial capture:
+  check `ghostscope --help`, then read `ghostscope --value-diagnostics-help` when supported.
+  This is the installed binary's offline diagnostic reference and needs no
+  target or eBPF privileges. If the binary is unavailable or too old to expose
+  the flag, use `docs/value-diagnostics.md` or `docs/zh/value-diagnostics.md`
+  when available, noting any version difference. Do not maintain a separate
+  catalog of diagnostic reasons in the skill.
 - Container or PID confusion: read `docs/container.md` or `docs/zh/container.md`.
 - Limits or caveats: read `docs/limitations.md` or `docs/zh/limitations.md`.
 - Crash, cannot-capture, or bug-report preparation: read `references/issue-reporting.md`, then `docs/install.md`, `docs/container.md`, and `docs/limitations.md` or their `docs/zh/` counterparts.
@@ -75,6 +82,13 @@ copy of GhostScope behavior. When the user is writing in Chinese, prefer the
 - If the command needs privileges and the user is likely to rerun it, prefer offering either a `setcap` command or a ready-to-run `sudo` wrapper script.
 - When asking the user for logs, check the current logging docs/help first and
   include the flags or config required to actually enable log output.
+- For value diagnostics, preserve the exact marker, affected expression/path,
+  and static display note from CLI output or `info trace <id>`. Explain the
+  matching reason and next step from the value guide before asking for logs.
+  Distinguish unavailable locations, failed reads, unsupported display layouts,
+  and partial captures. A note about a possible enum branch is not evidence
+  that the branch was active or that its memory read failed. Suggest sleepable
+  uprobes only under the guide's conditions, including the latency tradeoff.
 
 5. Avoid common mistakes.
 - Do not invent GhostScope DSL syntax. Validate it against `ghostscope --script-help`, or fall back to `docs/scripting.md` or `docs/zh/scripting.md` only when GhostScope is unavailable.

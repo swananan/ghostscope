@@ -488,6 +488,7 @@ impl BatchLoadingState {
                         trace_id,
                         status,
                         error: None,
+                        value_diagnostics: result.value_diagnostics.clone(),
                     });
                 }
                 crate::events::ExecutionStatus::Failed(error) => {
@@ -496,6 +497,7 @@ impl BatchLoadingState {
                         trace_id: None,
                         status: crate::events::LoadStatus::Failed,
                         error: Some(error.clone()),
+                        value_diagnostics: result.value_diagnostics.clone(),
                     });
                 }
                 crate::events::ExecutionStatus::Skipped(_) => {}
@@ -1407,6 +1409,7 @@ mod tests {
                 source_file: None,
                 source_line: None,
                 is_inline: None,
+                value_diagnostics: Vec::new(),
             }],
             total_count: 1,
             success_count: 1,
@@ -1425,6 +1428,7 @@ mod tests {
                 source_file: None,
                 source_line: None,
                 is_inline: None,
+                value_diagnostics: Vec::new(),
             }],
             total_count: 1,
             success_count: 0,

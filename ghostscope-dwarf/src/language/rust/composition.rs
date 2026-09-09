@@ -68,7 +68,7 @@ pub(super) fn build_variant_nested_plan(
     context: &dyn ValueAdapterContext,
     current: &ResolvedType,
     type_module_path: Option<&Path>,
-    resolve_nested: &mut dyn FnMut(&ResolvedType) -> Option<ValueReadPlan>,
+    resolve_nested: &mut dyn FnMut(&ResolvedType, &str) -> Option<ValueReadPlan>,
 ) -> Option<ValueNestedPlan> {
     if current.origin.as_ref().map(|origin| origin.language) != Some(SourceLanguage::Rust) {
         return None;
@@ -148,7 +148,10 @@ pub(super) fn build_variant_nested_plan(
                     if offset != payload_field.offset {
                         continue;
                     }
-                    let Some(value) = resolve_nested(&projection.resolved_type) else {
+                    let Some(value) = resolve_nested(
+                        &projection.resolved_type,
+                        &format!("::{}.{}", member.name, payload_field.name),
+                    ) else {
                         continue;
                     };
                     fields.push(ValueNestedVariantFieldPlan {

@@ -51,6 +51,20 @@ ghostscope --script-help
 Use this as the source of truth for the currently installed GhostScope script syntax.
 If `ghostscope` is unavailable but you are working inside the GhostScope repository, fall back to `docs/scripting.md`.
 
+### Understand Value Output
+
+Check `ghostscope --help` for support, then read the installed value guide:
+
+```bash
+ghostscope --value-diagnostics-help
+```
+
+This prints the embedded guide without loading configuration or requiring a
+target or eBPF privileges. Match the observed marker and the CLI display note
+or TUI `info trace <id>` details to its reason. If the binary is unavailable or
+does not support the flag, use `docs/value-diagnostics.md` or
+`docs/zh/value-diagnostics.md` when available and identify any version mismatch.
+
 ### Ask For Source And Debug Inputs
 
 Before giving file:line tracing or variable-inspection workflows, confirm:

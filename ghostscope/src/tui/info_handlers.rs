@@ -26,6 +26,7 @@ pub async fn handle_info_trace(
                     binary: snapshot.binary_path,
                     script_preview: Some(snapshot.script_content),
                     pc: snapshot.pc,
+                    value_diagnostics: snapshot.value_diagnostics,
                 });
         } else {
             let _ = runtime_channels

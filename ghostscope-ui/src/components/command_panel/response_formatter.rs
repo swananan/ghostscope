@@ -340,6 +340,11 @@ impl ResponseFormatter {
                     }
                     _ => {}
                 }
+                for note in &detail.value_diagnostics {
+                    for line in note.message("").lines() {
+                        lines.push(ratatui::text::Line::from(format!("    {line}")));
+                    }
+                }
             }
         }
 

@@ -122,6 +122,7 @@ fn compilation_failed_details(binary_path: String, friendly: String) -> ScriptCo
             source_file: None,
             source_line: None,
             is_inline: None,
+            value_diagnostics: Vec::new(),
         }],
         total_count: 1,
         success_count: 0,
@@ -169,6 +170,7 @@ fn build_tui_results(
             source_file,
             source_line,
             is_inline,
+            value_diagnostics: config.trace_context.resolved_value_diagnostics(),
         });
         success_count += 1;
     }
@@ -182,6 +184,7 @@ fn build_tui_results(
             source_file: None,
             source_line: None,
             is_inline: None,
+            value_diagnostics: Vec::new(),
         });
         failed_count += 1;
     }

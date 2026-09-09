@@ -6,7 +6,10 @@
 pub mod bpf_abi;
 mod format_template;
 mod type_kind;
+mod value_diagnostic;
 mod value_presentation;
+
+pub use value_diagnostic::{TraceValueDiagnostic, ValueDiagnostic, ValueDiagnosticReason};
 
 pub mod format_printer;
 pub mod streaming_parser;

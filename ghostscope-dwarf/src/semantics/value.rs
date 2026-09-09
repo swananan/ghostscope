@@ -25,6 +25,17 @@ impl Default for ValueReadPlanOptions {
     }
 }
 
+/// Operational adapter selection with diagnostics independent of capture.
+/// A missing plan keeps the ordinary DWARF read path, even when notes exist.
+#[derive(Debug, Clone, Default)]
+pub struct ValueReadPlanResolution {
+    pub plan: Option<ValueReadPlan>,
+    /// Root-relative static notes, including notes from an applied plan.
+    pub diagnostics: Vec<ghostscope_protocol::ValueDiagnostic>,
+    /// Rejected root adapter metadata for reporting a failed DWARF fallback.
+    pub rejection: Option<ValueAdapterReport>,
+}
+
 /// A language-selected presentation and the physical reads needed to produce
 /// its protocol payload.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,9 +57,60 @@ pub struct ValueReadPlan {
     /// implement nested capture can ignore this metadata and retain the
     /// existing one-level presentation.
     pub nested: Option<ValueNestedPlan>,
+    /// Static display limits relative to this root, including possible enum
+    /// branches. They do not change the capture or assert a runtime failure.
+    pub diagnostics: Vec<ghostscope_protocol::ValueDiagnostic>,
 }
 
 impl ValueReadPlan {
+    pub fn field_path(&self, index: usize) -> String {
+        let output = match &self.capture {
+            ValueCapturePlan::InlineView { output_type, .. }
+            | ValueCapturePlan::ProjectedView { output_type, .. } => output_type,
+            _ => &self.root_type.summary,
+        };
+        if let crate::TypeInfo::StructType { members, .. } = crate::strip_type_aliases(output) {
+            if let Some(member) = members.get(index) {
+                return format!(".{}", member.name);
+            }
+        }
+        format!(".field{index}")
+    }
+
+    pub fn hash_field_path(&self, index: usize) -> &'static str {
+        match &self.presentation {
+            ValuePresentation::HashTable {
+                entry: ghostscope_protocol::HashTableEntryPresentation::Map { .. },
+                ..
+            } if index == 0 => "[].key",
+            _ => "[].value",
+        }
+    }
+
+    pub fn variant_field_path(&self, field: &ValueNestedVariantFieldPlan) -> String {
+        if let crate::TypeInfo::VariantType { variant_parts, .. } =
+            crate::strip_type_aliases(&self.root_type.summary)
+        {
+            if let Some(member) = variant_parts
+                .get(field.part_index)
+                .and_then(|part| part.variants.get(field.variant_index))
+                .and_then(|variant| variant.members.get(field.member_index))
+            {
+                if let crate::TypeInfo::StructType { members, .. } =
+                    crate::strip_type_aliases(&member.member_type)
+                {
+                    if let Some(payload) = members.get(field.payload_field_index) {
+                        return format!("::{}.{}", member.name, payload.name);
+                    }
+                }
+            }
+        }
+        format!(
+            "::variant{}.field{}",
+            field.variant_index, field.payload_field_index
+        )
+    }
+
     pub(crate) fn new(
         root_type: crate::ResolvedType,
         presentation: ValuePresentation,
@@ -61,6 +123,7 @@ impl ValueReadPlan {
             sequence_element: None,
             hash_table_fields: Vec::new(),
             nested: None,
+            diagnostics: Vec::new(),
         }
     }
 }
@@ -137,6 +200,17 @@ pub enum ValueAdapterStage {
     LayoutValidation,
     /// The root layout was valid, but dependent DWARF could not form a plan.
     ReadPlanConstruction,
+}
+
+impl ValueAdapterStage {
+    pub fn diagnostic_reason(self) -> ghostscope_protocol::ValueDiagnosticReason {
+        match self {
+            Self::LayoutValidation => ghostscope_protocol::ValueDiagnosticReason::LayoutUnsupported,
+            Self::ReadPlanConstruction => {
+                ghostscope_protocol::ValueDiagnosticReason::ReadPlanUnsupported
+            }
+        }
+    }
 }
 
 /// Result of selecting and constructing a source-language value adapter.

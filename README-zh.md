@@ -221,6 +221,10 @@ GhostScope 把编译后的二进制重新变成“可观测系统”。在 TUI �
 - [**使用限制**](docs/zh/limitations.md)
   已知的限制和约束
 
+- [**值诊断**](docs/zh/value-diagnostics.md)
+  理解值不可用、内存读取失败、展示降级和采集限制；
+  使用 `ghostscope --value-diagnostics-help` 离线查看
+
 </td>
 <td width="33%" valign="top">
 
@@ -237,7 +241,7 @@ GhostScope 把编译后的二进制重新变成“可观测系统”。在 TUI �
   输入模式所有可用命令
 
 - [**脚本语言**](docs/zh/scripting.md)
-  编写强大的追踪脚本
+  编写追踪脚本；使用 `ghostscope --script-help` 离线查看
 
 </td>
 <td width="33%" valign="top">

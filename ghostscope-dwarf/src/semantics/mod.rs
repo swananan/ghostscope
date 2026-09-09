@@ -46,7 +46,7 @@ pub use value::{
     ValueAdapterOutcome, ValueAdapterReport, ValueAdapterStage, ValueCapturePlan,
     ValueHashTableField, ValueNestedFieldPlan, ValueNestedHashTableFieldPlan, ValueNestedPlan,
     ValueNestedVariantCondition, ValueNestedVariantFieldPlan, ValueReadPlan, ValueReadPlanOptions,
-    DEFAULT_VALUE_ADAPTER_NESTING_DEPTH, MAX_VALUE_ADAPTER_NESTING_DEPTH,
+    ValueReadPlanResolution, DEFAULT_VALUE_ADAPTER_NESTING_DEPTH, MAX_VALUE_ADAPTER_NESTING_DEPTH,
 };
 pub(crate) use variable_plan::PlanError;
 pub use variable_plan::{

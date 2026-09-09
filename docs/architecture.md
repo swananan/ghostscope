@@ -39,6 +39,36 @@ validated protocol record or explicit failure state
 | Event transport | `LOSS-1` | RingBuf or PerfEventArray carries events; output-helper failures increment per-trace loss counters. |
 | Protocol and rendering | `IDENT-1`, `FAIL-1` | Trace/PID/TID metadata and structured unavailable, expression-error, and backtrace states remain visible to consumers. |
 
+## Value Display Diagnostics
+
+Static display limits and runtime read statuses travel separately. The DWARF
+layer resolves a `ValueReadPlanResolution` containing an optional capture plan,
+path-qualified static notes, and any rejected root adapter report. Notes survive
+even when no semantic capture is selected; ordinary DWARF reads retain their
+runtime address checks. The compiler adds limits discovered during bounded
+capture lowering and finalizes notes for both memory-backed and register-backed
+arguments, binding them to expression/type indices in `TraceContext`. Setup messages deduplicate
+resolved expressions, types, and reasons even when internal indices differ.
+
+CLI, TUI creation results, and trace snapshots consume the same structured
+notes. Snapshots retain them for `info trace`, independently of logs and loader
+actor ownership. Runtime read failures retain `VariableStatus` and individual
+nested-child statuses; the formatter never parses logs to infer failures.
+Diagnostic metadata adds no eBPF memory reads and does not change the binary
+status layout. Optional sequence-width metadata identifies proven element-limit
+truncation; legacy metadata retains a general capture-limit explanation.
+
+At semantic depth boundaries, bounded type-only lookahead avoids diagnosing
+plain field-only structs as failed adapters. It does not traverse runtime
+pointer graphs. Static enum-path notes describe possible branches, not observed
+read failures. User-facing explanations and next steps are in
+[value diagnostics](value-diagnostics.md).
+
+The CLI embeds that same Markdown file for `--value-diagnostics-help`, using the same
+early-exit path as `--script-help`. CI compares both outputs with their source
+documents. Skills route to the installed binary's reference instead of
+maintaining a separate copy of the guide.
+
 ## System Overview
 
 ```

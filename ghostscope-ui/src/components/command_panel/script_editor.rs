@@ -818,6 +818,9 @@ impl ScriptEditor {
                     ));
                 }
             }
+            for note in &exec_result.value_diagnostics {
+                result.push(format!("  Display note: {}", note.message("")));
+            }
         }
 
         result.join("\n")

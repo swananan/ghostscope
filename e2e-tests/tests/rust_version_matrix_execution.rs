@@ -279,7 +279,7 @@ mem_dump_cap = 512
         "{toolchain}: invalid payload: {stdout}"
     );
     anyhow::ensure!(
-        !stdout.contains("<truncated>"),
+        !stdout.contains("<truncated:"),
         "{toolchain}: truncated payload: {stdout}"
     );
     eprintln!("completed Rust e2e toolchain {toolchain}");

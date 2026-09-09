@@ -182,6 +182,9 @@ pub enum NestedValueChildrenPresentation {
         first_slot_offset: u64,
         slot_stride: u64,
         slot_count: u64,
+        /// Configured width, distinct from slots reduced by the byte budget.
+        #[serde(default)]
+        element_limit: Option<u64>,
         element: Box<NestedValuePresentation>,
     },
     HashTable {

@@ -116,6 +116,20 @@ pub struct TraceLoadDetail {
     pub trace_id: Option<u32>,
     pub status: LoadStatus,
     pub error: Option<String>,
+    pub value_diagnostics: Vec<ghostscope_protocol::ValueDiagnostic>,
+}
+
+impl TraceLoadDetail {
+    pub fn value_diagnostic_messages(&self) -> Vec<String> {
+        let target = match self.trace_id {
+            Some(id) => format!("trace #{id} ({})", self.target),
+            None => self.target.clone(),
+        };
+        self.value_diagnostics
+            .iter()
+            .map(|note| format!("Display note · {target}: {}", note.message("")))
+            .collect()
+    }
 }
 
 /// Status of loading a trace
@@ -145,6 +159,7 @@ pub struct ScriptExecutionResult {
     pub source_file: Option<String>,
     pub source_line: Option<u32>,
     pub is_inline: Option<bool>,
+    pub value_diagnostics: Vec<ghostscope_protocol::ValueDiagnostic>,
 }
 
 /// Detailed compilation result for a script with multiple targets
@@ -246,6 +261,7 @@ pub enum RuntimeStatus {
         binary: String,
         script_preview: Option<String>,
         pc: u64,
+        value_diagnostics: Vec<ghostscope_protocol::ValueDiagnostic>,
     },
     /// All trace info with structured data for UI rendering
     TraceInfoAll {
@@ -433,6 +449,7 @@ impl RuntimeStatus {
                 binary,
                 script_preview,
                 pc,
+                value_diagnostics,
             } => {
                 // Header line
                 let mut result =
@@ -475,6 +492,12 @@ impl RuntimeStatus {
                     result.push_str(&format!("  {key}{spaces}: {value}\n"));
                 }
 
+                for note in value_diagnostics {
+                    result.push_str(&format!("  Display note: {}\n", note.message("")));
+                }
+                result.push_str(
+                    "  Value status help: ghostscope --value-diagnostics-help (docs/value-diagnostics.md)\n",
+                );
                 Some(result)
             }
             _ => None,
@@ -496,6 +519,7 @@ impl RuntimeStatus {
                 binary,
                 script_preview: _,
                 pc,
+                value_diagnostics,
             } => {
                 let mut lines = Vec::new();
 
@@ -584,6 +608,14 @@ impl RuntimeStatus {
                     (None, None) => {}
                 }
 
+                for note in value_diagnostics {
+                    for line in note.message("").lines() {
+                        lines.push(Line::from(format!("  {line}")));
+                    }
+                }
+                lines.push(Line::from(
+                    "  Value status help: ghostscope --value-diagnostics-help (docs/value-diagnostics.md)",
+                ));
                 Some(lines)
             }
             RuntimeStatus::TraceInfoAll { summary, traces } => {

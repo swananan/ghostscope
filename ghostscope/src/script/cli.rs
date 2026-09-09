@@ -23,9 +23,7 @@ pub fn compile_script_for_cli(
         Err(SessionCompileError::Compile(e)) => {
             let friendly = e.user_message().into_owned();
             error!("Script compilation failed: {}", friendly);
-            return Err(anyhow::anyhow!(
-                "Script compilation failed: {friendly}. Please check your script syntax and try again."
-            ));
+            return Err(anyhow::anyhow!("Script compilation failed: {friendly}"));
         }
         Err(SessionCompileError::Setup(e)) => return Err(e),
     };
@@ -62,6 +60,15 @@ pub fn compile_script_for_cli(
         }
     }
 
+    for config in &compilation_result.uprobe_configs {
+        for message in config.trace_context.value_diagnostic_messages() {
+            eprintln!(
+                "Display note · trace {} at 0x{:x}: {message}",
+                config.assigned_trace_id,
+                config.function_address.unwrap_or(0)
+            );
+        }
+    }
     Ok(compilation_result)
 }
 

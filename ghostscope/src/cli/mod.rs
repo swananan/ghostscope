@@ -193,5 +193,5 @@ fn print_human_report(args: &BpffsPruneArgs, report: &BpffsPruneReport) {
 }
 
 // Re-export main functions for convenience
-pub use docs::print_script_help;
+pub use docs::{print_script_help, print_value_diagnostics_help};
 pub use script_runtime::run_command_line_runtime_with_config;

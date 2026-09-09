@@ -1,5 +1,7 @@
 # Limitations
 
+For value failure and fallback messages and next steps, see [value diagnostics](value-diagnostics.md).
+
 This document describes conditions outside the supported operating envelope or
 cases that degrade explicitly. The guarantees that remain mandatory inside the
 supported envelope are defined in the

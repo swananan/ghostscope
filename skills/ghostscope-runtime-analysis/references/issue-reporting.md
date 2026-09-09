@@ -17,6 +17,9 @@ Use this flow when GhostScope crashes, cannot capture as expected, shows obvious
   `[dwarf].search_paths`, `--debug-file`, `--allow-loose-debug-match`, and
   debuginfod settings
 - Relevant logs or captured output
+- For value-display failures: the exact marker, expression/path, type, stable
+  reason and detail from CLI display notes or `info trace <id>`, and the
+  matching explanation from `ghostscope --value-diagnostics-help` when supported
 - Expected behavior
 - Actual behavior or crash text
 - Container or WSL context when relevant
@@ -64,6 +67,8 @@ When issue prep is needed:
 - Unknown source tree path for a source-oriented workflow
 - Wrong PID namespace assumption for `-p`
 - Shared-library `-t` case that actually needs `--enable-sysmon-shared-lib`
+- Documented value-display or capture limits, using the installed value guide
+  before treating raw fields or a partial capture as an unexplained failure
 
 2. If the problem still looks like a GhostScope bug, crash, or unexplained failure:
 - Generate the `/tmp` report

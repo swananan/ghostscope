@@ -1,64 +1,77 @@
 use super::*;
 
-#[derive(Default)]
-struct SemanticValueResolution {
-    plan: Option<ghostscope_dwarf::ValueReadPlan>,
-    rejection: Option<ghostscope_dwarf::ValueAdapterReport>,
-}
+use ghostscope_dwarf::ValueReadPlanResolution;
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(super) const UNKNOWN_CHAR_ARRAY_READ_FALLBACK: usize = 256;
+
+    fn diagnosed_arg(
+        &mut self,
+        arg: ComplexArg<'ctx>,
+        diagnostics: Vec<ghostscope_protocol::ValueDiagnostic>,
+    ) -> ComplexArg<'ctx> {
+        for diagnostic in diagnostics {
+            self.trace_context
+                .add_value_diagnostic(ghostscope_protocol::TraceValueDiagnostic {
+                    variable_index: arg.var_name_index,
+                    type_index: arg.type_index,
+                    diagnostic,
+                });
+        }
+        arg
+    }
+
+    fn finish_value_arg(
+        &mut self,
+        result: Result<ComplexArg<'ctx>>,
+        mut diagnostics: Vec<ghostscope_protocol::ValueDiagnostic>,
+        report: Option<ghostscope_dwarf::ValueAdapterReport>,
+    ) -> Result<ComplexArg<'ctx>> {
+        let arg = result.map_err(|error| match &report {
+            Some(report) => error.with_value_adapter_rejection(report.clone()),
+            None => error,
+        })?;
+        if matches!(
+            self.trace_context.get_type(arg.type_index),
+            Some(ghostscope_dwarf::TypeInfo::OptimizedOut { .. })
+        ) {
+            return Ok(arg);
+        }
+        if let Some(report) = report {
+            if let ghostscope_dwarf::ValueAdapterOutcome::Rejected { stage, reason } =
+                report.outcome
+            {
+                diagnostics.push(ghostscope_protocol::ValueDiagnostic {
+                    path: String::new(),
+                    type_name: report.qualified_type_name.unwrap_or(report.type_name),
+                    reason: stage.diagnostic_reason(),
+                    detail: format!(
+                        "{}: {reason}",
+                        report.adapter.as_deref().unwrap_or("value adapter")
+                    ),
+                });
+            }
+        }
+        Ok(self.diagnosed_arg(arg, diagnostics))
+    }
 
     fn semantic_value_read_plan(
         &self,
         resolved_type: &ghostscope_dwarf::ResolvedType,
         type_module_path: Option<&std::path::Path>,
-    ) -> Result<SemanticValueResolution> {
+    ) -> Result<ValueReadPlanResolution> {
         let Some(analyzer) = self.process_analyzer else {
-            return Ok(SemanticValueResolution::default());
+            return Ok(ValueReadPlanResolution::default());
         };
-        let options = ghostscope_dwarf::ValueReadPlanOptions {
-            max_nesting_depth: self.compile_options.value_adapter_max_nesting_depth,
-        };
-        let report = analyzer
-            .explain_value_read_plan_with_options(resolved_type, type_module_path, options)
-            .map_err(|error| CodeGenError::DwarfError(error.to_string()))?;
-        match &report.outcome {
-            // Adapter reports intentionally describe named source-language
-            // adapters only. Operational resolution may still compose those
-            // adapters through an ordinary Rust struct.
-            ghostscope_dwarf::ValueAdapterOutcome::NotApplicable => analyzer
-                .value_read_plan_with_options(resolved_type, type_module_path, options)
-                .map(|plan| SemanticValueResolution {
-                    plan,
-                    rejection: None,
-                })
-                .map_err(|error| CodeGenError::DwarfError(error.to_string())),
-            ghostscope_dwarf::ValueAdapterOutcome::Applied { plan } => {
-                Ok(SemanticValueResolution {
-                    plan: Some((**plan).clone()),
-                    rejection: None,
-                })
-            }
-            ghostscope_dwarf::ValueAdapterOutcome::Rejected { stage, reason } => {
-                debug!(
-                    target: "ghostscope_dwarf::value_adapter",
-                    adapter = report.adapter.as_deref().unwrap_or("unknown"),
-                    type_name = report.type_name,
-                    qualified_type_name = ?report.qualified_type_name,
-                    producer = ?report.producer.as_ref().map(|producer| producer.raw.as_str()),
-                    rustc_version = ?report.rustc_version,
-                    dwarf_version = ?report.dwarf_version,
-                    ?stage,
-                    %reason,
-                    "Rust value adapter rejected target DWARF; using DWARF presentation"
-                );
-                Ok(SemanticValueResolution {
-                    plan: None,
-                    rejection: Some(report),
-                })
-            }
-        }
+        analyzer
+            .resolve_value_read_plan_with_options(
+                resolved_type,
+                type_module_path,
+                ghostscope_dwarf::ValueReadPlanOptions {
+                    max_nesting_depth: self.compile_options.value_adapter_max_nesting_depth,
+                },
+            )
+            .map_err(|error| CodeGenError::DwarfError(error.to_string()))
     }
 
     fn complex_arg_from_value_read_plan(
@@ -69,6 +82,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         plan: ghostscope_dwarf::ValueReadPlan,
     ) -> Result<ComplexArg<'ctx>> {
         let cap = self.compile_options.mem_dump_cap as usize;
+        let mut diagnostics = plan.diagnostics.clone();
         if plan.nested.is_some() {
             if let Some(value) = compile_nested_value_source(
                 &plan,
@@ -76,9 +90,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 self.compile_options.value_adapter_max_sequence_elements,
             )? {
                 let output_type = value.output_type.clone();
-                let presentation = nested_value_presentation(&value)?;
+                let presentation = nested_value_presentation(
+                    &value,
+                    self.compile_options.value_adapter_max_sequence_elements,
+                )?;
                 let data_len = value.total_len;
-                return Ok(ComplexArg {
+                collect_capture_diagnostics(&plan, &value, "", cap, &mut diagnostics);
+                let arg = ComplexArg {
                     var_name_index: self.trace_context.add_variable_name(display_name)?,
                     type_index: self
                         .trace_context
@@ -89,13 +107,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         descriptor,
                         value: Box::new(value),
                     },
-                });
+                };
+                return Ok(self.diagnosed_arg(arg, diagnostics));
             }
+            let unsupported_condition = matches!(&plan.nested, Some(ghostscope_dwarf::ValueNestedPlan::Variant { fields }) if fields.iter().all(|field| compile_nested_variant_condition(&field.condition).is_none()));
+            diagnostics.push(ghostscope_protocol::ValueDiagnostic {
+                path: String::new(), type_name: plan.root_type.summary.type_name(),
+                reason: if unsupported_condition { ghostscope_protocol::ValueDiagnosticReason::ReadPlanUnsupported } else { ghostscope_protocol::ValueDiagnosticReason::CaptureBudget },
+                detail: if unsupported_condition { "Enum discriminants cannot select nested captures; using the root display".to_string() } else { format!("ebpf.mem_dump_cap = {cap} bytes cannot fit the nested capture; using the root display") },
+            });
             debug!(
                 target: "ghostscope_dwarf::value_adapter",
                 type_name = plan.root_type.summary.type_name(),
                 cap,
-                "Nested value plan exceeded its static capture budget; using the root adapter"
+                "Nested value plan could not be lowered within its capture constraints; using the root adapter"
             );
         }
         let ghostscope_dwarf::ValueReadPlan {
@@ -105,6 +130,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             sequence_element: _,
             hash_table_fields: _,
             nested: _,
+            diagnostics: _,
         } = plan;
         let mut output_type = dwarf_type;
         let (data_len, source) = match capture {
@@ -396,7 +422,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         };
 
-        Ok(ComplexArg {
+        let arg = ComplexArg {
             var_name_index: self.trace_context.add_variable_name(display_name)?,
             type_index: self
                 .trace_context
@@ -404,7 +430,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             access_path: Vec::new(),
             data_len,
             source,
-        })
+        };
+        Ok(self.diagnosed_arg(arg, diagnostics))
     }
 
     pub(super) fn complex_arg_from_dwarf_read_plan(
@@ -421,13 +448,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 Some(resolved_type) => {
                     self.semantic_value_read_plan(&resolved_type, plan.module_path.as_deref())?
                 }
-                None => SemanticValueResolution::default(),
+                None => ValueReadPlanResolution::default(),
             }
         } else {
-            SemanticValueResolution::default()
+            ValueReadPlanResolution::default()
         };
-        let SemanticValueResolution {
+        let ValueReadPlanResolution {
             plan: semantic_plan,
+            diagnostics,
             rejection,
         } = semantic_resolution;
         let fallback_result = (|| {
@@ -672,12 +700,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         })();
 
-        match rejection {
-            Some(report) => {
-                fallback_result.map_err(|error| error.with_value_adapter_rejection(report))
-            }
-            None => fallback_result,
-        }
+        self.finish_value_arg(fallback_result, diagnostics, rejection)
     }
 
     fn complex_arg_from_dynamic_lvalue(
@@ -685,19 +708,23 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         expr: &crate::script::ast::Expr,
         lvalue: crate::ebpf::expression::DynamicLvalue<'ctx>,
     ) -> Result<ComplexArg<'ctx>> {
-        let SemanticValueResolution { plan, rejection } = self.semantic_value_read_plan(
+        let ValueReadPlanResolution {
+            plan,
+            diagnostics,
+            rejection,
+        } = self.semantic_value_read_plan(
             &lvalue.type_info.resolved_type,
             lvalue.type_info.type_module_path.as_deref(),
         )?;
-        if let Some(plan) = plan {
-            return self.complex_arg_from_value_read_plan(
-                self.expr_to_name(expr),
-                lvalue.type_info.resolved_type.summary,
-                lvalue.address,
-                plan,
-            );
-        }
         let fallback_result = (|| {
+            if let Some(plan) = plan {
+                return self.complex_arg_from_value_read_plan(
+                    self.expr_to_name(expr),
+                    lvalue.type_info.resolved_type.summary,
+                    lvalue.address,
+                    plan,
+                );
+            }
             let dwarf_type = lvalue.type_info.resolved_type.summary;
             let data_len = Self::compute_read_size_for_type(&dwarf_type);
             if data_len == 0 {
@@ -717,12 +744,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 },
             })
         })();
-        match rejection {
-            Some(report) => {
-                fallback_result.map_err(|error| error.with_value_adapter_rejection(report))
-            }
-            None => fallback_result,
-        }
+        self.finish_value_arg(fallback_result, diagnostics, rejection)
     }
 
     fn complex_arg_from_cast_expr(

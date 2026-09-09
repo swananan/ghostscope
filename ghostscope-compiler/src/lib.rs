@@ -116,6 +116,7 @@ fn format_value_adapter_rejection(report: &ghostscope_dwarf::ValueAdapterReport)
     let ghostscope_dwarf::ValueAdapterOutcome::Rejected { stage, reason } = &report.outcome else {
         return None;
     };
+    let reason_code = stage.diagnostic_reason().code();
     let stage = match stage {
         ghostscope_dwarf::ValueAdapterStage::LayoutValidation => "layout-validation",
         ghostscope_dwarf::ValueAdapterStage::ReadPlanConstruction => "read-plan-construction",
@@ -147,6 +148,9 @@ fn format_value_adapter_rejection(report: &ghostscope_dwarf::ValueAdapterReport)
     if let Some(producer) = &report.producer {
         lines.push(format!("  producer: {}", producer.raw));
     }
+    lines.push(format!(
+        "  Help: docs/value-diagnostics.md#{reason_code} (offline: ghostscope --value-diagnostics-help)"
+    ));
     Some(lines.join("\n"))
 }
 
