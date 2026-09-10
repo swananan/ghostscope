@@ -1,6 +1,6 @@
 //! Shared parsing for GhostScope's formatted-print template syntax.
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 /// Conversion applied to one formatted-print value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +91,29 @@ pub enum FormatPart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatTemplate {
     parts: Vec<FormatPart>,
+}
+
+/// Templates used by one trace parser. Entries are bounded by the u16 string
+/// index and released with the parser, rather than retained in a global cache.
+#[derive(Default)]
+pub(crate) struct FormatTemplateCache {
+    entries: HashMap<u16, (String, FormatTemplate)>,
+}
+
+impl FormatTemplateCache {
+    pub(crate) fn get_or_parse(&mut self, index: u16, source: &str) -> &FormatTemplate {
+        let entry = self
+            .entries
+            .entry(index)
+            .or_insert_with(|| (source.to_owned(), FormatTemplate::parse_lossy(source)));
+
+        // TraceContext is supplied on each parse call and its string table is
+        // public, so an index alone cannot identify a template across updates.
+        if entry.0 != source {
+            *entry = (source.to_owned(), FormatTemplate::parse_lossy(source));
+        }
+        &entry.1
+    }
 }
 
 impl FormatTemplate {

@@ -1,4 +1,5 @@
 use crate::format_printer::FormatPrinter;
+use crate::format_template::FormatTemplateCache;
 use crate::trace_context::TraceContext;
 use crate::trace_event::*;
 use crate::{FormatConversion, FormatPart, FormatTemplate, TypeKind};
@@ -203,6 +204,7 @@ pub struct StreamingTraceParser {
     parse_state: ParseState,
     buffer: Vec<u8>,
     event_source: EventSource,
+    format_templates: FormatTemplateCache,
 }
 
 impl Default for StreamingTraceParser {
@@ -224,6 +226,7 @@ impl StreamingTraceParser {
             parse_state: ParseState::WaitingForHeader,
             buffer: Vec::with_capacity(1024),
             event_source,
+            format_templates: FormatTemplateCache::default(),
         }
     }
 
@@ -320,7 +323,11 @@ impl StreamingTraceParser {
                     mut instructions,
                 } => {
                     // Try to parse instruction from buffer
-                    match self.try_parse_instruction(&self.buffer[cursor..], trace_context)? {
+                    match Self::try_parse_instruction(
+                        &self.buffer[cursor..],
+                        trace_context,
+                        &mut self.format_templates,
+                    )? {
                         Some((parsed_instruction, consumed_bytes)) => {
                             // Check if this is EndInstruction
                             if matches!(
@@ -430,9 +437,9 @@ impl StreamingTraceParser {
     /// Try to parse a single instruction from buffer
     /// Returns Some((instruction, consumed_bytes)) if successful, None if need more data
     fn try_parse_instruction(
-        &self,
         data: &[u8],
         trace_context: &TraceContext,
+        format_templates: &mut FormatTemplateCache,
     ) -> Result<Option<(ParsedInstruction, usize)>, String> {
         // Try to read instruction header
         let (inst_header, _rest) = match InstructionHeader::read_from_prefix(data) {
@@ -551,7 +558,7 @@ impl StreamingTraceParser {
                     .map_err(|_| "Invalid PrintComplexFormat data".to_string())?;
 
                 // Parse complex variable data
-                let mut complex_variables = Vec::new();
+                let mut complex_variables = Vec::with_capacity(format_data.arg_count as usize);
                 let mut data_offset = std::mem::size_of::<PrintComplexFormatData>();
 
                 for _ in 0..format_data.arg_count {
@@ -579,7 +586,7 @@ impl StreamingTraceParser {
                         return Err("Invalid PrintComplexFormat access path".to_string());
                     }
                     let access_path_bytes = &inst_data[data_offset..data_offset + access_path_len];
-                    let access_path = String::from_utf8_lossy(access_path_bytes).to_string();
+                    let access_path = String::from_utf8_lossy(access_path_bytes);
                     data_offset += access_path_len;
 
                     // Read data length
@@ -594,7 +601,7 @@ impl StreamingTraceParser {
                     if data_offset + data_len as usize > inst_data.len() {
                         return Err("Invalid PrintComplexFormat variable data".to_string());
                     }
-                    let var_data = inst_data[data_offset..data_offset + data_len as usize].to_vec();
+                    let var_data = &inst_data[data_offset..data_offset + data_len as usize];
                     data_offset += data_len as usize;
 
                     complex_variables.push(crate::format_printer::ParsedComplexVariable {
@@ -606,13 +613,17 @@ impl StreamingTraceParser {
                     });
                 }
 
-                // Use FormatPrinter to generate formatted output
-                let formatted_output =
-                    crate::format_printer::FormatPrinter::format_complex_print_data(
-                        format_data.format_string_index,
+                // Format borrowed arguments before compacting or reusing the input
+                // buffer. Only the completed output leaves this instruction parser.
+                let format_index = format_data.format_string_index;
+                let formatted_output = match trace_context.get_string(format_index) {
+                    Some(source) => FormatPrinter::format_complex_print_template(
+                        format_templates.get_or_parse(format_index, source),
                         &complex_variables,
                         trace_context,
-                    );
+                    ),
+                    None => format!("<INVALID_FORMAT_INDEX_{format_index}>"),
+                };
 
                 ParsedInstruction::PrintComplexFormat { formatted_output }
             }
@@ -947,6 +958,173 @@ mod tests {
         event.push(0);
         event.push(0);
         event
+    }
+
+    fn format_context() -> TraceContext {
+        let mut context = TraceContext::new();
+        context.add_variable_name("value".into()).unwrap();
+        context
+            .add_type(crate::TypeInfo::BaseType {
+                name: "u64".into(),
+                size: 8,
+                encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+            })
+            .unwrap();
+        context
+    }
+
+    fn complex_format_event(format_index: u16, values: &[&[u8]]) -> Vec<u8> {
+        let mut event = Vec::new();
+        let header = TraceEventHeader {
+            magic: crate::consts::MAGIC,
+            reserved: 0,
+            generation: 1,
+        };
+        event.extend_from_slice(zerocopy::IntoBytes::as_bytes(&header));
+        let message = TraceEventMessage {
+            trace_id: 1,
+            timestamp: 2,
+            pid: 3,
+            tid: 4,
+        };
+        event.extend_from_slice(zerocopy::IntoBytes::as_bytes(&message));
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&format_index.to_le_bytes());
+        payload.extend_from_slice(&[values.len() as u8, 0]);
+        for value in values {
+            payload.extend_from_slice(&0u16.to_le_bytes()); // var_name_index
+            payload.extend_from_slice(&0u16.to_le_bytes()); // type_index
+
+            // Exercise lossy access-path decoding as well as borrowed payloads.
+            let access_path = b".field\xff";
+            payload.push(access_path.len() as u8);
+            payload.push(VariableStatus::Ok as u8);
+            payload.extend_from_slice(access_path);
+            payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            payload.extend_from_slice(value);
+        }
+        append_instruction_header(
+            &mut event,
+            InstructionType::PrintComplexFormat,
+            payload.len(),
+        );
+        event.extend_from_slice(&payload);
+        append_instruction_header(
+            &mut event,
+            InstructionType::EndInstruction,
+            std::mem::size_of::<EndInstructionData>(),
+        );
+        event.extend_from_slice(&[1, 0, 0, 0]);
+        event
+    }
+
+    #[test]
+    fn complex_format_preserves_output_across_segments_and_buffer_reuse() {
+        let mut context = format_context();
+        let format_index = context
+            .add_string("escaped {{}}: {} | {:x.2} | {:s.*} | {:s.n$}".into())
+            .unwrap();
+        let event = complex_format_event(
+            format_index,
+            &[
+                &42u64.to_le_bytes(),
+                &[0xab, 0xcd, 0xef],
+                &3i64.to_le_bytes(),
+                b"hello",
+                &2i64.to_le_bytes(),
+                b"world",
+            ],
+        );
+        let expected = ["escaped {}: 42 | ab cd | hel | wo"];
+
+        for source in [EventSource::RingBuf, EventSource::PerfEventArray] {
+            let mut parser = StreamingTraceParser::with_event_source(source);
+            for split in 0..event.len() {
+                assert!(parser
+                    .process_segment(&event[..split], &context)
+                    .unwrap()
+                    .is_none());
+                let first = parser
+                    .process_segment(&event[split..], &context)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(first.to_formatted_output(), expected);
+
+                // A subsequent event can clear/overwrite the parser's buffer
+                // while the first event's formatted output remains available.
+                let second = parser.process_segment(&event, &context).unwrap().unwrap();
+                assert_eq!(second.to_formatted_output(), expected);
+                assert_eq!(first.to_formatted_output(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn cached_formats_follow_replaced_and_cleared_context_strings() {
+        let mut context = format_context();
+        context.add_string("first={}".into()).unwrap();
+        let event = complex_format_event(0, &[&42u64.to_le_bytes()]);
+        let mut parser = StreamingTraceParser::new();
+        let first = parser.process_segment(&event, &context).unwrap().unwrap();
+        assert_eq!(first.to_formatted_output(), ["first=42"]);
+
+        // A different context can reuse the same string index.
+        let mut replacement = context.clone();
+        replacement.strings[0] = "{{next}}={:x.1}".into();
+        for _ in 0..2 {
+            let next = parser
+                .process_segment(&event, &replacement)
+                .unwrap()
+                .unwrap();
+            assert_eq!(next.to_formatted_output(), ["{next}=2a"]);
+        }
+
+        // Clearing the table must not make a previously cached index valid.
+        replacement.strings.clear();
+        let missing = parser
+            .process_segment(&event, &replacement)
+            .unwrap()
+            .unwrap();
+        assert_eq!(missing.to_formatted_output(), ["<INVALID_FORMAT_INDEX_0>"]);
+
+        // Resetting stream state and reusing an index retains lossy formatting.
+        parser.reset();
+        replacement.add_string("bad={".into()).unwrap();
+        let malformed = parser
+            .process_segment(&event, &replacement)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            malformed.to_formatted_output(),
+            ["bad=<MALFORMED_PLACEHOLDER>"]
+        );
+        let original = parser.process_segment(&event, &context).unwrap().unwrap();
+        assert_eq!(original.to_formatted_output(), first.to_formatted_output());
+    }
+
+    #[test]
+    fn complex_format_rejects_truncated_argument_fields() {
+        let mut context = format_context();
+        context.add_string("{}".into()).unwrap();
+        let event = complex_format_event(0, &[&42u64.to_le_bytes()]);
+        let instruction_start =
+            std::mem::size_of::<TraceEventHeader>() + std::mem::size_of::<TraceEventMessage>();
+        let payload_start = instruction_start + std::mem::size_of::<InstructionHeader>();
+        let payload_end = event.len()
+            - std::mem::size_of::<InstructionHeader>()
+            - std::mem::size_of::<EndInstructionData>();
+
+        for end in payload_start + std::mem::size_of::<PrintComplexFormatData>()..payload_end {
+            let mut truncated = event[..end].to_vec();
+            let length = (end - payload_start) as u16;
+            truncated[instruction_start + 1..instruction_start + 3]
+                .copy_from_slice(&length.to_le_bytes());
+            let error = StreamingTraceParser::new()
+                .process_segment(&truncated, &context)
+                .unwrap_err();
+            assert!(error.starts_with("Invalid PrintComplexFormat"), "{error}");
+        }
     }
 
     #[test]

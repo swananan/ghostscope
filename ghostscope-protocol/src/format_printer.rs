@@ -45,14 +45,15 @@ struct NestedHashTableContext<'a> {
 
 // Removed legacy simple variable wrapper; use complex paths only.
 
-/// A parsed complex variable from PrintComplexVariable instruction data
+/// A temporary argument view used while formatting a PrintComplexFormat instruction.
+/// Payload bytes borrow the parser input; invalid UTF-8 access paths are repaired.
 #[derive(Debug, Clone)]
-pub struct ParsedComplexVariable {
+pub struct ParsedComplexVariable<'a> {
     pub var_name_index: u16,
     pub type_index: u16,
-    pub access_path: String,
+    pub access_path: Cow<'a, str>,
     pub status: u8, // 0 OK; non-zero means error payload in data
-    pub data: Vec<u8>,
+    pub data: &'a [u8],
 }
 
 struct RawPresentationPayload<'data, 'presentation> {
@@ -74,7 +75,7 @@ impl FormatPrinter {
     /// Format printer for converting PrintComplexFormat data to formatted strings
     pub fn format_complex_print_data(
         format_string_index: u16,
-        complex_variables: &[ParsedComplexVariable],
+        complex_variables: &[ParsedComplexVariable<'_>],
         trace_context: &TraceContext,
     ) -> String {
         // Get the format string from the trace context
@@ -86,7 +87,8 @@ impl FormatPrinter {
         };
 
         // Apply formatting using raw variables to support extended specifiers
-        Self::apply_format_with_specs(format_string, complex_variables, trace_context)
+        let template = FormatTemplate::parse_lossy(format_string);
+        Self::format_complex_print_template(&template, complex_variables, trace_context)
     }
 
     /// Simple placeholder applier for tests that don't use complex variables
@@ -114,12 +116,11 @@ impl FormatPrinter {
 
     /// Apply formatting with extended specifiers {:x}/{:X}/{:p}/{:s}, and optional
     /// length suffix .N / .* / .name$.
-    fn apply_format_with_specs(
-        format_string: &str,
-        vars: &[ParsedComplexVariable],
+    pub(crate) fn format_complex_print_template(
+        template: &FormatTemplate,
+        vars: &[ParsedComplexVariable<'_>],
         trace_context: &TraceContext,
     ) -> String {
-        let template = FormatTemplate::parse_lossy(format_string);
         let mut result = String::new();
         let mut var_index: usize = 0;
 
@@ -133,7 +134,7 @@ impl FormatPrinter {
                                 variable.var_name_index,
                                 variable.type_index,
                                 &variable.access_path,
-                                &variable.data,
+                                variable.data,
                                 variable.status,
                                 trace_context,
                             );
@@ -180,7 +181,7 @@ impl FormatPrinter {
                                 v.var_name_index,
                                 v.type_index,
                                 &v.access_path,
-                                &v.data,
+                                v.data,
                                 v.status,
                                 trace_context,
                             );
@@ -215,10 +216,10 @@ impl FormatPrinter {
                                         continue;
                                     } else {
                                         // both Ok or ZeroLength
-                                        let lenb = vars[var_index].data.as_slice();
+                                        let lenb = vars[var_index].data;
                                         let n = parse_len_usize(lenb);
                                         let v = &vars[var_index + 1];
-                                        let full = v.data.as_slice();
+                                        let full = v.data;
                                         let take = if v.status == VariableStatus::ZeroLength as u8 {
                                             0
                                         } else {
@@ -252,7 +253,7 @@ impl FormatPrinter {
                                         continue;
                                     } else {
                                         let v = &vars[var_index];
-                                        let full = v.data.as_slice();
+                                        let full = v.data;
                                         let take = if v.status == VariableStatus::ZeroLength as u8 {
                                             0
                                         } else {
@@ -287,10 +288,10 @@ impl FormatPrinter {
                                         var_index += 2;
                                         continue;
                                     } else {
-                                        let lenb = vars[var_index].data.as_slice();
+                                        let lenb = vars[var_index].data;
                                         let n = parse_len_usize(lenb);
                                         let v = &vars[var_index + 1];
-                                        let full = v.data.as_slice();
+                                        let full = v.data;
                                         let take = if v.status == VariableStatus::ZeroLength as u8 {
                                             0
                                         } else {
@@ -383,10 +384,10 @@ impl FormatPrinter {
                                         var_index += 2;
                                         continue;
                                     } else {
-                                        let lenb = vars[var_index].data.as_slice();
+                                        let lenb = vars[var_index].data;
                                         let n = parse_len_usize(lenb);
                                         let v = &vars[var_index + 1];
-                                        let full = v.data.as_slice();
+                                        let full = v.data;
                                         let take = if v.status == VariableStatus::ZeroLength as u8 {
                                             0
                                         } else {
@@ -407,7 +408,7 @@ impl FormatPrinter {
                                         continue;
                                     } else {
                                         let v = &vars[var_index];
-                                        let full = v.data.as_slice();
+                                        let full = v.data;
                                         let take = if v.status == VariableStatus::ZeroLength as u8 {
                                             0
                                         } else {
@@ -430,10 +431,10 @@ impl FormatPrinter {
                                         var_index += 2;
                                         continue;
                                     } else {
-                                        let lenb = vars[var_index].data.as_slice();
+                                        let lenb = vars[var_index].data;
                                         let n = parse_len_usize(lenb);
                                         let v = &vars[var_index + 1];
-                                        let full = v.data.as_slice();
+                                        let full = v.data;
                                         let take = if v.status == VariableStatus::ZeroLength as u8 {
                                             0
                                         } else {
@@ -482,7 +483,7 @@ impl FormatPrinter {
                                 var_index += 1;
                                 continue;
                             } else {
-                                let b = vars[var_index].data.as_slice();
+                                let b = vars[var_index].data;
                                 if b.len() >= 8 {
                                     let addr = u64::from_le_bytes([
                                         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
@@ -503,7 +504,7 @@ impl FormatPrinter {
                                     v.var_name_index,
                                     v.type_index,
                                     &v.access_path,
-                                    &v.data,
+                                    v.data,
                                     v.status,
                                     trace_context,
                                 );
@@ -528,7 +529,7 @@ impl FormatPrinter {
     }
 
     fn is_semantic_truncation(
-        variable: &ParsedComplexVariable,
+        variable: &ParsedComplexVariable<'_>,
         trace_context: &TraceContext,
     ) -> bool {
         variable.status == VariableStatus::Truncated as u8
@@ -1421,7 +1422,7 @@ impl FormatPrinter {
     }
 
     fn format_spec_payload_bytes<'a>(
-        variable: &'a ParsedComplexVariable,
+        variable: &'a ParsedComplexVariable<'_>,
         trace_context: &TraceContext,
     ) -> Result<FormatSpecPayload<'a>, String> {
         if variable.status == VariableStatus::ZeroLength as u8 {
@@ -1433,7 +1434,7 @@ impl FormatPrinter {
 
         let presentation = trace_context.get_value_presentation(variable.type_index);
         let outer_truncated = Self::is_semantic_truncation(variable, trace_context);
-        let raw_payload = match Self::raw_presentation_payload(&variable.data, presentation) {
+        let raw_payload = match Self::raw_presentation_payload(variable.data, presentation) {
             Ok(payload) => payload,
             Err(_) if outer_truncated => {
                 return Ok(FormatSpecPayload {
@@ -2778,12 +2779,12 @@ mod tests {
         let fmt_idx = trace_context
             .add_string("{}".to_string())
             .expect("add format string");
-        let complex_vars = vec![ParsedComplexVariable {
+        let complex_vars = [ParsedComplexVariable {
             var_name_index: var_name_idx,
             type_index: type_idx,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: 0,
-            data,
+            data: &data,
         }];
 
         let result =
@@ -3468,9 +3469,9 @@ mod tests {
         let variable = ParsedComplexVariable {
             var_name_index: name_index,
             type_index,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Ok as u8,
-            data,
+            data: &data,
         };
         assert_eq!(
             FormatPrinter::format_complex_print_data(
@@ -3570,9 +3571,9 @@ mod tests {
         let variable = ParsedComplexVariable {
             var_name_index: name_index,
             type_index,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Ok as u8,
-            data,
+            data: &data,
         };
 
         assert_eq!(
@@ -3587,7 +3588,7 @@ mod tests {
         let root_payload_len = variable.data.len();
         let child_payload_len = 2;
         let bucket_slot_stride = NESTED_VALUE_CHILD_HEADER_SIZE + child_payload_len;
-        let mut nested_data = variable.data.clone();
+        let mut nested_data = variable.data.to_vec();
         for _ in 0..controls.len() {
             nested_data.extend_from_slice(&nested_child_slot(
                 VariableStatus::AccessError,
@@ -3624,9 +3625,9 @@ mod tests {
         let nested_variable = ParsedComplexVariable {
             var_name_index: name_index,
             type_index: nested_type_index,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Ok as u8,
-            data: nested_data,
+            data: &nested_data,
         };
         assert_eq!(
             FormatPrinter::format_complex_print_data(
@@ -3641,9 +3642,9 @@ mod tests {
         let huge_count = ParsedComplexVariable {
             var_name_index: name_index,
             type_index,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Truncated as u8,
-            data: hash_table_payload(u64::MAX, u64::MAX, &[0x01], &[0x34, 0x12]),
+            data: &hash_table_payload(u64::MAX, u64::MAX, &[0x01], &[0x34, 0x12]),
         };
         assert_eq!(
             FormatPrinter::format_complex_print_data(
@@ -3736,9 +3737,9 @@ mod tests {
         let variable = ParsedComplexVariable {
             var_name_index: name_index,
             type_index,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Ok as u8,
-            data,
+            data: &data,
         };
         assert_eq!(
             FormatPrinter::format_complex_print_data(format_index, &[variable], &trace_context,),
@@ -3825,9 +3826,9 @@ mod tests {
         let variable = ParsedComplexVariable {
             var_name_index: name_index,
             type_index,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Truncated as u8,
-            data: data.clone(),
+            data: &data,
         };
         assert_eq!(
             FormatPrinter::format_complex_print_data(raw_format, &[variable], &trace_context,),
@@ -3836,9 +3837,9 @@ mod tests {
         let omitted_raw = ParsedComplexVariable {
             var_name_index: name_index,
             type_index,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Truncated as u8,
-            data: vec![0; 12],
+            data: &[0; 12],
         };
         assert_eq!(
             FormatPrinter::format_complex_print_data(raw_format, &[omitted_raw], &trace_context,),
@@ -3871,12 +3872,12 @@ mod tests {
             .add_variable_name("message".to_string())
             .unwrap();
         let data = indirect_bytes_payload(3, b"a\0b");
-        let vars = vec![ParsedComplexVariable {
+        let vars = [ParsedComplexVariable {
             var_name_index: name_idx,
             type_index: type_idx,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Ok as u8,
-            data,
+            data: &data,
         }];
 
         assert_eq!(
@@ -4209,12 +4210,12 @@ mod tests {
         let name_idx = trace_context
             .add_variable_name("message".to_string())
             .unwrap();
-        let vars = vec![ParsedComplexVariable {
+        let vars = [ParsedComplexVariable {
             var_name_index: name_idx,
             type_index: type_idx,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Ok as u8,
-            data: indirect_bytes_payload(5, b"a = b"),
+            data: &indirect_bytes_payload(5, b"a = b"),
         }];
 
         assert_eq!(
@@ -4236,9 +4237,9 @@ mod tests {
         let variable = ParsedComplexVariable {
             var_name_index: name_idx,
             type_index: type_idx,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Ok as u8,
-            data: indirect_bytes_payload(3, b"abc"),
+            data: &indirect_bytes_payload(3, b"abc"),
         };
 
         assert_eq!(
@@ -4262,9 +4263,9 @@ mod tests {
         let variable = ParsedComplexVariable {
             var_name_index: name_idx,
             type_index: type_idx,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Ok as u8,
-            data: indirect_bytes_payload(3, b"a\xffb"),
+            data: &indirect_bytes_payload(3, b"a\xffb"),
         };
 
         assert_eq!(
@@ -4290,9 +4291,9 @@ mod tests {
         let variable = ParsedComplexVariable {
             var_name_index: name_idx,
             type_index: type_idx,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Truncated as u8,
-            data: indirect_bytes_payload(6, b"abc"),
+            data: &indirect_bytes_payload(6, b"abc"),
         };
 
         assert_eq!(
@@ -4395,12 +4396,12 @@ mod tests {
         elements.extend_from_slice(&1i32.to_le_bytes());
         elements.extend_from_slice(&(-2i32).to_le_bytes());
         elements.extend_from_slice(&3i32.to_le_bytes());
-        let vars = vec![ParsedComplexVariable {
+        let vars = [ParsedComplexVariable {
             var_name_index: name_idx,
             type_index: type_idx,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Ok as u8,
-            data: indirect_sequence_payload(3, 3, &elements),
+            data: &indirect_sequence_payload(3, 3, &elements),
         }];
 
         assert_eq!(
@@ -4609,9 +4610,9 @@ mod tests {
         let truncated = ParsedComplexVariable {
             var_name_index: name_idx,
             type_index: type_idx,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Ok as u8,
-            data: truncated_data,
+            data: &truncated_data,
         };
         assert_eq!(
             FormatPrinter::format_complex_print_data(
@@ -4638,9 +4639,9 @@ mod tests {
         let error = ParsedComplexVariable {
             var_name_index: name_idx,
             type_index: type_idx,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::Ok as u8,
-            data: error_data,
+            data: &error_data,
         };
         assert_eq!(
             FormatPrinter::format_complex_print_data(
@@ -5070,12 +5071,12 @@ mod tests {
             .add_variable_name("buf".to_string())
             .expect("add variable name");
 
-        let vars = vec![ParsedComplexVariable {
+        let vars = [ParsedComplexVariable {
             var_name_index: var_name_idx,
             type_index: type_idx,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::NullDeref as u8,
-            data: vec![],
+            data: &[],
         }];
 
         let out = FormatPrinter::format_complex_print_data(fmt_idx, &vars, &trace_context);
@@ -5118,12 +5119,12 @@ mod tests {
         data.extend_from_slice(&errno.to_le_bytes());
         data.extend_from_slice(&addr.to_le_bytes());
 
-        let vars = vec![ParsedComplexVariable {
+        let vars = [ParsedComplexVariable {
             var_name_index: var_name_idx,
             type_index: type_idx,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::ReadError as u8,
-            data,
+            data: &data,
         }];
 
         let out = FormatPrinter::format_complex_print_data(fmt_idx, &vars, &trace_context);
@@ -5154,12 +5155,12 @@ mod tests {
             .add_variable_name("ptr".to_string())
             .expect("add variable name");
 
-        let vars = vec![ParsedComplexVariable {
+        let vars = [ParsedComplexVariable {
             var_name_index: var_name_idx,
             type_index: type_idx,
-            access_path: String::new(),
+            access_path: Cow::Borrowed(""),
             status: VariableStatus::OffsetsUnavailable as u8,
-            data: vec![],
+            data: &[],
         }];
 
         let out = FormatPrinter::format_complex_print_data(fmt_idx, &vars, &trace_context);
@@ -5208,16 +5209,16 @@ mod tests {
             ParsedComplexVariable {
                 var_name_index: len_name_idx,
                 type_index: len_ty_idx,
-                access_path: String::new(),
+                access_path: Cow::Borrowed(""),
                 status: VariableStatus::NullDeref as u8,
-                data: vec![],
+                data: &[],
             },
             ParsedComplexVariable {
                 var_name_index: val_name_idx,
                 type_index: val_ty_idx,
-                access_path: String::new(),
+                access_path: Cow::Borrowed(""),
                 status: VariableStatus::Ok as u8,
-                data: val_data,
+                data: &val_data,
             },
         ];
 
