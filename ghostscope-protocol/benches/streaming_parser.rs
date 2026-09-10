@@ -1,8 +1,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use ghostscope_protocol::streaming_parser::StreamingTraceParser;
 use ghostscope_protocol::trace_event::{
-    EndInstructionData, InstructionHeader, InstructionType, PrintComplexVariableData,
-    TraceEventHeader, TraceEventMessage, VariableStatus,
+    EndInstructionData, InstructionHeader, InstructionType, PrintComplexFormatData,
+    PrintComplexVariableData, TraceEventHeader, TraceEventMessage, VariableStatus,
 };
 use ghostscope_protocol::{TraceContext, TypeInfo};
 use std::hint::black_box;
@@ -131,5 +131,125 @@ fn benchmark_streaming_parser(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, benchmark_streaming_parser);
+fn build_format_event(argument_count: u8, payload_size: usize) -> (TraceContext, Vec<u8>) {
+    let mut context = TraceContext::new();
+    context.add_variable_name("payload".into()).unwrap();
+    let scalar = payload_size == 8;
+    let ty = if scalar {
+        TypeInfo::BaseType {
+            name: "u64".into(),
+            size: 8,
+            encoding: gimli::constants::DW_ATE_unsigned.0 as u16,
+        }
+    } else {
+        TypeInfo::ArrayType {
+            element_type: Box::new(TypeInfo::BaseType {
+                name: "char".into(),
+                size: 1,
+                encoding: gimli::constants::DW_ATE_unsigned_char.0 as u16,
+            }),
+            element_count: Some(payload_size as u64),
+            total_size: Some(payload_size as u64),
+        }
+    };
+    context.add_type(ty).unwrap();
+    let slot = if scalar { "{}" } else { "{:s}" };
+    context
+        .add_string(
+            (0..argument_count)
+                .map(|index| format!("field{index}={slot}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+        .unwrap();
+
+    let mut arguments = Vec::new();
+    for _ in 0..argument_count {
+        arguments.extend_from_slice(&0u16.to_le_bytes()); // var_name_index
+        arguments.extend_from_slice(&0u16.to_le_bytes()); // type_index
+        let access_path = b".field";
+        arguments.push(access_path.len() as u8);
+        arguments.push(VariableStatus::Ok as u8);
+        arguments.extend_from_slice(access_path);
+        arguments.extend_from_slice(&(payload_size as u16).to_le_bytes());
+        if scalar {
+            arguments.extend_from_slice(&42u64.to_le_bytes());
+        } else {
+            // A fixed-size character buffer with a short NUL-terminated value.
+            // Captured padding should not require a temporary copy for formatting.
+            arguments.extend_from_slice(b"hello\0");
+            arguments.resize(arguments.len() + payload_size - 6, 0);
+        }
+    }
+
+    let mut event = Vec::new();
+    event.extend_from_slice(
+        TraceEventHeader {
+            magic: ghostscope_protocol::consts::MAGIC,
+            reserved: 0,
+            generation: 0,
+        }
+        .as_bytes(),
+    );
+    event.extend_from_slice(
+        TraceEventMessage {
+            trace_id: 1,
+            timestamp: 2,
+            pid: 3,
+            tid: 4,
+        }
+        .as_bytes(),
+    );
+    append_instruction_header(
+        &mut event,
+        InstructionType::PrintComplexFormat,
+        size_of::<PrintComplexFormatData>() + arguments.len(),
+    );
+    event.extend_from_slice(&0u16.to_le_bytes()); // format_string_index
+    event.push(argument_count);
+    event.push(0);
+    event.extend_from_slice(&arguments);
+    append_instruction_header(
+        &mut event,
+        InstructionType::EndInstruction,
+        size_of::<EndInstructionData>(),
+    );
+    event.extend_from_slice(&1u16.to_le_bytes());
+    event.extend_from_slice(&[0, 0]);
+    (context, event)
+}
+
+fn benchmark_complex_format(c: &mut Criterion) {
+    let mut group = c.benchmark_group("streaming_parser/complex_format");
+    for (name, argument_count, payload_size) in [
+        ("scalar", 1, 8),
+        ("scalar", 8, 8),
+        ("char_buffer_256", 1, 256),
+        ("char_buffer_4096", 1, 4096),
+    ] {
+        let (context, event) = build_format_event(argument_count, payload_size);
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(
+            BenchmarkId::new(name, argument_count),
+            &event,
+            |b, event| {
+                let mut parser = StreamingTraceParser::new();
+                b.iter(|| {
+                    let parsed = parser
+                        .process_segment(black_box(event), black_box(&context))
+                        .expect("format event parses successfully")
+                        .expect("format event is complete");
+                    black_box(parsed);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    benchmark_streaming_parser,
+    benchmark_complex_format
+);
 criterion_main!(benches);
