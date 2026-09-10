@@ -8,7 +8,12 @@ use crossterm::{
     terminal::{disable_raw_mode, LeaveAlternateScreen},
 };
 use futures_util::StreamExt;
+use tokio::time::{Duration, Instant};
 use tracing::debug;
+
+const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+const TRACE_BATCH_SIZE: usize = 256;
+const STATUS_BATCH_SIZE: usize = 64;
 
 impl App {
     pub async fn run(&mut self) -> Result<()> {
@@ -16,7 +21,11 @@ impl App {
 
         // Create async event stream (proper crossterm async support)
         let mut event_stream = EventStream::new();
-        let mut needs_render = true;
+        let mut needs_render = false;
+        let mut trace_batch = Vec::with_capacity(TRACE_BATCH_SIZE);
+        let mut status_batch = Vec::with_capacity(STATUS_BATCH_SIZE);
+        let mut trace_channel_open = true;
+        let mut status_channel_open = true;
 
         // Create a timeout for loading - if no runtime response, go to ready
         const LOADING_TIMEOUT_SECS: u64 = 30;
@@ -35,6 +44,7 @@ impl App {
 
         // Initial render
         self.terminal.draw(|f| Self::draw_ui(f, &mut self.state))?;
+        let mut next_render = Instant::now() + FRAME_INTERVAL;
 
         loop {
             // Handle events using select! to monitor multiple sources
@@ -58,17 +68,25 @@ impl App {
                     }
                 }
 
-                // Handle runtime status messages
-                Some(status) = self.state.event_registry.status_receiver.recv() => {
-                    self.handle_runtime_status(status).await;
-                    needs_render = true;
+                // Bound each batch so terminal input and timers get another turn.
+                count = self.state.event_registry.status_receiver.recv_many(&mut status_batch, STATUS_BATCH_SIZE), if status_channel_open => {
+                    status_channel_open = count != 0;
+                    for status in status_batch.drain(..) {
+                        self.handle_runtime_status(status).await;
+                    }
+                    needs_render |= count != 0;
                 }
 
-                // Handle trace events
-                Some(trace_event) = self.state.event_registry.trace_receiver.recv() => {
-                    self.handle_trace_event(trace_event).await;
-                    needs_render = true;
+                count = self.state.event_registry.trace_receiver.recv_many(&mut trace_batch, TRACE_BATCH_SIZE), if trace_channel_open => {
+                    trace_channel_open = count != 0;
+                    for trace_event in trace_batch.drain(..) {
+                        self.handle_trace_event(trace_event).await;
+                    }
+                    needs_render |= count != 0;
                 }
+
+                // Flush a pending frame even when a burst ends before the deadline.
+                () = tokio::time::sleep_until(next_render), if needs_render => {}
 
                 // Loading timeout - show error in loading UI
                 () = &mut loading_timeout, if !self.state.loading_state.is_ready() && !self.state.loading_state.is_failed() => {
@@ -112,15 +130,18 @@ impl App {
                 }
             }
 
-            // Render only when needed (event-driven)
-            if needs_render {
-                self.terminal.draw(|f| Self::draw_ui(f, &mut self.state))?;
-                needs_render = false;
-            }
-
             // Check for quit condition
             if self.should_quit || self.state.should_quit {
                 break;
+            }
+
+            // Check after every batch as well as timer wakeups so a busy queue
+            // cannot starve rendering. Start the next interval after the draw to
+            // avoid catch-up frames when rendering or event handling is slow.
+            if needs_render && Instant::now() >= next_render {
+                self.terminal.draw(|f| Self::draw_ui(f, &mut self.state))?;
+                needs_render = false;
+                next_render = Instant::now() + FRAME_INTERVAL;
             }
         }
 
