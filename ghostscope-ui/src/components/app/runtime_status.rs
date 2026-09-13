@@ -1492,6 +1492,7 @@ impl App {
                         let failed_count = batch.failed_count;
                         let disabled_count = batch.disabled_count;
                         let details = batch.details.clone();
+                        let warnings = batch.warnings.clone();
 
                         // Clear batch loading state
                         self.state.command_panel.batch_loading = None;
@@ -1552,8 +1553,12 @@ impl App {
                             }
                         }
 
+                        for warning in &warnings {
+                            response.push_str(&format!("\n⚠ {warning}\n"));
+                        }
+
                         // Create styled version using helper method
-                        let styled_lines =
+                        let mut styled_lines =
                             crate::components::command_panel::ResponseFormatter::format_batch_load_summary_styled(
                                 &filename,
                                 total_count,
@@ -1562,11 +1567,18 @@ impl App {
                                 disabled_count,
                                 &details,
                             );
+                        for warning in &warnings {
+                            styled_lines.extend(
+                                crate::components::command_panel::ResponseFormatter::style_generic_message_lines(
+                                    &format!("⚠ {warning}"),
+                                ),
+                            );
+                        }
 
                         let action = Action::AddResponseWithStyle {
                             content: response,
                             styled_lines: Some(styled_lines),
-                            response_type: if failed_count > 0 {
+                            response_type: if failed_count > 0 || !warnings.is_empty() {
                                 crate::action::ResponseType::Warning
                             } else {
                                 crate::action::ResponseType::Success
@@ -1711,7 +1723,11 @@ impl App {
         match status {
             RuntimeStatus::ScriptCompilationCompleted { details } => {
                 // Check if compilation actually succeeded
-                if details.success_count > 0 {
+                if details.success_count == 0 && details.failed_count > 0 {
+                    crate::action::ResponseType::Error
+                } else if !details.warnings.is_empty() {
+                    crate::action::ResponseType::Warning
+                } else if details.success_count > 0 {
                     crate::action::ResponseType::Success
                 } else {
                     crate::action::ResponseType::Error

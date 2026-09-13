@@ -18,6 +18,22 @@ pub fn compile_script_for_cli(
 ) -> Result<ghostscope_compiler::CompilationResult> {
     info!("Starting unified script compilation with DWARF integration...");
 
+    // Optional failures can remove matching probes from an otherwise successful
+    // compilation. Report the current state after any refresh, independently of
+    // logging, status rendering, and whether stderr is a terminal.
+    if let Some(analyzer) = &session.process_analyzer {
+        let failures = analyzer.module_load_failures();
+        if !failures.is_empty() {
+            eprintln!(
+                "Warning: {} module(s) failed to load; probes in these modules are unavailable:",
+                failures.len()
+            );
+            for failure in failures {
+                eprintln!("  {failure}");
+            }
+        }
+    }
+
     let compilation_result = match compile_script_with_session(script, session, compile_options) {
         Ok(result) => result,
         Err(SessionCompileError::Compile(e)) => {

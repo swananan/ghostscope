@@ -823,6 +823,11 @@ impl ScriptEditor {
             }
         }
 
+        for warning in &compilation_details.warnings {
+            result.push(String::new());
+            result.push(format!("\x1b[33m⚠ {warning}\x1b[0m"));
+        }
+
         result.join("\n")
     }
 

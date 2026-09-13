@@ -4,11 +4,12 @@ mod common;
 
 use anyhow::{bail, Context, Result};
 use common::init;
-use object::Object;
+use object::{Object, ObjectSection};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use tempfile::TempDir;
 
@@ -464,6 +465,138 @@ async fn test_startup_rejects_aarch64_target() -> Result<()> {
         run.output
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_optional_module_failure_is_reported_without_cli_status() -> Result<()> {
+    init();
+    if !is_host_topology() {
+        println!("skipping startup load report e2e outside host->host topology");
+        return Ok(());
+    }
+
+    let dir = TempDir::new()?;
+    let source = dir.path().join("target.c");
+    let binary = dir.path().join("target");
+    let library_source = dir.path().join("optional.c");
+    let library = dir.path().join("liboptional.so");
+    fs::write(
+        &source,
+        r#"
+#include <dlfcn.h>
+#include <unistd.h>
+int shared_function(void) { return 1; }
+int main(int argc, char **argv) {
+    if (argc != 2 || !dlopen(argv[1], RTLD_NOW | RTLD_LOCAL)) return 1;
+    write(STDOUT_FILENO, "ready\n", 6);
+    for (;;) pause();
+}
+"#,
+    )?;
+    fs::write(&library_source, "int shared_function(void) { return 2; }\n")?;
+    for (source, output_path, flags) in [
+        (&source, &binary, &[][..]),
+        (&library_source, &library, &["-shared", "-fPIC"][..]),
+    ] {
+        let output = Command::new("cc")
+            .args(["-g", "-gdwarf-4", "-O0"])
+            .args(flags)
+            .arg(source)
+            .arg("-o")
+            .arg(output_path)
+            .arg("-ldl")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to build optional module fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let mut bytes = fs::read(&library)?;
+    let object = object::File::parse(bytes.as_slice())?;
+    let (offset, _) = object
+        .section_by_name(".debug_info")
+        .and_then(|section| section.file_range())
+        .context("optional library has no .debug_info")?;
+    // Preserve a loadable ELF with the same function as the executable, but
+    // make its DWARF fail parsing so a successful script would omit its probe.
+    bytes[offset as usize..offset as usize + 4].copy_from_slice(&0xfffffff0u32.to_le_bytes());
+    fs::write(&library, bytes)?;
+
+    let target = Command::new(&binary)
+        .arg(&library)
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut target = scopeguard::guard(target, |mut child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+    let mut ready = String::new();
+    BufReader::new(target.stdout.take().context("target stdout unavailable")?)
+        .read_line(&mut ready)?;
+    anyhow::ensure!(ready == "ready\n", "optional module target did not start");
+
+    let config_path = dir.path().join("ghostscope.toml");
+    fs::write(&config_path, TEST_CONFIG)?;
+    let sandbox = common::sandbox::SandboxHandle::default_ghostscope()?;
+    let (program, sandbox_args) = sandbox.ghostscope_command()?;
+    for (status_args, use_pty) in [
+        (&[][..], false),
+        (&["--no-status"][..], false),
+        (&["--no-status"][..], true),
+    ] {
+        let mut command = Command::new(&program);
+        command
+            .args(&sandbox_args)
+            .arg("--config")
+            .arg(&config_path)
+            .args(["--pid", &target.id().to_string()])
+            .args([
+                "--script",
+                "trace shared_function { print \"healthy probe\"; }",
+                "--dry-run",
+            ])
+            .args(status_args);
+        let output = if use_pty {
+            let args = command
+                .get_args()
+                .map(OsStr::to_os_string)
+                .collect::<Vec<_>>();
+            let command_line = shell_command_line(command.get_program(), &args);
+            Command::new("script")
+                .env("TERM", "xterm-256color")
+                .args(["-q", "-e", "-c", &command_line, "/dev/null"])
+                .output()?
+        } else {
+            command.output()?
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let diagnostics = if use_pty { &stdout } else { &stderr };
+        anyhow::ensure!(
+            output.status.success(),
+            "optional failure should preserve compilation: {stdout}\n{stderr}"
+        );
+        assert_output_contains(&stdout, "Summary: 1 attachable target(s)");
+        assert_output_contains(&stdout, "shared_function");
+        assert_output_contains(diagnostics, "Warning: 1 module(s) failed to load");
+        assert_output_contains(diagnostics, "probes in these modules are unavailable");
+        assert_output_contains(
+            diagnostics,
+            library.to_str().context("non-UTF-8 library path")?,
+        );
+        assert_output_contains(diagnostics, "unknown reserved length: 0xfffffff0");
+        if !use_pty {
+            assert!(!stdout.contains("Warning:"), "{stdout}");
+        }
+        assert!(
+            !diagnostics.contains("Startup load report:"),
+            "{diagnostics}"
+        );
+    }
     Ok(())
 }
 

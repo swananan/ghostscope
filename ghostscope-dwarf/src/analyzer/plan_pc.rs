@@ -16,6 +16,7 @@ impl DwarfAnalyzer {
     /// query APIs, so `pc` and `normalized_pc` intentionally match. Runtime
     /// rebasing details are preserved in `address_space` for future lowering.
     pub fn resolve_pc(&self, module_address: &ModuleAddress) -> Result<PcContext> {
+        self.ensure_module_available(&module_address.module_path)?;
         if let Some(context) = self
             .pc_context_cache
             .read()

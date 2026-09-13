@@ -1348,6 +1348,9 @@ impl GhostSession {
             None
         };
 
+        if let (Some(analyzer), Some(target)) = (&process_analyzer, &self.target_binary) {
+            analyzer.resolve_target_module_path(target)?;
+        }
         self.process_analyzer = process_analyzer;
         Ok(())
     }
@@ -1403,6 +1406,9 @@ impl GhostSession {
             None
         };
 
+        if let (Some(analyzer), Some(target)) = (&process_analyzer, &self.target_binary) {
+            analyzer.resolve_target_module_path(target)?;
+        }
         self.process_analyzer = process_analyzer;
         Ok(())
     }

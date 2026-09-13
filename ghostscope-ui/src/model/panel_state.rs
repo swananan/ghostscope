@@ -447,6 +447,7 @@ pub struct BatchLoadingState {
     pub failed_count: usize,
     pub disabled_count: usize,
     pub details: Vec<crate::events::TraceLoadDetail>,
+    pub warnings: Vec<String>,
     requested_enabled: VecDeque<bool>,
 }
 
@@ -460,6 +461,7 @@ impl BatchLoadingState {
             failed_count: 0,
             disabled_count: 0,
             details: Vec::new(),
+            warnings: Vec::new(),
             requested_enabled: traces.iter().map(|trace| trace.enabled).collect(),
         }
     }
@@ -470,6 +472,11 @@ impl BatchLoadingState {
         let requested_enabled = self.requested_enabled.pop_front().unwrap_or(true);
         self.success_count += details.success_count;
         self.failed_count += details.failed_count;
+        for warning in &details.warnings {
+            if !self.warnings.contains(warning) {
+                self.warnings.push(warning.clone());
+            }
+        }
 
         let mut trace_ids = details.trace_ids.iter().copied();
         for result in &details.results {
@@ -1414,6 +1421,7 @@ mod tests {
             total_count: 1,
             success_count: 1,
             failed_count: 0,
+            warnings: Vec::new(),
         }
     }
 
@@ -1433,6 +1441,7 @@ mod tests {
             total_count: 1,
             success_count: 0,
             failed_count: 1,
+            warnings: Vec::new(),
         }
     }
 
@@ -1478,5 +1487,24 @@ mod tests {
         assert_eq!(batch.details.len(), 1);
         assert!(matches!(batch.details[0].status, LoadStatus::Failed));
         assert_eq!(batch.details[0].trace_id, None);
+    }
+
+    #[test]
+    fn batch_loading_deduplicates_module_load_warnings() {
+        let traces = vec![
+            trace_definition("first_target", true),
+            trace_definition("second_target", true),
+        ];
+        let mut batch = BatchLoadingState::new("saved.gs".to_string(), &traces);
+        let warning = "Warning: optional module failed to load".to_string();
+        let mut first = successful_compilation(42, "first_target");
+        first.warnings.push(warning.clone());
+        let mut second = successful_compilation(43, "second_target");
+        second.warnings.push(warning.clone());
+
+        batch.record_script_compilation(&first);
+        batch.record_script_compilation(&second);
+
+        assert_eq!(batch.warnings, vec![warning]);
     }
 }

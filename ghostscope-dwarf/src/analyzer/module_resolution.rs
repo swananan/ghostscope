@@ -1,4 +1,4 @@
-use super::{AddressQueryResult, DwarfAnalyzer};
+use super::{AddressQueryResult, DwarfAnalyzer, ModuleLoadFailure};
 use crate::core::{ModuleAddress, Result};
 use std::ffi::OsStr;
 use std::os::unix::fs::MetadataExt;
@@ -16,6 +16,37 @@ impl DwarfAnalyzer {
         let mut modules: Vec<PathBuf> = self.modules.keys().cloned().collect();
         modules.sort();
         modules
+    }
+
+    /// Return load failures in path order. Successful refreshes remove their failures.
+    pub fn module_load_failures(&self) -> Vec<&ModuleLoadFailure> {
+        let mut failures: Vec<_> = self.failed_modules.values().collect();
+        failures.sort_by(|left, right| left.module_path.cmp(&right.module_path));
+        failures
+    }
+
+    /// Reject a query whose module is known to have failed loading.
+    pub fn ensure_module_available<P: AsRef<Path>>(&self, module_path: P) -> Result<()> {
+        let module_path = module_path.as_ref();
+        if self.failed_modules.is_empty() || self.modules.contains_key(module_path) {
+            return Ok(());
+        }
+        if let Some(failure) = self.failed_modules.get(module_path).or_else(|| {
+            self.module_load_failures()
+                .into_iter()
+                .find(|failure| Self::module_paths_equivalent(&failure.module_path, module_path))
+        }) {
+            return Err(failure.clone().into());
+        }
+        Ok(())
+    }
+
+    fn discovered_module_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.module_paths();
+        paths.extend(self.failed_modules.keys().cloned());
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// Treat identical paths and symlink aliases that canonicalize to the same
@@ -54,19 +85,20 @@ impl DwarfAnalyzer {
             || module_path.to_string_lossy().ends_with(spec)
     }
 
-    /// Resolve a module spec against all loaded modules.
+    /// Resolve a module spec, retaining failed modules for ambiguity checks.
     pub fn resolve_loaded_module_by_spec(&self, module_spec: &str) -> Result<PathBuf> {
         let module_spec = module_spec.trim();
         if module_spec.is_empty() {
             return Err(anyhow::anyhow!("Module spec is empty"));
         }
 
-        let modules = self.module_paths();
+        let modules = self.discovered_module_paths();
 
         if let Some(found) = modules
             .iter()
             .find(|module_path| Self::module_paths_equivalent(module_path, Path::new(module_spec)))
         {
+            self.ensure_module_available(found)?;
             return Ok(found.clone());
         }
 
@@ -79,7 +111,10 @@ impl DwarfAnalyzer {
             0 => Err(anyhow::anyhow!(
                 "Module '{module_spec}' not found among loaded modules. Use full path or a unique suffix."
             )),
-            1 => Ok(candidates[0].clone()),
+            1 => {
+                self.ensure_module_available(&candidates[0])?;
+                Ok(candidates[0].clone())
+            }
             _ => {
                 let sample: Vec<String> = candidates
                     .iter()
@@ -103,7 +138,7 @@ impl DwarfAnalyzer {
         }
 
         let matches: Vec<PathBuf> = self
-            .module_paths()
+            .discovered_module_paths()
             .into_iter()
             .filter(|module_path| {
                 Self::module_paths_equivalent(module_path, Path::new(target_path))
@@ -114,7 +149,10 @@ impl DwarfAnalyzer {
             0 => Err(anyhow::anyhow!(
                 "Target '{target_path}' from -t is not loaded in the analyzed modules. When -t and -p are combined, -t scopes trace target resolution and -p only supplies PID filtering."
             )),
-            1 => Ok(matches[0].clone()),
+            1 => {
+                self.ensure_module_available(&matches[0])?;
+                Ok(matches[0].clone())
+            }
             _ => Err(anyhow::anyhow!(
                 "Target '{target_path}' from -t matches multiple loaded modules; use a more specific path."
             )),
@@ -161,20 +199,22 @@ impl DwarfAnalyzer {
         }
 
         if let Some(main) = self
-            .module_paths()
+            .discovered_module_paths()
             .into_iter()
             .find(|module_path| self.is_main_executable_module(module_path))
         {
+            self.ensure_module_available(&main)?;
             return Ok(main);
         }
 
         if fallback == ModuleDefaultPolicy::MainExecutableOrSingleSharedLibrary {
             let libs: Vec<PathBuf> = self
-                .module_paths()
+                .discovered_module_paths()
                 .into_iter()
                 .filter(|module_path| self.is_shared_library(module_path))
                 .collect();
             if libs.len() == 1 {
+                self.ensure_module_available(&libs[0])?;
                 return Ok(libs[0].clone());
             }
         }
@@ -199,10 +239,6 @@ impl DwarfAnalyzer {
         let Some(target_path) = target_path else {
             return Ok(module_addresses);
         };
-        if module_addresses.is_empty() {
-            return Ok(module_addresses);
-        }
-
         let target_module = self.resolve_target_module_path(target_path)?;
         Ok(module_addresses
             .into_iter()
@@ -221,10 +257,6 @@ impl DwarfAnalyzer {
         let Some(target_path) = target_path else {
             return Ok(addresses);
         };
-        if addresses.is_empty() {
-            return Ok(addresses);
-        }
-
         let target_module = self.resolve_target_module_path(target_path)?;
         Ok(addresses
             .into_iter()
