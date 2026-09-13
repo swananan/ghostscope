@@ -673,6 +673,7 @@ async fn compile_script_for_tui_details(
                         total_count: 1,
                         success_count: 0,
                         failed_count: 1,
+                        warnings: Vec::new(),
                     }
                 }
             };
@@ -697,6 +698,7 @@ async fn compile_script_for_tui_details(
             total_count: 1,
             success_count: 0,
             failed_count: 1,
+            warnings: Vec::new(),
         }
     }
 }

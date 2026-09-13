@@ -97,6 +97,14 @@ pub struct LoadedModuleRuntimeInfo {
     pub size: u64,
 }
 
+/// A discovered module whose object or debug information could not be loaded.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("Module {module_path} failed to load: {error}", module_path = .module_path.display())]
+pub struct ModuleLoadFailure {
+    pub module_path: PathBuf,
+    pub error: String,
+}
+
 /// Rich query result for a function lookup across modules.
 #[derive(Debug, Clone)]
 pub struct FunctionQueryResult {

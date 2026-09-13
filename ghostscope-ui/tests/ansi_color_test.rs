@@ -22,6 +22,7 @@ fn test_trace_results_success_color() {
             value_diagnostics: Vec::new(),
         }],
         trace_ids: vec![0],
+        warnings: Vec::new(),
     };
 
     let result = ScriptEditor::format_compilation_results(
@@ -50,6 +51,42 @@ fn test_trace_results_success_color() {
 }
 
 #[test]
+fn module_load_warnings_are_visible_without_changing_trace_counts() {
+    let compilation_details = ScriptCompilationDetails {
+        total_count: 1,
+        success_count: 1,
+        failed_count: 0,
+        results: vec![ScriptExecutionResult {
+            target_name: "healthy_function".to_string(),
+            binary_path: "/path/to/binary".to_string(),
+            pc_address: 0x1000,
+            status: ExecutionStatus::Success,
+            source_file: None,
+            source_line: None,
+            is_inline: None,
+            value_diagnostics: Vec::new(),
+        }],
+        trace_ids: vec![7],
+        warnings: vec![concat!(
+            "Warning: 1 module(s) failed to load; probes in these modules are unavailable:\n",
+            "  Module /tmp/libbad.so failed to load: invalid DWARF"
+        )
+        .to_string()],
+    };
+
+    let output = ScriptEditor::format_compilation_results(
+        &compilation_details,
+        Some("trace healthy_function"),
+        &EmojiConfig::new(false),
+    );
+
+    assert!(output.contains("\x1b[32m1 successful\x1b[0m"));
+    assert!(output.contains("0 failed"));
+    assert!(output.contains("\x1b[33m⚠ Warning: 1 module(s) failed to load"));
+    assert!(output.contains("/tmp/libbad.so failed to load: invalid DWARF"));
+}
+
+#[test]
 fn test_trace_results_failed_color() {
     // Test that failed count is shown in red
     let emoji_config = EmojiConfig::new(true);
@@ -69,6 +106,7 @@ fn test_trace_results_failed_color() {
             value_diagnostics: Vec::new(),
         }],
         trace_ids: vec![],
+        warnings: Vec::new(),
     };
 
     let result = ScriptEditor::format_compilation_results(
@@ -138,6 +176,7 @@ fn test_trace_results_mixed_colors() {
             },
         ],
         trace_ids: vec![0, 1],
+        warnings: Vec::new(),
     };
 
     let result = ScriptEditor::format_compilation_results(
@@ -183,6 +222,7 @@ fn test_trace_results_preserve_multiline_failure_diagnostics() {
             value_diagnostics: Vec::new(),
         }],
         trace_ids: vec![],
+        warnings: Vec::new(),
     };
 
     let result = ScriptEditor::format_compilation_results(
@@ -220,6 +260,7 @@ fn display_limits_remain_successful_and_are_visible_in_trace_details() {
             is_inline: None,
             value_diagnostics: vec![note.clone()],
         }],
+        warnings: Vec::new(),
     };
     let output = ScriptEditor::format_compilation_results(&details, None, &EmojiConfig::new(false));
     assert!(output.contains("1 successful"));

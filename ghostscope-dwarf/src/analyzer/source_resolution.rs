@@ -97,6 +97,9 @@ impl DwarfAnalyzer {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        if let Some(target_path) = target_path {
+            self.resolve_target_module_path(target_path)?;
+        }
         let mut seen = HashSet::new();
         let mut first_target_filtered: Option<SourceLineAddressSearch> = None;
 

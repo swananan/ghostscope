@@ -105,6 +105,7 @@ impl DwarfAnalyzer {
         base: &str,
         path: &VariableAccessPath,
     ) -> Result<Option<(PathBuf, VariableReadPlan)>> {
+        self.ensure_module_available(prefer_module)?;
         let mut matches = self.find_global_variables_by_name(base);
         let mut has_unknown_scope = false;
         if let Some(context) = context {

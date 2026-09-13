@@ -170,6 +170,8 @@ pub struct ScriptCompilationDetails {
     pub total_count: usize,
     pub success_count: usize,
     pub failed_count: usize,
+    /// Non-fatal diagnostics that did not prevent healthy trace targets from loading.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

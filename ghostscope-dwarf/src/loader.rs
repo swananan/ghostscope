@@ -1,7 +1,7 @@
 //! Module loading with Builder pattern and parallel support
 
 use crate::{
-    analyzer::{ModuleLoadingEvent, ModuleLoadingStats},
+    analyzer::{ModuleLoadFailure, ModuleLoadingEvent, ModuleLoadingStats},
     core::{mapping::ModuleMapping, Result},
     objfile::LoadedObjfile,
 };
@@ -76,6 +76,13 @@ impl LoadConfig {
 pub struct ModuleLoader {
     mappings: Vec<ModuleMapping>,
     config: LoadConfig,
+    required_module: Option<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ModuleLoadResult {
+    pub modules: Vec<LoadedObjfile>,
+    pub failures: Vec<ModuleLoadFailure>,
 }
 
 impl ModuleLoader {
@@ -84,12 +91,19 @@ impl ModuleLoader {
         Self {
             mappings,
             config: LoadConfig::default(),
+            required_module: None,
         }
     }
 
     /// Use predefined parallel configuration
     pub fn parallel(mut self) -> Self {
         self.config = LoadConfig::fast();
+        self
+    }
+
+    /// Keep main executable failures fatal. Explicit debug files are always strict.
+    pub fn with_required_module(mut self, module_path: Option<PathBuf>) -> Self {
+        self.required_module = module_path;
         self
     }
 
@@ -118,7 +132,7 @@ impl ModuleLoader {
     }
 
     /// Load with progress callback - always parallel
-    pub async fn load_with_progress<F>(self, progress_callback: F) -> Result<Vec<LoadedObjfile>>
+    pub async fn load_with_progress<F>(self, progress_callback: F) -> Result<ModuleLoadResult>
     where
         F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
     {
@@ -141,7 +155,7 @@ impl ModuleLoader {
     async fn load_modules_parallel_with_progress<F>(
         self,
         progress_callback: F,
-    ) -> Result<Vec<LoadedObjfile>>
+    ) -> Result<ModuleLoadResult>
     where
         F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
     {
@@ -176,7 +190,13 @@ impl ModuleLoader {
                             .then(|| explicit.debug_file.clone())
                     });
 
-                task::spawn(async move {
+                let module_path = mapping.path.clone();
+                let required = explicit_debug_file_for_module.is_some()
+                    || self.required_module.as_ref().is_some_and(|required| {
+                        crate::DwarfAnalyzer::module_paths_equivalent(required, &module_path)
+                    });
+
+                let task = task::spawn(async move {
                     let _permit = semaphore.acquire().await.unwrap();
 
                     let module_path = mapping.path.to_string_lossy().to_string();
@@ -201,50 +221,69 @@ impl ModuleLoader {
 
                     let load_time_ms = start_time.elapsed().as_millis() as u64;
 
-                    match result {
-                        Ok(module) => {
-                            // Extract stats for progress reporting
-                            let (functions, variables, types) = module.get_index_stats();
-                            let (parse_time_ms, index_time_ms, module_total_time_ms) =
-                                module.get_load_timing_ms();
-                            let stats = ModuleLoadingStats {
-                                functions,
-                                variables,
-                                types,
-                                debug_info_source: module.get_debug_info_source().clone(),
-                                dwarf_index_status: module.dwarf_index_status().clone(),
-                                load_time_ms,
-                                parse_time_ms,
-                                index_time_ms,
-                                module_total_time_ms,
-                            };
+                    result.inspect(|module| {
+                        // Extract stats for progress reporting
+                        let (functions, variables, types) = module.get_index_stats();
+                        let (parse_time_ms, index_time_ms, module_total_time_ms) =
+                            module.get_load_timing_ms();
+                        let stats = ModuleLoadingStats {
+                            functions,
+                            variables,
+                            types,
+                            debug_info_source: module.get_debug_info_source().clone(),
+                            dwarf_index_status: module.dwarf_index_status().clone(),
+                            load_time_ms,
+                            parse_time_ms,
+                            index_time_ms,
+                            module_total_time_ms,
+                        };
 
-                            progress_callback(ModuleLoadingEvent::LoadingCompleted {
-                                module_path,
-                                stats,
-                                current: index + 1,
-                                total: total_modules,
-                            });
-
-                            Ok(module)
-                        }
-                        Err(e) => {
-                            progress_callback(ModuleLoadingEvent::LoadingFailed {
-                                module_path,
-                                error: e.to_string(),
-                                current: index + 1,
-                                total: total_modules,
-                            });
-                            Err(e)
-                        }
-                    }
-                })
+                        progress_callback(ModuleLoadingEvent::LoadingCompleted {
+                            module_path,
+                            stats,
+                            current: index + 1,
+                            total: total_modules,
+                        });
+                    })
+                });
+                (index, module_path, required, task)
             })
             .collect();
 
-        let results = futures::future::try_join_all(tasks).await?;
-        let modules: Result<Vec<_>> = results.into_iter().collect();
-        modules
+        let mut loaded = ModuleLoadResult::default();
+        let mut required_failure = None;
+        // Await every task, including after a required failure, so no detached
+        // loads can emit progress after the caller has reported completion.
+        for (index, module_path, required, task) in tasks {
+            match task
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+            {
+                Ok(module) => loaded.modules.push(module),
+                Err(error) => {
+                    let failure = ModuleLoadFailure {
+                        module_path,
+                        error: format!("{error:#}"),
+                    };
+                    progress_callback(ModuleLoadingEvent::LoadingFailed {
+                        module_path: failure.module_path.to_string_lossy().into_owned(),
+                        error: failure.error.clone(),
+                        current: index + 1,
+                        total: total_modules,
+                    });
+                    if required && required_failure.is_none() {
+                        required_failure = Some(failure);
+                    } else {
+                        loaded.failures.push(failure);
+                    }
+                }
+            }
+        }
+        if let Some(failure) = required_failure {
+            return Err(failure.into());
+        }
+        Ok(loaded)
     }
 }
 
@@ -366,7 +405,7 @@ where
     F: Fn(ModuleLoadingEvent) + Send + Sync + 'static,
 {
     /// Load modules with attached progress callback
-    pub async fn load(self) -> Result<Vec<LoadedObjfile>> {
+    pub async fn load(self) -> Result<ModuleLoadResult> {
         self.loader.load_with_progress(self.callback).await
     }
 }

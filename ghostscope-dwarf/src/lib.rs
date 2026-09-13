@@ -26,8 +26,9 @@ pub(crate) mod analyzer;
 pub use analyzer::{
     AddressQueryResult, AnalyzerStats, DwarfAnalyzer, DwarfIndexStatus, ExecutableFileInfo,
     FunctionQueryResult, LoadedModuleRuntimeInfo, MainExecutableInfo, ModuleDefaultPolicy,
-    ModuleLoadingEvent, ModuleLoadingStats, ModuleStats, SectionInfo, SharedLibraryInfo,
-    SimpleFileInfo, SourceLineAddressSearch, SourceLineQuerySearch, TypeLookupAmbiguity,
+    ModuleLoadFailure, ModuleLoadingEvent, ModuleLoadingStats, ModuleStats, SectionInfo,
+    SharedLibraryInfo, SimpleFileInfo, SourceLineAddressSearch, SourceLineQuerySearch,
+    TypeLookupAmbiguity,
 };
 pub use loader::ExplicitDebugFile;
 pub use runtime_unwind::{

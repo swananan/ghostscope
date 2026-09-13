@@ -18,6 +18,7 @@ pub async fn compile_and_load_script_for_tui(
 ) -> Result<ScriptCompilationDetails> {
     let mut compile_options = compile_options.clone();
     prepare_runtime_modules_before_compile(script, session, &mut compile_options).await?;
+    let warnings = module_load_warnings(session);
 
     let binary_path = main_executable_path(session)?;
     // Compilation is synchronous and can be long-running. Mark the section as
@@ -30,7 +31,7 @@ pub async fn compile_and_load_script_for_tui(
         Err(SessionCompileError::Compile(e)) => {
             let friendly = e.user_message().into_owned();
             error!("Script compilation failed: {}", friendly);
-            return Ok(compilation_failed_details(binary_path, friendly));
+            return Ok(compilation_failed_details(binary_path, friendly, warnings));
         }
         Err(SessionCompileError::Setup(e)) => return Err(e),
     };
@@ -108,10 +109,35 @@ pub async fn compile_and_load_script_for_tui(
         total_count: success_count + failed_count,
         success_count,
         failed_count,
+        warnings,
     })
 }
 
-fn compilation_failed_details(binary_path: String, friendly: String) -> ScriptCompilationDetails {
+fn module_load_warnings(session: &GhostSession) -> Vec<String> {
+    let failures = session
+        .process_analyzer
+        .as_ref()
+        .map(|analyzer| analyzer.module_load_failures())
+        .unwrap_or_default();
+    if failures.is_empty() {
+        return Vec::new();
+    }
+
+    let mut warning = format!(
+        "Warning: {} module(s) failed to load; probes in these modules are unavailable:",
+        failures.len()
+    );
+    for failure in failures {
+        warning.push_str(&format!("\n  {failure}"));
+    }
+    vec![warning]
+}
+
+fn compilation_failed_details(
+    binary_path: String,
+    friendly: String,
+    warnings: Vec<String>,
+) -> ScriptCompilationDetails {
     ScriptCompilationDetails {
         trace_ids: vec![],
         results: vec![ScriptExecutionResult {
@@ -127,6 +153,7 @@ fn compilation_failed_details(binary_path: String, friendly: String) -> ScriptCo
         total_count: 1,
         success_count: 0,
         failed_count: 1,
+        warnings,
     }
 }
 

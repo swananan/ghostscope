@@ -57,6 +57,7 @@ impl DwarfAnalyzer {
         type_spec: &str,
     ) -> Option<ResolvedType> {
         let module_path = module_path.as_ref().to_path_buf();
+        self.ensure_module_available(&module_path).ok()?;
         resolve_c_style_semantic_type_spec_with(type_spec, |name| {
             self.resolve_named_semantic_type_in_module(&module_path, name)
                 .or_else(|| self.resolve_named_semantic_type(name))
@@ -67,7 +68,7 @@ impl DwarfAnalyzer {
         &self,
         module_path: P,
         type_spec: &str,
-    ) -> std::result::Result<Option<crate::TypeInfo>, TypeLookupAmbiguity> {
+    ) -> crate::Result<Option<crate::TypeInfo>> {
         self.try_resolve_c_style_semantic_type_spec_in_module(module_path, type_spec)
             .map(|resolved| resolved.map(|resolved| resolved.summary))
     }
@@ -76,14 +77,18 @@ impl DwarfAnalyzer {
         &self,
         module_path: P,
         type_spec: &str,
-    ) -> std::result::Result<Option<ResolvedType>, TypeLookupAmbiguity> {
+    ) -> crate::Result<Option<ResolvedType>> {
         let module_path = module_path.as_ref().to_path_buf();
-        try_resolve_c_style_semantic_type_spec_with(type_spec, |name| {
-            if let Some(ty) = self.resolve_named_semantic_type_in_module(&module_path, name) {
-                return Ok(Some(ty));
-            }
-            self.resolve_unique_named_semantic_type_outside_module(&module_path, name)
-        })
+        self.ensure_module_available(&module_path)?;
+        Ok(try_resolve_c_style_semantic_type_spec_with(
+            type_spec,
+            |name| {
+                if let Some(ty) = self.resolve_named_semantic_type_in_module(&module_path, name) {
+                    return Ok(Some(ty));
+                }
+                self.resolve_unique_named_semantic_type_outside_module(&module_path, name)
+            },
+        )?)
     }
 
     pub fn resolve_type_spec(&self, type_spec: &str) -> Option<crate::TypeInfo> {

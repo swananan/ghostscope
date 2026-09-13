@@ -27,6 +27,8 @@ fn runtime_text_symbol_storage_bytes(symbols: &[RuntimeTextSymbol]) -> usize {
 }
 
 mod cache;
+#[cfg(test)]
+mod module_loading_tests;
 mod module_resolution;
 mod plan_global;
 mod plan_pc;
@@ -50,6 +52,8 @@ pub struct DwarfAnalyzer {
     pid: u32,
     /// Module path -> module data mapping
     modules: HashMap<PathBuf, LoadedObjfile>,
+    /// Failed modules remain known to module resolution until a retry succeeds.
+    failed_modules: HashMap<PathBuf, ModuleLoadFailure>,
     /// The explicit target, or the loaded module identified by /proc/PID/exe.
     /// Keep this identity stable as shared libraries are discovered later.
     main_module: Option<PathBuf>,
@@ -441,7 +445,11 @@ impl DwarfAnalyzer {
                 Self::module_paths_equivalent(path.as_path(), &runtime_module.module_path)
             });
 
-            if let Some((_path, loaded)) = existing {
+            if let Some((module_path, loaded)) = existing {
+                // A failed path may now alias this cached module. Reuse is a
+                // successful recovery even when its mapping metadata is unchanged.
+                self.failed_modules
+                    .retain(|path, _| !Self::module_paths_equivalent(path, module_path));
                 let mapping = loaded.module_mapping();
                 if mapping.loaded_address != runtime_module.loaded_address
                     || mapping.load_bias != runtime_module.load_bias
@@ -479,6 +487,10 @@ impl DwarfAnalyzer {
         );
 
         let module_mappings = Self::runtime_modules_to_module_mappings(new_runtime_modules);
+        let required_module = match &self.main_module {
+            Some(main) => Some(main.clone()),
+            None => Self::pid_main_module_path(self.pid, &module_mappings)?,
+        };
 
         for (index, mapping) in module_mappings.iter().enumerate() {
             progress_callback(ModuleLoadingEvent::Discovered {
@@ -488,21 +500,31 @@ impl DwarfAnalyzer {
             });
         }
 
-        let mut loader = crate::loader::ModuleLoader::new(module_mappings).parallel();
+        let mut loader = crate::loader::ModuleLoader::new(module_mappings)
+            .parallel()
+            .with_required_module(required_module);
         if !debug_search_paths.is_empty() {
             loader = loader.with_debug_search_paths(debug_search_paths.to_vec());
         }
         loader = loader.with_loose_debug_match(allow_loose_debug_match);
         loader = loader.with_debuginfod_client(debuginfod_client);
 
-        let modules = loader
+        let result = loader
             .with_progress_callback(progress_callback)
             .load()
             .await?;
-        let loaded_count = modules.len();
+        let loaded_count = result.modules.len();
 
-        for module in modules {
+        for failure in result.failures {
+            self.failed_modules
+                .retain(|path, _| !Self::module_paths_equivalent(path, &failure.module_path));
+            self.failed_modules
+                .insert(failure.module_path.clone(), failure);
+        }
+        for module in result.modules {
             let module_path = module.module_path().clone();
+            self.failed_modules
+                .retain(|path, _| !Self::module_paths_equivalent(path, &module_path));
             self.modules.insert(module_path, module);
         }
         self.resolve_main_module_if_missing();
@@ -564,6 +586,7 @@ impl DwarfAnalyzer {
         );
 
         let module_mappings = Self::runtime_modules_to_module_mappings(runtime_modules);
+        let main_module_path = Self::pid_main_module_path(pid, &module_mappings)?;
 
         tracing::info!(
             "Discovered {} modules for PID {}",
@@ -581,7 +604,9 @@ impl DwarfAnalyzer {
         }
 
         // Load all modules in parallel with progress tracking
-        let mut loader = crate::loader::ModuleLoader::new(module_mappings).parallel();
+        let mut loader = crate::loader::ModuleLoader::new(module_mappings)
+            .parallel()
+            .with_required_module(main_module_path);
 
         // Configure debug search paths if provided
         if !debug_search_paths.is_empty() {
@@ -591,7 +616,7 @@ impl DwarfAnalyzer {
         loader = loader.with_explicit_debug_file(explicit_debug_file);
         loader = loader.with_debuginfod_client(debuginfod_client);
 
-        let modules = loader
+        let result = loader
             .with_progress_callback(progress_callback)
             .load()
             .await?;
@@ -599,10 +624,34 @@ impl DwarfAnalyzer {
         tracing::info!(
             "Created DWARF analyzer for PID {} with {} modules (parallel)",
             pid,
-            modules.len()
+            result.modules.len()
         );
 
-        Ok(Self::from_modules(pid, modules))
+        let mut analyzer = Self::from_modules(pid, result.modules);
+        analyzer.failed_modules = result
+            .failures
+            .into_iter()
+            .map(|failure| (failure.module_path.clone(), failure))
+            .collect();
+        Ok(analyzer)
+    }
+
+    fn pid_main_module_path(pid: u32, mappings: &[ModuleMapping]) -> Result<Option<PathBuf>> {
+        if pid == 0 {
+            return Ok(None);
+        }
+        let exe = PathBuf::from(format!("/proc/{pid}/exe"));
+        let mut matches = mappings
+            .iter()
+            .filter(|mapping| Self::module_paths_equivalent(&mapping.path, &exe));
+        // A removed executable may be absent from discovery. Keep identity
+        // unresolved until its path is restored, as in normal PID resolution.
+        let main = matches.next();
+        anyhow::ensure!(
+            matches.next().is_none(),
+            "Main executable for PID {pid} matched multiple runtime modules"
+        );
+        Ok(main.map(|mapping| mapping.path.clone()))
     }
 
     /// Create DWARF analyzer from executable path (single module mode, now async parallel)
@@ -709,6 +758,7 @@ impl DwarfAnalyzer {
         let mut analyzer = Self {
             pid: 0, // No specific PID in exec mode
             modules: HashMap::new(),
+            failed_modules: HashMap::new(),
             main_module: Some(exec_path.clone()),
             runtime_text_symbols: HashMap::new(),
             pc_context_cache: RwLock::new(PcContextCache::default()),
@@ -796,6 +846,7 @@ impl DwarfAnalyzer {
         let mut analyzer = Self {
             pid,
             modules: HashMap::new(),
+            failed_modules: HashMap::new(),
             main_module: None,
             runtime_text_symbols: HashMap::new(),
             pc_context_cache: RwLock::new(PcContextCache::default()),
@@ -908,6 +959,7 @@ impl DwarfAnalyzer {
         module_address: &ModuleAddress,
         registers: &[u16],
     ) -> Result<Option<CallerFrameRecovery>> {
+        self.ensure_module_available(&module_address.module_path)?;
         if let Some(module_data) = self
             .loaded_module_path_for(&module_address.module_path)
             .and_then(|module_path| self.modules.get(module_path))
