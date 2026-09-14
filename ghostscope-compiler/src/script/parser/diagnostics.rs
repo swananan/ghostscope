@@ -1,3 +1,6 @@
+use super::{GhostScopeParser, Rule};
+use pest::Parser;
+
 // Best-effort heuristic: if a line contains a print statement with an opening quote
 // but no closing quote before arguments, give a clearer error.
 pub(super) fn detect_unclosed_print_string(input: &str) -> Option<String> {
@@ -100,6 +103,55 @@ pub(super) fn detect_unknown_keyword(input: &str) -> Option<String> {
         dp[idx(n, m)]
     }
 
+    fn double_slash_is_in_trace_path(
+        line: &str,
+        statement_start: usize,
+        slash_start: usize,
+    ) -> bool {
+        let statement = &line[statement_start..];
+        let statement = statement.trim_start();
+        let statement_start = line.len() - statement.len();
+        let Some(after_trace) = statement.strip_prefix("trace") else {
+            return false;
+        };
+        if !after_trace.starts_with(char::is_whitespace) {
+            return false;
+        }
+
+        let pattern = after_trace.trim_start();
+        let pattern_start = statement_start + statement.len() - pattern.len();
+        let Some(block_start) = pattern.find('{') else {
+            return false;
+        };
+        let pattern = pattern[..block_start].trim_end();
+
+        let Ok(mut pairs) = GhostScopeParser::parse(Rule::trace_pattern, pattern) else {
+            return false;
+        };
+        let Some(trace_pattern) = pairs.next() else {
+            return false;
+        };
+        if trace_pattern.as_span().end() != pattern.len() {
+            return false;
+        }
+        let Some(path_pattern) = trace_pattern.into_inner().next() else {
+            return false;
+        };
+        if !matches!(
+            path_pattern.as_rule(),
+            Rule::source_line | Rule::module_hex_address
+        ) {
+            return false;
+        }
+        let Some(file_path) = path_pattern.into_inner().next() else {
+            return false;
+        };
+        let path_start = pattern_start + file_path.as_span().start();
+        let path_end = pattern_start + file_path.as_span().end();
+
+        path_start < slash_start && slash_start + 1 < path_end
+    }
+
     // Helper: check a slice for a command-like unknown keyword
     fn check_slice(slice: &str, line_no_1based: usize) -> Option<String> {
         let mut s = slice.trim_start();
@@ -190,10 +242,16 @@ pub(super) fn detect_unknown_keyword(input: &str) -> Option<String> {
 
     for (i, raw_line) in input.lines().enumerate() {
         let line = raw_line;
-        // Scan potential statement starts: at line start, and right after '{', ';', '}', '(', ',' (outside strings)
+        // Scan potential statement starts: at line start, and right after '{', ';', '}', '(', ',' (outside strings and comments)
         let mut quote_open = false;
         let mut positions: Vec<usize> = vec![0]; // include start-of-line
         for (idx, ch) in line.char_indices() {
+            if !quote_open
+                && line[idx..].starts_with("//")
+                && !double_slash_is_in_trace_path(line, positions.last().copied().unwrap_or(0), idx)
+            {
+                break;
+            }
             if ch == '"' {
                 quote_open = !quote_open;
             }

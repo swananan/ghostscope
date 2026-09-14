@@ -1244,3 +1244,32 @@ foobarbaz {
         other => panic!("expected friendly SyntaxError with expected list, got {other:?}"),
     }
 }
+
+#[test]
+fn parse_error_ignores_commas_in_line_comments() {
+    let s = "trace foo {\n    // explain the output, including ignored words\n    print somevalue -> other;\n}";
+    let r = parse(s);
+    match r {
+        Err(err @ ParseError::Pest(_)) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Pest parser error:  --> 3:22"),
+                "unexpected error location: {msg}"
+            );
+        }
+        other => panic!("expected Pest error at '->', got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_unknown_keyword_after_trace_path_with_double_slash() {
+    let s = r#"trace /foo//bar.c:1 { prnit "x"; }"#;
+    let r = parse(s);
+    match r {
+        Err(ParseError::SyntaxError(msg)) => {
+            assert!(msg.contains("Unknown keyword 'prnit'"), "{msg}");
+            assert!(msg.contains("Did you mean 'print'"), "{msg}");
+        }
+        other => panic!("expected friendly SyntaxError after trace path, got {other:?}"),
+    }
+}
