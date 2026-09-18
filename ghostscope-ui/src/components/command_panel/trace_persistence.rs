@@ -48,6 +48,95 @@ pub struct LoadResult {
     pub disabled_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptLexState {
+    Code,
+    String,
+    LineComment,
+    BlockComment,
+}
+
+/// Tracks brace depth while ignoring braces inside script strings and comments.
+struct TraceBlockScanner {
+    depth: usize,
+    state: ScriptLexState,
+}
+
+impl TraceBlockScanner {
+    fn after_opening_brace() -> Self {
+        Self {
+            depth: 1,
+            state: ScriptLexState::Code,
+        }
+    }
+
+    /// Return the byte offset of the closing brace that matches the outer trace block.
+    fn scan(&mut self, input: &str) -> Option<usize> {
+        let bytes = input.as_bytes();
+        let mut index = 0;
+
+        while index < bytes.len() {
+            match self.state {
+                ScriptLexState::Code => match bytes[index] {
+                    b'"' => {
+                        self.state = ScriptLexState::String;
+                        index += 1;
+                    }
+                    b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                        self.state = ScriptLexState::LineComment;
+                        index += 2;
+                    }
+                    b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                        self.state = ScriptLexState::BlockComment;
+                        index += 2;
+                    }
+                    b'{' => {
+                        self.depth += 1;
+                        index += 1;
+                    }
+                    b'}' => {
+                        self.depth -= 1;
+                        if self.depth == 0 {
+                            return Some(index);
+                        }
+                        index += 1;
+                    }
+                    _ => index += 1,
+                },
+                ScriptLexState::String => match bytes[index] {
+                    b'"' => {
+                        self.state = ScriptLexState::Code;
+                        index += 1;
+                    }
+                    _ => index += 1,
+                },
+                ScriptLexState::LineComment => {
+                    if bytes[index] == b'\n' {
+                        self.state = ScriptLexState::Code;
+                    }
+                    index += 1;
+                }
+                ScriptLexState::BlockComment => {
+                    if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                        self.state = ScriptLexState::Code;
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn finish_line(&mut self) {
+        if self.state == ScriptLexState::LineComment {
+            self.state = ScriptLexState::Code;
+        }
+    }
+}
+
 /// Main trace persistence handler
 pub struct TracePersistence {
     /// Current trace configurations indexed by ID
@@ -298,7 +387,8 @@ impl TracePersistence {
         }
     }
 
-    /// Extract the body of an existing trace block, tolerating inline braces
+    /// Extract the body of an existing trace block without counting braces in
+    /// strings or comments.
     fn extract_trace_body(script: &str) -> Option<String> {
         let trimmed = script.trim();
         if !trimmed.starts_with("trace ") {
@@ -314,24 +404,12 @@ impl TracePersistence {
             }
         }
         let start = start_brace?;
-        let mut depth = 1usize;
-        let mut i = start + 1;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let raw_body = &trimmed[start + 1..i];
-                        let normalized = Self::trim_wrapped_body(raw_body);
-                        return Some(normalized.to_string());
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        None
+        let mut scanner = TraceBlockScanner::after_opening_brace();
+        let relative_end = scanner.scan(&trimmed[start + 1..])?;
+        let end = start + 1 + relative_end;
+        let raw_body = &trimmed[start + 1..end];
+        let normalized = Self::trim_wrapped_body(raw_body);
+        Some(normalized.to_string())
     }
 
     /// Trim surrounding whitespace/newlines around an extracted body
@@ -399,79 +477,103 @@ impl TracePersistence {
         let mut script_lines = Vec::new();
         let mut pending_disabled = false;
         let mut pending_index: Option<usize> = None;
-        // Track nested braces so inner blocks (e.g., if { ... }) don't terminate the trace section
-        let mut brace_depth: usize = 0;
+        let mut block_scanner: Option<TraceBlockScanner> = None;
 
-        for line in content.lines() {
+        for (line_index, line) in content.lines().enumerate() {
             let trimmed = line.trim();
 
-            // Check for disabled marker
-            if trimmed == "//@disabled" {
-                pending_disabled = true;
-                continue;
-            }
-
-            // Parse optional index metadata line (e.g., "// Index: 3")
-            if let Some(rest) = trimmed.strip_prefix("// Index:") {
-                let val = rest.trim();
-                if let Ok(idx) = val.parse::<usize>() {
-                    pending_index = Some(idx);
+            if !in_script {
+                // Check for disabled marker
+                if trimmed == "//@disabled" {
+                    pending_disabled = true;
+                    continue;
                 }
-                continue;
-            }
 
-            // Check for trace command start
-            if trimmed.starts_with("trace ") && trimmed.ends_with(" {") {
-                // Extract target from trace command
-                let target = trimmed
-                    .strip_prefix("trace ")
-                    .and_then(|s| s.strip_suffix(" {"))
-                    .unwrap_or("")
-                    .to_string();
-
-                current_target = Some(target);
-                in_script = true;
-                script_lines.clear();
-                // Opening brace for the trace section
-                brace_depth = 1;
-                continue;
-            }
-
-            // Check for script end: only close when this '}' matches the outer trace block
-            if in_script && trimmed == "}" && brace_depth == 1 {
-                if let Some(target) = current_target.take() {
-                    let script = script_lines.join("\n");
-                    traces.push(TraceDefinition {
-                        target,
-                        script,
-                        enabled: !pending_disabled,
-                        selected_index: pending_index,
-                    });
-                    pending_disabled = false;
-                    pending_index = None;
+                // Parse optional index metadata line (e.g., "// Index: 3")
+                if let Some(rest) = trimmed.strip_prefix("// Index:") {
+                    let val = rest.trim();
+                    if let Ok(idx) = val.parse::<usize>() {
+                        pending_index = Some(idx);
+                    }
+                    continue;
                 }
-                in_script = false;
-                brace_depth = 0;
+
+                // Check for trace command start
+                if trimmed.starts_with("trace ") && trimmed.ends_with(" {") {
+                    // Extract target from trace command
+                    let target = trimmed
+                        .strip_prefix("trace ")
+                        .and_then(|s| s.strip_suffix(" {"))
+                        .unwrap_or("")
+                        .to_string();
+
+                    current_target = Some(target);
+                    in_script = true;
+                    script_lines.clear();
+                    block_scanner = Some(TraceBlockScanner::after_opening_brace());
+                    continue;
+                }
+            }
+
+            if !in_script {
                 continue;
             }
 
-            // Collect script lines
-            if in_script {
-                // Remove leading indentation (4 spaces)
-                let script_line = if let Some(stripped) = line.strip_prefix("    ") {
-                    stripped
-                } else {
-                    line
+            // Remove leading indentation (4 spaces)
+            let script_line = if let Some(stripped) = line.strip_prefix("    ") {
+                stripped
+            } else {
+                line
+            };
+            let Some(scanner) = block_scanner.as_mut() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing trace block scanner state",
+                ));
+            };
+            let closing_brace = scanner.scan(script_line);
+            scanner.finish_line();
+
+            if let Some(closing_index) = closing_brace {
+                if !script_line[..closing_index].trim().is_empty()
+                    || !script_line[closing_index + 1..].trim().is_empty()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "trace block closing brace must be on its own line at line {}",
+                            line_index + 1
+                        ),
+                    ));
+                }
+
+                let Some(target) = current_target.take() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "missing trace target while closing trace block",
+                    ));
                 };
+                let script = script_lines.join("\n");
+                traces.push(TraceDefinition {
+                    target,
+                    script,
+                    enabled: !pending_disabled,
+                    selected_index: pending_index,
+                });
+                pending_disabled = false;
+                pending_index = None;
+                in_script = false;
+                block_scanner = None;
+            } else {
                 script_lines.push(script_line.to_string());
-
-                // Update brace depth based on current line content so nested '}' are preserved
-                // Note: naïve count, acceptable because braces rarely appear in string literals in our scripts
-                let opens = script_line.chars().filter(|&c| c == '{').count();
-                let closes = script_line.chars().filter(|&c| c == '}').count();
-                // Saturating arithmetic to avoid underflow on malformed input
-                brace_depth = brace_depth.saturating_add(opens).saturating_sub(closes);
             }
+        }
+
+        if let Some(target) = current_target {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unterminated trace block for target '{target}'"),
+            ));
         }
 
         Ok(traces)
@@ -578,6 +680,50 @@ trace foo {
         assert_eq!(traces[1].target, "foo");
         assert!(traces[1].enabled); // enabled trace
         assert_eq!(traces[1].script, "print \"foo\";");
+    }
+
+    #[test]
+    fn test_trace_blocks_ignore_braces_in_strings_and_comments() {
+        for body in [
+            r#"print "value={";"#,
+            r#"print "value=}";"#,
+            r#"print "path\";"#,
+            "// }",
+            "/* { */",
+            "/*\n}\n*/",
+            "if ready {\n    print \"}\";\n}",
+            "//@disabled\n// Index: 99\nprint \"ok\";",
+        ] {
+            let block = TracePersistence::wrap_script_body("main", body);
+
+            assert_eq!(
+                TracePersistence::format_trace_block(&block, "main"),
+                block,
+                "failed to preserve block containing:\n{body}"
+            );
+
+            let traces = TracePersistence::parse_trace_file(&block)
+                .unwrap_or_else(|error| panic!("failed to parse body {body:?}: {error}"));
+            assert_eq!(traces.len(), 1, "failed to load body:\n{body}");
+            assert_eq!(traces[0].script, body);
+            assert!(traces[0].enabled);
+            assert_eq!(traces[0].selected_index, None);
+        }
+    }
+
+    #[test]
+    fn test_parse_trace_file_rejects_unterminated_blocks() {
+        for content in [
+            "trace main {\n    print \"hello\";",
+            "trace main {\n    print \"unterminated;\n}",
+            "trace main {\n    /* unterminated\n}",
+        ] {
+            let error = TracePersistence::parse_trace_file(content)
+                .expect_err("unterminated trace block should fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("unterminated trace block"));
+            assert!(error.to_string().contains("main"));
+        }
     }
 
     #[test]
