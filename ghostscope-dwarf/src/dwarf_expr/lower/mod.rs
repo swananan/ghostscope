@@ -1272,9 +1272,7 @@ impl ExpressionEvaluator {
 
         let mut entry_count = 0;
 
-        // Parse location list entries
-        // For now, we'll take the first valid entry as a simplification
-        // In a full implementation, we'd need to track PC ranges
+        // Only lower expressions whose ranges cover the requested PC.
         loop {
             let next_result = locations.next();
             match next_result {
@@ -1282,6 +1280,10 @@ impl ExpressionEvaluator {
                     entry_count += 1;
                     let start_pc = location_list_entry.range.begin;
                     let end_pc = location_list_entry.range.end;
+
+                    if !range_contains_pc(start_pc, end_pc, address) {
+                        continue;
+                    }
 
                     debug!(
                         "Location list entry #{}: PC 0x{:x}-0x{:x} (range length: {})",
@@ -1327,10 +1329,7 @@ impl ExpressionEvaluator {
 
                     debug!("  Parsed expression: {:?}", location_expr);
 
-                    let contains_address = range_contains_pc(start_pc, end_pc, address);
-
-                    if contains_address && !matches!(location_expr, RawExpressionResult::Optimized)
-                    {
+                    if !matches!(location_expr, RawExpressionResult::Optimized) {
                         return Ok(location_expr);
                     }
                 }
