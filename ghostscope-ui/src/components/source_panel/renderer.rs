@@ -726,6 +726,7 @@ impl SourceRenderer {
 
         // Find matches for this line in visible coordinates
         let h_off = state.horizontal_scroll_offset;
+        let visible_char_count = visible_line.chars().count();
         let ranges: Vec<(usize, usize)> = state
             .search_matches
             .iter()
@@ -733,7 +734,7 @@ impl SourceRenderer {
                 if *li != line_index {
                     return None;
                 }
-                if *e <= h_off || *s >= h_off + visible_line.len() {
+                if *e <= h_off || *s >= h_off + visible_char_count {
                     return None;
                 }
                 let vis_start = s.saturating_sub(h_off);
@@ -749,43 +750,32 @@ impl SourceRenderer {
                 .collect();
         }
 
-        // Apply highlighting (simplified implementation)
+        // Walk character columns in source order, including overlapping matches.
         let mut result: Vec<Span<'static>> = Vec::new();
         let mut pos = 0usize;
+        let mut ranges = ranges.into_iter().peekable();
 
         for span in spans {
-            let text = span.content.clone();
-            let base_style = span.style;
-            let mut cursor = 0usize;
-
-            while cursor < text.len() {
-                let mut next_break = text.len() - cursor;
-                let mut highlight_now = false;
-
-                for (rs, re) in &ranges {
-                    if pos >= *re || pos + next_break <= *rs {
-                        continue;
-                    }
-                    if pos < *rs {
-                        next_break = (*rs - pos).min(next_break);
-                        highlight_now = false;
-                    } else {
-                        next_break = (*re - pos).min(next_break);
-                        highlight_now = true;
-                    }
+            let mut text = String::new();
+            let mut style = span.style;
+            for ch in span.content.chars() {
+                while ranges.peek().is_some_and(|(_, end)| pos >= *end) {
+                    ranges.next();
                 }
-
-                let end_cursor = cursor + next_break;
-                let slice = &text[cursor..end_cursor];
-                let style = if highlight_now {
+                let char_style = if ranges.peek().is_some_and(|(start, _)| pos >= *start) {
                     Style::default().fg(Color::LightMagenta)
                 } else {
-                    base_style
+                    span.style
                 };
-
-                result.push(Span::styled(slice.to_string(), style));
-                pos += next_break;
-                cursor = end_cursor;
+                if char_style != style && !text.is_empty() {
+                    result.push(Span::styled(std::mem::take(&mut text), style));
+                }
+                text.push(ch);
+                style = char_style;
+                pos += 1;
+            }
+            if !text.is_empty() {
+                result.push(Span::styled(text, style));
             }
         }
 
@@ -878,5 +868,66 @@ impl SourceRenderer {
         let input_para =
             Paragraph::new(input_line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
         f.render_widget(input_para, Rect::new(area.x, area.y, area.width, 1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_search_overlay_uses_character_scroll_offsets() {
+        let base_style = Style::default().fg(Color::DarkGray);
+        for (offset, expected_highlight) in [(0, "文注"), (4, "文注"), (5, "注"), (6, "")] {
+            let state = SourcePanelState {
+                search_query: "文注".to_string(),
+                search_matches: vec![(0, 4, 6)],
+                horizontal_scroll_offset: offset,
+                ..SourcePanelState::default()
+            };
+            let visible: String = "// 中文注释".chars().skip(offset).collect();
+            let spans = SourceRenderer::apply_search_overlay(
+                &visible,
+                vec![Span::styled(visible.clone(), base_style)],
+                0,
+                &state,
+            );
+            let rendered: String = spans.iter().map(|span| span.content.as_ref()).collect();
+            let highlighted: String = spans
+                .iter()
+                .filter(|span| span.style.fg == Some(Color::LightMagenta))
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(rendered, visible);
+            assert_eq!(highlighted, expected_highlight, "scroll offset {offset}");
+            assert!(spans.iter().all(|span| {
+                span.style.fg == Some(Color::LightMagenta) || span.style == base_style
+            }));
+        }
+    }
+
+    #[test]
+    fn unicode_search_overlay_highlights_overlaps_across_spans() {
+        let state = SourcePanelState {
+            search_query: "中中".to_string(),
+            search_matches: vec![(0, 0, 2), (0, 1, 3)],
+            ..SourcePanelState::default()
+        };
+        let base_style = Style::default().fg(Color::Green);
+        let highlight_style = Style::default().fg(Color::LightMagenta);
+        let spans = SourceRenderer::apply_search_overlay(
+            "中中中!",
+            vec![Span::raw("中"), Span::styled("中中!", base_style)],
+            0,
+            &state,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                Span::styled("中", highlight_style),
+                Span::styled("中中", highlight_style),
+                Span::styled("!", base_style),
+            ]
+        );
     }
 }

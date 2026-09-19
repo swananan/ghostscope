@@ -208,31 +208,45 @@ impl FileCompletionCache {
         // Extract the part that user hasn't typed yet
         if let Some(relative) = Self::make_relative_path(full_path) {
             tracing::debug!("relative path: '{}'", relative);
-            if relative
-                .to_lowercase()
-                .starts_with(&user_input.to_lowercase())
-            {
-                let completion = relative[user_input.len()..].to_string();
+            if let Some(completion) = Self::strip_case_insensitive_prefix(relative, user_input) {
                 tracing::debug!("relative match: completion='{}'", completion);
-                return completion;
+                return completion.to_string();
             }
         }
 
         // Fallback: return basename if prefix doesn't match
         if let Some(basename) = Self::extract_basename(full_path) {
             tracing::debug!("basename: '{}'", basename);
-            if basename
-                .to_lowercase()
-                .starts_with(&user_input.to_lowercase())
-            {
-                let completion = basename[user_input.len()..].to_string();
+            if let Some(completion) = Self::strip_case_insensitive_prefix(basename, user_input) {
                 tracing::debug!("basename match: completion='{}'", completion);
-                return completion;
+                return completion.to_string();
             }
         }
 
         tracing::debug!("no match found, returning empty");
         String::new()
+    }
+
+    /// Strip a lowercase-matched prefix only at a boundary in the original text.
+    fn strip_case_insensitive_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+        let prefix_lower = prefix.to_lowercase();
+        if !text.to_lowercase().starts_with(&prefix_lower) {
+            return None;
+        }
+
+        // The typed prefix and original text can have different UTF-8 lengths.
+        let mut byte_end = 0;
+        let mut lowercase_bytes = 0;
+        for ch in text.chars() {
+            if lowercase_bytes >= prefix_lower.len() {
+                break;
+            }
+            lowercase_bytes += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+            byte_end += ch.len_utf8();
+        }
+
+        // Do not complete a prefix ending inside a lowercase expansion.
+        (lowercase_bytes == prefix_lower.len()).then_some(&text[byte_end..])
     }
 
     /// Find common prefix among multiple candidates
@@ -256,21 +270,22 @@ impl FileCompletionCache {
 
         // Find common prefix
         if let Some(first) = completions.first() {
-            let mut common_len = first.len();
+            let mut common_bytes = first.len();
 
             for completion in &completions[1..] {
-                let matching_chars = first
+                let matching_bytes = first
                     .chars()
                     .zip(completion.chars())
                     .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
-                    .count();
-                common_len = common_len.min(matching_chars);
+                    .map(|(ch, _)| ch.len_utf8())
+                    .sum::<usize>();
+                common_bytes = common_bytes.min(matching_bytes);
             }
 
-            if common_len > 0 {
-                let common_prefix = &first[..common_len];
+            if common_bytes > 0 {
+                let common_prefix = &first[..common_bytes];
                 // Don't complete with just whitespace or single character
-                if common_prefix.trim().len() > 1 {
+                if common_prefix.trim().chars().count() > 1 {
                     return Some(common_prefix.to_string());
                 }
             }

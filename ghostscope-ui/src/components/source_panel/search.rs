@@ -318,17 +318,26 @@ impl SourceSearch {
             return;
         }
 
-        let query = state.search_query.to_lowercase();
+        let query: Vec<char> = state.search_query.to_lowercase().chars().collect();
         for (line_idx, line) in state.content.iter().enumerate() {
-            let line_lower = line.to_lowercase();
-            let mut start = 0;
-            while let Some(pos) = line_lower[start..].find(&query) {
-                let match_start = start + pos;
-                let match_end = match_start + query.len();
-                state
-                    .search_matches
-                    .push((line_idx, match_start, match_end));
-                start = match_start + 1;
+            let line_lower: Vec<char> = line.to_lowercase().chars().collect();
+            // Lowercasing can expand a character (İ -> i + combining dot).
+            // Map each lowercase character back to its original character column.
+            let source_columns: Vec<usize> = line
+                .chars()
+                .enumerate()
+                .flat_map(|(col, ch)| ch.to_lowercase().map(move |_| col))
+                .collect();
+
+            // Character windows preserve overlapping matches without slicing UTF-8.
+            for (start, candidate) in line_lower.windows(query.len()).enumerate() {
+                if candidate == query {
+                    let match_start = source_columns[start];
+                    let match_end = source_columns[start + query.len() - 1] + 1;
+                    state
+                        .search_matches
+                        .push((line_idx, match_start, match_end));
+                }
             }
         }
 
@@ -373,7 +382,8 @@ impl SourceSearch {
                     .saturating_sub(line_number_width + border_width))
                     as usize;
 
-                if current_line.len() <= available_width {
+                let line_char_count = current_line.chars().count();
+                if line_char_count <= available_width {
                     // Line fits entirely, no horizontal scrolling needed
                     state.horizontal_scroll_offset = 0;
                 } else {
@@ -384,7 +394,7 @@ impl SourceSearch {
                     let ideal_scroll = state.cursor_col.saturating_sub(scrolloff);
 
                     // Calculate maximum possible scroll
-                    let max_scroll = current_line.len().saturating_sub(available_width);
+                    let max_scroll = line_char_count.saturating_sub(available_width);
 
                     // Check if we're near the end of the line
                     let near_end = state.cursor_col >= max_scroll.saturating_add(scrolloff);

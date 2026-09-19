@@ -67,9 +67,10 @@ impl InputHandler {
                         tracing::debug!("Found completion: '{}'", completion_text);
 
                         // Insert the completion at cursor position (same logic for both command and file completion)
-                        let cursor_pos = state.cursor_position.min(state.input_text.len());
-                        state.input_text.insert_str(cursor_pos, &completion_text);
-                        state.cursor_position += completion_text.len();
+                        let byte_pos =
+                            Self::char_pos_to_byte_pos(&state.input_text, state.cursor_position);
+                        state.input_text.insert_str(byte_pos, &completion_text);
+                        state.cursor_position += completion_text.chars().count();
 
                         // Update auto suggestion after completion
                         state.update_auto_suggestion();
