@@ -16,8 +16,10 @@ pub struct SourcePanelState {
     pub content: Vec<String>,
     pub current_line: Option<usize>,
     pub cursor_line: usize,
+    /// Zero-based Unicode scalar value index in the original source line.
     pub cursor_col: usize,
     pub scroll_offset: usize,
+    /// Number of Unicode scalar values skipped at the start of each line.
     pub horizontal_scroll_offset: usize,
     pub file_path: Option<String>,
     pub language: String,
@@ -26,7 +28,9 @@ pub struct SourcePanelState {
 
     // Search state
     pub search_query: String,
-    pub search_matches: Vec<(usize, usize, usize)>, // (line_idx, start, end)
+    /// (line index, start character column, exclusive end character column).
+    /// Columns refer to Unicode scalar values in the original source text.
+    pub search_matches: Vec<(usize, usize, usize)>,
     pub current_match: Option<usize>,
     pub is_searching: bool,
 
