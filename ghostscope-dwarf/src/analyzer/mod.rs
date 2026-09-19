@@ -52,6 +52,9 @@ pub struct DwarfAnalyzer {
     pid: u32,
     /// Module path -> module data mapping
     modules: HashMap<PathBuf, LoadedObjfile>,
+    /// Append-only module registration order. Runtime refreshes must not change
+    /// the meaning of IDs retained in PC contexts, DIE references, or type plans.
+    module_paths_by_id: Vec<PathBuf>,
     /// Failed modules remain known to module resolution until a retry succeeds.
     failed_modules: HashMap<PathBuf, ModuleLoadFailure>,
     /// The explicit target, or the loaded module identified by /proc/PID/exe.
@@ -289,18 +292,26 @@ impl DwarfAnalyzer {
             .find(|path| Self::module_paths_equivalent(path.as_path(), module_path))
     }
 
-    /// Return the deterministic per-analyzer module id for a loaded module path.
+    /// Register a loaded object without renumbering previously loaded modules.
+    fn insert_module(&mut self, module: LoadedObjfile) {
+        let path = module.module_path().clone();
+        if self.modules.insert(path.clone(), module).is_none() {
+            self.module_paths_by_id.push(path);
+        }
+    }
+
+    /// Return a module id that remains stable for this analyzer's lifetime.
     pub fn module_id_for_path<P: AsRef<Path>>(&self, module_path: P) -> Option<crate::ModuleId> {
         let module_path = self.loaded_module_path_for(module_path)?;
-        self.sorted_module_paths()
-            .into_iter()
-            .position(|path| path.as_path() == module_path.as_path())
+        self.module_paths_by_id
+            .iter()
+            .position(|path| path == module_path)
             .map(|index| crate::ModuleId(index as u32))
     }
 
     /// Resolve a semantic module id back to its loaded module path.
     pub fn module_path_for_id(&self, module: crate::ModuleId) -> Option<&Path> {
-        self.sorted_module_paths()
+        self.module_paths_by_id
             .get(module.0 as usize)
             .map(|path| path.as_path())
     }
@@ -525,7 +536,7 @@ impl DwarfAnalyzer {
             let module_path = module.module_path().clone();
             self.failed_modules
                 .retain(|path, _| !Self::module_paths_equivalent(path, &module_path));
-            self.modules.insert(module_path, module);
+            self.insert_module(module);
         }
         self.resolve_main_module_if_missing();
 
@@ -758,6 +769,7 @@ impl DwarfAnalyzer {
         let mut analyzer = Self {
             pid: 0, // No specific PID in exec mode
             modules: HashMap::new(),
+            module_paths_by_id: Vec::new(),
             failed_modules: HashMap::new(),
             main_module: Some(exec_path.clone()),
             runtime_text_symbols: HashMap::new(),
@@ -816,7 +828,7 @@ impl DwarfAnalyzer {
                     current: 1,
                     total: 1,
                 });
-                analyzer.modules.insert(exec_path.clone(), module_data);
+                analyzer.insert_module(module_data);
                 tracing::info!(
                     "Created DWARF analyzer for executable {} with 1 module",
                     exec_path.display()
@@ -842,19 +854,21 @@ impl DwarfAnalyzer {
     }
 
     /// Create analyzer from pre-loaded modules (for Builder pattern)
-    pub(crate) fn from_modules(pid: u32, modules: Vec<LoadedObjfile>) -> Self {
+    pub(crate) fn from_modules(pid: u32, mut modules: Vec<LoadedObjfile>) -> Self {
         let mut analyzer = Self {
             pid,
             modules: HashMap::new(),
+            module_paths_by_id: Vec::new(),
             failed_modules: HashMap::new(),
             main_module: None,
             runtime_text_symbols: HashMap::new(),
             pc_context_cache: RwLock::new(PcContextCache::default()),
         };
 
+        // Preserve deterministic initial IDs regardless of module load order.
+        modules.sort_unstable_by(|left, right| left.module_path().cmp(right.module_path()));
         for module in modules {
-            let module_path = module.module_path().clone();
-            analyzer.modules.insert(module_path, module);
+            analyzer.insert_module(module);
         }
 
         analyzer.resolve_main_module_if_missing();
