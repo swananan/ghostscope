@@ -46,10 +46,13 @@ async fn main() -> Result<()> {
         }
     };
 
-    if let Err(e) = logging::initialize_from_user_config(&user_config) {
-        eprintln!("Failed to initialize logging: {e}");
-        return Err(anyhow::anyhow!("Failed to initialize logging: {e}"));
-    }
+    let console_output = match logging::initialize_from_user_config(&user_config) {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("Failed to initialize logging: {e}");
+            return Err(anyhow::anyhow!("Failed to initialize logging: {e}"));
+        }
+    };
 
     info!("{}", user_config.config_source_message());
 
@@ -71,9 +74,13 @@ async fn main() -> Result<()> {
     let _pinned_maps_cleanup = crate::util::PinnedMapsCleanupGuard::new();
 
     // Route to appropriate runtime mode
-    if resolved_config.tui_mode {
+    let result = if resolved_config.tui_mode {
         tui::run_tui_coordinator_with_config(resolved_config).await
     } else {
         cli::run_command_line_runtime_with_config(resolved_config).await
+    };
+    if let Some(output) = console_output {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), output.finish()).await;
     }
+    result
 }

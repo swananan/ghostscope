@@ -3,17 +3,48 @@
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 const CHUNK_BYTES: usize = 64 * 1024;
 const QUEUED_CHUNKS: usize = 8;
 
-pub(super) struct ScriptOutputWriter {
-    sender: Option<mpsc::Sender<Vec<u8>>>,
+enum OutputMessage {
+    Bytes(Vec<u8>),
+    Finish,
+}
+
+pub(crate) struct ScriptOutputWriter {
+    sender: Option<mpsc::Sender<OutputMessage>>,
     completed: oneshot::Receiver<io::Result<()>>,
     cancelled: Arc<AtomicBool>,
+    dropped_log_chunks: Arc<AtomicU64>,
+}
+
+/// Console logging cannot await backpressure on the tracing task. Keep its
+/// best-effort queue bounded and report skipped chunks when output resumes.
+#[derive(Clone)]
+pub(crate) struct NonBlockingLogWriter {
+    sender: mpsc::Sender<OutputMessage>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl Write for NonBlockingLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        for chunk in bytes.chunks(CHUNK_BYTES) {
+            if let Err(mpsc::error::TrySendError::Full(_)) =
+                self.sender.try_send(OutputMessage::Bytes(chunk.to_vec()))
+            {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl ScriptOutputWriter {
@@ -24,16 +55,18 @@ impl ScriptOutputWriter {
         Self::new(File::from(fd))
     }
 
-    pub(super) fn stderr() -> io::Result<Self> {
+    pub(crate) fn stderr() -> io::Result<Self> {
         let fd = io::stderr().as_fd().try_clone_to_owned()?;
         Self::new(File::from(fd))
     }
 
     fn new(mut writer: impl Write + Send + 'static) -> io::Result<Self> {
-        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(QUEUED_CHUNKS);
+        let (sender, mut receiver) = mpsc::channel(QUEUED_CHUNKS);
         let (done, completed) = oneshot::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let dropped_log_chunks = Arc::new(AtomicU64::new(0));
+        let worker_dropped = Arc::clone(&dropped_log_chunks);
         // A dedicated thread owns only this descriptor and bounded byte chunks.
         // Blocking OS writes cannot be cancelled. Do not put them in Tokio's
         // blocking pool, whose shutdown waits for outstanding writes to finish.
@@ -41,11 +74,18 @@ impl ScriptOutputWriter {
             .name("ghostscope-output".into())
             .spawn(move || {
                 let result = (|| {
-                    while let Some(bytes) = receiver.blocking_recv() {
+                    while let Some(message) = receiver.blocking_recv() {
                         if worker_cancelled.load(Ordering::Acquire) {
                             return Ok(());
                         }
-                        writer.write_all(&bytes)?;
+                        let dropped = worker_dropped.swap(0, Ordering::Relaxed);
+                        if dropped > 0 {
+                            writeln!(writer, "ghostscope: console log output saturated: dropped {dropped} chunks")?;
+                        }
+                        match message {
+                            OutputMessage::Bytes(bytes) => writer.write_all(&bytes)?,
+                            OutputMessage::Finish => break,
+                        }
                     }
                     if !worker_cancelled.load(Ordering::Acquire) {
                         writer.flush()?;
@@ -58,7 +98,19 @@ impl ScriptOutputWriter {
             sender: Some(sender),
             completed,
             cancelled,
+            dropped_log_chunks,
         })
+    }
+
+    pub(crate) fn non_blocking_log_writer(&self) -> NonBlockingLogWriter {
+        NonBlockingLogWriter {
+            sender: self
+                .sender
+                .as_ref()
+                .expect("output sender is present until drop")
+                .clone(),
+            dropped: Arc::clone(&self.dropped_log_chunks),
+        }
     }
 
     /// Backpressure is asynchronous and cancellable by the caller's signal select.
@@ -69,7 +121,7 @@ impl ScriptOutputWriter {
                 .sender
                 .as_ref()
                 .expect("output sender is present until drop")
-                .send(chunk.to_vec())
+                .send(OutputMessage::Bytes(chunk.to_vec()))
                 .await
                 .is_err()
             {
@@ -87,8 +139,12 @@ impl ScriptOutputWriter {
 
     /// Deliver accepted chunks and close the descriptor. The caller must impose
     /// a deadline: cancelling this future falls back to the non-blocking Drop.
-    pub(super) async fn finish(mut self) -> io::Result<()> {
-        self.sender.take();
+    pub(crate) async fn finish(mut self) -> io::Result<()> {
+        // Logging subscribers can retain sender clones for the process lifetime.
+        // An explicit end marker lets the owner drain and close them anyway.
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(OutputMessage::Finish).await;
+        }
         self.completed().await
     }
 }
@@ -106,6 +162,90 @@ impl Drop for ScriptOutputWriter {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    struct PausedWriter {
+        started: Option<oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl Write for PausedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+                self.release.recv().unwrap();
+            }
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn full_queue_is_cancellable_and_console_loss_is_reported() {
+        let (started, blocked) = oneshot::channel();
+        let (release, receiver) = std::sync::mpsc::channel();
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut output = ScriptOutputWriter::new(PausedWriter {
+            started: Some(started),
+            release: receiver,
+            bytes: Arc::clone(&bytes),
+        })
+        .unwrap();
+        let mut console = output.non_blocking_log_writer();
+        output.write(b"first\n").await.unwrap();
+        blocked.await.unwrap();
+        output
+            .write(&vec![b'x'; CHUNK_BYTES * QUEUED_CHUNKS])
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            output.write(b"cancelled\n"),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the full queue must await capacity asynchronously"
+        );
+        console.write_all(b"dropped console message\n").unwrap();
+        release.send(()).unwrap();
+        // The subscriber's live sender clone must not hold graceful finish open.
+        tokio::time::timeout(std::time::Duration::from_secs(2), output.finish())
+            .await
+            .expect("healthy consumers must finish even with a live subscriber")
+            .unwrap();
+        let bytes = bytes.lock().unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("console log output saturated: dropped 1 chunks"));
+        assert!(!text.contains("cancelled"));
+        assert!(!text.contains("dropped console message"));
+        assert_eq!(
+            bytes.iter().filter(|byte| **byte == b'x').count(),
+            CHUNK_BYTES * QUEUED_CHUNKS
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_delivers_console_logs_with_a_live_subscriber() {
+        let (writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut reader = tokio::net::UnixStream::from_std(reader).unwrap();
+        let output = ScriptOutputWriter::new(writer).unwrap();
+        let mut console = output.non_blocking_log_writer();
+        console.write_all(b"console warning\n").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), output.finish())
+            .await
+            .expect("a subscriber clone must not keep the worker alive")
+            .unwrap();
+        let mut received = String::new();
+        reader.read_to_string(&mut received).await.unwrap();
+        assert_eq!(received, "console warning\n");
+    }
 
     #[tokio::test]
     async fn graceful_finish_delivers_all_queued_output() {

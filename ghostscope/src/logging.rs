@@ -1,3 +1,4 @@
+use crate::cli::script_output_writer::ScriptOutputWriter;
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -9,7 +10,9 @@ const DEFAULT_LOG_FILE: &str = "ghostscope.log";
 
 static INIT_GUARD: OnceLock<()> = OnceLock::new();
 
-pub fn initialize_from_user_config(user_config: &crate::config::UserConfig) -> Result<()> {
+pub fn initialize_from_user_config(
+    user_config: &crate::config::UserConfig,
+) -> Result<Option<ScriptOutputWriter>> {
     let log_file_string = user_config.log_file.to_string_lossy().to_string();
     initialize_logging_with_config(
         Some(log_file_string.as_str()),
@@ -27,10 +30,10 @@ pub fn initialize_logging_with_config(
     enable_console_logging: bool,
     log_level: crate::config::LogLevel,
     _tui_mode: bool,
-) -> Result<()> {
+) -> Result<Option<ScriptOutputWriter>> {
     if INIT_GUARD.set(()).is_err() {
         // Already initialized elsewhere; do nothing and succeed
-        return Ok(());
+        return Ok(None);
     }
 
     // If logging is disabled, set up a minimal subscriber that discards everything
@@ -39,7 +42,7 @@ pub fn initialize_logging_with_config(
             .with(tracing_subscriber::filter::LevelFilter::OFF)
             .try_init();
         let _ = init_res;
-        return Ok(());
+        return Ok(None);
     }
 
     // Initialize log to tracing adapter to capture aya's log:: output
@@ -70,6 +73,12 @@ pub fn initialize_logging_with_config(
         .truncate(true)
         .open(&log_path);
 
+    // Console writes share stderr with CLI diagnostics, so a blocked pipe must
+    // never hold a tracing event (including the shutdown message) on its caller.
+    let console_output = enable_console_logging
+        .then(ScriptOutputWriter::stderr)
+        .transpose()?;
+
     match maybe_log_file {
         Ok(log_file) => {
             // Configure file output
@@ -78,11 +87,12 @@ pub fn initialize_logging_with_config(
                 .with_writer(log_file)
                 .with_ansi(false);
 
-            if enable_console_logging {
+            if let Some(output) = &console_output {
                 // Console logging enabled: dual output to file and stderr with level filter
+                let writer = output.non_blocking_log_writer();
                 let stderr_layer = tracing_subscriber::fmt::layer()
                     .event_format(event_format.clone())
-                    .with_writer(std::io::stderr)
+                    .with_writer(move || writer.clone())
                     .with_ansi(true);
 
                 let init_res = tracing_subscriber::registry()
@@ -102,10 +112,11 @@ pub fn initialize_logging_with_config(
         }
         Err(_) => {
             // Fallback to stderr only if file creation fails and console logging is enabled
-            if enable_console_logging {
+            if let Some(output) = &console_output {
+                let writer = output.non_blocking_log_writer();
                 let stderr_layer = tracing_subscriber::fmt::layer()
                     .event_format(event_format)
-                    .with_writer(std::io::stderr);
+                    .with_writer(move || writer.clone());
                 let init_res = tracing_subscriber::registry()
                     .with(env_filter)
                     .with(stderr_layer)
@@ -121,5 +132,5 @@ pub fn initialize_logging_with_config(
         }
     }
 
-    Ok(())
+    Ok(console_output)
 }
