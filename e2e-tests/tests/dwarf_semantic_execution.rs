@@ -3,7 +3,9 @@ mod common;
 
 use anyhow::Context;
 use common::{init, runner::GhostscopeRunner, targets::TargetLauncher};
-use ghostscope_dwarf::{DwarfAnalyzer, ModuleAddress};
+use ghostscope_dwarf::{
+    DwarfAnalyzer, LoadedModuleRuntimeInfo, ModuleAddress, VariableAccessSegment, VariableId,
+};
 use gimli::write::{
     Address, AttributeValue, Dwarf, EndianVec, Expression, LineProgram, Location, LocationList,
     Sections, Unit,
@@ -206,4 +208,122 @@ async fn test_dwarf_semantics_location_list_dwarf4() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_dwarf_semantics_location_list_dwarf5() -> anyhow::Result<()> {
     check_location_list_at_probe_pc(5).await
+}
+
+fn runtime_module(path: &Path) -> LoadedModuleRuntimeInfo {
+    LoadedModuleRuntimeInfo {
+        module_path: path.to_path_buf(),
+        loaded_address: None,
+        load_bias: None,
+        size: 0,
+    }
+}
+
+#[tokio::test]
+async fn test_dwarf_semantics_module_identity_after_refresh() -> anyhow::Result<()> {
+    init();
+    let dir = fixture_dir()?;
+    let source = dir.path().join("original.c");
+    let original = dir.path().join("z-original");
+    fs::write(
+        &source,
+        "struct Record { int value; };\n\
+         struct Record record = {42};\n\
+         int identity_probe(struct Record *arg) { return arg->value; }\n\
+         int main(void) { return identity_probe(&record); }\n",
+    )?;
+    run_command(
+        Command::new("cc")
+            .args(["-g", "-O0", "-o"])
+            .arg(&original)
+            .arg(&source),
+    )?;
+
+    let mut analyzer = DwarfAnalyzer::from_exec_path(&original).await?;
+    let address = analyzer
+        .lookup_function_addresses("identity_probe")
+        .into_iter()
+        .next()
+        .context("missing identity_probe")?;
+    let context = analyzer.resolve_pc(&address)?;
+    let plan = analyzer
+        .plan_variable_by_name(&context, "arg")?
+        .context("missing parameter")?;
+    let variable = VariableId {
+        declaration: plan.declaration.context("missing parameter identity")?,
+    };
+    let resolved = analyzer
+        .resolved_type_for_plan(&plan)?
+        .context("missing parameter type")?;
+    let pointee = analyzer.project_resolved_type(
+        &resolved,
+        &VariableAccessSegment::Dereference,
+        Some(&original),
+    )?;
+    let module_id = context.module;
+
+    let added = dir.path().join("a-added.so");
+    let retry = dir.path().join("b-retry.so");
+    let alias = dir.path().join("0-original-alias");
+    std::os::unix::fs::symlink(&original, &alias)?;
+    let source = dir.path().join("added.c");
+    fs::write(
+        &source,
+        "struct Other { double other; }; struct Other other;\n",
+    )?;
+    run_command(
+        Command::new("cc")
+            .args(["-g", "-O0", "-shared", "-fPIC", "-o"])
+            .arg(&added)
+            .arg(&source),
+    )?;
+    fs::write(&retry, b"invalid ELF")?;
+
+    for repaired in [false, true] {
+        if repaired {
+            fs::copy(&added, &retry)?;
+        }
+        assert_eq!(
+            analyzer
+                .refresh_pid_runtime_modules_with_config_and_debuginfod(
+                    vec![
+                        runtime_module(&alias),
+                        runtime_module(&added),
+                        runtime_module(&retry)
+                    ],
+                    &[],
+                    false,
+                    None,
+                    |_| {},
+                )
+                .await?,
+            1
+        );
+        assert_eq!(
+            analyzer.module_path_for_id(module_id),
+            Some(original.as_path()),
+            "refresh redirected the saved module identity"
+        );
+        assert_eq!(analyzer.module_id_for_path(&alias), Some(module_id));
+        assert_eq!(analyzer.module_paths().len(), if repaired { 3 } else { 2 });
+        assert_eq!(
+            analyzer.module_load_failures().len(),
+            usize::from(!repaired)
+        );
+        let refreshed_plan = analyzer
+            .plan_variable(&context, variable)?
+            .context("saved variable identity stopped resolving after refresh")?;
+        assert_eq!(refreshed_plan.type_id, plan.type_id);
+        assert_eq!(
+            analyzer.project_resolved_type(
+                &resolved,
+                &VariableAccessSegment::Dereference,
+                Some(&original),
+            )?,
+            pointee,
+            "saved type identity changed after refresh"
+        );
+        assert_eq!(analyzer.resolve_pc(&address)?.module, module_id);
+    }
+    Ok(())
 }
