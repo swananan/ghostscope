@@ -785,6 +785,12 @@ export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 - **Log Level**: `warn` if not specified
 - **Log File**: `./ghostscope.log` in current directory
 
+Console logging uses a bounded queue so a blocked stderr pipe cannot hold up
+tracing or shutdown. When the queue fills, console log chunks may be dropped;
+the skipped count is reported when output resumes. File logging continues
+independently. Runtime script warnings also use bounded, cancellable output,
+with a short drain deadline during shutdown.
+
 ### Startup Load Report
 
 During startup, GhostScope can report how DWARF was loaded before traces
