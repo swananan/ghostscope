@@ -56,6 +56,10 @@ cargo build
 
 ## 构建
 
+运行时性能测量与 base/head 对比见[运行时基线指南](../../scripts/runtime-perf/README.md)。
+它覆盖简单 print、复杂值和 DWARF backtrace，记录目标减速、事件丢失与用户态 RSS。
+请将性能测量与常规测试、编译分开运行，避免把宿主机资源竞争算入追踪开销。
+
 ### Debug 构建（默认）
 
 ```bash

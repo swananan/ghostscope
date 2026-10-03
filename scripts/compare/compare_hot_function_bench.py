@@ -190,7 +190,12 @@ def start_target(target_bin: Path, iterations: int, inner_work: int) -> tuple[su
         bufsize=1,
     )
     assert proc.stderr is not None
-    ready_line = read_line_with_timeout(proc.stderr, DEFAULT_READY_TIMEOUT_SECS, "waiting for target READY line")
+    try:
+        ready_line = read_line_with_timeout(proc.stderr, DEFAULT_READY_TIMEOUT_SECS, "waiting for target READY line")
+    except BaseException:
+        proc.kill()
+        proc.communicate()
+        raise
     match = READY_RE.search(ready_line)
     if match is None:
         proc.kill()

@@ -56,6 +56,12 @@ cargo build
 
 ## Build
 
+Runtime performance measurements and base/head comparisons are documented in
+the [runtime baseline guide](../scripts/runtime-perf/README.md). It covers real
+scalar output, complex values, and DWARF backtraces, including target slowdown,
+event loss, and userspace RSS. Run measurements separately from ordinary tests
+and compilation to avoid measuring host contention.
+
 ### Debug Build (Default)
 
 ```bash
