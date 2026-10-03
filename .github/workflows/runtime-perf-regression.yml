@@ -1,0 +1,170 @@
+name: Runtime Perf Regression
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'ghostscope/**'
+      - 'ghostscope-compiler/**'
+      - 'ghostscope-loader/**'
+      - 'ghostscope-dwarf/**'
+      - 'ghostscope-process/**'
+      - 'ghostscope-protocol/**'
+      - 'ghostscope-ui/**'
+      - 'ghostscope-platform/**'
+      - 'ghostscope-debuginfod/**'
+      - 'scripts/runtime-perf/**'
+      - 'scripts/compare/compare_hot_function_bench.py'
+      - 'e2e-tests/tests/manual_runtime_performance_baseline.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/runtime-perf-regression.yml'
+  schedule:
+    - cron: '37 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'Baseline revision (build must support the current benchmark CLI options)'
+        default: 'origin/main~1'
+        type: string
+      fail_on_regression:
+        description: 'Enforce performance thresholds; normally report only on hosted runners'
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-perf-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTUP_TOOLCHAIN: '1.98.0'
+  LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+
+jobs:
+  runtime-perf:
+    name: Runtime Perf (same-host base/head)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.target_tmp/runtime-perf
+      RUNTIME_PERF_RESULTS_DIR: ${{ github.workspace }}/.tmp/runtime-perf
+    steps:
+      - name: Checkout head and benchmark harness
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: head
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Resolve baseline commit
+        id: base
+        working-directory: head
+        env:
+          REQUESTED_BASE_REF: ${{ github.event.pull_request.base.sha || inputs.base_ref || 'origin/main~1' }}
+        run: |
+          set -euo pipefail
+          base_sha=$(git rev-parse --verify "${REQUESTED_BASE_REF}^{commit}")
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.base.outputs.sha }}
+          path: base
+          submodules: recursive
+
+      - name: Install LLVM 22 and Polly
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y llvm-22-dev libpolly-22-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Cache cargo registry and git sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-runtime-perf-sources-${{ hashFiles('head/Cargo.lock', 'base/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-runtime-perf-sources-
+
+      - name: Cache cargo builds
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-runtime-perf-target-${{ hashFiles('head/Cargo.lock', 'base/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-runtime-perf-target-
+
+      - name: Test measurement and comparison logic
+        working-directory: head
+        run: python3 -m unittest discover -s scripts/runtime-perf -v
+
+      - name: Build baseline binary
+        working-directory: base
+        run: CARGO_TARGET_DIR="$CARGO_TARGET_DIR/base" cargo build --release -p ghostscope --all-features
+
+      - name: Build candidate and benchmark test
+        working-directory: head
+        run: |
+          CARGO_TARGET_DIR="$CARGO_TARGET_DIR/head" cargo build --release -p ghostscope --all-features
+          CARGO_TARGET_DIR="$CARGO_TARGET_DIR/head" cargo test --release -p ghostscope-e2e-tests --all-features --test manual_runtime_performance_baseline --no-run
+
+      - name: Record revisions
+        working-directory: head
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          mkdir -p "$RUNTIME_PERF_RESULTS_DIR"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path(os.environ['RUNTIME_PERF_RESULTS_DIR'], 'revisions.json').write_text(
+              json.dumps({key: os.environ[key] for key in ('BASE_SHA', 'HEAD_SHA')}, indent=2) + '\n'
+          )
+          PY
+
+      - name: Measure runtime performance
+        working-directory: head
+        env:
+          GHOSTSCOPE_RUNTIME_BENCH_FAIL_ON_REGRESSION: ${{ inputs.fail_on_regression && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          cargo_path=$(command -v cargo)
+          sudo -E env \
+            CARGO_TARGET_DIR="$CARGO_TARGET_DIR/head" \
+            GHOSTSCOPE_RUNTIME_BENCH_BIN="$CARGO_TARGET_DIR/head/release/ghostscope" \
+            GHOSTSCOPE_RUNTIME_BENCH_BASE_BIN="$CARGO_TARGET_DIR/base/release/ghostscope" \
+            GHOSTSCOPE_RUNTIME_BENCH_PROFILE=release \
+            GHOSTSCOPE_RUNTIME_BENCH_OUTPUT_JSON="$RUNTIME_PERF_RESULTS_DIR/runtime.json" \
+            GHOSTSCOPE_RUNTIME_BENCH_OUTPUT_MARKDOWN="$RUNTIME_PERF_RESULTS_DIR/runtime.md" \
+            "$cargo_path" test --release -p ghostscope-e2e-tests --all-features \
+            --test manual_runtime_performance_baseline manual_runtime_performance_baseline -- --nocapture
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          if [[ -f "$RUNTIME_PERF_RESULTS_DIR/runtime.md" ]]; then
+            cat "$RUNTIME_PERF_RESULTS_DIR/runtime.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload baseline, samples, and comparison
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-perf-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RUNTIME_PERF_RESULTS_DIR }}
+          retention-days: 90
+          if-no-files-found: warn
