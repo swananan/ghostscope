@@ -75,6 +75,7 @@ ghostscope --value-diagnostics-help
 # 选择脚本模式的事件 stdout 输出方式
 ghostscope --script-output pretty   # 默认：格式化 stdout
 ghostscope --script-output plain    # 仅保留 payload stdout
+ghostscope --script-output jsonl    # 每个事件一行带版本号的 JSON
 
 # 控制 stderr 上的交互式状态提示
 ghostscope --status                 # 默认
@@ -96,6 +97,59 @@ ghostscope --script-timestamp none
 # 以 TUI 模式启动（未提供脚本时的默认模式）
 ghostscope --tui
 ```
+
+### JSONL 脚本事件
+
+自动化可使用 `--script-output jsonl` 或配置 `[script] output = "jsonl"`：
+
+```bash
+sudo ghostscope -p 1234 -s 'trace main { print "hello"; }' --script-output jsonl > events.jsonl
+```
+
+每个输出事件对应一行紧凑 JSON，行尾有换行符；内容里的换行、引号和控制字符会转义。
+JSONL 不添加 ANSI 色彩，忽略 `--script-timestamp`。状态提示、日志、错误、丢失警告和
+内部就绪标记都走 stderr。只有含输出内容的事件会输出，并沿用 Pretty/Plain 的事件限速；
+`--script-output-events-per-sec 0` 可关闭限速。
+
+版本化契约见 [script-event-v1.schema.json](../script-event-v1.schema.json)：
+
+| 字段 | 含义 |
+| --- | --- |
+| `schema_version` | 整数版本号，当前为 `1` |
+| `event` | 记录类型，当前为 `"trace"` |
+| `timestamp_ns` | eBPF 原始单调时间戳，单位纳秒，不含系统休眠时间 |
+| `trace_id`, `pid`, `tid` | trace ID 和事件 PID/TID；PID/TID 保留现有内核观测的宿主机视图 |
+| `execution_status` | `0` 成功、`1` 部分失败、`2` 完全失败；缺失时为 `null` |
+| `trace` | `target`、`target_display`、`binary_path`；元数据不可用时为 `null` |
+| `value_diagnostics` | 静态显示/采集限制：`scope: "static"`、含表达式前缀的 `path`、`type_name`、稳定的 `reason` 和说明 `detail` |
+| `items` | 按原始顺序排列的结构化内容，用 `kind` 区分类型 |
+
+`items` 支持 `text`/`formatted_text`（`content`）、`variable`（`name`、`type_name`、
+`formatted_value`）、`complex_variable`（`name`、`access_path`、`type_index`、
+`formatted_value`）、`expr_error`（`expr`、`error_code`、`flags`、`failing_addr`）和
+`backtrace`。变量值和格式化打印内容仍是显示字符串，不包含类型化对象树或原始采集字节。
+`type_index` 仅在该编译 trace 内有效。静态诊断描述可能的显示限制，不能证明某个条件打印
+已执行，也不能据此断言发生了运行时读失败。
+
+表达式错误码为：`1` 空指针解引用、`2` 读错误、`3` 访问错误、`4` 截断、`5` 偏移不可用、
+`6` 长度为零。消费者应保留未知数字错误码；`flags` 是原始位字段，`failing_addr: 0`
+可能表示空地址或地址不可用。
+
+Backtrace 保留 `requested_depth`、`physical_frame_count`、`raw`、`status`、
+`status_code`、`error_code`、`error_reason` 和有序 `frames`。稳定的状态名依次为
+`complete`、`truncated`、`dwarf_unavailable`、`unsupported_cfi`、`offsets_unavailable`、
+`read_error`、`internal_error`、`invalid_frame`、`no_unwind_rows_for_pc`，对应代码 0–8。
+无停止错误时 `error_reason` 为 `null`，已知错误为稳定标签，未知数字错误码对应 `"unknown"`。
+达到深度/预算限制时可能是 `status: "truncated"` 且 `error_code: 0`，需要检查状态。
+
+每帧包含物理 `index`、`inline`、`function`、`parameters`、`address`、`location`、
+`module`、`raw_ip`、`cookie`、`flags`。不可用的可选字段为 `null`，参数列表可为空。
+内联帧共享物理索引，因此 `frames` 数量可能大于 `physical_frame_count`。
+时间戳和数字地址/cookie 需要使用能保留 64 位整数的解析器。
+
+消费者应检查 `schema_version`，忽略未知字段和 item 类型，按稳定代码/标签判断状态，
+避免解析函数名、模块/源码位置、格式化值和诊断详情等展示文本。
+版本 1 可增加兼容字段或 item 类型；不兼容的字段、类型或含义变化需要新版本号。
 
 ### 调试信息
 
@@ -288,7 +342,7 @@ ghostscope bpffs prune --dry-run --json
 | `--script-file <PATH>` | | 要执行的脚本文件 | 无 |
 | `--script-help` | | 输出内嵌的脚本语言参考并退出 | 关 |
 | `--value-diagnostics-help` | | 输出内嵌的值诊断指南并退出 | 关 |
-| `--script-output <MODE>` | | 脚本事件 stdout 模式：pretty, plain | pretty |
+| `--script-output <MODE>` | | 脚本事件 stdout 模式：pretty, plain, jsonl | pretty |
 | `--backtrace-depth <N>` | | 每条 `bt`/`backtrace` 指令最多采集的 DWARF unwind 栈帧数（`1..=128`） | 128 |
 | `--no-backtrace-runtime-modules` | | 禁止为 `bt`/`backtrace` 新映射模块加载 compact CFI；事件仍使用已有符号、模块偏移或裸地址输出 | 关 |
 | `--backtrace-runtime-modules-max <N>` | | 最多尝试解析 CFI 的不同运行时模块数（`1..=1024`） | 32 |
@@ -366,6 +420,7 @@ log_level = "warn"
 # 非 TUI 脚本模式的事件 stdout 渲染
 # pretty: 时间戳 + TraceID/PID/TID 头信息 + 缩进 payload
 # plain: 只输出 payload 行
+# jsonl: 每个事件一行带版本号的 JSON（见 ../script-event-v1.schema.json）
 output = "pretty"
 
 # stderr 上的交互式 DWARF/脚本/attach 状态提示

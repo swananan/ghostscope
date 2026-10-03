@@ -74,6 +74,7 @@ ghostscope --value-diagnostics-help
 # Choose script-mode event stdout rendering
 ghostscope --script-output pretty   # default: formatted stdout
 ghostscope --script-output plain    # payload-only stdout
+ghostscope --script-output jsonl    # versioned JSON object per event
 
 # Control interactive status prompts on stderr
 ghostscope --status                 # default
@@ -95,6 +96,70 @@ ghostscope --script-timestamp none
 # Start in TUI mode (default if no script provided)
 ghostscope --tui
 ```
+
+### JSONL Script Events
+
+Use `--script-output jsonl` or `[script] output = "jsonl"` for automation:
+
+```bash
+sudo ghostscope -p 1234 -s 'trace main { print "hello"; }' --script-output jsonl > events.jsonl
+```
+
+Each emitted event is one compact JSON object followed by a newline. Embedded
+newlines, quotes, and control characters are escaped. JSONL adds no ANSI colors
+and ignores `--script-timestamp`; status prompts, logging, errors, loss warnings,
+and the internal readiness marker use stderr. Payload-producing events follow
+the same output rate limit as Pretty/Plain. Use
+`--script-output-events-per-sec 0` to disable that limiter.
+
+The contract is described by [script-event-v1.schema.json](script-event-v1.schema.json).
+Version 1 uses these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | Integer schema version, currently `1` |
+| `event` | Record kind, currently `"trace"` |
+| `timestamp_ns` | Original eBPF monotonic timestamp in nanoseconds, excluding suspended time |
+| `trace_id`, `pid`, `tid` | Numeric trace ID and event PID/TID; PID/TID keep the existing kernel-observed host view |
+| `execution_status` | `0` success, `1` partial failure, `2` complete failure; `null` if unavailable |
+| `trace` | `target`, `target_display`, and `binary_path`; `null` if metadata is unavailable |
+| `value_diagnostics` | Static display/capture notes with `scope: "static"`, expression-qualified `path`, `type_name`, stable `reason`, and explanatory `detail` |
+| `items` | Ordered structured payload items, discriminated by `kind` |
+
+`items` supports `text`/`formatted_text` (`content`), `variable` (`name`,
+`type_name`, `formatted_value`), `complex_variable` (`name`, `access_path`,
+`type_index`, `formatted_value`), `expr_error` (`expr`, `error_code`, `flags`,
+`failing_addr`), and `backtrace`. Values and formatted print content remain
+display strings; JSONL does not expose a typed object tree or raw capture bytes.
+`type_index` is local to the compiled trace. Static diagnostics describe possible
+display limits and do not prove that a conditional print ran or a runtime read failed.
+
+Expression error codes are `1` null dereference, `2` read error, `3` access
+error, `4` truncation, `5` unavailable offsets, and `6` zero length. Preserve
+unknown numeric codes; `flags` is the original bitfield, and `failing_addr: 0`
+can mean a null or unavailable address.
+
+Backtraces retain `requested_depth`, `physical_frame_count`, `raw`, `status`,
+`status_code`, `error_code`, `error_reason`, and ordered `frames`.
+Stable status names are `complete`, `truncated`, `dwarf_unavailable`,
+`unsupported_cfi`, `offsets_unavailable`, `read_error`, `internal_error`,
+`invalid_frame`, and `no_unwind_rows_for_pc` (codes 0 through 8 respectively).
+`error_reason` is `null` when no stop error is reported, a stable reason label
+when known, or `"unknown"` for an unrecognized numeric error code. A truncated
+backtrace can have `error_code: 0`; use `status` to detect depth/budget stops.
+
+Frames retain the physical `index`, `inline`, `function`, `parameters`,
+`address`, `location`, `module`, `raw_ip`, `cookie`, and `flags`. Unavailable
+optional fields are `null`; `parameters` can be empty. Inline frames share a
+physical index, so `frames.length` can exceed `physical_frame_count`.
+Addresses/cookies exposed as numbers and timestamps require a parser that
+preserves 64-bit integers. Function names, module/location display strings,
+formatted values, and explanatory diagnostic details are presentation text.
+
+Consumers should check `schema_version`, ignore unknown fields and item kinds,
+and branch on stable codes/tags rather than parsing presentation text. Compatible
+additions may appear within version 1; incompatible field/type/meaning changes
+require a new schema version.
 
 ### Debug Information
 
@@ -294,7 +359,7 @@ index is reported in CLI/TUI startup status before falling back.
 | `--script-file <PATH>` | | Script file to execute | None |
 | `--script-help` | | Print the embedded script language reference and exit | Off |
 | `--value-diagnostics-help` | | Print the embedded value diagnostics guide and exit | Off |
-| `--script-output <MODE>` | | Script event stdout mode: pretty, plain | pretty |
+| `--script-output <MODE>` | | Script event stdout mode: pretty, plain, jsonl | pretty |
 | `--backtrace-depth <N>` | | Max DWARF-unwound frames captured by each `bt`/`backtrace` instruction (`1..=128`) | 128 |
 | `--no-backtrace-runtime-modules` | | Disable compact-CFI loading for newly mapped `bt`/`backtrace` modules; events still render with available symbols, module offsets, or raw addresses | Off |
 | `--backtrace-runtime-modules-max <N>` | | Maximum distinct runtime modules whose CFI GhostScope will try to resolve (`1..=1024`) | 32 |
@@ -372,6 +437,7 @@ log_level = "warn"
 # Event stdout rendering for non-TUI script mode
 # pretty: timestamp + TraceID/PID/TID header + indented payload
 # plain: payload lines only
+# jsonl: versioned JSON object per event (see script-event-v1.schema.json)
 output = "pretty"
 
 # Interactive DWARF/script/attach status prompts on stderr

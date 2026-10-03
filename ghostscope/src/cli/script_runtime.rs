@@ -369,8 +369,11 @@ async fn run_cli_with_session(
         "Starting event monitoring for {} active traces",
         session.trace_manager.active_trace_count()
     );
-    crate::util::emit_ready_marker(config.emit_ready_marker.as_deref())
-        .map_err(|e| anyhow::anyhow!("failed to emit ready marker: {e}"))?;
+    crate::util::emit_ready_marker(
+        config.emit_ready_marker.as_deref(),
+        config.script_output_mode == crate::config::ScriptOutputMode::Jsonl,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to emit ready marker: {e}"))?;
     if show_cli_status {
         eprintln!(
             "{} {}",
@@ -392,6 +395,24 @@ async fn run_cli_with_session(
     let mut diagnostic_writer = super::script_output_writer::ScriptOutputWriter::stderr()?;
     let mut diagnostics = String::new();
     let mut backtrace_renderer = crate::trace::backtrace::BacktraceRenderer::default();
+    // Trace metadata is fixed after attachment; avoid cloning scripts and static
+    // value diagnostics on every event in a high-volume JSONL stream.
+    let output_traces: std::collections::HashMap<_, _> =
+        if config.script_output_mode == crate::config::ScriptOutputMode::Jsonl {
+            session
+                .trace_manager
+                .get_all_trace_ids()
+                .into_iter()
+                .filter_map(|id| {
+                    session
+                        .trace_manager
+                        .get_trace_snapshot(id)
+                        .map(|trace| (u64::from(id), trace))
+                })
+                .collect()
+        } else {
+            Default::default()
+        };
     let mut output_rate_limiter = ScriptOutputRateLimiter::new(config.script_output_events_per_sec);
     let mut ebpf_loss_report_ticker = tokio::time::interval(Duration::from_secs(1));
     ebpf_loss_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -449,7 +470,11 @@ async fn run_cli_with_session(
                                         &process_snapshot,
                                         session.proc_pid(),
                                     );
-                                    output_renderer.write_display_event(&display_event, &mut output)?;
+                                    output_renderer.write_display_event(
+                                        &display_event,
+                                        output_traces.get(&event.trace_id),
+                                        &mut output,
+                                    )?;
                                 }
                                 ScriptOutputRateDecision::Suppress => {
                                     suppressed_output = true;

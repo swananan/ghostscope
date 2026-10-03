@@ -1,0 +1,413 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GhostScope script event v1",
+  "description": "One JSONL trace event. Unknown fields are allowed for compatible additions. Display strings are presentation text; tags and codes are the automation contract.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "event",
+    "timestamp_ns",
+    "trace_id",
+    "pid",
+    "tid",
+    "execution_status",
+    "trace",
+    "value_diagnostics",
+    "items"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "event": {
+      "const": "trace"
+    },
+    "timestamp_ns": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "trace_id": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "pid": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "tid": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "execution_status": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "trace": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": [
+            "target",
+            "target_display",
+            "binary_path"
+          ],
+          "properties": {
+            "target": {
+              "type": "string"
+            },
+            "target_display": {
+              "type": "string"
+            },
+            "binary_path": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "value_diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "scope",
+          "path",
+          "type_name",
+          "reason",
+          "detail"
+        ],
+        "properties": {
+          "scope": {
+            "const": "static"
+          },
+          "path": {
+            "type": "string"
+          },
+          "type_name": {
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "layout-unsupported",
+              "read-plan-unsupported",
+              "depth-limit",
+              "recursive-type",
+              "capture-budget"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "content"
+            ],
+            "properties": {
+              "kind": {
+                "const": "text"
+              },
+              "content": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "content"
+            ],
+            "properties": {
+              "kind": {
+                "const": "formatted_text"
+              },
+              "content": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "name",
+              "type_name",
+              "formatted_value"
+            ],
+            "properties": {
+              "kind": {
+                "const": "variable"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type_name": {
+                "type": "string"
+              },
+              "formatted_value": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "name",
+              "access_path",
+              "type_index",
+              "formatted_value"
+            ],
+            "properties": {
+              "kind": {
+                "const": "complex_variable"
+              },
+              "name": {
+                "type": "string"
+              },
+              "access_path": {
+                "type": "string"
+              },
+              "type_index": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 65535
+              },
+              "formatted_value": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "expr",
+              "error_code",
+              "flags",
+              "failing_addr"
+            ],
+            "properties": {
+              "kind": {
+                "const": "expr_error"
+              },
+              "expr": {
+                "type": "string"
+              },
+              "error_code": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "flags": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "failing_addr": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 18446744073709551615
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "requested_depth",
+              "physical_frame_count",
+              "status",
+              "status_code",
+              "error_code",
+              "error_reason",
+              "raw",
+              "frames"
+            ],
+            "properties": {
+              "kind": {
+                "const": "backtrace"
+              },
+              "requested_depth": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "physical_frame_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "status": {
+                "enum": [
+                  "complete",
+                  "truncated",
+                  "dwarf_unavailable",
+                  "unsupported_cfi",
+                  "offsets_unavailable",
+                  "read_error",
+                  "internal_error",
+                  "invalid_frame",
+                  "no_unwind_rows_for_pc"
+                ]
+              },
+              "status_code": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 8
+              },
+              "error_code": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 65535
+              },
+              "error_reason": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "raw": {
+                "type": "boolean"
+              },
+              "frames": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/frame"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "frame": {
+      "type": "object",
+      "required": [
+        "index",
+        "inline",
+        "function",
+        "parameters",
+        "address",
+        "location",
+        "module",
+        "raw_ip",
+        "cookie",
+        "flags"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "inline": {
+          "type": "boolean"
+        },
+        "function": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "location": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "module": {
+          "type": "string"
+        },
+        "raw_ip": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cookie": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "flags": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

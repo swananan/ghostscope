@@ -1118,6 +1118,7 @@ dependencies = [
  "object 0.36.7",
  "regex",
  "scopeguard",
+ "serde_json",
  "serial_test",
  "tempfile",
  "tokio",

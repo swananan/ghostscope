@@ -21,6 +21,7 @@ pub enum ScriptOutputMode {
     #[default]
     Pretty,
     Plain,
+    Jsonl,
 }
 
 #[derive(
@@ -146,7 +147,8 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
 
-    /// Emit a readiness marker to stdout after script compilation and uprobe attachment.
+    /// Emit a readiness marker after script compilation and uprobe attachment
+    /// (stdout for text output, stderr for JSONL).
     #[arg(long, value_name = "TEXT", hide = true)]
     pub emit_ready_marker: Option<String>,
 
@@ -242,7 +244,7 @@ pub struct Args {
     #[arg(long = "args", action = clap::ArgAction::SetTrue)]
     pub args_separator: bool,
 
-    /// Script-mode event stdout formatting: pretty or plain
+    /// Script-mode event stdout formatting: pretty, plain, or versioned jsonl
     #[arg(long, value_name = "MODE", value_enum)]
     pub script_output: Option<ScriptOutputMode>,
 
@@ -983,6 +985,24 @@ mod tests {
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_jsonl_output_from_cli_and_config() {
+        let args = Args::try_parse_from([
+            "ghostscope",
+            "-p",
+            "1234",
+            "-s",
+            "trace main { print 1; }",
+            "--script-output",
+            "jsonl",
+        ])
+        .unwrap();
+        assert_eq!(args.script_output, Some(ScriptOutputMode::Jsonl));
+        let config: crate::config::settings::ScriptConfig =
+            toml::from_str("output = 'jsonl'").unwrap();
+        assert_eq!(config.output, ScriptOutputMode::Jsonl);
     }
 
     #[test]

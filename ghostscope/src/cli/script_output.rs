@@ -26,7 +26,7 @@ impl ScriptOutputRenderer {
     pub fn new(options: ScriptOutputOptions) -> Self {
         let pretty_timestamp = match options.mode {
             ScriptOutputMode::Pretty => Some(PrettyTimestampFormatter::new(options.timestamp)),
-            ScriptOutputMode::Plain => None,
+            ScriptOutputMode::Plain | ScriptOutputMode::Jsonl => None,
         };
 
         Self {
@@ -39,6 +39,9 @@ impl ScriptOutputRenderer {
     #[cfg(test)]
     pub fn render_event_lines(&mut self, event: &ParsedTraceEvent) -> Vec<String> {
         match self.mode {
+            ScriptOutputMode::Jsonl => {
+                self.render_display_event_lines(&UiTraceEvent::from_protocol_event(event))
+            }
             ScriptOutputMode::Plain => {
                 let formatted_output = event.to_formatted_output();
                 if formatted_output.is_empty() {
@@ -68,6 +71,11 @@ impl ScriptOutputRenderer {
     #[cfg(test)]
     pub fn render_display_event_lines(&mut self, event: &UiTraceEvent) -> Vec<String> {
         match self.mode {
+            ScriptOutputMode::Jsonl => {
+                let mut output = Vec::new();
+                self.write_display_event(event, None, &mut output).unwrap();
+                vec![String::from_utf8(output).unwrap().trim_end().to_string()]
+            }
             ScriptOutputMode::Plain => event.to_formatted_output(),
             ScriptOutputMode::Pretty => {
                 if event.items.is_empty() {
@@ -87,9 +95,14 @@ impl ScriptOutputRenderer {
     pub fn write_display_event<W: Write>(
         &mut self,
         event: &UiTraceEvent,
+        trace: Option<&crate::trace::snapshot::TraceSnapshot>,
         writer: &mut W,
     ) -> io::Result<bool> {
         match self.mode {
+            ScriptOutputMode::Jsonl => {
+                super::script_output_jsonl::write_event(event, trace, writer)?;
+                Ok(true)
+            }
             ScriptOutputMode::Plain => {
                 let mut wrote = false;
                 for line in event.to_formatted_output() {
@@ -998,6 +1011,182 @@ mod tests {
         );
         assert_eq!(plain[2], "counter (U64): 99");
         assert_eq!(plain[3], "req.method = GET");
+    }
+
+    #[test]
+    fn jsonl_preserves_structured_values_and_escapes_each_event_on_one_line() {
+        let mut event = sample_structured_print_display_event();
+        let content = "quote: \" slash: \\ newline:\n中文\t\0";
+        event.items[0] = TraceDisplayItem::Text {
+            content: content.into(),
+        };
+        let mut renderer = ScriptOutputRenderer::new(ScriptOutputOptions {
+            mode: ScriptOutputMode::Jsonl,
+            timestamp: ScriptTimestampFormat::Local,
+            color_enabled: true,
+        });
+        let mut bytes = Vec::new();
+        for _ in 0..2 {
+            assert!(renderer
+                .write_display_event(&event, None, &mut bytes)
+                .unwrap());
+        }
+        let output = String::from_utf8(bytes).unwrap();
+        assert!(output.ends_with('\n'));
+        assert!(!output.contains('\u{1b}'));
+        assert_eq!(output.lines().count(), 2);
+        let record: serde_json::Value =
+            serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(record["schema_version"], 1);
+        assert_eq!(record["event"], "trace");
+        assert_eq!(record["timestamp_ns"], event.timestamp);
+        assert_eq!(record["trace_id"], event.trace_id);
+        assert_eq!(record["pid"], event.pid);
+        assert_eq!(record["tid"], event.tid);
+        assert_eq!(record["execution_status"], 1);
+        assert!(record["trace"].is_null());
+        assert_eq!(record["value_diagnostics"], serde_json::json!([]));
+        assert_eq!(
+            record["items"],
+            serde_json::json!([
+                {"kind": "text", "content": content},
+                {"kind": "formatted_text", "content": "value=99"},
+                {"kind": "variable", "name": "counter", "type_name": "U64", "formatted_value": "99"},
+                {"kind": "complex_variable", "name": "req", "access_path": "req.method", "type_index": 12, "formatted_value": "req.method = GET"},
+                {"kind": "expr_error", "expr": "memcmp(buf, hex(\"41\"), 1)", "error_code": 2, "flags": 1, "failing_addr": 0x1234}
+            ])
+        );
+    }
+
+    #[test]
+    fn jsonl_preserves_trace_metadata_and_static_diagnostics() {
+        let trace = crate::trace::snapshot::TraceSnapshot {
+            trace_id: 11,
+            target: "main".into(),
+            script_content: String::new(),
+            binary_path: "/tmp/program".into(),
+            target_display: "main at program.c:10".into(),
+            pid_context: Default::default(),
+            is_enabled: true,
+            pc: 0,
+            ebpf_function_name: String::new(),
+            address_global_index: None,
+            value_diagnostics: vec![ghostscope_protocol::ValueDiagnostic {
+                path: "req.headers[]".into(),
+                type_name: "Vec<Header>".into(),
+                reason: ghostscope_protocol::ValueDiagnosticReason::DepthLimit,
+                detail: "depth limit reached".into(),
+            }],
+        };
+        let mut renderer = ScriptOutputRenderer::new(ScriptOutputOptions {
+            mode: ScriptOutputMode::Jsonl,
+            timestamp: ScriptTimestampFormat::None,
+            color_enabled: false,
+        });
+        let mut output = Vec::new();
+        renderer
+            .write_display_event(
+                &sample_structured_print_display_event(),
+                Some(&trace),
+                &mut output,
+            )
+            .unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            record["trace"],
+            serde_json::json!({
+                "target": "main", "target_display": "main at program.c:10", "binary_path": "/tmp/program"
+            })
+        );
+        assert_eq!(
+            record["value_diagnostics"],
+            serde_json::json!([{
+                "scope": "static", "path": "req.headers[]", "type_name": "Vec<Header>",
+                "reason": "depth-limit", "detail": "depth limit reached"
+            }])
+        );
+    }
+
+    #[test]
+    fn jsonl_preserves_backtrace_stops_and_symbolized_frames() {
+        for (status, code, name) in [
+            (BacktraceStatus::Complete, 0, "complete"),
+            (BacktraceStatus::Truncated, 1, "truncated"),
+            (BacktraceStatus::DwarfUnavailable, 2, "dwarf_unavailable"),
+            (BacktraceStatus::UnsupportedCfi, 3, "unsupported_cfi"),
+            (
+                BacktraceStatus::OffsetsUnavailable,
+                4,
+                "offsets_unavailable",
+            ),
+            (BacktraceStatus::ReadError, 5, "read_error"),
+            (BacktraceStatus::InternalError, 6, "internal_error"),
+            (BacktraceStatus::InvalidFrame, 7, "invalid_frame"),
+            (
+                BacktraceStatus::NoUnwindRowsForPc,
+                8,
+                "no_unwind_rows_for_pc",
+            ),
+        ] {
+            let mut event = sample_backtrace_display_event();
+            let TraceDisplayItem::Backtrace(backtrace) = &mut event.items[1] else {
+                unreachable!()
+            };
+            backtrace.status = status;
+            backtrace.error_code = if code == 0 { 0 } else { 1 };
+            backtrace.frames[0].inline = true;
+            let lines = render_display_with_renderer(
+                &event,
+                ScriptOutputOptions {
+                    mode: ScriptOutputMode::Jsonl,
+                    timestamp: ScriptTimestampFormat::Boot,
+                    color_enabled: true,
+                },
+            );
+            let record: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+            let item = &record["items"][1];
+            assert_eq!(item["status"], name);
+            assert_eq!(item["status_code"], code);
+            assert_eq!(item["requested_depth"], 128);
+            assert_eq!(item["physical_frame_count"], 1);
+            assert_eq!(item["error_code"], if code == 0 { 0 } else { 1 });
+            if code == 0 {
+                assert!(item["error_reason"].is_null());
+            } else {
+                assert_eq!(item["error_reason"], "return-address-read-failed");
+            }
+            assert_eq!(item["frames"][0]["inline"], true);
+            assert_eq!(item["frames"][0]["function"], "ngx_http_process_request");
+            assert_eq!(
+                item["frames"][0]["location"],
+                "/tmp/ngx_http_request.c:2054:1"
+            );
+            assert_eq!(item["frames"][1]["raw_ip"], 0x7f001234_u64);
+            assert_eq!(item["frames"][1]["cookie"], 0xfeed_beef_u64);
+            assert_eq!(item["frames"][1]["flags"], 0x8000);
+        }
+    }
+
+    #[test]
+    fn jsonl_propagates_broken_pipe_for_normal_output_shutdown() {
+        struct Closed;
+        impl std::io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut renderer = ScriptOutputRenderer::new(ScriptOutputOptions {
+            mode: ScriptOutputMode::Jsonl,
+            timestamp: ScriptTimestampFormat::None,
+            color_enabled: false,
+        });
+        let error = renderer
+            .write_display_event(&sample_structured_print_display_event(), None, &mut Closed)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[test]
