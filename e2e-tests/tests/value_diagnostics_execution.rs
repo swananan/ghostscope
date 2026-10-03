@@ -205,6 +205,50 @@ trace observe_adapter_rejection {
 }
 
 #[tokio::test]
+async fn test_jsonl_static_value_diagnostics_preserve_values() -> anyhow::Result<()> {
+    init();
+    let output = run_fixture(
+        FALLBACK,
+        quiet_runner(
+            r#"trace observe_adapter_rejection { print G_REJECTED_STRING; }"#,
+            "[script]\noutput = 'jsonl'\n",
+        ),
+    )
+    .await?;
+    output.success();
+    assert!(!output.stdout.is_empty(), "{output:#?}");
+    for line in output.stdout.lines() {
+        let event: serde_json::Value = serde_json::from_str(line)?;
+        assert_eq!(event["schema_version"], 1);
+        let notes = event["value_diagnostics"].as_array().unwrap();
+        assert!(
+            notes.iter().any(|note| {
+                note["scope"] == "static"
+                    && note["path"] == "G_REJECTED_STRING"
+                    && note["reason"] == "layout-unsupported"
+                    && note["type_name"].is_string()
+                    && note["detail"].is_string()
+            }),
+            "{event}"
+        );
+        assert_eq!(
+            event["execution_status"], 0,
+            "static notes must not mark runtime failure: {event}"
+        );
+        assert!(
+            event["items"].as_array().unwrap().iter().any(|item| {
+                item["kind"] == "complex_variable"
+                    && item["formatted_value"]
+                        .as_str()
+                        .is_some_and(|value| value.contains("raw: 42"))
+            }),
+            "{event}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_value_diagnostics_failed_fallback_is_a_compile_error() -> anyhow::Result<()> {
     init();
     let output = run_fixture(

@@ -31,3 +31,4 @@ ghostscope-process = { version = "0.1.6", path = "../ghostscope-process" }
 ghostscope-protocol = { version = "0.1.6", path = "../ghostscope-protocol" }
 libc = "0.2"
 regex = "1"
+serde_json = { workspace = true }
