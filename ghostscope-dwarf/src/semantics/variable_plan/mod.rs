@@ -11,6 +11,9 @@ use crate::semantics::{
 use crate::TypeInfo;
 use std::path::PathBuf;
 
+mod pieces;
+pub use pieces::{PlannedPiece, PlannedPieceSource};
+
 /// Owned semantic view returned by PC-context variable queries.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisibleVariable {
@@ -185,7 +188,7 @@ pub enum PlannedValue {
 pub enum VariableMaterialization {
     DirectValue { value: PlannedValue },
     UserMemoryRead { address: PlannedAddress },
-    Composite { pieces: Vec<PieceLocation> },
+    Composite { pieces: Vec<PlannedPiece> },
     Unavailable { availability: Availability },
 }
 
@@ -420,7 +423,7 @@ impl VariableReadPlan {
         &self,
         capabilities: &RuntimeCapabilities,
     ) -> VariableMaterializationPlan {
-        let lowering = self.bpf_lowering_plan(capabilities);
+        let mut lowering = self.bpf_lowering_plan(capabilities);
         let materialization = if !lowering.availability.is_available() {
             VariableMaterialization::Unavailable {
                 availability: lowering.availability.clone(),
@@ -459,9 +462,18 @@ impl VariableReadPlan {
                     }
                 }
                 VariableLoweringKind::Composite => match &self.location {
-                    VariableLocation::Pieces(pieces) => VariableMaterialization::Composite {
-                        pieces: pieces.clone(),
-                    },
+                    VariableLocation::Pieces(pieces) => {
+                        match pieces::plan_pieces(pieces, self.dwarf_type.as_ref()) {
+                            Ok(pieces) => VariableMaterialization::Composite { pieces },
+                            Err(error) => VariableMaterialization::Unavailable {
+                                availability: Availability::Unsupported(
+                                    UnsupportedReason::ExpressionShape {
+                                        detail: error.to_string(),
+                                    },
+                                ),
+                            },
+                        }
+                    }
                     _ => VariableMaterialization::Unavailable {
                         availability: Availability::Unsupported(
                             UnsupportedReason::ExpressionShape {
@@ -475,6 +487,10 @@ impl VariableReadPlan {
                 },
             }
         };
+
+        if let VariableMaterialization::Unavailable { availability } = &materialization {
+            lowering.availability = availability.clone();
+        }
 
         VariableMaterializationPlan {
             name: self.name.clone(),

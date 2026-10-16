@@ -552,11 +552,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                     if let Some(ghostscope_dwarf::ValueReadPlan {
                         presentation,
-                        capture:
-                            ghostscope_dwarf::ValueCapturePlan::InlineView {
-                                output_type,
-                                ..
-                            },
+                        capture: ghostscope_dwarf::ValueCapturePlan::InlineView { output_type, .. },
                         nested: None,
                         ..
                     }) = semantic_plan.as_ref()
@@ -577,8 +573,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             });
                         }
                     }
-                    let value =
-                        self.variable_materialization_to_llvm_value(&materialized, pc_address, None)?;
+                    let value = self.variable_materialization_to_llvm_value(
+                        &materialized,
+                        pc_address,
+                        None,
+                    )?;
                     let value = match value {
                         BasicValueEnum::IntValue(value) => value,
                         BasicValueEnum::PointerValue(value) => self
@@ -626,9 +625,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                             false,
                                             "semantic_projected_direct_value",
                                         )
-                                        .map_err(|error| {
-                                            CodeGenError::Builder(error.to_string())
-                                        })?
+                                        .map_err(|error| CodeGenError::Builder(error.to_string()))?
                                 };
                                 return Ok(ComplexArg {
                                     var_name_index: self
@@ -647,8 +644,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 });
                             }
                             ghostscope_dwarf::ValueCapturePlan::InlineView {
-                                output_type,
-                                ..
+                                output_type, ..
                             } => {
                                 let data_len = inline_view_data_len(&dwarf_type, &output_type)?;
                                 if data_len == 0 || data_len > 8 {
@@ -688,15 +684,45 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         type_index: self.trace_context.add_type(dwarf_type)?,
                         access_path: Vec::new(),
                         data_len,
-                        source: ComplexArgSource::ComputedInt { value, byte_len: data_len },
+                        source: ComplexArgSource::ComputedInt {
+                            value,
+                            byte_len: data_len,
+                        },
                     })
                 }
-                ghostscope_dwarf::VariableMaterialization::Composite { .. } => Err(
-                    CodeGenError::DwarfError(format!(
-                        "DWARF variable '{}' is split across pieces; piece reconstruction is not implemented",
-                        materialized.name
-                    )),
-                ),
+                ghostscope_dwarf::VariableMaterialization::Composite { pieces } => {
+                    let dwarf_type = materialized.dwarf_type.clone().ok_or_else(|| {
+                        CodeGenError::DwarfError(
+                            "Split variable has no DWARF type information".to_string(),
+                        )
+                    })?;
+                    let data_len = usize::try_from(dwarf_type.size())
+                        .map_err(|error| CodeGenError::DwarfError(error.to_string()))?;
+                    if data_len > self.compile_options.mem_dump_cap as usize {
+                        return Err(CodeGenError::DwarfError(format!(
+                            "split variable '{}' needs {data_len} bytes, exceeding ebpf.mem_dump_cap = {}",
+                            materialized.name, self.compile_options.mem_dump_cap,
+                        )));
+                    }
+                    if semantic_plan.is_some() {
+                        return Err(CodeGenError::DwarfError(format!(
+                            "split variable '{}' requires an address-backed semantic value capture",
+                            materialized.name,
+                        )));
+                    }
+                    Ok(ComplexArg {
+                        var_name_index: self.trace_context.add_variable_name(display_name)?,
+                        type_index: self.trace_context.add_type(dwarf_type)?,
+                        access_path: Vec::new(),
+                        data_len,
+                        source: ComplexArgSource::Composite {
+                            pieces: pieces.clone(),
+                            module_for_offsets: Self::module_path_for_offsets(
+                                materialized.module_path.as_deref(),
+                            ),
+                        },
+                    })
+                }
             }
         })();
 
@@ -1314,6 +1340,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 Ok(1)
             }
             ComplexArgSource::AddressValue { .. }
+            | ComplexArgSource::Composite { .. }
             | ComplexArgSource::ComputedAddress { .. }
             | ComplexArgSource::ImmediateBytes { .. } => {
                 // Use ComplexFormat with "{}" to render address/immediate nicely

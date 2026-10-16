@@ -46,6 +46,10 @@ struct PrintVarRuntimeMeta {
 /// Source for complex formatted argument data
 #[derive(Debug, Clone)]
 enum ComplexArgSource<'ctx> {
+    Composite {
+        pieces: Vec<ghostscope_dwarf::PlannedPiece>,
+        module_for_offsets: Option<String>,
+    },
     RuntimeRead {
         address: ghostscope_dwarf::PlannedAddress,
         dwarf_type: ghostscope_dwarf::TypeInfo,

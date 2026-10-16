@@ -2900,6 +2900,15 @@ async fn test_stripped_binary_with_explicit_debug_file() -> anyhow::Result<()> {
 
     common::ensure_test_program_compiled_with_opt(OptimizationLevel::Stripped)?;
 
+    // Console logs may be dropped under load. Use an isolated file in the
+    // shared checkout so the assertion also works with container sandboxes.
+    let log_file = tempfile::Builder::new()
+        .prefix("explicit-debug-")
+        .suffix(".log")
+        .tempfile_in(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"))?;
+    let log_path =
+        common::sandbox::SandboxHandle::default_ghostscope()?.path_in_sandbox(log_file.path())?;
+
     let binary_path =
         FIXTURES.get_test_binary_with_opt("sample_program", OptimizationLevel::Stripped)?;
     let debug_file = binary_path.with_file_name("sample_program_stripped.debug");
@@ -2926,11 +2935,12 @@ trace add_numbers {
         .timeout_secs(3)
         .enable_sysmon_for_target(false)
         .enable_file_logging(true)
-        .enable_console_logging(true)
         .with_log_level("info")
         .with_cli_args([
             std::ffi::OsString::from("--debug-file"),
             debug_file.as_os_str().to_os_string(),
+            std::ffi::OsString::from("--log-file"),
+            log_path.into_os_string(),
         ])
         .run()
         .await?;
@@ -2946,8 +2956,13 @@ trace add_numbers {
         "explicit debug file run failed\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
     assert!(
-        stderr.contains("Loading DWARF from explicit debug file"),
-        "expected explicit debug-file loading log\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        stdout.contains("EXPLICIT_DEBUG_FILE: add_numbers called with a="),
+        "missing explicit debug-file trace output\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    let file_log = std::fs::read_to_string(log_file.path())?;
+    assert!(
+        file_log.contains("Loading DWARF from explicit debug file"),
+        "expected explicit debug-file loading log\nLOG:\n{file_log}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
 
     Ok(())
