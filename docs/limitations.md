@@ -81,6 +81,17 @@ Runtime mode also affects `bt` coverage. `-p <pid>` is a process-level view, so 
 ### 7. Highly Optimized Code Support
 Compiler optimizations (-O2, -O3) can cause variables to be optimized away or generate complex DWARF expressions. GhostScope will attempt to parse them, including inline function support, but some variables may be inaccessible (shown as OptimizedOut) because the compiler optimized them away.
 
+Byte-aligned `DW_OP_piece` values can be reconstructed from general-purpose
+registers, user memory, computed stack values, and implicit bytes. All pieces
+must cover the known type size without gaps or overlaps. Whole-value printing
+is bounded by `ebpf.mem_dump_cap`; scalar expressions support values up to eight
+bytes. Whole-value printing reports a failed memory piece as a read error;
+scalar reconstruction returns zero for the entire value on any fragment failure.
+Missing pieces, SIMD/FP registers, and
+`DW_OP_bit_piece` remain unsupported. Field/array projection, address-taking,
+and semantic adapter captures for composite values are not supported
+in this initial implementation.
+
 ### 8. Dynamically Loaded Libraries (dlopen)
 GhostScope scans `/proc/PID/maps` at startup, and runtime map-change monitoring refreshes module mappings for `-p <pid>` and standalone `-t <path>` runs while sysmon is enabled. For `bt`/`backtrace`, a later event can request compact CFI for the specific `dlopen` module it reached; GhostScope neither eagerly indexes every new mapping nor retains full runtime-module DWARF. This remains subject to the configured runtime module count/time limits, `backtrace_unwind_rows_max_entries`, and the map-change race noted above. Set `backtrace_runtime_modules = false` or pass `--no-backtrace-runtime-modules` to keep module-offset/raw-address degradation without automatic CFI loading.
 

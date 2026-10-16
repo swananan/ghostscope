@@ -4,6 +4,7 @@ mod btree;
 mod hash_table;
 mod indirect;
 mod nested;
+mod pieces;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ComplexFormatArgLayout {
@@ -127,6 +128,9 @@ fn complex_format_static_payload_len(arg: &ComplexArg<'_>) -> Option<usize> {
         ComplexArgSource::ComputedAddress { .. } => Some(8),
         ComplexArgSource::RuntimeRead { .. } => {
             Some(std::cmp::max(arg.data_len, VARIABLE_READ_ERROR_PAYLOAD_LEN))
+        }
+        ComplexArgSource::Composite { .. } => {
+            Some(arg.data_len.max(VARIABLE_READ_ERROR_PAYLOAD_LEN))
         }
         ComplexArgSource::ComputedInt { byte_len, .. } => Some(*byte_len),
         ComplexArgSource::MemDump { len, .. } => {
@@ -1500,7 +1504,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
-    fn emit_complex_format_read_error_payload(
+    pub(crate) fn emit_complex_format_read_error_payload(
         &mut self,
         var_data_ptr: PointerValue<'ctx>,
         reserved_len: usize,
@@ -2092,6 +2096,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let var_data_ptr = arg_ptrs.var_data_ptr;
 
         match &arg.source {
+            ComplexArgSource::Composite {
+                pieces,
+                module_for_offsets,
+            } => self.emit_complex_format_pieces(
+                status_ptr,
+                var_data_ptr,
+                pieces,
+                module_for_offsets.as_deref(),
+                reserved_len,
+            ),
             ComplexArgSource::ImmediateBytes { bytes, .. } => {
                 self.emit_complex_format_immediate_bytes(var_data_ptr, bytes)
             }

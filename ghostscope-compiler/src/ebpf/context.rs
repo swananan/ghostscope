@@ -177,6 +177,8 @@ pub struct EbpfContext<'ctx, 'dw> {
 
     // === Control-flow expression error capture (soft abort) ===
     pub condition_context_active: bool,
+    pub(crate) memory_read_error_capture:
+        Option<super::helper_functions::MemoryReadErrorCapture<'ctx>>,
 
     // === DWARF alias variables (script-level symbolic references) ===
     // These variables do not store pointer values; instead they remember the RHS
@@ -320,6 +322,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
             // Control-flow expression context
             condition_context_active: false,
+            memory_read_error_capture: None,
 
             // Alias variables
             alias_vars: HashMap::new(),

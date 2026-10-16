@@ -43,7 +43,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     pub(crate) fn cookie_for_module_or_fallback(&mut self, module_path: &str) -> u64 {
         self.fallback_cookie_from_module_path(module_path)
     }
-    fn planned_value_to_llvm_value(
+    pub(super) fn planned_value_to_llvm_value(
         &mut self,
         value: &ghostscope_dwarf::PlannedValue,
         var_name: &str,
@@ -413,9 +413,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
             ghostscope_dwarf::VariableMaterialization::UserMemoryRead { address } => {
                 let dwarf_type = materialization.dwarf_type.as_ref().ok_or_else(|| {
-                    CodeGenError::DwarfError(
-                        "Expression has no DWARF type information".to_string(),
-                    )
+                    CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
                 })?;
                 let module_hint =
                     Self::module_path_for_offsets(materialization.module_path.as_deref());
@@ -433,11 +431,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     pc_address,
                 ))
             }
-            ghostscope_dwarf::VariableMaterialization::Composite { .. } => {
-                Err(CodeGenError::DwarfError(format!(
-                    "DWARF variable '{}' is split across pieces; piece reconstruction is not implemented",
-                    materialization.name
-                )))
+            ghostscope_dwarf::VariableMaterialization::Composite { pieces } => {
+                let value =
+                    self.composite_pieces_to_llvm_value(materialization, pieces, status_ptr)?;
+                self.normalize_direct_integer_value_if_needed(
+                    value.into(),
+                    materialization.dwarf_type.as_ref(),
+                )
             }
         }
     }
@@ -1034,59 +1034,64 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
                         phi.add_incoming(&[(&null_val, null_bb), (&loaded_int, value_block)]);
                         let merged = phi.as_basic_value().into_int_value();
-                        // Update null flag based on loaded pointer value being zero
-                        let is_zero_ptr = self
-                            .builder
-                            .build_int_compare(
-                                inkwell::IntPredicate::EQ,
-                                merged,
-                                self.context.i64_type().const_zero(),
-                                "is_zero_ptr",
-                            )
-                            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                        deref_null_flag = Some(match deref_null_flag {
-                            Some(prev) => self
-                                .builder
-                                .build_or(prev, is_zero_ptr, "null_or")
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?,
-                            None => is_zero_ptr,
-                        });
-                        if let (Some(sp), Some(nf)) = (status_ptr, deref_null_flag) {
-                            // Only store NullDeref if currently OK and nf is true
-                            let cur_status = self
-                                .builder
-                                .build_load(self.context.i8_type(), sp, "cur_status")
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-                                .into_int_value();
-                            let is_ok = self
+                        // A loaded zero is a valid scalar value. Only address
+                        // evaluation treats it as a null pointer for later
+                        // member offsets and dereferences.
+                        if _result_size.is_none() {
+                            let is_zero_ptr = self
                                 .builder
                                 .build_int_compare(
                                     inkwell::IntPredicate::EQ,
-                                    cur_status,
-                                    self.context.i8_type().const_zero(),
-                                    "status_is_ok2",
+                                    merged,
+                                    self.context.i64_type().const_zero(),
+                                    "is_zero_ptr",
                                 )
                                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            let should_store = self
-                                .builder
-                                .build_and(is_ok, nf, "store_null_deref_from_ptr")
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            let then_val = self.context.i8_type().const_int(
-                                ghostscope_protocol::VariableStatus::NullDeref as u64,
-                                false,
-                            );
-                            let new_status_bv = self
-                                .builder
-                                .build_select::<inkwell::values::BasicValueEnum<'ctx>, _>(
-                                    should_store,
-                                    then_val.into(),
-                                    cur_status.into(),
-                                    "new_status2",
-                                )
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-                            self.builder
-                                .build_store(sp, new_status_bv)
-                                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            deref_null_flag = Some(match deref_null_flag {
+                                Some(prev) => {
+                                    self.builder
+                                        .build_or(prev, is_zero_ptr, "null_or")
+                                        .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                                }
+                                None => is_zero_ptr,
+                            });
+                            if let (Some(sp), Some(nf)) = (status_ptr, deref_null_flag) {
+                                // Only store NullDeref if currently OK and nf is true
+                                let cur_status = self
+                                    .builder
+                                    .build_load(self.context.i8_type(), sp, "cur_status")
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+                                    .into_int_value();
+                                let is_ok = self
+                                    .builder
+                                    .build_int_compare(
+                                        inkwell::IntPredicate::EQ,
+                                        cur_status,
+                                        self.context.i8_type().const_zero(),
+                                        "status_is_ok2",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                let should_store = self
+                                    .builder
+                                    .build_and(is_ok, nf, "store_null_deref_from_ptr")
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                let then_val = self.context.i8_type().const_int(
+                                    ghostscope_protocol::VariableStatus::NullDeref as u64,
+                                    false,
+                                );
+                                let new_status_bv = self
+                                    .builder
+                                    .build_select::<inkwell::values::BasicValueEnum<'ctx>, _>(
+                                        should_store,
+                                        then_val.into(),
+                                        cur_status.into(),
+                                        "new_status2",
+                                    )
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                                self.builder
+                                    .build_store(sp, new_status_bv)
+                                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                            }
                         }
                         stack.push(RuntimeAddress::with_offsets_found(
                             merged,
@@ -2237,7 +2242,7 @@ mod tests {
     }
 
     #[test]
-    fn piece_locations_are_rejected_instead_of_using_first_piece() {
+    fn piece_values_are_masked_combined_and_normalized_to_the_variable_type() {
         let llctx = LlvmContext::create();
         let opts = crate::CompileOptions::default();
         let mut ctx = EbpfContext::new(&llctx, "piece_value", Some(0), &opts).expect("ctx");
@@ -2248,19 +2253,28 @@ mod tests {
             size: 4,
             encoding: ghostscope_dwarf::constants::DW_ATE_signed.0 as u16,
         };
-        let location = VariableLocation::Pieces(vec![ghostscope_dwarf::PieceLocation {
-            bit_offset: 0,
-            bit_size: 32,
-            location: Box::new(VariableLocation::RegisterValue { dwarf_reg: 0 }),
-        }]);
+        let location = VariableLocation::Pieces(vec![
+            ghostscope_dwarf::PieceLocation {
+                bit_offset: 0,
+                bit_size: 24,
+                location: Box::new(VariableLocation::ComputedValue(vec![
+                    PlanExprOp::PushConstant(0x7fff_fffb),
+                ])),
+            },
+            ghostscope_dwarf::PieceLocation {
+                bit_offset: 24,
+                bit_size: 8,
+                location: Box::new(VariableLocation::ImplicitValue(vec![0xff])),
+            },
+        ]);
         let plan = read_plan("split", "int", Some(ty), location, Availability::Available);
 
-        let err = ctx
+        let value = ctx
             .variable_read_plan_to_llvm_value(&plan, 0x1234, None)
-            .expect_err("split pieces should not silently use the first piece");
+            .expect("complete pieces should reconstruct the scalar")
+            .into_int_value();
 
-        assert!(matches!(err, CodeGenError::DwarfError(_)));
-        assert!(err.to_string().contains("split across pieces"));
+        assert_eq!(value.get_sign_extended_constant(), Some(-5));
     }
 
     #[test]

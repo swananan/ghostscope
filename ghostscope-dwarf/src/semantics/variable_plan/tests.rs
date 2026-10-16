@@ -418,19 +418,142 @@ fn materialization_plan_converts_register_direct_value() {
 
 #[test]
 fn materialization_plan_surfaces_piece_locations_without_first_piece_fallback() {
-    let plan = read_plan(VariableLocation::Pieces(vec![PieceLocation {
-        bit_offset: 0,
-        bit_size: 32,
-        location: Box::new(VariableLocation::RegisterValue { dwarf_reg: 0 }),
-    }]));
+    let plan = typed_read_plan(
+        VariableLocation::Pieces(vec![PieceLocation {
+            bit_offset: 0,
+            bit_size: 32,
+            location: Box::new(VariableLocation::RegisterValue { dwarf_reg: 0 }),
+        }]),
+        TypeInfo::BaseType {
+            name: "int".to_string(),
+            size: 4,
+            encoding: crate::constants::DW_ATE_signed.0 as u16,
+        },
+    );
     let materialized = plan.materialization_plan(&capabilities(true));
 
     match materialized.materialization {
         VariableMaterialization::Composite { pieces } => {
             assert_eq!(pieces.len(), 1);
+            assert_eq!(pieces[0].byte_size, 4);
+            assert!(matches!(
+                pieces[0].source,
+                PlannedPieceSource::Value(PlannedValue::RegisterValue { dwarf_reg: 0, .. })
+            ));
         }
         other => panic!("unexpected materialization: {other:?}"),
     }
+}
+
+#[test]
+fn composite_materialization_rejects_incomplete_or_invalid_piece_layouts() {
+    let register = VariableLocation::RegisterValue { dwarf_reg: 0 };
+    let piece = |offset, size, location| PieceLocation {
+        bit_offset: offset,
+        bit_size: size,
+        location: Box::new(location),
+    };
+    let ty = TypeInfo::BaseType {
+        name: "long".to_string(),
+        size: 8,
+        encoding: crate::constants::DW_ATE_signed.0 as u16,
+    };
+    let cases = [
+        (vec![], "cover 0 of 8"),
+        (vec![piece(0, 32, register.clone())], "cover 4 of 8"),
+        (
+            vec![
+                piece(0, 32, register.clone()),
+                piece(40, 24, register.clone()),
+            ],
+            "gap or overlap",
+        ),
+        (
+            vec![
+                piece(0, 32, register.clone()),
+                piece(24, 40, register.clone()),
+            ],
+            "gap or overlap",
+        ),
+        (
+            vec![piece(0, 72, register.clone())],
+            "exceed its 8-byte type",
+        ),
+        (vec![piece(0, 7, register.clone())], "byte-aligned"),
+        (
+            vec![
+                piece(0, 32, register.clone()),
+                piece(32, 32, VariableLocation::OptimizedOut),
+            ],
+            "unavailable or unsupported",
+        ),
+        (
+            vec![piece(0, 64, VariableLocation::Unknown)],
+            "unavailable or unsupported",
+        ),
+        (
+            vec![piece(0, 64, VariableLocation::ImplicitValue(vec![0; 7]))],
+            "implicit piece is shorter",
+        ),
+        (
+            vec![piece(0, 64, VariableLocation::Pieces(vec![]))],
+            "unavailable or unsupported",
+        ),
+    ];
+    for (pieces, expected) in cases {
+        let plan = typed_read_plan(VariableLocation::Pieces(pieces), ty.clone());
+        let materialized = plan.materialization_plan(&capabilities(true));
+        let VariableMaterialization::Unavailable { availability } = materialized.materialization
+        else {
+            panic!("invalid piece layout should be unavailable: {materialized:?}");
+        };
+        assert!(!materialized.availability.is_available());
+        assert_eq!(materialized.availability, availability);
+        assert!(
+            format!("{availability:?}").contains(expected),
+            "{availability:?}"
+        );
+    }
+}
+
+#[test]
+fn composite_materialization_keeps_memory_and_stack_value_sources_distinct() {
+    let ty = TypeInfo::BaseType {
+        name: "long".to_string(),
+        size: 8,
+        encoding: crate::constants::DW_ATE_unsigned.0 as u16,
+    };
+    let plan = typed_read_plan(
+        VariableLocation::Pieces(vec![
+            PieceLocation {
+                bit_offset: 0,
+                bit_size: 24,
+                location: Box::new(VariableLocation::RegisterAddress {
+                    dwarf_reg: 4,
+                    offset: -3,
+                }),
+            },
+            PieceLocation {
+                bit_offset: 24,
+                bit_size: 40,
+                location: Box::new(VariableLocation::AbsoluteAddressValue(
+                    AddressExpr::constant(0x1234),
+                )),
+            },
+        ]),
+        ty,
+    );
+    let materialized = plan.materialization_plan(&capabilities(true));
+    let VariableMaterialization::Composite { pieces } = materialized.materialization else {
+        panic!("expected composite: {materialized:?}");
+    };
+    assert_eq!(pieces[0].byte_size, 3);
+    assert!(matches!(pieces[0].source, PlannedPieceSource::Memory(_)));
+    assert_eq!(pieces[1].byte_offset, 3);
+    assert!(matches!(
+        pieces[1].source,
+        PlannedPieceSource::Value(PlannedValue::AddressValue { .. })
+    ));
 }
 
 #[test]

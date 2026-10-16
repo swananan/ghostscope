@@ -550,7 +550,7 @@ async fn test_value_backed_aggregate_dw_op_piece_surfaces_composite_o2() -> anyh
 }
 
 #[tokio::test]
-async fn test_value_backed_aggregate_print_rejects_split_pieces_o2() -> anyhow::Result<()> {
+async fn test_value_backed_aggregate_print_reconstructs_split_pieces_o2() -> anyhow::Result<()> {
     init();
 
     let source_path = member_pointer_source_path(OptimizationLevel::O2)?;
@@ -563,16 +563,47 @@ trace {}:{VALUE_BACKED_AGGREGATE_LINE} {{
         source_path.display()
     );
 
-    let message = compile_member_pointer_failure_message(&script, OptimizationLevel::O2).await?;
+    let result = compile_member_pointer_script(&script, OptimizationLevel::O2).await?;
     assert!(
-        message.contains("split across pieces")
-            && message.contains("piece reconstruction is not implemented"),
-        "unexpected compile error: {message}"
+        !result.uprobe_configs.is_empty(),
+        "missing reconstructed-value probes: {result:?}"
     );
     assert!(
-        !message.contains("DW_OP_piece"),
-        "DW_OP_piece should lower before compiler rejection: {message}"
+        result.failed_targets.is_empty(),
+        "piece reconstruction failed: {result:?}"
     );
+    let binary =
+        FIXTURES.get_test_binary_with_opt("member_pointer_program", OptimizationLevel::O2)?;
+    let target = common::targets::TargetLauncher::binary(&binary)
+        .spawn()
+        .await?;
+    let output = common::runner::GhostscopeRunner::new()
+        .with_target(&binary)
+        .attach_to(&target)
+        .with_script(&script)
+        .timeout_secs(3)
+        .run()
+        .await;
+    target.terminate().await?;
+    let (exit_code, stdout, stderr) = output?;
+    assert_eq!(exit_code, 0, "{stderr}\n{stdout}");
+    assert!(
+        stdout.contains("value_backed_pair_t"),
+        "missing reconstructed aggregate: {stdout}"
+    );
+    let pair = regex::Regex::new(r"a:\s*(-?\d+),?\s+b:\s*(-?\d+)")?;
+    let mut samples = 0;
+    for sample in pair.captures_iter(&stdout) {
+        let first: i64 = sample[1].parse()?;
+        let second: i64 = sample[2].parse()?;
+        assert_eq!(
+            second,
+            first + 1,
+            "incorrect reconstructed fields: {stdout}"
+        );
+        samples += 1;
+    }
+    assert!(samples > 0, "no value-backed pair was decoded: {stdout}");
     Ok(())
 }
 
