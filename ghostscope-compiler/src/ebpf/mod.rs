@@ -6,6 +6,7 @@
 pub mod codegen; // New instruction analysis and variable resolution
 pub mod context;
 pub mod dwarf_bridge;
+mod dwarf_pieces;
 pub mod expression;
 mod expression_plan;
 pub mod helper_functions;

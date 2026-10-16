@@ -540,6 +540,13 @@ impl SandboxHandle {
                         inner.container_name
                     )
                 })?;
+                let init_status =
+                    fs::read_to_string(format!("/proc/{}/status", inner.init_host_pid))
+                        .context("failed to read sandbox init status while resolving host PID")?;
+                let namespace_index = parse_nspid_chain(&init_status)
+                    .context("sandbox init status did not contain NSpid")?
+                    .len()
+                    - 1;
 
                 let proc_dir = fs::read_dir("/proc")
                     .context("failed to read host /proc while resolving container host PID")?;
@@ -554,17 +561,20 @@ impl SandboxHandle {
                     let Some(chain) = parse_nspid_chain(&status) else {
                         continue;
                     };
+                    // A descendant may have the same numeric PID in an inner
+                    // namespace. Match the PID in this sandbox's namespace,
+                    // whose position is established by its init process.
+                    if chain.get(namespace_index) != Some(&sandbox_pid) {
+                        continue;
+                    }
                     let same_namespace_pid = read_pid_ns_inode(host_pid)
                         .ok()
                         .filter(|ns_inode| *ns_inode == pid_ns_inode)
-                        .is_some()
-                        && chain.last() == Some(&sandbox_pid);
+                        .is_some();
                     if same_namespace_pid {
                         return Ok(host_pid);
                     }
-                    if process_descends_from(host_pid, inner.init_host_pid)
-                        && chain.iter().skip(1).any(|pid| *pid == sandbox_pid)
-                    {
+                    if process_descends_from(host_pid, inner.init_host_pid) {
                         return Ok(host_pid);
                     }
                 }

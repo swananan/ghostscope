@@ -50,9 +50,9 @@ pub use value::{
 };
 pub(crate) use variable_plan::PlanError;
 pub use variable_plan::{
-    AddressOrigin, LvalueAddressPlan, PlannedAddress, PlannedAddressKind, PlannedValue,
-    RuntimeComputedExpr, RuntimeComputedKind, VariableAccessPath, VariableAccessSegment,
-    VariableLookupError, VariableLoweringKind, VariableLoweringPlan, VariableMaterialization,
-    VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic, VariableReadPlan,
-    VisibleVariable, VisibleVariablesResult,
+    AddressOrigin, LvalueAddressPlan, PlannedAddress, PlannedAddressKind, PlannedPiece,
+    PlannedPieceSource, PlannedValue, RuntimeComputedExpr, RuntimeComputedKind, VariableAccessPath,
+    VariableAccessSegment, VariableLookupError, VariableLoweringKind, VariableLoweringPlan,
+    VariableMaterialization, VariableMaterializationPlan, VariablePlan, VariableQueryDiagnostic,
+    VariableReadPlan, VisibleVariable, VisibleVariablesResult,
 };

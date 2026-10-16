@@ -31,6 +31,14 @@ pub(crate) struct MemoryReadDiagnostics<'ctx> {
     pub(crate) not_found: IntValue<'ctx>,
 }
 
+/// Optional output slot for the first helper failure while evaluating a value.
+#[derive(Clone, Copy)]
+pub(crate) struct MemoryReadErrorCapture<'ctx> {
+    pub(crate) status_ptr: PointerValue<'ctx>,
+    pub(crate) payload_ptr: PointerValue<'ctx>,
+    pub(crate) reserved_len: usize,
+}
+
 pub(crate) struct ProcModuleOffsetsLookup<'ctx> {
     pub(crate) found: IntValue<'ctx>,
     pub(crate) text: IntValue<'ctx>,
@@ -40,6 +48,17 @@ pub(crate) struct ProcModuleOffsetsLookup<'ctx> {
 }
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
+    pub(crate) fn with_memory_read_error_capture<T>(
+        &mut self,
+        capture: MemoryReadErrorCapture<'ctx>,
+        read: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let previous = self.memory_read_error_capture.replace(capture);
+        let result = read(self);
+        self.memory_read_error_capture = previous;
+        result
+    }
+
     fn get_or_create_tls_scratch_buffer(&mut self) -> Result<PointerValue<'ctx>> {
         if let Some(alloca) = self.tls_scratch_alloca {
             return Ok(alloca);
@@ -1085,7 +1104,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         })
     }
 
-    fn update_any_fail_flag(
+    pub(crate) fn update_any_fail_flag(
         &mut self,
         combined_fail: IntValue<'ctx>,
         name_suffix: &str,
@@ -1118,6 +1137,30 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         not_found: IntValue<'ctx>,
         name_suffix: &str,
     ) -> Result<()> {
+        let desired_status = self
+            .builder
+            .build_select(
+                not_found,
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::OffsetsUnavailable as u64, false),
+                self.context
+                    .i8_type()
+                    .const_int(VariableStatus::ReadError as u64, false),
+                &format!("desired_read_status_{name_suffix}"),
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            .into_int_value();
+        self.store_variable_failure_status(status_ptr, combined_fail, desired_status, name_suffix)
+    }
+
+    pub(crate) fn store_variable_failure_status(
+        &mut self,
+        status_ptr: PointerValue<'ctx>,
+        failed: IntValue<'ctx>,
+        desired_status: IntValue<'ctx>,
+        name_suffix: &str,
+    ) -> Result<()> {
         let cur_status = self
             .builder
             .build_load(
@@ -1136,35 +1179,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 &format!("status_is_ok_{name_suffix}"),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let desired_status = self
-            .builder
-            .build_select::<BasicValueEnum<'ctx>, _>(
-                not_found,
-                self.context
-                    .i8_type()
-                    .const_int(VariableStatus::OffsetsUnavailable as u64, false)
-                    .into(),
-                self.context
-                    .i8_type()
-                    .const_int(VariableStatus::ReadError as u64, false)
-                    .into(),
-                &format!("desired_read_status_{name_suffix}"),
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let should_store = self
             .builder
             .build_and(
                 is_ok,
-                combined_fail,
+                failed,
                 &format!("should_store_read_status_{name_suffix}"),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let new_status = self
             .builder
-            .build_select::<BasicValueEnum<'ctx>, _>(
+            .build_select(
                 should_store,
                 desired_status,
-                cur_status.into(),
+                cur_status,
                 &format!("new_status_{name_suffix}"),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
@@ -1200,6 +1228,68 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             combined_fail,
             not_found,
         } = self.probe_read_user_core(address, size, name_suffix)?;
+
+        if let Some(capture) = self.memory_read_error_capture {
+            let status = self
+                .builder
+                .build_load(
+                    self.context.i8_type(),
+                    capture.status_ptr,
+                    "capture_read_status",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
+                .into_int_value();
+            let is_ok = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    status,
+                    self.context.i8_type().const_zero(),
+                    "capture_read_is_first",
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let offsets_found = self
+                .builder
+                .build_not(not_found, "capture_read_offsets_found")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let helper_failed = self
+                .builder
+                .build_and(combined_fail, offsets_found, "capture_read_helper_failed")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let first_failure = self
+                .builder
+                .build_and(is_ok, helper_failed, "capture_read_first_failure")
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            let function = self.current_function("capture memory read error")?;
+            let error_block = self
+                .context
+                .append_basic_block(function, "capture_read_error");
+            let continue_block = self
+                .context
+                .append_basic_block(function, "capture_read_continue");
+            self.builder
+                .build_conditional_branch(first_failure, error_block, continue_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder.position_at_end(error_block);
+            self.emit_complex_format_read_error_payload(
+                capture.payload_ptr,
+                capture.reserved_len,
+                helper_result,
+                address.value,
+            )?;
+            self.builder
+                .build_store(
+                    capture.status_ptr,
+                    self.context
+                        .i8_type()
+                        .const_int(VariableStatus::ReadError as u64, false),
+                )
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder
+                .build_unconditional_branch(continue_block)
+                .map_err(|error| CodeGenError::LLVMError(error.to_string()))?;
+            self.builder.position_at_end(continue_block);
+        }
 
         if let Some(status_ptr) = status_ptr {
             self.store_variable_read_status(status_ptr, combined_fail, not_found, name_suffix)?;
@@ -1262,18 +1352,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         address: RuntimeAddress<'ctx>,
         size: MemoryAccessSize,
     ) -> Result<BasicValueEnum<'ctx>> {
-        let zero_const = self.context.i64_type().const_zero();
-        let ProbeReadResult {
-            loaded_i64,
-            combined_fail,
-            ..
-        } = self.probe_read_user_core(address, size, "probe_read_user_cf")?;
+        let read =
+            self.generate_memory_read_with_diagnostics(address, size, None, "probe_read_user_cf")?;
 
         let func = self.current_function("generate memory read with status")?;
         let set_block = self.context.append_basic_block(func, "set_cond_err");
         let cont_block = self.context.append_basic_block(func, "read_cont");
         self.builder
-            .build_conditional_branch(combined_fail, set_block, cont_block)
+            .build_conditional_branch(read.combined_fail, set_block, cont_block)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder.position_at_end(set_block);
         let _ = self.set_condition_error_if_unset(2u8);
@@ -1283,15 +1369,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder.position_at_end(cont_block);
 
-        let zero_bv: BasicValueEnum = zero_const.into();
-        let val_bv: BasicValueEnum = loaded_i64.into();
-        let sel_bv = self
-            .builder
-            .build_select::<BasicValueEnum<'ctx>, _>(combined_fail, zero_bv, val_bv, "val_or_zero")
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-
-        self.update_any_fail_flag(combined_fail, "probe_read_user_cf")?;
-        Ok(sel_bv)
+        Ok(read.value)
     }
     /// Map DWARF register number to pt_regs offset (simplified)
     pub fn dwarf_reg_to_pt_regs_offset(&self, dwarf_reg: u16) -> Result<usize> {
