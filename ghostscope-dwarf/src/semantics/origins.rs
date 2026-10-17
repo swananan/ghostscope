@@ -123,7 +123,13 @@ fn read_string_attr(
     for attr_name in attrs {
         if let Some(attr) = entry.attr(*attr_name) {
             if let Ok(value) = dwarf.attr_string(unit, attr.value()) {
-                if let Ok(value) = value.to_string_lossy() {
+                if let Ok(value) = value.to_string().inspect_err(|error| {
+                    tracing::debug!(
+                        ?error,
+                        ?attr_name,
+                        "Ignoring DWARF name that is not valid UTF-8"
+                    );
+                }) {
                     return Ok(Some(value.into_owned()));
                 }
             }

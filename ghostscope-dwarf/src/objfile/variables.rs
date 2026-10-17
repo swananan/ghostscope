@@ -77,7 +77,7 @@ pub(super) fn complete_aggregate_declaration_entry(
     let name = entry
         .attr(gimli::constants::DW_AT_name)
         .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
-        .and_then(|name| name.to_string_lossy().ok().map(|name| name.into_owned()))?;
+        .and_then(|name| name.to_string().ok().map(|name| name.into_owned()))?;
     let definition = type_name_index.find_aggregate_definition(&name, entry.tag())?;
     Some((definition.cu_offset, definition.die_offset))
 }
@@ -177,7 +177,7 @@ impl LoadedObjfile {
         self.dwarf()
             .attr_string(unit, name)
             .ok()?
-            .to_string_lossy()
+            .to_string()
             .ok()
             .map(|name| name.into_owned())
     }
@@ -1124,7 +1124,7 @@ mod tests {
             let Ok(name) = dwarf.attr_string(unit, attr.value()) else {
                 continue;
             };
-            let Ok(name) = name.to_string_lossy() else {
+            let Ok(name) = name.to_string() else {
                 continue;
             };
             let is_declaration = matches!(

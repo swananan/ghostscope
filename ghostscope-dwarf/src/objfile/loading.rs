@@ -127,6 +127,8 @@ impl LoadedObjfile {
         debuginfod_client: Option<Arc<DebuginfodClient>>,
     ) -> Result<Self> {
         let load_started_at = Instant::now();
+        let module_path =
+            ghostscope_process::module_probe::module_path_str(&module_mapping.path)?.to_owned();
         tracing::debug!(
             "Loading module in parallel: {}",
             module_mapping.path.display()
@@ -282,7 +284,7 @@ impl LoadedObjfile {
             tokio::task::spawn_blocking({
                 let dwarf = Arc::clone(&dwarf);
                 let mapped_file_for_index = Arc::clone(&mapped_file);
-                let module_path = module_mapping.path.to_string_lossy().to_string();
+                let module_path = module_path.clone();
                 move || -> Result<(
                     crate::parser::LineParseResult,
                     crate::parser::DebugParseResult,
@@ -366,7 +368,7 @@ impl LoadedObjfile {
         let parse_result = crate::parser::DwarfParser::combine_parallel_results(
             line_result,
             info_result,
-            module_mapping.path.to_string_lossy().to_string(),
+            module_path,
         );
         let parse_elapsed_ms = load_started_at.elapsed().as_millis();
 
