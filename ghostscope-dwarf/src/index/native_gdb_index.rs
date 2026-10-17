@@ -579,7 +579,7 @@ impl GdbIndex {
         let offset = self.pool_offset(relative_offset)?;
         let mut reader = self.reader_at(offset)?;
         let string = reader.read_null_terminated_slice()?;
-        Ok(string.to_string_lossy()?.into_owned())
+        Ok(string.to_string()?.into_owned())
     }
 
     fn pool_offset(&self, relative_offset: u32) -> Result<usize> {
@@ -753,6 +753,19 @@ mod tests {
             Arc::from(bytes),
             gimli::RunTimeEndian::Little,
         ))
+    }
+
+    #[test]
+    fn rejects_non_utf8_symbol_names() {
+        let mut bytes = fixture();
+        let name_end = bytes.len() - 2;
+        bytes[name_end] = 0xff;
+        let index = parse(bytes).unwrap();
+        let error = index.validate_symbol_data().unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<gimli::Error>(),
+            Some(gimli::Error::BadUtf8)
+        ));
     }
 
     #[test]

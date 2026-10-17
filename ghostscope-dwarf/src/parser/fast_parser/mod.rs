@@ -650,7 +650,9 @@ impl<'a> DwarfParser<'a> {
         attr_value: gimli::AttributeValue<DwarfReader>,
     ) -> Result<Option<Arc<str>>> {
         if let Ok(string) = dwarf.attr_string(unit, attr_value) {
-            if let Ok(s_str) = string.to_string_lossy() {
+            if let Ok(s_str) = string.to_string().inspect_err(|error| {
+                tracing::debug!(?error, "Ignoring DWARF name that is not valid UTF-8");
+            }) {
                 return Ok(Some(Arc::<str>::from(s_str.into_owned())));
             }
         }
@@ -1540,7 +1542,7 @@ impl<'a> DwarfParser<'a> {
             for name_index in names.names() {
                 let name = names
                     .name_string(name_index, &self.dwarf.debug_str)?
-                    .to_string_lossy()?
+                    .to_string()?
                     .into_owned();
                 let mut entries = names.name_entries(name_index)?;
                 while let Some(entry) = entries.next()? {
@@ -1724,7 +1726,7 @@ impl<'a> DwarfParser<'a> {
                             die_offset,
                         )?;
                         if let Some(kind) = gnu_pub_symbol_kind(entry.kind())? {
-                            let name = entry.name().to_string_lossy()?.into_owned();
+                            let name = entry.name().to_string()?.into_owned();
                             seeds.push((name, unit_offset, kind));
                         }
                     }
@@ -1755,7 +1757,7 @@ impl<'a> DwarfParser<'a> {
                             die_offset,
                         )?;
                         if let Some(kind) = gnu_pub_symbol_kind(entry.kind())? {
-                            let name = entry.name().to_string_lossy()?.into_owned();
+                            let name = entry.name().to_string()?.into_owned();
                             seeds.push((name, unit_offset, kind));
                         }
                     }
@@ -1986,7 +1988,7 @@ impl<'a> DwarfParser<'a> {
 
         if let Some(name_attr) = entry.attr_value(gimli::constants::DW_AT_name) {
             if let Ok(name) = dwarf.attr_string(unit, name_attr) {
-                if let Ok(s_str) = name.to_string_lossy() {
+                if let Ok(s_str) = name.to_string() {
                     return Some(s_str.into_owned());
                 }
             }
