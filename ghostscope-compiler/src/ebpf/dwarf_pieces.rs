@@ -58,7 +58,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         } else {
             status_ptr
         };
-        let module_hint = Self::module_path_for_offsets(materialization.module_path.as_deref());
+        let module_hint = Self::module_path_for_offsets(materialization.module_path.as_deref())?;
         let mut value = self.context.i64_type().const_zero();
         for piece in pieces {
             let mut part = self.load_piece_value(

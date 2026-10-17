@@ -14,8 +14,16 @@ use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use tracing::{debug, warn};
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
-    pub(super) fn module_path_for_offsets(module_path: Option<&std::path::Path>) -> Option<String> {
-        module_path.map(|path| path.to_string_lossy().into_owned())
+    pub(super) fn module_path_for_offsets(
+        module_path: Option<&std::path::Path>,
+    ) -> Result<Option<String>> {
+        module_path
+            .map(|path| {
+                module_probe::module_path_str(path)
+                    .map(str::to_owned)
+                    .map_err(|error| CodeGenError::DwarfError(error.to_string()))
+            })
+            .transpose()
     }
 
     /// Compute a stable cookie for a module when per-PID offsets are unavailable (via coordinator).
@@ -399,7 +407,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         match &materialization.materialization {
             ghostscope_dwarf::VariableMaterialization::DirectValue { value } => {
                 let module_hint =
-                    Self::module_path_for_offsets(materialization.module_path.as_deref());
+                    Self::module_path_for_offsets(materialization.module_path.as_deref())?;
                 let value = self.planned_value_to_llvm_value(
                     value,
                     &materialization.name,
@@ -416,7 +424,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     CodeGenError::DwarfError("Expression has no DWARF type information".to_string())
                 })?;
                 let module_hint =
-                    Self::module_path_for_offsets(materialization.module_path.as_deref());
+                    Self::module_path_for_offsets(materialization.module_path.as_deref())?;
                 self.generate_memory_location_from_planned_address(
                     address,
                     dwarf_type,
@@ -458,7 +466,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         pc_address: u64,
         status_ptr: Option<PointerValue<'ctx>>,
     ) -> Result<RuntimeAddress<'ctx>> {
-        let module_hint = Self::module_path_for_offsets(plan.module_path.as_deref());
+        let module_hint = Self::module_path_for_offsets(plan.module_path.as_deref())?;
         match plan.lvalue_address_plan() {
             LvalueAddressPlan::Address { address } => {
                 self.resolve_planned_address(&address, status_ptr, module_hint.as_deref())

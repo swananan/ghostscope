@@ -394,7 +394,11 @@ impl<'a> AstCompiler<'a> {
                         function_name: Some(format!("{file_path}:{line_number}")),
                         // Keep function_address as DWARF PC for compile-time DWARF queries
                         function_address: Some(module_address.address),
-                        binary_path: module_address.module_path.to_string_lossy().to_string(),
+                        binary_path: ghostscope_process::module_probe::module_path_str(
+                            &module_address.module_path,
+                        )
+                        .map_err(|error| CompileError::Other(error.to_string()))?
+                        .to_owned(),
                         // Attach with absolute file offset if conversion succeeded
                         uprobe_offset: file_off,
                         pattern: pattern.clone(),
@@ -469,7 +473,9 @@ impl<'a> AstCompiler<'a> {
 
                 // Convert DWARF PC (vaddr) to ELF file offset for uprobe
                 let file_off = analyzer.vaddr_to_file_offset(&module_path, *addr);
-                let module_path = module_path.to_string_lossy().to_string();
+                let module_path = ghostscope_process::module_probe::module_path_str(&module_path)
+                    .map_err(|error| CompileError::Other(error.to_string()))?
+                    .to_owned();
 
                 if file_off.is_none() {
                     return Err(CompileError::Other(format!(
@@ -522,7 +528,9 @@ impl<'a> AstCompiler<'a> {
 
                 // Convert DWARF PC (vaddr) to ELF file offset for uprobe
                 let file_off = analyzer.vaddr_to_file_offset(&module_path, *address);
-                let module_path = module_path.to_string_lossy().to_string();
+                let module_path = ghostscope_process::module_probe::module_path_str(&module_path)
+                    .map_err(|error| CompileError::Other(error.to_string()))?
+                    .to_owned();
 
                 if file_off.is_none() {
                     return Err(CompileError::Other(format!(
@@ -636,7 +644,11 @@ impl<'a> AstCompiler<'a> {
                     let target_info = ResolvedTarget {
                         function_name: Some(func_name.clone()),
                         function_address: Some(module_address.address),
-                        binary_path: module_address.module_path.to_string_lossy().to_string(),
+                        binary_path: ghostscope_process::module_probe::module_path_str(
+                            &module_address.module_path,
+                        )
+                        .map_err(|error| CompileError::Other(error.to_string()))?
+                        .to_owned(),
                         uprobe_offset: file_off,
                         pattern: pattern.clone(),
                     };
