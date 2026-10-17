@@ -1,5 +1,488 @@
 [
   {
+    "generated_at": "2026-10-17T07:49:13Z",
+    "sha": "e9eac72d2aaf4c5115d2c5840c9c8bcea3eef393",
+    "sha_short": "e9eac72d2aaf",
+    "ref": "main",
+    "event": "schedule",
+    "run_id": "39014819379",
+    "run_number": "317",
+    "run_attempt": "1",
+    "run_url": "https://github.com/swananan/ghostscope/actions/runs/39014819379",
+    "artifact_path": "data/runs/20261017T074913Z-e9eac72d2aaf.json",
+    "primary_parse_target": "parse-stress",
+    "parse_targets": {
+      "parse-stress": {
+        "metrics_ms": {
+          "average": 95.115,
+          "p50": 94.785,
+          "p95": 99.805,
+          "min": 92.86,
+          "max": 99.805
+        },
+        "internal_metrics_ms": {
+          "module_count": 1,
+          "parse_phase": {
+            "average": 80.7,
+            "p50": 80.0,
+            "p95": 84.0,
+            "min": 79.0,
+            "max": 84.0
+          },
+          "index_phase": {
+            "average": 13.5,
+            "p50": 13.0,
+            "p95": 15.0,
+            "min": 13.0,
+            "max": 15.0
+          },
+          "internal_total": {
+            "average": 94.4,
+            "p50": 94.0,
+            "p95": 99.0,
+            "min": 92.0,
+            "max": 99.0
+          }
+        }
+      },
+      "gnu-pubnames-stress": {
+        "metrics_ms": {
+          "average": 34.735,
+          "p50": 35.048,
+          "p95": 36.57,
+          "min": 33.0,
+          "max": 36.57
+        },
+        "internal_metrics_ms": {
+          "module_count": 1,
+          "parse_phase": {
+            "average": 27.5,
+            "p50": 28.0,
+            "p95": 29.0,
+            "min": 26.0,
+            "max": 29.0
+          },
+          "index_phase": {
+            "average": 6.1,
+            "p50": 6.0,
+            "p95": 7.0,
+            "min": 6.0,
+            "max": 7.0
+          },
+          "internal_total": {
+            "average": 34.1,
+            "p50": 34.0,
+            "p95": 36.0,
+            "min": 32.0,
+            "max": 36.0
+          }
+        }
+      },
+      "rust-parse-stress": {
+        "metrics_ms": {
+          "average": 8526.545,
+          "p50": 8453.328,
+          "p95": 9463.383,
+          "min": 8332.541,
+          "max": 9463.383
+        },
+        "internal_metrics_ms": {
+          "module_count": 1,
+          "parse_phase": {
+            "average": 8312.9,
+            "p50": 8242.0,
+            "p95": 9241.0,
+            "min": 8121.0,
+            "max": 9241.0
+          },
+          "index_phase": {
+            "average": 212.6,
+            "p50": 211.0,
+            "p95": 221.0,
+            "min": 210.0,
+            "max": 221.0
+          },
+          "internal_total": {
+            "average": 8526.1,
+            "p50": 8453.0,
+            "p95": 9463.0,
+            "min": 8332.0,
+            "max": 9463.0
+          }
+        }
+      },
+      "cpp-template-stress": {
+        "metrics_ms": {
+          "average": 4823.437,
+          "p50": 4768.914,
+          "p95": 5096.953,
+          "min": 4763.631,
+          "max": 5096.953
+        },
+        "internal_metrics_ms": {
+          "module_count": 1,
+          "parse_phase": {
+            "average": 4070.6,
+            "p50": 4025.0,
+            "p95": 4343.0,
+            "min": 4020.0,
+            "max": 4343.0
+          },
+          "index_phase": {
+            "average": 751.9,
+            "p50": 745.0,
+            "p95": 797.0,
+            "min": 741.0,
+            "max": 797.0
+          },
+          "internal_total": {
+            "average": 4822.9,
+            "p50": 4768.0,
+            "p95": 5096.0,
+            "min": 4763.0,
+            "max": 5096.0
+          }
+        }
+      },
+      "rust-generic-stress": {
+        "metrics_ms": {
+          "average": 3863.114,
+          "p50": 3869.017,
+          "p95": 4053.114,
+          "min": 3671.905,
+          "max": 4053.114
+        },
+        "internal_metrics_ms": {
+          "module_count": 1,
+          "parse_phase": {
+            "average": 3644.8,
+            "p50": 3646.0,
+            "p95": 3814.0,
+            "min": 3463.0,
+            "max": 3814.0
+          },
+          "index_phase": {
+            "average": 217.3,
+            "p50": 217.0,
+            "p95": 238.0,
+            "min": 208.0,
+            "max": 238.0
+          },
+          "internal_total": {
+            "average": 3862.4,
+            "p50": 3868.0,
+            "p95": 4053.0,
+            "min": 3671.0,
+            "max": 4053.0
+          }
+        }
+      },
+      "cpp-deep-namespace": {
+        "metrics_ms": {
+          "average": 268.008,
+          "p50": 267.576,
+          "p95": 272.471,
+          "min": 264.552,
+          "max": 272.471
+        },
+        "internal_metrics_ms": {
+          "module_count": 1,
+          "parse_phase": {
+            "average": 249.7,
+            "p50": 249.0,
+            "p95": 253.0,
+            "min": 247.0,
+            "max": 253.0
+          },
+          "index_phase": {
+            "average": 17.1,
+            "p50": 17.0,
+            "p95": 18.0,
+            "min": 17.0,
+            "max": 18.0
+          },
+          "internal_total": {
+            "average": 267.5,
+            "p50": 267.0,
+            "p95": 272.0,
+            "min": 264.0,
+            "max": 272.0
+          }
+        }
+      }
+    },
+    "metrics": {
+      "fast_parse_ms": {
+        "average": 95.115,
+        "p50": 94.785,
+        "p95": 99.805,
+        "min": 92.86,
+        "max": 99.805
+      },
+      "fast_parse_targets_ms": {
+        "parse-stress": {
+          "average": 95.115,
+          "p50": 94.785,
+          "p95": 99.805,
+          "min": 92.86,
+          "max": 99.805
+        },
+        "gnu-pubnames-stress": {
+          "average": 34.735,
+          "p50": 35.048,
+          "p95": 36.57,
+          "min": 33.0,
+          "max": 36.57
+        },
+        "rust-parse-stress": {
+          "average": 8526.545,
+          "p50": 8453.328,
+          "p95": 9463.383,
+          "min": 8332.541,
+          "max": 9463.383
+        },
+        "cpp-template-stress": {
+          "average": 4823.437,
+          "p50": 4768.914,
+          "p95": 5096.953,
+          "min": 4763.631,
+          "max": 5096.953
+        },
+        "rust-generic-stress": {
+          "average": 3863.114,
+          "p50": 3869.017,
+          "p95": 4053.114,
+          "min": 3671.905,
+          "max": 4053.114
+        },
+        "cpp-deep-namespace": {
+          "average": 268.008,
+          "p50": 267.576,
+          "p95": 272.471,
+          "min": 264.552,
+          "max": 272.471
+        }
+      },
+      "fast_parse_targets_detail": {
+        "parse-stress": {
+          "metrics_ms": {
+            "average": 95.115,
+            "p50": 94.785,
+            "p95": 99.805,
+            "min": 92.86,
+            "max": 99.805
+          },
+          "internal_metrics_ms": {
+            "module_count": 1,
+            "parse_phase": {
+              "average": 80.7,
+              "p50": 80.0,
+              "p95": 84.0,
+              "min": 79.0,
+              "max": 84.0
+            },
+            "index_phase": {
+              "average": 13.5,
+              "p50": 13.0,
+              "p95": 15.0,
+              "min": 13.0,
+              "max": 15.0
+            },
+            "internal_total": {
+              "average": 94.4,
+              "p50": 94.0,
+              "p95": 99.0,
+              "min": 92.0,
+              "max": 99.0
+            }
+          }
+        },
+        "gnu-pubnames-stress": {
+          "metrics_ms": {
+            "average": 34.735,
+            "p50": 35.048,
+            "p95": 36.57,
+            "min": 33.0,
+            "max": 36.57
+          },
+          "internal_metrics_ms": {
+            "module_count": 1,
+            "parse_phase": {
+              "average": 27.5,
+              "p50": 28.0,
+              "p95": 29.0,
+              "min": 26.0,
+              "max": 29.0
+            },
+            "index_phase": {
+              "average": 6.1,
+              "p50": 6.0,
+              "p95": 7.0,
+              "min": 6.0,
+              "max": 7.0
+            },
+            "internal_total": {
+              "average": 34.1,
+              "p50": 34.0,
+              "p95": 36.0,
+              "min": 32.0,
+              "max": 36.0
+            }
+          }
+        },
+        "rust-parse-stress": {
+          "metrics_ms": {
+            "average": 8526.545,
+            "p50": 8453.328,
+            "p95": 9463.383,
+            "min": 8332.541,
+            "max": 9463.383
+          },
+          "internal_metrics_ms": {
+            "module_count": 1,
+            "parse_phase": {
+              "average": 8312.9,
+              "p50": 8242.0,
+              "p95": 9241.0,
+              "min": 8121.0,
+              "max": 9241.0
+            },
+            "index_phase": {
+              "average": 212.6,
+              "p50": 211.0,
+              "p95": 221.0,
+              "min": 210.0,
+              "max": 221.0
+            },
+            "internal_total": {
+              "average": 8526.1,
+              "p50": 8453.0,
+              "p95": 9463.0,
+              "min": 8332.0,
+              "max": 9463.0
+            }
+          }
+        },
+        "cpp-template-stress": {
+          "metrics_ms": {
+            "average": 4823.437,
+            "p50": 4768.914,
+            "p95": 5096.953,
+            "min": 4763.631,
+            "max": 5096.953
+          },
+          "internal_metrics_ms": {
+            "module_count": 1,
+            "parse_phase": {
+              "average": 4070.6,
+              "p50": 4025.0,
+              "p95": 4343.0,
+              "min": 4020.0,
+              "max": 4343.0
+            },
+            "index_phase": {
+              "average": 751.9,
+              "p50": 745.0,
+              "p95": 797.0,
+              "min": 741.0,
+              "max": 797.0
+            },
+            "internal_total": {
+              "average": 4822.9,
+              "p50": 4768.0,
+              "p95": 5096.0,
+              "min": 4763.0,
+              "max": 5096.0
+            }
+          }
+        },
+        "rust-generic-stress": {
+          "metrics_ms": {
+            "average": 3863.114,
+            "p50": 3869.017,
+            "p95": 4053.114,
+            "min": 3671.905,
+            "max": 4053.114
+          },
+          "internal_metrics_ms": {
+            "module_count": 1,
+            "parse_phase": {
+              "average": 3644.8,
+              "p50": 3646.0,
+              "p95": 3814.0,
+              "min": 3463.0,
+              "max": 3814.0
+            },
+            "index_phase": {
+              "average": 217.3,
+              "p50": 217.0,
+              "p95": 238.0,
+              "min": 208.0,
+              "max": 238.0
+            },
+            "internal_total": {
+              "average": 3862.4,
+              "p50": 3868.0,
+              "p95": 4053.0,
+              "min": 3671.0,
+              "max": 4053.0
+            }
+          }
+        },
+        "cpp-deep-namespace": {
+          "metrics_ms": {
+            "average": 268.008,
+            "p50": 267.576,
+            "p95": 272.471,
+            "min": 264.552,
+            "max": 272.471
+          },
+          "internal_metrics_ms": {
+            "module_count": 1,
+            "parse_phase": {
+              "average": 249.7,
+              "p50": 249.0,
+              "p95": 253.0,
+              "min": 247.0,
+              "max": 253.0
+            },
+            "index_phase": {
+              "average": 17.1,
+              "p50": 17.0,
+              "p95": 18.0,
+              "min": 17.0,
+              "max": 18.0
+            },
+            "internal_total": {
+              "average": 267.5,
+              "p50": 267.0,
+              "p95": 272.0,
+              "min": 264.0,
+              "max": 272.0
+            }
+          }
+        }
+      },
+      "source_line_query_ms": {
+        "first_run": 0.739076,
+        "average": 0.7383747,
+        "p50": 0.740158,
+        "p95": 0.794462,
+        "min": 0.7021869999999999,
+        "max": 0.794462
+      }
+    },
+    "query_result": {
+      "source": {
+        "path": "/home/runner/work/ghostscope/ghostscope/scripts/dwarf-perf/corpus/src/query-hotspot/query_hotspot.c",
+        "line": 119
+      },
+      "address_count": 1,
+      "total_variables": 16,
+      "first_address": "0x40164f"
+    }
+  },
+  {
     "generated_at": "2026-10-17T01:44:07Z",
     "sha": "e9eac72d2aaf4c5115d2c5840c9c8bcea3eef393",
     "sha_short": "e9eac72d2aaf",
