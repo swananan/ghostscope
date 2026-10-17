@@ -469,6 +469,7 @@ impl Args {
             let binary_path = parsed.binary.clone();
             let binary_args = parsed.remaining.clone();
             Self::parsed_trace_args_from_clap(parsed, binary_path, binary_args)
+                .unwrap_or_else(|e| e.exit())
         }
     }
 
@@ -490,6 +491,7 @@ impl Args {
         };
 
         Self::parsed_trace_args_from_clap(parsed, binary_path, binary_args)
+            .unwrap_or_else(|e| e.exit())
     }
 
     fn command_with_bpffs() -> clap::Command {
@@ -517,7 +519,7 @@ impl Args {
         let binary_path = parsed.binary.clone();
         let binary_args = parsed.remaining.clone();
         Ok(ParsedCommand::Trace(Box::new(
-            Self::parsed_trace_args_from_clap(parsed, binary_path, binary_args),
+            Self::parsed_trace_args_from_clap(parsed, binary_path, binary_args)?,
         )))
     }
 
@@ -525,14 +527,16 @@ impl Args {
         parsed: Args,
         binary_path: Option<String>,
         binary_args: Vec<String>,
-    ) -> ParsedArgs {
+    ) -> std::result::Result<ParsedArgs, clap::Error> {
         let should_save_llvm_ir = Self::should_save_llvm_ir(&parsed);
         let should_save_ebpf = Self::should_save_ebpf(&parsed);
         let should_save_ast = Self::should_save_ast(&parsed);
         let tui_mode = Self::determine_tui_mode(&parsed);
         let dry_run = parsed.dry_run;
         let dry_run_details = parsed.dry_run_details;
-        let target_path = Self::resolve_target_path(&parsed);
+        let target_path = Self::resolve_target_path(&parsed).map_err(|error| {
+            clap::Error::raw(clap::error::ErrorKind::ValueValidation, error.to_string())
+        })?;
         let (status_enabled, has_explicit_status_flag) = Self::determine_status_config(&parsed);
         let (
             enable_logging,
@@ -542,7 +546,7 @@ impl Args {
             has_explicit_console_log_flag,
         ) = Self::determine_logging_config(&parsed);
 
-        ParsedArgs {
+        Ok(ParsedArgs {
             binary_path,
             target_path,
             binary_args,
@@ -585,7 +589,7 @@ impl Args {
             debuginfod_max_size: parsed.debuginfod_max_size,
             source_panel: parsed.source_panel,
             no_source_panel: parsed.no_source_panel,
-        }
+        })
     }
 
     /// Determine whether to save LLVM IR files based on arguments and build type
@@ -640,55 +644,41 @@ impl Args {
     }
 
     /// Resolve target path with fallback search logic
-    fn resolve_target_path(parsed: &Args) -> Option<String> {
-        if let Some(target) = &parsed.target {
-            // Check if it's an absolute path
-            let target_path = PathBuf::from(target);
-            if target_path.is_absolute() {
-                if target_path.exists() {
-                    Some(target.clone())
-                } else {
-                    warn!("Target file not found: {}", target);
-                    Some(target.clone()) // Return anyway for error handling later
-                }
-            } else {
-                // Try relative path searches and convert to absolute paths
-                // 1. Current working directory
-                if target_path.exists() {
-                    if let Ok(current_dir) = std::env::current_dir() {
-                        let absolute_target = current_dir.join(target);
-                        return Some(absolute_target.to_string_lossy().to_string());
-                    } else {
-                        return Some(target.clone()); // Fallback if can't get current dir
-                    }
-                }
-
-                // 2. Same directory as the command (executable directory)
-                if let Ok(exe_path) = std::env::current_exe() {
-                    if let Some(exe_dir) = exe_path.parent() {
-                        let exe_target = exe_dir.join(target);
-                        if exe_target.exists() {
-                            return Some(exe_target.to_string_lossy().to_string());
-                        }
-                    }
-                }
-
-                // 3. If not found, still convert to absolute path based on current directory
-                if let Ok(current_dir) = std::env::current_dir() {
-                    let absolute_target = current_dir.join(target);
-                    warn!(
-                        "Target file not found, using absolute path: {}",
-                        absolute_target.display()
-                    );
-                    Some(absolute_target.to_string_lossy().to_string())
-                } else {
-                    warn!("Cannot determine current directory for target: {}", target);
-                    Some(target.clone()) // Last resort fallback
-                }
+    fn resolve_target_path(parsed: &Args) -> Result<Option<String>> {
+        let Some(target) = &parsed.target else {
+            return Ok(None);
+        };
+        let target_path = PathBuf::from(target);
+        let resolved = if target_path.is_absolute() {
+            if !target_path.exists() {
+                warn!("Target file not found: {}", target);
             }
+            target_path
+        } else if target_path.exists() {
+            // Prefer the current directory, then the executable directory.
+            std::env::current_dir()
+                .map(|dir| dir.join(&target_path))
+                .unwrap_or(target_path)
+        } else if let Some(exe_target) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join(&target_path)))
+            .filter(|path| path.exists())
+        {
+            exe_target
+        } else if let Ok(current_dir) = std::env::current_dir() {
+            let absolute_target = current_dir.join(target_path);
+            warn!(
+                "Target file not found, using absolute path: {}",
+                absolute_target.display()
+            );
+            absolute_target
         } else {
-            None
-        }
+            warn!("Cannot determine current directory for target: {}", target);
+            target_path
+        };
+        Ok(Some(
+            ghostscope_process::module_probe::module_path_str(&resolved)?.to_owned(),
+        ))
     }
 
     /// Determine logging configuration from command line arguments

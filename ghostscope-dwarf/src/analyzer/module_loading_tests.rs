@@ -98,6 +98,33 @@ async fn load(paths: &[&Path]) -> DwarfAnalyzer {
 }
 
 #[tokio::test]
+async fn non_utf8_module_path_does_not_alias_a_utf8_module() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir
+        .path()
+        .join(OsString::from_vec(b"module-\xff.so".to_vec()));
+    let good = dir.path().join("module-\u{fffd}.so");
+    write_module(&bad);
+    write_module(&good);
+
+    let analyzer = load(&[&bad, &good]).await;
+    assert_eq!(analyzer.module_paths(), vec![good.clone()]);
+    let query = analyzer.query_function("working_function").unwrap();
+    assert_eq!(query.addresses.len(), 1);
+    assert_eq!(query.addresses[0].module_path, good);
+    let failures = analyzer.module_load_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].module_path, bad);
+    assert!(failures[0].error.contains("module path is not valid UTF-8"));
+
+    let error = DwarfAnalyzer::from_exec_path(&bad).await.unwrap_err();
+    assert!(error.to_string().contains("module path is not valid UTF-8"));
+}
+
+#[tokio::test]
 async fn optional_failure_preserves_working_queries_and_reports_failed_queries() {
     let dir = tempfile::tempdir().unwrap();
     let good = dir.path().join("good.so");

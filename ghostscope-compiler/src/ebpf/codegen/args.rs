@@ -491,7 +491,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         )
                     })?;
                     let module_hint =
-                        Self::module_path_for_offsets(materialized.module_path.as_deref());
+                        Self::module_path_for_offsets(materialized.module_path.as_deref())?;
                     if let Some(semantic_plan) = semantic_plan {
                         let descriptor =
                             self.resolve_planned_address(address, None, module_hint.as_deref())?;
@@ -719,7 +719,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             pieces: pieces.clone(),
                             module_for_offsets: Self::module_path_for_offsets(
                                 materialized.module_path.as_deref(),
-                            ),
+                            )?,
                         },
                     })
                 }
@@ -1050,7 +1050,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     }
                 };
                 let module_hint =
-                    Self::module_path_for_offsets(materialized.module_path.as_deref());
+                    Self::module_path_for_offsets(materialized.module_path.as_deref())?;
                 Ok(ComplexArg {
                     var_name_index: self
                         .trace_context
@@ -1200,7 +1200,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                                 };
                             let data_len = Self::compute_read_size_for_type(&elem_ty);
                             let module_hint =
-                                Self::module_path_for_offsets(materialized.module_path.as_deref());
+                                Self::module_path_for_offsets(materialized.module_path.as_deref())?;
                             if data_len == 0 {
                                 // Fallback for unsized/void targets: print computed address as pointer
                                 let ptr_ti = ghostscope_dwarf::TypeInfo::PointerType {

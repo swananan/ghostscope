@@ -88,7 +88,7 @@ impl DetailedParser {
         let name = entry
             .attr(DW_AT_NAME)
             .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
-            .and_then(|value| value.to_string_lossy().ok().map(|value| value.into_owned()))
+            .and_then(|value| value.to_string().ok().map(|value| value.into_owned()))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| fallback_name.to_string());
         let member_type = resolve_type_ref_in_same_unit_with_origins(dwarf, &entry, unit)
@@ -512,7 +512,7 @@ impl DetailedParser {
             let mut entry_name: Option<String> = None;
             if let Some(a) = entry.attr(DW_AT_NAME) {
                 if let Ok(s) = dwarf.attr_string(unit, a.value()) {
-                    if let Ok(s_str) = s.to_string_lossy() {
+                    if let Ok(s_str) = s.to_string() {
                         entry_name = Some(s_str.into_owned());
                     }
                 }
@@ -578,7 +578,7 @@ impl DetailedParser {
                                             if let Some(na) = tentry.attr(DW_AT_NAME) {
                                                 if let Ok(s) = dwarf.attr_string(unit, na.value()) {
                                                     if pointee_name.is_none() {
-                                                        if let Ok(s_str) = s.to_string_lossy() {
+                                                        if let Ok(s_str) = s.to_string() {
                                                             pointee_name = Some(s_str.into_owned());
                                                         }
                                                     }
@@ -613,7 +613,7 @@ impl DetailedParser {
                                         }
                                         let name = if let Some(na) = tentry.attr(DW_AT_NAME) {
                                             if let Ok(s) = dwarf.attr_string(unit, na.value()) {
-                                                s.to_string_lossy()
+                                                s.to_string()
                                                     .ok()
                                                     .map(|c| c.into_owned())
                                                     .unwrap_or_else(|| "<base>".into())
@@ -638,7 +638,7 @@ impl DetailedParser {
                                         // Only record the name; deref-time upgrade will use analyzer's shallow index safely.
                                         if let Some(na) = tentry.attr(DW_AT_NAME) {
                                             if let Ok(s) = dwarf.attr_string(unit, na.value()) {
-                                                if let Ok(s_str) = s.to_string_lossy() {
+                                                if let Ok(s_str) = s.to_string() {
                                                     let n = s_str.into_owned();
                                                     pointee_name = Some(n.clone());
                                                     // keep target as UnknownType{name} to avoid deep recursion here
@@ -720,7 +720,7 @@ impl DetailedParser {
                                     let mut m_name = String::new();
                                     if let Some(na) = ce.attr(DW_AT_NAME) {
                                         if let Ok(s) = dwarf.attr_string(unit, na.value()) {
-                                            if let Ok(s_str) = s.to_string_lossy() {
+                                            if let Ok(s_str) = s.to_string() {
                                                 m_name = s_str.into_owned();
                                             }
                                         }
@@ -925,7 +925,7 @@ impl DetailedParser {
                                     let mut m_name = String::new();
                                     if let Some(na) = ce.attr(gimli::DW_AT_name) {
                                         if let Ok(s) = dwarf.attr_string(unit, na.value()) {
-                                            if let Ok(s_str) = s.to_string_lossy() {
+                                            if let Ok(s_str) = s.to_string() {
                                                 m_name = s_str.into_owned();
                                             }
                                         }
@@ -1016,7 +1016,7 @@ impl DetailedParser {
                                     let mut v_name = String::new();
                                     if let Some(na) = ce.attr(gimli::DW_AT_name) {
                                         if let Ok(s) = dwarf.attr_string(unit, na.value()) {
-                                            if let Ok(s_str) = s.to_string_lossy() {
+                                            if let Ok(s_str) = s.to_string() {
                                                 v_name = s_str.into_owned();
                                             }
                                         }

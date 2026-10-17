@@ -7,6 +7,13 @@ use std::hash::{Hash, Hasher};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+
+/// Borrow a module path for APIs that use UTF-8 strings as file names or keys.
+pub fn module_path_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("module path is not valid UTF-8: {path:?}"))
+}
 
 #[derive(Debug)]
 pub struct ModuleProbe {

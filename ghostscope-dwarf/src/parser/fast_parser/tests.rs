@@ -56,6 +56,96 @@ fn dwarf_with_debug_info_bytes(debug_info: Vec<u8>) -> gimli::Dwarf<DwarfReader>
 }
 
 #[test]
+fn non_utf8_names_do_not_alias_valid_unicode_names() {
+    let mut written = WriteDwarf::new();
+    let unit_id = written.units.add(Unit::new(
+        gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        },
+        LineProgram::none(),
+    ));
+    let unit = written.units.get_mut(unit_id);
+    let root = unit.root();
+    let valid_name = "symbol-\u{fffd}";
+    for tag in [
+        gimli::DW_TAG_subprogram,
+        gimli::DW_TAG_variable,
+        gimli::DW_TAG_structure_type,
+    ] {
+        for name in [
+            b"symbol-\xff".as_slice(),
+            b"symbol-\xfe",
+            valid_name.as_bytes(),
+        ] {
+            let id = unit.add(root, tag);
+            unit.get_mut(id).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(name.to_vec()),
+            );
+        }
+    }
+    let dwarf = write_dwarf_to_read(written);
+    let parser = DwarfParser { dwarf: &dwarf };
+    let result = parser.parse_debug_info("synthetic").unwrap();
+
+    assert_eq!(
+        result
+            .lightweight_index
+            .get_function_names()
+            .into_iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![valid_name]
+    );
+    assert_eq!(
+        result
+            .lightweight_index
+            .find_dies_by_function_name(valid_name)
+            .len(),
+        1
+    );
+    assert_eq!(
+        result
+            .lightweight_index
+            .find_variables_by_name(valid_name)
+            .len(),
+        1
+    );
+    let mut type_count = 0;
+    result
+        .lightweight_index
+        .for_each_type_map_entry(|name, _, entries| {
+            assert_eq!(name, valid_name);
+            type_count += entries.len();
+        });
+    assert_eq!(type_count, 1);
+
+    // On-demand resolution must agree with the initial name index.
+    let header = dwarf.units().next().unwrap().unwrap();
+    let unit = dwarf.unit(header).unwrap();
+    let mut entries = unit.entries();
+    let mut invalid_count = 0;
+    let mut valid_count = 0;
+    while let Some(entry) = entries.next_dfs().unwrap() {
+        let Some(attr) = entry.attr(gimli::DW_AT_name) else {
+            continue;
+        };
+        let bytes = dwarf.attr_string(&unit, attr.value()).unwrap();
+        let name = crate::semantics::resolve_name_with_origins(&dwarf, &unit, entry).unwrap();
+        if bytes.to_slice().unwrap().as_ref() == valid_name.as_bytes() {
+            assert_eq!(name.as_deref(), Some(valid_name));
+            valid_count += 1;
+        } else {
+            assert!(name.is_none());
+            invalid_count += 1;
+        }
+    }
+    assert_eq!((invalid_count, valid_count), (6, 3));
+}
+
+#[test]
 fn flush_pending_line_entries_keeps_equal_end_bounded() {
     let mut out = Vec::new();
     let mut pending = vec![test_line_entry(0x1000)];
