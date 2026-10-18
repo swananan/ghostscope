@@ -672,7 +672,7 @@ mod tests {
         let mut note = Vec::new();
         note.extend_from_slice(&4_u32.to_le_bytes());
         note.extend_from_slice(&u32::try_from(build_id.len()).unwrap().to_le_bytes());
-        note.extend_from_slice(&object::elf::NT_GNU_BUILD_ID.to_le_bytes());
+        note.extend_from_slice(&object::elf::NT_GNU_BUILD_ID.0.to_le_bytes());
         note.extend_from_slice(b"GNU\0");
         note.extend_from_slice(build_id);
         while !note.len().is_multiple_of(4) {

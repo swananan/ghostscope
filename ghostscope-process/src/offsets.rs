@@ -831,8 +831,8 @@ impl ProcessManager {
         let mut executable_biases: Option<BTreeSet<u64>> = None;
         let mut observed_executable_biases = BTreeSet::new();
         for seg in obj.segments().filter(|seg| {
-            matches!(seg.flags(), object::SegmentFlags::Elf { p_flags }
-                if p_flags & object::elf::PF_X != 0)
+            matches!(seg.flags(), object::SegmentFlags::Elf { p_flags, .. }
+                if p_flags.contains(object::elf::PF_X))
         }) {
             let key = seg.file_range().0 & page_mask;
             let biases: BTreeSet<_> = executable_candidates
@@ -1178,11 +1178,11 @@ mod tests {
         let mut writer = Writer::new(Endianness::Little, true, &mut bytes);
         writer.reserve_file_header();
         writer.reserve_program_headers(segments.len() as u32);
-        writer.reserve_until(file_end as usize);
+        writer.reserve_until(file_end);
         writer.reserve_section_index();
         let text_name = writer.add_section_name(b".text");
         writer.reserve_shstrtab_section_index();
-        writer.reserve_shstrtab();
+        writer.reserve_shstrtab().unwrap();
         writer.reserve_section_headers();
         writer
             .write_file_header(&FileHeader {
@@ -1191,7 +1191,7 @@ mod tests {
                 e_type: elf::ET_DYN,
                 e_machine: elf::EM_X86_64,
                 e_entry: vaddr,
-                e_flags: 0,
+                e_flags: elf::FileFlags(0),
             })
             .unwrap();
         writer.write_align_program_headers();
@@ -1207,13 +1207,13 @@ mod tests {
                 p_align: 0x1000,
             });
         }
-        writer.pad_until(file_end as usize);
+        writer.pad_until(file_end);
         writer.write_shstrtab();
         writer.write_null_section_header();
         writer.write_section_header(&SectionHeader {
-            name: Some(text_name),
+            sh_name: writer.section_name_offset(Some(text_name)),
             sh_type: elf::SHT_PROGBITS,
-            sh_flags: (elf::SHF_ALLOC | elf::SHF_EXECINSTR) as u64,
+            sh_flags: elf::SHF_ALLOC | elf::SHF_EXECINSTR,
             sh_addr: vaddr,
             sh_offset: file_offset,
             sh_size: 16,

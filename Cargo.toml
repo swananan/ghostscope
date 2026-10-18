@@ -59,7 +59,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 dirs = "5.0"
-object = "0.36"
+object = "0.40"
 
 gimli = "0.34.0"
 aya = "0.14"
