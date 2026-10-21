@@ -247,9 +247,9 @@ type InfoShard = LightweightIndexShard;
 #[derive(Default)]
 struct LineShard {
     line_entries: Vec<crate::core::LineEntry>,
-    compilation_units: HashMap<String, CompilationUnit>,
+    compilation_units: HashMap<gimli::DebugInfoOffset, CompilationUnit>,
     source_unit_offsets: Vec<(String, gimli::DebugInfoOffset)>,
-    file_indices: Vec<(String, LightweightFileIndex)>,
+    file_indices: Vec<(gimli::DebugInfoOffset, LightweightFileIndex)>,
     files_count: usize,
 }
 
@@ -258,7 +258,7 @@ pub(crate) struct DwarfParseResult {
     pub lightweight_index: LightweightIndex,
     pub line_mapping: LineMappingTable,
     pub scoped_file_manager: ScopedFileIndexManager,
-    pub compilation_units: HashMap<String, CompilationUnit>,
+    pub compilation_units: HashMap<gimli::DebugInfoOffset, CompilationUnit>,
     pub line_source_unit_offsets: HashMap<String, Vec<gimli::DebugInfoOffset>>,
     pub stats: DwarfParseStats,
 }
@@ -267,7 +267,7 @@ pub(crate) struct DwarfParseResult {
 pub(crate) struct LineParseResult {
     pub line_mapping: LineMappingTable,
     pub scoped_file_manager: ScopedFileIndexManager,
-    pub compilation_units: HashMap<String, CompilationUnit>,
+    pub compilation_units: HashMap<gimli::DebugInfoOffset, CompilationUnit>,
     pub source_unit_offsets: HashMap<String, Vec<gimli::DebugInfoOffset>>,
     pub line_entries_count: usize,
     pub files_count: usize,
@@ -1265,6 +1265,9 @@ impl<'a> DwarfParser<'a> {
             .map(|unit_header| -> Result<LineShard> {
                 let mut shard = LineShard::default();
                 let version = unit_header.version();
+                let unit_offset = unit_header.debug_info_offset().ok_or_else(|| {
+                    anyhow::anyhow!("Line information requires a .debug_info unit")
+                })?;
                 let unit = self.dwarf.unit(unit_header)?;
                 if let Some(ref line_program) = unit.line_program {
                     // CU name and comp_dir
@@ -1307,22 +1310,20 @@ impl<'a> DwarfParser<'a> {
                         &unit,
                         line_program,
                     )?;
-                    if let Some(unit_offset) = unit.header.debug_info_offset() {
-                        for file in &compilation_unit.files {
-                            for source_path in [&file.full_path, &file.filename] {
-                                if !source_path.is_empty() {
-                                    shard
-                                        .source_unit_offsets
-                                        .push((source_path.clone(), unit_offset));
-                                }
+                    for file in &compilation_unit.files {
+                        for source_path in [&file.full_path, &file.filename] {
+                            if !source_path.is_empty() {
+                                shard
+                                    .source_unit_offsets
+                                    .push((source_path.clone(), unit_offset));
                             }
                         }
                     }
                     shard.files_count += compilation_unit.files.len();
                     shard
                         .compilation_units
-                        .insert(cu_name.clone(), compilation_unit);
-                    shard.file_indices.push((cu_name.clone(), file_index));
+                        .insert(unit_offset, compilation_unit);
+                    shard.file_indices.push((unit_offset, file_index));
 
                     // Extract line rows for this CU only when a query needs them.
                     if include_rows {
@@ -1372,6 +1373,7 @@ impl<'a> DwarfParser<'a> {
                                     end_address: None,
                                     file_path: String::new(),
                                     file_index: line_row.file_index(),
+                                    unit_offset,
                                     compilation_unit: std::sync::Arc::from(cu_name.as_str()),
                                     line: line_row.line().map(|l| l.get()).unwrap_or(0),
                                     column,
@@ -1394,7 +1396,8 @@ impl<'a> DwarfParser<'a> {
         // Combine shards
         let mut scoped_file_manager = ScopedFileIndexManager::new();
         let mut line_entries = Vec::new();
-        let mut compilation_units: HashMap<String, CompilationUnit> = HashMap::new();
+        let mut compilation_units: HashMap<gimli::DebugInfoOffset, CompilationUnit> =
+            HashMap::new();
         let mut source_unit_offsets: HashMap<String, Vec<gimli::DebugInfoOffset>> = HashMap::new();
         let mut total_files = 0usize;
 

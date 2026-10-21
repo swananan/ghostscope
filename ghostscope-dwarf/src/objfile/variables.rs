@@ -224,11 +224,11 @@ impl LoadedObjfile {
             .attr_value(gimli::constants::DW_AT_call_file)
             .and_then(Self::attr_file_index)
             .and_then(|file_index| {
-                cu_name.as_deref().and_then(|cu_name| {
+                unit.header.debug_info_offset().and_then(|unit_offset| {
                     self.scoped_file_manager
                         .read()
                         .expect("scoped file index lock poisoned")
-                        .lookup_by_scoped_index(cu_name, file_index)
+                        .lookup_by_scoped_index(unit_offset, file_index)
                 })
             })
             .or_else(|| cu_name.clone())

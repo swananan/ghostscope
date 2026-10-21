@@ -108,7 +108,7 @@ pub(crate) struct LoadedObjfile {
     pub(super) lightweight_index: RwLock<LightweightIndex>,
     pub(super) line_mapping: RwLock<LineMappingTable>,
     pub(super) scoped_file_manager: RwLock<ScopedFileIndexManager>,
-    pub(super) compilation_units: RwLock<HashMap<String, CompilationUnit>>,
+    pub(super) compilation_units: RwLock<HashMap<gimli::DebugInfoOffset, CompilationUnit>>,
     pub(super) line_source_unit_offsets: HashMap<String, Vec<gimli::DebugInfoOffset>>,
     pub(super) indexed_line_cus: Mutex<HashSet<gimli::DebugInfoOffset>>,
     pub(super) unwind_info: ModuleUnwindInfo,
