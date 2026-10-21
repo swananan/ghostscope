@@ -22,7 +22,7 @@ lazy_static = { workspace = true }
 scopeguard = { workspace = true }
 serial_test = { workspace = true }
 gimli = { workspace = true }
-object = { workspace = true }
+object = { workspace = true, features = ["write"] }
 aya = { workspace = true }
 ghostscope-compiler = { version = "0.1.6", path = "../ghostscope-compiler" }
 ghostscope-dwarf = { version = "0.1.6", path = "../ghostscope-dwarf" }

@@ -67,6 +67,8 @@ pub struct ModuleLoadingStats {
     pub variables: usize,
     pub types: usize,
     pub debug_info_source: DebugInfoSource,
+    /// Validated supplementary object used alongside the primary debug source.
+    pub supplementary_debug_file: Option<String>,
     pub dwarf_index_status: DwarfIndexStatus,
     pub load_time_ms: u64,
     pub parse_time_ms: u64,

@@ -1,5 +1,7 @@
 pub(crate) mod debuglink;
 pub(crate) mod mapped_file;
+pub(crate) mod references;
+pub(crate) mod supplementary;
 
 pub(crate) use debuglink::{load_explicit_debug_file, try_load_debug_file};
 #[cfg(test)]

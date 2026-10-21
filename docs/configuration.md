@@ -857,6 +857,19 @@ the skipped count is reported when output resumes. File logging continues
 independently. Runtime script warnings also use bounded, cancellable output,
 with a short drain deadline during shutdown.
 
+### Supplementary DWARF Files
+
+GhostScope also loads supplementary DWARF objects referenced by
+`.gnu_debugaltlink` (GNU/dwz) or `.debug_sup` (DWARF 5). Relative paths are
+resolved against the selected primary debug file, including a separate `.debug`
+file. Configured `[dwarf].debug_search_paths` are also searched. GNU supplements
+must match the link's Build-ID; DWARF 5 supplements must have the correct role
+and match a supplied checksum. `allow_loose_debug_match` does not relax these
+checks. Missing or invalid required supplements fail that module's load. The
+startup report lists the supplementary path alongside the primary source.
+Supplements are currently discovered locally; this does not add `.dwo`/`.dwp`
+support or supplementary downloads through debuginfod.
+
 ### Startup Load Report
 
 During startup, GhostScope can report how DWARF was loaded before traces

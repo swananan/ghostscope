@@ -230,7 +230,7 @@ mod tests {
     fn origin(language: SourceLanguage) -> TypeOrigin {
         TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language,
             producer: None,
             dwarf_version: 5,

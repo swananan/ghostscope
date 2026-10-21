@@ -29,8 +29,8 @@ type ParsedUnit = Arc<gimli::Unit<DwarfReader>>;
 /// every hot lookup into a write operation.
 #[derive(Debug)]
 pub(super) struct ParsedUnitCache {
-    entries: HashMap<gimli::DebugInfoOffset, ParsedUnit>,
-    insertion_order: VecDeque<gimli::DebugInfoOffset>,
+    entries: HashMap<(crate::DwarfObjectId, gimli::DebugInfoOffset), ParsedUnit>,
+    insertion_order: VecDeque<(crate::DwarfObjectId, gimli::DebugInfoOffset)>,
     max_entries: usize,
 }
 
@@ -49,11 +49,15 @@ impl ParsedUnitCache {
         }
     }
 
-    fn get(&self, offset: gimli::DebugInfoOffset) -> Option<ParsedUnit> {
+    fn get(&self, offset: (crate::DwarfObjectId, gimli::DebugInfoOffset)) -> Option<ParsedUnit> {
         self.entries.get(&offset).map(Arc::clone)
     }
 
-    fn insert(&mut self, offset: gimli::DebugInfoOffset, unit: ParsedUnit) -> ParsedUnit {
+    fn insert(
+        &mut self,
+        offset: (crate::DwarfObjectId, gimli::DebugInfoOffset),
+        unit: ParsedUnit,
+    ) -> ParsedUnit {
         if let Some(existing) = self.entries.get(&offset) {
             return Arc::clone(existing);
         }
@@ -78,21 +82,23 @@ fn load_parsed_unit(
     cache: &RwLock<ParsedUnitCache>,
     dwarf: &gimli::Dwarf<DwarfReader>,
     offset: gimli::DebugInfoOffset,
+    object: crate::DwarfObjectId,
 ) -> Result<ParsedUnit> {
     if let Some(unit) = cache
         .read()
         .expect("parsed unit cache lock poisoned")
-        .get(offset)
+        .get((object, offset))
     {
         return Ok(unit);
     }
 
+    let dwarf = object.dwarf(dwarf)?;
     let header = dwarf.unit_header(offset)?;
     let parsed = Arc::new(dwarf.unit(header)?);
     Ok(cache
         .write()
         .expect("parsed unit cache lock poisoned")
-        .insert(offset, parsed))
+        .insert((object, offset), parsed))
 }
 
 /// Complete DWARF data for a single loaded object file.
@@ -112,6 +118,7 @@ pub(crate) struct LoadedObjfile {
     pub(super) _dwarf_mapped_file: Arc<MappedFile>,
     pub(super) _binary_mapped_file: Arc<MappedFile>,
     pub(super) debug_info_source: DebugInfoSource,
+    pub(crate) supplementary_debug_file: Option<String>,
     pub(super) entry_address: Option<u64>,
     pub(super) text_symbol_starts_by_name: HashMap<String, Vec<u64>>,
     pub(super) function_ranges_cache: RwLock<HashMap<FunctionRangeCacheKey, Vec<(u64, u64)>>>,
@@ -123,7 +130,7 @@ pub(crate) struct LoadedObjfile {
     pub(super) lazy_debug_info: bool,
     pub(super) indexed_debug_info_cus: Mutex<HashSet<gimli::DebugInfoOffset>>,
     pub(super) compilation_unit_languages:
-        RwLock<HashMap<gimli::DebugInfoOffset, crate::SourceLanguage>>,
+        RwLock<HashMap<(crate::DwarfObjectId, gimli::DebugInfoOffset), crate::SourceLanguage>>,
     pub(super) load_parse_ms: u64,
     pub(super) load_index_ms: u64,
     pub(super) load_total_ms: u64,
@@ -265,7 +272,15 @@ impl LoadedObjfile {
     }
 
     pub(super) fn unit(&self, offset: gimli::DebugInfoOffset) -> Result<ParsedUnit> {
-        load_parsed_unit(&self.parsed_unit_cache, &self.dwarf, offset)
+        self.unit_in(crate::DwarfObjectId::Primary, offset)
+    }
+
+    pub(super) fn unit_in(
+        &self,
+        object: crate::DwarfObjectId,
+        offset: gimli::DebugInfoOffset,
+    ) -> Result<ParsedUnit> {
+        load_parsed_unit(&self.parsed_unit_cache, &self.dwarf, offset, object)
     }
 
     pub(super) fn ensure_debug_info_for_symbol(
@@ -540,8 +555,10 @@ mod tests {
         let cache = RwLock::new(ParsedUnitCache::new(2));
         let offset = gimli::DebugInfoOffset(0);
 
-        let first = load_parsed_unit(&cache, &dwarf, offset).expect("unit should load");
-        let second = load_parsed_unit(&cache, &dwarf, offset).expect("unit should be cached");
+        let first = load_parsed_unit(&cache, &dwarf, offset, crate::DwarfObjectId::Primary)
+            .expect("unit should load");
+        let second = load_parsed_unit(&cache, &dwarf, offset, crate::DwarfObjectId::Primary)
+            .expect("unit should be cached");
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(
@@ -568,8 +585,13 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    load_parsed_unit(&cache, &dwarf, gimli::DebugInfoOffset(0))
-                        .expect("unit should load")
+                    load_parsed_unit(
+                        &cache,
+                        &dwarf,
+                        gimli::DebugInfoOffset(0),
+                        crate::DwarfObjectId::Primary,
+                    )
+                    .expect("unit should load")
                 })
             })
             .collect::<Vec<_>>();
@@ -599,12 +621,13 @@ mod tests {
             &RwLock::new(ParsedUnitCache::new(0)),
             &dwarf,
             gimli::DebugInfoOffset(0),
+            crate::DwarfObjectId::Primary,
         )
         .expect("unit should load");
         let mut cache = ParsedUnitCache::new(2);
-        let first = gimli::DebugInfoOffset(1);
-        let second = gimli::DebugInfoOffset(2);
-        let third = gimli::DebugInfoOffset(3);
+        let first = (crate::DwarfObjectId::Primary, gimli::DebugInfoOffset(1));
+        let second = (crate::DwarfObjectId::Primary, gimli::DebugInfoOffset(2));
+        let third = (crate::DwarfObjectId::Primary, gimli::DebugInfoOffset(3));
 
         cache.insert(first, Arc::clone(&unit));
         cache.insert(second, Arc::clone(&unit));
@@ -617,13 +640,39 @@ mod tests {
     }
 
     #[test]
+    fn parsed_unit_cache_distinguishes_equal_offsets_in_two_objects() {
+        let mut dwarf = dwarf_fixture();
+        dwarf.set_sup(dwarf_fixture());
+        let cache = RwLock::new(ParsedUnitCache::default());
+        let offset = gimli::DebugInfoOffset(0);
+        let primary =
+            load_parsed_unit(&cache, &dwarf, offset, crate::DwarfObjectId::Primary).unwrap();
+        let supplementary =
+            load_parsed_unit(&cache, &dwarf, offset, crate::DwarfObjectId::Supplementary).unwrap();
+        assert!(!Arc::ptr_eq(&primary, &supplementary));
+        assert_eq!(cache.read().unwrap().entries.len(), 2);
+    }
+
+    #[test]
     fn parsed_unit_cache_does_not_cache_errors() {
         let dwarf = dwarf_fixture();
         let cache = RwLock::new(ParsedUnitCache::new(2));
         let invalid_offset = gimli::DebugInfoOffset(usize::MAX);
 
-        assert!(load_parsed_unit(&cache, &dwarf, invalid_offset).is_err());
-        assert!(load_parsed_unit(&cache, &dwarf, invalid_offset).is_err());
+        assert!(load_parsed_unit(
+            &cache,
+            &dwarf,
+            invalid_offset,
+            crate::DwarfObjectId::Primary
+        )
+        .is_err());
+        assert!(load_parsed_unit(
+            &cache,
+            &dwarf,
+            invalid_offset,
+            crate::DwarfObjectId::Primary
+        )
+        .is_err());
         assert!(cache
             .read()
             .expect("parsed unit cache lock poisoned")

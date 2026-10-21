@@ -52,7 +52,13 @@ impl DwarfAnalyzer {
         if type_id.module != type_id.die.module || type_id.cu != type_id.die.cu {
             return Err(anyhow::anyhow!("inconsistent TypeId identity: {type_id:?}"));
         }
-        self.compilation_unit_metadata(type_id.module, type_id.cu)
+        let module_path = self.module_path_for_id(type_id.module).ok_or_else(|| {
+            anyhow::anyhow!("Semantic module id {:?} is not loaded", type_id.module)
+        })?;
+        self.modules
+            .get(module_path)
+            .ok_or_else(|| anyhow::anyhow!("Module {} not loaded", module_path.display()))?
+            .type_metadata(type_id)
             .map(|metadata| metadata.map(TypeOrigin::from))
     }
 

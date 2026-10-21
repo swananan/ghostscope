@@ -6,7 +6,21 @@ pub struct ModuleId(pub u32);
 
 /// Stable identifier for a compilation unit within a loaded module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CuId(pub u32);
+pub struct CuId(pub u64, pub DwarfObjectId);
+
+impl CuId {
+    pub const fn primary(offset: u64) -> Self {
+        Self(offset, DwarfObjectId::Primary)
+    }
+}
+
+/// The object containing a DWARF unit. Offsets are local to this object.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DwarfObjectId {
+    #[default]
+    Primary,
+    Supplementary,
+}
 
 /// Stable reference to a DIE within a loaded module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -23,6 +37,9 @@ pub struct TypeId {
     pub module: ModuleId,
     pub cu: CuId,
     pub die: DieRef,
+    /// Primary CU importing a supplementary type. Supplies semantic attributes
+    /// omitted by the physical partial unit, without changing its DIE location.
+    pub importing_cu: Option<CuId>,
 }
 
 /// Stable identifier for a variable declaration DIE.

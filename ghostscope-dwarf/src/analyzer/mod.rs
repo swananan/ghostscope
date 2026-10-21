@@ -819,6 +819,7 @@ impl DwarfAnalyzer {
                         variables,
                         types,
                         debug_info_source: module_data.get_debug_info_source().clone(),
+                        supplementary_debug_file: module_data.supplementary_debug_file.clone(),
                         dwarf_index_status: module_data.dwarf_index_status().clone(),
                         load_time_ms: start_time.elapsed().as_millis() as u64,
                         parse_time_ms,

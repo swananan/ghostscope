@@ -215,11 +215,12 @@ fn materialization_plan_preserves_module_path_origin() {
 #[test]
 fn materialization_plan_preserves_type_identity() {
     let type_id = TypeId {
+        importing_cu: None,
         module: ModuleId(3),
-        cu: CuId(5),
+        cu: CuId::primary(5),
         die: DieRef {
             module: ModuleId(3),
-            cu: CuId(5),
+            cu: CuId::primary(5),
             offset: 0x42,
         },
     };

@@ -196,6 +196,7 @@ impl LoadingProgress {
                 self.module_reports.push(ModuleLoadReport {
                     path: module_path.clone(),
                     source: stats.debug_info_source,
+                    supplementary_debug_file: stats.supplementary_debug_file,
                     dwarf_index_status: stats.dwarf_index_status,
                     functions: stats.functions,
                     variables: stats.variables,
@@ -322,6 +323,9 @@ impl LoadingProgress {
                         module.load_time_ms,
                         shorten_path(&module.path, 88),
                     ));
+                    if let Some(path) = &module.supplementary_debug_file {
+                        lines.push(format!("      supplementary: {}", shorten_path(path, 120)));
+                    }
                 }
                 if debuggable_modules.len() > MAX_MODULE_REPORT_LINES {
                     lines.push(format!(
@@ -466,6 +470,7 @@ impl LoadingProgress {
 struct ModuleLoadReport {
     path: String,
     source: DebugInfoSource,
+    supplementary_debug_file: Option<String>,
     dwarf_index_status: DwarfIndexStatus,
     functions: usize,
     variables: usize,
@@ -712,6 +717,7 @@ mod tests {
         reporter.handle_event(ModuleLoadingEvent::LoadingCompleted {
             module_path: "/usr/bin/app".to_string(),
             stats: ModuleLoadingStats {
+                supplementary_debug_file: Some("/usr/lib/debug/.dwz/app.debug".to_string()),
                 functions: 12,
                 variables: 3,
                 types: 7,
@@ -748,6 +754,7 @@ mod tests {
         assert!(report.contains("embedded"));
         assert!(report.contains(".gdb_index-v9"));
         assert!(report.contains("/usr/bin/app"));
+        assert!(report.contains("supplementary: /usr/lib/debug/.dwz/app.debug"));
     }
 
     #[test]
@@ -760,6 +767,7 @@ mod tests {
         reporter.handle_event(ModuleLoadingEvent::LoadingCompleted {
             module_path: "/lib/libmissing.so".to_string(),
             stats: ModuleLoadingStats {
+                supplementary_debug_file: None,
                 functions: 0,
                 variables: 0,
                 types: 0,

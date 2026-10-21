@@ -209,12 +209,13 @@ struct RawDieAttrs {
 enum DieRef {
     Unit(gimli::UnitOffset),
     DebugInfo(gimli::DebugInfoOffset),
+    Supplementary(gimli::DebugInfoOffset),
 }
 
 struct ResolvedRawDieAttrs {
     unit: Option<gimli::Unit<DwarfReader>>,
     offset: gimli::UnitOffset,
-    absolute_offset: gimli::DebugInfoOffset,
+    absolute_offset: (crate::DwarfObjectId, gimli::DebugInfoOffset),
     attrs: RawDieAttrs,
 }
 
@@ -295,6 +296,9 @@ pub(crate) struct DwarfParser<'a> {
 
 /// Internal builder for accumulating parse results
 impl<'a> DwarfParser<'a> {
+    pub(crate) fn has_supplementary(&self) -> bool {
+        self.dwarf.sup().is_some()
+    }
     fn process_unit_shard(
         &self,
         unit: &gimli::Unit<DwarfReader>,
@@ -303,7 +307,10 @@ impl<'a> DwarfParser<'a> {
     ) -> Result<InfoShard> {
         let mut shard = InfoShard::default();
         let mut entries = unit.entries_raw(None)?;
-        let mut metadata_cache: HashMap<gimli::DebugInfoOffset, FunctionMetadata> = HashMap::new();
+        let mut metadata_cache: HashMap<
+            (crate::DwarfObjectId, gimli::DebugInfoOffset),
+            FunctionMetadata,
+        > = HashMap::new();
         let mut tag_stack: Vec<(gimli::DwTag, gimli::UnitOffset)> = Vec::new();
         while !entries.is_empty() {
             let d: usize = entries.next_depth() as usize;
@@ -649,7 +656,9 @@ impl<'a> DwarfParser<'a> {
         unit: &gimli::Unit<DwarfReader>,
         attr_value: gimli::AttributeValue<DwarfReader>,
     ) -> Result<Option<Arc<str>>> {
-        if let Ok(string) = dwarf.attr_string(unit, attr_value) {
+        if let Ok(string) =
+            crate::binary::references::unit_dwarf(dwarf, unit)?.attr_string(unit, attr_value)
+        {
             if let Ok(s_str) = string.to_string().inspect_err(|error| {
                 tracing::debug!(?error, "Ignoring DWARF name that is not valid UTF-8");
             }) {
@@ -674,6 +683,7 @@ impl<'a> DwarfParser<'a> {
                     Some(DieRef::DebugInfo(offset))
                 }
             }
+            gimli::AttributeValue::DebugInfoRefSup(offset) => Some(DieRef::Supplementary(offset)),
             _ => None,
         }
     }
@@ -779,48 +789,47 @@ impl<'a> DwarfParser<'a> {
         current_unit: &gimli::Unit<DwarfReader>,
         reference: DieRef,
     ) -> Result<Option<ResolvedRawDieAttrs>> {
-        match reference {
-            DieRef::Unit(unit_offset) => {
-                let Some(debug_info_offset) =
-                    unit_offset.to_debug_info_offset(&current_unit.header)
-                else {
-                    return Ok(None);
-                };
-                let attrs = self.read_selected_raw_attrs_at(current_unit, unit_offset)?;
-                Ok(Some(ResolvedRawDieAttrs {
-                    unit: None,
-                    offset: unit_offset,
-                    absolute_offset: debug_info_offset,
-                    attrs,
-                }))
-            }
-            DieRef::DebugInfo(debug_info_offset) => {
-                if let Some(unit_offset) = debug_info_offset.to_unit_offset(&current_unit.header) {
-                    let attrs = self.read_selected_raw_attrs_at(current_unit, unit_offset)?;
-                    return Ok(Some(ResolvedRawDieAttrs {
-                        unit: None,
-                        offset: unit_offset,
-                        absolute_offset: debug_info_offset,
-                        attrs,
-                    }));
-                }
-
-                let mut units = self.dwarf.units();
-                while let Some(header) = units.next()? {
-                    if let Some(unit_offset) = debug_info_offset.to_unit_offset(&header) {
-                        let unit = self.dwarf.unit(header)?;
-                        let attrs = self.read_selected_raw_attrs_at(&unit, unit_offset)?;
-                        return Ok(Some(ResolvedRawDieAttrs {
-                            unit: Some(unit),
-                            offset: unit_offset,
-                            absolute_offset: debug_info_offset,
-                            attrs,
-                        }));
-                    }
-                }
-                Ok(None)
-            }
+        // Most origins are local. Reuse the already-parsed unit and raw
+        // attributes instead of rebuilding its (potentially huge) line header.
+        let local = match reference {
+            DieRef::Unit(offset) => Some(offset),
+            DieRef::DebugInfo(offset) => offset.to_unit_offset(&current_unit.header),
+            DieRef::Supplementary(_) => None,
+        };
+        if let Some(offset) = local {
+            let Some(absolute) = offset.to_debug_info_offset(&current_unit.header) else {
+                return Ok(None);
+            };
+            return Ok(Some(ResolvedRawDieAttrs {
+                unit: None,
+                offset,
+                absolute_offset: (
+                    crate::binary::references::unit_object(self.dwarf, current_unit),
+                    absolute,
+                ),
+                attrs: self.read_selected_raw_attrs_at(current_unit, offset)?,
+            }));
         }
+        let value = match reference {
+            DieRef::Unit(offset) => gimli::AttributeValue::UnitRef(offset),
+            DieRef::DebugInfo(offset) => gimli::AttributeValue::DebugInfoRef(offset),
+            DieRef::Supplementary(offset) => gimli::AttributeValue::DebugInfoRefSup(offset),
+        };
+        let Some((absolute, unit, entry)) =
+            crate::semantics::resolve_origin_entry(self.dwarf, current_unit, value)?
+        else {
+            return Ok(None);
+        };
+        let attrs = self.read_selected_raw_attrs_at(&unit, entry.offset())?;
+        Ok(Some(ResolvedRawDieAttrs {
+            absolute_offset: (
+                crate::binary::references::unit_object(self.dwarf, &unit),
+                absolute,
+            ),
+            offset: entry.offset(),
+            unit: Some(unit),
+            attrs,
+        }))
     }
 
     fn read_selected_raw_attrs_at(
@@ -840,7 +849,7 @@ impl<'a> DwarfParser<'a> {
         unit: &gimli::Unit<DwarfReader>,
         entry_offset: gimli::UnitOffset,
         attrs: &RawDieAttrs,
-        visited: &mut HashSet<gimli::DebugInfoOffset>,
+        visited: &mut HashSet<(crate::DwarfObjectId, gimli::DebugInfoOffset)>,
     ) -> Result<Option<Arc<str>>> {
         if let Some(name) = attrs.name.as_ref() {
             return Ok(Some(Arc::clone(name)));
@@ -849,7 +858,11 @@ impl<'a> DwarfParser<'a> {
         let Some(entry_abs) = entry_offset.to_debug_info_offset(&unit.header) else {
             return Ok(None);
         };
-        if !visited.insert(entry_abs) {
+        let entry_abs = (
+            crate::binary::references::unit_object(self.dwarf, unit),
+            entry_abs,
+        );
+        if visited.len() >= 64 || !visited.insert(entry_abs) {
             return Ok(None);
         }
 
@@ -883,17 +896,21 @@ impl<'a> DwarfParser<'a> {
         unit: &gimli::Unit<DwarfReader>,
         entry_offset: gimli::UnitOffset,
         attrs: &RawDieAttrs,
-        cache: &mut HashMap<gimli::DebugInfoOffset, FunctionMetadata>,
-        visited: &mut HashSet<gimli::DebugInfoOffset>,
+        cache: &mut HashMap<(crate::DwarfObjectId, gimli::DebugInfoOffset), FunctionMetadata>,
+        visited: &mut HashSet<(crate::DwarfObjectId, gimli::DebugInfoOffset)>,
     ) -> Result<FunctionMetadata> {
         let Some(entry_abs) = entry_offset.to_debug_info_offset(&unit.header) else {
             return Ok(FunctionMetadata::default());
         };
+        let entry_abs = (
+            crate::binary::references::unit_object(self.dwarf, unit),
+            entry_abs,
+        );
         if let Some(cached) = cache.get(&entry_abs) {
             return Ok(cached.clone());
         }
 
-        if !visited.insert(entry_abs) {
+        if visited.len() >= 64 || !visited.insert(entry_abs) {
             return Ok(FunctionMetadata::default());
         }
 

@@ -15,3 +15,16 @@ async-friendly helpers for the rest of the workspace. Consumers should prefer
 the PC-context planning APIs over interpreting raw DWARF locations directly.
 
 Consumers typically do not use this crate directly; it is re-exported via higher-level components. See the main GhostScope docs for usage examples: <https://github.com/swananan/ghostscope#readme>.
+
+Supplementary DWARF objects referenced by `.gnu_debugaltlink` (GNU/dwz) or
+`.debug_sup` (DWARF 5) are loaded alongside the selected primary debug file.
+References retain the object identity through type queries and member projection.
+Imported units contribute reachable type declarations. Modules using a supplement
+currently use the full DWARF scan instead of accelerator indexes.
+
+Supplement discovery searches relative to the primary debug file (including its
+resolved symlink location), then the configured debug search directories. GNU
+links validate the supplement's Build-ID; DWARF 5 links validate its `.debug_sup`
+role and supplied checksum. Matching remains strict in loose debug-file mode.
+A missing or mismatched required supplement is a module-loading error. Supplement
+fetching through debuginfod and Split DWARF `.dwo`/`.dwp` loading are not included.

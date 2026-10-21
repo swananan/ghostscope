@@ -13,7 +13,7 @@ use crate::{
     parser::ExpressionEvaluator,
     semantics::{
         resolve_name_with_origins, resolve_type_definition_ref_with_origins,
-        resolve_type_ref_in_same_unit_with_origins, VisibleVariable,
+        resolve_type_ref_in_same_unit_with_origins, resolve_type_ref_with_origins, VisibleVariable,
     },
     TypeInfo,
 };
@@ -22,7 +22,7 @@ use gimli::Reader;
 use gimli::constants::{
     DW_AT_byte_size as DW_AT_BYTE_SIZE, DW_AT_discr as DW_AT_DISCR,
     DW_AT_discr_list as DW_AT_DISCR_LIST, DW_AT_discr_value as DW_AT_DISCR_VALUE,
-    DW_AT_encoding as DW_AT_ENCODING, DW_AT_name as DW_AT_NAME, DW_AT_type as DW_AT_TYPE,
+    DW_AT_encoding as DW_AT_ENCODING, DW_AT_name as DW_AT_NAME,
     DW_TAG_array_type as DW_TAG_ARRAY_TYPE, DW_TAG_base_type as DW_TAG_BASE_TYPE,
     DW_TAG_class_type as DW_TAG_CLASS_TYPE, DW_TAG_const_type as DW_TAG_CONST_TYPE,
     DW_TAG_enumeration_type as DW_TAG_ENUMERATION_TYPE, DW_TAG_pointer_type as DW_TAG_POINTER_TYPE,
@@ -78,6 +78,29 @@ impl DetailedParser {
         Self {}
     }
 
+    fn referenced_type(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+        depth: usize,
+    ) -> Option<TypeInfo> {
+        let loc = resolve_type_definition_ref_with_origins(dwarf, entry, unit)
+            .ok()
+            .flatten()?;
+        if loc.object == crate::binary::references::unit_object(dwarf, unit)
+            && unit.header.debug_info_offset() == Some(loc.cu_off)
+        {
+            return Self::resolve_type_shallow_at_offset_impl_with_depth(
+                dwarf,
+                unit,
+                loc.die_off,
+                depth + 1,
+            );
+        }
+        let target = loc.unit(dwarf).ok()?;
+        Self::resolve_type_shallow_at_offset_impl_with_depth(dwarf, &target, loc.die_off, depth + 1)
+    }
+
     fn parse_member_at_offset(
         dwarf: &gimli::Dwarf<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
@@ -87,19 +110,20 @@ impl DetailedParser {
         let entry = unit.entry(offset).ok()?;
         let name = entry
             .attr(DW_AT_NAME)
-            .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
+            .and_then(|attr| {
+                crate::binary::references::unit_dwarf(dwarf, unit)
+                    .ok()?
+                    .attr_string(unit, attr.value())
+                    .ok()
+            })
             .and_then(|value| value.to_string().ok().map(|value| value.into_owned()))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| fallback_name.to_string());
-        let member_type = resolve_type_ref_in_same_unit_with_origins(dwarf, &entry, unit)
-            .ok()
-            .flatten()
-            .and_then(|type_offset| {
-                Self::resolve_type_shallow_at_offset_impl(dwarf, unit, type_offset)
-            })
-            .unwrap_or_else(|| TypeInfo::UnknownType {
+        let member_type = Self::referenced_type(dwarf, unit, &entry, 0).unwrap_or_else(|| {
+            TypeInfo::UnknownType {
                 name: "unknown".to_string(),
-            });
+            }
+        });
 
         let mut member_offset = 0;
         if let Some(location) = entry.attr(gimli::DW_AT_data_member_location) {
@@ -214,8 +238,7 @@ impl DetailedParser {
         let base_loc = resolve_type_definition_ref_with_origins(dwarf, inheritance, unit)
             .ok()
             .flatten()?;
-        let base_header = dwarf.unit_header(base_loc.cu_off).ok()?;
-        let base_unit = dwarf.unit(base_header).ok()?;
+        let base_unit = base_loc.unit(dwarf).ok()?;
         let base_type = Self::resolve_type_shallow_at_offset_impl_with_depth(
             dwarf,
             &base_unit,
@@ -511,7 +534,10 @@ impl DetailedParser {
             // Utility to read attr string name
             let mut entry_name: Option<String> = None;
             if let Some(a) = entry.attr(DW_AT_NAME) {
-                if let Ok(s) = dwarf.attr_string(unit, a.value()) {
+                if let Ok(s) = crate::binary::references::unit_dwarf(dwarf, unit)
+                    .ok()?
+                    .attr_string(unit, a.value())
+                {
                     if let Ok(s_str) = s.to_string() {
                         entry_name = Some(s_str.into_owned());
                     }
@@ -528,13 +554,15 @@ impl DetailedParser {
                         type_offset = off;
                         continue;
                     }
+                    let underlying = Self::referenced_type(dwarf, unit, &entry, inheritance_depth)
+                        .unwrap_or_else(|| TypeInfo::UnknownType {
+                            name: "<unknown>".into(),
+                        });
                     return Some(TypeInfo::TypedefType {
                         name: alias_name.unwrap_or_else(|| {
                             entry_name.unwrap_or_else(|| "<anon_typedef>".to_string())
                         }),
-                        underlying_type: Box::new(TypeInfo::UnknownType {
-                            name: "<unknown>".to_string(),
-                        }),
+                        underlying_type: Box::new(underlying),
                     });
                 }
                 DW_TAG_CONST_TYPE | DW_TAG_VOLATILE_TYPE | DW_TAG_RESTRICT_TYPE => {
@@ -544,11 +572,13 @@ impl DetailedParser {
                         type_offset = off;
                         continue;
                     }
+                    let underlying = Self::referenced_type(dwarf, unit, &entry, inheritance_depth)
+                        .unwrap_or_else(|| TypeInfo::UnknownType {
+                            name: "<unknown>".into(),
+                        });
                     return Some(TypeInfo::QualifiedType {
                         qualifier: crate::TypeQualifier::Const,
-                        underlying_type: Box::new(TypeInfo::UnknownType {
-                            name: "<unknown>".to_string(),
-                        }),
+                        underlying_type: Box::new(underlying),
                     });
                 }
                 DW_TAG_POINTER_TYPE => {
@@ -564,9 +594,12 @@ impl DetailedParser {
                     }
                     // Very shallow pointee name resolution: unwrap typedef/qualifiers only, without recursion
                     let mut pointee_name: Option<String> = None;
-                    if let Some(mut toff) =
-                        resolve_type_ref_in_same_unit_with_origins(dwarf, &entry, unit).ok()?
+                    if let Some(target_loc) =
+                        resolve_type_ref_with_origins(dwarf, &entry, unit).ok()?
                     {
+                        let target_unit = target_loc.unit(dwarf).ok()?;
+                        let unit = &target_unit;
+                        let mut toff = target_loc.die_off;
                         // Unwrap up to a small bound to avoid deep recursion/stack blowups on real-world code
                         for _ in 0..8 {
                             if let Ok(tentry) = unit.entry(toff) {
@@ -576,7 +609,13 @@ impl DetailedParser {
                                         // Capture typedef name as a fallback pointee name
                                         if tentry.tag() == DW_TAG_TYPEDEF {
                                             if let Some(na) = tentry.attr(DW_AT_NAME) {
-                                                if let Ok(s) = dwarf.attr_string(unit, na.value()) {
+                                                if let Ok(s) =
+                                                    crate::binary::references::unit_dwarf(
+                                                        dwarf, unit,
+                                                    )
+                                                    .ok()?
+                                                    .attr_string(unit, na.value())
+                                                {
                                                     if pointee_name.is_none() {
                                                         if let Ok(s_str) = s.to_string() {
                                                             pointee_name = Some(s_str.into_owned());
@@ -612,7 +651,11 @@ impl DetailedParser {
                                             }
                                         }
                                         let name = if let Some(na) = tentry.attr(DW_AT_NAME) {
-                                            if let Ok(s) = dwarf.attr_string(unit, na.value()) {
+                                            if let Ok(s) =
+                                                crate::binary::references::unit_dwarf(dwarf, unit)
+                                                    .ok()?
+                                                    .attr_string(unit, na.value())
+                                            {
                                                 s.to_string()
                                                     .ok()
                                                     .map(|c| c.into_owned())
@@ -637,7 +680,11 @@ impl DetailedParser {
                                         // Do NOT recursively resolve aggregates here to avoid cycles on self-referential types.
                                         // Only record the name; deref-time upgrade will use analyzer's shallow index safely.
                                         if let Some(na) = tentry.attr(DW_AT_NAME) {
-                                            if let Ok(s) = dwarf.attr_string(unit, na.value()) {
+                                            if let Ok(s) =
+                                                crate::binary::references::unit_dwarf(dwarf, unit)
+                                                    .ok()?
+                                                    .attr_string(unit, na.value())
+                                            {
                                                 if let Ok(s_str) = s.to_string() {
                                                     let n = s_str.into_owned();
                                                     pointee_name = Some(n.clone());
@@ -719,7 +766,11 @@ impl DetailedParser {
                                     // member name
                                     let mut m_name = String::new();
                                     if let Some(na) = ce.attr(DW_AT_NAME) {
-                                        if let Ok(s) = dwarf.attr_string(unit, na.value()) {
+                                        if let Ok(s) =
+                                            crate::binary::references::unit_dwarf(dwarf, unit)
+                                                .ok()?
+                                                .attr_string(unit, na.value())
+                                        {
                                             if let Ok(s_str) = s.to_string() {
                                                 m_name = s_str.into_owned();
                                             }
@@ -729,14 +780,10 @@ impl DetailedParser {
                                     let mut m_type = TypeInfo::UnknownType {
                                         name: "unknown".to_string(),
                                     };
-                                    if let Some(gimli::AttributeValue::UnitRef(toff)) =
-                                        ce.attr_value(DW_AT_TYPE)
+                                    if let Some(ti) =
+                                        Self::referenced_type(dwarf, unit, ce, inheritance_depth)
                                     {
-                                        if let Some(ti) = Self::resolve_type_shallow_at_offset_impl(
-                                            dwarf, unit, toff,
-                                        ) {
-                                            m_type = ti;
-                                        }
+                                        m_type = ti;
                                     }
                                     // member offset (simple evaluation)
                                     let mut m_offset: u64 = 0;
@@ -924,7 +971,11 @@ impl DetailedParser {
                                 if ce.tag() == gimli::DW_TAG_member {
                                     let mut m_name = String::new();
                                     if let Some(na) = ce.attr(gimli::DW_AT_name) {
-                                        if let Ok(s) = dwarf.attr_string(unit, na.value()) {
+                                        if let Ok(s) =
+                                            crate::binary::references::unit_dwarf(dwarf, unit)
+                                                .ok()?
+                                                .attr_string(unit, na.value())
+                                        {
                                             if let Ok(s_str) = s.to_string() {
                                                 m_name = s_str.into_owned();
                                             }
@@ -933,14 +984,10 @@ impl DetailedParser {
                                     let mut m_type = TypeInfo::UnknownType {
                                         name: "unknown".to_string(),
                                     };
-                                    if let Some(gimli::AttributeValue::UnitRef(toff)) =
-                                        ce.attr_value(DW_AT_TYPE)
+                                    if let Some(ti) =
+                                        Self::referenced_type(dwarf, unit, ce, inheritance_depth)
                                     {
-                                        if let Some(ti) = Self::resolve_type_shallow_at_offset_impl(
-                                            dwarf, unit, toff,
-                                        ) {
-                                            m_type = ti;
-                                        }
+                                        m_type = ti;
                                     }
                                     if m_name.is_empty() {
                                         m_name = format!("member_{}", members.len());
@@ -980,18 +1027,14 @@ impl DetailedParser {
                         encoding: gimli::constants::DW_ATE_signed.0 as u16,
                     };
                     // If DW_AT_type refers to a base type, resolve it shallowly
-                    if let Some(gimli::AttributeValue::UnitRef(toff)) = entry.attr_value(DW_AT_TYPE)
+                    if let Some(ti) = Self::referenced_type(dwarf, unit, &entry, inheritance_depth)
                     {
-                        if let Some(ti) =
-                            Self::resolve_type_shallow_at_offset_impl(dwarf, unit, toff)
-                        {
-                            // Accept only base/qualified/typedef chain base type as enum underlying type
-                            base_type = ti;
-                            // If enum size missing, use underlying base type size
-                            let bs = base_type.size();
-                            if byte_size == 0 && bs > 0 {
-                                byte_size = bs;
-                            }
+                        // Accept only base/qualified/typedef chain base type as enum underlying type
+                        base_type = ti;
+                        // If enum size missing, use underlying base type size
+                        let bs = base_type.size();
+                        if byte_size == 0 && bs > 0 {
+                            byte_size = bs;
                         }
                     }
                     let scoped = entry
@@ -1015,7 +1058,11 @@ impl DetailedParser {
                                 if ce.tag() == gimli::DW_TAG_enumerator {
                                     let mut v_name = String::new();
                                     if let Some(na) = ce.attr(gimli::DW_AT_name) {
-                                        if let Ok(s) = dwarf.attr_string(unit, na.value()) {
+                                        if let Ok(s) =
+                                            crate::binary::references::unit_dwarf(dwarf, unit)
+                                                .ok()?
+                                                .attr_string(unit, na.value())
+                                        {
                                             if let Ok(s_str) = s.to_string() {
                                                 v_name = s_str.into_owned();
                                             }
@@ -1079,9 +1126,9 @@ impl DetailedParser {
                 DW_TAG_ARRAY_TYPE => {
                     // element_type shallow + total_size if available + subrange element_count (one step deeper)
                     let mut elem_type: Option<TypeInfo> = None;
-                    if let Some(gimli::AttributeValue::UnitRef(eoff)) = entry.attr_value(DW_AT_TYPE)
+                    if let Some(ti) = Self::referenced_type(dwarf, unit, &entry, inheritance_depth)
                     {
-                        elem_type = Self::resolve_type_shallow_at_offset_impl(dwarf, unit, eoff);
+                        elem_type = Some(ti);
                     }
                     let element_type = Box::new(elem_type.unwrap_or(TypeInfo::UnknownType {
                         name: "<elem>".to_string(),
@@ -1245,7 +1292,11 @@ impl DetailedParser {
         unit: &gimli::Unit<DwarfReader>,
         dwarf: &gimli::Dwarf<DwarfReader>,
     ) -> Result<String> {
-        let mut visited_types: HashSet<gimli::UnitOffset> = HashSet::new();
+        let mut visited_types: HashSet<(
+            crate::DwarfObjectId,
+            gimli::DebugInfoOffset,
+            gimli::UnitOffset,
+        )> = HashSet::new();
         Self::resolve_type_name_rec(entry, unit, dwarf, &mut visited_types)
     }
 
@@ -1253,10 +1304,14 @@ impl DetailedParser {
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         dwarf: &gimli::Dwarf<DwarfReader>,
-        visited: &mut HashSet<gimli::UnitOffset>,
+        visited: &mut HashSet<(
+            crate::DwarfObjectId,
+            gimli::DebugInfoOffset,
+            gimli::UnitOffset,
+        )>,
     ) -> Result<String> {
         // Follow DW_AT_type if present
-        let Some(type_off) = Self::resolve_type_ref(entry, unit, dwarf)? else {
+        let Some(loc) = resolve_type_ref_with_origins(dwarf, entry, unit)? else {
             // As a fallback, try to use the entry's own name if any
             let mut name_visited = HashSet::new();
             if let Some(n) = Self::resolve_name_with_origins(entry, unit, dwarf, &mut name_visited)?
@@ -1267,11 +1322,20 @@ impl DetailedParser {
         };
 
         // Recursion guard: if we've seen this type offset already, break the cycle
-        if !visited.insert(type_off) {
+        if visited.len() >= 64 || !visited.insert((loc.object, loc.cu_off, loc.die_off)) {
             return Ok("<recursive>".to_string());
         }
 
-        let mut tree = unit.entries_tree(Some(type_off))?;
+        let target_unit;
+        let unit = if loc.object == crate::binary::references::unit_object(dwarf, unit)
+            && unit.header.debug_info_offset() == Some(loc.cu_off)
+        {
+            unit
+        } else {
+            target_unit = loc.unit(dwarf)?;
+            &target_unit
+        };
+        let mut tree = unit.entries_tree(Some(loc.die_off))?;
         let type_node = tree.root()?;
         let type_entry = type_node.entry();
 
@@ -1347,14 +1411,6 @@ impl DetailedParser {
         Ok(resolve_name_with_origins(dwarf, unit, entry)?)
     }
 
-    fn resolve_type_ref(
-        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-        unit: &gimli::Unit<DwarfReader>,
-        dwarf: &gimli::Dwarf<DwarfReader>,
-    ) -> Result<Option<gimli::UnitOffset>> {
-        resolve_type_ref_in_same_unit_with_origins(dwarf, entry, unit)
-    }
-
     // resolve_flag_with_origins and entry_pc_matches removed with variable traversal helpers
 }
 
@@ -1368,6 +1424,100 @@ impl Default for DetailedParser {
 mod tests {
     use super::*;
     use crate::core::{Availability, VariableLocation};
+
+    #[test]
+    fn local_type_names_reuse_the_supplied_unit_with_a_large_line_table() {
+        use gimli::write::{
+            AttributeValue as A, Dwarf, EndianVec, LineProgram, LineString, Sections, Unit,
+        };
+        let encoding = gimli::Encoding {
+            format: gimli::Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        };
+        let mut line = LineProgram::new(
+            encoding,
+            gimli::LineEncoding::default(),
+            LineString::String(b"/src".to_vec()),
+            None,
+            LineString::String(b"main.c".to_vec()),
+            None,
+        );
+        let directory = line.default_directory();
+        for index in 0..5_000 {
+            line.add_file(
+                LineString::String(format!("file_{index}.h").into_bytes()),
+                directory,
+                None,
+            );
+        }
+        line.begin_sequence(Some(gimli::write::Address::Constant(0x1000)));
+        line.generate_row();
+        line.end_sequence(1);
+        let mut written = Dwarf::new();
+        let id = written.units.add(Unit::new(encoding, line));
+        let unit = written.units.get_mut(id);
+        let root = unit.root();
+        let base = unit.add(root, gimli::DW_TAG_base_type);
+        unit.get_mut(base)
+            .set(gimli::DW_AT_name, A::String(b"int".to_vec()));
+        let constant = unit.add(root, gimli::DW_TAG_const_type);
+        unit.get_mut(constant)
+            .set(gimli::DW_AT_type, A::UnitRef(base));
+        let pointer = unit.add(root, gimli::DW_TAG_pointer_type);
+        unit.get_mut(pointer)
+            .set(gimli::DW_AT_type, A::UnitRef(constant));
+        for absolute in [false, true] {
+            let variable = unit.add(root, gimli::DW_TAG_variable);
+            unit.get_mut(variable)
+                .set(gimli::DW_AT_name, A::String(b"value".to_vec()));
+            unit.get_mut(variable).set(
+                gimli::DW_AT_type,
+                if absolute {
+                    A::DebugInfoRef(gimli::write::DebugInfoRef::Entry(id, pointer))
+                } else {
+                    A::UnitRef(pointer)
+                },
+            );
+        }
+        let mut sections = Sections::new(EndianVec::new(gimli::LittleEndian));
+        written.write(&mut sections).unwrap();
+        let mut dwarf = gimli::Dwarf::load(|id| {
+            Ok::<_, gimli::Error>(crate::binary::dwarf_reader_from_arc(std::sync::Arc::from(
+                sections.get(id).map_or(&[][..], |section| section.slice()),
+            )))
+        })
+        .unwrap();
+        let header = dwarf.units().next().unwrap().unwrap();
+        let unit = dwarf.unit(header).unwrap();
+        assert_eq!(
+            unit.line_program
+                .as_ref()
+                .unwrap()
+                .header()
+                .file_names()
+                .len(),
+            5_000
+        );
+        // The caller already parsed the line table. Make it unavailable for a
+        // second parse: local type-name traversal must use the supplied unit.
+        dwarf.debug_line = gimli::DebugLine::from(crate::binary::dwarf_reader_from_arc(
+            std::sync::Arc::from([]),
+        ));
+        assert!(dwarf.unit(unit.header.clone()).is_err());
+        let mut entries = unit.entries();
+        let mut variables = 0;
+        while let Some(entry) = entries.next_dfs().unwrap() {
+            if entry.tag() == gimli::DW_TAG_variable {
+                assert_eq!(
+                    DetailedParser::resolve_type_name(entry, &unit, &dwarf).unwrap(),
+                    "const int*"
+                );
+                variables += 1;
+            }
+        }
+        assert_eq!(variables, 2);
+    }
 
     #[test]
     fn parses_unsigned_discriminant_labels_and_ranges() {

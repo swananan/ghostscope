@@ -231,6 +231,7 @@ impl ModuleLoader {
                             variables,
                             types,
                             debug_info_source: module.get_debug_info_source().clone(),
+                            supplementary_debug_file: module.supplementary_debug_file.clone(),
                             dwarf_index_status: module.dwarf_index_status().clone(),
                             load_time_ms,
                             parse_time_ms,

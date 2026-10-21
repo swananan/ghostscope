@@ -25,31 +25,26 @@ fn type_loc(type_id: TypeId) -> Result<TypeLoc> {
     }
 
     Ok(TypeLoc {
+        object: type_id.cu.1,
         cu_off: debug_info_offset(type_id.cu),
         die_off: gimli::UnitOffset(
             usize::try_from(type_id.die.offset).map_err(|_| {
                 anyhow::anyhow!("type DIE offset does not fit this host: {type_id:?}")
             })?,
         ),
+        importing_cu: type_id.importing_cu,
     })
 }
 
 fn type_id_from_loc(module: ModuleId, loc: TypeLoc) -> TypeId {
-    let cu = CuId(loc.cu_off.0 as u32);
-    let die = crate::DieRef {
-        module,
-        cu,
-        offset: loc.die_off.0 as u64,
-    };
-    TypeId { module, cu, die }
+    loc.type_id(module)
 }
 
 fn qualified_type_name_from_dwarf(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
     loc: TypeLoc,
 ) -> Result<Option<String>> {
-    let header = dwarf.unit_header(loc.cu_off)?;
-    let unit = dwarf.unit(header)?;
+    let unit = loc.unit(dwarf)?;
     let mut namespaces = Vec::<(isize, String)>::new();
     let mut entries = unit.entries();
 
@@ -88,6 +83,7 @@ fn compilation_unit_metadata_from_dwarf(
     module: ModuleId,
     cu: CuId,
 ) -> Result<Option<CompilationUnitMetadata>> {
+    let dwarf = cu.1.dwarf(dwarf)?;
     let header = dwarf.unit_header(debug_info_offset(cu))?;
     let dwarf_version = header.version();
     let unit = dwarf.unit(header)?;
@@ -117,6 +113,30 @@ fn compilation_unit_metadata_from_dwarf(
     }))
 }
 
+fn type_metadata_from_dwarf(
+    dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+    current: TypeId,
+) -> Result<Option<CompilationUnitMetadata>> {
+    let Some(mut metadata) =
+        compilation_unit_metadata_from_dwarf(dwarf, current.module, current.cu)?
+    else {
+        return Ok(None);
+    };
+    if let Some(importing_cu) = current.importing_cu {
+        if metadata.language == SourceLanguage::Unknown || metadata.producer.is_none() {
+            if let Some(importer) =
+                compilation_unit_metadata_from_dwarf(dwarf, current.module, importing_cu)?
+            {
+                if metadata.language == SourceLanguage::Unknown {
+                    metadata.language = importer.language;
+                }
+                metadata.producer = metadata.producer.or(importer.producer);
+            }
+        }
+    }
+    Ok(Some(metadata))
+}
+
 fn normalize_type_loc(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
     type_name_index: &crate::index::TypeNameIndex,
@@ -124,11 +144,12 @@ fn normalize_type_loc(
 ) -> Result<Option<TypeLoc>> {
     let mut visited = HashSet::new();
     for _ in 0..MAX_TYPE_REFERENCE_DEPTH {
+        let semantic_cu = loc.semantic_cu();
         let Some(definition_loc) = resolve_type_definition_loc(dwarf, loc)? else {
             return Ok(None);
         };
-        loc = definition_loc;
-        if !visited.insert((loc.cu_off.0, loc.die_off.0)) {
+        loc = definition_loc.in_context(semantic_cu);
+        if !visited.insert((loc.object, loc.cu_off.0, loc.die_off.0)) {
             return Err(anyhow::anyhow!(
                 "cycle while resolving type DIE at {:?}:{:?}",
                 loc.cu_off,
@@ -136,8 +157,7 @@ fn normalize_type_loc(
             ));
         }
 
-        let header = dwarf.unit_header(loc.cu_off)?;
-        let unit = dwarf.unit(header)?;
+        let unit = loc.unit(dwarf)?;
         let entry = unit.entry(loc.die_off)?;
         match entry.tag() {
             gimli::DW_TAG_typedef
@@ -147,16 +167,16 @@ fn normalize_type_loc(
                 let Some(next) = resolve_type_ref_with_origins(dwarf, &entry, &unit)? else {
                     return Ok(None);
                 };
-                loc = next;
+                loc = next.in_context(semantic_cu);
             }
             gimli::DW_TAG_structure_type
             | gimli::DW_TAG_class_type
             | gimli::DW_TAG_union_type
             | gimli::DW_TAG_enumeration_type => {
-                if let Some((cu_off, die_off)) =
+                if let Some(definition) =
                     complete_aggregate_declaration_entry(dwarf, type_name_index, &unit, &entry)
                 {
-                    loc = TypeLoc { cu_off, die_off };
+                    loc = definition.in_context(semantic_cu);
                 } else {
                     return Ok(Some(loc));
                 }
@@ -190,8 +210,7 @@ fn projected_member_type_loc(
         None => return Ok(None),
     };
 
-    let header = dwarf.unit_header(aggregate_loc.cu_off)?;
-    let unit = dwarf.unit(header)?;
+    let unit = aggregate_loc.unit(dwarf)?;
     let entry = unit.entry(aggregate_loc.die_off)?;
     if pointer_like(entry.tag()) {
         let Some(target) = resolve_type_ref_with_origins(dwarf, &entry, &unit)? else {
@@ -218,7 +237,7 @@ fn projected_aggregate_member_type_loc(
     type_name_index: &crate::index::TypeNameIndex,
     loc: TypeLoc,
     field: &str,
-    visited: &HashSet<(usize, usize)>,
+    visited: &HashSet<(crate::DwarfObjectId, usize, usize)>,
     inheritance_depth: usize,
 ) -> Result<Option<TypeLoc>> {
     if inheritance_depth >= MAX_TYPE_REFERENCE_DEPTH {
@@ -228,12 +247,15 @@ fn projected_aggregate_member_type_loc(
         return Ok(None);
     };
     let mut current_path = visited.clone();
-    if !current_path.insert((aggregate_loc.cu_off.0, aggregate_loc.die_off.0)) {
+    if !current_path.insert((
+        aggregate_loc.object,
+        aggregate_loc.cu_off.0,
+        aggregate_loc.die_off.0,
+    )) {
         return Ok(None);
     }
 
-    let header = dwarf.unit_header(aggregate_loc.cu_off)?;
-    let unit = dwarf.unit(header)?;
+    let unit = aggregate_loc.unit(dwarf)?;
     let entry = unit.entry(aggregate_loc.die_off)?;
     if !matches!(
         entry.tag(),
@@ -303,8 +325,7 @@ fn variant_member_type_loc(
     let Some(aggregate_loc) = normalize_type_loc(dwarf, type_name_index, loc)? else {
         return Ok(None);
     };
-    let header = dwarf.unit_header(aggregate_loc.cu_off)?;
-    let unit = dwarf.unit(header)?;
+    let unit = aggregate_loc.unit(dwarf)?;
     let entry = unit.entry(aggregate_loc.die_off)?;
     if !matches!(
         entry.tag(),
@@ -365,8 +386,7 @@ fn projected_element_type_loc(
     let Some(base) = normalize_type_loc(dwarf, type_name_index, loc)? else {
         return Ok(None);
     };
-    let header = dwarf.unit_header(base.cu_off)?;
-    let unit = dwarf.unit(header)?;
+    let unit = base.unit(dwarf)?;
     let entry = unit.entry(base.die_off)?;
     let supported = if dereference_only {
         pointer_like(entry.tag())
@@ -388,8 +408,7 @@ fn template_type_parameter_loc(
     let Some(aggregate_loc) = normalize_type_loc(dwarf, type_name_index, loc)? else {
         return Ok(None);
     };
-    let header = dwarf.unit_header(aggregate_loc.cu_off)?;
-    let unit = dwarf.unit(header)?;
+    let unit = aggregate_loc.unit(dwarf)?;
     let entry = unit.entry(aggregate_loc.die_off)?;
     if !matches!(
         entry.tag(),
@@ -428,11 +447,10 @@ fn type_alignment_from_dwarf(
     let Some(loc) = normalize_type_loc(dwarf, type_name_index, loc)? else {
         return Ok(None);
     };
-    let header = dwarf.unit_header(loc.cu_off)?;
-    let unit = dwarf.unit(header)?;
+    let unit = loc.unit(dwarf)?;
     let entry = unit.entry(loc.die_off)?;
     Ok(
-        resolve_attr_with_unit_origins(&entry, &unit, gimli::DW_AT_alignment)?
+        resolve_attr_with_unit_origins(dwarf, &entry, &unit, gimli::DW_AT_alignment)?
             .and_then(crate::core::attr_u64),
     )
 }
@@ -460,16 +478,37 @@ fn projected_type_loc(
 }
 
 impl LoadedObjfile {
+    pub(super) fn type_language(
+        &self,
+        loc: TypeLoc,
+        unit: &gimli::Unit<crate::binary::DwarfReader>,
+    ) -> SourceLanguage {
+        let language = self.compilation_unit_language(loc.cu_off, unit);
+        if language == SourceLanguage::Unknown {
+            if let Some(importing_cu) = loc.importing_cu {
+                let offset = debug_info_offset(importing_cu);
+                if let Ok(unit) = self.unit_in(importing_cu.1, offset) {
+                    return self.compilation_unit_language(offset, &unit);
+                }
+            }
+        }
+        language
+    }
+
     pub(super) fn compilation_unit_language(
         &self,
         cu_off: gimli::DebugInfoOffset,
         unit: &gimli::Unit<crate::binary::DwarfReader>,
     ) -> SourceLanguage {
+        let key = (
+            crate::binary::references::unit_object(self.dwarf(), unit),
+            cu_off,
+        );
         if let Some(language) = self
             .compilation_unit_languages
             .read()
             .expect("compilation unit language cache lock poisoned")
-            .get(&cu_off)
+            .get(&key)
             .copied()
         {
             return language;
@@ -487,7 +526,7 @@ impl LoadedObjfile {
             .compilation_unit_languages
             .write()
             .expect("compilation unit language cache lock poisoned")
-            .entry(cu_off)
+            .entry(key)
             .or_insert(language)
     }
 
@@ -499,17 +538,25 @@ impl LoadedObjfile {
         compilation_unit_metadata_from_dwarf(self.dwarf(), module, cu)
     }
 
+    pub(crate) fn type_metadata(&self, current: TypeId) -> Result<Option<CompilationUnitMetadata>> {
+        type_metadata_from_dwarf(self.dwarf(), current)
+    }
+
     pub(crate) fn projected_type_id(
         &self,
         current: TypeId,
         segment: &VariableAccessSegment,
     ) -> Result<Option<TypeId>> {
+        let current_loc = type_loc(current)?;
         let type_name_index = self
             .type_name_index
             .read()
             .expect("type name index lock poisoned");
-        projected_type_loc(self.dwarf(), &type_name_index, type_loc(current)?, segment)
-            .map(|loc| loc.map(|loc| type_id_from_loc(current.module, loc)))
+        projected_type_loc(self.dwarf(), &type_name_index, current_loc, segment).map(|loc| {
+            loc.map(|loc| {
+                type_id_from_loc(current.module, loc.in_context(current_loc.semantic_cu()))
+            })
+        })
     }
 
     pub(crate) fn variant_member_type_id(
@@ -519,6 +566,7 @@ impl LoadedObjfile {
         variant_index: usize,
         member_index: usize,
     ) -> Result<Option<TypeId>> {
+        let current_loc = type_loc(current)?;
         let type_name_index = self
             .type_name_index
             .read()
@@ -526,12 +574,16 @@ impl LoadedObjfile {
         variant_member_type_loc(
             self.dwarf(),
             &type_name_index,
-            type_loc(current)?,
+            current_loc,
             part_index,
             variant_index,
             member_index,
         )
-        .map(|loc| loc.map(|loc| type_id_from_loc(current.module, loc)))
+        .map(|loc| {
+            loc.map(|loc| {
+                type_id_from_loc(current.module, loc.in_context(current_loc.semantic_cu()))
+            })
+        })
     }
 
     pub(crate) fn type_summary(&self, current: TypeId) -> Result<Option<crate::TypeInfo>> {
@@ -542,7 +594,7 @@ impl LoadedObjfile {
                 .expect("type name index lock poisoned");
             normalize_type_loc(self.dwarf(), &type_name_index, type_loc(current)?)?
         };
-        Ok(normalized.and_then(|loc| self.detailed_shallow_type(loc.cu_off, loc.die_off)))
+        Ok(normalized.and_then(|loc| self.detailed_shallow_type_loc(loc)))
     }
 
     pub(crate) fn qualified_type_name(&self, current: TypeId) -> Result<Option<String>> {
@@ -564,8 +616,8 @@ impl LoadedObjfile {
         let Some(parameter_loc) = parameter_loc else {
             return Ok(None);
         };
-        let Some(summary) = self.detailed_shallow_type(parameter_loc.cu_off, parameter_loc.die_off)
-        else {
+        let parameter_loc = parameter_loc.in_context(type_loc(current)?.semantic_cu());
+        let Some(summary) = self.detailed_shallow_type_loc(parameter_loc) else {
             return Ok(None);
         };
 
@@ -603,8 +655,10 @@ impl LoadedObjfile {
                 type_id_from_loc(
                     module,
                     TypeLoc {
+                        object: loc.object,
                         cu_off: loc.cu_offset,
                         die_off: loc.die_offset,
+                        importing_cu: loc.importing_cu,
                     },
                 )
             })
@@ -633,6 +687,71 @@ mod tests {
         int_array: TypeLoc,
         derived: TypeLoc,
         ambiguous_derived: TypeLoc,
+    }
+
+    #[test]
+    fn supplementary_metadata_inherits_only_missing_attributes() {
+        for language in [None, Some(gimli::DW_LANG_C11)] {
+            for producer in [None, Some("supplementary producer")] {
+                let mut primary = build_fixture();
+                let mut written = WriteDwarf::new();
+                let id = written.units.add(Unit::new(
+                    gimli::Encoding {
+                        format: Format::Dwarf32,
+                        version: 4,
+                        address_size: 8,
+                    },
+                    LineProgram::none(),
+                ));
+                let unit = written.units.get_mut(id);
+                let root = unit.root();
+                if let Some(language) = language {
+                    unit.get_mut(root).set(
+                        gimli::DW_AT_language,
+                        WriteAttributeValue::Language(language),
+                    );
+                }
+                if let Some(producer) = producer {
+                    unit.get_mut(root).set(
+                        gimli::DW_AT_producer,
+                        WriteAttributeValue::String(producer.as_bytes().to_vec()),
+                    );
+                }
+                let mut sections = Sections::new(EndianVec::new(LittleEndian));
+                written.write(&mut sections).unwrap();
+                let supplementary = gimli::Dwarf::load(|id| {
+                    Ok::<_, gimli::Error>(dwarf_reader_from_arc(Arc::from(
+                        sections.get(id).map_or(&[][..], |section| section.slice()),
+                    )))
+                })
+                .unwrap();
+                let header = supplementary.units().next().unwrap().unwrap();
+                let loc = TypeLoc {
+                    object: crate::DwarfObjectId::Supplementary,
+                    cu_off: header.debug_info_offset().unwrap(),
+                    die_off: header.root_offset(),
+                    importing_cu: Some(primary.cu),
+                };
+                primary.dwarf.set_sup(supplementary);
+                let metadata = type_metadata_from_dwarf(&primary.dwarf, loc.type_id(ModuleId(7)))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    metadata.language,
+                    if language.is_some() {
+                        SourceLanguage::C
+                    } else {
+                        SourceLanguage::Rust
+                    }
+                );
+                assert_eq!(
+                    metadata.producer.unwrap().raw,
+                    producer.unwrap_or("rustc version 1.88.0")
+                );
+                assert_eq!(metadata.dwarf_version, 4);
+                assert_eq!(metadata.cu.1, crate::DwarfObjectId::Supplementary);
+            }
+        }
     }
 
     fn build_fixture() -> Fixture {
@@ -809,6 +928,8 @@ mod tests {
         let mut entries = unit.entries();
         while let Some(entry) = entries.next_dfs().unwrap() {
             let loc = TypeLoc {
+                importing_cu: None,
+                object: crate::DwarfObjectId::Primary,
                 cu_off,
                 die_off: entry.offset(),
             };
@@ -826,7 +947,7 @@ mod tests {
         assert_eq!(classes.len(), 2);
         Fixture {
             dwarf,
-            cu: CuId(cu_off.0 as u32),
+            cu: CuId::primary(cu_off.0 as u64),
             pair: structures[0],
             generic: structures[1],
             int: int.unwrap(),
@@ -928,10 +1049,14 @@ mod tests {
         (
             dwarf,
             TypeLoc {
+                importing_cu: None,
+                object: crate::DwarfObjectId::Primary,
                 cu_off: rust_cu,
                 die_off: wrapper,
             },
             TypeLoc {
+                importing_cu: None,
+                object: crate::DwarfObjectId::Primary,
                 cu_off: c_cu,
                 die_off: int,
             },
@@ -1000,6 +1125,8 @@ mod tests {
         while let Some(entry) = entries.next_dfs().unwrap() {
             if entry.tag() == gimli::DW_TAG_structure_type {
                 strings.push(TypeLoc {
+                    importing_cu: None,
+                    object: crate::DwarfObjectId::Primary,
                     cu_off,
                     die_off: entry.offset(),
                 });
@@ -1183,7 +1310,7 @@ mod tests {
         let metadata = compilation_unit_metadata_from_dwarf(
             &dwarf,
             ModuleId(3),
-            CuId(projected.cu_off.0 as u32),
+            CuId::primary(projected.cu_off.0 as u64),
         )
         .unwrap()
         .unwrap();
