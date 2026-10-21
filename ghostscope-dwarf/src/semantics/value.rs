@@ -307,7 +307,7 @@ pub struct BTreeEdgesCapture {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HashTableBucketSource {
     /// Buckets start at a dedicated pointer projected from the descriptor.
-    Forward { data: TypeProjection },
+    Forward { data: Box<TypeProjection> },
     /// Buckets are stored immediately before the control-byte pointer.
     ReverseFromControl,
     /// Rust 1.35 stores pairs after aligned pointer-sized hash words in one
@@ -383,7 +383,7 @@ pub enum ValueCapturePlan {
         root_pointer: TypeProjection,
         root_height: TypeProjection,
         length: TypeProjection,
-        node_length: TypeProjection,
+        node_length: Box<TypeProjection>,
         keys: BTreeArrayCapture,
         values: Option<BTreeArrayCapture>,
         edges: BTreeEdgesCapture,

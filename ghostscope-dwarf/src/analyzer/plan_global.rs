@@ -131,7 +131,7 @@ impl DwarfAnalyzer {
         if let Some(cu) = prefer_cu {
             let in_scope = |(module_path, info): &(PathBuf, GlobalVariableInfo)| {
                 Self::module_paths_equivalent(module_path, prefer_module)
-                    && info.unit_offset.0 as u64 == u64::from(cu.0)
+                    && info.unit_offset.0 as u64 == cu.0
             };
             if matches.iter().any(in_scope) {
                 matches.retain(in_scope);

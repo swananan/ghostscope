@@ -385,11 +385,12 @@ mod tests {
 
     fn type_id() -> TypeId {
         TypeId {
+            importing_cu: None,
             module: ModuleId(1),
-            cu: CuId(2),
+            cu: CuId::primary(2),
             die: DieRef {
                 module: ModuleId(1),
-                cu: CuId(2),
+                cu: CuId::primary(2),
                 offset: 3,
             },
         }
@@ -453,7 +454,7 @@ mod tests {
     fn exposes_rustc_versions_only_for_rust_compilation_units() {
         let metadata = |language| CompilationUnitMetadata {
             module: ModuleId(1),
-            cu: CuId(2),
+            cu: CuId::primary(2),
             language,
             producer: Some(ProducerInfo::new("rustc version 1.88.0")),
             dwarf_version: 5,

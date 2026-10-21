@@ -25,7 +25,9 @@ pub(crate) use evaluation::{
 pub use evaluation::{
     CallerFrameRecovery, CfaResult, EntryValueCase, MemoryAccessSize, PlanExprOp,
 };
-pub use ids::{CuId, DieRef, FunctionId, InlineContextId, ModuleId, ScopeId, TypeId, VariableId};
+pub use ids::{
+    CuId, DieRef, DwarfObjectId, FunctionId, InlineContextId, ModuleId, ScopeId, TypeId, VariableId,
+};
 pub(crate) use plan::ParsedLocation;
 pub use plan::{AddressExpr, PieceLocation, VariableLocation};
 pub(crate) use symbol_names::{

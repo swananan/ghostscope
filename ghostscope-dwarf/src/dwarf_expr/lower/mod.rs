@@ -65,7 +65,7 @@ impl ExpressionEvaluator {
     ) -> Result<RawExpressionResult> {
         // Get DW_AT_location attribute (follow origins/specification for inlined/declared vars)
         let location_attr =
-            resolve_attr_with_unit_origins(entry, unit, gimli::constants::DW_AT_location)?;
+            resolve_attr_with_unit_origins(dwarf, entry, unit, gimli::constants::DW_AT_location)?;
 
         match location_attr {
             Some(gimli::AttributeValue::Exprloc(expr)) => {
@@ -138,6 +138,7 @@ impl ExpressionEvaluator {
             None => {
                 // Try DW_AT_const_value (follow origins) as a last resort
                 if let Some(cv) = resolve_attr_with_unit_origins(
+                    dwarf,
                     entry,
                     unit,
                     gimli::constants::DW_AT_const_value,

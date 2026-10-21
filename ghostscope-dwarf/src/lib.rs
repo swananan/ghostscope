@@ -39,7 +39,7 @@ pub use runtime_unwind::{
 // Re-export essential core and semantic support types.
 pub use core::{
     AddressExpr, AmbiguityReason, Availability, CallerFrameRecovery, CfaResult, CuId,
-    DebugInfoSource, DieRef, DwarfError, EntryValueCase, FunctionId, FunctionInfo,
+    DebugInfoSource, DieRef, DwarfError, DwarfObjectId, EntryValueCase, FunctionId, FunctionInfo,
     GlobalVariableInfo, HelperMode, InlineContextId, MemoryAccessSize, ModuleAddress, ModuleId,
     PieceLocation, PlanExprOp, Provenance, Result, RuntimeCapabilities, RuntimeRequirement,
     ScopeId, SectionType, SourceLocation, TargetArch, TypeId, UnsupportedReason, VariableId,

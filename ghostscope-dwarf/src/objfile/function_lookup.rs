@@ -704,9 +704,12 @@ impl LoadedObjfile {
                     }
                     saw_parameter = true;
 
-                    if let Ok(Some(value)) =
-                        resolve_attr_with_unit_origins(e, unit, gimli::constants::DW_AT_location)
-                    {
+                    if let Ok(Some(value)) = resolve_attr_with_unit_origins(
+                        dwarf,
+                        e,
+                        unit,
+                        gimli::constants::DW_AT_location,
+                    ) {
                         if Self::attribute_uses_entry_value(dwarf, unit, value, pc)? {
                             return Ok(Some(true));
                         }
@@ -896,12 +899,15 @@ impl LoadedObjfile {
     ) -> Option<String> {
         let cu_offset = gimli::DebugInfoOffset(inline_frame.concrete_die.cu.0 as usize);
         let die_offset = gimli::UnitOffset(inline_frame.concrete_die.offset as usize);
-        let linkage_name = self.unit(cu_offset).ok().and_then(|unit| {
-            let entry = unit.entry(die_offset).ok()?;
-            resolve_linkage_name_with_origins(self.dwarf(), &unit, &entry)
-                .ok()
-                .flatten()
-        });
+        let linkage_name = self
+            .unit_in(inline_frame.concrete_die.cu.1, cu_offset)
+            .ok()
+            .and_then(|unit| {
+                let entry = unit.entry(die_offset).ok()?;
+                resolve_linkage_name_with_origins(self.dwarf(), &unit, &entry)
+                    .ok()
+                    .flatten()
+            });
 
         inline_function_name_for_display(
             linkage_name.as_deref(),

@@ -153,6 +153,14 @@ Backtrace 保留 `requested_depth`、`physical_frame_count`、`raw`、`status`�
 
 ### 调试信息
 
+GhostScope 支持通过 `.gnu_debugaltlink`（GNU/dwz）或 `.debug_sup`（DWARF 5）
+关联的 DWARF 补充文件。相对路径以选定的主调试文件为基准，包括独立的 `.debug`
+文件；也会搜索 `[dwarf].debug_search_paths`。GNU 补充文件必须匹配链接中的
+Build-ID；DWARF 5 补充文件必须具有正确的文件角色，并匹配链接中提供的 checksum。
+`allow_loose_debug_match` 不会放宽这些检查。所需补充文件缺失或无效时，对应模块
+加载失败。启动报告会在主调试来源之外列出补充文件路径。目前仅支持本地查找，
+不包含通过 debuginfod 下载补充文件或 `.dwo`/`.dwp` 加载。
+
 ```bash
 # 为目标模块指定显式调试文件（覆盖自动检测）
 ghostscope -t /path/to/binary --debug-file /path/to/binary.debug

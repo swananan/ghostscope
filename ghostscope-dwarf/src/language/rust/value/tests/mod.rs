@@ -64,7 +64,7 @@ fn rust_str_type(layout: RustStrLayout<'_>) -> ResolvedType {
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language: layout.language,
             producer: None,
             dwarf_version: 5,
@@ -239,7 +239,7 @@ fn rust_nonzero_type(
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language,
             producer: None,
             dwarf_version: 5,
@@ -260,7 +260,7 @@ fn rust_cell_type(
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language,
             producer: None,
             dwarf_version: 5,
@@ -300,7 +300,7 @@ fn rust_ref_cell_type(layout: RefCellTestLayout<'_>, value_type: TypeInfo) -> Re
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language: layout.language,
             producer: None,
             dwarf_version: 5,
@@ -362,7 +362,7 @@ fn rust_ref_type(layout: RefTestLayout<'_>, value_type: TypeInfo) -> ResolvedTyp
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language: layout.language,
             producer: None,
             dwarf_version: 5,
@@ -412,7 +412,7 @@ fn rust_reference_counted_type(
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language,
             producer: None,
             dwarf_version: 5,
@@ -486,7 +486,7 @@ fn rust_reference_counted_dst_type(
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language,
             producer: None,
             dwarf_version: 5,
@@ -601,7 +601,7 @@ fn rust_hash_collection_type(
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language,
             producer: None,
             dwarf_version: 5,
@@ -697,7 +697,7 @@ fn rust_135_hash_collection_type(
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language,
             producer: None,
             dwarf_version: 4,
@@ -748,7 +748,7 @@ fn rust_btree_collection_type(
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language,
             producer: None,
             dwarf_version: 5,
@@ -767,7 +767,7 @@ fn rust_legacy_nonzero_type(
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language,
             producer: None,
             dwarf_version: 4,
@@ -840,7 +840,7 @@ fn rust_string_type(
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language,
             producer: None,
             dwarf_version: 5,
@@ -985,7 +985,7 @@ fn rust_vec_deque_type(layout: VecDequeTestLayout<'_>) -> ResolvedType {
         TypeIdentity::Unknown,
         Some(TypeOrigin {
             module: ModuleId(0),
-            cu: CuId(0),
+            cu: CuId::primary(0),
             language: SourceLanguage::Rust,
             producer: None,
             dwarf_version: 5,

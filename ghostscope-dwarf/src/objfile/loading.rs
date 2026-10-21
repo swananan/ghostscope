@@ -44,6 +44,11 @@ fn select_fallback_index(
     mapped_file: &Arc<MappedFile>,
     mut rejection: Option<String>,
 ) -> Result<(DebugParseResult, InitialIndexSelection)> {
+    if parser.has_supplementary() {
+        return parser
+            .parse_debug_info(module_path)
+            .map(|index| (index, InitialIndexSelection::FullScan { rejection }));
+    }
     if has_gdb_index {
         return Ok((
             parser.initialize_lazy_debug_info(),
@@ -251,8 +256,26 @@ impl LoadedObjfile {
             }
         };
 
+        // Resolve supplements after every primary-debug source has converged,
+        // before any parser/index observes the DWARF graph.
+        let mut dwarf = Arc::try_unwrap(dwarf).expect("DWARF is not shared before parsing");
+        let mut supplementary_debug_file = None;
+        if let Some(supplementary) =
+            crate::binary::supplementary::discover(&mapped_file_for_dwarf, debug_search_paths)?
+        {
+            supplementary_debug_file = Some(supplementary.path.display().to_string());
+            let mut supplement =
+                gimli::Dwarf::load(|id| crate::binary::supplementary::reader(&supplementary, id))?;
+            supplement.populate_abbreviations_cache(gimli::AbbreviationsCacheStrategy::All);
+            dwarf.set_sup(supplement);
+        }
+        let dwarf = Arc::new(dwarf);
         let mapped_file = mapped_file_for_dwarf;
-        let (gdb_index, gdb_index_rejection) = match Self::load_gdb_index(&mapped_file, &dwarf) {
+        let (gdb_index, gdb_index_rejection) = match if dwarf.sup().is_some() {
+            Ok(None)
+        } else {
+            Self::load_gdb_index(&mapped_file, &dwarf)
+        } {
             Ok(Some(index)) => {
                 tracing::info!(
                     "Found .gdb_index v{} with {} compilation units in {}",
@@ -297,7 +320,7 @@ impl LoadedObjfile {
                         },
                         || {
                             let parser = crate::parser::DwarfParser::new(&dwarf);
-                            match parser.parse_debug_names(&module_path) {
+                            match if dwarf.sup().is_some() { Ok(None) } else { parser.parse_debug_names(&module_path) } {
                                 Ok(Some(index)) => Ok((index, InitialIndexSelection::DebugNames)),
                                 Ok(None) => select_fallback_index(
                                     &parser,
@@ -393,11 +416,16 @@ impl LoadedObjfile {
             stats,
         } = parse_result;
         let index_started_at = Instant::now();
-        let (lightweight_index, type_name_index) = tokio::task::spawn_blocking(move || {
-            let type_name_index = TypeNameIndex::build_from_lightweight(&lightweight_index);
-            (lightweight_index, type_name_index)
-        })
-        .await?;
+        let dwarf_for_types = Arc::clone(&dwarf);
+        let (lightweight_index, type_name_index) =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let mut type_name_index = TypeNameIndex::build_from_lightweight(&lightweight_index);
+                if dwarf_for_types.sup().is_some() {
+                    type_name_index.extend_imports(&dwarf_for_types)?;
+                }
+                Ok((lightweight_index, type_name_index))
+            })
+            .await??;
         let dwarf =
             Arc::try_unwrap(dwarf).map_err(|_| anyhow::anyhow!("Failed to unwrap DWARF Arc"))?;
         let detailed_parser = DetailedParser::new();
@@ -450,6 +478,7 @@ impl LoadedObjfile {
             _dwarf_mapped_file: mapped_file,
             _binary_mapped_file: binary_mapped,
             debug_info_source,
+            supplementary_debug_file,
             entry_address,
             text_symbol_starts_by_name,
             function_ranges_cache: std::sync::RwLock::new(HashMap::new()),

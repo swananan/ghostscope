@@ -1,4 +1,7 @@
-use crate::binary::DwarfReader;
+use crate::binary::{
+    references::{unit_dwarf, unit_object},
+    DwarfReader,
+};
 use gimli::Reader;
 use std::collections::HashSet;
 
@@ -9,56 +12,49 @@ pub(crate) type ResolvedOriginEntry = (gimli::DebugInfoOffset, DwarfUnit, DwarfE
 pub(crate) type ResolvedUnitEntry = (DwarfUnit, DwarfEntry);
 
 pub(crate) fn resolve_attr_with_unit_origins(
+    dwarf: &gimli::Dwarf<DwarfReader>,
     entry: &DwarfEntry,
     unit: &DwarfUnit,
     attr: gimli::DwAt,
 ) -> gimli::read::Result<Option<gimli::AttributeValue<DwarfReader>>> {
-    if let Some(value) = entry.attr_value(attr) {
-        return Ok(Some(value));
-    }
-
-    let has_origin = entry
-        .attr_value(gimli::constants::DW_AT_abstract_origin)
-        .is_some()
-        || entry
-            .attr_value(gimli::constants::DW_AT_specification)
-            .is_some();
-    if !has_origin {
-        return Ok(None);
-    }
-
-    let mut visited = HashSet::with_capacity(4);
-    visited.insert(entry.offset());
-    resolve_attr_with_unit_origins_inner(entry, unit, attr, &mut visited)
-}
-
-pub(crate) fn resolve_attr_with_unit_origins_inner(
-    entry: &DwarfEntry,
-    unit: &DwarfUnit,
-    attr: gimli::DwAt,
-    visited: &mut HashSet<gimli::UnitOffset>,
-) -> gimli::read::Result<Option<gimli::AttributeValue<DwarfReader>>> {
-    if let Some(value) = entry.attr_value(attr) {
-        return Ok(Some(value));
-    }
-
-    for origin_attr in [
-        gimli::constants::DW_AT_abstract_origin,
-        gimli::constants::DW_AT_specification,
-    ] {
-        if let Some(gimli::AttributeValue::UnitRef(offset)) = entry.attr_value(origin_attr) {
-            if visited.insert(offset) {
-                let origin_entry = unit.entry(offset)?;
-                if let Some(value) =
-                    resolve_attr_with_unit_origins_inner(&origin_entry, unit, attr, visited)?
+    fn inner(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        entry: &DwarfEntry,
+        unit: &DwarfUnit,
+        attr: gimli::DwAt,
+        visited: &mut HashSet<(crate::DwarfObjectId, gimli::DebugInfoOffset)>,
+    ) -> gimli::read::Result<Option<gimli::AttributeValue<DwarfReader>>> {
+        if let Some(value) = entry.attr_value(attr) {
+            return Ok(Some(value));
+        }
+        let Some(absolute) = entry.offset().to_debug_info_offset(&unit.header) else {
+            return Ok(None);
+        };
+        if visited.len() >= 64 || !visited.insert((unit_object(dwarf, unit), absolute)) {
+            return Ok(None);
+        }
+        for origin_attr in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
+            if let Some(value) = entry.attr_value(origin_attr) {
+                if let Some((_, origin_unit, origin_entry)) =
+                    resolve_origin_entry(dwarf, unit, value)?
                 {
-                    return Ok(Some(value));
+                    if matches!(attr, gimli::DW_AT_location | gimli::DW_AT_frame_base)
+                        && (unit_object(dwarf, unit) != unit_object(dwarf, &origin_unit)
+                            || unit.header.offset() != origin_unit.header.offset())
+                    {
+                        // Callers evaluate location lists using the concrete unit.
+                        // Address-bearing locations cannot be moved into supplements.
+                        continue;
+                    }
+                    if let Some(value) = inner(dwarf, &origin_entry, &origin_unit, attr, visited)? {
+                        return Ok(Some(value));
+                    }
                 }
             }
         }
+        Ok(None)
     }
-
-    Ok(None)
+    inner(dwarf, entry, unit, attr, &mut HashSet::new())
 }
 
 fn resolve_debug_info_ref(
@@ -80,7 +76,7 @@ fn reload_current_unit(
     dwarf: &gimli::Dwarf<DwarfReader>,
     unit: &DwarfUnit,
 ) -> gimli::read::Result<DwarfUnit> {
-    dwarf.unit(unit.header.clone())
+    unit_dwarf(dwarf, unit)?.unit(unit.header.clone())
 }
 
 pub(crate) fn resolve_origin_entry(
@@ -104,11 +100,17 @@ pub(crate) fn resolve_origin_entry(
                 return Ok(Some((debug_info_off, origin_unit, origin_entry)));
             }
 
-            let Some((origin_unit, origin_entry)) = resolve_debug_info_ref(dwarf, debug_info_off)?
+            let Some((origin_unit, origin_entry)) =
+                resolve_debug_info_ref(unit_dwarf(dwarf, unit)?, debug_info_off)?
             else {
                 return Ok(None);
             };
             Ok(Some((debug_info_off, origin_unit, origin_entry)))
+        }
+        gimli::AttributeValue::DebugInfoRefSup(debug_info_off) => {
+            let supplementary = crate::DwarfObjectId::Supplementary.dwarf(dwarf)?;
+            Ok(resolve_debug_info_ref(supplementary, debug_info_off)?
+                .map(|(unit, entry)| (debug_info_off, unit, entry)))
         }
         _ => Ok(None),
     }
@@ -122,7 +124,7 @@ fn read_string_attr(
 ) -> gimli::read::Result<Option<String>> {
     for attr_name in attrs {
         if let Some(attr) = entry.attr(*attr_name) {
-            if let Ok(value) = dwarf.attr_string(unit, attr.value()) {
+            if let Ok(value) = unit_dwarf(dwarf, unit)?.attr_string(unit, attr.value()) {
                 if let Ok(value) = value.to_string().inspect_err(|error| {
                     tracing::debug!(
                         ?error,
@@ -149,7 +151,7 @@ fn resolve_string_attr_with_origins(
         unit: &DwarfUnit,
         entry: &DwarfEntry,
         attrs: &[gimli::DwAt],
-        visited: &mut HashSet<gimli::DebugInfoOffset>,
+        visited: &mut HashSet<(crate::DwarfObjectId, gimli::DebugInfoOffset)>,
     ) -> gimli::read::Result<Option<String>> {
         if let Some(value) = read_string_attr(dwarf, unit, entry, attrs)? {
             return Ok(Some(value));
@@ -163,7 +165,9 @@ fn resolve_string_attr_with_origins(
                 if let Some((origin_abs, origin_unit, origin_entry)) =
                     resolve_origin_entry(dwarf, unit, value)?
                 {
-                    if visited.insert(origin_abs) {
+                    if visited.len() < 64
+                        && visited.insert((unit_object(dwarf, &origin_unit), origin_abs))
+                    {
                         if let Some(value) =
                             inner(dwarf, &origin_unit, &origin_entry, attrs, visited)?
                         {
@@ -193,7 +197,7 @@ fn resolve_string_attr_with_origins(
 
     let mut visited = HashSet::with_capacity(4);
     if let Some(entry_abs) = entry.offset().to_debug_info_offset(&unit.header) {
-        visited.insert(entry_abs);
+        visited.insert((unit_object(dwarf, unit), entry_abs));
     }
     inner(dwarf, unit, entry, attrs, &mut visited)
 }

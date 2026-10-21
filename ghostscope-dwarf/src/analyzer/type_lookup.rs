@@ -645,8 +645,9 @@ mod tests {
 
     fn type_id() -> crate::TypeId {
         let module = crate::ModuleId(4);
-        let cu = crate::CuId(8);
+        let cu = crate::CuId::primary(8);
         crate::TypeId {
+            importing_cu: None,
             module,
             cu,
             die: crate::DieRef {

@@ -178,7 +178,9 @@ pub(crate) fn hash_table_value_read_plan(
             if strip_type_aliases(target_type) != strip_type_aliases(&entry_type.summary) {
                 return Ok(None);
             }
-            HashTableBucketSource::Forward { data }
+            HashTableBucketSource::Forward {
+                data: Box::new(data),
+            }
         }
         HashTableBucketLayout::ReverseFromControl => HashTableBucketSource::ReverseFromControl,
         HashTableBucketLayout::LegacyAfterControl { pointer_tag_mask } => {
@@ -487,7 +489,7 @@ impl BTreePlanner<'_> {
                 root_pointer,
                 root_height,
                 length,
-                node_length,
+                node_length: Box::new(node_length),
                 keys: BTreeArrayCapture {
                     offset: keys_offset,
                     slot_stride: key_stride,

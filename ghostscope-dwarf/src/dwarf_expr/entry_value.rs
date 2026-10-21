@@ -436,6 +436,7 @@ mod tests {
     #[test]
     fn ignores_outgoing_call_sites_in_inline_context() {
         let mut function = FunctionBlocks {
+            declaration_origins: Vec::new(),
             cu_offset: gimli::DebugInfoOffset(0),
             die_offset: gimli::UnitOffset(0),
             abs_die_offset: Some(gimli::DebugInfoOffset(0)),
@@ -502,6 +503,7 @@ mod tests {
     #[test]
     fn ignores_outgoing_call_sites_in_non_inline_context() {
         let mut function = FunctionBlocks {
+            declaration_origins: Vec::new(),
             cu_offset: gimli::DebugInfoOffset(0),
             die_offset: gimli::UnitOffset(0),
             abs_die_offset: Some(gimli::DebugInfoOffset(0)),
@@ -545,6 +547,7 @@ mod tests {
     #[test]
     fn uses_incoming_call_site_lookup_for_non_inline_functions() {
         let mut function = FunctionBlocks {
+            declaration_origins: Vec::new(),
             cu_offset: gimli::DebugInfoOffset(0),
             die_offset: gimli::UnitOffset(0),
             abs_die_offset: Some(gimli::DebugInfoOffset(0)),
@@ -566,7 +569,9 @@ mod tests {
                 cu_offset: gimli::DebugInfoOffset(1),
                 die_offset: gimli::UnitOffset(3),
                 return_pc: 0x2018,
-                call_origin: function.abs_die_offset,
+                call_origin: function
+                    .abs_die_offset
+                    .map(|offset| (crate::DwarfObjectId::Primary, offset)),
                 call_target: Some(0x1200),
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,
@@ -580,7 +585,9 @@ mod tests {
                 cu_offset: gimli::DebugInfoOffset(2),
                 die_offset: gimli::UnitOffset(4),
                 return_pc: 0x2030,
-                call_origin: function.abs_die_offset,
+                call_origin: function
+                    .abs_die_offset
+                    .map(|offset| (crate::DwarfObjectId::Primary, offset)),
                 call_target: Some(0x1200),
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,
@@ -618,6 +625,7 @@ mod tests {
     #[test]
     fn prefers_indexed_incoming_parameters_over_dwarf_scan() {
         let mut function = FunctionBlocks {
+            declaration_origins: Vec::new(),
             cu_offset: gimli::DebugInfoOffset(0),
             die_offset: gimli::UnitOffset(0),
             abs_die_offset: Some(gimli::DebugInfoOffset(0)),
@@ -639,7 +647,9 @@ mod tests {
                 cu_offset: gimli::DebugInfoOffset(1),
                 die_offset: gimli::UnitOffset(3),
                 return_pc: 0x2018,
-                call_origin: function.abs_die_offset,
+                call_origin: function
+                    .abs_die_offset
+                    .map(|offset| (crate::DwarfObjectId::Primary, offset)),
                 call_target: Some(0x1200),
                 parameters: vec![CallSiteParameter {
                     callee_register: 5,

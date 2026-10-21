@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 /// Reference to a variable DIE within a unit (minimal info)
 #[derive(Debug, Clone)]
 pub struct VarRef {
+    pub object: crate::DwarfObjectId,
     pub cu_offset: gimli::DebugInfoOffset,
     pub die_offset: gimli::UnitOffset,
 }
@@ -41,7 +42,7 @@ pub struct CallSiteRecord {
     /// Return PC immediately after the call instruction.
     pub return_pc: u64,
     /// Target callee resolved from DW_AT_call_origin when available.
-    pub call_origin: Option<gimli::DebugInfoOffset>,
+    pub call_origin: Option<(crate::DwarfObjectId, gimli::DebugInfoOffset)>,
     /// Target callee address from DW_AT_call_target when available.
     pub call_target: Option<u64>,
     /// Callee parameter bindings available at this call site.
@@ -92,6 +93,8 @@ pub struct FunctionBlocks {
     pub die_offset: gimli::UnitOffset,
     /// Absolute DIE offset for this function in .debug_info.
     pub abs_die_offset: Option<gimli::DebugInfoOffset>,
+    /// Declaration/abstract origins, including their containing object.
+    pub declaration_origins: Vec<(crate::DwarfObjectId, gimli::DebugInfoOffset)>,
     /// Function ranges
     pub ranges: Vec<(u64, u64)>,
     /// Root node is index 0
@@ -114,6 +117,7 @@ impl FunctionBlocks {
             cu_offset,
             die_offset,
             abs_die_offset: None,
+            declaration_origins: Vec::new(),
             ranges: Vec::new(),
             nodes,
             block_addr_map: BTreeMap::new(),
@@ -244,9 +248,32 @@ impl BlockIndex {
         }
 
         let mut functions_by_die = BTreeMap::new();
-        for (index, function) in self.functions.iter().enumerate() {
+        for (index, function) in self
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(_, function)| !function.ranges.is_empty())
+        {
+            for origin in &function.declaration_origins {
+                functions_by_die
+                    .entry(*origin)
+                    .and_modify(|current| {
+                        if *current != Some(index) {
+                            *current = None;
+                        }
+                    })
+                    .or_insert(Some(index));
+            }
+        }
+        for (index, function) in self
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(_, function)| !function.ranges.is_empty())
+        {
             if let Some(abs_die_offset) = function.abs_die_offset {
-                functions_by_die.insert(abs_die_offset, index);
+                functions_by_die
+                    .insert((crate::DwarfObjectId::Primary, abs_die_offset), Some(index));
             }
         }
 
@@ -258,7 +285,7 @@ impl BlockIndex {
             .filter_map(|record| {
                 let callee_index = record
                     .call_origin
-                    .and_then(|origin| functions_by_die.get(&origin).copied())
+                    .and_then(|origin| functions_by_die.get(&origin).copied().flatten())
                     .or_else(|| {
                         record
                             .call_target
@@ -300,6 +327,7 @@ impl<'a> BlockIndexBuilder<'a> {
             if entry.tag() == gimli::constants::DW_TAG_subprogram {
                 let mut fb = FunctionBlocks::new(cu_offset, entry.offset());
                 fb.abs_die_offset = entry.offset().to_debug_info_offset(&unit.header);
+                fb.declaration_origins = Self::declaration_origins(self.dwarf, &unit, entry);
                 if let Ok(ranges) = RangeExtractor::extract_all_ranges(entry, &unit, self.dwarf) {
                     fb.ranges = ranges;
                 }
@@ -332,6 +360,7 @@ impl<'a> BlockIndexBuilder<'a> {
         }
         let mut fb = FunctionBlocks::new(cu_offset, die_offset);
         fb.abs_die_offset = entry.offset().to_debug_info_offset(&unit.header);
+        fb.declaration_origins = Self::declaration_origins(self.dwarf, &unit, &entry);
         if let Ok(ranges) = RangeExtractor::extract_all_ranges(&entry, &unit, self.dwarf) {
             fb.ranges = ranges;
         }
@@ -440,6 +469,7 @@ impl<'a> BlockIndexBuilder<'a> {
                 gimli::constants::DW_TAG_formal_parameter | gimli::constants::DW_TAG_variable => {
                     // Only record DIE offsets; evaluation happens on demand
                     let v = VarRef {
+                        object: crate::binary::references::unit_object(self.dwarf, unit),
                         cu_offset: match unit.header.debug_info_offset() {
                             Some(off) => off,
                             _ => continue,
@@ -504,6 +534,10 @@ impl<'a> BlockIndexBuilder<'a> {
                                             if ce.tag() == gimli::constants::DW_TAG_formal_parameter
                                             {
                                                 let v = VarRef {
+                                                    object: crate::binary::references::unit_object(
+                                                        self.dwarf,
+                                                        &origin_unit,
+                                                    ),
                                                     cu_offset: match origin_unit
                                                         .header
                                                         .debug_info_offset()
@@ -577,18 +611,61 @@ impl<'a> BlockIndexBuilder<'a> {
         fb.call_sites.entry(return_pc).or_default().push(record);
     }
 
+    fn declaration_origins(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+    ) -> Vec<(crate::DwarfObjectId, gimli::DebugInfoOffset)> {
+        fn visit(
+            dwarf: &gimli::Dwarf<DwarfReader>,
+            unit: &gimli::Unit<DwarfReader>,
+            entry: &gimli::DebuggingInformationEntry<DwarfReader>,
+            output: &mut Vec<(crate::DwarfObjectId, gimli::DebugInfoOffset)>,
+        ) {
+            if output.len() >= 64 {
+                return;
+            }
+            for attr in [gimli::DW_AT_specification, gimli::DW_AT_abstract_origin] {
+                if let Some(value) = entry.attr_value(attr) {
+                    if let Ok(Some((offset, target, origin))) =
+                        resolve_origin_entry(dwarf, unit, value)
+                    {
+                        let key = (
+                            crate::binary::references::unit_object(dwarf, &target),
+                            offset,
+                        );
+                        if !output.contains(&key) {
+                            output.push(key);
+                            visit(dwarf, &target, &origin, output);
+                        }
+                    }
+                }
+            }
+        }
+        if dwarf.sup().is_none() {
+            return Vec::new();
+        }
+        let mut output = Vec::new();
+        visit(dwarf, unit, entry, &mut output);
+        output
+    }
+
     fn resolve_call_site_origin(
         dwarf: &gimli::Dwarf<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         entry: &gimli::DebuggingInformationEntry<DwarfReader>,
-    ) -> Option<gimli::DebugInfoOffset> {
+    ) -> Option<(crate::DwarfObjectId, gimli::DebugInfoOffset)> {
         entry
             .attr_value(gimli::constants::DW_AT_call_origin)
             .and_then(|value| {
-                resolve_origin_entry(dwarf, unit, value)
-                    .ok()
-                    .flatten()
-                    .map(|(debug_info_offset, _, _)| debug_info_offset)
+                resolve_origin_entry(dwarf, unit, value).ok().flatten().map(
+                    |(debug_info_offset, target, _)| {
+                        (
+                            crate::binary::references::unit_object(dwarf, &target),
+                            debug_info_offset,
+                        )
+                    },
+                )
             })
     }
 
@@ -629,10 +706,16 @@ impl<'a> BlockIndexBuilder<'a> {
 
     fn call_site_targets_function(
         callee: &FunctionBlocks,
-        call_origin: Option<gimli::DebugInfoOffset>,
+        call_origin: Option<(crate::DwarfObjectId, gimli::DebugInfoOffset)>,
         call_target: Option<u64>,
     ) -> bool {
-        if callee.abs_die_offset.is_some() && call_origin == callee.abs_die_offset {
+        if call_origin.is_some_and(|origin| callee.declaration_origins.contains(&origin))
+            || (callee.abs_die_offset.is_some()
+                && call_origin
+                    == callee
+                        .abs_die_offset
+                        .map(|offset| (crate::DwarfObjectId::Primary, offset)))
+        {
             return true;
         }
         call_target
@@ -1195,7 +1278,67 @@ mod tests {
             incoming[0].parameters[0].caller_value_steps,
             vec![PlanExprOp::PushConstant(42)]
         );
-        assert_eq!(incoming[0].call_origin, callee.abs_die_offset);
+        assert_eq!(
+            incoming[0].call_origin,
+            callee
+                .abs_die_offset
+                .map(|offset| (crate::DwarfObjectId::Primary, offset))
+        );
+    }
+
+    #[test]
+    fn supplementary_call_origin_links_to_its_definition_without_offset_collision() {
+        for object in [
+            crate::DwarfObjectId::Primary,
+            crate::DwarfObjectId::Supplementary,
+        ] {
+            let (dwarf, cu_offset) = build_incoming_call_site_fixture();
+            let mut functions = BlockIndexBuilder::new(&dwarf)
+                .build_for_unit(cu_offset)
+                .unwrap();
+            let collision = functions
+                .iter()
+                .find(|function| function.function_contains_pc(0x1000))
+                .unwrap()
+                .abs_die_offset
+                .unwrap();
+            let origin = (
+                object,
+                if object == crate::DwarfObjectId::Primary {
+                    gimli::DebugInfoOffset(0x9999)
+                } else {
+                    collision
+                },
+            );
+            for function in &mut functions {
+                if function.function_contains_pc(0x1200) {
+                    function.declaration_origins.push(origin);
+                }
+                for records in function.call_sites.values_mut() {
+                    for record in records {
+                        record.call_origin = Some(origin);
+                    }
+                }
+            }
+            let mut declaration = FunctionBlocks::new(cu_offset, gimli::UnitOffset(0));
+            declaration.abs_die_offset = Some(origin.1);
+            functions.push(declaration);
+            let mut index = BlockIndex::new();
+            index.add_functions(functions);
+            assert!(index
+                .find_function_by_pc(0x1000)
+                .unwrap()
+                .incoming_call_sites
+                .is_empty());
+            assert_eq!(
+                index
+                    .find_function_by_pc(0x1200)
+                    .unwrap()
+                    .incoming_call_sites[&0x1018][0]
+                    .call_origin,
+                Some(origin)
+            );
+        }
     }
 
     #[test]
@@ -1254,6 +1397,7 @@ mod tests {
             build_incoming_call_site_fixture_with_target(IncomingCallSiteTarget::CallTargetExpr);
         let builder = BlockIndexBuilder::new(&dwarf);
         let callee = FunctionBlocks {
+            declaration_origins: Vec::new(),
             cu_offset: gimli::DebugInfoOffset(1),
             die_offset: gimli::UnitOffset(0),
             abs_die_offset: None,
