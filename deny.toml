@@ -18,8 +18,7 @@ allow-wildcard-paths = true
 skip = [
     { crate = "hashbrown@0.16.1", reason = "gimli and ratatui-core currently use this alongside aya/indexmap's newer hashbrown" },
     { crate = "object@0.39.1", reason = "aya and aya-obj still use this version without the compression feature" },
-    { crate = "thiserror@1.0.69", reason = "inkwell 0.6 still depends on thiserror 1.x" },
-    { crate = "thiserror-impl@1.0.69", reason = "proc-macro companion for inkwell's thiserror 1.x dependency" },
+    { crate = "syn@2.0.117", reason = "existing proc-macro dependencies use syn 2.x alongside inkwell_internals' syn 3.x" },
 ]
 
 [licenses]
@@ -46,4 +45,3 @@ unknown-registry = "deny"
 unknown-git = "deny"
 required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/aya-rs/aya"]
