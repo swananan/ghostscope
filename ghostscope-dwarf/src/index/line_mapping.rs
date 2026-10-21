@@ -109,8 +109,7 @@ impl LineMappingTable {
         for e in entries.iter_mut() {
             // Resolve full path if missing, using scoped per-CU file index (DW_AT_comp_dir + line table)
             if e.file_path.is_empty() {
-                if let Some(full_path) =
-                    scoped.lookup_by_scoped_index(&e.compilation_unit, e.file_index)
+                if let Some(full_path) = scoped.lookup_by_scoped_index(e.unit_offset, e.file_index)
                 {
                     e.file_path = full_path;
                 }
@@ -853,6 +852,7 @@ mod tests {
             file_path: file_path.to_string(),
             file_index: 1,
             compilation_unit: Arc::from("main.c"),
+            unit_offset: gimli::DebugInfoOffset(0),
             line,
             column: 0,
             is_stmt,

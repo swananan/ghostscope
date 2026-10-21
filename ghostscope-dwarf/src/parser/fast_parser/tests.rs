@@ -19,6 +19,7 @@ fn test_line_entry(address: u64) -> LineEntry {
         file_path: "/src/main.c".to_string(),
         file_index: 1,
         compilation_unit: Arc::from("main.c"),
+        unit_offset: gimli::DebugInfoOffset(0),
         line: 10,
         column: 0,
         is_stmt: true,
@@ -173,6 +174,85 @@ fn parse_line_info_propagates_unit_header_errors() {
         err.downcast_ref::<gimli::Error>().is_some(),
         "expected gimli parse error, got: {err}"
     );
+}
+
+#[test]
+fn duplicate_and_unnamed_cus_preserve_eager_and_lazy_file_tables() {
+    for version in [4, 5] {
+        for name in [Some(b"<artificial>".as_slice()), None] {
+            let mut written = WriteDwarf::new();
+            for (source, address) in [("first.c", 0x1000), ("second.c", 0x2000)] {
+                let encoding = gimli::Encoding {
+                    format: Format::Dwarf32,
+                    version,
+                    address_size: 8,
+                };
+                let source = gimli::write::LineString::String(source.as_bytes().to_vec());
+                let mut lines = LineProgram::new(
+                    encoding,
+                    gimli::LineEncoding::default(),
+                    gimli::write::LineString::String(b"/src".to_vec()),
+                    None,
+                    source.clone(),
+                    None,
+                );
+                let file = lines.add_file(source, lines.default_directory(), None);
+                lines.begin_sequence(Some(Address::Constant(address)));
+                lines.row().file = file;
+                lines.row().line = 42;
+                lines.generate_row();
+                lines.end_sequence(16);
+                let id = written.units.add(Unit::new(encoding, lines));
+                let unit = written.units.get_mut(id);
+                let root = unit.root();
+                unit.get_mut(root).set(
+                    gimli::DW_AT_comp_dir,
+                    WriteAttributeValue::String(b"/src".to_vec()),
+                );
+                if let Some(name) = name {
+                    unit.get_mut(root).set(
+                        gimli::DW_AT_name,
+                        WriteAttributeValue::String(name.to_vec()),
+                    );
+                }
+            }
+            let dwarf = write_dwarf_to_read(written);
+            let parser = DwarfParser::new(&dwarf);
+            let eager = parser.parse_line_info("synthetic").unwrap();
+            let mut lazy = parser.parse_line_headers("synthetic").unwrap();
+            assert_eq!(eager.compilation_units.len(), 2);
+            assert_eq!(lazy.compilation_units.len(), 2);
+            let header_stats = lazy.scoped_file_manager.get_stats();
+            assert_eq!(header_stats.1, 2);
+
+            let mut offsets = lazy.compilation_units.keys().copied().collect::<Vec<_>>();
+            offsets.sort_unstable_by_key(|offset| std::cmp::Reverse(offset.0));
+            for offset in offsets {
+                let rows = parser.parse_line_info_cus("synthetic", &[offset]).unwrap();
+                lazy.line_mapping.extend(rows.line_mapping);
+                lazy.scoped_file_manager.extend(rows.scoped_file_manager);
+                lazy.compilation_units.extend(rows.compilation_units);
+            }
+            assert_eq!(lazy.compilation_units.len(), 2);
+            assert_eq!(lazy.scoped_file_manager.get_stats(), header_stats);
+            for result in [&eager, &lazy] {
+                for (source, address) in [("/src/first.c", 0x1000), ("/src/second.c", 0x2000)] {
+                    let entry = result.line_mapping.lookup_line(address).unwrap();
+                    assert_eq!(entry.file_path, source);
+                    assert_eq!(
+                        result
+                            .scoped_file_manager
+                            .lookup_by_scoped_index(entry.unit_offset, entry.file_index),
+                        Some(source.to_string()),
+                    );
+                    assert_eq!(
+                        result.line_mapping.lookup_addresses_by_path(source, 42),
+                        vec![address]
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

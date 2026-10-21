@@ -162,15 +162,11 @@ impl LightweightFileIndex {
 /// This replaces the heavy FileIndexManager with minimal memory overhead
 #[derive(Debug)]
 pub(crate) struct ScopedFileIndexManager {
-    /// Per-compilation-unit file indices: cu_name -> file_index
-    /// This is the primary lookup method, avoiding cross-CU conflicts
-    cu_file_indices: HashMap<Arc<str>, Arc<LightweightFileIndex>>,
-
-    /// String pool for compilation unit names to reduce memory
-    cu_name_pool: HashMap<String, Arc<str>>,
+    /// Per-CU file indices within one module. DW_AT_name is display metadata:
+    /// GCC LTO partitions, for example, all use the name `<artificial>`.
+    cu_file_indices: HashMap<gimli::DebugInfoOffset, Arc<LightweightFileIndex>>,
 
     /// Statistics
-    total_compilation_units: usize,
     total_files: usize,
 }
 
@@ -179,38 +175,27 @@ impl ScopedFileIndexManager {
     pub fn new() -> Self {
         Self {
             cu_file_indices: HashMap::new(),
-            cu_name_pool: HashMap::new(),
-            total_compilation_units: 0,
             total_files: 0,
         }
     }
 
     /// Add compilation unit with its file index
-    pub fn add_compilation_unit(&mut self, cu_name: String, file_index: LightweightFileIndex) {
-        // Pool the CU name to reduce memory usage
-        let pooled_cu_name = self
-            .cu_name_pool
-            .entry(cu_name.clone())
-            .or_insert_with(|| Arc::from(cu_name.as_str()))
-            .clone();
-
+    pub fn add_compilation_unit(
+        &mut self,
+        unit_offset: gimli::DebugInfoOffset,
+        file_index: LightweightFileIndex,
+    ) {
         self.total_files += file_index.total_files;
-        self.cu_file_indices
-            .insert(pooled_cu_name, Arc::new(file_index));
-        self.total_compilation_units += 1;
+        if let Some(previous) = self
+            .cu_file_indices
+            .insert(unit_offset, Arc::new(file_index))
+        {
+            self.total_files -= previous.total_files;
+        }
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
-        for (name, file_index) in other.cu_file_indices {
-            if self
-                .cu_file_indices
-                .insert(name.clone(), file_index)
-                .is_none()
-            {
-                self.total_compilation_units += 1;
-            }
-            self.cu_name_pool.entry(name.to_string()).or_insert(name);
-        }
+        self.cu_file_indices.extend(other.cu_file_indices);
         self.total_files = self
             .cu_file_indices
             .values()
@@ -224,10 +209,10 @@ impl ScopedFileIndexManager {
     /// but with minimal memory overhead
     pub fn lookup_by_scoped_index(
         &self,
-        compilation_unit: &str,
+        unit_offset: gimli::DebugInfoOffset,
         file_index: u64,
     ) -> Option<String> {
-        let file_index_ref = self.cu_file_indices.get(compilation_unit)?;
+        let file_index_ref = self.cu_file_indices.get(&unit_offset)?;
 
         let file_entry = file_index_ref.get_file_entry(file_index)?;
 
@@ -246,13 +231,16 @@ impl ScopedFileIndexManager {
     }
     /// Get statistics (total files, total compilation units)
     pub fn get_stats(&self) -> (usize, usize) {
-        (self.total_files, self.total_compilation_units)
+        (self.total_files, self.cu_file_indices.len())
     }
 
     /// Get file index for a specific compilation unit
-    pub fn get_cu_file_index(&self, compilation_unit: &str) -> Option<&LightweightFileIndex> {
+    pub fn get_cu_file_index(
+        &self,
+        unit_offset: gimli::DebugInfoOffset,
+    ) -> Option<&LightweightFileIndex> {
         self.cu_file_indices
-            .get(compilation_unit)
+            .get(&unit_offset)
             .map(|arc| arc.as_ref())
     }
 }
@@ -330,12 +318,16 @@ mod tests {
         let mut lib_index = LightweightFileIndex::new(Some("/lib".to_string()), 4);
         lib_index.add_file_entry(1, 0, "lib.c".to_string());
 
-        manager.add_compilation_unit("main.c".to_string(), main_index);
-        manager.add_compilation_unit("lib.c".to_string(), lib_index);
+        manager.add_compilation_unit(gimli::DebugInfoOffset(0), main_index);
+        manager.add_compilation_unit(gimli::DebugInfoOffset(100), lib_index);
 
         // Both should be findable without conflict
-        let main_file = manager.lookup_by_scoped_index("main.c", 1).unwrap();
-        let lib_file = manager.lookup_by_scoped_index("lib.c", 1).unwrap();
+        let main_file = manager
+            .lookup_by_scoped_index(gimli::DebugInfoOffset(0), 1)
+            .unwrap();
+        let lib_file = manager
+            .lookup_by_scoped_index(gimli::DebugInfoOffset(100), 1)
+            .unwrap();
 
         assert_eq!(main_file, "/src/main.c");
         assert_eq!(lib_file, "/lib/lib.c");

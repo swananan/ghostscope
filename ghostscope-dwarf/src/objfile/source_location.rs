@@ -118,7 +118,7 @@ impl LoadedObjfile {
         let end_addr = entry.address.saturating_add(search_range);
 
         for (addr, candidate_entry) in line_mapping.get_entries_in_range(start_addr, end_addr) {
-            if candidate_entry.compilation_unit != entry.compilation_unit {
+            if candidate_entry.unit_offset != entry.unit_offset {
                 continue;
             }
 
@@ -143,7 +143,7 @@ impl LoadedObjfile {
             .scoped_file_manager
             .read()
             .expect("scoped file index lock poisoned")
-            .get_cu_file_index(&entry.compilation_unit)
+            .get_cu_file_index(entry.unit_offset)
         {
             for file_entry in cu_file_index.file_entries() {
                 if let Some(full_path) = file_entry.get_full_path(cu_file_index) {
@@ -263,7 +263,7 @@ impl LoadedObjfile {
             .scoped_file_manager
             .read()
             .expect("scoped file index lock poisoned")
-            .lookup_by_scoped_index(&entry.compilation_unit, entry.file_index)
+            .lookup_by_scoped_index(entry.unit_offset, entry.file_index)
         {
             return Some(full_path);
         }
@@ -290,7 +290,7 @@ impl LoadedObjfile {
                 .scoped_file_manager
                 .read()
                 .expect("scoped file index lock poisoned")
-                .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
+                .lookup_by_scoped_index(line_entry.unit_offset, line_entry.file_index)
             {
                 if self.is_path_like(&resolved_full_path) {
                     tracing::debug!(
@@ -330,7 +330,7 @@ impl LoadedObjfile {
                 .scoped_file_manager
                 .read()
                 .expect("scoped file index lock poisoned")
-                .lookup_by_scoped_index(&line_entry.compilation_unit, line_entry.file_index)
+                .lookup_by_scoped_index(line_entry.unit_offset, line_entry.file_index)
                 .unwrap_or_else(|| line_entry.file_path.clone());
 
             tracing::debug!(
@@ -340,9 +340,10 @@ impl LoadedObjfile {
 
             if self.is_path_like(&current_path) {
                 if self.is_header_file(&current_path) {
-                    if let Some(alternative_path) =
-                        self.find_main_source_file_in_cu(&line_entry.compilation_unit)
-                    {
+                    if let Some(alternative_path) = self.find_main_source_file_in_cu(
+                        line_entry.unit_offset,
+                        &line_entry.compilation_unit,
+                    ) {
                         tracing::debug!(
                             "create_source_location_from_entry: replaced header '{}' with main source '{}'",
                             current_path, alternative_path
@@ -396,12 +397,16 @@ impl LoadedObjfile {
             || file_path.contains("/usr/include/")
     }
 
-    fn find_main_source_file_in_cu(&self, compilation_unit: &str) -> Option<String> {
+    fn find_main_source_file_in_cu(
+        &self,
+        unit_offset: gimli::DebugInfoOffset,
+        compilation_unit: &str,
+    ) -> Option<String> {
         let scoped_file_manager = self
             .scoped_file_manager
             .read()
             .expect("scoped file index lock poisoned");
-        if let Some(cu_file_index) = scoped_file_manager.get_cu_file_index(compilation_unit) {
+        if let Some(cu_file_index) = scoped_file_manager.get_cu_file_index(unit_offset) {
             tracing::debug!(
                 "find_main_source_file_in_cu: searching for main source file in CU '{}'",
                 compilation_unit

@@ -148,7 +148,9 @@ pub struct LineEntry {
     pub end_address: Option<u64>,
     pub file_path: String, // Full file path for direct lookup
     pub file_index: u64,   // Original DWARF file index (kept for compatibility)
-    pub compilation_unit: std::sync::Arc<str>, // Pooled CU name to reduce duplication
+    /// Owning CU within this module's .debug_info; names need not be unique.
+    pub unit_offset: gimli::DebugInfoOffset,
+    pub compilation_unit: std::sync::Arc<str>, // CU name for display and source selection
     pub line: u64,
     pub column: u64,
     pub is_stmt: bool,
