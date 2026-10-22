@@ -3322,6 +3322,42 @@ trace do_stuff {
 }
 
 #[tokio::test]
+async fn test_qualified_function_trace_rust() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_rust_global_program().await?;
+    let script = r#"
+trace rust_global_program::math::do_stuff {
+    print "RUST_QUALIFIED";
+}
+trace "rust_global_program::math::do_stuff" {
+    print "RUST_QUOTED";
+}
+"#;
+
+    // Allow both trace targets to resolve while the full Rust suite loads DWARF.
+    let result = common::runner::GhostscopeRunner::new()
+        .with_script(script)
+        .attach_to(&target)
+        .startup_timeout_secs(60)
+        .timeout_secs(9)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await;
+    target.terminate().await?;
+    let (exit_code, stdout, stderr) = result?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    for marker in ["RUST_QUALIFIED", "RUST_QUOTED"] {
+        assert!(
+            stdout.contains(marker),
+            "Expected {marker} output. STDOUT: {stdout}\nSTDERR: {stderr}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_rust_script_print_globals() -> anyhow::Result<()> {
     init();
 

@@ -289,13 +289,21 @@ fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
             Ok(TracePattern::Wildcard(pattern))
         }
         Rule::function_name => {
-            let func_name = inner
+            let name = inner
                 .into_inner()
                 .next()
-                .ok_or(ParseError::InvalidExpression)?
-                .as_str()
-                .to_string();
-            Ok(TracePattern::FunctionName(func_name))
+                .ok_or(ParseError::InvalidExpression)?;
+            let func_name = if name.as_rule() == Rule::string {
+                &name.as_str()[1..name.as_str().len() - 1]
+            } else {
+                name.as_str()
+            };
+            if func_name.is_empty() {
+                return Err(ParseError::SyntaxError(
+                    "Function trace target cannot be empty".to_string(),
+                ));
+            }
+            Ok(TracePattern::FunctionName(func_name.to_string()))
         }
         Rule::source_line => {
             let mut parts = inner.into_inner();
