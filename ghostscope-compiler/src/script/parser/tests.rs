@@ -1,5 +1,5 @@
 use super::{parse, ParseError};
-use crate::script::ast::{BinaryOp, Expr, PrintStatement, Statement};
+use crate::script::ast::{BinaryOp, Expr, PrintStatement, Statement, TracePattern};
 
 #[test]
 fn parse_memcmp_builtin_in_if_should_succeed() {
@@ -621,6 +621,59 @@ trace foo {
 "#;
     let r = parse(script);
     assert!(r.is_ok(), "parse failed: {:?}", r.err());
+}
+
+#[test]
+fn parse_qualified_function_trace_targets() {
+    for name in [
+        "ns1::Foo::bar",
+        "rust_global_program::math::do_stuff",
+        "_module::__probe",
+    ] {
+        let program = parse(&format!("trace {name} {{ print \"hit\"; }}"))
+            .unwrap_or_else(|error| panic!("failed to parse {name}: {error}"));
+        assert!(matches!(
+            &program.statements[0],
+            Statement::TracePoint { pattern: TracePattern::FunctionName(actual), body }
+                if actual == name && body.len() == 1
+        ));
+    }
+}
+
+#[test]
+fn parse_quoted_function_trace_targets_preserves_symbol_text() {
+    for name in [
+        "ns1::Foo::bar(int)",
+        "ns1::add(double, double)",
+        "ns::Box<ns::Item>::get() const",
+        "test[123abc]::main",
+        "<example::Type as example::Trait>::method",
+    ] {
+        let program = parse(&format!("trace \"{name}\" {{ print \"hit\"; }}"))
+            .unwrap_or_else(|error| panic!("failed to parse {name}: {error}"));
+        assert!(matches!(
+            &program.statements[0],
+            Statement::TracePoint { pattern: TracePattern::FunctionName(actual), body }
+                if actual == name && body.len() == 1
+        ));
+    }
+}
+
+#[test]
+fn parse_qualified_trace_targets_rejects_malformed_paths_and_variable_names() {
+    for script in [
+        "trace ns:::probe {}",
+        "trace ns:: {}",
+        "trace ns::123 {}",
+        "trace ns:probe {}",
+        "trace ns ::probe {}",
+        "trace ns:: probe {}",
+        "trace \"\" {}",
+        "trace main { let ns::value = 1; }",
+        "trace main { print ns::value; }",
+    ] {
+        assert!(parse(script).is_err(), "unexpectedly accepted {script}");
+    }
 }
 
 #[test]

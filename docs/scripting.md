@@ -78,7 +78,21 @@ trace main {
 trace calculate_something {
     print "Calculating...";
 }
+
+// Qualified C++ or Rust names
+trace rust_global_program::math::do_stuff {
+    print "Qualified function called";
+}
+
+// In script files, quote names containing parameters, templates, spaces,
+// or Rust symbol hashes/disambiguators.
+trace "ns1::Foo::bar(int)" {
+    print "C++ method called";
+}
 ```
+
+Qualified names use `::` between identifiers. Quoted function names are passed
+to symbol lookup without the surrounding quotes, preserving all other characters.
 
 #### Source Line
 ```ghostscope

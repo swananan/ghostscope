@@ -216,6 +216,34 @@ trace {}:{CPP_AMBIGUOUS_INHERITED_MEMBER_TRACE_LINE} {{
 }
 
 #[tokio::test]
+async fn test_qualified_function_trace_cpp() -> anyhow::Result<()> {
+    init();
+
+    let target = spawn_cpp_complex_program().await?;
+    let script = r#"
+trace ns1::nested_member_probe {
+    print "CPP_QUALIFIED";
+}
+trace "ns1::Foo::bar(int)" {
+    print "CPP_SIGNATURE";
+}
+"#;
+
+    let result = run_ghostscope_with_script_for_target(script, 4, &target).await;
+    target.terminate().await?;
+    let (exit_code, stdout, stderr) = result?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    for marker in ["CPP_QUALIFIED", "CPP_SIGNATURE"] {
+        assert!(
+            stdout.contains(marker),
+            "Expected {marker} output. STDOUT: {stdout}\nSTDERR: {stderr}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_cpp_script_print_globals() -> anyhow::Result<()> {
     init();
 
