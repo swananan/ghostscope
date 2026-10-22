@@ -8,7 +8,7 @@
 
   <p>
     <img src="https://img.shields.io/badge/version-0.1.6-blue.svg" alt="Version"/>
-    <img src="https://img.shields.io/badge/license-GPL-green.svg" alt="License"/>
+    <img src="https://img.shields.io/badge/license-GPL--3.0--only%20OR%20MIT-green.svg" alt="License: GPL-3.0-only OR MIT"/>
     <img src="https://img.shields.io/badge/Linux-4.4+-orange.svg" alt="Linux 4.4+"/>
     <img src="https://img.shields.io/badge/Rust-1.98.0-red.svg" alt="Rust 1.98.0"/>
   </p>
@@ -284,7 +284,11 @@ Please see our [Contributing Guide](docs/contributing.md) for:
 
 ## 📜 License
 
-GhostScope is licensed under the [GNU General Public License](LICENSE).
+GhostScope is dual-licensed under the [GNU General Public License, version 3 only](LICENSE-GPL)
+or the [MIT License](LICENSE-MIT), at your option (`GPL-3.0-only OR MIT`).
+
+Third-party components retain their respective licenses. GPL-compatible declarations
+for loading eBPF programs into the Linux kernel are retained; see [LICENSE](LICENSE).
 
 ## 🙏 Acknowledgements
 

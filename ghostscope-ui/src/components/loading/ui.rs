@@ -155,7 +155,7 @@ impl LoadingUI {
 
         // License
         let license_line = Line::from(Span::styled(
-            "Licensed under GPL License",
+            "Licensed under GPL-3.0-only OR MIT",
             Style::default().fg(Color::Gray),
         ));
         let license_paragraph = Paragraph::new(license_line).alignment(Alignment::Center);
@@ -213,7 +213,7 @@ impl LoadingUI {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                "Licensed under GPL",
+                "Licensed under GPL-3.0-only OR MIT",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),

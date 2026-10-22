@@ -48,3 +48,10 @@ git commit -m "docs: update installation instructions"
 ## Development Setup
 
 Please refer to the [Development Guide](development.md) for setting up your development environment.
+
+## Licensing
+
+By submitting a contribution for inclusion in GhostScope, you agree to license it
+under both [GPL-3.0-only](../LICENSE-GPL) and [MIT](../LICENSE-MIT), allowing recipients
+to choose either license (`GPL-3.0-only OR MIT`). If you cannot grant both licenses,
+please discuss this with the maintainers before submitting the contribution.

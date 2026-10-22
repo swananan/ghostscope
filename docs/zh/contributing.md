@@ -48,3 +48,9 @@ git commit -m "docs: update installation instructions"
 ## 开发环境设置
 
 请参考[开发指南](development.md)了解如何设置开发环境。
+
+## 贡献许可
+
+提交贡献供 GhostScope 收录，即表示您同意同时以 [GPL-3.0-only](../../LICENSE-GPL) 和
+[MIT](../../LICENSE-MIT) 授权该贡献，让接收者可以任选其一（`GPL-3.0-only OR MIT`）。
+如果您无法授予这两种许可，请在提交前与维护者讨论。
