@@ -8,7 +8,7 @@
 
   <p>
     <img src="https://img.shields.io/badge/版本-0.1.6-blue.svg" alt="版本"/>
-    <img src="https://img.shields.io/badge/协议-GPL-green.svg" alt="协议"/>
+    <img src="https://img.shields.io/badge/协议-GPL--3.0--only%20OR%20MIT-green.svg" alt="协议：GPL-3.0-only OR MIT"/>
     <img src="https://img.shields.io/badge/Linux-4.4+-orange.svg" alt="Linux 4.4+"/>
     <img src="https://img.shields.io/badge/Rust-1.98.0-red.svg" alt="Rust 1.98.0"/>
   </p>
@@ -279,7 +279,11 @@ GhostScope 把编译后的二进制重新变成“可观测系统”。在 TUI �
 
 ## 📜 许可证
 
-GhostScope 采用 [GNU 通用公共许可证](LICENSE) 授权。
+GhostScope 采用 [GNU 通用公共许可证第 3 版（仅此版本）](LICENSE-GPL) 或
+[MIT 许可证](LICENSE-MIT) 双重授权，使用者可以任选其一（`GPL-3.0-only OR MIT`）。
+
+第三方组件仍遵循各自的许可证。向 Linux 内核加载 eBPF 程序所需的 GPL 兼容声明予以保留，
+详见 [LICENSE](LICENSE)。
 
 ## 🙏 致谢
 
