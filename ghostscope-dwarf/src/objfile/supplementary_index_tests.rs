@@ -142,3 +142,117 @@ async fn supplementary_rejected_accelerator_falls_back_to_working_dwarf() -> any
     assert_eq!(ty.size(), 8);
     Ok(())
 }
+
+#[tokio::test]
+async fn cross_cu_declarations_load_definitions_only_when_projected() -> anyhow::Result<()> {
+    use crate::{semantics::resolve_type_ref_with_origins, ModuleId, VariableAccessSegment};
+    for index in [
+        Index::GnuPubNames,
+        Index::Gdb,
+        Index::DebugNames,
+        Index::GdbDebugNames,
+    ] {
+        for standard in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let fixture = build_cross_cu_fixture(dir.path(), standard)?;
+            indexes::add_index(&fixture.binary, index)?;
+            for segment in [
+                VariableAccessSegment::Dereference,
+                VariableAccessSegment::Field("second".into()),
+            ] {
+                let module = LoadedObjfile::load_parallel(
+                    ModuleMapping::from_path(fixture.binary.clone()),
+                    &[],
+                    false,
+                    None,
+                    None,
+                )
+                .await?;
+                assert!(
+                    module.lazy_debug_info,
+                    "{index:?}: {:?}",
+                    module.dwarf_index_status
+                );
+                assert!(module.indexed_debug_info_cus.lock().unwrap().is_empty());
+                let pointer = module.find_global_variables_by_name("pointer").remove(0);
+                assert_eq!(module.indexed_debug_info_cus.lock().unwrap().len(), 1);
+                let unit = module.unit(pointer.unit_offset)?;
+                let entry = unit.entry(pointer.die_offset)?;
+                let pointer_type = resolve_type_ref_with_origins(module.dwarf(), &entry, &unit)?
+                    .unwrap()
+                    .type_id(ModuleId(0));
+                let projected = module.projected_type_id(pointer_type, &segment)?.unwrap();
+                let summary = module.type_summary(projected)?.unwrap();
+                assert_eq!(
+                    summary.size(),
+                    if segment == VariableAccessSegment::Dereference {
+                        16
+                    } else {
+                        8
+                    },
+                    "{index:?}, {segment:?}"
+                );
+                assert_eq!(
+                    module.indexed_debug_info_cus.lock().unwrap().len(),
+                    2,
+                    "unrelated CU must remain lazy: {index:?}"
+                );
+                if segment == VariableAccessSegment::Dereference {
+                    assert_eq!(module.type_alignment(projected)?, Some(16));
+                }
+                let opaque = module.find_global_variables_by_name("opaque").remove(0);
+                let entry = unit.entry(opaque.die_offset)?;
+                let opaque_type = resolve_type_ref_with_origins(module.dwarf(), &entry, &unit)?
+                    .unwrap()
+                    .type_id(ModuleId(0));
+                let opaque = module
+                    .projected_type_id(opaque_type, &VariableAccessSegment::Dereference)?
+                    .unwrap();
+                assert_eq!(module.type_summary(opaque)?.unwrap().size(), 0);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_cross_cu_fixture(
+    dir: &std::path::Path,
+    standard: bool,
+) -> anyhow::Result<fixture::Fixture> {
+    use object::{Object, ObjectSection};
+    use std::process::Command;
+    let run = |command: &mut Command| -> anyhow::Result<()> {
+        let output = command.output()?;
+        anyhow::ensure!(output.status.success(), "{command:?}: {output:?}");
+        Ok(())
+    };
+    let fixture = fixture::build(dir, standard, false)?;
+    let data = std::fs::read(&fixture.binary)?;
+    let object = object::File::parse(data.as_slice())?;
+    let section_name = if standard {
+        ".debug_sup"
+    } else {
+        ".gnu_debugaltlink"
+    };
+    let link = dir.join("cross-cu-link");
+    std::fs::write(&link, object.section_by_name(section_name).unwrap().data()?)?;
+    let main = dir.join("cross-main.c");
+    let definition = dir.join("cross-definition.c");
+    let unrelated = dir.join("cross-unrelated.c");
+    std::fs::write(&main, "struct Cross; typedef const struct Cross CrossAlias; extern struct Cross instance; CrossAlias *pointer = &instance; struct Opaque *opaque; int main(void) { return pointer != 0; }\n")?;
+    std::fs::write(&definition, "struct __attribute__((aligned(16))) Cross { int first; long second; }; struct Cross instance = {17, 23};\n")?;
+    std::fs::write(
+        &unrelated,
+        "struct Unrelated { long value; }; struct Unrelated unrelated;\n",
+    )?;
+    run(Command::new("cc")
+        .args(["-g", "-gdwarf-4", "-O0", "-no-pie", "-o"])
+        .arg(&fixture.binary)
+        .arg(main)
+        .arg(definition)
+        .arg(unrelated))?;
+    run(Command::new("objcopy")
+        .arg(format!("--add-section={section_name}={}", link.display()))
+        .arg(&fixture.binary))?;
+    Ok(fixture)
+}

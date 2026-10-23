@@ -355,3 +355,100 @@ async fn real_dwz_rust_types_keep_tuple_access_and_value_adapters() -> anyhow::R
     }
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires dwz and gdb-add-index; set GHOSTSCOPE_DWZ to its executable path"]
+async fn real_dwz_indexed_pointer_resolves_cross_cu_definition() -> anyhow::Result<()> {
+    use std::process::Command;
+    let dir = tempfile::tempdir()?;
+    let source = |name: &str, text: &str| -> anyhow::Result<std::path::PathBuf> {
+        let path = dir.path().join(name);
+        std::fs::write(&path, text)?;
+        Ok(path)
+    };
+    let main = source("main.c", "struct Cross; extern struct Cross instance; struct Cross *pointer = &instance; int shared_value(void); int main(void) { return shared_value() + (pointer != 0); }\n")?;
+    let definition = source(
+        "definition.c",
+        "struct Cross { int first; long second; }; struct Cross instance = {17, 23};\n",
+    )?;
+    let peer_definition = source("peer.c", "long instance[2] = {17, 23};\n")?;
+    let common = source("common.c", "struct Shared { int first; int second; }; struct Shared shared = {1, 2}; int shared_value(void) { return shared.first; }\n")?;
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    for (binary, definition) in [(&first, &definition), (&second, &peer_definition)] {
+        let output = Command::new("cc")
+            .args(["-g", "-gdwarf-4", "-O0", "-no-pie", "-o"])
+            .arg(binary)
+            .arg(&main)
+            .arg(definition)
+            .arg(&common)
+            .output()?;
+        anyhow::ensure!(output.status.success(), "cc: {output:?}");
+    }
+    let dwz = std::env::var_os("GHOSTSCOPE_DWZ").unwrap_or_else(|| "dwz".into());
+    let output = Command::new(dwz)
+        .arg("-r")
+        .arg("-m")
+        .arg(dir.path().join("shared.debug"))
+        .arg(&first)
+        .arg(&second)
+        .output()?;
+    anyhow::ensure!(output.status.success(), "dwz: {output:?}");
+    let binary_bytes = std::fs::read(&first)?;
+    let shared = dir.path().join("shared.debug");
+    let shared_bytes = std::fs::read(&shared)?;
+    for kind in ["full-scan", "gdb-index", "debug-names"] {
+        std::fs::write(&first, &binary_bytes)?;
+        std::fs::write(&shared, &shared_bytes)?;
+        if kind != "full-scan" {
+            let mut command = Command::new("gdb-add-index");
+            if kind == "debug-names" {
+                command.arg("-dwarf-5");
+            }
+            let output = command.arg(&first).current_dir(dir.path()).output()?;
+            anyhow::ensure!(output.status.success(), "gdb-add-index: {output:?}");
+        }
+        let selected = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed = std::sync::Arc::clone(&selected);
+        let analyzer = DwarfAnalyzer::from_exec_path_with_config_and_progress(
+            &first,
+            &[],
+            false,
+            move |event| {
+                if let ghostscope_dwarf::ModuleLoadingEvent::LoadingCompleted { stats, .. } = event
+                {
+                    assert!(stats.supplementary_debug_file.is_some());
+                    *observed.lock().unwrap() = Some(stats.dwarf_index_status);
+                }
+            },
+        )
+        .await?;
+        let selected = selected.lock().unwrap().clone().unwrap();
+        assert!(
+            match &selected {
+                ghostscope_dwarf::DwarfIndexStatus::FullScan => kind == "full-scan",
+                ghostscope_dwarf::DwarfIndexStatus::GdbIndex { .. } => kind == "gdb-index",
+                ghostscope_dwarf::DwarfIndexStatus::DebugNames => kind == "debug-names",
+                _ => false,
+            },
+            "{kind}: {selected:?}"
+        );
+        let (_, plan) = analyzer
+            .plan_global_access_read_plan(&first, "pointer", &VariableAccessPath::default())?
+            .unwrap();
+        let pointer = analyzer.resolved_type_for_plan(&plan)?.unwrap();
+        let projected = analyzer.project_resolved_type(
+            &pointer,
+            &VariableAccessSegment::Dereference,
+            Some(&first),
+        )?;
+        assert_eq!(projected.resolved_type.summary.size(), 16, "{kind}");
+        let member = analyzer.project_resolved_type(
+            &projected.resolved_type,
+            &VariableAccessSegment::Field("second".into()),
+            Some(&first),
+        )?;
+        assert_eq!(member.resolved_type.summary.size(), 8, "{kind}");
+    }
+    Ok(())
+}

@@ -225,6 +225,16 @@ impl TypeNameIndex {
         offsets
     }
 
+    pub(crate) fn aggregate_definitions<'a>(
+        &'a self,
+        name: &'a str,
+        tag: DwTag,
+    ) -> impl Iterator<Item = TypeLoc> + 'a {
+        self.candidates(name)
+            .filter(move |candidate| candidate.tag == tag && !candidate.is_declaration)
+            .copied()
+    }
+
     /// Find an aggregate definition by name and tag, preferring non-declarations
     pub fn find_aggregate_definition(&self, name: &str, tag: DwTag) -> Option<TypeLoc> {
         // First pass: non-declarations
