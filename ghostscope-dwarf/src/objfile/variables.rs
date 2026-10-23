@@ -484,9 +484,8 @@ impl LoadedObjfile {
         let resolve_materialized = || -> Option<(crate::TypeInfo, TypeLoc)> {
             for &tag in tags {
                 let loc = self
-                    .type_name_index
-                    .read()
-                    .expect("type name index lock poisoned")
+                    .type_name_index()
+                    .ok()?
                     .find_aggregate_definition(name, tag);
                 if let Some(loc) = loc {
                     let ty = self.detailed_shallow_type_loc(TypeLoc {
@@ -507,11 +506,7 @@ impl LoadedObjfile {
                 }
             }
 
-            let typedef = self
-                .type_name_index
-                .read()
-                .expect("type name index lock poisoned")
-                .find_typedef(name);
+            let typedef = self.type_name_index().ok()?.find_typedef(name);
             if let Some(td) = typedef {
                 let dwarf = self.dwarf();
                 if let Ok(unit) = self.unit_in(td.object, td.cu_offset) {
@@ -542,13 +537,13 @@ impl LoadedObjfile {
         };
 
         let resolved = resolve_materialized();
-        if resolved.is_some() || !self.uses_gnu_pub_index() {
+        if resolved.is_some() || !self.uses_cu_name_index() {
             return resolved;
         }
 
-        if let Err(error) = self.ensure_all_debug_info_for_gnu_index() {
+        if let Err(error) = self.ensure_all_debug_info_for_name_index() {
             tracing::warn!(
-                "Failed to exhaust GNU-indexed DWARF for type '{}' in {}: {}",
+                "Failed to exhaust name-indexed DWARF for type '{}' in {}: {}",
                 name,
                 self.module_path().display(),
                 error
@@ -868,10 +863,7 @@ impl LoadedObjfile {
         let entry = unit.entry(die_off).ok()?;
         let definition = complete_aggregate_declaration_entry(
             dwarf,
-            &self
-                .type_name_index
-                .read()
-                .expect("type name index lock poisoned"),
+            &*self.type_name_index().ok()?,
             &unit,
             &entry,
         );

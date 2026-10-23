@@ -6,21 +6,20 @@ use std::collections::HashMap;
 
 type SymbolsByName = HashMap<String, Vec<gimli::DebugInfoOffset>>;
 
-/// Lossy GNU pubnames accelerator used only to select compilation units.
+/// Name accelerator used only to select compilation units.
 ///
-/// GNU pubnames/pubtypes entries do not carry enough information to serve as
-/// cooked query results: compilers may omit local names, collapse overloads,
-/// and expose only a coarse symbol kind. Keep them separate from the
-/// materialized DWARF index and use them solely to decide which units to parse.
+/// GNU pubnames can omit local names and collapse overloads. GDB2 debug_names
+/// can attribute imported DIEs to a containing CU in a different object. Neither
+/// is a cooked query result: materialize the selected CUs before querying DWARF.
 #[derive(Debug, Default)]
-pub(crate) struct GnuPubIndex {
+pub(crate) struct CuNameIndex {
     functions: SymbolsByName,
     variables: SymbolsByName,
     types: SymbolsByName,
     all_unit_offsets: Vec<gimli::DebugInfoOffset>,
 }
 
-impl GnuPubIndex {
+impl CuNameIndex {
     pub(crate) fn new(mut all_unit_offsets: Vec<gimli::DebugInfoOffset>) -> Self {
         all_unit_offsets.sort_unstable_by_key(|offset| offset.0);
         all_unit_offsets.dedup();
@@ -102,7 +101,7 @@ mod tests {
     #[test]
     fn qualified_template_leaf_selects_its_compilation_unit() {
         let expected = gimli::DebugInfoOffset(0x20);
-        let mut index = GnuPubIndex::new(vec![expected]);
+        let mut index = CuNameIndex::new(vec![expected]);
         index.insert(
             "ns2::Box<ns1::Inner>".to_string(),
             expected,

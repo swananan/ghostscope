@@ -4,7 +4,7 @@ use crate::{
     binary::{dwarf_reader_from_arc_with_endian, DwarfReader},
     core::{FunctionDieKind, IndexEntry, LineEntry, Result},
     index::{
-        directory_from_index, resolve_file_path, GdbSymbolKind, GnuPubIndex, LightweightFileIndex,
+        directory_from_index, resolve_file_path, CuNameIndex, GdbSymbolKind, LightweightFileIndex,
         LightweightIndex, LightweightIndexShard, LineMappingTable, ScopedFileIndexManager,
     },
 };
@@ -296,9 +296,6 @@ pub(crate) struct DwarfParser<'a> {
 
 /// Internal builder for accumulating parse results
 impl<'a> DwarfParser<'a> {
-    pub(crate) fn has_supplementary(&self) -> bool {
-        self.dwarf.sup().is_some()
-    }
     fn process_unit_shard(
         &self,
         unit: &gimli::Unit<DwarfReader>,
@@ -1546,9 +1543,14 @@ impl<'a> DwarfParser<'a> {
     }
 
     /// Parse debug_info sections (for parallel processing)
-    pub(crate) fn parse_debug_names(&self, module_path: &str) -> Result<Option<DebugParseResult>> {
+    pub(crate) fn parse_debug_names(
+        &self,
+        module_path: &str,
+    ) -> Result<Option<(DebugParseResult, Option<CuNameIndex>)>> {
         debug!("Starting .debug_names parsing for: {}", module_path);
         let debug_names = self.compatible_debug_names()?;
+        let mut cu_names = None;
+        let mut primary_units = HashSet::new();
         let mut headers = debug_names.headers();
         let mut shards = Vec::new();
         let mut saw_index = false;
@@ -1557,6 +1559,20 @@ impl<'a> DwarfParser<'a> {
             saw_index = true;
             let gdb2 = is_gdb2_name_index(&header)?;
             let names = header.index()?;
+            // GDB attributes partial-unit definitions to the outer importing CU,
+            // while DW_IDX_die_offset still belongs to the defining object.
+            // Use these entries as CU hints, never as primary-file DIE locations.
+            // https://sourceware.org/gdb/current/onlinedocs/gdb.html/Debug-Names.html
+            let imported_gdb_names = gdb2 && self.dwarf.sup().is_some();
+            if imported_gdb_names && cu_names.is_none() {
+                let mut units = self.dwarf.units();
+                while let Some(unit) = units.next()? {
+                    if let Some(offset) = unit.debug_info_offset() {
+                        primary_units.insert(offset);
+                    }
+                }
+                cu_names = Some(CuNameIndex::new(primary_units.iter().copied().collect()));
+            }
             let mut shard = LightweightIndexShard::default();
 
             for name_index in names.names() {
@@ -1582,6 +1598,29 @@ impl<'a> DwarfParser<'a> {
                     let Some(die_offset) = entry.die_offset()? else {
                         continue;
                     };
+                    if imported_gdb_names {
+                        anyhow::ensure!(
+                            primary_units.contains(&unit_offset),
+                            "GDB2 .debug_names refers to an unknown importing CU"
+                        );
+                        let kind = match entry.tag {
+                            gimli::DW_TAG_subprogram | gimli::DW_TAG_inlined_subroutine => {
+                                GdbSymbolKind::Function
+                            }
+                            gimli::DW_TAG_variable => GdbSymbolKind::Variable,
+                            gimli::DW_TAG_structure_type
+                            | gimli::DW_TAG_class_type
+                            | gimli::DW_TAG_union_type
+                            | gimli::DW_TAG_enumeration_type
+                            | gimli::DW_TAG_typedef => GdbSymbolKind::Type,
+                            _ => continue,
+                        };
+                        cu_names
+                            .as_mut()
+                            .unwrap()
+                            .insert(name.clone(), unit_offset, kind);
+                        continue;
+                    }
                     let die_offset = self.debug_names_die_offset(unit_offset, die_offset, gdb2)?;
                     let tag = entry.tag;
                     let function_kind = match tag {
@@ -1634,10 +1673,15 @@ impl<'a> DwarfParser<'a> {
         }
 
         let mut lightweight_index = LightweightIndex::from_shards(shards);
-        let functions_count = lightweight_index.get_stats().0;
-        let variables_count = lightweight_index.get_stats().1;
+        let (functions_count, variables_count, _) = cu_names
+            .as_ref()
+            .map_or_else(|| lightweight_index.get_stats(), CuNameIndex::get_stats);
         let has_aranges = lightweight_index.build_cu_maps_from_aranges(self.dwarf);
-        let has_root_ranges = lightweight_index.build_cu_maps_from_roots(self.dwarf);
+        let has_root_ranges = if cu_names.is_some() {
+            lightweight_index.build_cu_maps_from_unit_roots(self.dwarf, primary_units)
+        } else {
+            lightweight_index.build_cu_maps_from_roots(self.dwarf)
+        };
         let has_cu_ranges = has_aranges || has_root_ranges;
         if !has_cu_ranges && functions_count > 0 {
             anyhow::bail!(
@@ -1649,18 +1693,21 @@ impl<'a> DwarfParser<'a> {
             "Completed .debug_names parsing for {}: {} functions, {} variables",
             module_path, functions_count, variables_count
         );
-        Ok(Some(DebugParseResult {
-            lightweight_index,
-            functions_count,
-            variables_count,
-        }))
+        Ok(Some((
+            DebugParseResult {
+                lightweight_index,
+                functions_count,
+                variables_count,
+            },
+            cu_names,
+        )))
     }
 
     pub(crate) fn parse_gnu_pubnames(
         &self,
         sections: &GnuPubSections,
         module_path: &str,
-    ) -> Result<(DebugParseResult, GnuPubIndex)> {
+    ) -> Result<(DebugParseResult, CuNameIndex)> {
         debug!("Starting GNU pubnames parsing for: {}", module_path);
         let mut pub_names_sets = Vec::new();
         let mut pub_names_set_iter = sections.pub_names.sets();
@@ -1786,16 +1833,16 @@ impl<'a> DwarfParser<'a> {
             )
             .collect::<Result<Vec<_>>>()?;
 
-        let mut gnu_pub_index = GnuPubIndex::new(all_debug_info_units);
+        let mut cu_name_index = CuNameIndex::new(all_debug_info_units);
         for (name, unit_offset, kind) in pub_name_seed_shards
             .into_iter()
             .chain(pub_type_seed_shards)
             .flatten()
         {
-            gnu_pub_index.insert(name, unit_offset, kind);
+            cu_name_index.insert(name, unit_offset, kind);
         }
 
-        let (functions_count, variables_count, _) = gnu_pub_index.get_stats();
+        let (functions_count, variables_count, _) = cu_name_index.get_stats();
         let mut lightweight_index = LightweightIndex::new();
         let has_aranges = lightweight_index.build_cu_maps_from_aranges(self.dwarf);
         let has_root_ranges = lightweight_index
@@ -1820,7 +1867,7 @@ impl<'a> DwarfParser<'a> {
                 functions_count,
                 variables_count,
             },
-            gnu_pub_index,
+            cu_name_index,
         ))
     }
 

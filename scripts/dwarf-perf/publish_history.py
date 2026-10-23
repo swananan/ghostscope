@@ -10,14 +10,7 @@ from pathlib import Path
 from typing import Any
 
 MAX_HISTORY_ENTRIES = 500
-PREFERRED_PARSE_TARGETS = [
-    "parse-stress",
-    "gnu-pubnames-stress",
-    "rust-parse-stress",
-    "cpp-template-stress",
-    "rust-generic-stress",
-    "cpp-deep-namespace",
-]
+PREFERRED_PARSE_TARGETS = Path(__file__).with_name("parse_targets.txt").read_text().splitlines()
 
 
 def parse_args() -> argparse.Namespace:
