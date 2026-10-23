@@ -19,6 +19,14 @@ struct Symbol {
     tag: gimli::DwTag,
 }
 
+fn symbol_kind(tag: gimli::DwTag) -> usize {
+    match tag {
+        gimli::DW_TAG_variable => 2,
+        gimli::DW_TAG_subprogram | gimli::DW_TAG_inlined_subroutine => 3,
+        _ => 1,
+    }
+}
+
 fn word(out: &mut Vec<u8>, value: usize, width: usize) {
     out.extend_from_slice(&(value as u64).to_le_bytes()[..width]);
 }
@@ -60,9 +68,18 @@ pub fn add_index(binary: &Path, index: Index) -> Result<()> {
         let mut entries = unit.entries();
         while let Some(entry) = entries.next_dfs()? {
             let name = match entry.tag() {
-                gimli::DW_TAG_subprogram => "tick".to_owned(),
+                gimli::DW_TAG_subprogram => entry
+                    .attr_value(gimli::DW_AT_name)
+                    .and_then(|name| dwarf.attr_string(&unit, name).ok())
+                    .and_then(|name| name.to_string().ok().map(|name| name.into_owned()))
+                    .unwrap_or_else(|| "tick".to_owned()),
                 gimli::DW_TAG_inlined_subroutine => "inlined_stub".to_owned(),
-                gimli::DW_TAG_variable => dwarf
+                gimli::DW_TAG_structure_type
+                | gimli::DW_TAG_class_type
+                | gimli::DW_TAG_union_type
+                | gimli::DW_TAG_enumeration_type
+                | gimli::DW_TAG_typedef
+                | gimli::DW_TAG_variable => dwarf
                     .attr_string(&unit, entry.attr_value(gimli::DW_AT_name).unwrap())?
                     .to_string()?
                     .into_owned(),
@@ -90,14 +107,13 @@ pub fn add_index(binary: &Path, index: Index) -> Result<()> {
                     let mut body = 2u16.to_le_bytes().to_vec();
                     word(&mut body, unit.debug_info_offset().unwrap().0, width);
                     word(&mut body, unit.length_including_self(), width);
-                    if include_symbols {
-                        for symbol in symbols.iter().filter(|symbol| symbol.cu as usize == cu) {
+                    {
+                        for symbol in symbols.iter().filter(|symbol| {
+                            symbol.cu as usize == cu
+                                && (symbol_kind(symbol.tag) != 1) == include_symbols
+                        }) {
                             word(&mut body, symbol.die, width);
-                            body.push(if symbol.tag == gimli::DW_TAG_variable {
-                                0x20
-                            } else {
-                                0x30
-                            });
+                            body.push((symbol_kind(symbol.tag) << 4) as u8);
                             body.extend_from_slice(symbol.name.as_bytes());
                             body.push(0);
                         }
@@ -147,6 +163,10 @@ pub fn add_index(binary: &Path, index: Index) -> Result<()> {
                     gimli::DW_TAG_variable => 2,
                     gimli::DW_TAG_inlined_subroutine => 3,
                     gimli::DW_TAG_typedef => 4,
+                    gimli::DW_TAG_structure_type => 5,
+                    gimli::DW_TAG_class_type => 6,
+                    gimli::DW_TAG_union_type => 7,
+                    gimli::DW_TAG_enumeration_type => 8,
                     _ => 1,
                 });
                 word(&mut pool, symbol.cu as usize, 4);
@@ -159,6 +179,10 @@ pub fn add_index(binary: &Path, index: Index) -> Result<()> {
                 (2, gimli::DW_TAG_variable),
                 (3, gimli::DW_TAG_inlined_subroutine),
                 (4, gimli::DW_TAG_typedef),
+                (5, gimli::DW_TAG_structure_type),
+                (6, gimli::DW_TAG_class_type),
+                (7, gimli::DW_TAG_union_type),
+                (8, gimli::DW_TAG_enumeration_type),
             ] {
                 abbrev.extend_from_slice(&[
                     code,
@@ -233,22 +257,28 @@ pub fn add_index(binary: &Path, index: Index) -> Result<()> {
             data.resize(data.len() + slots * 8, 0);
             let pool = data.len();
             let mut used = std::collections::HashSet::new();
+            let mut by_name = std::collections::BTreeMap::<&str, Vec<usize>>::new();
             for symbol in &symbols {
+                by_name
+                    .entry(&symbol.name)
+                    .or_default()
+                    .push(symbol.cu as usize | symbol_kind(symbol.tag) << 28);
+            }
+            for (name, mut locations) in by_name {
+                locations.sort_unstable();
+                locations.dedup();
                 let vector_offset = data.len() - pool;
-                word(&mut data, 1, 4);
-                let kind = if symbol.tag == gimli::DW_TAG_variable {
-                    2
-                } else {
-                    3
-                };
-                word(&mut data, symbol.cu as usize | kind << 28, 4);
+                word(&mut data, locations.len(), 4);
+                for location in locations {
+                    word(&mut data, location, 4);
+                }
                 let name_offset = data.len() - pool;
-                data.extend_from_slice(symbol.name.as_bytes());
+                data.extend_from_slice(name.as_bytes());
                 data.push(0);
                 while !data.len().is_multiple_of(4) {
                     data.push(0);
                 }
-                let hash = symbol.name.bytes().fold(0u32, |hash, byte| {
+                let hash = name.bytes().fold(0u32, |hash, byte| {
                     hash.wrapping_mul(67)
                         .wrapping_add(u32::from(byte.to_ascii_lowercase()))
                         .wrapping_sub(113)

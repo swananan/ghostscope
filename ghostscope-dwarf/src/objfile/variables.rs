@@ -66,13 +66,26 @@ pub(super) fn complete_aggregate_declaration_entry(
                 .ok()
         })
         .and_then(|name| name.to_string().ok().map(|name| name.into_owned()))?;
-    let definition = type_name_index.find_aggregate_definition(&name, entry.tag())?;
-    Some(TypeLoc {
-        object: definition.object,
-        importing_cu: definition.importing_cu,
-        cu_off: definition.cu_offset,
-        die_off: definition.die_offset,
-    })
+    let definition = type_name_index
+        .aggregate_definitions(&name, entry.tag())
+        .find_map(|definition| {
+            let loc = TypeLoc {
+                object: definition.object,
+                importing_cu: definition.importing_cu,
+                cu_off: definition.cu_offset,
+                die_off: definition.die_offset,
+            };
+            // Accelerator seeds need not carry DW_AT_declaration. Validate the DIE
+            // instead of mistaking a seed for a definition after CU materialization.
+            let unit = loc.unit(dwarf).ok()?;
+            let entry = unit.entry(loc.die_off).ok()?;
+            if entry.attr_value(gimli::DW_AT_declaration) == Some(gimli::AttributeValue::Flag(true))
+            {
+                return None;
+            }
+            Some(loc)
+        });
+    definition
 }
 
 impl LoadedObjfile {
@@ -855,18 +868,45 @@ impl LoadedObjfile {
         None
     }
 
+    pub(super) fn complete_aggregate_declaration(
+        &self,
+        unit: &gimli::Unit<crate::binary::DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<crate::binary::DwarfReader>,
+    ) -> Result<Option<TypeLoc>> {
+        if !matches!(
+            entry.tag(),
+            gimli::DW_TAG_structure_type
+                | gimli::DW_TAG_class_type
+                | gimli::DW_TAG_union_type
+                | gimli::DW_TAG_enumeration_type
+        ) || entry.attr_value(gimli::DW_AT_declaration)
+            != Some(gimli::AttributeValue::Flag(true))
+        {
+            return Ok(None);
+        }
+        let Some(name) = resolve_name_with_origins(self.dwarf(), unit, entry)? else {
+            return Ok(None);
+        };
+        // Loading the candidate CUs rebuilds the type-name index. Do this before
+        // taking its read lock, including declarations reached through pointers,
+        // aliases, inherited members, and template parameters.
+        self.ensure_debug_info_for_type_name(&name)?;
+        let index = self.type_name_index()?;
+        Ok(complete_aggregate_declaration_entry(
+            self.dwarf(),
+            &index,
+            unit,
+            entry,
+        ))
+    }
+
     pub(crate) fn detailed_shallow_type_loc(&self, loc: TypeLoc) -> Option<crate::TypeInfo> {
         let cu_off = loc.cu_off;
         let die_off = loc.die_off;
         let dwarf = self.dwarf();
         let unit = self.unit_in(loc.object, cu_off).ok()?;
         let entry = unit.entry(die_off).ok()?;
-        let definition = complete_aggregate_declaration_entry(
-            dwarf,
-            &*self.type_name_index().ok()?,
-            &unit,
-            &entry,
-        );
+        let definition = self.complete_aggregate_declaration(&unit, &entry).ok()?;
         if let Some(definition) = definition {
             let def_cu_off = definition.cu_off;
             let def_die_off = definition.die_off;
