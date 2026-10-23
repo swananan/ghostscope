@@ -7,6 +7,7 @@ on:
       - 'ghostscope-dwarf/**'
       - 'bins/dwarf-tool/**'
       - 'scripts/dwarf-perf/**'
+      - 'docker/dwarf-perf-builder/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/dwarf-perf-regression.yml'
@@ -62,7 +63,7 @@ jobs:
 
           benchmark_changed=false
           if printf '%s\n' "$changed_files" | grep -Eq \
-            '^(scripts/dwarf-perf/corpus/|scripts/dwarf-perf/build_corpus\.sh$|scripts/dwarf-perf/build_corpus_in_container\.sh$|scripts/dwarf-perf/run_baseline\.sh$|scripts/dwarf-perf/generate_parse_stress\.py$|scripts/dwarf-perf/generate_rust_parse_stress\.py$|scripts/dwarf-perf/generate_cpp_template_stress\.py$|scripts/dwarf-perf/generate_rust_generic_stress\.py$|scripts/dwarf-perf/generate_cpp_deep_namespace\.py$|scripts/dwarf-perf/builder_image_ref\.txt$|scripts/dwarf-perf/compare_baseline\.py$|\.github/workflows/dwarf-perf-regression\.yml$)'; then
+            '^(scripts/dwarf-perf/|docker/dwarf-perf-builder/|\.github/workflows/dwarf-perf-regression\.yml$)'; then
             benchmark_changed=true
           fi
 
@@ -112,6 +113,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-dwarf-perf-target-
 
+      - name: Check index benchmark tooling
+        working-directory: head
+        run: python3 -m unittest discover -s scripts/dwarf-perf -p '*_tests.py'
+
       - name: Prepare result directories
         run: mkdir -p "$DWARF_PERF_RESULTS_DIR"
 
@@ -123,14 +128,7 @@ jobs:
           set -euo pipefail
           ./scripts/dwarf-perf/build_corpus.sh
           manifest="$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out/manifest.json"
-          parse_targets=(
-            parse-stress
-            gnu-pubnames-stress
-            rust-parse-stress
-            cpp-template-stress
-            rust-generic-stress
-            cpp-deep-namespace
-          )
+          mapfile -t parse_targets < "$GITHUB_WORKSPACE/head/scripts/dwarf-perf/parse_targets.txt"
           missing_targets=false
           for target in "${parse_targets[@]}"; do
             safe_target=${target//-/_}
@@ -149,14 +147,7 @@ jobs:
         run: |
           set -euo pipefail
           manifest="$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out/manifest.json"
-          parse_targets=(
-            parse-stress
-            gnu-pubnames-stress
-            rust-parse-stress
-            cpp-template-stress
-            rust-generic-stress
-            cpp-deep-namespace
-          )
+          mapfile -t parse_targets < "$GITHUB_WORKSPACE/head/scripts/dwarf-perf/parse_targets.txt"
 
           for target in "${parse_targets[@]}"; do
             if ! jq -e --arg target "$target" '.artifacts[] | select(.name==$target)' "$manifest" >/dev/null; then
@@ -179,14 +170,7 @@ jobs:
         run: |
           set -euo pipefail
           manifest="$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out/manifest.json"
-          parse_targets=(
-            parse-stress
-            gnu-pubnames-stress
-            rust-parse-stress
-            cpp-template-stress
-            rust-generic-stress
-            cpp-deep-namespace
-          )
+          mapfile -t parse_targets < "$GITHUB_WORKSPACE/head/scripts/dwarf-perf/parse_targets.txt"
 
           for target in "${parse_targets[@]}"; do
             if ! jq -e --arg target "$target" '.artifacts[] | select(.name==$target)' "$manifest" >/dev/null; then
@@ -219,14 +203,7 @@ jobs:
           set -euo pipefail
           head_manifest="$GITHUB_WORKSPACE/head/scripts/dwarf-perf/corpus/out/manifest.json"
           base_manifest="$GITHUB_WORKSPACE/base/scripts/dwarf-perf/corpus/out/manifest.json"
-          parse_targets=(
-            parse-stress
-            gnu-pubnames-stress
-            rust-parse-stress
-            cpp-template-stress
-            rust-generic-stress
-            cpp-deep-namespace
-          )
+          mapfile -t parse_targets < "$GITHUB_WORKSPACE/head/scripts/dwarf-perf/parse_targets.txt"
 
           for target in "${parse_targets[@]}"; do
             if ! jq -e --arg target "$target" '.artifacts[] | select(.name==$target)' "$head_manifest" >/dev/null; then
@@ -311,14 +288,7 @@ jobs:
           } > "$DWARF_PERF_RESULTS_DIR/summary.md"
           overall_exit=0
 
-          parse_targets=(
-            parse-stress
-            gnu-pubnames-stress
-            rust-parse-stress
-            cpp-template-stress
-            rust-generic-stress
-            cpp-deep-namespace
-          )
+          mapfile -t parse_targets < "$GITHUB_WORKSPACE/head/scripts/dwarf-perf/parse_targets.txt"
 
           for target in "${parse_targets[@]}"; do
             safe_target=${target//-/_}

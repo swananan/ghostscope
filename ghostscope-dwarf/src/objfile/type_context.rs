@@ -137,9 +137,44 @@ fn type_metadata_from_dwarf(
     Ok(Some(metadata))
 }
 
+// A module can materialize the defining CU on demand. Pure DWARF fixtures use
+// an already populated index through the same normalization path.
+trait AggregateDefinitionResolver {
+    fn complete_declaration(
+        &self,
+        dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+        unit: &gimli::Unit<crate::binary::DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<crate::binary::DwarfReader>,
+    ) -> Result<Option<TypeLoc>>;
+}
+
+impl AggregateDefinitionResolver for crate::index::TypeNameIndex {
+    fn complete_declaration(
+        &self,
+        dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+        unit: &gimli::Unit<crate::binary::DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<crate::binary::DwarfReader>,
+    ) -> Result<Option<TypeLoc>> {
+        Ok(complete_aggregate_declaration_entry(
+            dwarf, self, unit, entry,
+        ))
+    }
+}
+
+impl AggregateDefinitionResolver for LoadedObjfile {
+    fn complete_declaration(
+        &self,
+        _dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+        unit: &gimli::Unit<crate::binary::DwarfReader>,
+        entry: &gimli::DebuggingInformationEntry<crate::binary::DwarfReader>,
+    ) -> Result<Option<TypeLoc>> {
+        self.complete_aggregate_declaration(unit, entry)
+    }
+}
+
 fn normalize_type_loc(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
-    type_name_index: &crate::index::TypeNameIndex,
+    type_resolver: &impl AggregateDefinitionResolver,
     mut loc: TypeLoc,
 ) -> Result<Option<TypeLoc>> {
     let mut visited = HashSet::new();
@@ -174,7 +209,7 @@ fn normalize_type_loc(
             | gimli::DW_TAG_union_type
             | gimli::DW_TAG_enumeration_type => {
                 if let Some(definition) =
-                    complete_aggregate_declaration_entry(dwarf, type_name_index, &unit, &entry)
+                    type_resolver.complete_declaration(dwarf, &unit, &entry)?
                 {
                     loc = definition.in_context(semantic_cu);
                 } else {
@@ -201,11 +236,11 @@ fn pointer_like(tag: gimli::DwTag) -> bool {
 
 fn projected_member_type_loc(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
-    type_name_index: &crate::index::TypeNameIndex,
+    type_resolver: &impl AggregateDefinitionResolver,
     loc: TypeLoc,
     field: &str,
 ) -> Result<Option<TypeLoc>> {
-    let mut aggregate_loc = match normalize_type_loc(dwarf, type_name_index, loc)? {
+    let mut aggregate_loc = match normalize_type_loc(dwarf, type_resolver, loc)? {
         Some(loc) => loc,
         None => return Ok(None),
     };
@@ -216,7 +251,7 @@ fn projected_member_type_loc(
         let Some(target) = resolve_type_ref_with_origins(dwarf, &entry, &unit)? else {
             return Ok(None);
         };
-        aggregate_loc = match normalize_type_loc(dwarf, type_name_index, target)? {
+        aggregate_loc = match normalize_type_loc(dwarf, type_resolver, target)? {
             Some(loc) => loc,
             None => return Ok(None),
         };
@@ -224,7 +259,7 @@ fn projected_member_type_loc(
 
     projected_aggregate_member_type_loc(
         dwarf,
-        type_name_index,
+        type_resolver,
         aggregate_loc,
         field,
         &HashSet::new(),
@@ -234,7 +269,7 @@ fn projected_member_type_loc(
 
 fn projected_aggregate_member_type_loc(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
-    type_name_index: &crate::index::TypeNameIndex,
+    type_resolver: &impl AggregateDefinitionResolver,
     loc: TypeLoc,
     field: &str,
     visited: &HashSet<(crate::DwarfObjectId, usize, usize)>,
@@ -243,7 +278,7 @@ fn projected_aggregate_member_type_loc(
     if inheritance_depth >= MAX_TYPE_REFERENCE_DEPTH {
         return Ok(None);
     }
-    let Some(aggregate_loc) = normalize_type_loc(dwarf, type_name_index, loc)? else {
+    let Some(aggregate_loc) = normalize_type_loc(dwarf, type_resolver, loc)? else {
         return Ok(None);
     };
     let mut current_path = visited.clone();
@@ -287,7 +322,7 @@ fn projected_aggregate_member_type_loc(
     for base_class in base_classes {
         if let Some(member) = projected_aggregate_member_type_loc(
             dwarf,
-            type_name_index,
+            type_resolver,
             base_class,
             field,
             &current_path,
@@ -316,13 +351,13 @@ fn projected_aggregate_member_type_loc(
 
 fn variant_member_type_loc(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
-    type_name_index: &crate::index::TypeNameIndex,
+    type_resolver: &impl AggregateDefinitionResolver,
     loc: TypeLoc,
     part_index: usize,
     variant_index: usize,
     member_index: usize,
 ) -> Result<Option<TypeLoc>> {
-    let Some(aggregate_loc) = normalize_type_loc(dwarf, type_name_index, loc)? else {
+    let Some(aggregate_loc) = normalize_type_loc(dwarf, type_resolver, loc)? else {
         return Ok(None);
     };
     let unit = aggregate_loc.unit(dwarf)?;
@@ -379,11 +414,11 @@ fn variant_member_type_loc(
 
 fn projected_element_type_loc(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
-    type_name_index: &crate::index::TypeNameIndex,
+    type_resolver: &impl AggregateDefinitionResolver,
     loc: TypeLoc,
     dereference_only: bool,
 ) -> Result<Option<TypeLoc>> {
-    let Some(base) = normalize_type_loc(dwarf, type_name_index, loc)? else {
+    let Some(base) = normalize_type_loc(dwarf, type_resolver, loc)? else {
         return Ok(None);
     };
     let unit = base.unit(dwarf)?;
@@ -401,11 +436,11 @@ fn projected_element_type_loc(
 
 fn template_type_parameter_loc(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
-    type_name_index: &crate::index::TypeNameIndex,
+    type_resolver: &impl AggregateDefinitionResolver,
     loc: TypeLoc,
     index: usize,
 ) -> Result<Option<TypeLoc>> {
-    let Some(aggregate_loc) = normalize_type_loc(dwarf, type_name_index, loc)? else {
+    let Some(aggregate_loc) = normalize_type_loc(dwarf, type_resolver, loc)? else {
         return Ok(None);
     };
     let unit = aggregate_loc.unit(dwarf)?;
@@ -431,7 +466,7 @@ fn template_type_parameter_loc(
             else {
                 return Ok(None);
             };
-            return normalize_type_loc(dwarf, type_name_index, parameter_loc);
+            return normalize_type_loc(dwarf, type_resolver, parameter_loc);
         }
         type_parameter_index += 1;
     }
@@ -441,10 +476,10 @@ fn template_type_parameter_loc(
 
 fn type_alignment_from_dwarf(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
-    type_name_index: &crate::index::TypeNameIndex,
+    type_resolver: &impl AggregateDefinitionResolver,
     loc: TypeLoc,
 ) -> Result<Option<u64>> {
-    let Some(loc) = normalize_type_loc(dwarf, type_name_index, loc)? else {
+    let Some(loc) = normalize_type_loc(dwarf, type_resolver, loc)? else {
         return Ok(None);
     };
     let unit = loc.unit(dwarf)?;
@@ -457,22 +492,22 @@ fn type_alignment_from_dwarf(
 
 fn projected_type_loc(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
-    type_name_index: &crate::index::TypeNameIndex,
+    type_resolver: &impl AggregateDefinitionResolver,
     loc: TypeLoc,
     segment: &VariableAccessSegment,
 ) -> Result<Option<TypeLoc>> {
     match segment {
         VariableAccessSegment::Field(field) => {
-            projected_member_type_loc(dwarf, type_name_index, loc, field)
+            projected_member_type_loc(dwarf, type_resolver, loc, field)
         }
         VariableAccessSegment::TupleIndex(index) => Err(anyhow::anyhow!(
             "tuple index '.{index}' was not resolved to a DWARF member"
         )),
         VariableAccessSegment::ArrayIndex(_) => {
-            projected_element_type_loc(dwarf, type_name_index, loc, false)
+            projected_element_type_loc(dwarf, type_resolver, loc, false)
         }
         VariableAccessSegment::Dereference => {
-            projected_element_type_loc(dwarf, type_name_index, loc, true)
+            projected_element_type_loc(dwarf, type_resolver, loc, true)
         }
     }
 }
@@ -548,11 +583,7 @@ impl LoadedObjfile {
         segment: &VariableAccessSegment,
     ) -> Result<Option<TypeId>> {
         let current_loc = type_loc(current)?;
-        let type_name_index = self
-            .type_name_index
-            .read()
-            .expect("type name index lock poisoned");
-        projected_type_loc(self.dwarf(), &type_name_index, current_loc, segment).map(|loc| {
+        projected_type_loc(self.dwarf(), self, current_loc, segment).map(|loc| {
             loc.map(|loc| {
                 type_id_from_loc(current.module, loc.in_context(current_loc.semantic_cu()))
             })
@@ -567,13 +598,9 @@ impl LoadedObjfile {
         member_index: usize,
     ) -> Result<Option<TypeId>> {
         let current_loc = type_loc(current)?;
-        let type_name_index = self
-            .type_name_index
-            .read()
-            .expect("type name index lock poisoned");
         variant_member_type_loc(
             self.dwarf(),
-            &type_name_index,
+            self,
             current_loc,
             part_index,
             variant_index,
@@ -587,13 +614,7 @@ impl LoadedObjfile {
     }
 
     pub(crate) fn type_summary(&self, current: TypeId) -> Result<Option<crate::TypeInfo>> {
-        let normalized = {
-            let type_name_index = self
-                .type_name_index
-                .read()
-                .expect("type name index lock poisoned");
-            normalize_type_loc(self.dwarf(), &type_name_index, type_loc(current)?)?
-        };
+        let normalized = normalize_type_loc(self.dwarf(), self, type_loc(current)?)?;
         Ok(normalized.and_then(|loc| self.detailed_shallow_type_loc(loc)))
     }
 
@@ -606,13 +627,8 @@ impl LoadedObjfile {
         current: TypeId,
         index: usize,
     ) -> Result<Option<(TypeId, crate::TypeInfo)>> {
-        let parameter_loc = {
-            let type_name_index = self
-                .type_name_index
-                .read()
-                .expect("type name index lock poisoned");
-            template_type_parameter_loc(self.dwarf(), &type_name_index, type_loc(current)?, index)?
-        };
+        let parameter_loc =
+            template_type_parameter_loc(self.dwarf(), self, type_loc(current)?, index)?;
         let Some(parameter_loc) = parameter_loc else {
             return Ok(None);
         };
@@ -628,11 +644,7 @@ impl LoadedObjfile {
     }
 
     pub(crate) fn type_alignment(&self, current: TypeId) -> Result<Option<u64>> {
-        let type_name_index = self
-            .type_name_index
-            .read()
-            .expect("type name index lock poisoned");
-        type_alignment_from_dwarf(self.dwarf(), &type_name_index, type_loc(current)?)
+        type_alignment_from_dwarf(self.dwarf(), self, type_loc(current)?)
     }
 
     pub(crate) fn aggregate_type_id_by_name(&self, module: ModuleId, name: &str) -> Option<TypeId> {
@@ -644,10 +656,7 @@ impl LoadedObjfile {
                 error
             );
         }
-        let type_name_index = self
-            .type_name_index
-            .read()
-            .expect("type name index lock poisoned");
+        let type_name_index = self.type_name_index().ok()?;
         [gimli::DW_TAG_structure_type, gimli::DW_TAG_class_type]
             .into_iter()
             .find_map(|tag| type_name_index.find_aggregate_definition(name, tag))

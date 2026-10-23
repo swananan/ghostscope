@@ -1,0 +1,11 @@
+parse-stress
+gnu-pubnames-stress
+gdb-index-stress
+debug-names-stress
+supplementary-stress
+supplementary-gdb-index-stress
+supplementary-debug-names-stress
+rust-parse-stress
+cpp-template-stress
+rust-generic-stress
+cpp-deep-namespace

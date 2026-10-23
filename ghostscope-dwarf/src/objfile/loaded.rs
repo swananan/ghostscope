@@ -4,7 +4,7 @@ use crate::{
     binary::{DwarfReader, MappedFile},
     core::{mapping::ModuleMapping, DebugInfoSource, Result},
     index::{
-        BlockIndex, GdbIndex, GdbSymbolKind, GnuPubIndex, LightweightIndex, LineMappingTable,
+        BlockIndex, CuNameIndex, GdbIndex, GdbSymbolKind, LightweightIndex, LineMappingTable,
         ScopedFileIndexManager, TypeNameIndex,
     },
     objfile::ModuleUnwindInfo,
@@ -14,7 +14,7 @@ use object::{Object, ObjectSegment};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
 };
 
 type FunctionRangeCacheKey = (u64, u64);
@@ -125,7 +125,7 @@ pub(crate) struct LoadedObjfile {
     pub(super) block_index: RwLock<BlockIndex>,
     pub(super) type_name_index: RwLock<TypeNameIndex>,
     pub(super) gdb_index: Option<GdbIndex>,
-    pub(super) gnu_pub_index: Option<GnuPubIndex>,
+    pub(super) cu_name_index: Option<CuNameIndex>,
     pub(super) dwarf_index_status: crate::DwarfIndexStatus,
     pub(super) lazy_debug_info: bool,
     pub(super) indexed_debug_info_cus: Mutex<HashSet<gimli::DebugInfoOffset>>,
@@ -171,9 +171,9 @@ impl LoadedObjfile {
                 ),
             }
         }
-        if let Err(error) = self.ensure_all_debug_info_for_gnu_index() {
+        if let Err(error) = self.ensure_all_debug_info_for_name_index() {
             tracing::warn!(
-                "Failed to materialize all GNU-indexed DWARF functions in {}: {}",
+                "Failed to materialize all name-indexed DWARF functions in {}: {}",
                 self.module_path().display(),
                 error
             );
@@ -198,9 +198,9 @@ impl LoadedObjfile {
                 ),
             }
         }
-        if let Err(error) = self.ensure_all_debug_info_for_gnu_index() {
+        if let Err(error) = self.ensure_all_debug_info_for_name_index() {
             tracing::warn!(
-                "Failed to materialize all GNU-indexed DWARF variables in {}: {}",
+                "Failed to materialize all name-indexed DWARF variables in {}: {}",
                 self.module_path().display(),
                 error
             );
@@ -227,7 +227,7 @@ impl LoadedObjfile {
                 .map_or(0, <[String]>::len);
             return (functions, variables, functions + variables + types);
         }
-        if let Some(index) = &self.gnu_pub_index {
+        if let Some(index) = &self.cu_name_index {
             return index.get_stats();
         }
         self.lightweight_index
@@ -298,13 +298,13 @@ impl LoadedObjfile {
             return self.ensure_debug_info_cus(symbols.into_iter().map(|symbol| symbol.cu_offset));
         }
 
-        if let Some(index) = &self.gnu_pub_index {
+        if let Some(index) = &self.cu_name_index {
             let mut unit_offsets = index.lookup_units(name, kind, match_variants);
             if unit_offsets.is_empty() && !match_variants {
                 unit_offsets = index.lookup_units(name, kind, true);
             }
             if unit_offsets.is_empty() {
-                return self.ensure_all_debug_info_for_gnu_index();
+                return self.ensure_all_debug_info_for_name_index();
             }
             return self.ensure_debug_info_cus(unit_offsets);
         }
@@ -331,15 +331,34 @@ impl LoadedObjfile {
 
     pub(super) fn ensure_debug_info_for_type_name(&self, name: &str) -> Result<()> {
         self.ensure_debug_info_for_symbol(name, GdbSymbolKind::Type, true)?;
+        // Import visibility is independent of accelerator coverage. Build it
+        // only for type queries, including modules that used a full scan.
+        let type_name_index = self.type_name_index()?;
         if !self.lazy_debug_info {
             return Ok(());
         }
-        let unit_offsets = self
+        let unit_offsets = type_name_index.unit_offsets_for_name(name);
+        drop(type_name_index);
+        self.ensure_debug_info_cus(unit_offsets)
+    }
+
+    pub(super) fn type_name_index(&self) -> Result<RwLockReadGuard<'_, TypeNameIndex>> {
+        let index = self
             .type_name_index
             .read()
+            .expect("type name index lock poisoned");
+        if self.dwarf.sup().is_none() || index.imports_indexed() {
+            return Ok(index);
+        }
+        drop(index);
+        self.type_name_index
+            .write()
             .expect("type name index lock poisoned")
-            .unit_offsets_for_name(name);
-        self.ensure_debug_info_cus(unit_offsets)
+            .extend_imports(&self.dwarf)?;
+        Ok(self
+            .type_name_index
+            .read()
+            .expect("type name index lock poisoned"))
     }
 
     pub(super) fn ensure_line_info_for_unit(
@@ -381,12 +400,12 @@ impl LoadedObjfile {
         self.ensure_line_info_cus(unit_offsets)
     }
 
-    pub(super) fn uses_gnu_pub_index(&self) -> bool {
-        self.gnu_pub_index.is_some()
+    pub(super) fn uses_cu_name_index(&self) -> bool {
+        self.cu_name_index.is_some()
     }
 
-    pub(super) fn ensure_all_debug_info_for_gnu_index(&self) -> Result<()> {
-        let Some(index) = &self.gnu_pub_index else {
+    pub(super) fn ensure_all_debug_info_for_name_index(&self) -> Result<()> {
+        let Some(index) = &self.cu_name_index else {
             return Ok(());
         };
         self.ensure_debug_info_cus(index.all_unit_offsets().iter().copied())
@@ -416,11 +435,10 @@ impl LoadedObjfile {
             .write()
             .expect("lightweight index lock poisoned");
         lightweight_index.append_shards(shards);
-        *self
-            .type_name_index
+        self.type_name_index
             .write()
-            .expect("type name index lock poisoned") =
-            TypeNameIndex::build_from_lightweight(&lightweight_index);
+            .expect("type name index lock poisoned")
+            .rebuild_primary(&lightweight_index);
         loaded.extend(missing);
         Ok(())
     }

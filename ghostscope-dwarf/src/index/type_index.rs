@@ -24,6 +24,8 @@ pub struct TypeLoc {
 pub struct TypeNameIndex {
     /// name -> list of candidate DIEs (across all CUs in a module)
     by_name: HashMap<String, Vec<TypeLoc>>,
+    imported_by_name: HashMap<String, Vec<TypeLoc>>,
+    imports_indexed: bool,
 }
 
 impl TypeNameIndex {
@@ -57,7 +59,27 @@ impl TypeNameIndex {
                 }
             }
         });
-        Self { by_name }
+        Self {
+            by_name,
+            ..Self::default()
+        }
+    }
+
+    /// Refresh materialized primary entries without dropping imported types.
+    pub(crate) fn rebuild_primary(&mut self, ix: &LightweightIndex) {
+        self.by_name = Self::build_from_lightweight(ix).by_name;
+    }
+
+    pub(crate) fn imports_indexed(&self) -> bool {
+        self.imports_indexed
+    }
+
+    fn candidates(&self, name: &str) -> impl Iterator<Item = &TypeLoc> {
+        self.by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .chain(self.imported_by_name.get(name).into_iter().flatten())
     }
 
     /// Index only declarations reachable through imports, preserving their
@@ -66,6 +88,9 @@ impl TypeNameIndex {
         &mut self,
         dwarf: &crate::binary::DwarfData,
     ) -> crate::core::Result<()> {
+        if self.imports_indexed {
+            return Ok(());
+        }
         let mut units = dwarf.units();
         while let Some(header) = units.next()? {
             let unit = dwarf.unit(header)?;
@@ -79,6 +104,7 @@ impl TypeNameIndex {
                 &mut visited,
             )?;
         }
+        self.imports_indexed = true;
         Ok(())
     }
 
@@ -163,7 +189,7 @@ impl TypeNameIndex {
                 };
                 context.push(name.clone());
                 for key in [name.clone(), context.join("::")] {
-                    let locations = self.by_name.entry(key).or_default();
+                    let locations = self.imported_by_name.entry(key).or_default();
                     if !locations.iter().any(|candidate| {
                         candidate.object == loc.object
                             && candidate.importing_cu == loc.importing_cu
@@ -190,10 +216,7 @@ impl TypeNameIndex {
 
     pub(crate) fn unit_offsets_for_name(&self, name: &str) -> Vec<gimli::DebugInfoOffset> {
         let mut offsets = self
-            .by_name
-            .get(name)
-            .into_iter()
-            .flatten()
+            .candidates(name)
             .filter(|location| location.object == crate::DwarfObjectId::Primary)
             .map(|location| location.cu_offset)
             .collect::<Vec<_>>();
@@ -202,21 +225,21 @@ impl TypeNameIndex {
         offsets
     }
 
+    pub(crate) fn aggregate_definitions<'a>(
+        &'a self,
+        name: &'a str,
+        tag: DwTag,
+    ) -> impl Iterator<Item = TypeLoc> + 'a {
+        self.candidates(name)
+            .filter(move |candidate| candidate.tag == tag && !candidate.is_declaration)
+            .copied()
+    }
+
     /// Find an aggregate definition by name and tag, preferring non-declarations
     pub fn find_aggregate_definition(&self, name: &str, tag: DwTag) -> Option<TypeLoc> {
-        let cands = match self.by_name.get(name) {
-            Some(v) => v,
-            None => {
-                info!(
-                    "TypeNameIndex: MISS name='{}' tag={:?} (no entries)",
-                    name, tag
-                );
-                return None;
-            }
-        };
         // First pass: non-declarations
-        if let Some(loc) = cands
-            .iter()
+        if let Some(loc) = self
+            .candidates(name)
             .find(|c| c.tag == tag && !c.is_declaration)
             .cloned()
         {
@@ -227,7 +250,7 @@ impl TypeNameIndex {
             return Some(loc);
         }
         // Fallback: any matching tag
-        if let Some(loc) = cands.iter().find(|c| c.tag == tag).cloned() {
+        if let Some(loc) = self.candidates(name).find(|c| c.tag == tag).cloned() {
             info!(
                 "TypeNameIndex: HIT(decl) name='{}' tag={:?} cu_off={:?} die_off={:?}",
                 name, tag, loc.cu_offset, loc.die_offset
@@ -244,27 +267,19 @@ impl TypeNameIndex {
 
     /// Find a typedef by name
     pub fn find_typedef(&self, name: &str) -> Option<TypeLoc> {
-        match self.by_name.get(name) {
-            Some(v) => {
-                if let Some(loc) = v
-                    .iter()
-                    .find(|c| c.tag == gimli::constants::DW_TAG_typedef)
-                    .cloned()
-                {
-                    info!(
-                        "TypeNameIndex: HIT(typedef) name='{}' cu_off={:?} die_off={:?}",
-                        name, loc.cu_offset, loc.die_offset
-                    );
-                    Some(loc)
-                } else {
-                    info!("TypeNameIndex: MISS(typedef) name='{}'", name);
-                    None
-                }
-            }
-            None => {
-                info!("TypeNameIndex: MISS(typedef) name='{}' (no entries)", name);
-                None
-            }
+        if let Some(loc) = self
+            .candidates(name)
+            .find(|c| c.tag == gimli::constants::DW_TAG_typedef)
+            .copied()
+        {
+            info!(
+                "TypeNameIndex: HIT(typedef) name='{}' cu_off={:?} die_off={:?}",
+                name, loc.cu_offset, loc.die_offset
+            );
+            Some(loc)
+        } else {
+            info!("TypeNameIndex: MISS(typedef) name='{}'", name);
+            None
         }
     }
 }

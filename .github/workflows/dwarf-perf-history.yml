@@ -7,6 +7,7 @@ on:
       - 'ghostscope-dwarf/**'
       - 'bins/dwarf-tool/**'
       - 'scripts/dwarf-perf/**'
+      - 'docker/dwarf-perf-builder/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/dwarf-perf-history.yml'
@@ -79,6 +80,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-dwarf-perf-history-target-
 
+      - name: Check index benchmark tooling
+        run: python3 -m unittest discover -s scripts/dwarf-perf -p '*_tests.py'
+
       - name: Prepare result directories
         run: mkdir -p "$DWARF_PERF_RESULTS_DIR"
 
@@ -86,14 +90,7 @@ jobs:
         run: |
           set -euo pipefail
           ./scripts/dwarf-perf/build_corpus.sh
-          parse_targets=(
-            parse-stress
-            gnu-pubnames-stress
-            rust-parse-stress
-            cpp-template-stress
-            rust-generic-stress
-            cpp-deep-namespace
-          )
+          mapfile -t parse_targets < "scripts/dwarf-perf/parse_targets.txt"
           combine_args=()
           primary_json=""
 

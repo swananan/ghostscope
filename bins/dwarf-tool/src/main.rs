@@ -5,9 +5,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ghostscope_dwarf::{
-    AddressQueryResult, DwarfAnalyzer, FunctionQueryResult, ModuleAddress, ModuleLoadingEvent,
-    ModuleLoadingStats, SectionType, SourceLanguage, ValueAdapterOutcome, ValueAdapterReport,
-    ValueAdapterStage, ValueCapturePlan, ValuePresentation, VariableAccessPath,
+    AddressQueryResult, DwarfAnalyzer, DwarfIndexStatus, FunctionQueryResult, ModuleAddress,
+    ModuleLoadingEvent, ModuleLoadingStats, SectionType, SourceLanguage, ValueAdapterOutcome,
+    ValueAdapterReport, ValueAdapterStage, ValueCapturePlan, ValuePresentation, VariableAccessPath,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -224,6 +224,17 @@ struct LoadTimingBreakdown {
     parse_time_ms: u64,
     index_time_ms: u64,
     internal_total_time_ms: u64,
+    index_usage: IndexUsage,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+struct IndexUsage {
+    full_scan: usize,
+    gnu_pubnames: usize,
+    gdb_index: usize,
+    debug_names: usize,
+    rejected: usize,
+    supplementary: usize,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -512,6 +523,14 @@ fn summarize_load_breakdown(stats: &[ModuleLoadingStats]) -> LoadTimingBreakdown
         out.parse_time_ms += stat.parse_time_ms;
         out.index_time_ms += stat.index_time_ms;
         out.internal_total_time_ms += stat.module_total_time_ms;
+        match stat.dwarf_index_status {
+            DwarfIndexStatus::FullScan => out.index_usage.full_scan += 1,
+            DwarfIndexStatus::GnuPubNames => out.index_usage.gnu_pubnames += 1,
+            DwarfIndexStatus::GdbIndex { .. } => out.index_usage.gdb_index += 1,
+            DwarfIndexStatus::DebugNames => out.index_usage.debug_names += 1,
+            DwarfIndexStatus::Rejected { .. } => out.index_usage.rejected += 1,
+        }
+        out.index_usage.supplementary += usize::from(stat.supplementary_debug_file.is_some());
     }
 
     out
@@ -1101,6 +1120,7 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
         let mut index_phase_ms = Vec::with_capacity(runs);
         let mut internal_total_phase_ms = Vec::with_capacity(runs);
         let mut module_counts = Vec::with_capacity(runs);
+        let mut selected_indexes = None;
 
         for _ in 0..runs {
             print!(".");
@@ -1112,6 +1132,7 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
             index_phase_ms.push(breakdown.index_time_ms);
             internal_total_phase_ms.push(breakdown.internal_total_time_ms);
             module_counts.push(breakdown.module_count);
+            selected_indexes = Some(breakdown.index_usage);
         }
         println!();
         let summary = summarize_durations(&load_times)?;
@@ -1128,6 +1149,10 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
         println!("  Max: {:.3}ms", summary.max_ms);
         println!("\nInternal load phases (per-run sums across loaded modules):");
         println!("  Internal module count: {module_count}");
+        println!(
+            "  Selected DWARF indexes: {}",
+            serde_json::to_string(&selected_indexes.unwrap_or_default())?
+        );
         println!("  Parse avg: {:.3}ms", parse_summary.average_ms);
         println!("  Parse p50: {:.3}ms", parse_summary.p50_ms);
         println!("  Parse p95: {:.3}ms", parse_summary.p95_ms);
@@ -1167,6 +1192,7 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
         let mut index_phase_ms = Vec::with_capacity(runs);
         let mut internal_total_phase_ms = Vec::with_capacity(runs);
         let mut module_counts = Vec::with_capacity(runs);
+        let mut selected_indexes = None;
 
         for _ in 0..runs {
             print!(".");
@@ -1178,6 +1204,13 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
             index_phase_ms.push(breakdown.index_time_ms);
             internal_total_phase_ms.push(breakdown.internal_total_time_ms);
             module_counts.push(breakdown.module_count);
+            if let Some(previous) = selected_indexes {
+                anyhow::ensure!(
+                    previous == breakdown.index_usage,
+                    "Selected DWARF indexes changed between benchmark runs"
+                );
+            }
+            selected_indexes = Some(breakdown.index_usage);
         }
         println!();
         let summary = summarize_durations(&load_times)?;
@@ -1194,6 +1227,10 @@ async fn run_benchmark(pid: Option<u32>, target_path: Option<&str>, runs: usize)
         println!("  Max: {:.3}ms", summary.max_ms);
         println!("\nInternal load phases (per-run sums across loaded modules):");
         println!("  Internal module count: {module_count}");
+        println!(
+            "  Selected DWARF indexes: {}",
+            serde_json::to_string(&selected_indexes.unwrap_or_default())?
+        );
         println!("  Parse avg: {:.3}ms", parse_summary.average_ms);
         println!("  Parse p50: {:.3}ms", parse_summary.p50_ms);
         println!("  Parse p95: {:.3}ms", parse_summary.p95_ms);

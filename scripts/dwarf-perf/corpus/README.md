@@ -55,6 +55,11 @@ The build writes artifacts under `scripts/dwarf-perf/corpus/out/`:
 - `query-hotspot/query_hotspot`
 - `parse-stress/parse_stress`
 - `gnu-pubnames-stress/gnu_pubnames_stress`
+- `gdb-index-stress/gdb_index_stress`
+- `debug-names-stress/debug_names_stress`
+- `supplementary-stress/supplementary_stress` (with `shared.debug`)
+- `supplementary-gdb-index-stress/supplementary_gdb_index_stress` (with `shared.debug`)
+- `supplementary-debug-names-stress/supplementary_debug_names_stress` (with `shared.debug`)
 - `rust-parse-stress/rust_parse_stress`
 - `cpp-template-stress/cpp_template_stress`
 - `rust-generic-stress/rust_generic_stress`
@@ -87,6 +92,11 @@ Other built-in parse targets include:
 
 - `parse-stress`
 - `gnu-pubnames-stress`
+- `gdb-index-stress`
+- `debug-names-stress`
+- `supplementary-stress`
+- `supplementary-gdb-index-stress`
+- `supplementary-debug-names-stress`
 - `rust-parse-stress`
 - `cpp-template-stress`
 - `rust-generic-stress`
@@ -228,3 +238,39 @@ The new comparison groups focus on mangled-symbol coverage from three angles:
   mangled symbols on the default preset
 - `cpp-deep-namespace`: long hierarchical namespace names, roughly `10K-30K`
   mangled symbols on the default preset
+
+## Index and Supplementary Coverage
+
+The original compiler image and six parse cases remain unchanged. A separate
+index-tools image, built locally from `docker/dwarf-perf-builder/index-tools.Dockerfile`,
+provides dwz, GDB, and binutils. Set `DWARF_PERF_INDEX_TOOLS_IMAGE` to reuse an
+existing tools image instead. Tool versions are recorded in the manifest.
+
+Five additional cases copy the existing C binary without recompiling it. GDB
+produces `.gdb_index` and DWARF 5 `.debug_names` variants. Real `dwz -m` output
+provides `.gnu_debugaltlink` cases with no accelerator and with each GDB index.
+The shared debug object is copied beside each supplementary binary and its hash
+is recorded. dwz removes GNU pubnames, so that accelerator retains its separate
+compiler-generated corpus; supplementary combinations for all three index
+formats and `.debug_sup` are checked by correctness tests.
+
+`dwarf-tool benchmark` reports the actual selected index and supplementary load
+counts. The manifest's `expected_index` contract is checked before a baseline is
+written: a rejected index, silent full-scan fallback, or missing supplementary
+object fails the run. Results retain these counts as `parse_benchmark.index_usage`.
+Older manifests without a contract remain usable for base/head comparisons.
+
+CI and history share the target list in `scripts/dwarf-perf/parse_targets.txt`.
+Existing cases continue to compare base and head on identical base-built inputs
+with the existing thresholds. Newly introduced targets get a head-only bootstrap
+result until the base revision also supplies them.
+
+Check the index guard and real producer outputs with:
+
+```bash
+python3 -m unittest discover -s scripts/dwarf-perf -p '*_tests.py'
+```
+
+The producer check requires `cc`, `dwz`, `gdb-add-index`, and `readelf`; it is
+skipped when those tools are unavailable. `DWARF_PERF_TEST_DWZ` can select a dwz
+executable outside PATH.
