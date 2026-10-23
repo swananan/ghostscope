@@ -9,5 +9,8 @@ pub(crate) mod type_context;
 pub(crate) mod unwind;
 pub(crate) mod variables;
 
+#[cfg(test)]
+mod supplementary_index_tests;
+
 pub(crate) use loaded::LoadedObjfile;
 pub(crate) use unwind::ModuleUnwindInfo;

@@ -19,8 +19,9 @@ Consumers typically do not use this crate directly; it is re-exported via higher
 Supplementary DWARF objects referenced by `.gnu_debugaltlink` (GNU/dwz) or
 `.debug_sup` (DWARF 5) are loaded alongside the selected primary debug file.
 References retain the object identity through type queries and member projection.
-Imported units contribute reachable type declarations. Modules using a supplement
-currently use the full DWARF scan instead of accelerator indexes.
+Imported units contribute reachable type declarations. Primary-file accelerator
+indexes remain available with a supplement; imported type names are indexed on
+the first type query and retained as further compilation units are parsed.
 
 Supplement discovery searches relative to the primary debug file (including its
 resolved symlink location), then the configured debug search directories. GNU
@@ -28,3 +29,8 @@ links validate the supplement's Build-ID; DWARF 5 links validate its `.debug_sup
 role and supplied checksum. Matching remains strict in loose debug-file mode.
 A missing or mismatched required supplement is a module-loading error. Supplement
 fetching through debuginfod and Split DWARF `.dwo`/`.dwp` loading are not included.
+
+For GDB2 `.debug_names` with supplementary DWARF, imported definitions can carry
+DIE offsets from a different unit or object than the attributed importing CU.
+These entries select CUs for lazy materialization; they are not treated as
+primary-object DIE locations. Ordinary `.debug_names` keeps its existing path.

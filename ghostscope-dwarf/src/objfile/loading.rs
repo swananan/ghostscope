@@ -7,7 +7,7 @@ use crate::{
         DwarfReader, MappedFile,
     },
     core::{mapping::ModuleMapping, DebugInfoSource, Result},
-    index::{BlockIndex, GdbIndex, GnuPubIndex, TypeNameIndex},
+    index::{BlockIndex, CuNameIndex, GdbIndex, TypeNameIndex},
     objfile::ModuleUnwindInfo,
     parser::{DebugParseResult, DetailedParser, DwarfParser, GnuPubSections},
 };
@@ -25,9 +25,9 @@ use std::{
 
 enum InitialIndexSelection {
     FullScan { rejection: Option<String> },
-    DebugNames,
+    DebugNames(Option<CuNameIndex>),
     GdbIndex,
-    GnuPubNames(GnuPubIndex),
+    GnuPubNames(CuNameIndex),
 }
 
 fn append_index_rejection(current: Option<String>, next: String) -> Option<String> {
@@ -44,11 +44,6 @@ fn select_fallback_index(
     mapped_file: &Arc<MappedFile>,
     mut rejection: Option<String>,
 ) -> Result<(DebugParseResult, InitialIndexSelection)> {
-    if parser.has_supplementary() {
-        return parser
-            .parse_debug_info(module_path)
-            .map(|index| (index, InitialIndexSelection::FullScan { rejection }));
-    }
     if has_gdb_index {
         return Ok((
             parser.initialize_lazy_debug_info(),
@@ -81,8 +76,8 @@ fn select_fallback_index(
 
     if let Some(sections) = gnu_pub_sections.as_ref() {
         match parser.parse_gnu_pubnames(sections, module_path) {
-            Ok((index, gnu_pub_index)) => {
-                return Ok((index, InitialIndexSelection::GnuPubNames(gnu_pub_index)));
+            Ok((index, cu_name_index)) => {
+                return Ok((index, InitialIndexSelection::GnuPubNames(cu_name_index)));
             }
             Err(error) => {
                 tracing::warn!(
@@ -271,11 +266,7 @@ impl LoadedObjfile {
         }
         let dwarf = Arc::new(dwarf);
         let mapped_file = mapped_file_for_dwarf;
-        let (gdb_index, gdb_index_rejection) = match if dwarf.sup().is_some() {
-            Ok(None)
-        } else {
-            Self::load_gdb_index(&mapped_file, &dwarf)
-        } {
+        let (gdb_index, gdb_index_rejection) = match Self::load_gdb_index(&mapped_file, &dwarf) {
             Ok(Some(index)) => {
                 tracing::info!(
                     "Found .gdb_index v{} with {} compilation units in {}",
@@ -320,8 +311,10 @@ impl LoadedObjfile {
                         },
                         || {
                             let parser = crate::parser::DwarfParser::new(&dwarf);
-                            match if dwarf.sup().is_some() { Ok(None) } else { parser.parse_debug_names(&module_path) } {
-                                Ok(Some(index)) => Ok((index, InitialIndexSelection::DebugNames)),
+                            match parser.parse_debug_names(&module_path) {
+                                Ok(Some((index, cu_names))) => {
+                                    Ok((index, InitialIndexSelection::DebugNames(cu_names)))
+                                },
                                 Ok(None) => select_fallback_index(
                                     &parser,
                                     &module_path,
@@ -368,14 +361,16 @@ impl LoadedObjfile {
 
         let (line_result, info_result, index_selection) = pair_result?;
         let lazy_debug_info = !matches!(index_selection, InitialIndexSelection::FullScan { .. });
-        let (gdb_index, gnu_pub_index, dwarf_index_status) = match index_selection {
+        let (gdb_index, cu_name_index, dwarf_index_status) = match index_selection {
             InitialIndexSelection::FullScan { rejection } => {
                 let status = rejection.map_or(DwarfIndexStatus::FullScan, |reason| {
                     DwarfIndexStatus::Rejected { reason }
                 });
                 (None, None, status)
             }
-            InitialIndexSelection::DebugNames => (None, None, DwarfIndexStatus::DebugNames),
+            InitialIndexSelection::DebugNames(cu_names) => {
+                (None, cu_names, DwarfIndexStatus::DebugNames)
+            }
             InitialIndexSelection::GdbIndex => {
                 let index = gdb_index.expect("selected GDB index must be loaded");
                 let status = DwarfIndexStatus::GdbIndex {
@@ -416,16 +411,11 @@ impl LoadedObjfile {
             stats,
         } = parse_result;
         let index_started_at = Instant::now();
-        let dwarf_for_types = Arc::clone(&dwarf);
-        let (lightweight_index, type_name_index) =
-            tokio::task::spawn_blocking(move || -> Result<_> {
-                let mut type_name_index = TypeNameIndex::build_from_lightweight(&lightweight_index);
-                if dwarf_for_types.sup().is_some() {
-                    type_name_index.extend_imports(&dwarf_for_types)?;
-                }
-                Ok((lightweight_index, type_name_index))
-            })
-            .await??;
+        let (lightweight_index, type_name_index) = tokio::task::spawn_blocking(move || {
+            let type_name_index = TypeNameIndex::build_from_lightweight(&lightweight_index);
+            (lightweight_index, type_name_index)
+        })
+        .await?;
         let dwarf =
             Arc::try_unwrap(dwarf).map_err(|_| anyhow::anyhow!("Failed to unwrap DWARF Arc"))?;
         let detailed_parser = DetailedParser::new();
@@ -470,7 +460,7 @@ impl LoadedObjfile {
             block_index: std::sync::RwLock::new(BlockIndex::new()),
             type_name_index: RwLock::new(type_name_index),
             gdb_index,
-            gnu_pub_index,
+            cu_name_index,
             dwarf_index_status,
             lazy_debug_info,
             indexed_debug_info_cus: Mutex::new(HashSet::new()),

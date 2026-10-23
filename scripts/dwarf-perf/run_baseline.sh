@@ -146,6 +146,7 @@ print_parse_summary() {
     echo "  p95: ${PARSE_P95_MS}ms"
     echo "  min: ${PARSE_MIN_MS}ms"
     echo "  max: ${PARSE_MAX_MS}ms"
+    echo "  selected indexes: ${PARSE_INDEX_USAGE}"
     echo "  internal modules: ${PARSE_INTERNAL_MODULE_COUNT}"
     echo "  parse phase avg: $(display_metric_ms "$PARSE_PHASE_AVG_MS")"
     echo "  parse phase p50: $(display_metric_ms "$PARSE_PHASE_P50_MS")"
@@ -232,6 +233,9 @@ run_parse_benchmark() {
     PARSE_P95_MS=$(require_json_value "parse p95" "$(printf '%s\n' "$parse_output" | awk '/P95:/ {gsub("ms","",$2); print $2}')" "$parse_output")
     PARSE_MIN_MS=$(require_json_value "parse min" "$(printf '%s\n' "$parse_output" | awk '/Min:/ {gsub("ms","",$2); print $2}')" "$parse_output")
     PARSE_MAX_MS=$(require_json_value "parse max" "$(printf '%s\n' "$parse_output" | awk '/Max:/ {gsub("ms","",$2); print $2}')" "$parse_output")
+    PARSE_INDEX_USAGE=$(optional_json_value "$(printf '%s\n' "$parse_output" | sed -n 's/^  Selected DWARF indexes: //p')")
+    python3 "$SCRIPT_DIR/validate_index_usage.py" --manifest "$MANIFEST_PATH" \
+        --target "$parse_target" --actual "$PARSE_INDEX_USAGE"
     PARSE_INTERNAL_MODULE_COUNT=$(optional_json_value "$(printf '%s\n' "$parse_output" | awk '/Internal module count:/ {print $4}')")
     PARSE_PHASE_AVG_MS=$(optional_json_value "$(printf '%s\n' "$parse_output" | awk '/Parse avg:/ {gsub("ms","",$3); print $3}')")
     PARSE_PHASE_P50_MS=$(optional_json_value "$(printf '%s\n' "$parse_output" | awk '/Parse p50:/ {gsub("ms","",$3); print $3}')")
@@ -275,6 +279,7 @@ write_baseline_json() {
         --argjson parse_p95_ms "$PARSE_P95_MS" \
         --argjson parse_min_ms "$PARSE_MIN_MS" \
         --argjson parse_max_ms "$PARSE_MAX_MS" \
+        --argjson parse_index_usage "$PARSE_INDEX_USAGE" \
         --argjson parse_internal_module_count "$PARSE_INTERNAL_MODULE_COUNT" \
         --argjson parse_phase_avg_ms "$PARSE_PHASE_AVG_MS" \
         --argjson parse_phase_p50_ms "$PARSE_PHASE_P50_MS" \
@@ -314,6 +319,7 @@ write_baseline_json() {
                 artifact_name: $parse_artifact_name,
                 binary: $parse_binary,
                 runs: $runs,
+                index_usage: $parse_index_usage,
                 metrics_ms: {
                     average: $parse_avg_ms,
                     p50: $parse_p50_ms,

@@ -250,10 +250,10 @@ impl LoadedObjfile {
                 .expect("lightweight index lock poisoned"),
             name,
         );
-        if candidates.is_empty() && self.uses_gnu_pub_index() {
-            if let Err(error) = self.ensure_all_debug_info_for_gnu_index() {
+        if candidates.is_empty() && self.uses_cu_name_index() {
+            if let Err(error) = self.ensure_all_debug_info_for_name_index() {
                 tracing::warn!(
-                    "Failed to exhaust GNU-indexed DWARF for function '{}' in {}: {}",
+                    "Failed to exhaust name-indexed DWARF for function '{}' in {}: {}",
                     name,
                     self.module_path().display(),
                     error
@@ -304,10 +304,10 @@ impl LoadedObjfile {
                 .expect("lightweight index lock poisoned"),
             name,
         );
-        if candidates.is_empty() && self.uses_gnu_pub_index() {
-            if let Err(error) = self.ensure_all_debug_info_for_gnu_index() {
+        if candidates.is_empty() && self.uses_cu_name_index() {
+            if let Err(error) = self.ensure_all_debug_info_for_name_index() {
                 tracing::warn!(
-                    "Failed to exhaust GNU-indexed DWARF for variable '{}' in {}: {}",
+                    "Failed to exhaust name-indexed DWARF for variable '{}' in {}: {}",
                     name,
                     self.module_path().display(),
                     error

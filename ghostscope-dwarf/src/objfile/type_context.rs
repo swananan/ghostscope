@@ -548,10 +548,7 @@ impl LoadedObjfile {
         segment: &VariableAccessSegment,
     ) -> Result<Option<TypeId>> {
         let current_loc = type_loc(current)?;
-        let type_name_index = self
-            .type_name_index
-            .read()
-            .expect("type name index lock poisoned");
+        let type_name_index = self.type_name_index()?;
         projected_type_loc(self.dwarf(), &type_name_index, current_loc, segment).map(|loc| {
             loc.map(|loc| {
                 type_id_from_loc(current.module, loc.in_context(current_loc.semantic_cu()))
@@ -567,10 +564,7 @@ impl LoadedObjfile {
         member_index: usize,
     ) -> Result<Option<TypeId>> {
         let current_loc = type_loc(current)?;
-        let type_name_index = self
-            .type_name_index
-            .read()
-            .expect("type name index lock poisoned");
+        let type_name_index = self.type_name_index()?;
         variant_member_type_loc(
             self.dwarf(),
             &type_name_index,
@@ -588,10 +582,7 @@ impl LoadedObjfile {
 
     pub(crate) fn type_summary(&self, current: TypeId) -> Result<Option<crate::TypeInfo>> {
         let normalized = {
-            let type_name_index = self
-                .type_name_index
-                .read()
-                .expect("type name index lock poisoned");
+            let type_name_index = self.type_name_index()?;
             normalize_type_loc(self.dwarf(), &type_name_index, type_loc(current)?)?
         };
         Ok(normalized.and_then(|loc| self.detailed_shallow_type_loc(loc)))
@@ -607,10 +598,7 @@ impl LoadedObjfile {
         index: usize,
     ) -> Result<Option<(TypeId, crate::TypeInfo)>> {
         let parameter_loc = {
-            let type_name_index = self
-                .type_name_index
-                .read()
-                .expect("type name index lock poisoned");
+            let type_name_index = self.type_name_index()?;
             template_type_parameter_loc(self.dwarf(), &type_name_index, type_loc(current)?, index)?
         };
         let Some(parameter_loc) = parameter_loc else {
@@ -628,10 +616,7 @@ impl LoadedObjfile {
     }
 
     pub(crate) fn type_alignment(&self, current: TypeId) -> Result<Option<u64>> {
-        let type_name_index = self
-            .type_name_index
-            .read()
-            .expect("type name index lock poisoned");
+        let type_name_index = self.type_name_index()?;
         type_alignment_from_dwarf(self.dwarf(), &type_name_index, type_loc(current)?)
     }
 
@@ -644,10 +629,7 @@ impl LoadedObjfile {
                 error
             );
         }
-        let type_name_index = self
-            .type_name_index
-            .read()
-            .expect("type name index lock poisoned");
+        let type_name_index = self.type_name_index().ok()?;
         [gimli::DW_TAG_structure_type, gimli::DW_TAG_class_type]
             .into_iter()
             .find_map(|tag| type_name_index.find_aggregate_definition(name, tag))

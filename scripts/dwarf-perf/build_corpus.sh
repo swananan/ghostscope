@@ -90,13 +90,14 @@ docker run --rm \
     "$IMAGE_REF" \
     bash /workspace/scripts/dwarf-perf/build_corpus_in_container.sh "$CONTAINER_OUT_DIR"
 
-echo "Host artifacts:"
-echo "  $OUT_DIR/query-hotspot/query_hotspot"
-echo "  $OUT_DIR/parse-stress/parse_stress"
-echo "  $OUT_DIR/gnu-pubnames-stress/gnu_pubnames_stress"
-echo "  $OUT_DIR/rust-parse-stress/rust_parse_stress"
-echo "  $OUT_DIR/cpp-template-stress/cpp_template_stress"
-echo "  $OUT_DIR/rust-generic-stress/rust_generic_stress"
-echo "  $OUT_DIR/cpp-deep-namespace/cpp_deep_namespace"
-echo "  $OUT_DIR/manifest.json"
-echo
+# Keep index tooling independent of the pinned compiler image and its outputs.
+INDEX_IMAGE=${DWARF_PERF_INDEX_TOOLS_IMAGE:-ghostscope-dwarf-perf-index-tools:local}
+if [[ -z "${DWARF_PERF_INDEX_TOOLS_IMAGE:-}" ]]; then
+    docker build -f "$REPO_ROOT/docker/dwarf-perf-builder/index-tools.Dockerfile" \
+        -t "$INDEX_IMAGE" "$REPO_ROOT/docker/dwarf-perf-builder"
+fi
+docker run --rm --user "$(id -u):$(id -g)" \
+    -v "$REPO_ROOT:/workspace" -w /workspace "$INDEX_IMAGE" \
+    python3 scripts/dwarf-perf/build_index_corpus.py "$CONTAINER_OUT_DIR"
+
+echo "Host corpus: $OUT_DIR (see manifest.json for all artifacts)"
