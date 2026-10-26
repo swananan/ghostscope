@@ -49,6 +49,9 @@ lazy_static! {
         Mutex::new(None);
     static ref COMPILE_INLINE_CALL_VALUE_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
+    static ref COMPILE_FUNCTION_ENTRY_RESULT: Mutex<Option<anyhow::Result<()>>> = Mutex::new(None);
+    static ref COMPILE_FUNCTION_ENTRY_CLANG_RESULT: Mutex<Option<anyhow::Result<()>>> =
+        Mutex::new(None);
     static ref COMPILE_PARTITIONED_RANGES_DEFAULT_RESULT: Mutex<Option<anyhow::Result<()>>> =
         Mutex::new(None);
     static ref COMPILE_PARTITIONED_RANGES_GCC_DWARF5_FUNCTION_SECTIONS_RESULT: Mutex<Option<anyhow::Result<()>>> =
@@ -89,6 +92,7 @@ enum RegisteredFixtureKind {
     RustGlobal,
     InlineCallsite,
     InlineCallValue,
+    FunctionEntry,
     PartitionedRanges,
     CppComplex,
     StaticScope,
@@ -208,6 +212,12 @@ const REGISTERED_FIXTURES: &[RegisteredFixture] = &[
         directory: "partitioned_ranges_program",
         cleanup: CleanupCommand::Make,
         kind: RegisteredFixtureKind::PartitionedRanges,
+    },
+    RegisteredFixture {
+        name: "function_entry_program",
+        directory: "function_entry_program",
+        cleanup: CleanupCommand::Make,
+        kind: RegisteredFixtureKind::FunctionEntry,
     },
     RegisteredFixture {
         name: "cpp_complex_program",
@@ -550,6 +560,14 @@ impl RegisteredFixture {
                 ensure_inline_call_value_program_compiled()?;
                 Ok(dir.join("inline_call_value_program"))
             }
+            RegisteredFixtureKind::FunctionEntry => {
+                ensure_function_entry_program_compiled(FixtureCompiler::Default)?;
+                match opt_level {
+                    OptimizationLevel::Debug => Ok(dir.join(self.name)),
+                    OptimizationLevel::O2 => Ok(dir.join(format!("{}_o2", self.name))),
+                    _ => anyhow::bail!("Unsupported optimization for function_entry_program"),
+                }
+            }
             RegisteredFixtureKind::PartitionedRanges => {
                 ensure_partitioned_ranges_program_compiled(FixtureCompiler::Default)?;
                 Ok(dir.join(FixtureCompiler::Default.binary_name(self.name)))
@@ -575,6 +593,12 @@ impl RegisteredFixture {
         compiler: FixtureCompiler,
     ) -> anyhow::Result<PathBuf> {
         match self.kind {
+            RegisteredFixtureKind::FunctionEntry => {
+                ensure_function_entry_program_compiled(compiler)?;
+                Ok(self
+                    .dir(fixtures_base)
+                    .join(compiler.binary_name(self.name)))
+            }
             RegisteredFixtureKind::InlineCallsite => {
                 ensure_inline_callsite_program_compiled(compiler)?;
                 Ok(self
@@ -1322,6 +1346,8 @@ static COMPILE_RUST_GLOBAL: Once = Once::new();
 static COMPILE_INLINE_CALLSITE_DEFAULT: Once = Once::new();
 static COMPILE_INLINE_CALLSITE_CLANG_DWARF5: Once = Once::new();
 static COMPILE_INLINE_CALL_VALUE: Once = Once::new();
+static COMPILE_FUNCTION_ENTRY: Once = Once::new();
+static COMPILE_FUNCTION_ENTRY_CLANG: Once = Once::new();
 static COMPILE_PARTITIONED_RANGES_DEFAULT: Once = Once::new();
 static COMPILE_PARTITIONED_RANGES_GCC_DWARF5_FUNCTION_SECTIONS: Once = Once::new();
 static COMPILE_PARTITIONED_RANGES_CLANG_DWARF5_RNGLISTX: Once = Once::new();
@@ -1963,6 +1989,29 @@ fn ensure_cpp_complex_program_compiled() -> anyhow::Result<()> {
         Some(Ok(())) => Ok(()),
         Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
         None => panic!("Compilation result should be set after call_once"),
+    }
+}
+
+fn ensure_function_entry_program_compiled(compiler: FixtureCompiler) -> anyhow::Result<()> {
+    let (once, slot) = match compiler {
+        FixtureCompiler::Default => (&COMPILE_FUNCTION_ENTRY, &*COMPILE_FUNCTION_ENTRY_RESULT),
+        FixtureCompiler::ClangDwarf5 => (
+            &COMPILE_FUNCTION_ENTRY_CLANG,
+            &*COMPILE_FUNCTION_ENTRY_CLANG_RESULT,
+        ),
+        _ => anyhow::bail!("Unsupported compiler for function_entry_program"),
+    };
+    once.call_once(|| {
+        *slot.lock().unwrap() = Some(compile_c_make_fixture(
+            "function_entry_program",
+            compiler,
+            "-Wall -Wextra -gdwarf-5",
+        ));
+    });
+    match slot.lock().unwrap().as_ref() {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+        None => unreachable!("Compilation result is set by call_once"),
     }
 }
 

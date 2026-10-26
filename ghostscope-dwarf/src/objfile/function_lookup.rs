@@ -13,6 +13,7 @@ use crate::{
         resolve_origin_entry, InlineFrame,
     },
 };
+use gimli::Reader as _;
 use std::collections::HashSet;
 
 // Optimized inline point entries observed from GCC/Clang sit only a few bytes
@@ -456,18 +457,35 @@ impl LoadedObjfile {
             crate::core::FunctionDieKind::ConcreteSubprogram => {
                 let preferred_start = self.preferred_non_inline_symbol_start(entry, &ranges);
                 let nranges = Self::selected_non_inline_ranges(entry, &ranges, preferred_start);
+                // Line rows describe source statements, not control-flow dominance.
+                // In optimized code even prologue_end can lie on only one path.
+                // Only move past entry when parameters need prologue setup,
+                // either for fixed callee-frame storage or a loclist whose
+                // first available location starts after entry.
                 for (start, end) in &nranges {
-                    let candidate = {
+                    let needs_prologue = self
+                        .function_parameters_need_prologue(entry, *start, *end)
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(
+                                "Failed to inspect parameter locations for '{}': {error}",
+                                entry.name
+                            );
+                            false
+                        });
+                    let candidate = if needs_prologue {
                         let first_exec = self
                             .line_mapping
                             .read()
                             .expect("line mapping lock poisoned")
                             .find_first_executable_address(*start, *end);
                         Self::selected_non_inline_probe_address(*start, *end, first_exec)
+                    } else {
+                        *start
                     };
-                    let prefer_entry = self
-                        .function_uses_entry_value_at(entry, candidate)
-                        .unwrap_or(false);
+                    let prefer_entry = candidate != *start
+                        && self
+                            .function_uses_entry_value_at(entry, candidate)
+                            .unwrap_or(false);
                     let addr = if prefer_entry { *start } else { candidate };
                     if prefer_entry {
                         tracing::debug!(
@@ -482,7 +500,7 @@ impl LoadedObjfile {
                         );
                         if addr == *start {
                             tracing::debug!(
-                                "Non-inline '{}' kept entry start because prologue-skip candidate escaped range [0x{start:x}, 0x{end:x})",
+                                "Non-inline '{}' kept entry start in range [0x{start:x}, 0x{end:x}), needs_prologue={needs_prologue}",
                                 entry.name
                             );
                         }
@@ -585,6 +603,101 @@ impl LoadedObjfile {
         } else {
             start
         }
+    }
+
+    fn function_parameters_need_prologue(
+        &self,
+        idx_entry: &crate::core::IndexEntry,
+        start: u64,
+        end: u64,
+    ) -> Result<bool> {
+        let dwarf = self.dwarf();
+        let unit = dwarf.unit(dwarf.unit_header(idx_entry.unit_offset)?)?;
+        let entry = unit.entry(idx_entry.die_offset)?;
+        let frame_base_is_cfa =
+            match resolve_attr_with_unit_origins(dwarf, &entry, &unit, gimli::DW_AT_frame_base)? {
+                Some(gimli::AttributeValue::Exprloc(expression)) => matches!(
+                    crate::dwarf_expr::ops::parse_single_op(
+                        expression.0,
+                        unit.encoding(),
+                        "parameter frame base",
+                    )?,
+                    Some(gimli::Operation::CallFrameCFA)
+                ),
+                _ => false,
+            };
+        let mut tree = unit.entries_tree(Some(idx_entry.die_offset))?;
+        let root = tree.root()?;
+        let mut children = root.children();
+        while let Some(child) = children.next()? {
+            let parameter = child.entry();
+            if parameter.tag() != gimli::DW_TAG_formal_parameter {
+                continue;
+            }
+            let Some(value) =
+                resolve_attr_with_unit_origins(dwarf, parameter, &unit, gimli::DW_AT_location)?
+            else {
+                continue;
+            };
+            if let gimli::AttributeValue::Exprloc(expression) = value {
+                if crate::dwarf_expr::ops::any_op(
+                    expression.0,
+                    unit.encoding(),
+                    "parameter frame location",
+                    // Nonnegative CFA offsets name incoming stack arguments,
+                    // already supplied by the caller, rather than callee spills.
+                    |op| {
+                        matches!(op, gimli::Operation::FrameOffset { offset }
+                        if !frame_base_is_cfa || *offset < 0)
+                    },
+                )? {
+                    return Ok(true);
+                }
+            } else if Self::parameter_location_starts_after_entry(dwarf, &unit, value, start, end)?
+            {
+                // Rust -O0 indirect aggregate parameters can have loclists
+                // beginning only after their argument pointers are spilled.
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn parameter_location_starts_after_entry(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        value: gimli::AttributeValue<DwarfReader>,
+        start: u64,
+        end: u64,
+    ) -> Result<bool> {
+        let value = match value {
+            gimli::AttributeValue::SecOffset(offset) => {
+                gimli::AttributeValue::LocationListsRef(gimli::LocationListsOffset(offset))
+            }
+            value => value,
+        };
+        let Some(mut locations) = dwarf.attr_locations(unit, value)? else {
+            return Ok(false);
+        };
+        let mut entry_available = None;
+        let mut default_available = false;
+        let mut later_available = false;
+        while let Some(location) = locations.next()? {
+            let available = !location.data.0.is_empty();
+            // gimli represents DW_LLE_default_location with the full range.
+            // An explicit entry range, including an empty expression, wins.
+            if location.range.begin == 0 && location.range.end == u64::MAX {
+                default_available = available;
+            } else if range_contains_pc(location.range.begin, location.range.end, start) {
+                if available {
+                    return Ok(false);
+                }
+                entry_available = Some(available);
+            } else if start < location.range.begin && location.range.begin < end && available {
+                later_available = true;
+            }
+        }
+        Ok(!entry_available.unwrap_or(default_available) && later_available)
     }
 
     fn function_uses_entry_value_at(
@@ -1202,6 +1315,61 @@ mod tests {
         let mut units = dwarf.units();
         let header = units.next().unwrap().unwrap();
         dwarf.unit(header).unwrap()
+    }
+
+    fn first_parameter_location(
+        unit: &gimli::Unit<DwarfReader>,
+    ) -> gimli::AttributeValue<DwarfReader> {
+        let mut entries = unit.entries();
+        while let Some(entry) = entries.next_dfs().unwrap() {
+            if entry.tag() == constants::DW_TAG_formal_parameter {
+                return entry.attr_value(constants::DW_AT_location).unwrap();
+            }
+        }
+        panic!("fixture has no formal parameter");
+    }
+
+    #[test]
+    fn parameter_loclist_only_delays_entry_when_a_later_location_is_available() {
+        let dwarf = build_origin_backed_entry_value_range_fixture(constants::DW_AT_abstract_origin);
+        let unit = first_unit(&dwarf);
+        let location = first_parameter_location(&unit);
+        assert!(LoadedObjfile::parameter_location_starts_after_entry(
+            &dwarf,
+            &unit,
+            location.clone(),
+            0x146f,
+            0x147b,
+        )
+        .unwrap());
+        assert!(!LoadedObjfile::parameter_location_starts_after_entry(
+            &dwarf,
+            &unit,
+            location.clone(),
+            0x1470,
+            0x147b,
+        )
+        .unwrap());
+        assert!(!LoadedObjfile::parameter_location_starts_after_entry(
+            &dwarf, &unit, location, 0x147b, 0x1480,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn parameter_loclist_default_location_keeps_entry_available() {
+        let dwarf = build_origin_backed_default_location_entry_value_fixture(
+            constants::DW_AT_abstract_origin,
+        );
+        let unit = first_unit(&dwarf);
+        assert!(!LoadedObjfile::parameter_location_starts_after_entry(
+            &dwarf,
+            &unit,
+            first_parameter_location(&unit),
+            0x146f,
+            0x147b,
+        )
+        .unwrap());
     }
 
     fn find_subprogram_with_origin_attr(

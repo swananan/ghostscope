@@ -2358,7 +2358,7 @@ async fn test_partitioned_ranges_lookup_prefers_hot_entry_over_cold_partition() 
 }
 
 #[tokio::test]
-async fn test_gcc_o3_duplicate_pc_rows_preserve_first_statement_address() -> anyhow::Result<()> {
+async fn test_gcc_o3_duplicate_pc_rows_do_not_move_function_entry() -> anyhow::Result<()> {
     init();
 
     if !fixture_compiler_available(FixtureCompiler::GccDwarf5FunctionSections) {
@@ -2378,7 +2378,7 @@ async fn test_gcc_o3_duplicate_pc_rows_preserve_first_statement_address() -> any
             .values()
             .flatten()
             .all(|row| !row.prologue_end),
-        "fixture should exercise the is_stmt fallback without DW_LNS_set_prologue_end"
+        "fixture should expose statement rows without DW_LNS_set_prologue_end"
     );
 
     let (&expected_address, expected_rows) = rows_by_address
@@ -2402,8 +2402,9 @@ async fn test_gcc_o3_duplicate_pc_rows_preserve_first_statement_address() -> any
     );
     assert_eq!(addrs[0].module_path, binary_path);
     assert_eq!(
-        addrs[0].address, expected_address,
-        "function lookup must consider every line row at a PC when selecting the first statement"
+        addrs[0].address, main_range.start,
+        "optimized main has no fixed frame parameters and must keep its entry, \
+         even when a later PC has a statement row hidden before a non-statement row"
     );
 
     Ok(())
