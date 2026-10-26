@@ -98,6 +98,14 @@ run_make_fixture inline_callsite_program \
 run_make_fixture inline_call_value_program clean
 run_make_fixture inline_call_value_program all
 
+run_make_fixture function_entry_program clean
+run_make_fixture function_entry_program all
+run_make_fixture function_entry_program \
+    all \
+    "CC=${CLANG_BIN}" \
+    "CFLAGS=-Wall -Wextra -gdwarf-5" \
+    "BINARY=function_entry_program_clang_dwarf5"
+
 run_make_fixture partitioned_ranges_program clean
 run_make_fixture partitioned_ranges_program all
 run_make_fixture partitioned_ranges_program \
