@@ -464,27 +464,24 @@ impl LightweightIndex {
 
     fn resolve_cu_root_ranges(
         dwarf: &gimli::Dwarf<DwarfReader>,
-        cu: DebugInfoOffset,
+        unit: &gimli::Unit<DwarfReader>,
     ) -> Option<Vec<(u64, u64)>> {
-        let header = dwarf.unit_header(cu).ok()?;
-        let unit = dwarf.unit(header).ok()?;
         let mut entries = unit.entries();
         let root = entries.next_dfs().ok()??;
-        RangeExtractor::extract_all_ranges(root, &unit, dwarf).ok()
+        RangeExtractor::extract_all_ranges(root, unit, dwarf).ok()
     }
 
     fn resolve_function_ranges(
         dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
         entry: &IndexEntry,
     ) -> Option<Vec<(u64, u64)>> {
         if !Self::is_function_tag(entry.tag) {
             return None;
         }
 
-        let header = dwarf.unit_header(entry.unit_offset).ok()?;
-        let unit = dwarf.unit(header).ok()?;
         let die = unit.entry(entry.die_offset).ok()?;
-        RangeExtractor::extract_all_ranges(&die, &unit, dwarf).ok()
+        RangeExtractor::extract_all_ranges(&die, unit, dwarf).ok()
     }
 
     /// Attach CU range map and per-CU function address map built from entries
@@ -505,7 +502,14 @@ impl LightweightIndex {
         }
 
         for (&cu, indices) in &self.func_indices_by_cu {
-            let root_ranges = Self::resolve_cu_root_ranges(dwarf, cu).unwrap_or_default();
+            let Ok(header) = dwarf.unit_header(cu) else {
+                continue;
+            };
+            // Reuse the parsed unit so fallback scans do not reparse its line table per DIE.
+            let Ok(unit) = dwarf.unit(header) else {
+                continue;
+            };
+            let root_ranges = Self::resolve_cu_root_ranges(dwarf, &unit).unwrap_or_default();
             if !root_ranges.is_empty() {
                 for (start, end) in root_ranges {
                     Self::insert_cu_range(&mut cu_ranges, start, end, cu);
@@ -517,7 +521,7 @@ impl LightweightIndex {
                 let Some(entry) = self.entries.get(idx) else {
                     continue;
                 };
-                let Some(ranges) = Self::resolve_function_ranges(dwarf, entry) else {
+                let Some(ranges) = Self::resolve_function_ranges(dwarf, &unit, entry) else {
                     continue;
                 };
                 for (start, end) in ranges {
@@ -589,7 +593,13 @@ impl LightweightIndex {
     ) -> bool {
         let mut added_any = false;
         for cu in compilation_units {
-            for (start, end) in Self::resolve_cu_root_ranges(dwarf, cu).unwrap_or_default() {
+            let Ok(header) = dwarf.unit_header(cu) else {
+                continue;
+            };
+            let Ok(unit) = dwarf.unit(header) else {
+                continue;
+            };
+            for (start, end) in Self::resolve_cu_root_ranges(dwarf, &unit).unwrap_or_default() {
                 added_any |= Self::insert_cu_range(&mut self.cu_ranges, start, end, cu);
             }
         }
