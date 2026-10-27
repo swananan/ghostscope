@@ -319,27 +319,50 @@ impl<'a> DwarfParser<'a> {
                 continue;
             };
             let tag = abbrev.tag();
-            let needs_full_entry = matches!(
+            let addressless_function = matches!(
                 tag,
-                gimli::constants::DW_TAG_subprogram
-                    | gimli::constants::DW_TAG_inlined_subroutine
-                    | gimli::constants::DW_TAG_variable
-                    | gimli::constants::DW_TAG_structure_type
-                    | gimli::constants::DW_TAG_class_type
-                    | gimli::constants::DW_TAG_union_type
-                    | gimli::constants::DW_TAG_enumeration_type
-                    | gimli::constants::DW_TAG_typedef
-            );
+                gimli::DW_TAG_subprogram | gimli::DW_TAG_inlined_subroutine
+            ) && !abbrev.attributes().iter().any(|spec| {
+                matches!(
+                    spec.name(),
+                    gimli::DW_AT_low_pc | gimli::DW_AT_entry_pc | gimli::DW_AT_ranges
+                )
+            });
+            let needs_full_entry = !addressless_function
+                && matches!(
+                    tag,
+                    gimli::constants::DW_TAG_subprogram
+                        | gimli::constants::DW_TAG_inlined_subroutine
+                        | gimli::constants::DW_TAG_variable
+                        | gimli::constants::DW_TAG_structure_type
+                        | gimli::constants::DW_TAG_class_type
+                        | gimli::constants::DW_TAG_union_type
+                        | gimli::constants::DW_TAG_enumeration_type
+                        | gimli::constants::DW_TAG_typedef
+                );
 
             if !needs_full_entry {
-                // Most DIEs are not indexable. Skip their attributes without materializing
-                // a full DebuggingInformationEntry so template-heavy CUs stay cheaper.
+                // Skip unindexable DIEs without decoding names or materializing
+                // entries. Abstract origin attributes remain readable on demand.
                 entries.skip_attributes(abbrev.attributes())?;
                 tag_stack.push((tag, entry_offset));
                 continue;
             }
 
             let raw_attrs = self.read_selected_raw_attrs(unit, &mut entries, abbrev)?;
+
+            if matches!(
+                tag,
+                gimli::DW_TAG_subprogram | gimli::DW_TAG_inlined_subroutine
+            ) && raw_attrs.low_pc.is_none()
+                && raw_attrs.entry_pc.is_none()
+                && raw_attrs.ranges_attr.is_none()
+            {
+                // Keep walking children; origins remain readable on demand.
+                // Do not resolve metadata or allocate index entries for this DIE.
+                tag_stack.push((tag, entry_offset));
+                continue;
+            }
 
             match tag {
                 gimli::constants::DW_TAG_subprogram => {
@@ -629,6 +652,12 @@ impl<'a> DwarfParser<'a> {
         linkage_name: Option<Arc<str>>,
         seed: &FunctionEntrySeed,
     ) {
+        // An empty range list can also leave a fully parsed function addressless.
+        // Accelerator seeds are inserted separately: their addresses are still
+        // unknown and must remain available for lazy CU materialization.
+        if seed.representative_addr.is_none() && seed.entry_pc.is_none() {
+            return;
+        }
         shard.push_function_entry(
             name.to_string(),
             Self::build_function_index_entry(Arc::clone(&name), seed),
