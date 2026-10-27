@@ -4,9 +4,10 @@ use super::{variables::complete_aggregate_declaration_entry, LoadedObjfile};
 use crate::{
     core::Result,
     semantics::{
-        resolve_attr_with_unit_origins, resolve_name_with_origins, resolve_type_definition_loc,
-        resolve_type_definition_ref_with_origins, resolve_type_ref_with_origins,
-        CompilationUnitMetadata, ProducerInfo, SourceLanguage, TypeLoc, VariableAccessSegment,
+        resolve_attr_with_unit_origins, resolve_name_with_origins,
+        resolve_type_definition_loc_with_unit, resolve_type_definition_ref_with_origins,
+        resolve_type_ref_with_origins, CompilationUnitMetadata, ProducerInfo, SourceLanguage,
+        TypeLoc, VariableAccessSegment,
     },
     CuId, ModuleId, TypeId,
 };
@@ -175,15 +176,28 @@ impl AggregateDefinitionResolver for LoadedObjfile {
 fn normalize_type_loc(
     dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
     type_resolver: &impl AggregateDefinitionResolver,
+    loc: TypeLoc,
+) -> Result<Option<TypeLoc>> {
+    let unit = loc.unit(dwarf)?;
+    normalize_type_loc_with_unit(dwarf, type_resolver, loc, unit)
+}
+
+fn normalize_type_loc_with_unit(
+    dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+    type_resolver: &impl AggregateDefinitionResolver,
     mut loc: TypeLoc,
+    mut unit: gimli::Unit<crate::binary::DwarfReader>,
 ) -> Result<Option<TypeLoc>> {
     let mut visited = HashSet::new();
     for _ in 0..MAX_TYPE_REFERENCE_DEPTH {
         let semantic_cu = loc.semantic_cu();
-        let Some(definition_loc) = resolve_type_definition_loc(dwarf, loc)? else {
+        let Some((definition_loc, definition_unit)) =
+            resolve_type_definition_loc_with_unit(dwarf, loc, unit)?
+        else {
             return Ok(None);
         };
         loc = definition_loc.in_context(semantic_cu);
+        unit = definition_unit;
         if !visited.insert((loc.object, loc.cu_off.0, loc.die_off.0)) {
             return Err(anyhow::anyhow!(
                 "cycle while resolving type DIE at {:?}:{:?}",
@@ -192,7 +206,6 @@ fn normalize_type_loc(
             ));
         }
 
-        let unit = loc.unit(dwarf)?;
         let entry = unit.entry(loc.die_off)?;
         match entry.tag() {
             gimli::DW_TAG_typedef
@@ -696,6 +709,85 @@ mod tests {
         int_array: TypeLoc,
         derived: TypeLoc,
         ambiguous_derived: TypeLoc,
+    }
+
+    #[test]
+    fn normalizes_local_type_chains_without_reparsing_the_line_table() {
+        let encoding = gimli::Encoding {
+            format: Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        };
+        let mut line = LineProgram::new(
+            encoding,
+            gimli::LineEncoding::default(),
+            gimli::write::LineString::String(b"/src".to_vec()),
+            None,
+            gimli::write::LineString::String(b"main.c".to_vec()),
+            None,
+        );
+        line.begin_sequence(Some(gimli::write::Address::Constant(0x1000)));
+        line.generate_row();
+        line.end_sequence(1);
+        let mut written = WriteDwarf::new();
+        let id = written.units.add(Unit::new(encoding, line));
+        let unit = written.units.get_mut(id);
+        let root = unit.root();
+        let base = unit.add(root, gimli::DW_TAG_base_type);
+        unit.get_mut(base).set(
+            gimli::DW_AT_name,
+            WriteAttributeValue::String(b"int".to_vec()),
+        );
+        let mut target = base;
+        for tag in [
+            gimli::DW_TAG_const_type,
+            gimli::DW_TAG_volatile_type,
+            gimli::DW_TAG_typedef,
+        ] {
+            let wrapper = unit.add(root, tag);
+            unit.get_mut(wrapper)
+                .set(gimli::DW_AT_type, WriteAttributeValue::UnitRef(target));
+            target = wrapper;
+        }
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        written.write(&mut sections).unwrap();
+        let mut dwarf = gimli::Dwarf::load(|id| {
+            Ok::<_, gimli::Error>(dwarf_reader_from_arc(Arc::from(
+                sections.get(id).map_or(&[][..], |section| section.slice()),
+            )))
+        })
+        .unwrap();
+        let header = dwarf.units().next().unwrap().unwrap();
+        let unit = dwarf.unit(header).unwrap();
+        let mut entries = unit.entries();
+        let mut base = None;
+        let mut alias = None;
+        while let Some(entry) = entries.next_dfs().unwrap() {
+            if entry.tag() == gimli::DW_TAG_base_type {
+                base = Some(entry.offset());
+            }
+            if entry.tag() == gimli::DW_TAG_typedef {
+                alias = Some(entry.offset());
+            }
+        }
+        let loc = TypeLoc {
+            object: crate::DwarfObjectId::Primary,
+            cu_off: unit.header.debug_info_offset().unwrap(),
+            die_off: alias.unwrap(),
+            importing_cu: None,
+        };
+        dwarf.debug_line = gimli::DebugLine::from(dwarf_reader_from_arc(Arc::from([])));
+        assert!(dwarf.unit(unit.header.clone()).is_err());
+        let normalized = normalize_type_loc_with_unit(&dwarf, &TypeNameIndex::default(), loc, unit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            normalized,
+            TypeLoc {
+                die_off: base.unwrap(),
+                ..loc
+            }
+        );
     }
 
     #[test]

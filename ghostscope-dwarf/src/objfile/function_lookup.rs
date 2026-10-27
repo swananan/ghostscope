@@ -21,6 +21,11 @@ use std::collections::HashSet;
 // caller-side setup PCs still fall back to the range start.
 const MAX_INLINE_POINT_ENTRY_PC_GAP: u64 = 32;
 
+enum ParameterRegisterClass {
+    Integer,
+    Sse,
+}
+
 fn function_name_for_display(
     entry: &crate::core::IndexEntry,
     rust_hashes: RustSymbolHashDisplay,
@@ -344,12 +349,7 @@ impl LoadedObjfile {
         }
 
         let dwarf = self.dwarf();
-        let header = dwarf
-            .unit_header(entry.unit_offset)
-            .map_err(|e| anyhow::anyhow!("unit header error: {e}"))?;
-        let unit = dwarf
-            .unit(header)
-            .map_err(|e| anyhow::anyhow!("unit load error: {e}"))?;
+        let unit = self.unit(entry.unit_offset)?;
         let die = unit
             .entry(entry.die_offset)
             .map_err(|e| anyhow::anyhow!("entry load error: {e}"))?;
@@ -612,7 +612,7 @@ impl LoadedObjfile {
         end: u64,
     ) -> Result<bool> {
         let dwarf = self.dwarf();
-        let unit = dwarf.unit(dwarf.unit_header(idx_entry.unit_offset)?)?;
+        let unit = self.unit(idx_entry.unit_offset)?;
         let entry = unit.entry(idx_entry.die_offset)?;
         let frame_base_is_cfa =
             match resolve_attr_with_unit_origins(dwarf, &entry, &unit, gimli::DW_AT_frame_base)? {
@@ -626,6 +626,17 @@ impl LoadedObjfile {
                 ),
                 _ => false,
             };
+        let normal_calling_convention = matches!(
+            resolve_attr_with_unit_origins(dwarf, &entry, &unit, gimli::DW_AT_calling_convention)?,
+            None | Some(gimli::AttributeValue::CallingConvention(
+                gimli::DW_CC_normal
+            ))
+        );
+        let mut integer_parameters = 0usize;
+        let mut sse_parameters = 0usize;
+        let mut parameter_index = 0;
+        let mut sysv_stack_offset = 0;
+        let mut scalar_layout = true;
         let mut tree = unit.entries_tree(Some(idx_entry.die_offset))?;
         let root = tree.root()?;
         let mut children = root.children();
@@ -634,23 +645,90 @@ impl LoadedObjfile {
             if parameter.tag() != gimli::DW_TAG_formal_parameter {
                 continue;
             }
+            // A positive CFA offset alone does not establish entry availability:
+            // GCC can omit the ms_abi marker; its register home slots also
+            // live above the CFA. Only exempt scalar arguments after exhausting
+            // their SysV register class (six integer or eight SSE arguments).
+            // Such arguments are also beyond the four register slots of ms_abi.
+            // Require the actual slot to agree with one of these caller layouts.
+            let on_stack = match Self::parameter_register_class(dwarf, &unit, parameter) {
+                Some(ParameterRegisterClass::Integer) => {
+                    let on_stack = integer_parameters >= 6;
+                    integer_parameters += 1;
+                    on_stack
+                }
+                Some(ParameterRegisterClass::Sse) => {
+                    let on_stack = sse_parameters >= 8;
+                    sse_parameters += 1;
+                    on_stack
+                }
+                None => {
+                    scalar_layout = false;
+                    false
+                }
+            };
+            let incoming_stack_offsets = (on_stack && scalar_layout && normal_calling_convention)
+                .then_some((sysv_stack_offset, parameter_index * 8));
+            if on_stack {
+                sysv_stack_offset += 8;
+            }
+            parameter_index += 1;
             let Some(value) =
                 resolve_attr_with_unit_origins(dwarf, parameter, &unit, gimli::DW_AT_location)?
             else {
                 continue;
             };
             if let gimli::AttributeValue::Exprloc(expression) = value {
-                if crate::dwarf_expr::ops::any_op(
+                let operations = crate::dwarf_expr::ops::parse_ops(
                     expression.0,
                     unit.encoding(),
                     "parameter frame location",
-                    // Nonnegative CFA offsets name incoming stack arguments,
-                    // already supplied by the caller, rather than callee spills.
-                    |op| {
-                        matches!(op, gimli::Operation::FrameOffset { offset }
-                        if !frame_base_is_cfa || *offset < 0)
-                    },
-                )? {
+                )?;
+                let cfa_offset = match operations.as_slice() {
+                    [gimli::Operation::FrameOffset { offset }] if frame_base_is_cfa => {
+                        Some(*offset)
+                    }
+                    [gimli::Operation::RegisterOffset {
+                        register, offset, ..
+                    }] if incoming_stack_offsets.is_some() => {
+                        // The expression may use a post-prologue RSP/RBP value.
+                        // Do not interpret it as an incoming slot if frame setup
+                        // changes the register's relation to the CFA.
+                        let statement = self
+                            .line_mapping
+                            .read()
+                            .expect("line mapping lock poisoned")
+                            .find_first_executable_address(start, end);
+                        let entry_cfa = self.unwind_info.get_cfa_result(start).ok().flatten();
+                        let statement_cfa =
+                            self.unwind_info.get_cfa_result(statement).ok().flatten();
+                        match entry_cfa {
+                            Some(crate::core::CfaResult::RegisterPlusOffset {
+                                register: cfa_register,
+                                offset: cfa_offset,
+                            }) if register.0 == cfa_register && entry_cfa == statement_cfa => {
+                                offset.checked_sub(cfa_offset)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let known_incoming_location = matches!((cfa_offset, incoming_stack_offsets),
+                    (Some(offset), Some((sysv, ms))) if offset == sysv || offset == ms);
+                if !known_incoming_location
+                    && operations.iter().any(|op| {
+                        matches!(
+                            op,
+                            gimli::Operation::FrameOffset { .. }
+                                | gimli::Operation::CallFrameCFA
+                                | gimli::Operation::RegisterOffset {
+                                    register: gimli::Register(6 | 7),
+                                    ..
+                                }
+                        )
+                    })
+                {
                     return Ok(true);
                 }
             } else if Self::parameter_location_starts_after_entry(dwarf, &unit, value, start, end)?
@@ -661,6 +739,73 @@ impl LoadedObjfile {
             }
         }
         Ok(false)
+    }
+
+    /// Identify only scalar types with an unambiguous x86-64 register class.
+    /// Unknown types do not establish that a parameter is caller-initialized.
+    fn parameter_register_class(
+        dwarf: &gimli::Dwarf<DwarfReader>,
+        unit: &gimli::Unit<DwarfReader>,
+        parameter: &gimli::DebuggingInformationEntry<DwarfReader>,
+    ) -> Option<ParameterRegisterClass> {
+        use crate::semantics::{origins::ResolvedUnit, resolve_type_ref_with_origins};
+        let mut loc = resolve_type_ref_with_origins(dwarf, parameter, unit).ok()??;
+        let mut type_unit = ResolvedUnit::Borrowed(unit);
+        let mut visited = HashSet::new();
+        while visited.len() < 64 && visited.insert((loc.object, loc.cu_off, loc.die_off)) {
+            if loc.object != crate::binary::references::unit_object(dwarf, &type_unit)
+                || type_unit.header.debug_info_offset() != Some(loc.cu_off)
+            {
+                type_unit = ResolvedUnit::Owned(Box::new(loc.unit(dwarf).ok()?));
+            }
+            let entry = type_unit.entry(loc.die_off).ok()?;
+            let size = entry
+                .attr_value(gimli::DW_AT_byte_size)
+                .and_then(crate::core::attr_u64);
+            match entry.tag() {
+                gimli::DW_TAG_typedef
+                | gimli::DW_TAG_const_type
+                | gimli::DW_TAG_volatile_type
+                | gimli::DW_TAG_restrict_type
+                | gimli::DW_TAG_atomic_type => {
+                    loc = resolve_type_ref_with_origins(dwarf, &entry, &type_unit).ok()??;
+                }
+                gimli::DW_TAG_pointer_type
+                | gimli::DW_TAG_reference_type
+                | gimli::DW_TAG_rvalue_reference_type
+                    if matches!(
+                        size.unwrap_or(u64::from(type_unit.header.address_size())),
+                        1..=8
+                    ) =>
+                {
+                    return Some(ParameterRegisterClass::Integer);
+                }
+                gimli::DW_TAG_enumeration_type if matches!(size, Some(1..=8)) => {
+                    return Some(ParameterRegisterClass::Integer);
+                }
+                gimli::DW_TAG_base_type if matches!(size, Some(1..=8)) => {
+                    return match entry.attr_value(gimli::DW_AT_encoding) {
+                        Some(gimli::AttributeValue::Encoding(
+                            gimli::DW_ATE_signed
+                            | gimli::DW_ATE_unsigned
+                            | gimli::DW_ATE_signed_char
+                            | gimli::DW_ATE_unsigned_char
+                            | gimli::DW_ATE_boolean
+                            | gimli::DW_ATE_address
+                            | gimli::DW_ATE_UTF,
+                        )) => Some(ParameterRegisterClass::Integer),
+                        Some(gimli::AttributeValue::Encoding(gimli::DW_ATE_float))
+                            if matches!(size, Some(4 | 8)) =>
+                        {
+                            Some(ParameterRegisterClass::Sse)
+                        }
+                        _ => None,
+                    };
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     fn parameter_location_starts_after_entry(
@@ -706,12 +851,7 @@ impl LoadedObjfile {
         pc: u64,
     ) -> Result<bool> {
         let dwarf = self.dwarf();
-        let header = dwarf
-            .unit_header(idx_entry.unit_offset)
-            .map_err(|e| anyhow::anyhow!("unit header error: {e}"))?;
-        let unit = dwarf
-            .unit(header)
-            .map_err(|e| anyhow::anyhow!("unit load error: {e}"))?;
+        let unit = self.unit(idx_entry.unit_offset)?;
         let entry = unit
             .entry(idx_entry.die_offset)
             .map_err(|e| anyhow::anyhow!("entry load error: {e}"))?;
@@ -1078,7 +1218,18 @@ mod tests {
         };
 
         let mut dwarf = WriteDwarf::new();
-        let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+        let mut line = LineProgram::new(
+            encoding,
+            gimli::LineEncoding::default(),
+            gimli::write::LineString::String(b"/src".to_vec()),
+            None,
+            gimli::write::LineString::String(b"main.c".to_vec()),
+            None,
+        );
+        line.begin_sequence(Some(Address::Constant(0x1000)));
+        line.generate_row();
+        line.end_sequence(1);
+        let unit_id = dwarf.units.add(Unit::new(encoding, line));
         let unit = dwarf.units.get_mut(unit_id);
         let root = unit.root();
 
@@ -1574,6 +1725,109 @@ mod tests {
             LoadedObjfile::subprogram_uses_entry_value(&dwarf, &unit, &concrete).unwrap(),
             "entry_value should be discovered through DW_AT_abstract_origin"
         );
+    }
+
+    #[test]
+    fn local_origins_work_without_reparsing_primary_or_supplementary_line_tables() {
+        for supplementary in [false, true] {
+            for attr in [
+                constants::DW_AT_abstract_origin,
+                constants::DW_AT_specification,
+            ] {
+                let mut dwarf = build_origin_backed_entry_value_fixture(attr);
+                let unit = first_unit(&dwarf);
+                let concrete = unit
+                    .entry(find_subprogram_with_origin_attr(&unit, attr))
+                    .unwrap();
+                let gimli::AttributeValue::UnitRef(offset) = concrete.attr_value(attr).unwrap()
+                else {
+                    panic!("expected a local origin reference");
+                };
+                // A second parse must fail; the already parsed unit remains usable.
+                dwarf.debug_line = gimli::DebugLine::from(dwarf_reader_from_arc(Arc::from([])));
+                assert!(dwarf.unit(unit.header.clone()).is_err());
+                if supplementary {
+                    let mut primary = gimli::Dwarf::load(|_| {
+                        Ok::<_, gimli::Error>(dwarf_reader_from_arc(Arc::from([])))
+                    })
+                    .unwrap();
+                    primary.set_sup(dwarf);
+                    dwarf = primary;
+                }
+                for reference in [
+                    gimli::AttributeValue::UnitRef(offset),
+                    gimli::AttributeValue::DebugInfoRef(
+                        offset.to_debug_info_offset(&unit.header).unwrap(),
+                    ),
+                ] {
+                    let (_, origin_unit, origin) =
+                        crate::semantics::resolve_origin_entry(&dwarf, &unit, reference)
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(origin.offset(), offset);
+                    assert_eq!(
+                        crate::semantics::resolve_name_with_origins(&dwarf, &origin_unit, &origin)
+                            .unwrap()
+                            .as_deref(),
+                        Some("entry_value_target")
+                    );
+                }
+                assert_eq!(
+                    crate::semantics::resolve_name_with_origins(&dwarf, &unit, &concrete)
+                        .unwrap()
+                        .as_deref(),
+                    Some("entry_value_target")
+                );
+                assert!(
+                    LoadedObjfile::subprogram_uses_entry_value(&dwarf, &unit, &concrete).unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn function_queries_reuse_the_cached_unit_across_different_dies() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("functions.c");
+        let binary = dir.path().join("functions");
+        std::fs::write(&source, "int first(int x) { return x + 1; }\nint second(int x) { return x + 2; }\nint main(void) { return first(second(1)); }\n")?;
+        let output = std::process::Command::new("cc")
+            .args(["-g", "-O0", "-o"])
+            .arg(&binary)
+            .arg(&source)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut module = LoadedObjfile::load_parallel(
+            crate::core::mapping::ModuleMapping::from_path(binary),
+            &[],
+            false,
+            None,
+            None,
+        )
+        .await?;
+        let entries = {
+            let index = module.lightweight_index.read().unwrap();
+            ["first", "second"]
+                .into_iter()
+                .map(|name| index.find_dies_by_function_name(name)[0].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(entries[0].unit_offset, entries[1].unit_offset);
+        let unit = module.unit(entries[0].unit_offset)?;
+        module.dwarf.debug_line = gimli::DebugLine::from(dwarf_reader_from_arc(Arc::from([])));
+        assert!(module.dwarf.unit(unit.header.clone()).is_err());
+        for entry in entries {
+            let ranges = module.resolve_function_ranges(&entry)?;
+            assert!(!ranges.is_empty());
+            let (start, end) = ranges[0];
+            module.function_parameters_need_prologue(&entry, start, end)?;
+            assert!(!module.function_uses_entry_value_at(&entry, start)?);
+        }
+        Ok(())
     }
 
     #[test]

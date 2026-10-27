@@ -8,7 +8,24 @@ use std::collections::HashSet;
 type DwarfUnit = gimli::Unit<DwarfReader>;
 type DwarfEntry = gimli::DebuggingInformationEntry<DwarfReader>;
 
-pub(crate) type ResolvedOriginEntry = (gimli::DebugInfoOffset, DwarfUnit, DwarfEntry);
+/// Local references borrow the caller's unit; cross-unit references own their parsed unit.
+pub(crate) enum ResolvedUnit<'a> {
+    Borrowed(&'a DwarfUnit),
+    Owned(Box<DwarfUnit>),
+}
+
+impl std::ops::Deref for ResolvedUnit<'_> {
+    type Target = DwarfUnit;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(unit) => unit,
+            Self::Owned(unit) => unit,
+        }
+    }
+}
+
+pub(crate) type ResolvedOriginEntry<'a> = (gimli::DebugInfoOffset, ResolvedUnit<'a>, DwarfEntry);
 pub(crate) type ResolvedUnitEntry = (DwarfUnit, DwarfEntry);
 
 pub(crate) fn resolve_attr_with_unit_origins(
@@ -72,32 +89,31 @@ fn resolve_debug_info_ref(
     Ok(None)
 }
 
-fn reload_current_unit(
+pub(crate) fn resolve_origin_entry<'a>(
     dwarf: &gimli::Dwarf<DwarfReader>,
-    unit: &DwarfUnit,
-) -> gimli::read::Result<DwarfUnit> {
-    unit_dwarf(dwarf, unit)?.unit(unit.header.clone())
-}
-
-pub(crate) fn resolve_origin_entry(
-    dwarf: &gimli::Dwarf<DwarfReader>,
-    unit: &DwarfUnit,
+    unit: &'a DwarfUnit,
     value: gimli::AttributeValue<DwarfReader>,
-) -> gimli::read::Result<Option<ResolvedOriginEntry>> {
+) -> gimli::read::Result<Option<ResolvedOriginEntry<'a>>> {
     match value {
         gimli::AttributeValue::UnitRef(offset) => {
             let Some(debug_info_off) = offset.to_debug_info_offset(&unit.header) else {
                 return Ok(None);
             };
-            let origin_unit = reload_current_unit(dwarf, unit)?;
-            let origin_entry = origin_unit.entry(offset)?;
-            Ok(Some((debug_info_off, origin_unit, origin_entry)))
+            let origin_entry = unit.entry(offset)?;
+            Ok(Some((
+                debug_info_off,
+                ResolvedUnit::Borrowed(unit),
+                origin_entry,
+            )))
         }
         gimli::AttributeValue::DebugInfoRef(debug_info_off) => {
             if let Some(unit_off) = debug_info_off.to_unit_offset(&unit.header) {
-                let origin_unit = reload_current_unit(dwarf, unit)?;
-                let origin_entry = origin_unit.entry(unit_off)?;
-                return Ok(Some((debug_info_off, origin_unit, origin_entry)));
+                let origin_entry = unit.entry(unit_off)?;
+                return Ok(Some((
+                    debug_info_off,
+                    ResolvedUnit::Borrowed(unit),
+                    origin_entry,
+                )));
             }
 
             let Some((origin_unit, origin_entry)) =
@@ -105,12 +121,16 @@ pub(crate) fn resolve_origin_entry(
             else {
                 return Ok(None);
             };
-            Ok(Some((debug_info_off, origin_unit, origin_entry)))
+            Ok(Some((
+                debug_info_off,
+                ResolvedUnit::Owned(Box::new(origin_unit)),
+                origin_entry,
+            )))
         }
         gimli::AttributeValue::DebugInfoRefSup(debug_info_off) => {
             let supplementary = crate::DwarfObjectId::Supplementary.dwarf(dwarf)?;
             Ok(resolve_debug_info_ref(supplementary, debug_info_off)?
-                .map(|(unit, entry)| (debug_info_off, unit, entry)))
+                .map(|(unit, entry)| (debug_info_off, ResolvedUnit::Owned(Box::new(unit)), entry)))
         }
         _ => Ok(None),
     }
