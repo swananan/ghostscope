@@ -212,8 +212,8 @@ enum DieRef {
     Supplementary(gimli::DebugInfoOffset),
 }
 
-struct ResolvedRawDieAttrs {
-    unit: Option<gimli::Unit<DwarfReader>>,
+struct ResolvedRawDieAttrs<'a> {
+    unit: crate::semantics::origins::ResolvedUnit<'a>,
     offset: gimli::UnitOffset,
     absolute_offset: (crate::DwarfObjectId, gimli::DebugInfoOffset),
     attrs: RawDieAttrs,
@@ -781,11 +781,11 @@ impl<'a> DwarfParser<'a> {
         Ok(attrs)
     }
 
-    fn read_attrs_for_die_ref(
+    fn read_attrs_for_die_ref<'unit>(
         &self,
-        current_unit: &gimli::Unit<DwarfReader>,
+        current_unit: &'unit gimli::Unit<DwarfReader>,
         reference: DieRef,
-    ) -> Result<Option<ResolvedRawDieAttrs>> {
+    ) -> Result<Option<ResolvedRawDieAttrs<'unit>>> {
         // Most origins are local. Reuse the already-parsed unit and raw
         // attributes instead of rebuilding its (potentially huge) line header.
         let local = match reference {
@@ -798,7 +798,7 @@ impl<'a> DwarfParser<'a> {
                 return Ok(None);
             };
             return Ok(Some(ResolvedRawDieAttrs {
-                unit: None,
+                unit: crate::semantics::origins::ResolvedUnit::Borrowed(current_unit),
                 offset,
                 absolute_offset: (
                     crate::binary::references::unit_object(self.dwarf, current_unit),
@@ -824,7 +824,7 @@ impl<'a> DwarfParser<'a> {
                 absolute,
             ),
             offset: entry.offset(),
-            unit: Some(unit),
+            unit,
             attrs,
         }))
     }
@@ -875,7 +875,7 @@ impl<'a> DwarfParser<'a> {
                 continue;
             }
 
-            let origin_unit = origin.unit.as_ref().unwrap_or(unit);
+            let origin_unit = &origin.unit;
             if let Some(name) =
                 self.resolve_name_from_raw(origin_unit, origin.offset, &origin.attrs, visited)?
             {
@@ -937,7 +937,7 @@ impl<'a> DwarfParser<'a> {
             let origin_metadata = if let Some(cached) = cache.get(&origin.absolute_offset) {
                 cached.clone()
             } else {
-                let origin_unit = origin.unit.as_ref().unwrap_or(unit);
+                let origin_unit = &origin.unit;
                 self.resolve_function_metadata_from_raw(
                     origin_unit,
                     origin.offset,

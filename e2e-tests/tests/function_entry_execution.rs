@@ -93,6 +93,74 @@ async fn test_function_entry_gcc_o0_preserves_spilled_parameters() -> anyhow::Re
     assert_both_branches_and_parameters(&binary).await
 }
 
+async fn assert_fixed_spill_parameters(binary: &Path, name: &str) -> anyhow::Result<()> {
+    let bytes = std::fs::read(binary)?;
+    let object = object::File::parse(bytes.as_slice())?;
+    let symbol = object
+        .symbols()
+        .find(|s| s.name().ok() == Some(name))
+        .unwrap();
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(binary).await?;
+    let addresses = analyzer.lookup_function_addresses(name);
+    assert_eq!(addresses.len(), 1, "{name}: {addresses:?}");
+    assert!(
+        addresses[0].address > symbol.address()
+            && addresses[0].address < symbol.address() + symbol.size(),
+        "{name} must wait for callee-frame stores: {addresses:?}"
+    );
+
+    let target = common::targets::TargetLauncher::binary(binary)
+        .spawn()
+        .await?;
+    let result = common::runner::GhostscopeRunner::new()
+        .with_script(&format!(
+            "trace {name} {{ print \"SPILL:{{}}:{{}}\", x, y; }}"
+        ))
+        .attach_to(&target)
+        .timeout_secs(4)
+        .enable_sysmon_for_target(false)
+        .run()
+        .await;
+    target.terminate().await?;
+    let (exit_code, stdout, stderr) = result?;
+    assert_eq!(exit_code, 0, "stderr={stderr}\nstdout={stdout}");
+    let regex = Regex::new(r"SPILL:(-?\d+):(-?\d+)")?;
+    let samples: BTreeSet<(i32, i32)> = regex
+        .captures_iter(&stdout)
+        .map(|caps| Ok((caps[1].parse()?, caps[2].parse()?)))
+        .collect::<anyhow::Result<_>>()?;
+    assert_eq!(
+        samples,
+        BTreeSet::from([(-7, 31), (7, 31)]),
+        "{name}: samples={samples:?}\nstdout={stdout}\nstderr={stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_function_entry_gcc_o0_realigned_parameters() -> anyhow::Result<()> {
+    init();
+    let binary = FIXTURES.get_test_binary("function_entry_program")?;
+    assert_fixed_spill_parameters(&binary, "realigned_spill").await
+}
+
+#[tokio::test]
+async fn test_function_entry_gcc_o0_ms_abi_home_slots() -> anyhow::Result<()> {
+    init();
+    let binary = FIXTURES.get_test_binary("function_entry_program")?;
+    assert_fixed_spill_parameters(&binary, "home_slot_spill").await
+}
+
+#[tokio::test]
+async fn test_function_entry_gcc_o0_spills_without_frame_pointer() -> anyhow::Result<()> {
+    init();
+    let binary = FIXTURES
+        .get_test_binary("function_entry_program")?
+        .with_file_name("function_entry_program_omit_fp");
+    assert_fixed_spill_parameters(&binary, "realigned_spill").await?;
+    assert_fixed_spill_parameters(&binary, "home_slot_spill").await
+}
+
 #[tokio::test]
 async fn test_function_entry_clang_preserves_parameters_at_o0_and_o2() -> anyhow::Result<()> {
     init();

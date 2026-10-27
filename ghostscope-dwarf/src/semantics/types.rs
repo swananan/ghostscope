@@ -129,8 +129,18 @@ fn type_loc_from_attr_value(
 /// instead of referencing the type-unit signature directly with `DW_FORM_ref_sig8`.
 pub(crate) fn resolve_type_definition_loc(
     dwarf: &gimli::Dwarf<DwarfReader>,
-    mut loc: TypeLoc,
+    loc: TypeLoc,
 ) -> crate::core::Result<Option<TypeLoc>> {
+    let unit = loc.unit(dwarf)?;
+    Ok(resolve_type_definition_loc_with_unit(dwarf, loc, unit)?.map(|(loc, _)| loc))
+}
+
+/// Retain the parsed unit so callers walking type chains can reuse it.
+pub(crate) fn resolve_type_definition_loc_with_unit(
+    dwarf: &gimli::Dwarf<DwarfReader>,
+    mut loc: TypeLoc,
+    mut unit: gimli::Unit<DwarfReader>,
+) -> crate::core::Result<Option<(TypeLoc, gimli::Unit<DwarfReader>)>> {
     const MAX_SIGNATURE_DEPTH: usize = 64;
     let mut visited = std::collections::HashSet::new();
 
@@ -139,16 +149,19 @@ pub(crate) fn resolve_type_definition_loc(
             return Ok(None);
         }
 
-        let source = loc.object.dwarf(dwarf)?;
-        let header = source.unit_header(loc.cu_off)?;
-        let unit = source.unit(header)?;
+        if loc.object != unit_object(dwarf, &unit)
+            || unit.header.debug_info_offset() != Some(loc.cu_off)
+        {
+            unit = loc.unit(dwarf)?;
+        }
         let entry = unit.entry(loc.die_off)?;
         let Some(value) = entry.attr_value(gimli::constants::DW_AT_signature) else {
-            return Ok(Some(loc));
+            return Ok(Some((loc, unit)));
         };
         let gimli::AttributeValue::DebugTypesRef(signature) = value else {
-            return Ok(Some(loc));
+            return Ok(Some((loc, unit)));
         };
+        let source = loc.object.dwarf(dwarf)?;
         let Some(definition) = type_unit_loc_by_signature(source, signature)? else {
             return Ok(None);
         };
