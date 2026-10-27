@@ -85,6 +85,14 @@ fn non_utf8_names_do_not_alias_valid_unicode_names() {
                 gimli::DW_AT_name,
                 WriteAttributeValue::String(name.to_vec()),
             );
+            if tag == gimli::DW_TAG_subprogram {
+                unit.get_mut(id).set(
+                    gimli::DW_AT_low_pc,
+                    WriteAttributeValue::Address(Address::Constant(0x1000)),
+                );
+                unit.get_mut(id)
+                    .set(gimli::DW_AT_high_pc, WriteAttributeValue::Udata(0x10));
+            }
         }
     }
     let dwarf = write_dwarf_to_read(written);
@@ -368,6 +376,10 @@ fn build_inline_origin_fixture() -> gimli::Dwarf<DwarfReader> {
         WriteAttributeValue::String(b"CGPsend".to_vec()),
     );
     abstract_fn.set(
+        gimli::DW_AT_linkage_name,
+        WriteAttributeValue::String(b"_Z7CGPsendv".to_vec()),
+    );
+    abstract_fn.set(
         gimli::constants::DW_AT_inline,
         WriteAttributeValue::Inline(gimli::DW_INL_inlined),
     );
@@ -395,6 +407,10 @@ fn build_inline_origin_fixture() -> gimli::Dwarf<DwarfReader> {
     unit.get_mut(inlined_id).set(
         gimli::constants::DW_AT_abstract_origin,
         WriteAttributeValue::UnitRef(abstract_id),
+    );
+    unit.get_mut(inlined_id).set(
+        gimli::DW_AT_entry_pc,
+        WriteAttributeValue::Address(Address::Constant(0x8ea000)),
     );
 
     let mut sections = Sections::new(EndianVec::new(LittleEndian));
@@ -804,6 +820,96 @@ fn parse_debug_info_skips_stack_value_address_locals_from_global_index() {
 }
 
 #[test]
+fn parse_debug_info_omits_addressless_functions_and_preserves_range_and_point_entries() {
+    use gimli::write::{Range, RangeList};
+    for version in [4, 5] {
+        let mut written = WriteDwarf::new();
+        let id = written.units.add(Unit::new(
+            gimli::Encoding {
+                format: Format::Dwarf32,
+                version,
+                address_size: 8,
+            },
+            LineProgram::none(),
+        ));
+        let unit = written.units.get_mut(id);
+        let root = unit.root();
+        let empty_ranges = unit.ranges.add(RangeList(Vec::new()));
+        for tag in [gimli::DW_TAG_subprogram, gimli::DW_TAG_inlined_subroutine] {
+            for index in 0..128 {
+                let id = unit.add(root, tag);
+                unit.get_mut(id).set(
+                    gimli::DW_AT_name,
+                    WriteAttributeValue::String(format!("unused_{tag:?}_{index}").into_bytes()),
+                );
+                unit.get_mut(id).set(
+                    gimli::DW_AT_linkage_name,
+                    WriteAttributeValue::String(
+                        format!("unused_alias_{tag:?}_{index}").into_bytes(),
+                    ),
+                );
+                if tag == gimli::DW_TAG_subprogram {
+                    unit.get_mut(id)
+                        .set(gimli::DW_AT_declaration, WriteAttributeValue::Flag(true));
+                }
+            }
+            let empty = unit.add(root, tag);
+            unit.get_mut(empty).set(
+                gimli::DW_AT_name,
+                WriteAttributeValue::String(format!("empty_{tag:?}").into_bytes()),
+            );
+            unit.get_mut(empty).set(
+                gimli::DW_AT_ranges,
+                WriteAttributeValue::RangeListRef(empty_ranges),
+            );
+        }
+        let ranges = unit.ranges.add(RangeList(vec![Range::StartEnd {
+            begin: Address::Constant(0x3000),
+            end: Address::Constant(0x3010),
+        }]));
+        let ranged = unit.add(root, gimli::DW_TAG_subprogram);
+        unit.get_mut(ranged).set(
+            gimli::DW_AT_name,
+            WriteAttributeValue::String(b"ranged".to_vec()),
+        );
+        unit.get_mut(ranged).set(
+            gimli::DW_AT_ranges,
+            WriteAttributeValue::RangeListRef(ranges),
+        );
+        let point = unit.add(root, gimli::DW_TAG_inlined_subroutine);
+        unit.get_mut(point).set(
+            gimli::DW_AT_name,
+            WriteAttributeValue::String(b"point".to_vec()),
+        );
+        unit.get_mut(point).set(
+            gimli::DW_AT_entry_pc,
+            WriteAttributeValue::Address(Address::Constant(0x2000)),
+        );
+
+        let dwarf = write_dwarf_to_read(written);
+        let result = DwarfParser::new(&dwarf)
+            .parse_debug_info("synthetic")
+            .unwrap();
+        let index = &result.lightweight_index;
+        assert_eq!(result.functions_count, 2);
+        assert_eq!(index.get_stats(), (2, 0, 2));
+        assert!(index
+            .function_candidate_indices_by_fragment("unused")
+            .is_empty());
+        assert_eq!(
+            index.find_dies_by_function_name("ranged")[0].representative_addr,
+            Some(0x3000)
+        );
+        let entries = index.find_dies_by_function_name("point");
+        assert_eq!(entries.len(), 1);
+        let entry = entries[0];
+        assert_eq!(entry.name.as_ref(), "point");
+        assert!(entry.is_inline_instance());
+        assert_eq!(entry.entry_pc, Some(0x2000));
+    }
+}
+
+#[test]
 fn parse_debug_info_keeps_concrete_abstract_origin_subprogram_non_inline() {
     // Regression scenario:
     // GCC/Clang can emit all three DIE shapes for one logical function:
@@ -819,7 +925,7 @@ fn parse_debug_info_keeps_concrete_abstract_origin_subprogram_non_inline() {
     //
     // This test keeps the synthetic DIE graph minimal and asserts the parser
     // preserves the intended split:
-    // - abstract definition stays inline
+    // - abstract definition is omitted from the index but supplies origin metadata
     // - concrete out-of-line body stays non-inline
     // - inlined_subroutine instance stays inline
     let dwarf = build_inline_origin_fixture();
@@ -853,8 +959,8 @@ fn parse_debug_info_keeps_concrete_abstract_origin_subprogram_non_inline() {
     );
     assert_eq!(
         abstract_entries.len(),
-        1,
-        "only the abstract inline definition should carry the inline flag: {entries:?}"
+        0,
+        "addressless abstract definitions should not be probe candidates: {entries:?}"
     );
     assert_eq!(
         inlined_entries.len(),
@@ -869,10 +975,17 @@ fn parse_debug_info_keeps_concrete_abstract_origin_subprogram_non_inline() {
         !concrete_entries[0].flags.has_inline_attribute,
         "concrete out-of-line body should not inherit the abstract inline attribute: {entries:?}"
     );
-    assert!(
-        abstract_entries[0].flags.has_inline_attribute,
-        "abstract definition should retain its original DW_AT_inline attribute: {entries:?}"
+    assert_eq!(entries.len(), 2);
+    assert_eq!(inlined_entries[0].entry_pc, Some(0x8ea000));
+    let aliases = result
+        .lightweight_index
+        .find_dies_by_function_name("_Z7CGPsendv");
+    assert_eq!(
+        aliases.len(),
+        2,
+        "both concrete instances should inherit the linkage alias"
     );
+    assert!(aliases.iter().all(|entry| entry.flags.is_linkage));
 }
 
 #[test]
@@ -884,6 +997,11 @@ fn parse_debug_info_resolves_cross_cu_origin_names_for_index_entries() {
     let function_entries = result
         .lightweight_index
         .find_dies_by_function_name("cross_cu_origin_fn");
+    assert_eq!(
+        function_entries.len(),
+        1,
+        "the origin-only CU should add no function entries"
+    );
     assert!(
         function_entries.iter().any(|entry| {
             entry.function_kind() == crate::core::FunctionDieKind::ConcreteSubprogram
