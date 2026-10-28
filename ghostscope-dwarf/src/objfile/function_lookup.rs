@@ -14,6 +14,7 @@ use crate::{
     },
 };
 use gimli::Reader as _;
+use object::{Object, ObjectSection};
 use std::collections::HashSet;
 
 // Optimized inline point entries observed from GCC/Clang sit only a few bytes
@@ -21,9 +22,11 @@ use std::collections::HashSet;
 // caller-side setup PCs still fall back to the range start.
 const MAX_INLINE_POINT_ENTRY_PC_GAP: u64 = 32;
 
-enum ParameterRegisterClass {
+#[derive(Clone, Copy)]
+enum ParameterAbiClass {
     Integer,
     Sse,
+    StackAggregate,
 }
 
 fn function_name_for_display(
@@ -482,6 +485,20 @@ impl LoadedObjfile {
                     } else {
                         *start
                     };
+                    let candidate = if candidate != *start {
+                        match self.validate_probe_advance(*start, candidate) {
+                            Ok(()) => candidate,
+                            Err(reason) => {
+                                tracing::debug!(
+                                    "Non-inline '{}' kept entry start=0x{start:x}, cannot advance to 0x{candidate:x}: {reason}",
+                                    entry.name,
+                                );
+                                *start
+                            }
+                        }
+                    } else {
+                        candidate
+                    };
                     let prefer_entry = candidate != *start
                         && self
                             .function_uses_entry_value_at(entry, candidate)
@@ -605,6 +622,47 @@ impl LoadedObjfile {
         }
     }
 
+    fn validate_probe_advance(&self, start: u64, candidate: u64) -> Result<()> {
+        let object = self._binary_mapped_file.parse_object()?;
+        anyhow::ensure!(
+            object.architecture() == object::Architecture::X86_64,
+            "unsupported architecture for probe instruction decoding"
+        );
+        let size = candidate
+            .checked_sub(start)
+            .ok_or_else(|| anyhow::anyhow!("candidate precedes entry"))?;
+        for section in object.sections() {
+            if section.kind() == object::SectionKind::Text {
+                if let Some(code) = section.data_range(start, size)? {
+                    return Self::validate_linear_instructions(code, start);
+                }
+            }
+        }
+        anyhow::bail!("cannot read instructions between entry and candidate")
+    }
+
+    // Decode complete instructions rather than searching for opcode bytes:
+    // immediates and displacements can contain the same bytes as branches.
+    // Any decoding failure also keeps the probe at entry.
+    fn validate_linear_instructions(code: &[u8], start: u64) -> Result<()> {
+        let mut decoder =
+            iced_x86::Decoder::with_ip(64, code, start, iced_x86::DecoderOptions::NONE);
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            let pc = instruction.ip();
+            anyhow::ensure!(
+                !instruction.is_invalid(),
+                "invalid or truncated instruction at 0x{pc:x}"
+            );
+            let flow = instruction.flow_control();
+            anyhow::ensure!(
+                flow == iced_x86::FlowControl::Next,
+                "control-flow instruction {flow:?} at 0x{pc:x}"
+            );
+        }
+        Ok(())
+    }
+
     fn function_parameters_need_prologue(
         &self,
         idx_entry: &crate::core::IndexEntry,
@@ -651,18 +709,19 @@ impl LoadedObjfile {
             // their SysV register class (six integer or eight SSE arguments).
             // Such arguments are also beyond the four register slots of ms_abi.
             // Require the actual slot to agree with one of these caller layouts.
-            let on_stack = match Self::parameter_register_class(dwarf, &unit, parameter) {
-                Some(ParameterRegisterClass::Integer) => {
+            let abi_class = Self::parameter_abi_class(dwarf, &unit, parameter);
+            let on_stack = match abi_class {
+                Some(ParameterAbiClass::Integer) => {
                     let on_stack = integer_parameters >= 6;
                     integer_parameters += 1;
                     on_stack
                 }
-                Some(ParameterRegisterClass::Sse) => {
+                Some(ParameterAbiClass::Sse) => {
                     let on_stack = sse_parameters >= 8;
                     sse_parameters += 1;
                     on_stack
                 }
-                None => {
+                Some(ParameterAbiClass::StackAggregate) | None => {
                     scalar_layout = false;
                     false
                 }
@@ -715,7 +774,17 @@ impl LoadedObjfile {
                     _ => None,
                 };
                 let known_incoming_location = matches!((cfa_offset, incoming_stack_offsets),
-                    (Some(offset), Some((sysv, ms))) if offset == sysv || offset == ms);
+                    (Some(offset), Some((sysv, ms))) if offset == sysv || offset == ms)
+                    // SysV passes aggregates larger than 16 bytes on the stack.
+                    // ms_abi passes them indirectly, so a bare fbreg cannot be
+                    // an uninitialized register home slot for such a value.
+                    // The frame base must also be valid at entry: Clang's
+                    // fixed RBP frame base still needs its prologue setup.
+                    || (normal_calling_convention
+                        && frame_base_is_cfa
+                        && matches!(abi_class, Some(ParameterAbiClass::StackAggregate))
+                        && matches!(operations.as_slice(),
+                            [gimli::Operation::FrameOffset { offset }] if *offset >= 0));
                 if !known_incoming_location
                     && operations.iter().any(|op| {
                         matches!(
@@ -741,13 +810,13 @@ impl LoadedObjfile {
         Ok(false)
     }
 
-    /// Identify only scalar types with an unambiguous x86-64 register class.
+    /// Identify scalar register classes and large by-value stack aggregates.
     /// Unknown types do not establish that a parameter is caller-initialized.
-    fn parameter_register_class(
+    fn parameter_abi_class(
         dwarf: &gimli::Dwarf<DwarfReader>,
         unit: &gimli::Unit<DwarfReader>,
         parameter: &gimli::DebuggingInformationEntry<DwarfReader>,
-    ) -> Option<ParameterRegisterClass> {
+    ) -> Option<ParameterAbiClass> {
         use crate::semantics::{origins::ResolvedUnit, resolve_type_ref_with_origins};
         let mut loc = resolve_type_ref_with_origins(dwarf, parameter, unit).ok()??;
         let mut type_unit = ResolvedUnit::Borrowed(unit);
@@ -778,10 +847,17 @@ impl LoadedObjfile {
                         1..=8
                     ) =>
                 {
-                    return Some(ParameterRegisterClass::Integer);
+                    return Some(ParameterAbiClass::Integer);
                 }
                 gimli::DW_TAG_enumeration_type if matches!(size, Some(1..=8)) => {
-                    return Some(ParameterRegisterClass::Integer);
+                    return Some(ParameterAbiClass::Integer);
+                }
+                gimli::DW_TAG_structure_type
+                | gimli::DW_TAG_class_type
+                | gimli::DW_TAG_union_type
+                    if size.is_some_and(|size| size > 16) =>
+                {
+                    return Some(ParameterAbiClass::StackAggregate);
                 }
                 gimli::DW_TAG_base_type if matches!(size, Some(1..=8)) => {
                     return match entry.attr_value(gimli::DW_AT_encoding) {
@@ -793,11 +869,11 @@ impl LoadedObjfile {
                             | gimli::DW_ATE_boolean
                             | gimli::DW_ATE_address
                             | gimli::DW_ATE_UTF,
-                        )) => Some(ParameterRegisterClass::Integer),
+                        )) => Some(ParameterAbiClass::Integer),
                         Some(gimli::AttributeValue::Encoding(gimli::DW_ATE_float))
                             if matches!(size, Some(4 | 8)) =>
                         {
-                            Some(ParameterRegisterClass::Sse)
+                            Some(ParameterAbiClass::Sse)
                         }
                         _ => None,
                     };
@@ -1609,6 +1685,210 @@ mod tests {
             LoadedObjfile::selected_non_inline_probe_address(0x1470, 0x147b, 0x1474),
             0x1474
         );
+    }
+
+    #[test]
+    fn probe_advance_rejects_control_flow_instructions() {
+        for code in [
+            &[0x75, 0x02][..],                     // jne
+            &[0x0f, 0x84, 0x00, 0x00, 0x00, 0x00], // je near
+            &[0xeb, 0x00],                         // jmp short
+            &[0xff, 0xe0],                         // jmp rax
+            &[0xe2, 0xfe],                         // loop
+            &[0xe3, 0x00],                         // jrcxz
+            &[0xe8, 0x00, 0x00, 0x00, 0x00],       // call relative
+            &[0xff, 0xd0],                         // call rax
+            &[0xc3],                               // ret
+            &[0xc2, 0x10, 0x00],                   // ret 16
+            &[0x0f, 0x05],                         // syscall
+            &[0xcc],                               // int3
+            &[0x0f, 0x0b],                         // ud2
+        ] {
+            let mut prefix = vec![0x90];
+            prefix.extend_from_slice(code);
+            let reason = LoadedObjfile::validate_linear_instructions(&prefix, 0x1000)
+                .unwrap_err()
+                .to_string();
+            assert!(reason.contains("0x1001"), "{code:x?}: {reason}");
+        }
+    }
+
+    #[test]
+    fn probe_advance_decodes_instructions_and_requires_a_complete_prefix() {
+        // push rbp; mov rbp,rsp; mov eax,0xc3e8ff75; mov [rbp-4],edi.
+        // Branch, call and return opcode bytes inside the immediate are data.
+        let code = [
+            0x55, 0x48, 0x89, 0xe5, 0xb8, 0x75, 0xff, 0xe8, 0xc3, 0x89, 0x7d, 0xfc,
+        ];
+        LoadedObjfile::validate_linear_instructions(&code, 0x1000).unwrap();
+        assert!(LoadedObjfile::validate_linear_instructions(&code[..11], 0x1000).is_err());
+        assert!(LoadedObjfile::validate_linear_instructions(&[0x0f], 0x1000).is_err());
+    }
+
+    async fn load_test_module(source: &str) -> anyhow::Result<(tempfile::TempDir, LoadedObjfile)> {
+        let dir = tempfile::tempdir()?;
+        let source_path = dir.path().join("parameters.c");
+        let binary = dir.path().join("parameters");
+        std::fs::write(&source_path, source)?;
+        let output = std::process::Command::new("cc")
+            .args(["-g", "-O0", "-o"])
+            .arg(&binary)
+            .arg(source_path)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let module = LoadedObjfile::load_parallel(
+            crate::core::mapping::ModuleMapping::from_path(binary),
+            &[],
+            false,
+            None,
+            None,
+        )
+        .await?;
+        Ok((dir, module))
+    }
+
+    #[tokio::test]
+    async fn probe_advance_keeps_entry_when_a_prologue_marker_follows_a_branch(
+    ) -> anyhow::Result<()> {
+        let (_dir, module) = load_test_module(
+            "int branch(int x) { if (x < 0) return 1; return 2; }\nint main(void) { return branch(1); }\n"
+        ).await?;
+        let entry = module
+            .lightweight_index
+            .read()
+            .unwrap()
+            .find_dies_by_function_name("branch")[0]
+            .clone();
+        module.ensure_line_info_for_unit(entry.unit_offset)?;
+        let (start, end) = module.resolve_function_ranges(&entry)?[0];
+        assert!(module.function_parameters_need_prologue(&entry, start, end)?);
+        let candidate = end - 1;
+        assert!(module
+            .validate_probe_advance(start, candidate)
+            .unwrap_err()
+            .to_string()
+            .contains("control-flow"));
+        // Even an explicit prologue_end on only one path must not make a
+        // function-name trace miss the other path.
+        *module.line_mapping.write().unwrap() =
+            crate::index::LineMappingTable::from_entries_with_scoped_manager(
+                vec![crate::core::LineEntry {
+                    address: candidate,
+                    end_address: Some(end),
+                    file_path: "/src/parameters.c".into(),
+                    file_index: 1,
+                    unit_offset: entry.unit_offset,
+                    compilation_unit: Arc::from("parameters.c"),
+                    line: 1,
+                    column: 0,
+                    is_stmt: true,
+                    prologue_end: true,
+                }],
+                &module.scoped_file_manager.read().unwrap(),
+            );
+        assert_eq!(module.compute_addresses_for_entry(&entry), vec![start]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn large_stack_parameters_require_a_bare_nonnegative_fbreg() -> anyhow::Result<()> {
+        let (_dir, mut module) = load_test_module("int main(void) { return 0; }\n").await?;
+        for (size, offset, indirect, pointer, cfa_base, needs_prologue) in [
+            (24, 0, false, false, true, false),
+            (24, 16, false, false, true, false),
+            (17, 0, false, false, true, false),
+            (16, 0, false, false, true, true),
+            (8, 0, false, false, true, true),
+            (24, -24, false, false, true, true),
+            (24, 0, true, false, true, true),
+            (24, 0, false, true, true, true),
+            (24, 16, false, false, false, true),
+        ] {
+            let encoding = gimli::Encoding {
+                format: Format::Dwarf32,
+                version: 4,
+                address_size: 8,
+            };
+            let mut dwarf = WriteDwarf::new();
+            let unit_id = dwarf.units.add(Unit::new(encoding, LineProgram::none()));
+            let unit = dwarf.units.get_mut(unit_id);
+            let root = unit.root();
+            let aggregate = unit.add(root, constants::DW_TAG_structure_type);
+            unit.get_mut(aggregate)
+                .set(constants::DW_AT_byte_size, WriteAttributeValue::Udata(size));
+            let alias = unit.add(root, constants::DW_TAG_typedef);
+            unit.get_mut(alias).set(
+                constants::DW_AT_type,
+                WriteAttributeValue::UnitRef(aggregate),
+            );
+            let qualifier = unit.add(
+                root,
+                if pointer {
+                    constants::DW_TAG_pointer_type
+                } else {
+                    constants::DW_TAG_const_type
+                },
+            );
+            unit.get_mut(qualifier)
+                .set(constants::DW_AT_type, WriteAttributeValue::UnitRef(alias));
+            let function = unit.add(root, constants::DW_TAG_subprogram);
+            let mut frame_base = WriteExpression::new();
+            if cfa_base {
+                frame_base.op(constants::DW_OP_call_frame_cfa);
+            } else {
+                frame_base.op_reg(Register(6));
+            }
+            unit.get_mut(function).set(
+                constants::DW_AT_frame_base,
+                WriteAttributeValue::Exprloc(frame_base),
+            );
+            let parameter = unit.add(function, constants::DW_TAG_formal_parameter);
+            unit.get_mut(parameter).set(
+                constants::DW_AT_type,
+                WriteAttributeValue::UnitRef(qualifier),
+            );
+            let mut location = WriteExpression::new();
+            location.op_fbreg(offset);
+            if indirect {
+                location.op_deref();
+            }
+            unit.get_mut(parameter).set(
+                constants::DW_AT_location,
+                WriteAttributeValue::Exprloc(location),
+            );
+            let mut sections = Sections::new(EndianVec::new(gimli::LittleEndian));
+            dwarf.write(&mut sections)?;
+            module.dwarf = gimli::Dwarf::load(|id| {
+                Ok::<_, gimli::Error>(dwarf_reader_from_arc(Arc::from(
+                    sections
+                        .get(id)
+                        .map(|section| section.slice())
+                        .unwrap_or_default(),
+                )))
+            })?;
+            *module.parsed_unit_cache.write().unwrap() = Default::default();
+            let unit = first_unit(&module.dwarf);
+            let mut entries = unit.entries();
+            let function_offset = loop {
+                let entry = entries.next_dfs()?.unwrap();
+                if entry.tag() == constants::DW_TAG_subprogram {
+                    break entry.offset();
+                }
+            };
+            let mut entry = subprogram_entry(&[(0x1000, 0x1100)], None);
+            entry.unit_offset = unit.header.debug_info_offset().unwrap();
+            entry.die_offset = function_offset;
+            assert_eq!(
+                module.function_parameters_need_prologue(&entry, 0x1000, 0x1100)?,
+                needs_prologue,
+                "size={size} offset={offset} indirect={indirect} pointer={pointer} cfa_base={cfa_base}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

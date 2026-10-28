@@ -33,6 +33,7 @@ fn visible_var(name: &str, scope_depth: usize) -> VisibleVariable {
         scope_depth,
         is_parameter: false,
         is_artificial: false,
+        is_inline_receiver: false,
     }
 }
 
@@ -45,6 +46,7 @@ fn diagnostic(
         pc: 0x1234,
         name: Some(name.to_string()),
         scope_depth,
+        is_inline_receiver: false,
         availability: Availability::Unsupported(crate::UnsupportedReason::ExpressionShape {
             detail: detail.to_string(),
         }),
@@ -129,6 +131,118 @@ fn variable_selection_keeps_inner_match_over_outer_diagnostic() {
 
     assert_eq!(selected.name, "state");
     assert_eq!(selected.scope_depth, 2);
+}
+
+#[test]
+fn variable_selection_keeps_readable_this_over_unavailable_inline_this() {
+    let mut unavailable = visible_var("this", 2);
+    unavailable.is_inline_receiver = true;
+    unavailable.availability = Availability::OptimizedOut;
+    unavailable.location = VariableLocation::OptimizedOut;
+    let mut receiver_diagnostic = diagnostic("this", 3, "inline receiver cannot be evaluated");
+    receiver_diagnostic.is_inline_receiver = true;
+    let selected = DwarfAnalyzer::select_visible_variable_by_name(
+        0x1234,
+        "this",
+        vec![visible_var("this", 0), unavailable],
+        &[receiver_diagnostic],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.scope_depth, 0);
+    assert_eq!(selected.availability, Availability::Available);
+}
+
+#[test]
+fn variable_selection_prefers_innermost_readable_this() {
+    let selected = DwarfAnalyzer::select_visible_variable_by_name(
+        0x1234,
+        "this",
+        vec![visible_var("this", 0), visible_var("this", 2)],
+        &[],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.scope_depth, 2);
+}
+
+#[test]
+fn variable_selection_does_not_hide_unavailable_this_without_a_readable_receiver() {
+    assert!(matches!(
+        DwarfAnalyzer::select_visible_variable_by_name(
+            0x1234,
+            "this",
+            Vec::new(),
+            &[diagnostic("this", 2, "inline receiver cannot be evaluated")],
+        ),
+        Err(VariableLookupError::Unavailable { .. })
+    ));
+}
+
+#[test]
+fn variable_selection_keeps_unavailable_ordinary_local_over_readable_outer_local() {
+    let mut unavailable = visible_var("state", 2);
+    unavailable.availability = Availability::OptimizedOut;
+    unavailable.location = VariableLocation::OptimizedOut;
+    let selected = DwarfAnalyzer::select_visible_variable_by_name(
+        0x1234,
+        "state",
+        vec![visible_var("state", 0), unavailable],
+        &[],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.scope_depth, 2);
+    assert_eq!(selected.availability, Availability::OptimizedOut);
+}
+
+#[test]
+fn ordinary_this_preserves_lexical_shadowing() {
+    let mut outer = visible_var("this", 0);
+    outer.is_parameter = true;
+    let mut inner = visible_var("this", 2);
+    inner.availability = Availability::OptimizedOut;
+    inner.location = VariableLocation::OptimizedOut;
+    let selected = DwarfAnalyzer::select_visible_variable_by_name(
+        0x1234,
+        "this",
+        vec![outer.clone(), inner],
+        &[],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.scope_depth, 2);
+    assert_eq!(selected.availability, Availability::OptimizedOut);
+    assert!(matches!(
+        DwarfAnalyzer::select_visible_variable_by_name(
+            0x1234,
+            "this",
+            vec![outer],
+            &[diagnostic("this", 2, "ordinary this is unavailable")],
+        ),
+        Err(VariableLookupError::Unavailable { .. })
+    ));
+}
+
+#[test]
+fn ordinary_this_still_shadows_a_confirmed_inline_receiver() {
+    let mut receiver = visible_var("this", 1);
+    receiver.is_inline_receiver = true;
+    receiver.availability = Availability::OptimizedOut;
+    receiver.location = VariableLocation::OptimizedOut;
+    let mut local = visible_var("this", 2);
+    local.availability = Availability::OptimizedOut;
+    local.location = VariableLocation::OptimizedOut;
+    let selected = DwarfAnalyzer::select_visible_variable_by_name(
+        0x1234,
+        "this",
+        vec![visible_var("this", 0), receiver, local],
+        &[],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.scope_depth, 2);
+    assert_eq!(selected.availability, Availability::OptimizedOut);
 }
 
 #[test]

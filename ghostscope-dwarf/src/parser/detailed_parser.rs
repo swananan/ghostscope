@@ -47,6 +47,7 @@ pub struct ParsedVariable {
     pub scope_depth: usize,
     pub is_parameter: bool,
     pub is_artificial: bool,
+    pub is_inline_receiver: bool,
 }
 
 impl ParsedVariable {
@@ -62,6 +63,7 @@ impl ParsedVariable {
             scope_depth: self.scope_depth,
             is_parameter: self.is_parameter,
             is_artificial: self.is_artificial,
+            is_inline_receiver: self.is_inline_receiver,
         }
     }
 }
@@ -1280,6 +1282,7 @@ impl DetailedParser {
             scope_depth,
             is_parameter,
             is_artificial: false,
+            is_inline_receiver: false,
         }))
     }
 
@@ -1592,6 +1595,7 @@ mod tests {
             scope_depth: 1,
             is_parameter: true,
             is_artificial: false,
+            is_inline_receiver: false,
         };
 
         assert_eq!(variable.name, "arg");
@@ -1617,6 +1621,7 @@ mod tests {
             scope_depth: 2,
             is_parameter: false,
             is_artificial: false,
+            is_inline_receiver: false,
         };
 
         assert_eq!(variable.availability, Availability::OptimizedOut);

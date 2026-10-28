@@ -315,6 +315,19 @@ impl DwarfAnalyzer {
             return Ok(None);
         }
 
+        // An inlined method's receiver can be optimized out while an enclosing
+        // method still has a readable receiver. Keep that usable `this` rather
+        // than letting an unavailable inline binding or diagnostic hide it.
+        // Ordinary locals must continue to obey lexical shadowing.
+        let readable_this = name == "this"
+            && candidates
+                .iter()
+                .any(|variable| variable.availability.is_available());
+        if readable_this {
+            candidates.retain(|variable| {
+                !variable.is_inline_receiver || variable.availability.is_available()
+            });
+        }
         let max_scope_depth = candidates
             .iter()
             .map(|variable| variable.scope_depth)
@@ -322,7 +335,10 @@ impl DwarfAnalyzer {
             .unwrap_or(0);
         if let Some(diagnostic) = matching_diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.scope_depth > max_scope_depth)
+            .filter(|diagnostic| {
+                diagnostic.scope_depth > max_scope_depth
+                    && !(readable_this && diagnostic.is_inline_receiver)
+            })
             .max_by_key(|diagnostic| diagnostic.scope_depth)
         {
             return Err(VariableLookupError::Unavailable {

@@ -16,6 +16,7 @@ description = "DWARF parser and symbolizer used by GhostScope to resolve variabl
 [dependencies]
 gimli.workspace = true
 object.workspace = true
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 memmap2 = "0.9"
 anyhow.workspace = true
 tracing.workspace = true

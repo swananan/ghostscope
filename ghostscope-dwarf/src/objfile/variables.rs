@@ -12,6 +12,74 @@ use crate::{
     },
 };
 use gimli::Reader;
+use std::collections::HashSet;
+
+type DieOrigins = HashSet<(crate::DwarfObjectId, gimli::DebugInfoOffset)>;
+
+fn collect_die_origins(
+    dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+    unit: &gimli::Unit<crate::binary::DwarfReader>,
+    entry: &gimli::DebuggingInformationEntry<crate::binary::DwarfReader>,
+    origins: &mut DieOrigins,
+) -> gimli::Result<()> {
+    let Some(offset) = entry.offset().to_debug_info_offset(&unit.header) else {
+        return Ok(());
+    };
+    if origins.len() >= 64
+        || !origins.insert((crate::binary::references::unit_object(dwarf, unit), offset))
+    {
+        return Ok(());
+    }
+    for attr in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
+        if let Some(value) = entry.attr_value(attr) {
+            if let Some((_, origin_unit, origin)) = resolve_origin_entry(dwarf, unit, value)? {
+                collect_die_origins(dwarf, &origin_unit, &origin, origins)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn object_pointer_matches(
+    dwarf: &gimli::Dwarf<crate::binary::DwarfReader>,
+    unit: &gimli::Unit<crate::binary::DwarfReader>,
+    scope: &gimli::DebuggingInformationEntry<crate::binary::DwarfReader>,
+    parameter_origins: &DieOrigins,
+    visited: &mut DieOrigins,
+) -> gimli::Result<bool> {
+    let Some(offset) = scope.offset().to_debug_info_offset(&unit.header) else {
+        return Ok(false);
+    };
+    if visited.len() >= 64
+        || !visited.insert((crate::binary::references::unit_object(dwarf, unit), offset))
+    {
+        return Ok(false);
+    }
+    if let Some(value) = scope.attr_value(gimli::DW_AT_object_pointer) {
+        let Some((_, receiver_unit, receiver)) = resolve_origin_entry(dwarf, unit, value)? else {
+            return Ok(false);
+        };
+        if receiver.tag() != gimli::DW_TAG_formal_parameter {
+            return Ok(false);
+        }
+        let mut receiver_origins = DieOrigins::new();
+        collect_die_origins(dwarf, &receiver_unit, &receiver, &mut receiver_origins)?;
+        return Ok(!parameter_origins.is_disjoint(&receiver_origins));
+    }
+    // Resolve references in the unit that owns the attribute, including when
+    // an inline DIE inherits its object pointer from another CU or supplement.
+    for attr in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
+        if let Some(value) = scope.attr_value(attr) {
+            if let Some((_, origin_unit, origin)) = resolve_origin_entry(dwarf, unit, value)? {
+                if object_pointer_matches(dwarf, &origin_unit, &origin, parameter_origins, visited)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
 
 type PcScopes = (
     Option<crate::CuId>,
@@ -611,11 +679,23 @@ impl LoadedObjfile {
         };
 
         let var_refs = func.variables_at_pc_with_scope_depth(address);
+        let block_path = func.block_path_for_pc(address);
         let cfi_index = self.unwind_info.cfi_index().cloned();
         let mut variables = Vec::with_capacity(var_refs.len());
         let mut diagnostics = Vec::new();
 
         for (var_ref, scope_depth) in var_refs {
+            let is_inline_receiver = scope_depth > 0
+                && self
+                    .is_inline_receiver(
+                        func.cu_offset,
+                        func.nodes[block_path[scope_depth]].die_offset,
+                        &var_ref,
+                    )
+                    .unwrap_or_else(|error| {
+                        tracing::debug!("Cannot establish inline receiver identity: {error}");
+                        false
+                    });
             let item = [(
                 var_ref.object,
                 var_ref.cu_offset,
@@ -637,6 +717,7 @@ impl LoadedObjfile {
                         pc: address,
                         name: self.variable_name_for_ref(&var_ref),
                         scope_depth,
+                        is_inline_receiver,
                         availability: Self::variable_eval_error_availability(&error, &detail),
                         detail,
                     });
@@ -652,6 +733,7 @@ impl LoadedObjfile {
             let Some(mut variable) = resolved.pop() else {
                 continue;
             };
+            variable.is_inline_receiver = is_inline_receiver;
             self.attach_variable_identity_in(
                 var_ref.object,
                 module,
@@ -670,6 +752,36 @@ impl LoadedObjfile {
                 || seen_param_names.insert((variable.name.clone(), variable.scope_depth))
         });
         Ok((variables, diagnostics))
+    }
+
+    fn is_inline_receiver(
+        &self,
+        cu_offset: gimli::DebugInfoOffset,
+        scope_offset: Option<gimli::UnitOffset>,
+        variable: &VarRef,
+    ) -> Result<bool> {
+        let Some(scope_offset) = scope_offset else {
+            return Ok(false);
+        };
+        let scope_unit = self.unit(cu_offset)?;
+        let scope = scope_unit.entry(scope_offset)?;
+        if scope.tag() != gimli::DW_TAG_inlined_subroutine {
+            return Ok(false);
+        }
+        let unit = self.unit_in(variable.object, variable.cu_offset)?;
+        let entry = unit.entry(variable.die_offset)?;
+        if entry.tag() != gimli::DW_TAG_formal_parameter {
+            return Ok(false);
+        }
+        let mut parameter_origins = DieOrigins::new();
+        collect_die_origins(self.dwarf(), &unit, &entry, &mut parameter_origins)?;
+        Ok(object_pointer_matches(
+            self.dwarf(),
+            &scope_unit,
+            &scope,
+            &parameter_origins,
+            &mut DieOrigins::new(),
+        )?)
     }
 
     pub(crate) fn function_parameters(

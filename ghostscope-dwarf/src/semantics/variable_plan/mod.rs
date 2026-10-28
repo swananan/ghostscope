@@ -27,6 +27,8 @@ pub struct VisibleVariable {
     pub scope_depth: usize,
     pub is_parameter: bool,
     pub is_artificial: bool,
+    /// The object parameter identified by an enclosing inline DIE's metadata.
+    pub is_inline_receiver: bool,
 }
 
 /// Failure to establish which local variable a source name denotes at a PC.
@@ -58,6 +60,7 @@ pub struct VariableQueryDiagnostic {
     pub pc: u64,
     pub name: Option<String>,
     pub scope_depth: usize,
+    pub is_inline_receiver: bool,
     pub availability: Availability,
     pub detail: String,
 }

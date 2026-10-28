@@ -42,6 +42,25 @@ __attribute__((noinline)) int stack_branch(
 typedef int (*stack_branch_fn)(int, int, int, int, int, int, int, int);
 static stack_branch_fn volatile call_stack_branch = stack_branch;
 
+typedef struct {
+    long x;
+    long y;
+    long z;
+} LargeArgument;
+
+/* Volatile keeps the by-value argument in its caller-initialized stack slot,
+ * described by a bare fbreg instead of a register-piece location list. */
+__attribute__((noinline)) long aggregate_branch(volatile LargeArgument value) {
+    if (value.x < 0) {
+        sink += value.y;
+        return value.x - value.y + value.z;
+    }
+    return value.x + value.y + value.z;
+}
+
+typedef long (*aggregate_branch_fn)(LargeArgument);
+static aggregate_branch_fn volatile call_aggregate_branch = aggregate_branch;
+
 /* GCC -O0 uses fixed RSP-relative locations after stack realignment. */
 __attribute__((noinline)) int realigned_spill(int x, int y) {
     _Alignas(64) volatile int buf[16];
@@ -68,6 +87,8 @@ int main(void) {
         sink = loclist_branch(-7, 31);
         sink = call_stack_branch(1, 2, 3, 4, 5, 6, 7, 31);
         sink = call_stack_branch(1, 2, 3, 4, 5, 6, -7, 31);
+        sink = call_aggregate_branch((LargeArgument){7, 31, 99});
+        sink = call_aggregate_branch((LargeArgument){-7, 31, 99});
         sink = realigned_spill(7, 31);
         sink = realigned_spill(-7, 31);
         sink = poison_home_slots(101, 202);

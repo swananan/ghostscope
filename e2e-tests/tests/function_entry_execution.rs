@@ -16,6 +16,7 @@ async fn assert_both_branches_and_parameters(binary_path: &Path) -> anyhow::Resu
 trace register_branch { print "REGISTER:{}:{}", x, y; }
 trace loclist_branch { print "LOCLIST:{}:{}", x, y; }
 trace stack_branch { print "STACK:{}:{}", x, y; }
+trace aggregate_branch { print "AGGREGATE:{}:{}:{}", value.x, value.y, value.z; }
 "#,
         )
         .attach_to(&target)
@@ -27,7 +28,7 @@ trace stack_branch { print "STACK:{}:{}", x, y; }
     let (exit_code, stdout, stderr) = result?;
     assert_eq!(exit_code, 0, "stderr={stderr}\nstdout={stdout}");
 
-    for marker in ["REGISTER", "LOCLIST", "STACK"] {
+    for marker in ["REGISTER", "LOCLIST", "STACK", "AGGREGATE"] {
         let re = Regex::new(&format!(r"{marker}:(-?\d+):(-?\d+)"))?;
         let samples: BTreeSet<(i32, i32)> = re
             .captures_iter(&stdout)
@@ -40,6 +41,12 @@ trace stack_branch { print "STACK:{}:{}", x, y; }
              samples={samples:?}\nstderr={stderr}"
         );
     }
+    let re = Regex::new(r"AGGREGATE:-?7:31:(\d+)")?;
+    let tail: BTreeSet<i32> = re
+        .captures_iter(&stdout)
+        .map(|caps| caps[1].parse())
+        .collect::<Result<_, _>>()?;
+    assert_eq!(tail, BTreeSet::from([99]), "stdout={stdout}");
     Ok(())
 }
 
@@ -54,6 +61,7 @@ async fn assert_probe_addresses(
     let mut names = vec!["register_branch", "loclist_branch"];
     if stack_entry {
         names.push("stack_branch");
+        names.push("aggregate_branch");
     }
     for name in names {
         let symbol = obj.symbols().find(|s| s.name().ok() == Some(name)).unwrap();
