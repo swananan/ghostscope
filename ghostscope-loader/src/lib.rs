@@ -940,10 +940,14 @@ impl GhostScopeLoader {
                 .try_into()
                 .map_err(|e| LoaderError::Generic(format!("Failed to convert ringbuf map: {e}")))?;
             let fd = ringbuf.as_raw_fd();
-            let readiness =
-                AsyncFd::with_interest(EventBufferFd(fd), Interest::READABLE).map_err(|err| {
-                    LoaderError::Generic(format!("Failed to register ring buffer fd: {err}"))
-                })?;
+            // SAFETY: ringbuf owns this stable fd and is stored alongside the
+            // registration. RingBufEventMap drops readiness before ringbuf,
+            // keeping the fd open until Tokio has deregistered it.
+            let registration =
+                unsafe { AsyncFd::register_with_interest(EventBufferFd(fd), Interest::READABLE) };
+            let readiness = registration.map_err(|err| {
+                LoaderError::Generic(format!("Failed to register ring buffer fd: {err}"))
+            })?;
             EventMap::RingBuf(RingBufEventMap { readiness, ringbuf })
         } else if let Some(map) = self.bpf.take_map("events") {
             info!("Initializing PerfEventArray event map");
@@ -980,14 +984,17 @@ impl GhostScopeLoader {
                             );
                         }
                         let fd = buffer.as_raw_fd();
-                        let readiness =
-                            AsyncFd::with_interest(EventBufferFd(fd), Interest::READABLE).map_err(
-                                |err| {
-                                    LoaderError::Generic(format!(
-                                        "Failed to register perf buffer fd for CPU {cpu_id}: {err}"
-                                    ))
-                                },
-                            )?;
+                        // SAFETY: buffer owns this stable fd. PerfEventCpuBuffer
+                        // stores the registration with that owner and drops
+                        // readiness first, before buffer can close the fd.
+                        let registration = unsafe {
+                            AsyncFd::register_with_interest(EventBufferFd(fd), Interest::READABLE)
+                        };
+                        let readiness = registration.map_err(|err| {
+                            LoaderError::Generic(format!(
+                                "Failed to register perf buffer fd for CPU {cpu_id}: {err}"
+                            ))
+                        })?;
                         cpu_buffers.push(PerfEventCpuBuffer {
                             cpu_id,
                             readiness,
