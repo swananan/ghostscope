@@ -381,10 +381,20 @@ async fn test_function_entry_fallback_rejects_control_flow_but_allows_linear_set
         script.push_str(&format!("trace {name} {{ print \"{name}:{{}}\", x; }}\n"));
     }
     let target = TargetLauncher::binary(&binary).spawn().await?;
+    // Console logging is best effort. Keep diagnostic assertions in an isolated
+    // file beside the fixture, where every sandbox can access it.
+    let log_file = binary.with_extension("log");
+    let log_path =
+        common::sandbox::SandboxHandle::default_ghostscope()?.path_in_sandbox(&log_file)?;
     let result = GhostscopeRunner::new()
         .attach_to(&target)
         .with_script(&script)
+        .enable_file_logging(true)
         .with_log_level("debug")
+        .with_cli_args([
+            std::ffi::OsString::from("--log-file"),
+            log_path.into_os_string(),
+        ])
         .enable_sysmon_for_target(false)
         .timeout_secs(3)
         .run()
@@ -392,6 +402,8 @@ async fn test_function_entry_fallback_rejects_control_flow_but_allows_linear_set
     target.terminate().await?;
     let (exit, stdout, stderr) = result?;
     assert_eq!(exit, 0, "{stdout}\n{stderr}");
+    let file_log = fs::read_to_string(&log_file)
+        .with_context(|| format!("failed to read diagnostic log {}", log_file.display()))?;
     for name in GUARDS {
         let regex = Regex::new(&format!(r"{name}:(-?\d+)"))?;
         let samples: BTreeSet<i32> = regex
@@ -405,15 +417,15 @@ async fn test_function_entry_fallback_rejects_control_flow_but_allows_linear_set
         );
         if name != "guard_linear" {
             assert!(
-                stderr.contains(&format!("Non-inline '{name}' kept entry")),
-                "{stderr}"
+                file_log.contains(&format!("Non-inline '{name}' kept entry")),
+                "{file_log}"
             );
         }
     }
     for flow in ["ConditionalBranch", "UnconditionalBranch", "Call", "Return"] {
         assert!(
-            stderr.contains(&format!("control-flow instruction {flow}")),
-            "{stderr}"
+            file_log.contains(&format!("control-flow instruction {flow}")),
+            "{file_log}"
         );
     }
     Ok(())
