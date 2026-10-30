@@ -2286,6 +2286,40 @@ mod tests {
     }
 
     #[test]
+    fn scalar_piece_reconstruction_rejects_unavailable_bytes() {
+        let llvm = LlvmContext::create();
+        let options = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&llvm, "partial_scalar", Some(0), &options).unwrap();
+        ctx.create_basic_ebpf_function("f").unwrap();
+        let plan = read_plan(
+            "partial",
+            "unsigned long",
+            Some(TypeInfo::BaseType {
+                name: "unsigned long".into(),
+                size: 8,
+                encoding: ghostscope_dwarf::constants::DW_ATE_unsigned.0.into(),
+            }),
+            VariableLocation::Pieces(vec![
+                ghostscope_dwarf::PieceLocation {
+                    bit_offset: 0,
+                    bit_size: 32,
+                    location: Box::new(VariableLocation::RegisterValue { dwarf_reg: 0 }),
+                },
+                ghostscope_dwarf::PieceLocation {
+                    bit_offset: 32,
+                    bit_size: 32,
+                    location: Box::new(VariableLocation::OptimizedOut),
+                },
+            ]),
+            Availability::PartiallyAvailable,
+        );
+        let error = ctx
+            .variable_read_plan_to_llvm_value(&plan, 0x1234, None)
+            .expect_err("missing scalar bytes must not become valid zero bits");
+        assert!(matches!(error, CodeGenError::VariableUnavailable(_)));
+    }
+
+    #[test]
     fn unavailable_error_formats_structured_dwarf_reason() {
         let err = EbpfContext::dwarf_expression_unavailable_error(
             "x",

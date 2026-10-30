@@ -710,9 +710,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             materialized.name,
                         )));
                     }
+                    let capture_type = materialized
+                        .composite_capture_type()
+                        .map_err(|error| CodeGenError::DwarfError(error.to_string()))?;
                     Ok(ComplexArg {
                         var_name_index: self.trace_context.add_variable_name(display_name)?,
-                        type_index: self.trace_context.add_type(dwarf_type)?,
+                        type_index: self.trace_context.add_type(capture_type)?,
                         access_path: Vec::new(),
                         data_len,
                         source: ComplexArgSource::Composite {

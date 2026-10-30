@@ -11,6 +11,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         pieces: &[PlannedPiece],
         status_ptr: Option<PointerValue<'ctx>>,
     ) -> Result<IntValue<'ctx>> {
+        if pieces
+            .iter()
+            .any(|piece| matches!(piece.source, PlannedPieceSource::Unavailable))
+        {
+            return Err(CodeGenError::VariableUnavailable(format!(
+                "'{}' has unavailable scalar pieces",
+                materialization.name
+            )));
+        }
         let size = materialization
             .dwarf_type
             .as_ref()
@@ -138,6 +147,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             status_ptr
         };
         match &piece.source {
+            PlannedPieceSource::Unavailable => Err(CodeGenError::VariableUnavailable(format!(
+                "'{name}' has an unavailable piece"
+            ))),
             PlannedPieceSource::Value(value) => self
                 .planned_value_to_llvm_value(value, name, status_ptr, module_hint)
                 .map(|value| value.into_int_value()),

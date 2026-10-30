@@ -34,6 +34,15 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     .map_err(|error| CodeGenError::LLVMError(error.to_string()))?
             };
             let computed_value = match &piece.source {
+                PlannedPieceSource::Unavailable => {
+                    // The capture type marks every intersecting field unavailable;
+                    // these initialized bytes are never rendered as field values.
+                    self.emit_complex_format_immediate_bytes(
+                        destination,
+                        &vec![0; piece.byte_size],
+                    )?;
+                    None
+                }
                 PlannedPieceSource::Memory(address) => {
                     let address = self.with_memory_read_error_capture(capture, |ctx| {
                         ctx.resolve_planned_address(address, Some(status_ptr), module_hint)

@@ -72,6 +72,14 @@ fn add_piece_dwarf(binary: &Path) -> anyhow::Result<u64> {
     };
     let unsigned = base(b"unsigned long", 8, gimli::DW_ATE_unsigned);
     let signed = base(b"int", 4, gimli::DW_ATE_signed);
+    let array = unit.add(root, gimli::DW_TAG_array_type);
+    unit.get_mut(array)
+        .set(gimli::DW_AT_type, AttributeValue::UnitRef(signed));
+    unit.get_mut(array)
+        .set(gimli::DW_AT_byte_size, AttributeValue::Udata(16));
+    let range = unit.add(array, gimli::DW_TAG_subrange_type);
+    unit.get_mut(range)
+        .set(gimli::DW_AT_count, AttributeValue::Udata(4));
     let mut structure = |name: &[u8], members: &[&[u8]]| {
         let id = unit.add(root, gimli::DW_TAG_structure_type);
         unit.get_mut(id)
@@ -95,6 +103,44 @@ fn add_piece_dwarf(binary: &Path) -> anyhow::Result<u64> {
     };
     let pair = structure(b"PiecePair", &[b"first", b"second"]);
     let mixed = structure(b"PieceMixed", &[b"first", b"middle", b"last"]);
+    let implicit_holder = unit.add(root, gimli::DW_TAG_structure_type);
+    unit.get_mut(implicit_holder).set(
+        gimli::DW_AT_name,
+        AttributeValue::String(b"ImplicitHolder".to_vec()),
+    );
+    unit.get_mut(implicit_holder)
+        .set(gimli::DW_AT_byte_size, AttributeValue::Udata(20));
+    let array_member = unit.add(implicit_holder, gimli::DW_TAG_member);
+    unit.get_mut(array_member).set(
+        gimli::DW_AT_name,
+        AttributeValue::String(b"values".to_vec()),
+    );
+    unit.get_mut(array_member)
+        .set(gimli::DW_AT_type, AttributeValue::UnitRef(array));
+    unit.get_mut(array_member)
+        .set(gimli::DW_AT_data_member_location, AttributeValue::Udata(4));
+    let padded = unit.add(root, gimli::DW_TAG_structure_type);
+    unit.get_mut(padded).set(
+        gimli::DW_AT_name,
+        AttributeValue::String(b"Padded".to_vec()),
+    );
+    unit.get_mut(padded)
+        .set(gimli::DW_AT_byte_size, AttributeValue::Udata(8));
+    let value_member = unit.add(padded, gimli::DW_TAG_member);
+    unit.get_mut(value_member)
+        .set(gimli::DW_AT_name, AttributeValue::String(b"value".to_vec()));
+    unit.get_mut(value_member)
+        .set(gimli::DW_AT_type, AttributeValue::UnitRef(signed));
+    unit.get_mut(value_member)
+        .set(gimli::DW_AT_data_member_location, AttributeValue::Udata(0));
+    let padded_array = unit.add(root, gimli::DW_TAG_array_type);
+    unit.get_mut(padded_array)
+        .set(gimli::DW_AT_type, AttributeValue::UnitRef(padded));
+    unit.get_mut(padded_array)
+        .set(gimli::DW_AT_byte_size, AttributeValue::Udata(16));
+    let padded_range = unit.add(padded_array, gimli::DW_TAG_subrange_type);
+    unit.get_mut(padded_range)
+        .set(gimli::DW_AT_count, AttributeValue::Udata(2));
     let function = unit.add(root, gimli::DW_TAG_subprogram);
     unit.get_mut(function).set(
         gimli::DW_AT_name,
@@ -110,6 +156,9 @@ fn add_piece_dwarf(binary: &Path) -> anyhow::Result<u64> {
     let mut pair_location = Expression::new();
     register_piece(&mut pair_location, 5, 8);
     register_piece(&mut pair_location, 1, 8);
+    let mut array_location = Expression::new();
+    register_piece(&mut array_location, 5, 8);
+    register_piece(&mut array_location, 1, 8);
     let mut mixed_location = Expression::new();
     register_piece(&mut mixed_location, 5, 8);
     memory_piece(&mut mixed_location, 3);
@@ -134,6 +183,19 @@ fn add_piece_dwarf(binary: &Path) -> anyhow::Result<u64> {
             .into_boxed_slice(),
     );
     implicit.op_piece(16);
+    let mut implicit_field = Expression::new();
+    implicit_field.op_implicit_value(
+        [0i32, 11, 22, 33, 44]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let mut padded_location = Expression::new();
+    register_piece(&mut padded_location, 5, 4);
+    padded_location.op_piece(4);
+    register_piece(&mut padded_location, 1, 4);
+    padded_location.op_piece(4);
     let mut bad_read = Expression::new();
     register_piece(&mut bad_read, 5, 8);
     bad_read.op_addr(Address::Constant(1));
@@ -202,11 +264,14 @@ fn add_piece_dwarf(binary: &Path) -> anyhow::Result<u64> {
     bits.op_bit_piece(32, 0);
     for (name, ty, location) in [
         ("pair", pair, pair_location),
+        ("array", array, array_location),
         ("mixed", mixed, mixed_location),
         ("scalar", unsigned, scalar_location),
         ("memory_scalar", unsigned, memory_scalar),
         ("signed_scalar", signed, signed_location),
         ("implicit", pair, implicit),
+        ("implicit_holder", implicit_holder, implicit_field),
+        ("padded_array", padded_array, padded_location),
         ("bad_read", mixed, bad_read),
         ("broken_scalar", unsigned, broken_scalar),
         ("zero_computed_scalar", unsigned, zero_computed_scalar),
@@ -540,12 +605,101 @@ async fn test_dwarf_pieces_null_computed_failures_set_execution_status() -> anyh
 }
 
 #[tokio::test]
-async fn test_dwarf_pieces_reject_missing_short_simd_and_bit_pieces() -> anyhow::Result<()> {
+async fn test_dwarf_pieces_project_fields_arrays_and_missing_members() -> anyhow::Result<()> {
+    init();
+    let (_dir, binary, pc) = build_fixture()?;
+    let target = TargetLauncher::binary(&binary).spawn().await?;
+    let script = format!(
+        r#"trace 0x{pc:x} {{
+        print "MISSING:{{}}", missing;
+        print "FIRST:{{}}", missing.first;
+        print "ABSENT:{{}}", missing.second;
+        print "ARRAY:{{}}:{{}}:{{}}:{{}}", array[0], array[1], array[2], array[3];
+        if mixed.middle == 0x5544332211ccbbaa {{ print "CROSS_PIECE_FIELD_OK"; }}
+        if mixed.last == 0x0123456789abcdef {{ print "LAST_FIELD_OK"; }}
+        if array[1] < 0 {{ print "SIGNED_ARRAY_OK"; }}
+    }}"#
+    );
+    let result = GhostscopeRunner::new()
+        .with_target(&binary)
+        .attach_to(&target)
+        .with_script(&script)
+        .timeout_secs(2)
+        .run()
+        .await;
+    target.terminate().await?;
+    let (code, stdout, stderr) = result?;
+    assert_eq!(code, 0, "{stderr}\n{stdout}");
+    for expected in [
+        "MISSING:PiecePair".to_owned(),
+        "second: <unavailable: optimized out>".to_owned(),
+        format!("FIRST:{}", 0xfeedface76543210u64),
+        "ABSENT:<unavailable: optimized out>".to_owned(),
+        format!(
+            "ARRAY:{}:{}:{}:{}",
+            0x76543210i32, 0xfeedfaceu32 as i32, 0x89abcdefu32 as i32, 0x01234567i32
+        ),
+        "CROSS_PIECE_FIELD_OK".to_owned(),
+        "LAST_FIELD_OK".to_owned(),
+        "SIGNED_ARRAY_OK".to_owned(),
+    ] {
+        assert!(
+            stdout.contains(&expected),
+            "missing {expected:?}: {stderr}\n{stdout}"
+        );
+    }
+    assert!(!stdout.contains("ExprError"), "{stdout}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_dwarf_pieces_capture_large_implicit_fields_and_padded_arrays() -> anyhow::Result<()> {
+    init();
+    let (_dir, binary, pc) = build_fixture()?;
+    let target = TargetLauncher::binary(&binary).spawn().await?;
+    let output = GhostscopeRunner::new()
+        .with_target(&binary)
+        .attach_to(&target)
+        .with_script(&format!(
+            r#"trace 0x{pc:x} {{
+            print "LARGE_FIELD:{{}}", implicit_holder.values;
+            print "LAST_ELEMENT:{{}}", implicit_holder.values[3];
+            print "PADDED_ARRAY:{{}}", padded_array;
+            print "PADDED_ELEMENT:{{}}", padded_array[1];
+        }}"#
+        ))
+        .timeout_secs(2)
+        .run()
+        .await;
+    target.terminate().await?;
+    let (code, stdout, stderr) = output?;
+    assert_eq!(code, 0, "{stderr}\n{stdout}");
+    for expected in [
+        "LARGE_FIELD:[11, 22, 33, 44]".to_owned(),
+        "LAST_ELEMENT:44".to_owned(),
+        format!(
+            "PADDED_ARRAY:[Padded {{ value: {} }}, Padded {{ value: {} }}]",
+            0x7654_3210i32, 0x89ab_cdefu32 as i32
+        ),
+        format!(
+            "PADDED_ELEMENT:Padded {{ value: {} }}",
+            0x89ab_cdefu32 as i32
+        ),
+    ] {
+        assert!(
+            stdout.contains(&expected),
+            "missing {expected:?}: {stderr}\n{stdout}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_dwarf_pieces_reject_short_simd_and_bit_pieces() -> anyhow::Result<()> {
     init();
     let (_dir, binary, pc) = build_fixture()?;
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary).await?;
     for (variable, expected) in [
-        ("missing", "unavailable or unsupported"),
         ("short", "cover 8 of 16"),
         ("simd", "SIMD/FP register"),
         ("bits", "DW_OP_bit_piece"),
