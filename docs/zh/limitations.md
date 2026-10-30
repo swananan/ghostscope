@@ -77,8 +77,11 @@ stack value 和隐式字节中重建。所有片段必须完整覆盖已知的�
 有缺口或重叠。整值输出受 `ebpf.mem_dump_cap` 限制；标量表达式支持最多
 八字节的值。内存片段读取失败时，整值输出会报告读取错误；标量重建会将
 整个值置零，不会把剩余片段当作有效值。
-缺失片段、SIMD/FP 寄存器和 `DW_OP_bit_piece` 仍不支持。第一阶段尚不支持
-复合值的字段／数组投影、取地址，以及语义 adapter 捕获。
+支持从字节对齐的片段或标量聚合值中投影字段和常量数组索引。缺失字段显示
+`<unavailable: optimized out>`，不影响其他字段访问；缺失的 padding 不会作为
+字段值展示。标量运算要求所需字节全部可用。SIMD/FP 寄存器、`DW_OP_bit_piece`、
+值形式聚合的位字段提取、对没有目标内存存储的值取地址，以及语义 adapter 捕获
+仍不支持。
 
 ### 8. 动态加载库（dlopen）
 GhostScope 启动时会扫描进程的 `/proc/PID/maps` 获取已加载的动态库信息；在 `-p <pid>` 和启用 sysmon 的独立 `-t <path>` 下，也会通过运行时 map-change 监控刷新模块映射。对 `bt`/`backtrace` 来说，后续事件只会按需请求实际触达的 `dlopen` 模块的 compact CFI，而不是预先索引所有新映射或常驻其完整 DWARF；该行为受运行时模块数量/时间限制、`backtrace_unwind_rows_max_entries` 以及上文提到的 map-change 竞态限制。可设置 `backtrace_runtime_modules = false` 或传入 `--no-backtrace-runtime-modules`，关闭自动 CFI 加载并保留模块偏移/裸地址降级输出。

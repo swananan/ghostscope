@@ -13,6 +13,8 @@ pub struct PlannedPiece {
 pub enum PlannedPieceSource {
     Value(PlannedValue),
     Memory(PlannedAddress),
+    /// Bytes absent at this PC. Typed capture must mark their fields unavailable.
+    Unavailable,
 }
 
 pub(super) fn plan_pieces(
@@ -44,6 +46,7 @@ pub(super) fn plan_pieces(
         }
         let location = piece.location.as_ref();
         let source = match location {
+            VariableLocation::OptimizedOut => PlannedPieceSource::Unavailable,
             VariableLocation::ImplicitValue(bytes) => {
                 if bytes.len() < byte_size {
                     anyhow::bail!(

@@ -11,6 +11,7 @@ use crate::semantics::{
 use crate::TypeInfo;
 use std::path::PathBuf;
 
+mod aggregate;
 mod pieces;
 pub use pieces::{PlannedPiece, PlannedPieceSource};
 
@@ -329,9 +330,7 @@ pub enum PlanError {
     #[error("pointer dereference requires pointer type, got '{type_name}'")]
     InvalidPointerDereference { type_name: String },
 
-    #[error(
-        "cannot apply byte offset {offset} to value-backed aggregate location {location:?}; field/array extraction from aggregate values is not implemented"
-    )]
+    #[error("cannot apply byte offset {offset} to value-backed aggregate location {location:?}")]
     ValueBackedAggregateOffset {
         offset: i64,
         location: VariableLocation,
@@ -408,7 +407,7 @@ impl VariableReadPlan {
                 .find(|requirement| !capabilities.supports_requirement(requirement))
                 .cloned()
                 .map(Availability::Requires)
-                .unwrap_or(Availability::Available),
+                .unwrap_or_else(|| self.availability.clone()),
         };
 
         VariableLoweringPlan {
@@ -629,8 +628,23 @@ impl VariableReadPlan {
             }
         })?;
 
+        if matches!(
+            strip_type_aliases(&member.member_type),
+            TypeInfo::BitfieldType { .. }
+        ) && matches!(
+            base_location,
+            VariableLocation::RegisterValue { .. }
+                | VariableLocation::ComputedValue(_)
+                | VariableLocation::ImplicitValue(_)
+                | VariableLocation::Pieces(_)
+        ) {
+            anyhow::bail!("bitfield extraction from a value-backed aggregate is not supported");
+        }
         let mut plan = self.clone();
-        plan.location = add_location_offset(base_location, member.offset as i64)?;
+        plan.location = base_location.byte_range(member.offset, member.member_type.size())?;
+        if plan.availability.is_available() {
+            plan.availability = plan.location.availability();
+        }
         plan.type_name = member.member_type.type_name();
         plan.dwarf_type = Some(member.member_type);
         plan.type_id = None;
@@ -666,7 +680,14 @@ impl VariableReadPlan {
 
         let byte_offset = index.saturating_mul(layout.stride as i64);
         let mut plan = self.clone();
-        plan.location = add_location_offset(base_location, byte_offset)?;
+        plan.location = if byte_offset >= 0 {
+            base_location.byte_range(byte_offset as u64, layout.element_type.size())?
+        } else {
+            add_location_offset(base_location, byte_offset)?
+        };
+        if plan.availability.is_available() {
+            plan.availability = plan.location.availability();
+        }
         plan.type_name = layout.element_type.type_name();
         plan.dwarf_type = Some(layout.element_type);
         plan.type_id = None;

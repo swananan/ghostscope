@@ -87,10 +87,13 @@ must cover the known type size without gaps or overlaps. Whole-value printing
 is bounded by `ebpf.mem_dump_cap`; scalar expressions support values up to eight
 bytes. Whole-value printing reports a failed memory piece as a read error;
 scalar reconstruction returns zero for the entire value on any fragment failure.
-Missing pieces, SIMD/FP registers, and
-`DW_OP_bit_piece` remain unsupported. Field/array projection, address-taking,
-and semantic adapter captures for composite values are not supported
-in this initial implementation.
+Fields and constant array indices can be projected from byte-aligned pieces or
+scalar aggregate values. Missing fields display `<unavailable: optimized out>`
+without preventing access to other fields; missing padding is not a field value.
+Scalar arithmetic requires all requested bytes to be available. SIMD/FP registers,
+`DW_OP_bit_piece`, bitfield extraction from aggregate values, taking the address
+of a value without target memory storage, and semantic adapter captures remain
+unsupported.
 
 ### 8. Dynamically Loaded Libraries (dlopen)
 GhostScope scans `/proc/PID/maps` at startup, and runtime map-change monitoring refreshes module mappings for `-p <pid>` and standalone `-t <path>` runs while sysmon is enabled. For `bt`/`backtrace`, a later event can request compact CFI for the specific `dlopen` module it reached; GhostScope neither eagerly indexes every new mapping nor retains full runtime-module DWARF. This remains subject to the configured runtime module count/time limits, `backtrace_unwind_rows_max_entries`, and the map-change race noted above. Set `backtrace_runtime_modules = false` or pass `--no-backtrace-runtime-modules` to keep module-offset/raw-address degradation without automatic CFI loading.

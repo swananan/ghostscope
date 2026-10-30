@@ -461,25 +461,25 @@ trace {}:68 {{
 }
 
 #[tokio::test]
-async fn test_value_backed_aggregate_member_access_is_rejected_o2() -> anyhow::Result<()> {
+async fn test_value_backed_aggregate_member_access_compiles_o2() -> anyhow::Result<()> {
     init();
 
     let source_path = member_pointer_source_path(OptimizationLevel::O2)?;
     let script = format!(
         r#"
 trace {}:{VALUE_BACKED_AGGREGATE_LINE} {{
+    print s.a;
     print s.b;
+    print "PAIR={{}}:{{}}", s.a, s.b;
+    if s.b - s.a == 1 {{ print "PAIR_OK"; }}
 }}
 "#,
         source_path.display()
     );
 
-    let message = compile_member_pointer_failure_message(&script, OptimizationLevel::O2).await?;
-    assert!(
-        message.contains("value-backed aggregate")
-            || message.contains("field/array extraction from aggregate values is not implemented"),
-        "unexpected compile error: {message}"
-    );
+    let result = compile_member_pointer_script(&script, OptimizationLevel::O2).await?;
+    assert!(!result.uprobe_configs.is_empty(), "{result:?}");
+    assert!(result.failed_targets.is_empty(), "{result:?}");
     Ok(())
 }
 

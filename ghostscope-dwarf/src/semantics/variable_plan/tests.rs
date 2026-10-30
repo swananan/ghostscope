@@ -482,13 +482,6 @@ fn composite_materialization_rejects_incomplete_or_invalid_piece_layouts() {
         ),
         (vec![piece(0, 7, register.clone())], "byte-aligned"),
         (
-            vec![
-                piece(0, 32, register.clone()),
-                piece(32, 32, VariableLocation::OptimizedOut),
-            ],
-            "unavailable or unsupported",
-        ),
-        (
             vec![piece(0, 64, VariableLocation::Unknown)],
             "unavailable or unsupported",
         ),
@@ -808,7 +801,7 @@ fn field_access_folds_constant_address_offsets() {
 }
 
 #[test]
-fn field_access_rejects_value_backed_aggregates() {
+fn field_access_extracts_value_backed_aggregates() {
     let int_type = TypeInfo::BaseType {
         name: "int".to_string(),
         size: 4,
@@ -828,24 +821,28 @@ fn field_access_rejects_value_backed_aggregates() {
     let access = VariableAccessPath::fields(["b"]);
 
     for location in [
-        VariableLocation::AbsoluteAddressValue(AddressExpr::constant(0x1000)),
         VariableLocation::RegisterValue { dwarf_reg: 0 },
         VariableLocation::ComputedValue(vec![PlanExprOp::LoadRegister(0)]),
     ] {
         let plan = typed_read_plan(location, struct_type.clone());
-        let err = plan
+        let projected = plan
             .plan_access_path(&access)
-            .expect_err("value-backed aggregate field access should fail");
-        assert!(
-            err.downcast_ref::<PlanError>()
-                .is_some_and(|error| matches!(error, PlanError::ValueBackedAggregateOffset { .. })),
-            "unexpected error: {err}"
+            .expect("value-backed field projection");
+        assert_eq!(
+            projected.location,
+            VariableLocation::ComputedValue(vec![
+                PlanExprOp::LoadRegister(0),
+                PlanExprOp::PushConstant(32),
+                PlanExprOp::Shr,
+                PlanExprOp::PushConstant(0xffff_ffff),
+                PlanExprOp::And
+            ])
         );
     }
 }
 
 #[test]
-fn array_index_rejects_value_backed_aggregates() {
+fn array_index_extracts_value_backed_aggregates() {
     let int_type = TypeInfo::BaseType {
         name: "int".to_string(),
         size: 4,
@@ -859,18 +856,22 @@ fn array_index_rejects_value_backed_aggregates() {
     let access = VariableAccessPath::new(vec![VariableAccessSegment::ArrayIndex(1)]);
 
     for location in [
-        VariableLocation::AbsoluteAddressValue(AddressExpr::constant(0x1000)),
         VariableLocation::RegisterValue { dwarf_reg: 0 },
         VariableLocation::ComputedValue(vec![PlanExprOp::LoadRegister(0)]),
     ] {
         let plan = typed_read_plan(location, array_type.clone());
-        let err = plan
+        let projected = plan
             .plan_access_path(&access)
-            .expect_err("value-backed aggregate array access should fail");
-        assert!(
-            err.downcast_ref::<PlanError>()
-                .is_some_and(|error| matches!(error, PlanError::ValueBackedAggregateOffset { .. })),
-            "unexpected error: {err}"
+            .expect("value-backed array projection");
+        assert_eq!(
+            projected.location,
+            VariableLocation::ComputedValue(vec![
+                PlanExprOp::LoadRegister(0),
+                PlanExprOp::PushConstant(32),
+                PlanExprOp::Shr,
+                PlanExprOp::PushConstant(0xffff_ffff),
+                PlanExprOp::And
+            ])
         );
     }
 }
@@ -1079,4 +1080,336 @@ fn array_index_access_uses_element_stride() {
         planned.location,
         VariableLocation::Address(AddressExpr::constant(0x100c))
     );
+}
+
+fn split_pair_plan(first: VariableLocation, second: VariableLocation) -> VariableReadPlan {
+    let int_type = TypeInfo::BaseType {
+        name: "int".into(),
+        size: 4,
+        encoding: gimli::DW_ATE_signed.0.into(),
+    };
+    let location = VariableLocation::Pieces(vec![
+        PieceLocation {
+            bit_offset: 0,
+            bit_size: 32,
+            location: Box::new(first),
+        },
+        PieceLocation {
+            bit_offset: 32,
+            bit_size: 32,
+            location: Box::new(second),
+        },
+    ]);
+    let availability = location.availability();
+    let mut plan = typed_read_plan(
+        location,
+        TypeInfo::StructType {
+            name: "Pair".into(),
+            size: 8,
+            members: vec![
+                StructMember {
+                    name: "a".into(),
+                    member_type: int_type.clone(),
+                    offset: 0,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+                StructMember {
+                    name: "b".into(),
+                    member_type: int_type,
+                    offset: 4,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+            ],
+        },
+    );
+    plan.availability = availability;
+    plan
+}
+
+#[test]
+fn split_field_availability_ignores_missing_siblings() {
+    let plan = split_pair_plan(
+        VariableLocation::OptimizedOut,
+        VariableLocation::RegisterValue { dwarf_reg: 3 },
+    );
+    assert_eq!(plan.availability, Availability::PartiallyAvailable);
+    let present = plan
+        .plan_access_path(&VariableAccessPath::fields(["b"]))
+        .unwrap();
+    let missing = plan
+        .plan_access_path(&VariableAccessPath::fields(["a"]))
+        .unwrap();
+    assert_eq!(present.availability, Availability::Available);
+    assert_eq!(
+        present
+            .bpf_lowering_plan(&capabilities(true))
+            .required_registers,
+        vec![3]
+    );
+    assert_eq!(missing.availability, Availability::OptimizedOut);
+    assert!(missing
+        .bpf_lowering_plan(&capabilities(true))
+        .required_registers
+        .is_empty());
+}
+
+#[test]
+fn split_capture_marks_missing_fields_instead_of_zero_values() {
+    let plan = split_pair_plan(
+        VariableLocation::OptimizedOut,
+        VariableLocation::ImplicitValue(vec![42, 0, 0, 0]),
+    );
+    let materialized = plan.materialization_plan(&capabilities(true));
+    assert_eq!(materialized.availability, Availability::PartiallyAvailable);
+    let capture_type = materialized.composite_capture_type().unwrap();
+    let TypeInfo::StructType { members, .. } = &capture_type else {
+        panic!("expected struct")
+    };
+    assert!(matches!(
+        members[0].member_type,
+        TypeInfo::OptimizedOut { .. }
+    ));
+    assert_eq!(members[1].offset, 4);
+    let mut data = vec![0; 8];
+    data[4] = 42;
+    let rendered = ghostscope_protocol::format_printer::FormatPrinter::format_data_with_type_info(
+        &data,
+        &capture_type,
+    );
+    assert!(
+        rendered.contains("a: <unavailable: optimized out>") && rendered.contains("b: 42"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn split_projection_spans_pieces_and_retains_unavailable_holes() {
+    let plan = split_pair_plan(
+        VariableLocation::ImplicitValue(vec![1, 2, 3, 4]),
+        VariableLocation::ImplicitValue(vec![5, 6, 7, 8]),
+    );
+    let projected = plan.location.byte_range(2, 4).unwrap();
+    let VariableLocation::Pieces(pieces) = projected else {
+        panic!("expected split field")
+    };
+    assert_eq!((pieces[0].bit_offset, pieces[0].bit_size), (0, 16));
+    assert_eq!(
+        *pieces[0].location,
+        VariableLocation::ImplicitValue(vec![3, 4])
+    );
+    assert_eq!((pieces[1].bit_offset, pieces[1].bit_size), (16, 16));
+    assert_eq!(
+        *pieces[1].location,
+        VariableLocation::ImplicitValue(vec![5, 6])
+    );
+    assert_eq!(
+        plan.location.byte_range(6, 4).unwrap().availability(),
+        Availability::PartiallyAvailable
+    );
+    assert_eq!(
+        plan.location.byte_range(8, 4).unwrap(),
+        VariableLocation::OptimizedOut
+    );
+}
+
+#[test]
+fn split_locations_have_no_target_address_and_reject_malformed_pieces() {
+    let plan = split_pair_plan(
+        VariableLocation::RegisterValue { dwarf_reg: 0 },
+        VariableLocation::RegisterValue { dwarf_reg: 3 },
+    );
+    assert!(matches!(
+        plan.lvalue_address_plan(),
+        LvalueAddressPlan::Unavailable { .. }
+    ));
+    let mut overlapping = plan.location.clone();
+    if let VariableLocation::Pieces(pieces) = &mut overlapping {
+        pieces[1].bit_offset = 16;
+    }
+    assert!(overlapping.byte_range(0, 8).is_err());
+    let mut bits = plan.location.clone();
+    if let VariableLocation::Pieces(pieces) = &mut bits {
+        pieces[0].bit_size = 31;
+    }
+    assert!(bits.byte_range(0, 8).is_err());
+}
+
+#[test]
+fn pointer_arithmetic_preserves_addresses_when_pointee_size_is_unknown() {
+    let plan = typed_read_plan(
+        VariableLocation::ComputedValue(vec![PlanExprOp::LoadRegister(5)]),
+        TypeInfo::PointerType {
+            size: 8,
+            target_type: Box::new(TypeInfo::UnknownType {
+                name: "Incomplete".into(),
+            }),
+        },
+    );
+    let projected = plan.plan_pointer_element_index(0).unwrap();
+    assert_eq!(
+        projected.location,
+        VariableLocation::ComputedAddress(vec![PlanExprOp::LoadRegister(5)])
+    );
+    assert!(matches!(
+        projected.lvalue_address_plan(),
+        LvalueAddressPlan::Address { .. }
+    ));
+}
+
+#[test]
+fn large_implicit_field_projection_keeps_complete_capture() {
+    let array = TypeInfo::ArrayType {
+        element_type: Box::new(TypeInfo::BaseType {
+            name: "unsigned char".into(),
+            size: 1,
+            encoding: gimli::DW_ATE_unsigned_char.0.into(),
+        }),
+        element_count: Some(16),
+        total_size: Some(16),
+    };
+    let implicit = VariableLocation::ImplicitValue((0..20).collect());
+    for location in [
+        implicit.clone(),
+        VariableLocation::Pieces(vec![PieceLocation {
+            bit_offset: 0,
+            bit_size: 160,
+            location: Box::new(implicit),
+        }]),
+    ] {
+        let plan = typed_read_plan(
+            location,
+            TypeInfo::StructType {
+                name: "Bytes".into(),
+                size: 20,
+                members: vec![StructMember {
+                    name: "bytes".into(),
+                    member_type: array.clone(),
+                    offset: 4,
+                    bit_offset: None,
+                    bit_size: None,
+                }],
+            },
+        );
+        let projected = plan
+            .plan_access_path(&VariableAccessPath::fields(["bytes"]))
+            .unwrap();
+        let materialized = projected.materialization_plan(&capabilities(true));
+        let VariableMaterialization::Composite { pieces } = materialized.materialization else {
+            panic!("large field must not be truncated to one scalar")
+        };
+        assert_eq!(pieces[0].byte_size, 16);
+        assert_eq!(
+            pieces[0].source,
+            PlannedPieceSource::Value(PlannedValue::ImplicitBytes((4..20).collect()))
+        );
+        let last = projected
+            .plan_access_path(&VariableAccessPath::new(vec![
+                VariableAccessSegment::ArrayIndex(15),
+            ]))
+            .unwrap();
+        assert_eq!(last.location, VariableLocation::ImplicitValue(vec![19]));
+    }
+}
+
+fn padded_array_plan(missing_field: bool, element_count: Option<u64>) -> VariableReadPlan {
+    let element = TypeInfo::StructType {
+        name: "Padded".into(),
+        size: 8,
+        members: vec![
+            StructMember {
+                name: "tag".into(),
+                member_type: TypeInfo::BaseType {
+                    name: "unsigned char".into(),
+                    size: 1,
+                    encoding: gimli::DW_ATE_unsigned_char.0.into(),
+                },
+                offset: 0,
+                bit_offset: None,
+                bit_size: None,
+            },
+            StructMember {
+                name: "value".into(),
+                member_type: TypeInfo::BaseType {
+                    name: "unsigned short".into(),
+                    size: 2,
+                    encoding: gimli::DW_ATE_unsigned.0.into(),
+                },
+                offset: 4,
+                bit_offset: None,
+                bit_size: None,
+            },
+        ],
+    };
+    let mut pieces = Vec::new();
+    for index in 0..2 {
+        for (offset, size, location) in [
+            (0, 1, VariableLocation::ImplicitValue(vec![7 + index as u8])),
+            (1, 3, VariableLocation::OptimizedOut),
+            (
+                4,
+                2,
+                if missing_field && index == 1 {
+                    VariableLocation::OptimizedOut
+                } else {
+                    VariableLocation::ImplicitValue(vec![42 + index as u8, 0])
+                },
+            ),
+            (6, 2, VariableLocation::OptimizedOut),
+        ] {
+            pieces.push(PieceLocation {
+                bit_offset: (index * 8 + offset) * 8,
+                bit_size: size * 8,
+                location: Box::new(location),
+            });
+        }
+    }
+    let location = VariableLocation::Pieces(pieces);
+    let availability = location.availability();
+    let mut plan = typed_read_plan(
+        location,
+        TypeInfo::ArrayType {
+            element_type: Box::new(TypeInfo::TypedefType {
+                name: "PaddedAlias".into(),
+                underlying_type: Box::new(element),
+            }),
+            element_count,
+            total_size: Some(16),
+        },
+    );
+    plan.availability = availability;
+    plan
+}
+
+#[test]
+fn split_array_capture_ignores_internal_and_trailing_element_padding() {
+    for count in [Some(2), None] {
+        let plan = padded_array_plan(false, count);
+        let capture_type = plan
+            .materialization_plan(&capabilities(true))
+            .composite_capture_type()
+            .unwrap();
+        assert_eq!(Some(&capture_type), plan.dwarf_type.as_ref());
+        let data = [7, 0, 0, 0, 42, 0, 0, 0, 8, 0, 0, 0, 43, 0, 0, 0];
+        let rendered =
+            ghostscope_protocol::format_printer::FormatPrinter::format_data_with_type_info(
+                &data,
+                &capture_type,
+            );
+        assert_eq!(
+            rendered,
+            "[PaddedAlias { tag: 7, value: 42 }, PaddedAlias { tag: 8, value: 43 }]"
+        );
+    }
+}
+
+#[test]
+fn split_array_capture_does_not_expose_missing_element_fields() {
+    let plan = padded_array_plan(true, Some(2));
+    let capture_type = plan
+        .materialization_plan(&capabilities(true))
+        .composite_capture_type()
+        .unwrap();
+    assert!(matches!(capture_type, TypeInfo::OptimizedOut { .. }));
 }

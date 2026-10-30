@@ -98,6 +98,26 @@ __attribute__((noinline)) static int trace_shadowed_state(int seed) {
     return total;
 }
 
+typedef struct {
+    int code;
+    const int *category;
+    uint64_t serial;
+    int missing;
+} split_record_t;
+
+__attribute__((noinline)) static uint64_t trace_split_record(int seed) {
+    static const int category = 314;
+    split_record_t ec;
+    ec.code = seed + 7;
+    ec.category = &category;
+    ec.serial = (uint64_t)seed + UINT64_C(0x1234567800000000);
+    asm volatile("" : "+r"(ec.code), "+r"(ec.category), "+r"(ec.serial) : : "memory");
+    asm volatile("nop" : : "r"(ec.code), "r"(ec.category), "r"(ec.serial) : "memory"); /* SRA_SPLIT_PROBE */
+    uint64_t result = ec.serial + ec.code + *ec.category;
+    asm volatile("" : "+r"(result) : : "memory");
+    return result;
+}
+
 int main(void) {
     int iter = 0;
     while (iter < 20000) {
@@ -105,6 +125,8 @@ int main(void) {
         volatile int semantic_sink =
             trace_value_backed_aggregate(iter) + trace_shadowed_state(iter);
         (void)semantic_sink;
+        volatile uint64_t split_sink = trace_split_record(iter);
+        (void)split_sink;
         iter++;
         sleep(1);
     }

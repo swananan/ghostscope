@@ -35,6 +35,113 @@ async fn spawn_member_pointer_binary(
 }
 
 #[tokio::test]
+async fn test_value_backed_aggregate_o2_runtime_fields() -> anyhow::Result<()> {
+    init();
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("member_pointer_program", OptimizationLevel::O2)?;
+    let target = spawn_member_pointer_binary(&binary_path).await?;
+    let script = r#"
+trace member_pointer_program.c:84 {
+    print "SRA_FIELDS={}:{}", s.a, s.b;
+    print "SRA_DELTA={}", s.b - s.a;
+    if s.b - s.a == 1 { print "SRA_FIELDS_OK"; }
+}
+"#;
+    let result = run_ghostscope_with_script_for_target(script, 4, &target).await;
+    target.terminate().await?;
+    let (exit_code, stdout, stderr) = result?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    let fields = regex::Regex::new(r"SRA_FIELDS=(-?\d+):(-?\d+)")?;
+    let samples: Vec<_> = fields.captures_iter(&stdout).collect();
+    assert!(!samples.is_empty(), "{stdout}");
+    for sample in samples {
+        assert_eq!(
+            sample[2].parse::<i64>()?,
+            sample[1].parse::<i64>()? + 1,
+            "{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("SRA_DELTA=1") && stdout.contains("SRA_FIELDS_OK"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("<unavailable") && !stdout.contains("ExprError"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_value_backed_aggregate_o2_runtime_padding_pointer_and_missing_field(
+) -> anyhow::Result<()> {
+    init();
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("member_pointer_program", OptimizationLevel::O2)?;
+    let source = std::fs::read_to_string(
+        binary_path
+            .parent()
+            .unwrap()
+            .join("member_pointer_program.c"),
+    )?;
+    let line = source
+        .lines()
+        .position(|line| line.contains("SRA_SPLIT_PROBE"))
+        .unwrap()
+        + 1;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let addresses =
+        analyzer.lookup_addresses_by_source_line("member_pointer_program.c", line as u32);
+    anyhow::ensure!(!addresses.is_empty(), "missing split-record probe address");
+    for address in &addresses {
+        let pc = analyzer.resolve_pc(address)?;
+        let plan = analyzer
+            .plan_variable_by_name(&pc, "ec")?
+            .ok_or_else(|| anyhow::anyhow!("missing ec"))?;
+        anyhow::ensure!(
+            matches!(plan.location, ghostscope_dwarf::VariableLocation::Pieces(_)),
+            "fixture must exercise DW_OP_piece: {plan:?}"
+        );
+    }
+    let target = spawn_member_pointer_binary(&binary_path).await?;
+    let script = format!(
+        r#"
+trace member_pointer_program.c:{line} {{
+    print "SRA_RECORD={{}}", ec;
+    print "SRA_CATEGORY={{}}", *ec.category;
+    print "SRA_MISSING={{}}", ec.missing;
+    if ec.serial - ec.code == 0x12345677fffffff9 {{ print "SRA_RECORD_OK"; }}
+}}
+"#
+    );
+    let result = run_ghostscope_with_script_for_target(&script, 4, &target).await;
+    target.terminate().await?;
+    let (exit_code, stdout, stderr) = result?;
+    assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
+    assert!(
+        stdout.contains("SRA_RECORD=") && stdout.contains("code:") && stdout.contains("serial:"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("SRA_CATEGORY=314") && stdout.contains("SRA_RECORD_OK"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("missing: <unavailable: optimized out>"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("SRA_MISSING=<unavailable: optimized out>"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("ExprError") && !stdout.contains("<OUT_OF_BOUNDS>"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_member_pointer_o3_runtime_member_pointer_format_and_memcmp() -> anyhow::Result<()> {
     init();
 
