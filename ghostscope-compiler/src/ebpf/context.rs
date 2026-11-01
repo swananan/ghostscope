@@ -216,10 +216,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     fn uprobe_section(&self) -> &'static str {
-        if self.compile_options.runtime_capabilities.sleepable_uprobe {
-            "uprobe.s"
-        } else {
-            "uprobe"
+        let caps = &self.compile_options.runtime_capabilities;
+        match (caps.uprobe_multi, caps.sleepable_uprobe) {
+            (true, true) => "uprobe.multi.s",
+            (true, false) => "uprobe.multi",
+            (false, true) => "uprobe.s",
+            (false, false) => "uprobe",
         }
     }
 
@@ -1354,6 +1356,20 @@ mod tests {
 
         let llvm_ir = llvm_ir_with_basic_program(&options);
         assert!(llvm_ir.contains("uprobe.s"));
+    }
+
+    #[test]
+    fn multi_uprobe_sections_preserve_sleepable_mode() {
+        for (sleepable, section) in [(false, "uprobe.multi"), (true, "uprobe.multi.s")] {
+            let mut options = crate::CompileOptions::default();
+            options.runtime_capabilities.uprobe_multi = true;
+            options.runtime_capabilities.sleepable_uprobe = sleepable;
+            let llvm_context = Context::create();
+            let mut codegen =
+                EbpfContext::new(&llvm_context, "section_test", Some(1), &options).unwrap();
+            let function = codegen.create_main_function("test_program").unwrap();
+            assert_eq!(function.get_section().unwrap().to_str().unwrap(), section);
+        }
     }
 
     #[test]

@@ -143,7 +143,7 @@ pub(super) fn configure_sysmon_exec_comm_filter(
 
     if let Some(map) = bpf.map_mut("target_exec_comm") {
         let mut array: Array<_, [u8; 16]> = map.try_into()?;
-        array.set(0, filter_bytes, 0)?;
+        array.set(0, &filter_bytes, 0)?;
         if filter_len > 0 {
             match std::str::from_utf8(&filter_bytes[..filter_len]) {
                 Ok(name_str) => {
@@ -177,7 +177,7 @@ pub(super) fn configure_sysmon_event_filter(
 
     if let Some(map) = bpf.map_mut("sysmon_event_mask") {
         let mut array: Array<_, u32> = map.try_into()?;
-        array.set(0, event_mask.bits(), 0)?;
+        array.set(0, &event_mask.bits(), 0)?;
         tracing::info!(
             "Sysmon: event mask configured (exec={}, fork={}, exit={}, map_change={})",
             event_mask.exec,
@@ -191,7 +191,7 @@ pub(super) fn configure_sysmon_event_filter(
 
     if let Some(map) = bpf.map_mut("sysmon_map_change_unfiltered") {
         let mut array: Array<_, u32> = map.try_into()?;
-        array.set(0, u32::from(map_change_unfiltered), 0)?;
+        array.set(0, &u32::from(map_change_unfiltered), 0)?;
         tracing::info!(
             "Sysmon: map-change pre-allowlist emission {}",
             if map_change_unfiltered {
@@ -208,7 +208,7 @@ pub(super) fn configure_sysmon_event_filter(
 
     if let Some(map) = bpf.map_mut("sysmon_watched_pid") {
         let mut array: Array<_, u32> = map.try_into()?;
-        array.set(0, watched_pid.unwrap_or(0), 0)?;
+        array.set(0, &watched_pid.unwrap_or(0), 0)?;
         if let Some(pid) = watched_pid {
             tracing::info!("Sysmon: watched event pid configured: {}", pid);
         } else {
@@ -224,7 +224,7 @@ pub(super) fn configure_sysmon_event_filter(
 
     if let Some(map) = bpf.map_mut("sysmon_watched_pid_ns_dev") {
         let mut array: Array<_, u64> = map.try_into()?;
-        array.set(0, ns_dev, 0)?;
+        array.set(0, &ns_dev, 0)?;
     } else if ns_spec.is_some() {
         tracing::warn!(
             "Sysmon: sysmon_watched_pid_ns_dev map missing; namespace PID filtering unavailable"
@@ -233,7 +233,7 @@ pub(super) fn configure_sysmon_event_filter(
 
     if let Some(map) = bpf.map_mut("sysmon_watched_pid_ns_ino") {
         let mut array: Array<_, u64> = map.try_into()?;
-        array.set(0, ns_ino, 0)?;
+        array.set(0, &ns_ino, 0)?;
     } else if ns_spec.is_some() {
         tracing::warn!(
             "Sysmon: sysmon_watched_pid_ns_ino map missing; namespace PID filtering unavailable"
@@ -254,7 +254,7 @@ pub(super) fn configure_sysmon_event_filter(
 
     if let Some(map) = bpf.map_mut("sysmon_event_pid_ns_dev") {
         let mut array: Array<_, u64> = map.try_into()?;
-        array.set(0, event_ns_dev, 0)?;
+        array.set(0, &event_ns_dev, 0)?;
     } else if event_ns_spec.is_some() {
         tracing::warn!(
             "Sysmon: sysmon_event_pid_ns_dev map missing; event namespace reporting unavailable"
@@ -263,7 +263,7 @@ pub(super) fn configure_sysmon_event_filter(
 
     if let Some(map) = bpf.map_mut("sysmon_event_pid_ns_ino") {
         let mut array: Array<_, u64> = map.try_into()?;
-        array.set(0, event_ns_ino, 0)?;
+        array.set(0, &event_ns_ino, 0)?;
     } else if event_ns_spec.is_some() {
         tracing::warn!(
             "Sysmon: sysmon_event_pid_ns_ino map missing; event namespace reporting unavailable"

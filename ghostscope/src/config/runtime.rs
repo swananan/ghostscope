@@ -310,6 +310,7 @@ fn dwarf_runtime_capabilities_from_kernel(
     sleepable_uprobe_enabled: bool,
 ) -> ghostscope_compiler::RuntimeCapabilities {
     ghostscope_compiler::RuntimeCapabilities {
+        uprobe_multi: kernel_caps.supports_uprobe_multi,
         regular_uprobe: kernel_caps.supports_ringbuf || kernel_caps.supports_perf_event_array,
         sleepable_uprobe: sleepable_uprobe_enabled && kernel_caps.supports_sleepable_uprobe,
         sleepable_tail_calls: sleepable_uprobe_enabled
@@ -351,12 +352,22 @@ mod tests {
         supports_sleepable_tail_calls: bool,
     ) -> KernelCapabilities {
         KernelCapabilities {
+            supports_uprobe_multi: false,
             supports_ringbuf: true,
             supports_perf_event_array: true,
             supports_ns_current_pid_tgid_helper: true,
             supports_sleepable_uprobe,
             supports_sleepable_tail_calls,
         }
+    }
+
+    #[test]
+    fn multi_uprobe_requires_kernel_support() {
+        let mut caps = kernel_caps(true, true);
+        assert!(!dwarf_runtime_capabilities_from_kernel(&caps, false).uprobe_multi);
+        caps.supports_uprobe_multi = true;
+        assert!(dwarf_runtime_capabilities_from_kernel(&caps, false).uprobe_multi);
+        assert!(dwarf_runtime_capabilities_from_kernel(&caps, true).uprobe_multi);
     }
 
     #[test]

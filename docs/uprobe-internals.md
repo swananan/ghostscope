@@ -2,6 +2,20 @@
 
 Understanding how GhostScope uses Linux uprobe and eBPF for dynamic tracing.
 
+## Attachment backend
+
+GhostScope uses Aya 0.16 and probes multi-uprobe support at startup with
+`is_uprobe_multi_supported(UProbeMultiFeature::ProcessScopedPidFilter)`.
+This checks both link creation and process-wide PID filtering, so probes attached
+to a PID also cover its worker threads. A kernel version check alone is insufficient
+because distributions can backport the PID-filtering fix.
+
+When supported, generated programs use `uprobe.multi` (or `uprobe.multi.s` for
+opt-in sleepable tracing). Otherwise, including when capability probing fails,
+GhostScope keeps using `uprobe` / `uprobe.s`. Probe errors are not cached as a
+permanent lack of support. Each trace still attaches its own compiled program;
+the multi backend does not combine distinct trace programs into one link.
+
 ## What is Uprobe?
 
 Uprobe (User-space probe) is a Linux kernel feature that allows you to dynamically instrument user-space applications at runtime without modifying the binary or requiring recompilation. It is one of the core components of the Linux kernel's dynamic tracing infrastructure.

@@ -182,7 +182,7 @@ struct PerfEventCpuBuffer {
     // See RingBufEventMap: reactor registration must be removed before the
     // perf buffer destroys the fd borrowed by EventBufferFd.
     readiness: AsyncFd<EventBufferFd>,
-    buffer: aya::maps::perf::PerfEventArrayBuffer<MapData>,
+    buffer: aya::maps::perf::PerfEventArrayBuffer,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -369,8 +369,7 @@ fn drain_readable_perf_cpu_buffers(
     )
 }
 
-/// Compatibility shim that mimics Aya's newer attach location helper so we can keep
-/// a single call-site regardless of which `UProbe::attach` signature we compile against.
+/// Attach one location using the same scope for initial attachment and reattachment.
 enum UProbeAttachLocation<'a> {
     AbsoluteOffset(u64),
     Function(&'a str),
@@ -385,8 +384,8 @@ impl<'a> UProbeAttachLocation<'a> {
     ) -> std::result::Result<UProbeLinkId, ProgramError> {
         let scope = uprobe_scope(pid)?;
         match self {
-            Self::AbsoluteOffset(offset) => program.attach(offset, target, scope),
-            Self::Function(fn_name) => program.attach(fn_name, target, scope),
+            Self::AbsoluteOffset(offset) => program.attach([offset], target, scope),
+            Self::Function(fn_name) => program.attach([fn_name], target, scope),
         }
     }
 }
@@ -680,7 +679,7 @@ impl GhostScopeLoader {
         let mut generations: Array<_, u64> = map.try_into().map_err(|e| {
             LoaderError::Generic(format!("Failed to convert event_generation map: {e}"))
         })?;
-        generations.set(0, generation, 0).map_err(|e| {
+        generations.set(0, &generation, 0).map_err(|e| {
             LoaderError::Generic(format!("Failed to set event generation {generation}: {e}"))
         })
     }
@@ -970,8 +969,13 @@ impl GhostScopeLoader {
 
             for cpu_id in online_cpus {
                 let pages = self.perf_page_count;
-                match perf_array.open(cpu_id, pages) {
+                match aya::maps::perf::PerfEventArrayBuffer::open(cpu_id, pages.unwrap_or(2)) {
                     Ok(buffer) => {
+                        perf_array.set(cpu_id, &buffer).map_err(|e| {
+                            LoaderError::Generic(format!(
+                                "Failed to install perf buffer for CPU {cpu_id}: {e}"
+                            ))
+                        })?;
                         if let Some(p) = pages {
                             info!(
                                 "Opened PerfEventArray buffer for CPU {} with {} pages",
@@ -1501,7 +1505,7 @@ impl GhostScopeLoader {
         })?;
         let populate_started_at = Instant::now();
         for (row_index, row) in rows.iter().copied().enumerate() {
-            array.set(row_index as u32, row, 0).map_err(|e| {
+            array.set(row_index as u32, &row, 0).map_err(|e| {
                 LoaderError::Generic(format!("Failed to set unwind row {row_index}: {e}"))
             })?;
         }
@@ -1541,7 +1545,7 @@ impl GhostScopeLoader {
             })?;
         let populate_started_at = Instant::now();
         for (cookie, range) in ranges.iter().copied() {
-            hash.insert(cookie, range, 0).map_err(|e| {
+            hash.insert(&cookie, &range, 0).map_err(|e| {
                 LoaderError::Generic(format!(
                     "Failed to set bt module row range for cookie 0x{cookie:016x}: {e}"
                 ))
@@ -1624,7 +1628,7 @@ impl GhostScopeLoader {
 
         for (offset, row) in retained_rows.iter().copied().enumerate() {
             let row_index = start + offset as u32;
-            array.set(row_index, row, 0).map_err(|e| {
+            array.set(row_index, &row, 0).map_err(|e| {
                 LoaderError::Generic(format!("Failed to append unwind row {row_index}: {e}"))
             })?;
         }
@@ -1640,7 +1644,7 @@ impl GhostScopeLoader {
             map.try_into().map_err(|e| {
                 LoaderError::Generic(format!("Failed to convert bt_module_row_ranges map: {e}"))
             })?;
-        hash.insert(cookie, range, 0).map_err(|e| {
+        hash.insert(&cookie, &range, 0).map_err(|e| {
             LoaderError::Generic(format!(
                 "Failed to append bt module row range for cookie 0x{cookie:016x}: {e}"
             ))

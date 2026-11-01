@@ -28,6 +28,7 @@ const INNER_DOCKER_DATA_ROOT: &str = "/var/lib/ghostscope-dind";
 const INNER_DOCKER_EXEC_ROOT: &str = "/var/run/ghostscope-dind";
 
 static NEXT_SANDBOX_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_BACKGROUND_LAUNCH_ID: AtomicU64 = AtomicU64::new(1);
 static DEFAULT_SANDBOX_STATE: OnceLock<Result<DefaultSandboxState, String>> = OnceLock::new();
 static STALE_DOCKER_SANDBOX_SWEEP: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -1159,14 +1160,9 @@ impl SandboxHandle {
             anyhow::bail!("child-container targets require a docker sandbox");
         };
 
-        let pid_file = format!(
-            "/tmp/ghostscope-child-target-{}.pid",
-            unix_timestamp_nanos()
-        );
-        let err_file = format!(
-            "/tmp/ghostscope-child-target-{}.err",
-            unix_timestamp_nanos()
-        );
+        let launch_token = next_background_launch_token();
+        let pid_file = format!("/tmp/ghostscope-child-target-{launch_token}.pid");
+        let err_file = format!("/tmp/ghostscope-child-target-{launch_token}.err");
         let working_dir = working_dir
             .map(Path::to_path_buf)
             .or_else(|| binary_path.parent().map(Path::to_path_buf))
@@ -1301,8 +1297,9 @@ impl SandboxHandle {
                 })
             }
             SandboxInner::Docker(inner) => {
-                let pid_file = format!("/tmp/ghostscope-target-{}.pid", unix_timestamp_nanos());
-                let err_file = format!("/tmp/ghostscope-target-{}.err", unix_timestamp_nanos());
+                let launch_token = next_background_launch_token();
+                let pid_file = format!("/tmp/ghostscope-target-{launch_token}.pid");
+                let err_file = format!("/tmp/ghostscope-target-{launch_token}.err");
                 let working_dir = working_dir
                     .map(Path::to_path_buf)
                     .or_else(|| binary_path.parent().map(Path::to_path_buf))
@@ -1366,7 +1363,14 @@ impl SandboxHandle {
                             })?;
                         if status_output.status.success() {
                             let _ = Command::new("docker")
-                                .args(["exec", &inner.container_name, "rm", "-f", &pid_file])
+                                .args([
+                                    "exec",
+                                    &inner.container_name,
+                                    "rm",
+                                    "-f",
+                                    &pid_file,
+                                    &err_file,
+                                ])
                                 .status();
                             return Ok(BackgroundProcess::Detached { pid });
                         }
@@ -2148,4 +2152,9 @@ fn unix_timestamp_nanos() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0)
+}
+
+fn next_background_launch_token() -> String {
+    let launch_id = NEXT_BACKGROUND_LAUNCH_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{launch_id}", std::process::id())
 }

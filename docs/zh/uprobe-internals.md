@@ -2,6 +2,19 @@
 
 了解 GhostScope 如何使用 Linux uprobe 和 eBPF 进行动态追踪。
 
+## 挂载后端
+
+GhostScope 使用 Aya 0.16，并在启动时调用
+`is_uprobe_multi_supported(UProbeMultiFeature::ProcessScopedPidFilter)`
+动态探测 multi-uprobe 支持。该探测同时检查 link 创建和进程级 PID 过滤，
+确保指定 PID 的探针也覆盖其工作线程。发行版可能回移 PID 过滤修复，因此不能
+仅根据内核版本选择后端。
+
+支持时生成 `uprobe.multi`；开启 sleepable 追踪时生成 `uprobe.multi.s`。
+不支持或探测失败时保留 `uprobe` / `uprobe.s`，且不会把探测错误永久缓存为
+“不支持”。每个 trace 仍挂载自己的编译程序，multi 后端不会将不同 trace 的
+程序合并到同一个 link。
+
 ## 什么是 Uprobe？
 
 Uprobe（用户空间探针）是 Linux 内核的一个功能，允许您在运行时动态地对用户空间应用程序进行插桩，无需修改二进制文件或重新编译。它是 Linux 内核提供的动态追踪基础设施的核心组件之一。

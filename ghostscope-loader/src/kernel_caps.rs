@@ -1,7 +1,10 @@
 use aya::{
     maps::MapType,
     programs::ProgramType,
-    sys::{is_helper_supported, is_map_supported, BpfHelper},
+    sys::{
+        is_helper_supported, is_map_supported, is_uprobe_multi_supported, BpfHelper,
+        UProbeMultiFeature,
+    },
     util::KernelVersion,
 };
 use aya_obj::generated::{
@@ -84,6 +87,8 @@ impl std::error::Error for KernelCapabilityError {}
 /// Kernel eBPF capabilities detection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelCapabilities {
+    /// Multi-uprobe links with process-wide PID filtering, including worker threads.
+    pub supports_uprobe_multi: bool,
     /// Whether the kernel supports BPF_MAP_TYPE_RINGBUF (requires >= 5.8)
     pub supports_ringbuf: bool,
     /// Whether the kernel supports BPF_MAP_TYPE_PERF_EVENT_ARRAY (requires >= 4.3)
@@ -282,18 +287,21 @@ fn detect_full_capabilities(
         warn!("⚠️  Kernel does not support helper bpf_get_ns_current_pid_tgid (id=120)");
     }
 
+    let supports_uprobe_multi = detect_uprobe_multi_support();
     let (supports_sleepable_uprobe, supports_sleepable_tail_calls) =
         detect_sleepable_capabilities(probe_sleepable);
 
     Ok(KernelCapabilityDetection {
         capabilities: KernelCapabilities {
+            supports_uprobe_multi: supports_uprobe_multi.supported,
             supports_ringbuf: supports_ringbuf.supported,
             supports_perf_event_array: supports_perf_event_array.supported,
             supports_ns_current_pid_tgid_helper: supports_ns_current_pid_tgid_helper.supported,
             supports_sleepable_uprobe: supports_sleepable_uprobe.supported,
             supports_sleepable_tail_calls: supports_sleepable_tail_calls.supported,
         },
-        cacheable: supports_ringbuf.cacheable
+        cacheable: supports_uprobe_multi.cacheable
+            && supports_ringbuf.cacheable
             && supports_perf_event_array.cacheable
             && supports_ns_current_pid_tgid_helper.cacheable
             && supports_sleepable_uprobe.cacheable
@@ -333,16 +341,33 @@ fn detect_perf_only_capabilities(
         warn!("⚠️  Kernel does not support helper bpf_get_ns_current_pid_tgid (id=120)");
     }
 
+    let supports_uprobe_multi = detect_uprobe_multi_support();
     let (supports_sleepable_uprobe, supports_sleepable_tail_calls) =
         detect_sleepable_capabilities(probe_sleepable);
 
     Ok(KernelCapabilities {
+        supports_uprobe_multi: supports_uprobe_multi.supported,
         supports_ringbuf: false,
         supports_perf_event_array: supports_perf_event_array.supported,
         supports_ns_current_pid_tgid_helper: supports_ns_current_pid_tgid_helper.supported,
         supports_sleepable_uprobe: supports_sleepable_uprobe.supported,
         supports_sleepable_tail_calls: supports_sleepable_tail_calls.supported,
     })
+}
+
+/// Require process-wide filtering even for all-process traces so compiled programs
+/// remain safe to reuse with a process-specific attachment scope.
+fn detect_uprobe_multi_support() -> CapabilityProbe {
+    match is_uprobe_multi_supported(UProbeMultiFeature::ProcessScopedPidFilter) {
+        Ok(supported) => {
+            info!("Process-scoped uprobe multi support: {supported}");
+            CapabilityProbe::cacheable(supported)
+        }
+        Err(err) => {
+            warn!("Uprobe multi probe failed; using regular uprobes: {err}");
+            CapabilityProbe::uncacheable_unsupported()
+        }
+    }
 }
 
 /// Detect RingBuf support by attempting to create a minimal map
@@ -787,6 +812,7 @@ mod tests {
         supports_sleepable_tail_calls: bool,
     ) -> KernelCapabilities {
         KernelCapabilities {
+            supports_uprobe_multi: false,
             supports_ringbuf,
             supports_perf_event_array,
             supports_ns_current_pid_tgid_helper,
