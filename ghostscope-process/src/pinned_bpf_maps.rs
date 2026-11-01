@@ -838,7 +838,7 @@ pub fn ensure_pinned_backtrace_cfi_maps_exist(
 /// Insert a PID into the allowed_pids pinned map.
 pub fn insert_allowed_pid(pid: u32) -> anyhow::Result<()> {
     let mut map = open_pinned_hash_map::<u32, u8>(allowed_pids_pin_path()?)?;
-    map.insert(pid, 1, 0)
+    map.insert(&pid, &1, 0)
         .map_err(|e| anyhow::anyhow!("allowed_pids update failed for {pid}: {e}"))
 }
 
@@ -863,7 +863,7 @@ pub fn remove_allowed_pid(pid: u32) -> anyhow::Result<()> {
 pub fn insert_pid_alias(runtime_pid: u32, proc_pid: u32) -> anyhow::Result<()> {
     let mut map = open_pinned_hash_map::<u32, PidAliasValue>(pid_aliases_pin_path()?)?;
     let val = PidAliasValue { proc_pid };
-    map.insert(runtime_pid, val, 0).map_err(|e| {
+    map.insert(&runtime_pid, &val, 0).map_err(|e| {
         anyhow::anyhow!(
             "pid_aliases update failed for runtime_pid={runtime_pid} proc_pid={proc_pid}: {e}"
         )
@@ -970,7 +970,7 @@ pub fn insert_offsets_for_pid(
             cookie_lo: (*cookie & 0xffff_ffff) as u32,
             cookie_hi: (*cookie >> 32) as u32,
         };
-        match map.insert(key, *off, 0) {
+        match map.insert(&key, off, 0) {
             Ok(()) => {
                 tracing::debug!(
                     "proc_module_offsets insert ok: pid={} cookie=0x{:08x}{:08x} text=0x{:x} rodata=0x{:x} data=0x{:x} bss=0x{:x} base=0x{:x} size=0x{:x}",
@@ -1012,11 +1012,11 @@ impl ModuleRangeSnapshotStore for PinnedModuleRangeSnapshotStore<'_> {
         key: ProcModuleRangeKey,
         value: ProcModuleRangeValue,
     ) -> anyhow::Result<()> {
-        self.ranges.insert(key, value, 0).map_err(Into::into)
+        self.ranges.insert(&key, &value, 0).map_err(Into::into)
     }
 
     fn publish_meta(&mut self, pid: u32, meta: ProcModuleRangeMeta) -> anyhow::Result<()> {
-        self.meta.insert(pid, meta, 0).map_err(Into::into)
+        self.meta.insert(&pid, &meta, 0).map_err(Into::into)
     }
 }
 

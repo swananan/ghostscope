@@ -452,8 +452,12 @@ pub(super) fn run_sysmon_loop(
         let online = aya::util::online_cpus().map_err(|(_, e)| anyhow::anyhow!(e))?;
         let mut bufs = Vec::new();
         for cpu in online {
-            match perf.open(cpu, cfg.perf_page_count) {
-                Ok(buf) => bufs.push(buf),
+            match aya::maps::perf::PerfEventArrayBuffer::open(cpu, cfg.perf_page_count.unwrap_or(2))
+            {
+                Ok(buf) => match perf.set(cpu, &buf) {
+                    Ok(()) => bufs.push(buf),
+                    Err(e) => warn!("Perf map update failed for CPU {}: {}", cpu, e),
+                },
                 Err(e) => warn!("Perf open failed for CPU {}: {}", cpu, e),
             }
         }
