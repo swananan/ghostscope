@@ -9,6 +9,8 @@
     - BPF_MAP_TYPE_PERF_EVENT_ARRAY - Linux 4.3 引入
     - 稳定的 eBPF 追踪支持 - 建议 Linux 4.4+
 - **架构**: 目前仅支持 x86_64 (AMD64)
+- **预编译二进制运行依赖**：glibc 2.31 或更高版本、libstdc++、zlib 和 zstd
+  （Debian/Ubuntu 软件包：`libstdc++6 zlib1g libzstd1`）。运行预编译二进制无需安装 Rust 或 LLVM。
 
 安装器会拒绝非 Linux 主机、非 x86_64 主机和不支持的 `--arch` 参数。运行时也会拒绝不是 64 位小端 x86_64 ELF 的目标可执行文件或共享库。
 
@@ -41,17 +43,17 @@ curl -fsSL https://raw.githubusercontent.com/swananan/ghostscope/main/scripts/in
 
 2. 解压二进制文件：
 ```bash
-tar -xzf ghostscope-v0.1.6-x86_64-linux.tar.gz
+tar -xzf ghostscope-v0.1.7-x86_64-linux.tar.gz
 ```
 
-3. 移动到系统路径（可选）：
-```bash
-sudo mv ghostscope /usr/local/bin/
-```
-
-4. 设置可执行权限：
+3. 设置可执行权限：
 ```bash
 chmod +x ghostscope
+```
+
+4. 移动到系统路径（可选）：
+```bash
+sudo mv ghostscope /usr/local/bin/
 ```
 
 5. 验证安装：

@@ -399,10 +399,6 @@ download_and_unpack() {
   ensure_command tar
 
   local tmpdir="$TMPDIR_CREATED"
-  if [[ -z "$tmpdir" ]]; then
-    tmpdir="$(mktemp -d)"
-    TMPDIR_CREATED="$tmpdir"
-  fi
 
   local archive_name="$asset_name"
   if [[ -z "$archive_name" ]]; then
@@ -433,7 +429,6 @@ download_and_unpack() {
     return 1
   fi
 
-  EXTRACTED_ASSET_DIR="$tmpdir"
   debug_log "Archive extracted into $tmpdir"
 
   local bin_path
@@ -723,6 +718,9 @@ main() {
       echo "error: internal error resolving release asset (download_url or asset_name missing)" >&2
       return 1
     fi
+    # Allocate in the parent shell so config discovery and EXIT cleanup share it.
+    TMPDIR_CREATED="$(mktemp -d)"
+    EXTRACTED_ASSET_DIR="$TMPDIR_CREATED"
     if ! bin_path="$(download_and_unpack "$download_url" "$asset_name")"; then
       return 1
     fi

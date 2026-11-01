@@ -82,37 +82,31 @@ cargo build --release
 
 ### Docker 构建（推荐用于 Release）
 
-在 Ubuntu 20.04 容器中构建，获得最大兼容性（glibc 2.31）：
+使用与 CI 相同的固定 Ubuntu 20.04 / LLVM 22 镜像构建并打包：
 
 ```bash
-# 一键构建（如需要会自动创建 Docker 镜像）
-./docker-build.sh
-
-# 输出：./target/release/ghostscope
+bash scripts/release/build.sh
+python3 scripts/release/smoke_install.py target/dist/*.tar.gz
 ```
 
-**优势：**
-- 使用 glibc 2.31 构建（兼容 Ubuntu 20.04+、Debian 11+、RHEL 8+）
-- 隔离环境，不影响系统
-- 在不同开发机器上可复现构建
+宿主机需要 Docker、Python 3、binutils 以及常用 shell 和归档工具。
+构建产物位于 `target/release-build`，发布包和 SHA-256 校验文件位于
+`target/dist`，不会清理已有 debug 构建。
 
-**其他 Docker 命令：**
+打包时检查二进制版本、x86_64 ELF 格式、glibc 2.31 版本上限，以及是否直接依赖
+共享 LLVM/libffi。CI 还会在特权 Ubuntu 20.04 容器中运行发布包安装、CLI
+和真实 DWARF 参数追踪 smoke 测试。这使用 runner 的内核验证用户态兼容性，
+不代表已验证所有支持的内核版本。
 
-```bash
-# 构建 debug 版本
-docker run --rm -v $(pwd):/workspace -w /workspace \
-    ghostscope-builder:ubuntu20.04 cargo build
+发版前更新工作区版本、内部依赖版本、`Cargo.lock`、README 徽章和安装示例，
+编写 `docs/releases/v<版本>.md`，等待候选提交的 CI、供应链和相关 e2e 检查通过。
+先在候选分支手动运行 **Release Build** 并检查产物和 tracing 行为，再推送匹配的 tag。
+工作流会拒绝版本不一致的 tag，并创建包含发布说明和资产的 **Draft Release**；
+人工检查后再发布。手动触发工作流只生成 artifact，不创建 Release。
 
-# 进入容器交互式环境
-docker run -it --rm -v $(pwd):/workspace -w /workspace \
-    ghostscope-builder:ubuntu20.04 bash
-
-# 重新构建 Docker 镜像（仅在 `docker/base-build/Dockerfile` 修改后需要）
-docker build -t ghostscope-builder:ubuntu20.04 -f docker/base-build/Dockerfile .
-```
-
-**注意**：开发过程中默认使用 debug 构建，以获得更快的迭代速度和更好的调试体验。
-
+归档包含二进制、中英文配置模板、README 和项目许可证。
+安装 smoke 测试使用本地归档替代 GitHub 下载，正式发布后仍需验证公开资产下载。
+安装器会保留已有用户配置。
 
 ### Sysmon eBPF（已预编译）与脚本使用
 

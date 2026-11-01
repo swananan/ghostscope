@@ -7,7 +7,7 @@
   </p>
 
   <p>
-    <img src="https://img.shields.io/badge/版本-0.1.6-blue.svg" alt="版本"/>
+    <img src="https://img.shields.io/badge/版本-0.1.7-blue.svg" alt="版本"/>
     <img src="https://img.shields.io/badge/协议-GPL--3.0--only%20OR%20MIT-green.svg" alt="协议：GPL-3.0-only OR MIT"/>
     <img src="https://img.shields.io/badge/Linux-4.4+-orange.svg" alt="Linux 4.4+"/>
     <img src="https://img.shields.io/badge/Rust-1.98.0-red.svg" alt="Rust 1.98.0"/>

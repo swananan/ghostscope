@@ -1,55 +1,78 @@
 name: Release Build
 
 on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/release/**'
+      - 'scripts/install.sh'
+      - 'docker/base-build/**'
+      - 'Cargo.lock'
+      - '**/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - 'config*.toml'
+      - 'docs/releases/**'
   push:
     tags:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-22.04
-
+    timeout-minutes: 60
     steps:
-    - uses: actions/checkout@v4
-
-    - name: Use GHCR base image (pinned digest)
-      run: |
-        set -euo pipefail
-        IMAGE="ghcr.io/swananan/ghostscope-build@sha256:6ef243d05b1157004a96d87f1abb35c499819d3c5d51d86379f8bf3b7ceb540f"
-        docker pull "$IMAGE" >/dev/null
-        echo "Using GHCR base image (pinned digest): $IMAGE"
-        echo "BASE_IMAGE=$IMAGE" >> "$GITHUB_ENV"
-
-    - name: Verify LLVM in container (no libffi)
-      run: |
-        docker run --rm \
-          -v "${{ github.workspace }}:/workspace" \
-          -w /workspace \
-          "${BASE_IMAGE}" bash -lc '
-            echo "llvm-config version:" && llvm-config --version && \
-            echo "Checking libLLVM for libffi dependency (should be none)..." && \
-            (ldd "$(llvm-config --libdir)"/libLLVM* | grep -i ffi && exit 1 || echo "OK: no libffi referenced")
+      - uses: actions/checkout@v4
+      - name: Check tag matches workspace version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+          test "$RELEASE_TAG" = "v$version"
+      - name: Build and package release
+        run: bash scripts/release/build.sh
+      - name: Verify installer with packaged release
+        run: python3 scripts/release/smoke_install.py target/dist/*.tar.gz
+      - name: Install and trace on Ubuntu 20.04
+        run: |
+          docker run --rm --privileged -v "$PWD:/workspace:ro" -w /workspace ubuntu:20.04 bash -c '
+            set -euo pipefail
+            apt-get update -qq
+            apt-get install -y --no-install-recommends gcc libc6-dev python3 ca-certificates libstdc++6 libzstd1 zlib1g
+            python3 scripts/release/smoke_install.py target/dist/*.tar.gz
+            mount -t bpf bpf /sys/fs/bpf
+            stage=$(mktemp -d)
+            tar -xzf target/dist/*.tar.gz -C "$stage"
+            python3 scripts/release/smoke_trace.py "$stage/ghostscope"
           '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ghostscope-x86_64-linux-gnu
+          path: target/dist/*
+          if-no-files-found: error
 
-    - name: Build release inside container
-      run: |
-        docker run --rm \
-          -v "${{ github.workspace }}:/workspace" \
-          -w /workspace \
-          "${BASE_IMAGE}" \
-          bash -lc 'export LLVM_SYS_221_PREFIX=/opt/llvm-22; export LLVM_CONFIG_PATH=/opt/llvm-22/bin/llvm-config; export RUSTFLAGS="-C link-arg=-Wl,--as-needed"; rustup show; llvm-config --version; echo "llvm-config system-libs:"; llvm-config --system-libs; cargo clean; cargo build --release'
-
-    - name: Check glibc dependency
-      run: |
-        echo "=== Required glibc versions (from binary) ==="
-        objdump -T ./target/release/ghostscope | grep GLIBC | sed 's/.*GLIBC_\([.0-9]*\).*/\1/g' | sort -Vu
-        echo "=== Binary info ==="
-        file ./target/release/ghostscope
-        ls -lh ./target/release/ghostscope
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ghostscope-x86_64-linux-gnu
-        path: target/release/ghostscope
+  draft-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ghostscope-x86_64-linux-gnu
+          path: dist
+      - name: Create draft release for review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --draft \
+            --title "GhostScope $RELEASE_TAG" \
+            --notes-file "docs/releases/$RELEASE_TAG.md"

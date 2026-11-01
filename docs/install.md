@@ -9,6 +9,9 @@
     - BPF_MAP_TYPE_PERF_EVENT_ARRAY - introduced in Linux 4.3
     - Stable eBPF for tracing - recommended Linux 4.4+
 - **Architecture**: x86_64 (AMD64) only currently
+- **Prebuilt binary runtime**: glibc 2.31 or newer, libstdc++, zlib, and zstd
+  (Debian/Ubuntu packages: `libstdc++6 zlib1g libzstd1`). Rust and LLVM are not
+  required to run the prebuilt binary.
 
 The installer rejects non-Linux hosts, non-x86_64 hosts, and unsupported
 `--arch` values. The runtime also rejects target executables and shared objects
@@ -43,17 +46,17 @@ Restart the terminal and run `ghostscope --version` to verify.
 
 2. Extract the binary:
 ```bash
-tar -xzf ghostscope-v0.1.6-x86_64-linux.tar.gz
+tar -xzf ghostscope-v0.1.7-x86_64-linux.tar.gz
 ```
 
-3. Move to system path (optional):
-```bash
-sudo mv ghostscope /usr/local/bin/
-```
-
-4. Make it executable:
+3. Make it executable:
 ```bash
 chmod +x ghostscope
+```
+
+4. Move to system path (optional):
+```bash
+sudo mv ghostscope /usr/local/bin/
 ```
 
 5. Verify installation:
