@@ -24,11 +24,11 @@ serial_test = { workspace = true }
 gimli = { workspace = true }
 object = { workspace = true, features = ["write"] }
 aya = { workspace = true }
-ghostscope-compiler = { version = "0.1.6", path = "../ghostscope-compiler" }
-ghostscope-dwarf = { version = "0.1.6", path = "../ghostscope-dwarf" }
-ghostscope-loader = { version = "0.1.6", path = "../ghostscope-loader" }
-ghostscope-process = { version = "0.1.6", path = "../ghostscope-process" }
-ghostscope-protocol = { version = "0.1.6", path = "../ghostscope-protocol" }
+ghostscope-compiler = { version = "0.1.7", path = "../ghostscope-compiler" }
+ghostscope-dwarf = { version = "0.1.7", path = "../ghostscope-dwarf" }
+ghostscope-loader = { version = "0.1.7", path = "../ghostscope-loader" }
+ghostscope-process = { version = "0.1.7", path = "../ghostscope-process" }
+ghostscope-protocol = { version = "0.1.7", path = "../ghostscope-protocol" }
 libc = "0.2"
 regex = "1"
 serde_json = { workspace = true }

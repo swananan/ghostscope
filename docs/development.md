@@ -84,36 +84,40 @@ cargo build --release
 
 ### Docker Build (Recommended for Release)
 
-Build in Ubuntu 20.04 container for maximum compatibility (glibc 2.31):
+Build and package with the same pinned Ubuntu 20.04 / LLVM 22 image used by CI:
 
 ```bash
-# One-command build (automatically creates Docker image if needed)
-./docker-build.sh
-
-# Output: ./target/release/ghostscope
+bash scripts/release/build.sh
+python3 scripts/release/smoke_install.py target/dist/*.tar.gz
 ```
 
-**Advantages:**
-- Builds with glibc 2.31 (compatible with Ubuntu 20.04+, Debian 11+, RHEL 8+)
-- Isolated environment, won't affect your system
-- Reproducible builds across different development machines
+Docker, Python 3, binutils, and the usual shell/archive tools are required on the
+host. Build outputs live under `target/release-build`; archives and SHA-256
+checksums are written to `target/dist`. Existing debug builds are preserved.
 
-**Other Docker commands:**
+Packaging checks the executable version, x86_64 ELF format, glibc 2.31 ceiling,
+and absence of direct shared LLVM/libffi dependencies. CI also runs the packaged
+installer, CLI, and a real DWARF parameter tracing smoke test in a privileged
+Ubuntu 20.04 container. This checks the userspace baseline with the runner's
+kernel; it does not establish compatibility with every supported kernel version.
 
-```bash
-# Build debug version
-docker run --rm -v $(pwd):/workspace -w /workspace \
-    ghostscope-builder:ubuntu20.04 cargo build
+Before tagging a release:
 
-# Interactive shell in container
-docker run -it --rm -v $(pwd):/workspace -w /workspace \
-    ghostscope-builder:ubuntu20.04 bash
+1. Update the workspace version, internal dependency versions, `Cargo.lock`,
+   README badges, and installation examples.
+2. Write `docs/releases/v<VERSION>.md` and wait for CI, supply-chain checks,
+   and the relevant e2e jobs on the candidate revision.
+3. Run **Release Build** manually on the candidate branch and review the archive,
+   checksum, installer smoke results, and tracing behavior.
+4. Push the matching tag when ready. The workflow rejects a version mismatch,
+   builds the assets, and creates a **draft** GitHub Release using the release notes.
+5. Review the draft and publish it manually. A manual workflow run builds artifacts
+   without creating a release.
 
-# Rebuild Docker image (only needed if `docker/base-build/Dockerfile` changes)
-docker build -t ghostscope-builder:ubuntu20.04 -f docker/base-build/Dockerfile .
-```
-
-**Note**: Debug builds are used by default during development for faster iteration and better debugging experience.
+The archive contains the executable, English/Chinese config templates, README,
+and all project license files. The install smoke test substitutes GitHub download
+transport with a local archive; public asset download should be checked after
+publication. The installer preserves existing user config files.
 
 ### Sysmon eBPF (prebuilt) and when to rebuild
 
