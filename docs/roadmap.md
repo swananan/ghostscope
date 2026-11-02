@@ -4,7 +4,7 @@ GhostScope is still evolving quickly. The milestones below are ordered from “s
 
 ## Chained array access
 - One-dimensional chained array access now supports constant and expression indices, including chain-tail `a.b.c[i]`, chain-middle `a.b[i].c`, and address-of forms such as `&arr[i]`.
-- Remaining work focuses on multi-dimensional arrays.
+- Multi-dimensional arrays now support constant/expression indices, partial row access, row pointers, and address-of. Runtime-sized inner dimensions and non-contiguous layouts remain unsupported.
 
 ## Container tracing enhancements
 - Most PID-based container tracing scenarios for `-p` are now in place.

@@ -387,7 +387,7 @@ DWARF variables include locals, parameters, and globals from the traced program.
 | Char | `char`, `unsigned char` | 1‑byte int/char | Printed as 1‑byte integer; arrays/pointers see below |
 | C string | `char*`, `const char*`, `char[]` | CString (rendered as string) | Printable; equality `==`, `!=` with script strings |
 | Pointer | `T*`, `void*`, function pointer | Pointer/NullPointer (address) | Supports `*` deref and `==`/`!=`; auto‑deref for locals/params/globals when safe |
-| Array | `T[N]` | Array | Literal and expression index reads for one-dimensional arrays, including top-level arrays, chain-tail arrays, and array elements followed by member access; multi-dim arrays are not supported |
+| Array | `T[N]` | Array | Literal and expression index reads for one- and multi-dimensional arrays, including chained member access and partial indexing |
 | Struct/Class | `struct Foo`, `class Bar` | Struct | Use `.` member access; operate on scalar members only |
 | Union | `union U` | Union | Show one member view; access members then treat as scalar |
 | Enum | `enum E` | Enum (via base int) | Printed as `Type::Variant`; arithmetic/compare uses base integer |
@@ -432,7 +432,7 @@ Tips:
   globals. You do not need to write `*ptr` or `->`; when safe, pointers are
   read and dereferenced automatically. Printing a pointer itself still uses
   pointer presentation, so use `*ptr` to print its pointee.
-- Array access: supported for one-dimensional arrays such as `arr[index]`, chain-tail `a.b.c[index]`, and array elements followed by member access such as `arr[index].field` or `a.b[index].c`, where `index` can be an integer literal or an integer expression such as `i + 1`. Address-of forms like `&arr[i]` and `&a.b.c[i]` can be printed as pointers, used as memory-format inputs (`{:x.N}`/`{:s.N}`), or passed to `memcmp`. Not supported: multi-dimensional arrays.
+- Array access: supported for arrays such as `arr[index]`, chain-tail `a.b.c[index]`, and array elements followed by member access such as `arr[index].field` or `a.b[index].c`, where `index` can be an integer literal or an integer expression such as `i + 1`. Address-of forms like `&arr[i]` and `&a.b.c[i]` can be printed as pointers, used as memory-format inputs (`{:x.N}`/`{:s.N}`), or passed to `memcmp`. Multi-dimensional arrays support mixed literal/expression indices (`matrix[i][2]`, `cube[i][j][k]`), member access (`obj.cells[i][j].field`), and address-of (`&matrix[i][j]`). Partial indexing (`matrix[i]`) prints a row; pointers to rows use the row size as their stride. Layout must be contiguous and row-major with zero-based bounds and known inner extents. Runtime-sized inner dimensions, explicit DWARF strides, and column-major layouts are unsupported. As with one-dimensional indexing, indices are not bounds-checked; keep them within the target array.
 
 #### Explicit Casts
 

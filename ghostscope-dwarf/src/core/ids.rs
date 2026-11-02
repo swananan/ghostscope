@@ -31,9 +31,11 @@ pub struct DieRef {
     pub offset: u64,
 }
 
-/// Stable identifier for a type DIE.
+/// Stable identifier for a type DIE or one of its remaining array dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TypeId {
+    /// Consumed subranges within a single multidimensional array DIE.
+    pub array_dimension: usize,
     pub module: ModuleId,
     pub cu: CuId,
     pub die: DieRef,

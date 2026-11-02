@@ -1707,10 +1707,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             // Scalar DWARF expressions should stay concrete so `let n = foo.len;` behaves
             // like an integer script variable and remains usable in capture-length formatting.
             other => self
-                .query_dwarf_for_complex_expr(other)
+                .query_dwarf_for_access_type(other)
                 .ok()
                 .flatten()
-                .and_then(|var| var.dwarf_type)
                 .is_some_and(|ty| Self::is_aliasable_dwarf_type(&ty)),
         }
     }

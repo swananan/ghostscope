@@ -1465,6 +1465,34 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
+    /// Infer an access type without evaluating runtime indices. Only the type
+    /// is returned: the representative zero indices must never become reads.
+    pub(in crate::ebpf) fn query_dwarf_for_access_type(
+        &mut self,
+        expr: &crate::script::Expr,
+    ) -> Result<Option<ghostscope_dwarf::TypeInfo>> {
+        use crate::script::Expr;
+        fn type_path(expr: Expr) -> Expr {
+            match expr {
+                Expr::ArrayAccess(base, _) => {
+                    Expr::ArrayAccess(Box::new(type_path(*base)), Box::new(Expr::Int(0)))
+                }
+                Expr::MemberAccess(base, field) => {
+                    Expr::MemberAccess(Box::new(type_path(*base)), field)
+                }
+                Expr::TupleAccess(base, index) => {
+                    Expr::TupleAccess(Box::new(type_path(*base)), index)
+                }
+                Expr::PointerDeref(base) => Expr::PointerDeref(Box::new(type_path(*base))),
+                other => other,
+            }
+        }
+        let expanded = self.expand_dwarf_aliases(expr)?;
+        Ok(self
+            .query_dwarf_for_complex_expr_plan(&type_path(expanded))?
+            .and_then(|plan| plan.dwarf_type))
+    }
+
     /// Query DWARF for complex expression (supports member access, array access, etc.)
     pub fn query_dwarf_for_complex_expr(
         &mut self,
@@ -1619,7 +1647,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         out
     }
 
-    fn access_path_from_expr(
+    pub(super) fn access_path_from_expr(
         expr: &crate::script::Expr,
     ) -> Result<Option<(String, VariableAccessPath)>> {
         fn append_segments(
@@ -1651,9 +1679,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 }
                 crate::script::Expr::ArrayAccess(array, index) => {
                     let crate::script::Expr::Int(index) = index.as_ref() else {
-                        return Err(CodeGenError::NotImplemented(
-                            "Only literal integer array indices are supported (TODO)".to_string(),
-                        ));
+                        // Runtime indices are handled by dynamic lvalue lowering.
+                        return Ok(None);
                     };
 
                     if let Some((array_base, base_index)) =
@@ -1804,17 +1831,17 @@ mod tests {
     }
 
     #[test]
-    fn access_path_from_expr_rejects_dynamic_array_index() {
+    fn access_path_from_expr_defers_dynamic_array_index() {
         let expr = Expr::ArrayAccess(
             Box::new(Expr::Variable("items".to_string())),
             Box::new(Expr::Variable("idx".to_string())),
         );
 
-        let err = EbpfContext::<'static, 'static>::access_path_from_expr(&expr)
-            .expect_err("dynamic array index should be rejected");
-
-        assert!(matches!(err, CodeGenError::NotImplemented(_)));
-        assert!(err.to_string().contains("literal integer array indices"));
+        assert!(
+            EbpfContext::<'static, 'static>::access_path_from_expr(&expr)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

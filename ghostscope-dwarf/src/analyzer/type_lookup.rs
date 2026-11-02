@@ -253,6 +253,37 @@ impl DwarfAnalyzer {
             _ => return,
         };
 
+        // Array rows cannot be recovered by aggregate-name lookup. Resolve
+        // their exact identity while preserving existing named presentation
+        // for scalar and aggregate pointees.
+        if let Some(id) = plan.type_id {
+            let target_id = if pointer_size.is_some() {
+                self.projected_type_id(id, &crate::VariableAccessSegment::Dereference)
+                    .ok()
+                    .flatten()
+            } else {
+                Some(id)
+            };
+            if let Some(summary) = target_id.and_then(|id| self.type_summary(id).ok().flatten()) {
+                if matches!(
+                    crate::strip_type_aliases(&summary),
+                    crate::TypeInfo::ArrayType { .. }
+                ) {
+                    let summary = if let Some(size) = pointer_size {
+                        crate::TypeInfo::PointerType {
+                            target_type: Box::new(summary),
+                            size,
+                        }
+                    } else {
+                        summary
+                    };
+                    plan.type_name = summary.type_name();
+                    plan.dwarf_type = Some(summary);
+                    return;
+                }
+            }
+        }
+
         let mut candidate_names = Vec::new();
         if !unknown_name.is_empty() && unknown_name != "void" {
             candidate_names.push(unknown_name);
@@ -647,6 +678,7 @@ mod tests {
         let module = crate::ModuleId(4);
         let cu = crate::CuId::primary(8);
         crate::TypeId {
+            array_dimension: 0,
             importing_cu: None,
             module,
             cu,

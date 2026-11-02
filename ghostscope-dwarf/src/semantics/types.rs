@@ -38,6 +38,7 @@ impl TypeLoc {
     pub(crate) fn type_id(self, module: crate::ModuleId) -> crate::TypeId {
         let cu = crate::CuId(self.cu_off.0 as u64, self.object);
         crate::TypeId {
+            array_dimension: 0,
             module,
             cu,
             importing_cu: self.importing_cu,
