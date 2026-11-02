@@ -46,6 +46,9 @@ run_cargo_fixture() {
     )
 }
 
+run_make_fixture architecture_program clean
+run_make_fixture architecture_program all
+
 run_make_fixture sample_program clean
 run_make_fixture sample_program all
 

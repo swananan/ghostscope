@@ -296,7 +296,12 @@ pub fn backtrace_unwind_row_from_compact(
     };
 
     let (ra_kind, ra_register, ra_offset) = backtrace_wire_recovery(plan.return_address);
-    wire.ra_kind = ra_kind;
+    wire.ra_kind = ra_kind
+        | if plan.return_address_signed {
+            ghostscope_protocol::BACKTRACE_RECOVERY_SIGNED_RA
+        } else {
+            0
+        };
     wire.ra_register = ra_register;
     wire.ra_offset = ra_offset;
 
@@ -537,6 +542,7 @@ mod tests {
 
         for (return_address, expected_kind, expected_register, expected_offset) in cases {
             let compact = CompactUnwindRow {
+                architecture: ghostscope_platform::TargetArch::X86_64,
                 module: ModuleId(1),
                 pc_start: 0x1000,
                 pc_end: 0x1010,
@@ -545,6 +551,7 @@ mod tests {
                     offset: 16,
                 },
                 return_address_register: 16,
+                return_address_signed: false,
                 return_address,
                 sp: None,
                 rbp: None,
@@ -556,9 +563,19 @@ mod tests {
             assert_eq!(wire.ra_offset, expected_offset);
             assert_eq!(wire.rbp_kind, BACKTRACE_RECOVERY_SAME_VALUE);
             assert_eq!(wire.rbp_register, 6);
+            let mut signed = compact;
+            signed.return_address_signed = true;
+            let signed_wire = backtrace_unwind_row_from_compact(&signed);
+            assert_eq!(
+                signed_wire.ra_kind,
+                expected_kind | ghostscope_protocol::BACKTRACE_RECOVERY_SIGNED_RA
+            );
+            assert_eq!(signed_wire.ra_register, wire.ra_register);
+            assert_eq!(signed_wire.ra_offset, wire.ra_offset);
         }
 
         let compact = CompactUnwindRow {
+            architecture: ghostscope_platform::TargetArch::X86_64,
             module: ModuleId(1),
             pc_start: 0x2000,
             pc_end: 0x2010,
@@ -567,6 +584,7 @@ mod tests {
                 offset: 16,
             },
             return_address_register: 16,
+            return_address_signed: false,
             return_address: RegisterRecoveryPlan::AtCfaOffset { offset: -8 },
             sp: None,
             rbp: Some(RegisterRecoveryPlan::Undefined),
@@ -579,6 +597,7 @@ mod tests {
     #[test]
     fn backtrace_unwind_row_encoding_preserves_unsupported_ranges() {
         let compact = CompactUnwindRow {
+            architecture: ghostscope_platform::TargetArch::X86_64,
             module: ModuleId(1),
             pc_start: 0x1000,
             pc_end: 0x1010,
@@ -587,6 +606,7 @@ mod tests {
                 offset: 16,
             },
             return_address_register: 16,
+            return_address_signed: false,
             return_address: RegisterRecoveryPlan::Register { register: 3 },
             sp: None,
             rbp: None,

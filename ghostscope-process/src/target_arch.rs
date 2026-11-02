@@ -4,7 +4,19 @@ use object::{Architecture, BinaryFormat, Endianness, Object};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_arch = "aarch64"))]
 pub const SUPPORTED_TARGET_DESCRIPTION: &str = "64-bit little-endian x86_64 ELF";
+
+#[cfg(target_arch = "aarch64")]
+pub const SUPPORTED_TARGET_DESCRIPTION: &str = "64-bit little-endian AArch64 ELF";
+
+fn native_architecture() -> Architecture {
+    if cfg!(target_arch = "aarch64") {
+        Architecture::Aarch64
+    } else {
+        Architecture::X86_64
+    }
+}
 
 pub fn ensure_supported_target_path(path: &Path) -> Result<()> {
     let file = File::open(path)
@@ -27,7 +39,7 @@ pub fn ensure_supported_pid_executable(pid: u32) -> Result<()> {
 
 pub fn ensure_supported_target_object(object: &object::File<'_>, path: &Path) -> Result<()> {
     let supported = object.format() == BinaryFormat::Elf
-        && object.architecture() == Architecture::X86_64
+        && object.architecture() == native_architecture()
         && object.is_64()
         && object.endianness() == Endianness::Little;
 
@@ -89,16 +101,30 @@ mod tests {
     }
 
     #[test]
-    fn accepts_x86_64_elf() {
-        validate_bytes(&elf64(EM_X86_64)).expect("x86_64 ELF should be supported");
+    fn accepts_native_elf() {
+        let machine = if cfg!(target_arch = "aarch64") {
+            EM_AARCH64
+        } else {
+            EM_X86_64
+        };
+        validate_bytes(&elf64(machine)).expect("native ELF should be supported");
     }
 
     #[test]
-    fn rejects_aarch64_elf() {
-        let error = validate_bytes(&elf64(EM_AARCH64)).expect_err("AArch64 must be rejected");
+    fn rejects_foreign_elf() {
+        let machine = if cfg!(target_arch = "aarch64") {
+            EM_X86_64
+        } else {
+            EM_AARCH64
+        };
+        let error = validate_bytes(&elf64(machine)).expect_err("foreign ELF must be rejected");
         let message = error.to_string();
         assert!(message.contains(SUPPORTED_TARGET_DESCRIPTION));
-        assert!(message.contains("architecture=Aarch64"));
+        assert!(message.contains(if cfg!(target_arch = "aarch64") {
+            "architecture=X86_64"
+        } else {
+            "architecture=Aarch64"
+        }));
     }
 
     #[test]

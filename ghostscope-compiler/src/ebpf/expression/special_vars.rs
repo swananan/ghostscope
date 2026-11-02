@@ -211,13 +211,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 let ts = self.get_current_timestamp()?;
                 Ok(ts.into())
             }
-            SpecialVarPlan::Pc => self.load_special_register_value(16),
-            SpecialVarPlan::Sp => self.load_special_register_value(7),
+            SpecialVarPlan::Pc => {
+                self.load_special_register_value(ghostscope_platform::ProbeRegister::Pc)
+            }
+            SpecialVarPlan::Sp => {
+                self.load_special_register_value(ghostscope_platform::ProbeRegister::Sp)
+            }
         }
     }
 
-    fn load_special_register_value(&mut self, dwarf_reg: u16) -> Result<BasicValueEnum<'ctx>> {
+    fn load_special_register_value(
+        &mut self,
+        register: ghostscope_platform::ProbeRegister,
+    ) -> Result<BasicValueEnum<'ctx>> {
         let pt_regs = self.get_pt_regs_parameter()?;
-        self.load_register_value(dwarf_reg, pt_regs)
+        self.load_probe_register(register, pt_regs)
     }
 }

@@ -86,6 +86,46 @@ impl CallingConvention for X86_64SystemV {
     }
 }
 
+/// AAPCS64 integer/pointer register slots. The index is the ABI GPR slot,
+/// not a source parameter index for mixed, aggregate, or indirect arguments.
+pub struct Aarch64Aapcs;
+
+impl CallingConvention for Aarch64Aapcs {
+    fn get_parameter_register(param_index: usize) -> Option<u16> {
+        (param_index < 8).then_some(param_index as u16)
+    }
+
+    fn max_register_parameters() -> usize {
+        8
+    }
+
+    fn skip_prologue<R: CodeReader>(
+        function_start: u64,
+        code_reader: &R,
+    ) -> Result<u64, PlatformError> {
+        let error = || {
+            PlatformError::PrologueAnalysisFailed(
+                "no validated AArch64 statement boundary after entry".into(),
+            )
+        };
+        let candidate = code_reader
+            .find_next_stmt_address(function_start)
+            .ok_or_else(error)?;
+        let size = candidate
+            .checked_sub(function_start)
+            .filter(|size| *size > 0 && *size <= 4096)
+            .ok_or_else(error)? as usize;
+        let code = code_reader
+            .read_code_bytes(function_start, size)
+            .ok_or_else(error)?;
+        if code.len() != size {
+            return Err(error());
+        }
+        crate::aarch64::validate_probe_prefix(&code, function_start)?;
+        Ok(candidate)
+    }
+}
+
 /// Find prologue end using DWARF line number information
 fn find_prologue_end_from_line_info<R: CodeReader>(
     function_start: u64,
@@ -227,25 +267,69 @@ pub fn get_parameter_register_in_context<R: CodeReader>(
     function_start: u64,
     code_reader: &R,
 ) -> Result<Option<u16>, PlatformError> {
+    get_parameter_register_for_target(
+        crate::TargetArch::current(),
+        param_index,
+        param_name,
+        pc,
+        function_start,
+        code_reader,
+    )
+}
+
+/// Resolve a scalar GPR argument slot using an explicit target ABI.
+pub fn get_parameter_register_for_target<R: CodeReader>(
+    architecture: crate::TargetArch,
+    param_index: usize,
+    param_name: &str,
+    pc: u64,
+    function_start: u64,
+    code_reader: &R,
+) -> Result<Option<u16>, PlatformError> {
+    match architecture {
+        crate::TargetArch::X86_64 => parameter_register::<X86_64SystemV, R>(
+            param_index,
+            param_name,
+            pc,
+            function_start,
+            code_reader,
+        ),
+        crate::TargetArch::Aarch64 => parameter_register::<Aarch64Aapcs, R>(
+            param_index,
+            param_name,
+            pc,
+            function_start,
+            code_reader,
+        ),
+        crate::TargetArch::Unknown => Err(PlatformError::UnsupportedArchitecture(
+            "unknown target ABI".into(),
+        )),
+    }
+}
+
+fn parameter_register<C: CallingConvention, R: CodeReader>(
+    param_index: usize,
+    param_name: &str,
+    pc: u64,
+    function_start: u64,
+    code_reader: &R,
+) -> Result<Option<u16>, PlatformError> {
     debug!(
         "Checking parameter '{}' (index={}) register access at PC 0x{:x}, function_start=0x{:x}",
         param_name, param_index, pc, function_start
     );
 
-    // Use x86-64 System V ABI for now
-    // TODO: Detect platform and use appropriate calling convention
-
-    if X86_64SystemV::is_in_prologue(pc, function_start, code_reader) {
+    if C::is_in_prologue(pc, function_start, code_reader) {
         debug!("PC 0x{:x} is in prologue, checking register parameter", pc);
 
         // In prologue, parameter is in register
-        if let Some(reg) = X86_64SystemV::get_parameter_register(param_index) {
+        if let Some(reg) = C::get_parameter_register(param_index) {
             debug!("Parameter '{}' is in register {}", param_name, reg);
             Ok(Some(reg))
         } else {
-            // Parameter index >= 6, likely optimized away
             Err(PlatformError::ParameterOptimized(format!(
-                "Parameter '{param_name}' (index {param_index}) likely optimized away (>6 parameters)"
+                "Parameter '{param_name}' (slot {param_index}) exceeds {} GPR argument slots",
+                C::max_register_parameters()
             )))
         }
     } else {
@@ -262,6 +346,71 @@ pub fn get_parameter_register_in_context<R: CodeReader>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ArmCode {
+        candidate: Option<u64>,
+        code: Vec<u8>,
+    }
+
+    impl CodeReader for ArmCode {
+        fn read_code_bytes(&self, _address: u64, size: usize) -> Option<Vec<u8>> {
+            self.code.get(..size).map(<[u8]>::to_vec)
+        }
+        fn get_source_location_slow(&self, _address: u64) -> Option<crate::SourceLocation> {
+            None
+        }
+        fn find_next_stmt_address(&self, _start: u64) -> Option<u64> {
+            self.candidate
+        }
+    }
+
+    #[test]
+    fn arm_parameter_slots_require_a_validated_statement_boundary() {
+        // LLVM llvm-mc -triple=aarch64: STP X29,X30,[SP,#-32]!; MOV X29,SP.
+        let mut reader = ArmCode {
+            candidate: Some(0x1008),
+            code: vec![0xfd, 0x7b, 0xbe, 0xa9, 0xfd, 0x03, 0x00, 0x91],
+        };
+        assert_eq!(
+            Aarch64Aapcs::skip_prologue(0x1000, &reader).unwrap(),
+            0x1008
+        );
+        for slot in 0..8 {
+            assert_eq!(
+                get_parameter_register_for_target(
+                    crate::TargetArch::Aarch64,
+                    slot,
+                    "arg",
+                    0x1000,
+                    0x1000,
+                    &reader
+                )
+                .unwrap(),
+                Some(slot as u16)
+            );
+        }
+        assert_eq!(Aarch64Aapcs::get_parameter_register(8), None);
+        assert_eq!(Aarch64Aapcs::get_parameter_register(usize::MAX), None);
+        assert_eq!(
+            get_parameter_register_for_target(
+                crate::TargetArch::Aarch64,
+                0,
+                "arg",
+                0x1008,
+                0x1000,
+                &reader
+            )
+            .unwrap(),
+            None
+        );
+        for candidate in [None, Some(0xffc), Some(0x1000), Some(0x1006), Some(0x2004)] {
+            reader.candidate = candidate;
+            assert!(Aarch64Aapcs::skip_prologue(0x1000, &reader).is_err());
+        }
+        reader.candidate = Some(0x1008);
+        reader.code[..4].copy_from_slice(&0x94000000u32.to_le_bytes()); // BL
+        assert!(Aarch64Aapcs::skip_prologue(0x1000, &reader).is_err());
+    }
 
     #[test]
     fn test_x86_64_parameter_registers() {

@@ -372,6 +372,13 @@ async fn test_value_diagnostics_optimized_out_print_and_expression_are_distinct(
     // The existing compiler-specific fixture pins this source line and checks
     // its DWARF. Fail if the intended unavailable location stops being emitted.
     const LINE: u32 = 20;
+    // AArch64 retains local_x in a register here; after_call has no location
+    // yet. Both exercise the same explicit DWARF-unavailable diagnostic.
+    let unavailable_name = if cfg!(target_arch = "aarch64") {
+        "after_call"
+    } else {
+        "local_x"
+    };
     let binary = FIXTURES.get_test_binary("inline_call_value_program")?;
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary).await?;
     let locations = analyzer.query_source_line_best_effort("inline_call_value_program.c", LINE)?;
@@ -380,7 +387,7 @@ async fn test_value_diagnostics_optimized_out_print_and_expression_are_distinct(
             |location| location
                 .variables
                 .iter()
-                .any(|variable| variable.name == "local_x"
+                .any(|variable| variable.name == unavailable_name
                     && matches!(
                         variable.location,
                         ghostscope_dwarf::VariableLocation::OptimizedOut
@@ -395,6 +402,7 @@ async fn test_value_diagnostics_optimized_out_print_and_expression_are_distinct(
         ),
         (r#"if local_x == 0 { print "SHOULD_NOT_LOAD"; }"#, false),
     ] {
+        let body = body.replace("local_x", unavailable_name);
         let target = TargetLauncher::binary(&binary).spawn().await?;
         let script = format!("trace inline_call_value_program.c:{LINE} {{ {body} }}");
         let result = capture(&target, quiet_runner(&script, "")).await;
@@ -423,7 +431,7 @@ async fn test_value_diagnostics_optimized_out_print_and_expression_are_distinct(
             );
         } else {
             output.compile_failure("optimized out at the selected probe PC");
-            assert!(output.stderr.contains("local_x"), "{output:#?}");
+            assert!(output.stderr.contains(unavailable_name), "{output:#?}");
         }
     }
     Ok(())

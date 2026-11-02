@@ -1,3 +1,27 @@
+#if defined(__aarch64__)
+.text
+.globl zero_rbp_tail_boundary
+.type zero_rbp_tail_boundary, %function
+zero_rbp_tail_boundary:
+.cfi_startproc
+stp x29, x30, [sp, #-16]!
+.cfi_def_cfa_offset 16
+.cfi_offset 29, -16
+.cfi_offset 30, -8
+mov x29, xzr
+.cfi_register 30, 29
+bl zero_rbp_tail_level_4
+
+ldp x29, x30, [sp], #16
+.cfi_restore 29
+.cfi_def_cfa sp, 0
+.cfi_restore 30
+ret
+.cfi_endproc
+.size zero_rbp_tail_boundary, .-zero_rbp_tail_boundary
+
+.section .note.GNU-stack,"",%progbits
+#else
 	.text
 	.globl zero_rbp_tail_boundary
 	.type zero_rbp_tail_boundary, @function
@@ -20,3 +44,4 @@ zero_rbp_tail_boundary:
 	.size zero_rbp_tail_boundary, .-zero_rbp_tail_boundary
 
 	.section .note.GNU-stack,"",@progbits
+#endif

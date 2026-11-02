@@ -604,7 +604,18 @@ impl LineMappingTable {
             let addr = sorted_addrs[i];
             let prev_addr = sorted_addrs[i - 1];
 
-            if addr - prev_addr <= CONSECUTIVE_THRESHOLD {
+            // Nearby code can belong to different LTO partitions whose CU
+            // names are identical. Never coalesce their independent probes.
+            let same_unit = self.entries_at_address(prev_addr).any(|previous| {
+                previous.file_path == file_path
+                    && previous.line == line_number
+                    && self.entries_at_address(addr).any(|current| {
+                        current.file_path == file_path
+                            && current.line == line_number
+                            && current.unit_offset == previous.unit_offset
+                    })
+            });
+            if addr - prev_addr <= CONSECUTIVE_THRESHOLD && same_unit {
                 // Consecutive address, add to current group
                 current_group.push(addr);
             } else {
@@ -895,6 +906,28 @@ mod tests {
 
         assert_eq!(entry.file_path, "/src/include/header.h");
         assert_eq!(entry.line, 12);
+    }
+
+    #[test]
+    fn adjacent_lto_partitions_keep_independent_source_probes() {
+        let scoped = crate::index::ScopedFileIndexManager::new();
+        let mut entries = Vec::new();
+        for (address, unit, statement) in [
+            (0x1000, 0, true),
+            (0x1004, 0, false),
+            (0x1010, 64, true),
+            (0x1014, 64, false),
+        ] {
+            let mut entry = line_entry(address, "/src/shared.h", 501, statement);
+            entry.unit_offset = gimli::DebugInfoOffset(unit);
+            entry.compilation_unit = "<artificial>".into();
+            entries.push(entry);
+        }
+        let table = LineMappingTable::from_entries_with_scoped_manager(entries, &scoped);
+        assert_eq!(
+            table.lookup_addresses_by_path("shared.h", 501),
+            vec![0x1000, 0x1010]
+        );
     }
 
     #[test]

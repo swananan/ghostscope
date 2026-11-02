@@ -31,9 +31,6 @@ pub fn observe_legacy_sequences(
     contiguous: VecDeque<u16>,
     empty_slice: &[i32],
     empty_vector: Vec<i32>,
-    empty_deque: VecDeque<i32>,
-    unit_vector: Vec<()>,
-    unit_deque: VecDeque<()>,
 ) -> usize {
     slice.len()
         + vector.len()
@@ -41,9 +38,20 @@ pub fn observe_legacy_sequences(
         + contiguous.len()
         + empty_slice.len()
         + empty_vector.len()
-        + empty_deque.len()
-        + unit_vector.len()
-        + unit_deque.len()
+
+}
+
+// Rust 1.35's LLVM omits DW_OP_deref for AArch64 aggregate arguments passed
+// indirectly on the stack. Keep these layout probes within the argument
+// registers so the fixture has accurate DWARF on both supported architectures.
+#[no_mangle]
+#[inline(never)]
+pub fn observe_legacy_empty_and_unit_sequences(
+    empty_deque: VecDeque<i32>,
+    unit_vector: Vec<()>,
+    unit_deque: VecDeque<()>,
+) -> usize {
+    empty_deque.len() + unit_vector.len() + unit_deque.len()
 }
 
 fn main() {
@@ -71,6 +79,7 @@ fn main() {
             contiguous,
             &EMPTY_SLICE,
             Vec::new(),
+        ) + observe_legacy_empty_and_unit_sequences(
             VecDeque::new(),
             vec![(); 3],
             unit_deque,

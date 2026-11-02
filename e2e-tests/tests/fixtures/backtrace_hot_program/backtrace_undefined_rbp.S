@@ -1,3 +1,115 @@
+#if defined(__aarch64__)
+.text
+.globl undefined_rbp_inline_caller
+.type undefined_rbp_inline_caller, %function
+undefined_rbp_inline_caller:
+.cfi_startproc
+str x30, [sp, #-16]!
+.cfi_def_cfa_offset 16
+.cfi_offset 30, -16
+.cfi_undefined 29
+bl undefined_rbp_inline_leaf
+
+ldr x30, [sp], #16
+.cfi_def_cfa sp, 0
+.cfi_restore 30
+ret
+.cfi_endproc
+.size undefined_rbp_inline_caller, .-undefined_rbp_inline_caller
+.text
+.globl undefined_rbp_ra_inline_caller
+.type undefined_rbp_ra_inline_caller, %function
+undefined_rbp_ra_inline_caller:
+.cfi_startproc
+str x30, [sp, #-16]!
+.cfi_def_cfa_offset 16
+.cfi_offset 30, -16
+.cfi_undefined 29
+bl undefined_rbp_ra_inline_leaf
+
+ldr x30, [sp], #16
+.cfi_def_cfa sp, 0
+.cfi_restore 30
+ret
+.cfi_endproc
+.size undefined_rbp_ra_inline_caller, .-undefined_rbp_ra_inline_caller
+.text
+.globl undefined_rbp_tail_caller
+.type undefined_rbp_tail_caller, %function
+undefined_rbp_tail_caller:
+.cfi_startproc
+str x30, [sp, #-16]!
+.cfi_def_cfa_offset 16
+.cfi_offset 30, -16
+.cfi_undefined 29
+bl undefined_rbp_tail_level_2
+
+ldr x30, [sp], #16
+.cfi_def_cfa sp, 0
+.cfi_restore 30
+ret
+.cfi_endproc
+.size undefined_rbp_tail_caller, .-undefined_rbp_tail_caller
+.text
+.globl undefined_rbp_inline_outer
+.type undefined_rbp_inline_outer, %function
+undefined_rbp_inline_outer:
+.cfi_startproc
+stp x29, x30, [sp, #-16]!
+.cfi_def_cfa_offset 16
+.cfi_offset 29, -16
+.cfi_offset 30, -8
+mov x29, sp
+.cfi_def_cfa_register 29
+bl undefined_rbp_inline_caller
+
+ldp x29, x30, [sp], #16
+.cfi_restore 29
+.cfi_def_cfa sp, 0
+.cfi_restore 30
+ret
+.cfi_endproc
+.size undefined_rbp_inline_outer, .-undefined_rbp_inline_outer
+.text
+.globl undefined_rbp_tail_outer
+.type undefined_rbp_tail_outer, %function
+undefined_rbp_tail_outer:
+.cfi_startproc
+stp x29, x30, [sp, #-16]!
+.cfi_def_cfa_offset 16
+.cfi_offset 29, -16
+.cfi_offset 30, -8
+mov x29, sp
+.cfi_def_cfa_register 29
+bl undefined_rbp_tail_caller
+
+ldp x29, x30, [sp], #16
+.cfi_restore 29
+.cfi_def_cfa sp, 0
+.cfi_restore 30
+ret
+.cfi_endproc
+.size undefined_rbp_tail_outer, .-undefined_rbp_tail_outer
+.text
+.globl undefined_rbp_ra_inline_outer
+.type undefined_rbp_ra_inline_outer, %function
+undefined_rbp_ra_inline_outer:
+.cfi_startproc
+str x30, [sp, #-16]!
+.cfi_def_cfa_offset 16
+.cfi_offset 30, -16
+.cfi_register 30, 29
+bl undefined_rbp_ra_inline_caller
+
+ldr x30, [sp], #16
+.cfi_def_cfa sp, 0
+.cfi_restore 30
+ret
+.cfi_endproc
+.size undefined_rbp_ra_inline_outer, .-undefined_rbp_ra_inline_outer
+
+.section .note.GNU-stack,"",%progbits
+#else
 	.text
 	.globl undefined_rbp_inline_caller
 	.type undefined_rbp_inline_caller, @function
@@ -94,3 +206,4 @@ undefined_rbp_tail_outer:
 	.size undefined_rbp_tail_outer, .-undefined_rbp_tail_outer
 
 	.section .note.GNU-stack,"",@progbits
+#endif

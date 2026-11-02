@@ -15,7 +15,9 @@
 
 The installer rejects non-Linux hosts, non-x86_64 hosts, and unsupported
 `--arch` values. The runtime also rejects target executables and shared objects
-that are not 64-bit little-endian x86_64 ELF files.
+that are not 64-bit little-endian ELF files matching the runtime architecture.
+Experimental ARM64 source builds are described in [limitations](limitations.md);
+this installer still distributes x86_64 releases only.
 
 ## Installation
 

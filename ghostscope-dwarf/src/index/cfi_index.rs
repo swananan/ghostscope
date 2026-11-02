@@ -3,8 +3,11 @@
 //! This module provides efficient access to CFA (Canonical Frame Address) rules
 //! by utilizing eh_frame_hdr's binary search table when available.
 
+mod reader;
+use reader::CfiReader;
+
 use crate::{
-    binary::{dwarf_endian_from_object, DwarfReader, MappedFile},
+    binary::{dwarf_endian_from_object, MappedFile},
     core::{CallerFrameRecovery, CfaResult, ModuleId, PlanExprOp, Result},
     semantics::{
         CfaRulePlan, CompactUnwindRow, CompactUnwindTable, RegisterRecoveryPlan, UnwindDiagnostic,
@@ -12,6 +15,7 @@ use crate::{
     },
 };
 use anyhow::{anyhow, Context};
+use ghostscope_platform::TargetArch;
 use gimli::{
     BaseAddresses, CfaRule, CieOrFde, EhFrame, EhFrameHdr, FrameDescriptionEntry, ParsedEhFrameHdr,
     Register, RegisterRule, UnwindContext, UnwindSection,
@@ -23,12 +27,13 @@ use tracing::{debug, info, warn};
 /// CFI index for fast CFA rule lookup
 #[derive(Clone)]
 pub struct CfiIndex {
+    architecture: TargetArch,
     /// Keep file data alive
     _file_data: Arc<MappedFile>,
     /// Parsed eh_frame section
-    eh_frame: EhFrame<DwarfReader>,
+    eh_frame: EhFrame<CfiReader>,
     /// Parsed eh_frame_hdr for fast lookup (if available)
-    eh_frame_hdr: Option<ParsedEhFrameHdr<DwarfReader>>,
+    eh_frame_hdr: Option<ParsedEhFrameHdr<CfiReader>>,
     /// Base addresses for DWARF sections
     bases: BaseAddresses,
     /// Encoding used when parsing CFI DWARF expressions.
@@ -52,6 +57,11 @@ impl CfiIndex {
         let object = file_data
             .parse_object()
             .context("Failed to parse object file")?;
+        let architecture = match object.architecture() {
+            object::Architecture::X86_64 => TargetArch::X86_64,
+            object::Architecture::Aarch64 => TargetArch::Aarch64,
+            _ => TargetArch::Unknown,
+        };
         let endian = dwarf_endian_from_object(&object);
         let address_size = if object.is_64() { 8 } else { 4 };
         let encoding = gimli::Encoding {
@@ -76,7 +86,13 @@ impl CfiIndex {
             endian,
         )
         .ok_or_else(|| anyhow!("Invalid .eh_frame range in mapped file"))?;
-        let eh_frame = EhFrame::from(eh_frame_reader);
+        let mut eh_frame = EhFrame::from(CfiReader::new(
+            eh_frame_reader,
+            architecture == TargetArch::Aarch64,
+        ));
+        if architecture == TargetArch::Aarch64 {
+            eh_frame.set_vendor(gimli::Vendor::AArch64);
+        }
 
         // Try to load eh_frame_hdr for fast lookup (optional)
         let (eh_frame_hdr, has_fast_lookup) = match object.section_by_name(".eh_frame_hdr") {
@@ -91,7 +107,10 @@ impl CfiIndex {
                     endian,
                 )
                 .ok_or_else(|| anyhow!("Invalid .eh_frame_hdr range in mapped file"))?;
-                let hdr_section = EhFrameHdr::from(hdr_reader);
+                let hdr_section = EhFrameHdr::from(CfiReader::new(
+                    hdr_reader,
+                    architecture == TargetArch::Aarch64,
+                ));
 
                 let mut bases = BaseAddresses::default();
 
@@ -137,6 +156,7 @@ impl CfiIndex {
         }
 
         Ok(Self {
+            architecture,
             _file_data: file_data,
             eh_frame,
             eh_frame_hdr,
@@ -144,6 +164,11 @@ impl CfiIndex {
             encoding,
             has_fast_lookup,
         })
+    }
+
+    /// Architecture of the object supplying CFI, independent of the host.
+    pub fn architecture(&self) -> TargetArch {
+        self.architecture
     }
 
     /// Get CFA rule for given PC (file offset) and convert to CfaResult
@@ -159,7 +184,8 @@ impl CfiIndex {
             },
             CfaRule::Expression(expr) => {
                 let expression = expr.get(&self.eh_frame)?;
-                let steps = crate::dwarf_expr::cfa::parse_expression(expression.0, self.encoding)?;
+                let steps =
+                    crate::dwarf_expr::cfa::parse_expression(expression.0.inner, self.encoding)?;
                 CfaResult::Expression { steps }
             }
         };
@@ -191,17 +217,33 @@ impl CfiIndex {
 
         let cfa_steps = self.cfa_steps(unwind_row.cfa())?;
         let return_address_register = fde.cie().return_address_register().0;
-        let caller_pc_steps = self
+        let mut caller_pc_steps = self
             .register_rule_steps(&unwind_row, return_address_register)?
+            .or_else(|| {
+                (self.architecture == TargetArch::Aarch64
+                    && return_address_register == 30
+                    && unwind_row.register(Register(30)).is_none())
+                    .then(|| vec![PlanExprOp::LoadRegister(30)])
+            })
             .ok_or_else(|| {
                 anyhow!(
                     "no caller PC recovery rule for DWARF register {return_address_register} at 0x{pc:x}"
                 )
             })?;
 
+        if self.return_address_signed(&unwind_row)? {
+            let mask = ghostscope_platform::aarch64::native_instruction_address_mask().ok_or_else(
+                || anyhow!("signed AArch64 return-address recovery requires a native PAC mask"),
+            )?;
+            caller_pc_steps.push(PlanExprOp::PushConstant(mask as i64));
+            caller_pc_steps.push(PlanExprOp::And);
+        }
+
         let mut register_recovery_steps = BTreeMap::new();
         for &register in registers {
-            if let Some(steps) = self.register_rule_steps(&unwind_row, register)? {
+            if register == return_address_register {
+                register_recovery_steps.insert(register, caller_pc_steps.clone());
+            } else if let Some(steps) = self.register_rule_steps(&unwind_row, register)? {
                 register_recovery_steps.insert(register, steps);
             }
         }
@@ -236,6 +278,10 @@ impl CfiIndex {
         max_rows: usize,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<CompactUnwindTable> {
+        anyhow::ensure!(
+            self.architecture.dwarf_register_roles().is_some(),
+            "compact BPF unwind tables require a supported target ABI"
+        );
         let started_at = Instant::now();
         let mut rows = Vec::new();
         let mut diagnostics = Vec::new();
@@ -289,7 +335,7 @@ impl CfiIndex {
     fn find_fde_for_address(
         &self,
         address: u64,
-    ) -> Result<FrameDescriptionEntry<DwarfReader, usize>> {
+    ) -> Result<FrameDescriptionEntry<CfiReader, usize>> {
         if let Some(hdr) = &self.eh_frame_hdr {
             // Fast path: O(log n) binary search using eh_frame_hdr
             debug!(
@@ -357,7 +403,7 @@ impl CfiIndex {
     fn append_compact_rows(
         &self,
         module: ModuleId,
-        fde: &FrameDescriptionEntry<DwarfReader, usize>,
+        fde: &FrameDescriptionEntry<CfiReader, usize>,
         max_rows: usize,
         rows: &mut Vec<CompactUnwindRow>,
         diagnostics: &mut Vec<UnwindDiagnostic>,
@@ -381,35 +427,78 @@ impl CfiIndex {
             }
 
             let cfa = self.compact_cfa_rule(row.cfa(), pc_start, pc_end, diagnostics);
-            let return_address = self.compact_register_rule(
-                row.register(Register(return_address_register)),
+            let mut return_address = self.compact_register_rule(
+                row.register(Register(return_address_register)).or_else(|| {
+                    (self.architecture == TargetArch::Aarch64 && return_address_register == 30)
+                        .then_some(RegisterRule::SameValue)
+                }),
                 return_address_register,
                 pc_start,
                 pc_end,
                 true,
                 diagnostics,
             );
+            let return_address_signed = match self.return_address_signed(row) {
+                Ok(signed) => signed,
+                Err(error) => {
+                    let reason = error.to_string();
+                    self.push_unsupported_register_diagnostic(
+                        return_address_register,
+                        pc_start,
+                        pc_end,
+                        &reason,
+                        diagnostics,
+                    );
+                    return_address = RegisterRecoveryPlan::Unsupported { reason };
+                    false
+                }
+            };
             let sp = self.compact_optional_register_rule(
-                row.register(Register(7)),
-                7,
+                row.register(Register(
+                    self.architecture
+                        .dwarf_register_roles()
+                        .unwrap()
+                        .stack_pointer,
+                )),
+                self.architecture
+                    .dwarf_register_roles()
+                    .unwrap()
+                    .stack_pointer,
                 pc_start,
                 pc_end,
                 diagnostics,
             );
             let rbp = self.compact_optional_register_rule(
-                row.register(Register(6))
-                    .or_else(|| Self::default_register_rule(6)),
-                6,
+                row.register(Register(
+                    self.architecture
+                        .dwarf_register_roles()
+                        .unwrap()
+                        .frame_pointer,
+                ))
+                .or_else(|| {
+                    self.default_register_rule(
+                        self.architecture
+                            .dwarf_register_roles()
+                            .unwrap()
+                            .frame_pointer,
+                    )
+                }),
+                self.architecture
+                    .dwarf_register_roles()
+                    .unwrap()
+                    .frame_pointer,
                 pc_start,
                 pc_end,
                 diagnostics,
             );
             rows.push(CompactUnwindRow {
+                architecture: self.architecture,
                 module,
                 pc_start,
                 pc_end,
                 cfa,
                 return_address_register,
+                return_address_signed,
                 return_address,
                 sp,
                 rbp,
@@ -417,6 +506,17 @@ impl CfiIndex {
         }
 
         Ok(())
+    }
+
+    fn return_address_signed(&self, row: &gimli::UnwindTableRow<usize>) -> Result<bool> {
+        if self.architecture != TargetArch::Aarch64 {
+            return Ok(false);
+        }
+        match row.register(gimli::AArch64::RA_SIGN_STATE) {
+            None | Some(RegisterRule::Constant(0)) => Ok(false),
+            Some(RegisterRule::Constant(1)) => Ok(true),
+            state => Err(anyhow!("unsupported AArch64 RA_SIGN_STATE: {state:?}")),
+        }
     }
 
     fn compact_cfa_rule(
@@ -605,7 +705,7 @@ impl CfiIndex {
         let cfa_steps = self.cfa_steps(unwind_row.cfa())?;
         let rule = unwind_row
             .register(Register(register))
-            .or_else(|| Self::default_register_rule(register));
+            .or_else(|| self.default_register_rule(register));
 
         match rule {
             Some(RegisterRule::Undefined) => Ok(None),
@@ -654,16 +754,13 @@ impl CfiIndex {
         expr: gimli::UnwindExpression<usize>,
     ) -> Result<Vec<PlanExprOp>> {
         let expression = expr.get(&self.eh_frame)?;
-        crate::dwarf_expr::cfa::parse_expression(expression.0, self.encoding)
+        crate::dwarf_expr::cfa::parse_expression(expression.0.inner, self.encoding)
     }
 
-    fn default_register_rule(register: u16) -> Option<RegisterRule<usize>> {
-        match register {
-            // x86_64 callee-saved general-purpose registers remain valid in the
-            // current pt_regs snapshot when there is no explicit unwind rule.
-            3 | 6 | 12..=15 => Some(RegisterRule::SameValue),
-            _ => None,
-        }
+    fn default_register_rule(&self, register: u16) -> Option<RegisterRule<usize>> {
+        self.architecture
+            .is_callee_saved_gpr(register)
+            .then_some(RegisterRule::SameValue)
     }
 
     /// Check if fast lookup is available
@@ -689,9 +786,207 @@ pub struct CfiStats {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use gimli::write::{
+        Address, CallFrameInstruction, CommonInformationEntry, EndianVec,
+        FrameDescriptionEntry as WriteFde, FrameTable,
+    };
+
+    fn fixture(architecture: object::Architecture, sp: u16, ra: u16, cfa_offset: i32) -> CfiIndex {
+        fixture_with_instructions(architecture, sp, ra, cfa_offset, &[])
+    }
+
+    fn fixture_with_instructions(
+        architecture: object::Architecture,
+        sp: u16,
+        ra: u16,
+        cfa_offset: i32,
+        instructions: &[(u32, CallFrameInstruction)],
+    ) -> CfiIndex {
+        let mut cie = CommonInformationEntry::new(
+            gimli::Encoding {
+                format: gimli::Format::Dwarf32,
+                version: 1,
+                address_size: 8,
+            },
+            1,
+            -8,
+            Register(ra),
+        );
+        cie.add_instruction(CallFrameInstruction::Cfa(Register(sp), cfa_offset));
+        if architecture == object::Architecture::X86_64 {
+            cie.add_instruction(CallFrameInstruction::Offset(Register(ra), -8));
+        } else {
+            // AArch64 leaves LR implicit until it is spilled.
+            // AArch64 startup objects contain these even for unsigned fixture
+            // functions; parsing must not discard the entire module table.
+            cie.add_instruction(CallFrameInstruction::NegateRaState);
+            cie.add_instruction(CallFrameInstruction::NegateRaState);
+        }
+        let mut frames = FrameTable::default();
+        let cie_id = frames.add_cie(cie);
+        let mut fde = WriteFde::new(Address::Constant(0x1000), 0x20);
+        for (offset, instruction) in instructions {
+            fde.add_instruction(*offset, instruction.clone());
+        }
+        frames.add_fde(cie_id, fde);
+        let mut eh_frame = gimli::write::EhFrame::from(EndianVec::new(gimli::LittleEndian));
+        frames.write_eh_frame(&mut eh_frame).unwrap();
+        let mut object = object::write::Object::new(
+            object::BinaryFormat::Elf,
+            architecture,
+            object::Endianness::Little,
+        );
+        let section = object.add_section(
+            Vec::new(),
+            b".eh_frame".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        object.append_section_data(section, eh_frame.slice(), 8);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), object.write().unwrap()).unwrap();
+        CfiIndex::from_mapped_file(Arc::new(MappedFile::open(file.path()).unwrap())).unwrap()
+    }
+
     #[test]
-    fn test_cfi_index_creation() {
-        // This would need a real ELF file for testing
-        // For now, just ensure the module compiles
+    fn target_elf_controls_cfi_recovery_independently_of_host() {
+        let arm = fixture(object::Architecture::Aarch64, 31, 30, 0);
+        assert_eq!(arm.architecture(), TargetArch::Aarch64);
+        assert_eq!(
+            arm.recover_caller_frame(0x1000, &[])
+                .unwrap()
+                .caller_pc_steps,
+            vec![PlanExprOp::LoadRegister(30)]
+        );
+        assert_eq!(
+            arm.recover_caller_register_steps(0x1000, 19).unwrap(),
+            Some(vec![PlanExprOp::LoadRegister(19)])
+        );
+        assert_eq!(arm.recover_caller_register_steps(0x1000, 3).unwrap(), None);
+        assert_eq!(arm.recover_caller_register_steps(0x1000, 18).unwrap(), None);
+        let table = arm.compact_unwind_table(ModuleId(0)).unwrap();
+        let plan = table.rows[0].bpf_fast_path_plan().unwrap();
+        assert_eq!(plan.cfa_register, 31);
+        assert_eq!(plan.return_address.register, 30);
+        assert_eq!(plan.rbp.register, 29);
+
+        let x86 = fixture(object::Architecture::X86_64, 7, 16, 8);
+        assert_eq!(x86.architecture(), TargetArch::X86_64);
+        assert_eq!(
+            x86.recover_caller_register_steps(0x1000, 3).unwrap(),
+            Some(vec![PlanExprOp::LoadRegister(3)])
+        );
+        assert_eq!(x86.recover_caller_register_steps(0x1000, 19).unwrap(), None);
+        assert_eq!(x86.compact_unwind_table(ModuleId(0)).unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn arm64_signed_return_addresses_follow_cfi_state_transitions() {
+        let cfi = fixture_with_instructions(
+            object::Architecture::Aarch64,
+            31,
+            30,
+            16,
+            &[
+                (4, CallFrameInstruction::NegateRaState),
+                (8, CallFrameInstruction::Offset(Register(30), -8)),
+                (12, CallFrameInstruction::NegateRaState),
+            ],
+        );
+        let table = cfi.compact_unwind_table(ModuleId(0)).unwrap();
+        assert_eq!(table.rows.len(), 4);
+        for (index, signed) in [false, true, true, false].into_iter().enumerate() {
+            let row = &table.rows[index];
+            assert_eq!(row.pc_start, 0x1000 + 4 * index as u64);
+            assert_eq!(row.return_address_signed, signed);
+            assert_eq!(
+                row.bpf_fast_path_plan().unwrap().return_address_signed,
+                signed
+            );
+            let recovered = cfi.recover_caller_frame(row.pc_start, &[30]);
+            if signed && !cfg!(target_arch = "aarch64") {
+                assert!(recovered
+                    .unwrap_err()
+                    .to_string()
+                    .contains("native PAC mask"));
+                continue;
+            }
+            let recovered = recovered.unwrap();
+            assert_eq!(
+                recovered.register_recovery_steps[&30],
+                recovered.caller_pc_steps
+            );
+            if signed {
+                let mask = ghostscope_platform::aarch64::native_instruction_address_mask().unwrap();
+                assert!(recovered
+                    .caller_pc_steps
+                    .ends_with(&[PlanExprOp::PushConstant(mask as i64), PlanExprOp::And,]));
+            } else {
+                assert!(!recovered.caller_pc_steps.contains(&PlanExprOp::And));
+            }
+        }
+        assert!(matches!(
+            table.rows[1].return_address,
+            RegisterRecoveryPlan::SameValue { register: 30 }
+        ));
+        assert!(matches!(
+            table.rows[2].return_address,
+            RegisterRecoveryPlan::AtCfaOffset { offset: -8 }
+        ));
+    }
+
+    #[test]
+    fn arm64_unknown_sign_state_is_unsupported() {
+        let cfi = fixture_with_instructions(
+            object::Architecture::Aarch64,
+            31,
+            30,
+            16,
+            &[(
+                0,
+                CallFrameInstruction::SameValue(gimli::AArch64::RA_SIGN_STATE),
+            )],
+        );
+        let table = cfi.compact_unwind_table(ModuleId(0)).unwrap();
+        assert!(matches!(
+            table.rows[0].return_address,
+            RegisterRecoveryPlan::Unsupported { .. }
+        ));
+        assert!(table.rows[0].bpf_fast_path_plan().is_err());
+        assert!(cfi
+            .recover_caller_frame(0x1000, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("RA_SIGN_STATE"));
+    }
+
+    #[test]
+    fn entry_sp_recovery_uses_target_call_frame_layout() {
+        for (architecture, sp, ra, cfa_offset, correction) in [
+            (object::Architecture::X86_64, 7, 16, 32, -8),
+            (object::Architecture::Aarch64, 31, 30, 32, 0),
+        ] {
+            let cfi = fixture(architecture, sp, ra, cfa_offset);
+            let steps = crate::dwarf_expr::entry_value::resolve_register_offset(
+                0x1000,
+                sp,
+                16,
+                8,
+                None,
+                None,
+                Some(&cfi),
+            )
+            .unwrap();
+            assert_eq!(
+                steps,
+                vec![
+                    PlanExprOp::LoadRegister(sp),
+                    PlanExprOp::PushConstant(32),
+                    PlanExprOp::Add,
+                    PlanExprOp::PushConstant(16 + correction),
+                    PlanExprOp::Add,
+                ]
+            );
+        }
     }
 }

@@ -396,3 +396,115 @@ ls gs_*.ast   # AST dumps
 - Follow standard Rust naming conventions
 - Use `cargo fmt` before committing
 - Run `cargo clippy` for linting
+
+
+## ARM64 development VM
+
+ARM64 runtime support is still under development. The VM helper prepares an
+independent AArch64 Linux kernel for native eBPF/uprobe tests; preparing
+this VM does not establish full ARM64 runtime support. An ARM64
+container using user-mode emulation on an x86 kernel is not equivalent.
+
+The host needs `qemu-system-aarch64`, `qemu-img`, AArch64 UEFI firmware, `curl`,
+OpenSSH, and Python 3.11 or newer with venv support. Choose a state directory
+outside the repository on a disk with enough free space. The 12 GiB guest disk
+is a sparse overlay; installing LLVM/Rust and building tests requires additional
+physical host disk space. TCG works on x86 without KVM or host sudo, but is slow.
+
+```bash
+ARM64_VM_DIR=/path/to/arm64-vm
+python3 -m venv "$ARM64_VM_DIR/tools"
+"$ARM64_VM_DIR/tools/bin/pip" install pycdlib==1.14.0
+"$ARM64_VM_DIR/tools/bin/python" scripts/e2e/vm/arm64_vm.py --state-dir "$ARM64_VM_DIR" prepare
+python3 scripts/e2e/vm/arm64_vm.py --state-dir "$ARM64_VM_DIR" start
+# Allow several minutes for first boot under TCG; inspect console.log for progress.
+python3 scripts/e2e/vm/arm64_vm.py --state-dir "$ARM64_VM_DIR" check
+python3 scripts/e2e/vm/arm64_vm.py --state-dir "$ARM64_VM_DIR" ssh
+```
+
+The helper pins and verifies an Ubuntu 24.04 minimal ARM64 image, creates a local
+SSH key, and forwards host loopback ports 22264 (SSH) and 8789 (guest runner
+8788). `check` verifies the guest architecture, cloud-init completion, readable
+kernel BTF, BPF/uprobe kernel configuration, and loading a minimal BPF socket
+filter. It does not attach a uprobe or execute GhostScope e2e. The helper never starts the runner service.
+
+Inside the VM, copy a source checkout, install the normal project development
+dependencies, and build ARM64 fixtures locally. Do not reuse x86 fixture or Cargo
+caches. Once the ARM64 runtime is ready, start the runner **manually** in the guest:
+
+```bash
+cd /path/to/ghostscope
+sudo env HOST=0.0.0.0 ./scripts/e2e/runner/start_e2e_runner_service.sh
+```
+
+Then use the existing runner API at `http://127.0.0.1:8789` on the host, with the
+repository path **inside the guest**. Standard project `cargo test` commands
+remain unchanged. Shut down the VM with:
+
+```bash
+python3 scripts/e2e/vm/arm64_vm.py --state-dir "$ARM64_VM_DIR" stop
+```
+
+ARM64 source builds are experimental. The build now permits Linux AArch64 and
+requires target ELF files to match that architecture. DWARF backtraces and
+executable static TLS are supported. For cross compilation, set `AYA_BPF_TARGET_ARCH=aarch64`
+in addition to the Cargo target and cross linker: Aya's bindings otherwise
+follow the build host. LLVM headers/configuration and linked libraries must be
+compatible, and linked LLVM libraries must be ARM64. Never link the host's x86
+LLVM archives into an ARM64 executable. Native builds use the usual commands.
+
+### ARM64 CI coverage
+
+`.github/workflows/arm64-e2e.yml` runs on `ubuntu-24.04-arm`, checks the native
+kernel and BPF syscall, and builds the fixture compiler and topology runtime
+images from the checkout. It uses local image tags, so PR validation does not
+require publishing images or replacing the existing x86 pinned digests. The
+manual image publishing workflows also build `linux/amd64,linux/arm64` manifests.
+Cargo caches include `runner.arch`; ARM fixtures are rebuilt inside the native
+compiler image rather than restored from an x86 fixture archive.
+
+Clang 18 does not support basic-block sections on ARM64. For its indexed-range
+fixture, `arm64_rnglistx.py` preserves native instructions, line tables, variable
+locations, and types, and substitutes indexed, reordered function ranges with
+an explicit entry PC. GCC still provides a naturally partitioned ARM64 fixture.
+Both cases retain their range-encoding and runtime assertions. The fixture
+compiler and native test host need `python3-pyelftools` for this transformation.
+
+The ARM workflow runs host and host-to-private-container e2e as two parallel
+matrix jobs with independent runners and `fail-fast: false`. Each job compiles
+the full fixture set and Rust compatibility matrix and builds the CLI and
+`dwarf-tool`. The host job also runs lint, platform/process unit tests, and
+compiler architecture tests; only the container job builds the topology runtime
+image. Both jobs reuse the Cargo and fixture-image caches, with only the host
+job exporting the shared fixture-image cache. Each job runs its corresponding
+ordinary e2e command:
+
+```bash
+sudo -E "$(which cargo)" test -p ghostscope-e2e-tests --all-features \
+  --tests -- --nocapture
+
+sudo -E env \
+  E2E_CONTAINER_IMAGE=ghostscope-e2e-runtime:arm64-ci \
+  E2E_GHOSTSCOPE_SANDBOX=host E2E_TARGET_SANDBOX=docker-private \
+  E2E_TARGET_MODE=same \
+  "$(which cargo)" test -p ghostscope-e2e-tests --all-features \
+  --tests -- --nocapture
+```
+
+The architecture suite requires real events and checks eight scalar arguments,
+global data, PC/SP against the target's mappings, O0/O2, PIE/non-PIE, PID/path
+attachment, and the perf-event-array transport. On ARM64 it also checks LR-based
+backtraces and executable TLS values. PAC fixtures cover A-key and B-key signed
+return addresses, entry parameters, and complete stacks through both inline and
+tail-call unwinding. Signed CFI rows strip PAC bits using the native instruction
+address mask; unsigned rows retain the usual invalid-address checks. The startup suite covers native
+ELF validation and debug-source reporting. The same portable architecture suite
+runs in the existing x86 standard and container jobs. In the nested
+child-container topology, the path-only globals case follows the existing
+unsupported-topology exclusion; all PID-scoped architecture cases still run.
+
+The full e2e suite includes backtraces, multithreaded TLS, and compiler-version
+compatibility coverage. Shared-library/dynamic TLS retains the same explicit
+limitation as x86. No `continue-on-error` or missing-privilege skips are used
+in the architecture suite. A local QEMU system VM can run the same native test
+binaries, but user-mode emulation on an x86 kernel cannot validate this contract.

@@ -40,11 +40,13 @@ pub struct CompactUnwindStats {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactUnwindRow {
+    pub architecture: ghostscope_platform::TargetArch,
     pub module: ModuleId,
     pub pc_start: u64,
     pub pc_end: u64,
     pub cfa: CfaRulePlan,
     pub return_address_register: u16,
+    pub return_address_signed: bool,
     pub return_address: RegisterRecoveryPlan,
     pub sp: Option<RegisterRecoveryPlan>,
     pub rbp: Option<RegisterRecoveryPlan>,
@@ -57,6 +59,7 @@ pub struct BpfUnwindRowPlan {
     pub cfa_register: u16,
     pub cfa_offset: i64,
     pub return_address: BpfRecoveryPlan,
+    pub return_address_signed: bool,
     pub rbp: BpfRecoveryPlan,
 }
 
@@ -86,9 +89,10 @@ pub enum BpfUnwindRowRejection {
     UnsupportedFramePointerRegister { register: u16 },
 }
 
-const X86_64_DWARF_RIP: u16 = 16;
-const X86_64_DWARF_RBP: u16 = 6;
-const X86_64_DWARF_RSP: u16 = 7;
+#[cfg(test)]
+use ghostscope_platform::architecture::x86_64::{
+    RBP as X86_64_DWARF_RBP, RIP as X86_64_DWARF_RIP, RSP as X86_64_DWARF_RSP,
+};
 
 impl CompactUnwindRow {
     /// Lower this semantic row into the complete contract supported by the
@@ -98,9 +102,13 @@ impl CompactUnwindRow {
     /// wire encoding one source of truth. The caller stack pointer is the CFA,
     /// so the explicit `sp` recovery rule does not need a separate wire field.
     pub fn bpf_fast_path_plan(&self) -> Result<BpfUnwindRowPlan, BpfUnwindRowRejection> {
+        let roles = self
+            .architecture
+            .dwarf_register_roles()
+            .ok_or(BpfUnwindRowRejection::UnsupportedCfaRule)?;
         let (cfa_register, cfa_offset) = match self.cfa {
             CfaRulePlan::RegPlusOffset { register, offset }
-                if matches!(register, X86_64_DWARF_RBP | X86_64_DWARF_RSP) =>
+                if register == roles.frame_pointer || register == roles.stack_pointer =>
             {
                 (register, offset)
             }
@@ -112,30 +120,34 @@ impl CompactUnwindRow {
             }
         };
 
-        let return_address = bpf_recovery_plan(&self.return_address, self.return_address_register)
-            .map_err(|rejection| match rejection {
-                BpfRecoveryRejection::UnsupportedRule => {
-                    BpfUnwindRowRejection::UnsupportedReturnAddressRule
-                }
-                BpfRecoveryRejection::UnsupportedRegister { register } => {
-                    BpfUnwindRowRejection::UnsupportedReturnAddressRegister { register }
-                }
-            })?;
+        let return_address =
+            bpf_recovery_plan(&self.return_address, self.return_address_register, roles).map_err(
+                |rejection| match rejection {
+                    BpfRecoveryRejection::UnsupportedRule => {
+                        BpfUnwindRowRejection::UnsupportedReturnAddressRule
+                    }
+                    BpfRecoveryRejection::UnsupportedRegister { register } => {
+                        BpfUnwindRowRejection::UnsupportedReturnAddressRegister { register }
+                    }
+                },
+            )?;
 
         let rbp = match self.rbp.as_ref() {
             Some(rule) => {
-                bpf_recovery_plan(rule, X86_64_DWARF_RBP).map_err(|rejection| match rejection {
-                    BpfRecoveryRejection::UnsupportedRule => {
-                        BpfUnwindRowRejection::UnsupportedFramePointerRule
-                    }
-                    BpfRecoveryRejection::UnsupportedRegister { register } => {
-                        BpfUnwindRowRejection::UnsupportedFramePointerRegister { register }
+                bpf_recovery_plan(rule, roles.frame_pointer, roles).map_err(|rejection| {
+                    match rejection {
+                        BpfRecoveryRejection::UnsupportedRule => {
+                            BpfUnwindRowRejection::UnsupportedFramePointerRule
+                        }
+                        BpfRecoveryRejection::UnsupportedRegister { register } => {
+                            BpfUnwindRowRejection::UnsupportedFramePointerRegister { register }
+                        }
                     }
                 })?
             }
             None => BpfRecoveryPlan {
                 kind: BpfRecoveryKind::SameValue,
-                register: X86_64_DWARF_RBP,
+                register: roles.frame_pointer,
                 offset: 0,
             },
         };
@@ -145,6 +157,7 @@ impl CompactUnwindRow {
             cfa_register,
             cfa_offset,
             return_address,
+            return_address_signed: self.return_address_signed,
             rbp,
         })
     }
@@ -159,6 +172,7 @@ enum BpfRecoveryRejection {
 fn bpf_recovery_plan(
     rule: &RegisterRecoveryPlan,
     target_register: u16,
+    roles: ghostscope_platform::architecture::DwarfRegisterRoles,
 ) -> Result<BpfRecoveryPlan, BpfRecoveryRejection> {
     let plan = match *rule {
         RegisterRecoveryPlan::Undefined => BpfRecoveryPlan {
@@ -196,10 +210,13 @@ fn bpf_recovery_plan(
     if matches!(
         plan.kind,
         BpfRecoveryKind::SameValue | BpfRecoveryKind::Register
-    ) && !matches!(
-        plan.register,
-        X86_64_DWARF_RIP | X86_64_DWARF_RBP | X86_64_DWARF_RSP
-    ) {
+    ) && ![
+        roles.return_address,
+        roles.frame_pointer,
+        roles.stack_pointer,
+    ]
+    .contains(&plan.register)
+    {
         return Err(BpfRecoveryRejection::UnsupportedRegister {
             register: plan.register,
         });
@@ -262,6 +279,7 @@ mod tests {
 
     fn compact_row(return_address: RegisterRecoveryPlan) -> CompactUnwindRow {
         CompactUnwindRow {
+            architecture: ghostscope_platform::TargetArch::X86_64,
             module: ModuleId(1),
             pc_start: 0x1000,
             pc_end: 0x1010,
@@ -270,10 +288,38 @@ mod tests {
                 offset: 16,
             },
             return_address_register: X86_64_DWARF_RIP,
+            return_address_signed: false,
             return_address,
             sp: None,
             rbp: None,
         }
+    }
+
+    #[test]
+    fn arm64_fast_path_uses_fp_sp_and_lr_without_accepting_x86_registers() {
+        let mut row = compact_row(RegisterRecoveryPlan::SameValue { register: 30 });
+        row.architecture = ghostscope_platform::TargetArch::Aarch64;
+        row.return_address_register = 30;
+        row.cfa = CfaRulePlan::RegPlusOffset {
+            register: 31,
+            offset: 0,
+        };
+        let plan = row.bpf_fast_path_plan().unwrap();
+        assert_eq!(plan.return_address.register, 30);
+        assert_eq!(plan.rbp.register, 29);
+        row.return_address = RegisterRecoveryPlan::Register { register: 16 };
+        assert_eq!(
+            row.bpf_fast_path_plan(),
+            Err(BpfUnwindRowRejection::UnsupportedReturnAddressRegister { register: 16 })
+        );
+        row.cfa = CfaRulePlan::RegPlusOffset {
+            register: 7,
+            offset: 8,
+        };
+        assert_eq!(
+            row.bpf_fast_path_plan(),
+            Err(BpfUnwindRowRejection::UnsupportedCfaRegister { register: 7 })
+        );
     }
 
     #[test]

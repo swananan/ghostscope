@@ -173,7 +173,7 @@ async fn test_t_mode_executable_globals_prints() -> anyhow::Result<()> {
     let pid = visible_pid_for_target(&target)?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "PID:{} GY:{}", $pid, G_STATE.inner.y;
 }
 "#;
@@ -398,9 +398,9 @@ async fn test_t_mode_executable_rodata_and_struct_pretty() -> anyhow::Result<()>
     let target = spawn_globals_program(&binary_path).await?;
     let pid = visible_pid_for_target(&target)?;
 
-    // At line 26, aliases (s, ls, gm, etc.) are initialized
+    // At line 31, aliases (s, ls, gm, etc.) are initialized
     let script = r#"
-trace globals_program.c:26 {
+trace globals_program.c:31 {
     print "PID:{} GM:{:s.32}", $pid, gm;   // rodata string (explicit string format)
     print *s;                              // struct pretty print (deref pointer)
 }
@@ -453,7 +453,7 @@ async fn test_t_mode_executable_late_start_globals_prints() -> anyhow::Result<()
     // GhostScope starts first (-t points to the executable), then we start the process
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "PID:{} GY:{}", $pid, G_STATE.inner.y;
 }
 "#;
@@ -651,9 +651,9 @@ async fn test_t_mode_executable_late_start_rodata_and_struct_pretty() -> anyhow:
     }
 
     let binary_path = FIXTURES.get_test_binary("globals_program")?;
-    // At line 26, aliases (s, ls, gm, etc.) are initialized
+    // At line 31, aliases (s, ls, gm, etc.) are initialized
     let script = r#"
-trace globals_program.c:26 {
+trace globals_program.c:31 {
     print "PID:{} GM:{:s.32}", $pid, gm;   // rodata string
     print *s;                              // struct pretty print
 }

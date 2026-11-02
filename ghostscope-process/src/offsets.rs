@@ -821,9 +821,38 @@ impl ProcessManager {
         base: u64,
         size: u64,
     ) -> Result<(u64, SectionOffsets, u64, u64)> {
+        // The traced process shares this kernel's base page size, including on
+        // ARM64 kernels configured for 16 or 64 KiB pages.
+        // SAFETY: sysconf reads a process-independent kernel parameter.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        anyhow::ensure!(page_size > 0, "failed to determine kernel page size");
+        self.compute_section_offsets_with_page_size(
+            pid,
+            module_path,
+            candidates,
+            executable_candidates,
+            (base, size),
+            page_size as u64,
+        )
+    }
+
+    fn compute_section_offsets_with_page_size(
+        &self,
+        pid: u32,
+        module_path: &str,
+        candidates: &[(u64, u64)],
+        executable_candidates: &[(u64, u64)],
+        image_range: (u64, u64),
+        page_size: u64,
+    ) -> Result<(u64, SectionOffsets, u64, u64)> {
+        anyhow::ensure!(
+            page_size.is_power_of_two(),
+            "invalid kernel page size {page_size}"
+        );
+        let (base, size) = image_range;
         let probe = ModuleProbe::open(module_path)?;
         let obj = probe.object()?;
-        let page_mask: u64 = !0xfffu64;
+        let page_mask = !(page_size - 1);
         // Only executable mappings establish a loaded image. An ordinary read-only
         // mmap of the ELF (e.g. by a symbol reader) must not create another instance.
         // Intersect across executable segments: two segments can share a file page,
@@ -1189,7 +1218,11 @@ mod tests {
                 os_abi: elf::ELFOSABI_NONE,
                 abi_version: 0,
                 e_type: elf::ET_DYN,
-                e_machine: elf::EM_X86_64,
+                e_machine: if cfg!(target_arch = "aarch64") {
+                    elf::EM_AARCH64
+                } else {
+                    elf::EM_X86_64
+                },
                 e_entry: vaddr,
                 e_flags: elf::FileFlags(0),
             })
@@ -1224,6 +1257,33 @@ mod tests {
         });
         writer.write_shstrtab_section_header();
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn load_bias_uses_kernel_page_size_for_unaligned_segments() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("unaligned-pages.elf");
+        write_load_bias_fixture(&path, 0x1b345, 0x2b345);
+        let manager = ProcessManager::new();
+        let bias = 0x100000;
+        for (page_size, file_page, address_page) in [
+            (4096, 0x1b000, 0x2b000),
+            (16384, 0x18000, 0x28000),
+            (65536, 0x10000, 0x20000),
+        ] {
+            let maps = [(file_page, bias + address_page)];
+            let (_, offsets, _, _) = manager
+                .compute_section_offsets_with_page_size(
+                    42,
+                    path.to_str().unwrap(),
+                    &maps,
+                    &maps,
+                    (bias, 0x40000),
+                    page_size,
+                )
+                .unwrap();
+            assert_eq!(offsets.text, bias, "page size {page_size}");
+        }
     }
 
     #[test]

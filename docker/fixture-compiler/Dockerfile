@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     gnupg \
     make \
+    python3-pyelftools \
     tar \
     xz-utils \
     && rm -rf /var/lib/apt/lists/*

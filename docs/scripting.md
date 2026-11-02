@@ -138,7 +138,7 @@ GhostScope's script syntax is source-language agnostic, but real-world support d
 
 Practical guidance:
 - Prefer C targets when you need the highest success rate for complex DWARF expressions.
-- GhostScope recognizes `DW_OP_form_tls_address`, which is used for both static and dynamic TLS. Runtime address resolution currently supports only x86_64 executable static TLS; dynamic/shared-library TLS is not modeled yet.
+- GhostScope recognizes `DW_OP_form_tls_address`, which is used for both static and dynamic TLS. Runtime address resolution currently supports executable static TLS on x86_64 and AArch64; dynamic/shared-library TLS is not modeled yet.
 - C++ remains primarily DWARF-layout aware.
 - Rust support is determined from each target type's language, identity, and
   validated DWARF layout. A rustc release parsed from `DW_AT_producer` is only

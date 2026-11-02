@@ -844,7 +844,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             // unrelated read-only mappings can enlarge that range across a new
             // instance. The context retains the probe PC for cross-module reads.
             let regs = self.get_pt_regs_parameter()?;
-            let ip = self.load_register_value(16, regs)?.into_int_value();
+            let ip = self
+                .load_probe_register(ghostscope_platform::ProbeRegister::Pc, regs)?
+                .into_int_value();
             let link_pc = self
                 .context
                 .i64_type()
@@ -961,6 +963,30 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Map DWARF register number to pt_regs offset
         let pt_regs_offset = self.dwarf_reg_to_pt_regs_offset(reg_num)?;
 
+        self.load_context_register_slot(pt_regs_offset, &format!("reg_{reg_num}"), pt_regs_ptr)
+    }
+
+    pub(crate) fn load_probe_register(
+        &mut self,
+        register: ghostscope_platform::ProbeRegister,
+        pt_regs_ptr: PointerValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let offset = ghostscope_platform::TargetArch::current()
+            .probe_register_byte_offset(register)
+            .ok_or_else(|| {
+                CodeGenError::RegisterMappingError(format!(
+                    "unsupported probe register {register:?}"
+                ))
+            })?;
+        self.load_context_register_slot(offset / 8, &format!("probe_{register:?}"), pt_regs_ptr)
+    }
+
+    fn load_context_register_slot(
+        &mut self,
+        pt_regs_offset: usize,
+        name: &str,
+        pt_regs_ptr: PointerValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>> {
         // Calculate pointer to register in pt_regs structure
         let i64_type = self.context.i64_type();
         let offset_value = i64_type.const_int(pt_regs_offset as u64, false);
@@ -973,7 +999,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     i64_type,
                     pt_regs_ptr,
                     &[offset_value],
-                    &format!("reg_{reg_num}_ptr"),
+                    &format!("{name}_ptr"),
                 )
                 .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
         };
@@ -981,14 +1007,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Load the register value
         let reg_value = self
             .builder
-            .build_load(i64_type, reg_ptr, &format!("reg_{reg_num}"))
+            .build_load(i64_type, reg_ptr, name)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         if let BasicValueEnum::IntValue(_) = reg_value {
             Ok(reg_value)
         } else {
             Err(CodeGenError::RegisterMappingError(format!(
-                "Failed to load register {reg_num} as integer"
+                "Failed to load register {name} as integer"
             )))
         }
     }
@@ -1367,9 +1393,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Use platform-specific register mapping to get byte offset
         let byte_offset = register_mapping::dwarf_reg_to_pt_regs_byte_offset(dwarf_reg)
             .ok_or_else(|| match register_mapping::dwarf_reg_to_name(dwarf_reg) {
-                Some(reg_name) if reg_name.starts_with("XMM") => {
+                Some(reg_name) if reg_name.starts_with("XMM") || (cfg!(target_arch = "aarch64") && reg_name.starts_with('V')) => {
+                    let bank = if reg_name.starts_with("XMM") { "XMM" } else { "SIMD/FP" };
                     CodeGenError::RegisterMappingError(format!(
-                        "Unsupported DWARF register: {dwarf_reg} ({reg_name}) is a SIMD/FP register; uprobe pt_regs does not expose XMM register values, so optimized float by-value parameters are unavailable unless the compiler spills them to memory"
+                        "Unsupported DWARF register: {dwarf_reg} ({reg_name}) is a SIMD/FP register; uprobe pt_regs does not expose {bank} register values, so optimized float by-value parameters are unavailable unless the compiler spills them to memory"
                     ))
                 }
                 Some(reg_name) => CodeGenError::RegisterMappingError(format!(
@@ -1536,7 +1563,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         };
         if ghostscope_process::is_shared_object(std::path::Path::new(&module_path)) {
             return Err(CodeGenError::NotImplemented(format!(
-                "dynamic/shared-library TLS is not supported yet for DW_OP_form_tls_address in {module_path}; only x86_64 executable static TLS is currently supported"
+                "dynamic/shared-library TLS is not supported yet for DW_OP_form_tls_address in {module_path}; only executable static TLS is currently supported"
             )));
         }
         let tls_bias =
@@ -1551,11 +1578,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         "module {module_path} does not contain a PT_TLS segment"
                     ))
                 })?;
-        let fsbase_offset = ghostscope_platform::current_task_fsbase_offset().map_err(|err| {
-            CodeGenError::LLVMError(format!(
-                "failed to resolve task_struct.thread.fsbase offset from kernel BTF: {err}"
-            ))
-        })?;
+        let fsbase_offset =
+            ghostscope_platform::current_task_thread_pointer_offset().map_err(|err| {
+                CodeGenError::LLVMError(format!(
+                    "failed to resolve native thread pointer offset from kernel BTF: {err}"
+                ))
+            })?;
 
         let i64_type = self.context.i64_type();
         let i32_type = self.context.i32_type();
@@ -2025,5 +2053,33 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.record_event_output_loss_on_error(result)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod architecture_tests {
+    use super::*;
+    use ghostscope_platform::ProbeRegister;
+
+    #[test]
+    fn probe_pc_and_sp_use_context_slots_not_assumed_dwarf_numbers() {
+        let context = inkwell::context::Context::create();
+        let options = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "probe_registers", Some(0), &options).unwrap();
+        ctx.create_basic_ebpf_function("probe_registers").unwrap();
+        let regs = ctx.get_pt_regs_parameter().unwrap();
+        ctx.load_probe_register(ProbeRegister::Pc, regs).unwrap();
+        ctx.load_probe_register(ProbeRegister::Sp, regs).unwrap();
+        ctx.builder
+            .build_return(Some(&context.i32_type().const_zero()))
+            .unwrap();
+        let ir = ctx.module.print_to_string().to_string();
+        let (pc, sp) = if cfg!(target_arch = "aarch64") {
+            (32, 31)
+        } else {
+            (16, 19)
+        };
+        assert!(ir.contains(&format!("i64 {pc}")), "{ir}");
+        assert!(ir.contains(&format!("i64 {sp}")), "{ir}");
     }
 }

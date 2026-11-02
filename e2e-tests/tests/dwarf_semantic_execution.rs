@@ -88,13 +88,20 @@ fn add_location_list_dwarf(binary: &Path, version: u16) -> anyhow::Result<(u64, 
     // This earlier range needs unsupported entry-value recovery. At the next
     // instruction the parameter is simply in RDI, regardless of that limitation.
     let mut entry_expression = Expression::new();
-    entry_expression.op_breg(gimli::Register(5), 0);
+    entry_expression.op_breg(
+        gimli::Register(if cfg!(target_arch = "aarch64") { 0 } else { 5 }),
+        0,
+    );
     entry_expression.op_deref();
     let mut inactive_location = Expression::new();
     inactive_location.op_entry_value(entry_expression);
     inactive_location.op(gimli::DW_OP_stack_value);
     let mut active_location = Expression::new();
-    active_location.op_reg(gimli::Register(5));
+    active_location.op_reg(gimli::Register(if cfg!(target_arch = "aarch64") {
+        0
+    } else {
+        5
+    }));
     let locations = unit.locations.add(LocationList(vec![
         Location::BaseAddress {
             address: Address::Constant(start),
@@ -163,6 +170,14 @@ async fn check_location_list_at_probe_pc(version: u16) -> anyhow::Result<()> {
          .size location_probe, .-location_probe\n\
          .section .note.GNU-stack,\"\",@progbits\n",
     )?;
+    if cfg!(target_arch = "aarch64") {
+        fs::write(
+            &assembly,
+            fs::read_to_string(&assembly)?
+                .replace("@function", "%function")
+                .replace("@progbits", "%progbits"),
+        )?;
+    }
     run_command(
         Command::new("cc")
             .args(["-g0", "-no-pie", "-o"])

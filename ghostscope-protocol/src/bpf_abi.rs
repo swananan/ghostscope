@@ -336,6 +336,9 @@ pub const BACKTRACE_RECOVERY_AT_CFA_OFFSET: u8 = 1;
 pub const BACKTRACE_RECOVERY_VAL_CFA_OFFSET: u8 = 2;
 pub const BACKTRACE_RECOVERY_REGISTER: u8 = 3;
 pub const BACKTRACE_RECOVERY_SAME_VALUE: u8 = 4;
+/// Flag in ra_kind only: strip the native instruction PAC after recovering LR.
+/// Lower bits retain the recovery kind; 0xff remains the unsupported sentinel.
+pub const BACKTRACE_RECOVERY_SIGNED_RA: u8 = 0x80;
 /// Sentinel stored in `BacktraceUnwindRow::ra_kind` when a CFI row exists but
 /// cannot be lowered into the compact eBPF recovery contract.
 pub const BACKTRACE_UNWIND_ROW_UNSUPPORTED_CFI: u8 = u8::MAX;
@@ -448,7 +451,7 @@ mod tests {
             cfa_register: 7,
             ra_register: 16,
             rbp_register: 6,
-            ra_kind: BACKTRACE_RA_AT_CFA_OFFSET,
+            ra_kind: BACKTRACE_RA_AT_CFA_OFFSET | BACKTRACE_RECOVERY_SIGNED_RA,
             rbp_kind: BACKTRACE_RECOVERY_SAME_VALUE,
             reserved: [0, 0],
         };

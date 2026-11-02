@@ -77,7 +77,7 @@ async fn test_memcmp_hex_helper_on_globals() -> anyhow::Result<()> {
     // gm -> "Hello, Global!" → prefix "Hello, " = 48 65 6c 6c 6f 2c 20
     // lm -> "LIB_MESSAGE" → prefix "LIB_" = 4c 49 42 5f
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     if memcmp(gm, hex("48656c6c6f2c20"), 7) { print "HEX_OK"; }
     if memcmp(lm, hex("4c49425f"), 4) { print "HEX_LM"; }
 }
@@ -108,7 +108,7 @@ async fn test_memcmp_hex_helper_infers_len_on_dwarf_pointer_globals() -> anyhow:
     // gm/lm are DWARF-backed local const char* aliases to rodata.
     // Omitting len should infer it from the hex literal and still compile/run.
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     if memcmp(gm, hex("48656c6c6f2c20")) { print "HEX_OK_INFER"; }
     if memcmp(lm, hex("4c49425f")) { print "HEX_LM_INFER"; }
 }
@@ -138,7 +138,7 @@ async fn test_globals_o3_pointer_arithmetic_memcmp_and_strncmp() -> anyhow::Resu
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let n = 0b110;
     print "GM_OFFSET_PTR={:p}", gm + 7;
     print "GM_OFFSET_FMT={:s.0x6}", gm + 7;
@@ -424,7 +424,7 @@ async fn test_if_memcmp_failure_emits_exprerror_and_suppress_else() -> anyhow::R
     // G_STATE.lib is NULL on some ticks, memcmp will fail probe_read_user.
     // Soft-abort semantics: emit ExprError, suppress both then and else, but keep subsequent prints.
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     if memcmp(G_STATE.lib, hex("00"), 1) { print "THEN"; } else { print "ELSE"; }
     print "AFTER";
 }
@@ -494,7 +494,7 @@ async fn test_script_variables_shadow_dwarf_types_in_ordered_comparisons() -> an
     // These names collide with an aggregate in the executable and a pointer in
     // libgvars.so. The concrete script variables must win type resolution.
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "DWARF_COLLISION:{}:{}", G_STATE.counter, LIB_AMBIGUOUS_DYNAMIC[0].want;
     let G_STATE = 100;
     let LIB_AMBIGUOUS_DYNAMIC = 200;
@@ -528,7 +528,7 @@ async fn test_unknown_member_on_global_reports_members() -> anyhow::Result<()> {
 
     // Access a member that does not exist; expect a concise member list in error
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print G_STATE.no_such_member;
 }
 "#;
@@ -556,7 +556,7 @@ async fn test_else_if_continues_after_error() -> anyhow::Result<()> {
     // First if may fail at runtime via DWARF read (G_STATE.lib == NULL on even ticks),
     // else-if checks gm first byte == 'H' (0x48) should succeed, else suppressed
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     if memcmp(G_STATE.lib, hex("00"), 1) { print "A"; }
     else if memcmp(gm, hex("48"), 1) { print "B"; }
     else { print "C"; }
@@ -607,7 +607,7 @@ async fn test_script_signed_ints_regression() -> anyhow::Result<()> {
 
     // Regression: script ints should keep signed semantics (I8/I16/I32), not U*
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let a = -1;
     let b = -2;
     let c = -3;
@@ -660,7 +660,7 @@ async fn test_trace_by_address_via_dwarf_line_lookup() -> anyhow::Result<()> {
     let addrs = analyzer.lookup_addresses_by_source_line("globals_program.c", 32);
     anyhow::ensure!(
         !addrs.is_empty(),
-        "No DWARF addresses found for globals_program.c:32"
+        "No DWARF addresses found for globals_program.c:31"
     );
     let pc = addrs[0].address;
 
@@ -707,7 +707,7 @@ async fn test_special_vars_pid_tid_timestamp_globals() -> anyhow::Result<()> {
         target.visible_pid_from(&common::sandbox::SandboxHandle::default_ghostscope()?)?;
 
     let script = format!(
-        "trace globals_program.c:32 {{\n    print \"PID={} HOST_PID={} INPUT_PID={} TID={} TS={}\", $pid, $host_pid, $input_pid, $tid, $timestamp;\n    if $host_pid == {} {{ print \"HOST_PID_EQ\"; }}\n    if $input_pid == {} {{ print \"INPUT_PID_EQ\"; }}\n}}\n",
+        "trace globals_program.c:31 {{\n    print \"PID={} HOST_PID={} INPUT_PID={} TID={} TS={}\", $pid, $host_pid, $input_pid, $tid, $timestamp;\n    if $host_pid == {} {{ print \"HOST_PID_EQ\"; }}\n    if $input_pid == {} {{ print \"INPUT_PID_EQ\"; }}\n}}\n",
         "{}", "{}", "{}", "{}", "{}", host_pid, input_pid
     );
 
@@ -837,7 +837,7 @@ async fn test_address_of_with_hint_regression() -> anyhow::Result<()> {
 
     // Ensure &LIB_STATE is computed with the correct module hint (prints as hex pointer)
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print &LIB_STATE;
 }
 "#;
@@ -861,7 +861,7 @@ async fn test_unary_minus_nested() -> anyhow::Result<()> {
 
     // Nested unary minus should work: -(-1) == 1
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let d = -(-1);
     print d;
     print "X:{}", d;
@@ -889,7 +889,7 @@ async fn test_string_comparison_globals_char_ptr_and_array() -> anyhow::Result<(
     // In tick_once, gm/lm are aliases to global rodata strings,
     // and s is alias to &G_STATE with name[32].
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     if (gm == "Hello, Global!") { print "GM_OK"; }
     if (lm == "LIB_MESSAGE") { print "LM_OK"; }
     if (s.name == "RUNNING") { print "GNAME_RUN"; }
@@ -927,7 +927,7 @@ async fn test_print_format_current_global_member_leaf() -> anyhow::Result<()> {
 
     // Current-module leaf member via formatted print
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "GY:{}", G_STATE.inner.y;
 }
 "#;
@@ -968,7 +968,7 @@ async fn test_print_format_global_autoderef_pointer_member() -> anyhow::Result<(
 
     // Test script: global base with one auto-deref in chain
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "X: {}", G_STATE.lib.inner.x;
 }
 "#;
@@ -1007,7 +1007,7 @@ async fn test_cross_type_comparisons_globals() -> anyhow::Result<()> {
     // - p_lib_internal == 0 (DWARF pointer vs script int; often false depending on timing)
     // - s_internal > th (DWARF int vs script variable)
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let th = 6;
     print "SI_GT5:{} PIN0:{} SI_GT_TH:{}",
         s_internal > 5,
@@ -1051,7 +1051,7 @@ async fn test_if_else_if_and_bare_expr_globals() -> anyhow::Result<()> {
 
     // Use globals at a stable attach site; exercise bare expr + conditional with expressions
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     // bare expression print
     print s_internal > 5;
     if s_internal > 5 {
@@ -1092,7 +1092,7 @@ async fn test_if_else_if_logical_ops_globals() -> anyhow::Result<()> {
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     // Stable conditions to exercise both operators; first branch always true
     if 1 == 1 && s_bss_counter >= 0 { print "AND"; }
     else if 1 == 0 || p_lib_internal == 0 { print "OR"; }
@@ -1119,7 +1119,7 @@ async fn test_address_of_and_comparisons_globals() -> anyhow::Result<()> {
 
     // Address-of on globals and in comparisons
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print &G_STATE;              // pointer to global struct
     print (&G_STATE != 0);       // expression with address-of
     if &G_STATE != 0 { print "ADDR"; }
@@ -1163,7 +1163,7 @@ async fn test_string_equality_globals() -> anyhow::Result<()> {
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "GM_EQ:{}", g_message == "Hello, Global!";
 }
 "#;
@@ -1186,7 +1186,7 @@ async fn test_chain_tail_array_constant_index_increments() -> anyhow::Result<()>
 
     // LIB_STATE.array[i] increments by +1 per tick in lib_tick(); via G_STATE.lib pointer
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "A0:{}", G_STATE.lib.array[0];
 }
 "#;
@@ -1236,7 +1236,7 @@ async fn test_builtins_strncmp_starts_with_globals() -> anyhow::Result<()> {
 
     // Validate strncmp/starts_with builtins on globals
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "SN1:{}", strncmp(gm, "Hello", 5);
     print "SW1:{}", starts_with(gm, "Hello");
     print "SN2:{}", strncmp(lm, "LIB_", 4);
@@ -1275,7 +1275,7 @@ async fn test_builtin_strncmp_generic_ptr_and_null() -> anyhow::Result<()> {
     // When non-NULL, the first bytes are 'LIB' (name field), so strncmp should be true
     // When NULL, read fails and builtin returns false
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "SL:{}", strncmp(s.lib, "LIB", 3);
 }
 "#;
@@ -1305,7 +1305,7 @@ async fn test_builtin_failure_inside_print_emits_exprerror() -> anyhow::Result<(
     // s.lib flips between NULL and &LIB_STATE each tick.
     // On NULL, starts_with should keep the print line alive but also emit ExprError.
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "SW:{} AFTER", starts_with(s.lib, "LIB");
 }
 "#;
@@ -1339,7 +1339,7 @@ async fn test_rodata_char_element() -> anyhow::Result<()> {
 
     // Print first character of executable/library rodata messages
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     // variable-print (name = value)
     print g_message[0];
     print lib_message[0];
@@ -1395,7 +1395,7 @@ async fn test_format_specifiers_memory_and_pointer() -> anyhow::Result<()> {
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     // Hex dump first 4 bytes of g_message
     print "HX={:x.4}", g_message;
     // ASCII dump first 5 bytes of s.name
@@ -1444,7 +1444,7 @@ async fn test_multiple_dynamic_ascii_format_specifiers_in_one_print() -> anyhow:
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     // Regression guard: a single print with repeated {:s.*} must keep later fields populated.
     print "GM={:s.*} LM={:s.*} NAME={:s.*} GLOB={:s.*}",
         5, gm,
@@ -1480,7 +1480,7 @@ async fn test_large_pattern_dump_and_checks() -> anyhow::Result<()> {
     // - Byte at index 255 is 255
     // - Dynamic {:x.*} with length=10 shows 00..09
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "LPX16={:x.16}", lib_pattern;
     print "LPD10={:x.*}", 10, lib_pattern;
     print "B100={} B255={}", lib_pattern[100], lib_pattern[255];
@@ -1525,7 +1525,7 @@ async fn test_format_capture_len_zero_and_exceed_cap() -> anyhow::Result<()> {
     // - len=0 should yield empty
     // - len=512 should truncate to 256 bytes
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let z = 0;
     let big = 512;
     print "Z0={:x.z$}", lib_pattern;     // expect empty
@@ -1565,7 +1565,7 @@ async fn test_format_negative_len_clamped_to_zero() -> anyhow::Result<()> {
 
     // Negative lengths should clamp to 0 and produce empty output
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let neg = -5;
     print "ZN1={:x.neg$}", lib_pattern;   // capture negative -> empty
     print "ZN2={:x.*}", -10, lib_pattern; // star negative -> empty
@@ -1596,7 +1596,7 @@ async fn test_format_specifiers_capture_len() -> anyhow::Result<()> {
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let n = 4;
     // Capture length from script variable for ASCII and HEX
     print "CL={:s.n$}", lm;
@@ -1633,7 +1633,7 @@ async fn test_alias_to_complex_dwarf_expr_index_and_address_of() -> anyhow::Resu
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let a = G_STATE.array;      // alias to DWARF array member
     print "APTR={:p}", &a;      // address-of alias
     print "A0={}", a[0];        // index on alias
@@ -1678,7 +1678,7 @@ async fn test_alias_to_aggregate_and_chain_and_string_prefix() -> anyhow::Result
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let a = s;                    // alias to pointer-to-aggregate (GlobalState*)
     print "AX:{}", a.inner.x;     // member chain from alias
     // probe string prefix on nested char[N]
@@ -1728,7 +1728,7 @@ async fn test_alias_rodata_string_builtins() -> anyhow::Result<()> {
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let sg = gm; // alias to g_message (const char*)
     let sl = lm; // alias to lib_message (const char*)
     print "GST:{}", starts_with(sg, "Hell");
@@ -1761,7 +1761,7 @@ async fn test_alias_rodata_string_builtins_perf() -> anyhow::Result<()> {
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let sg = gm; // alias to g_message (const char*)
     let sl = lm; // alias to lib_message (const char*)
     print "GST:{}", starts_with(sg, "Hell");
@@ -1795,7 +1795,7 @@ async fn test_alias_address_of_cross_module_uses_correct_hint() -> anyhow::Resul
     // Touch an executable symbol first (to set a prior module hint), then
     // alias a library global and take its address; compare with &LIB_STATE.
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "MX:{}", G_STATE.counter;  // touch main exe symbol first
     let a = LIB_STATE;               // alias to library global (cross-module)
     print "PA={:p}", &a;             // &alias must equal &LIB_STATE
@@ -1839,7 +1839,7 @@ async fn test_top_level_array_member_struct_field() -> anyhow::Result<()> {
 
     // Top-level array-of-struct member access: g_slots[1].x
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "SX:{}", g_slots[1].x;
 }
 "#;
@@ -1865,7 +1865,7 @@ async fn test_dynamic_cross_module_member_completion_uses_global_module() -> any
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let dyn_idx = $pid - $pid;
     print "LAD:{}", LIB_AMBIGUOUS_DYNAMIC[dyn_idx].want;
 }
@@ -1890,7 +1890,7 @@ async fn test_dynamic_chain_middle_array_member_access() -> anyhow::Result<()> {
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     let dyn_idx = $pid - $pid;
     print "MID_MAIN:{}", G_STATE.slots[dyn_idx].x;
     print "MID_LIB:{}", LIB_STATE.slots[dyn_idx].x;
@@ -1927,7 +1927,7 @@ async fn test_tick_once_entry_strings_and_structs() -> anyhow::Result<()> {
 
     // Attach at a source line after local aliases are initialized (line 26 is first non-comment after 19..24)
     let script = r#"
-trace globals_program.c:26 {
+trace globals_program.c:31 {
     print s.name;       // char[32] -> string
     print ls.name;      // from shared library
     print s;            // struct GlobalState pretty print
@@ -1996,7 +1996,7 @@ async fn test_tick_once_pointer_values() -> anyhow::Result<()> {
 
     // Validate pointers to rodata appear as addresses; attach after locals are set
     let script = r#"
-trace globals_program.c:26 {
+trace globals_program.c:31 {
     print gm; // const char* to executable rodata
     print lm; // const char* to library rodata
 }
@@ -2023,7 +2023,7 @@ async fn test_two_events_evolution_and_statics() -> anyhow::Result<()> {
 
     // Attach at initialized locals line; print counters and statics via local pointers
     let script = r#"
-trace globals_program.c:26 {
+trace globals_program.c:31 {
     print s.counter;
     print ls.counter;
     print *p_s_internal;
@@ -2115,7 +2115,7 @@ async fn test_direct_globals_current_module() -> anyhow::Result<()> {
 
     // Directly print globals without local aliases
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print G_STATE;
     print s_internal;
     print s_bss_counter;
@@ -2187,7 +2187,7 @@ async fn test_direct_bss_global_no_alias() -> anyhow::Result<()> {
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "SBSS_ONLY:{}", s_bss_counter;
 }
 "#;
@@ -2222,7 +2222,7 @@ async fn test_direct_global_cross_module() -> anyhow::Result<()> {
 
     // Cross-module global: offsets are auto-populated in -p mode; expect successful struct print
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print LIB_STATE;
     // Also emit formatted cross-module counter to ensure format-path works for globals
     print "LIBCNT:{}", LIB_STATE.counter;
@@ -2268,7 +2268,7 @@ async fn test_rodata_direct_strings() -> anyhow::Result<()> {
 
     // Directly print rodata arrays as strings (executable + library)
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print g_message;    // executable .rodata (char[...])
     print lib_message;  // library .rodata (char[...])
     // Also check formatted path for strings
@@ -2311,7 +2311,7 @@ async fn test_bss_first_byte_evolves() -> anyhow::Result<()> {
 
     // Read first byte of executable/library .bss buffers via locals 'gb'/'lb'
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print *gb; // g_bss_buffer[0]
     print *lb; // lib_bss[0]
     // Also formatted first bytes from both buffers
@@ -2378,7 +2378,7 @@ async fn test_print_variable_global_member_direct() -> anyhow::Result<()> {
 
     // Directly print global member fields in variable mode
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print G_STATE.counter;
     print LIB_STATE.counter;
 }
@@ -2419,7 +2419,7 @@ async fn test_duplicate_global_name_prefers_current_module() -> anyhow::Result<(
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "MAIN_DUP:{}", module_duplicate_counter;
 }
 trace lib_tick {
@@ -2471,7 +2471,7 @@ async fn test_print_format_global_member_direct() -> anyhow::Result<()> {
 
     // Print format with global member (counter int)
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "LIBCNT:{}", LIB_STATE.counter;
 }
 "#;
@@ -2504,7 +2504,7 @@ async fn test_print_format_global_member_leaf() -> anyhow::Result<()> {
 
     // Ensure formatted multi-level member prints scalar value, not whole struct
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "LIBY:{}", LIB_STATE.inner.y;
 }
 "#;
@@ -2549,7 +2549,7 @@ async fn test_print_variable_global_member_leaf() -> anyhow::Result<()> {
 
     // Variable mode: nested chain leaf prints as scalar
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print LIB_STATE.inner.y;
 }
 "#;
@@ -2589,7 +2589,7 @@ async fn test_print_format_current_global_member_leaf_perf() -> anyhow::Result<(
 
     // Current-module leaf member via formatted print
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     print "GY:{}", G_STATE.inner.y;
 }
 "#;
@@ -2630,7 +2630,7 @@ async fn test_tick_once_entry_strings_and_structs_perf() -> anyhow::Result<()> {
 
     // Attach at a source line after local aliases are initialized (line 26 is first non-comment after 19..24)
     let script = r#"
-trace globals_program.c:26 {
+trace globals_program.c:31 {
     print s.name;       // char[32] -> string
     print ls.name;      // from shared library
     print s;            // struct GlobalState pretty print
@@ -2673,7 +2673,7 @@ async fn test_memcmp_numeric_pointer_literal_and_hex_len() -> anyhow::Result<()>
     let target = spawn_globals_program(&binary_path).await?;
 
     let script = r#"
-trace globals_program.c:32 {
+trace globals_program.c:31 {
     // hex static length should work when comparing equal pointers
     if memcmp(&lib_pattern[0], &lib_pattern[0], 0x10) { print "LENHEX"; }
 }

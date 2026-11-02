@@ -84,9 +84,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let module_cookie = self.cookie_for_module_or_fallback(&compile_ctx.module_path);
         let module_cookie_value = self.context.i64_type().const_int(module_cookie, false);
         let pt_regs = self.get_pt_regs_parameter()?;
-        let raw_ip = self.load_dwarf_register_i64(X86_64_DWARF_RIP, pt_regs)?;
-        let initial_rsp = self.load_dwarf_register_i64(X86_64_DWARF_RSP, pt_regs)?;
-        let initial_rbp = self.load_dwarf_register_i64(X86_64_DWARF_RBP, pt_regs)?;
+        let raw_ip = self
+            .load_probe_register(ProbeRegister::Pc, pt_regs)?
+            .into_int_value();
+        let initial_rsp = self.load_dwarf_register_i64(DWARF_SP, pt_regs)?;
+        let initial_rbp = self.load_dwarf_register_i64(DWARF_FP, pt_regs)?;
+        let initial_lr = if TargetArch::current() == TargetArch::Aarch64 {
+            Some(self.load_dwarf_register_i64(DWARF_RA, pt_regs)?)
+        } else {
+            None
+        };
         let (module_bias, offsets_found) = self.generate_runtime_address_from_offsets(
             self.context.i64_type().const_zero(),
             0,
@@ -182,6 +189,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let runtime_row = self.runtime_row_from_static(row);
         let state = BtRegisterState {
+            link_register: initial_lr,
             ip: raw_ip,
             rsp: initial_rsp,
             rbp: initial_rbp,
@@ -280,7 +288,16 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             return Ok(());
         }
 
-        let prefix_depth = depth.min(BPF_INLINE_BACKTRACE_FRAME_LIMIT);
+        // ARM64 recovery also tracks the availability of the link register.
+        // Repeating runtime row lookups in conditional bt slots multiplies
+        // verifier states. Recover the interrupted frame here, then leave
+        // further lookups to the shared continuation program.
+        let prefix_limit = if TargetArch::current() == TargetArch::Aarch64 {
+            2
+        } else {
+            BPF_INLINE_BACKTRACE_FRAME_LIMIT
+        };
+        let prefix_depth = depth.min(prefix_limit);
         for frame_index in 2..prefix_depth {
             let current_ip = self.load_i64(ip_ptr, "bt_tail_prefix_lookup_ip")?;
             let current_module_bias =
@@ -333,6 +350,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
             self.builder.position_at_end(found_block);
             let state = BtRegisterState {
+                link_register: None,
                 ip: self.load_i64(ip_ptr, "bt_tail_prefix_current_ip")?,
                 rsp: self.load_i64(rsp_ptr, "bt_tail_prefix_current_rsp")?,
                 rbp: self.load_i64(rbp_ptr, "bt_tail_prefix_current_rbp")?,
@@ -1153,6 +1171,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         self.builder.position_at_end(row_found_block);
         let state = BtRegisterState {
+            link_register: None,
             ip: current_ip,
             rsp: current_rsp,
             rbp: current_rbp,

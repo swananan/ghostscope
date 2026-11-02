@@ -625,7 +625,10 @@ impl LoadedObjfile {
     fn validate_probe_advance(&self, start: u64, candidate: u64) -> Result<()> {
         let object = self._binary_mapped_file.parse_object()?;
         anyhow::ensure!(
-            object.architecture() == object::Architecture::X86_64,
+            matches!(
+                object.architecture(),
+                object::Architecture::X86_64 | object::Architecture::Aarch64
+            ) && object.is_little_endian(),
             "unsupported architecture for probe instruction decoding"
         );
         let size = candidate
@@ -634,7 +637,13 @@ impl LoadedObjfile {
         for section in object.sections() {
             if section.kind() == object::SectionKind::Text {
                 if let Some(code) = section.data_range(start, size)? {
-                    return Self::validate_linear_instructions(code, start);
+                    return match object.architecture() {
+                        object::Architecture::Aarch64 => {
+                            ghostscope_platform::aarch64::validate_probe_prefix(code, start)
+                                .map_err(Into::into)
+                        }
+                        _ => Self::validate_linear_instructions(code, start),
+                    };
                 }
             }
         }
@@ -669,6 +678,14 @@ impl LoadedObjfile {
         start: u64,
         end: u64,
     ) -> Result<bool> {
+        let architecture = self._binary_mapped_file.parse_object()?.architecture();
+        let x86_stack_abi = architecture == object::Architecture::X86_64;
+        let target_arch = match architecture {
+            object::Architecture::X86_64 => ghostscope_platform::TargetArch::X86_64,
+            object::Architecture::Aarch64 => ghostscope_platform::TargetArch::Aarch64,
+            _ => ghostscope_platform::TargetArch::Unknown,
+        };
+        let register_roles = target_arch.dwarf_register_roles();
         let dwarf = self.dwarf();
         let unit = self.unit(idx_entry.unit_offset)?;
         let entry = unit.entry(idx_entry.die_offset)?;
@@ -726,8 +743,9 @@ impl LoadedObjfile {
                     false
                 }
             };
-            let incoming_stack_offsets = (on_stack && scalar_layout && normal_calling_convention)
-                .then_some((sysv_stack_offset, parameter_index * 8));
+            let incoming_stack_offsets =
+                (x86_stack_abi && on_stack && scalar_layout && normal_calling_convention)
+                    .then_some((sysv_stack_offset, parameter_index * 8));
             if on_stack {
                 sysv_stack_offset += 8;
             }
@@ -743,6 +761,19 @@ impl LoadedObjfile {
                     unit.encoding(),
                     "parameter frame location",
                 )?;
+                // AAPCS64 parameters arrive in X0-X7 (or on the stack),
+                // never in callee-saved X19-X28. Fixed locations using those
+                // registers describe a copy made by the function prologue.
+                if architecture == object::Architecture::Aarch64
+                    && operations.iter().any(|op| {
+                        matches!(op,
+                        gimli::Operation::Register { register }
+                            | gimli::Operation::RegisterOffset { register, .. }
+                            if (19..=28).contains(&register.0))
+                    })
+                {
+                    return Ok(true);
+                }
                 let cfa_offset = match operations.as_slice() {
                     [gimli::Operation::FrameOffset { offset }] if frame_base_is_cfa => {
                         Some(*offset)
@@ -780,7 +811,8 @@ impl LoadedObjfile {
                     // an uninitialized register home slot for such a value.
                     // The frame base must also be valid at entry: Clang's
                     // fixed RBP frame base still needs its prologue setup.
-                    || (normal_calling_convention
+                    || (x86_stack_abi
+                        && normal_calling_convention
                         && frame_base_is_cfa
                         && matches!(abi_class, Some(ParameterAbiClass::StackAggregate))
                         && matches!(operations.as_slice(),
@@ -791,11 +823,8 @@ impl LoadedObjfile {
                             op,
                             gimli::Operation::FrameOffset { .. }
                                 | gimli::Operation::CallFrameCFA
-                                | gimli::Operation::RegisterOffset {
-                                    register: gimli::Register(6 | 7),
-                                    ..
-                                }
-                        )
+                        ) || matches!(op, gimli::Operation::RegisterOffset { register, .. }
+                            if register_roles.is_some_and(|roles| register.0 == roles.frame_pointer || register.0 == roles.stack_pointer))
                     })
                 {
                     return Ok(true);

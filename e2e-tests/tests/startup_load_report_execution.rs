@@ -428,7 +428,7 @@ async fn test_startup_report_shows_explicit_debug_file_failure() -> Result<()> {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn test_startup_rejects_aarch64_target() -> Result<()> {
+async fn test_startup_rejects_foreign_architecture_target() -> Result<()> {
     init();
 
     if !is_host_topology() {
@@ -438,14 +438,19 @@ async fn test_startup_rejects_aarch64_target() -> Result<()> {
 
     let fixture = ensure_startup_report_fixture()?;
     let temp_dir = TempDir::new().context("failed to create unsupported target temp dir")?;
-    let target = temp_dir.path().join("aarch64-target");
+    let target = temp_dir.path().join("foreign-architecture-target");
     let mut target_bytes = fs::read(&fixture.embedded_binary).with_context(|| {
         format!(
             "failed to read fixture binary {}",
             fixture.embedded_binary.display()
         )
     })?;
-    target_bytes[18..20].copy_from_slice(&183u16.to_le_bytes());
+    let foreign_machine: u16 = if cfg!(target_arch = "aarch64") {
+        62
+    } else {
+        183
+    };
+    target_bytes[18..20].copy_from_slice(&foreign_machine.to_le_bytes());
     fs::write(&target, target_bytes)
         .with_context(|| format!("failed to write unsupported target {}", target.display()))?;
 
@@ -453,12 +458,22 @@ async fn test_startup_rejects_aarch64_target() -> Result<()> {
 
     assert!(
         !run.status.success(),
-        "AArch64 target should fail before DWARF loading\n{}",
+        "Foreign-architecture target should fail before DWARF loading\n{}",
         run.output
     );
     assert_output_contains(&run.output, "unsupported target object");
-    assert_output_contains(&run.output, "expected 64-bit little-endian x86_64 ELF");
-    assert_output_contains(&run.output, "architecture=Aarch64");
+    assert_output_contains(
+        &run.output,
+        ghostscope_process::SUPPORTED_TARGET_DESCRIPTION,
+    );
+    assert_output_contains(
+        &run.output,
+        if cfg!(target_arch = "aarch64") {
+            "architecture=X86_64"
+        } else {
+            "architecture=Aarch64"
+        },
+    );
     assert!(
         !run.output.contains("DWARF ready:"),
         "unsupported target must not reach DWARF-ready state\n{}",

@@ -208,14 +208,6 @@ impl LoadedObjfile {
         }
     }
 
-    fn find_innermost_inline_node(func: &FunctionBlocks, pc: u64) -> Option<usize> {
-        let path = func.block_path_for_pc(pc);
-        path.iter()
-            .rev()
-            .find(|&&idx| func.nodes[idx].entry_pc.is_some())
-            .copied()
-    }
-
     fn ensure_block_index_for_address(&self, address: u64) {
         if self
             .block_index
@@ -333,11 +325,15 @@ impl LoadedObjfile {
             .find_function_by_pc(address)
             .cloned()?;
 
-        if let Some(inline_idx) = Self::find_innermost_inline_node(&func, address) {
-            if let Ok(unit) = self.unit(func.cu_offset) {
-                if let Some(off) = func.nodes[inline_idx].die_offset {
-                    if let Ok(entry) = unit.entry(off) {
-                        return Some(entry.tag() == gimli::constants::DW_TAG_inlined_subroutine);
+        // DW_AT_entry_pc is optional: a ranged inline DIE still establishes
+        // inline context. Inspect DIE tags along the active lexical path.
+        if let Ok(unit) = self.unit(func.cu_offset) {
+            for index in func.block_path_for_pc(address).iter().rev() {
+                if let Some(offset) = func.nodes[*index].die_offset {
+                    if let Ok(entry) = unit.entry(offset) {
+                        if entry.tag() == gimli::DW_TAG_inlined_subroutine {
+                            return Some(true);
+                        }
                     }
                 }
             }
@@ -529,11 +525,16 @@ impl LoadedObjfile {
         function_context: Option<&FunctionBlocks>,
         cfi_index: Option<&crate::index::CfiIndex>,
     ) -> Result<Vec<crate::parser::ParsedVariable>> {
+        use object::Object;
+        let arm64 = self
+            ._binary_mapped_file
+            .parse_object()
+            .is_ok_and(|object| object.architecture() == object::Architecture::Aarch64);
         let mut vars = Vec::with_capacity(items.len());
         for (object, cu_off, die_off, scope_depth) in items.iter().cloned() {
             let unit = self.unit_in(object, cu_off)?;
             let entry = unit.entry(die_off)?;
-            if let Some(v) = self.detailed_parser.parse_variable_entry_with_mode(
+            if let Some(mut v) = self.detailed_parser.parse_variable_entry_with_mode(
                 &entry,
                 &unit,
                 &self.dwarf,
@@ -543,6 +544,53 @@ impl LoadedObjfile {
                 cfi_index,
                 scope_depth,
             )? {
+                // AArch64 GCC can omit DW_AT_location for file-scope
+                // TLS definitions. Only an exact, defined STT_TLS symbol may
+                // supply the missing offset; never reinterpret ordinary locals.
+                if arm64
+                    && v.location == crate::VariableLocation::OptimizedOut
+                    && !v.is_parameter
+                    && resolve_attr_with_unit_origins(
+                        &self.dwarf,
+                        &entry,
+                        &unit,
+                        gimli::DW_AT_location,
+                    )?
+                    .is_none()
+                    && is_file_scope_variable(&unit, entry.offset())?
+                {
+                    let linkage = resolve_attr_with_unit_origins(
+                        &self.dwarf,
+                        &entry,
+                        &unit,
+                        gimli::DW_AT_linkage_name,
+                    )?
+                    .and_then(|value| self.dwarf.attr_string(&unit, value).ok())
+                    .and_then(|value| value.to_string().ok().map(|name| name.into_owned()));
+                    let external = resolve_attr_with_unit_origins(
+                        &self.dwarf,
+                        &entry,
+                        &unit,
+                        gimli::DW_AT_external,
+                    )? == Some(gimli::AttributeValue::Flag(true));
+                    let source = unit.name.as_ref().and_then(|name| name.to_string().ok());
+                    let source = if external {
+                        None
+                    } else {
+                        Some(source.as_deref().unwrap_or(""))
+                    };
+                    if let Some(offset) = tls_symbol_offset(
+                        self._binary_mapped_file.data.as_ref(),
+                        linkage.as_deref().unwrap_or(&v.name),
+                        source,
+                    ) {
+                        v.location = crate::VariableLocation::ComputedAddress(vec![
+                            crate::PlanExprOp::PushConstant(offset as i64),
+                            crate::PlanExprOp::FormTlsAddress,
+                        ]);
+                        v.availability = Availability::Available;
+                    }
+                }
                 vars.push(v);
             }
         }
@@ -1389,4 +1437,140 @@ mod tests {
         assert_eq!(resolved, None);
         assert_ne!(empty_struct_off, full_struct_off);
     }
+}
+
+fn tls_symbol_offset(data: &[u8], name: &str, source: Option<&str>) -> Option<u64> {
+    use object::{Object, ObjectSymbol};
+    let binary = object::File::parse(data).ok()?;
+    if binary.architecture() != object::Architecture::Aarch64 {
+        return None;
+    }
+    let mut found = None;
+    let mut file_matches = false;
+    for symbol in binary.symbols().chain(binary.dynamic_symbols()) {
+        if symbol.kind() == object::SymbolKind::File {
+            file_matches = source.is_some_and(|source| {
+                !source.is_empty()
+                    && symbol.name().ok().is_some_and(|name| {
+                        std::path::Path::new(name).file_name()
+                            == std::path::Path::new(source).file_name()
+                    })
+            });
+        }
+        if symbol.kind() == object::SymbolKind::Tls
+            && symbol.section_index().is_some()
+            && (if source.is_some() {
+                !symbol.is_global() && file_matches
+            } else {
+                symbol.is_global()
+            })
+            && symbol.name().ok() == Some(name)
+        {
+            if found.is_some_and(|offset| offset != symbol.address()) {
+                return None;
+            }
+            found = Some(symbol.address());
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod tls_symbol_tests {
+    use super::tls_symbol_offset;
+
+    #[test]
+    fn only_defined_external_tls_symbols_supply_missing_locations() {
+        use object::write::{Object, StandardSection, Symbol, SymbolSection};
+        let mut elf = Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::Aarch64,
+            object::Endianness::Little,
+        );
+        elf.add_symbol(Symbol {
+            name: b"worker.c".to_vec(),
+            value: 0,
+            size: 0,
+            kind: object::SymbolKind::File,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: SymbolSection::Absolute,
+            flags: object::SymbolFlags::None,
+        });
+        let tls = elf.section_id(StandardSection::Tls);
+        elf.append_section_data(tls, &[0; 32], 8);
+        for (name, kind, scope, section) in [
+            (
+                "worker_tls",
+                object::SymbolKind::Tls,
+                object::SymbolScope::Linkage,
+                SymbolSection::Section(tls),
+            ),
+            (
+                "local_tls",
+                object::SymbolKind::Tls,
+                object::SymbolScope::Compilation,
+                SymbolSection::Section(tls),
+            ),
+            (
+                "undefined_tls",
+                object::SymbolKind::Tls,
+                object::SymbolScope::Linkage,
+                SymbolSection::Undefined,
+            ),
+            (
+                "ordinary",
+                object::SymbolKind::Data,
+                object::SymbolScope::Linkage,
+                SymbolSection::Section(tls),
+            ),
+        ] {
+            elf.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: 8,
+                size: 8,
+                kind,
+                scope,
+                weak: false,
+                section,
+                flags: object::SymbolFlags::None,
+            });
+        }
+        let bytes = elf.write().unwrap();
+        assert_eq!(tls_symbol_offset(&bytes, "worker_tls", None), Some(8));
+        assert_eq!(
+            tls_symbol_offset(&bytes, "local_tls", Some("/src/worker.c")),
+            Some(8)
+        );
+        assert_eq!(
+            tls_symbol_offset(&bytes, "local_tls", Some("other.c")),
+            None
+        );
+        for name in ["local_tls", "undefined_tls", "ordinary", "missing"] {
+            assert_eq!(tls_symbol_offset(&bytes, name, None), None);
+        }
+    }
+}
+
+fn is_file_scope_variable(
+    unit: &gimli::Unit<crate::binary::DwarfReader>,
+    offset: gimli::UnitOffset,
+) -> gimli::Result<bool> {
+    let mut cursor = unit.entries();
+    let mut ancestors = Vec::new();
+    while let Some(entry) = cursor.next_dfs()? {
+        ancestors.truncate(entry.depth() as usize);
+        if entry.offset() == offset {
+            return Ok(!ancestors.iter().any(|tag| {
+                matches!(
+                    *tag,
+                    gimli::DW_TAG_subprogram
+                        | gimli::DW_TAG_inlined_subroutine
+                        | gimli::DW_TAG_lexical_block
+                )
+            }));
+        }
+        ancestors.push(entry.tag());
+    }
+    Ok(false)
 }

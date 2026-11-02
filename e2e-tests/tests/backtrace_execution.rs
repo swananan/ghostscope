@@ -152,6 +152,10 @@ async fn run_backtrace_binary_with_args_and_mapped_module(
         .timeout_secs(timeout_secs)
         .enable_sysmon_for_target(false)
         .with_cli_args(cli_args);
+    // ARM64 LR availability adds verifier paths to deep tail-call programs.
+    if cfg!(target_arch = "aarch64") {
+        runner = runner.startup_timeout_secs(60);
+    }
     if let Some(config_content) = config_content {
         runner = runner.with_config_content(config_content);
     }
@@ -603,7 +607,12 @@ async fn test_hot_backtrace_compact_unwind_rows_cover_call_sites() -> anyhow::Re
     let leaf = analyzer
         .lookup_function_address_by_name("hot_bt_leaf")
         .ok_or_else(|| anyhow::anyhow!("missing hot_bt_leaf function"))?;
-    let lookup_pc = leaf.address + 0x19;
+    let lookup_pc = leaf.address
+        + if cfg!(target_arch = "aarch64") {
+            0x18
+        } else {
+            0x19
+        };
     let ctx = analyzer.resolve_pc(&ModuleAddress::new(leaf.module_path, lookup_pc))?;
     let row = analyzer
         .compact_unwind_row_for_context(&ctx)?
@@ -616,16 +625,16 @@ async fn test_hot_backtrace_compact_unwind_rows_cover_call_sites() -> anyhow::Re
         matches!(
             row.cfa,
             CfaRulePlan::RegPlusOffset {
-                register: 7,
+                register,
                 offset: 32
-            }
+            } if register == if cfg!(target_arch = "aarch64") { 31 } else { 7 }
         ),
         "hot_bt_leaf call-site CFA should be rsp+32: {row:?}"
     );
     assert!(
         matches!(
             row.return_address,
-            RegisterRecoveryPlan::AtCfaOffset { offset: -8 }
+            RegisterRecoveryPlan::AtCfaOffset { offset } if offset == if cfg!(target_arch = "aarch64") { -32 } else { -8 }
         ),
         "hot_bt_leaf return address should be at CFA-8: {row:?}"
     );
@@ -642,16 +651,16 @@ async fn test_hot_backtrace_compact_unwind_rows_cover_call_sites() -> anyhow::Re
         matches!(
             row.cfa,
             CfaRulePlan::RegPlusOffset {
-                register: 7,
+                register,
                 offset: 240
-            }
+            } if register == if cfg!(target_arch = "aarch64") { 31 } else { 7 }
         ),
         "dummy_touch probe-site CFA should be rsp+240: {row:?}"
     );
     assert!(
         matches!(
             row.return_address,
-            RegisterRecoveryPlan::AtCfaOffset { offset: -8 }
+            RegisterRecoveryPlan::AtCfaOffset { offset } if offset == if cfg!(target_arch = "aarch64") { -16 } else { -8 }
         ),
         "dummy_touch return address should be at CFA-8: {row:?}"
     );
@@ -2029,6 +2038,7 @@ trace dlopen_main_callback {
     let trigger_for_callback = trigger_path.clone();
     let result = common::runner::GhostscopeRunner::new()
         .with_script(script)
+        .with_log_level("debug")
         .with_target(&binary_path)
         .timeout_secs(5)
         .with_cli_args([
@@ -2099,6 +2109,7 @@ trace dlopen_lib_leaf {
     let trigger_for_callback = trigger_path.clone();
     let result = common::runner::GhostscopeRunner::new()
         .with_script(script)
+        .with_log_level("debug")
         .with_target(&lib_path)
         .timeout_secs(5)
         .with_cli_args([

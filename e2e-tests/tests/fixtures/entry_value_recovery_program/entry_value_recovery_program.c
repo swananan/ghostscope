@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <unistd.h>
-
+#include "registers.h"
 struct EntryState {
     int total_bytes;
     int stream_id;
@@ -22,7 +22,7 @@ __attribute__((noinline)) static int wrapper_state(int seed, struct EntryState *
     if (after_call & 1) {
         after_call += state->stream_id;
     }
-    asm volatile("" ::: "rbx", "memory");
+    asm volatile("" ::: ENTRY_VALUE_CALLEE_SAVED_REGISTER, "memory");
     asm volatile("" : "+r"(after_call) :: "memory");
     return after_call;
 }
