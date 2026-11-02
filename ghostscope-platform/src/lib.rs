@@ -1,5 +1,8 @@
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-compile_error!("GhostScope runtime currently supports only Linux x86_64");
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+compile_error!("GhostScope runtime requires Linux x86_64 or AArch64");
 
 /// Platform-specific utilities for the GhostScope eBPF debugging tool
 ///
@@ -8,16 +11,26 @@ compile_error!("GhostScope runtime currently supports only Linux x86_64");
 /// - Calling convention analysis and parameter location detection
 /// - Function prologue analysis for accurate parameter access
 /// - Type definitions for cross-crate compatibility
+pub mod aarch64;
+pub mod architecture;
 pub mod calling_convention;
 pub mod register_mapping;
 pub mod tls;
 pub mod types;
 
+pub use architecture::{DwarfRegisterRoles, ProbeRegister, TargetArch};
+
 // Re-export key types and traits for convenience
-pub use calling_convention::{get_parameter_register_in_context, CallingConvention, X86_64SystemV};
+pub use calling_convention::{
+    get_parameter_register_for_target, get_parameter_register_in_context, Aarch64Aapcs,
+    CallingConvention, X86_64SystemV,
+};
 pub use register_mapping::{
     dwarf_reg_to_name, dwarf_reg_to_name_x86_64, dwarf_reg_to_pt_regs_byte_offset,
     dwarf_reg_to_pt_regs_byte_offset_x86_64, pt_regs_indices,
 };
-pub use tls::{current_task_fsbase_offset, static_tls_bias_for_elf, TlsLayoutError};
+pub use tls::{
+    current_task_fsbase_offset, current_task_thread_pointer_offset, static_tls_bias_for_elf,
+    TlsLayoutError,
+};
 pub use types::{CodeReader, PlatformError, SourceLocation};

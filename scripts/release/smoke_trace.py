@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Trace a real DWARF parameter with the packaged executable (requires BPF privileges)."""
+"""Trace DWARF values and validate probe PC/SP against real mappings (requires BPF privileges)."""
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -14,6 +15,7 @@ def smoke(binary):
         root = Path(tmp)
         source, target = root / "target.c", root / "target"
         source.write_text('''#include <unistd.h>
+volatile int release_global = 73;
 __attribute__((noinline)) void release_probe(int value) {
     asm volatile("" : : "r"(value) : "memory");
 }
@@ -30,17 +32,31 @@ int main(void) {
                 trace = subprocess.Popen([
                     str(binary), "-t", str(target), "-p", str(process.pid),
                     "--no-status", "--no-log", "--script",
-                    'trace release_probe { print "release-smoke {}", value; }',
+                    'trace release_probe { print "release-smoke {} {} pc={:p} sp={:p}", '
+                    'value, release_global, cast($pc, "unsigned char *"), '
+                    'cast($sp, "unsigned char *"); }',
                 ], cwd=root, stdout=stdout, stderr=stderr)
                 deadline = time.monotonic() + 60
                 while time.monotonic() < deadline:
-                    if "release-smoke 42" in output.read_text():
+                    match = re.search(r"release-smoke 42 73 pc=(0x[0-9a-fA-F]+) sp=(0x[0-9a-fA-F]+)", output.read_text())
+                    if match:
+                        pc, sp = (int(value, 16) for value in match.groups())
+                        mappings = Path(f"/proc/{process.pid}/maps").read_text().splitlines()
+                        pc_valid = sp_valid = False
+                        for mapping in mappings:
+                            fields = mapping.split(maxsplit=5)
+                            start, end = (int(value, 16) for value in fields[0].split("-"))
+                            name = fields[5] if len(fields) == 6 else ""
+                            pc_valid |= start <= pc < end and "x" in fields[1] and name == str(target)
+                            sp_valid |= start <= sp < end and name == "[stack]"
+                        if not pc_valid or not sp_valid:
+                            raise RuntimeError(f"probe registers do not match target mappings: pc={pc:#x}, sp={sp:#x}")
                         break
                     if trace.poll() is not None:
                         raise RuntimeError("tracer exited before receiving an event")
                     time.sleep(0.1)
                 else:
-                    raise RuntimeError("timed out waiting for DWARF parameter capture")
+                    raise RuntimeError("timed out waiting for DWARF values and probe registers")
                 trace.send_signal(signal.SIGINT)
                 if trace.wait(timeout=10) != 0:
                     raise RuntimeError("tracer failed during graceful shutdown")
@@ -54,7 +70,7 @@ int main(void) {
                 trace.wait()
             process.terminate()
             process.wait(timeout=10)
-        print("Release tracing smoke passed: captured release-smoke 42 and shut down cleanly")
+        print("Release tracing smoke passed: captured parameter 42, global 73, validated PC/SP, and shut down cleanly")
 
 
 if __name__ == "__main__":

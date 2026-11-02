@@ -279,6 +279,7 @@ pub fn init() {
         // Touch rarely-used symbols so they aren't considered dead code
         // in test binaries that don't exercise every helper.
         let _ = &COMPILE_COMPLEX_NOPIE;
+        let _new_fixtures: fn() -> TestFixtures = TestFixtures::new;
         let _use_method_ptr: fn(&TestFixtures) -> anyhow::Result<PathBuf> =
             TestFixtures::get_test_binary_complex_nopie;
         let _use_method_ptr2: fn(&TestFixtures, &str) -> anyhow::Result<PathBuf> =

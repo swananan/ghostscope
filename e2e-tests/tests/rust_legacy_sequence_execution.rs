@@ -44,9 +44,13 @@ async fn test_rust_135_sequence_family_values() -> anyhow::Result<()> {
     let script = r#"
 trace observe_legacy_sequences {
     print "R135_SLICE:{}:{}", slice, empty_slice;
-    print "R135_VEC:{}:{}:{}", vector, empty_vector, unit_vector;
-    print "R135_DEQUE:{}:{}:{}:{}", wrapped, contiguous, empty_deque, unit_deque;
+    print "R135_VEC:{}:{}", vector, empty_vector;
+    print "R135_DEQUE:{}:{}", wrapped, contiguous;
     print "R135_DEQUE_RAW:{:x}", wrapped;
+}
+trace observe_legacy_empty_and_unit_sequences {
+    print "R135_EMPTY_DEQUE:{}", empty_deque;
+    print "R135_UNITS:{}:{}", unit_vector, unit_deque;
 }
 "#;
     let result = common::runner::GhostscopeRunner::new()
@@ -68,8 +72,10 @@ mem_dump_cap = 256
     assert_eq!(exit_code, 0, "stderr={stderr} stdout={stdout}");
     for expected in [
         "R135_SLICE:[-3, 5, 8]:[]",
-        "R135_VEC:[10, -20, 30]:[]:[(), (), ()]",
-        "R135_DEQUE:[3, 4, 5, 6, 7, 8]:[7, 8, 9]:[]:[(), (), ()]",
+        "R135_VEC:[10, -20, 30]:[]",
+        "R135_DEQUE:[3, 4, 5, 6, 7, 8]:[7, 8, 9]",
+        "R135_EMPTY_DEQUE:[]",
+        "R135_UNITS:[(), (), ()]:[(), (), ()]",
         concat!(
             "R135_DEQUE_RAW:",
             "03 00 00 00 04 00 00 00 05 00 00 00 ",

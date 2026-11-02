@@ -110,24 +110,7 @@ pub struct RuntimeCapabilities {
     pub arch: TargetArch,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TargetArch {
-    X86_64,
-    Aarch64,
-    Unknown,
-}
-
-impl TargetArch {
-    pub fn current() -> Self {
-        if cfg!(target_arch = "x86_64") {
-            Self::X86_64
-        } else if cfg!(target_arch = "aarch64") {
-            Self::Aarch64
-        } else {
-            Self::Unknown
-        }
-    }
-}
+pub use ghostscope_platform::TargetArch;
 
 impl Default for RuntimeCapabilities {
     fn default() -> Self {

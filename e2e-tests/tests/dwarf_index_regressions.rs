@@ -9,7 +9,7 @@ use gimli::write::{
 use gimli::Reader;
 use gimli::{Format, LineEncoding, SectionId};
 use object::{Object, ObjectSection, ObjectSymbol};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1378,7 +1378,7 @@ fn duplicate_line_row_address_for_source_line(
     binary_path: &Path,
     source_basename: &str,
     target_line: u64,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<(u64, u64)> {
     let dwarf = load_dwarf_from_binary(binary_path)?;
     let mut rows_by_address: HashMap<u64, Vec<u64>> = HashMap::new();
     let mut units = dwarf.units();
@@ -1420,19 +1420,29 @@ fn duplicate_line_row_address_for_source_line(
         }
     }
 
+    // Optimization changes which source lines share a PC across targets.
+    // Keep the collision requirement, preferring the historical line when it
+    // exists and otherwise choosing another genuine same-PC line pair.
     rows_by_address
         .into_iter()
-        .filter(|(_, lines)| {
-            lines.contains(&target_line) && lines.iter().any(|line| *line != target_line)
+        .filter_map(|(address, lines)| {
+            let distinct: BTreeSet<_> = lines.into_iter().collect();
+            if distinct.len() < 2 {
+                return None;
+            }
+            let line = if distinct.contains(&target_line) {
+                target_line
+            } else {
+                *distinct.first()?
+            };
+            Some((address, line))
         })
-        .map(|(address, _)| address)
-        .min()
+        .min_by_key(|(address, line)| (*line != target_line, *address, *line))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "{} has no same-PC line rows for {}:{}",
+                "{} has no same-PC line rows for {}",
                 binary_path.display(),
-                source_basename,
-                target_line
+                source_basename
             )
         })
 }
@@ -2018,15 +2028,15 @@ async fn test_source_line_query_preserves_same_pc_line_candidate() -> anyhow::Re
 
     let binary_path =
         FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::O3)?;
-    let duplicate_pc = duplicate_line_row_address_for_source_line(
+    let (duplicate_pc, duplicate_line) = duplicate_line_row_address_for_source_line(
         &binary_path,
         "complex_types_program.c",
         u64::from(COMPLEX_DUPLICATE_PC_LINE),
     )?;
 
+    let duplicate_line = u32::try_from(duplicate_line)?;
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
-    let addrs = analyzer
-        .lookup_addresses_by_source_line("complex_types_program.c", COMPLEX_DUPLICATE_PC_LINE);
+    let addrs = analyzer.lookup_addresses_by_source_line("complex_types_program.c", duplicate_line);
     assert!(
         addrs
             .iter()
@@ -2034,15 +2044,15 @@ async fn test_source_line_query_preserves_same_pc_line_candidate() -> anyhow::Re
         "Expected source-line lookup to include duplicate-PC row 0x{duplicate_pc:x}. Results: {addrs:?}"
     );
 
-    let query_results = analyzer
-        .query_source_line_best_effort("complex_types_program.c", COMPLEX_DUPLICATE_PC_LINE)?;
+    let query_results =
+        analyzer.query_source_line_best_effort("complex_types_program.c", duplicate_line)?;
     assert!(
         query_results.iter().any(|result| {
             result.module_path == binary_path
                 && result.address == duplicate_pc
-                && result.source_line == Some(COMPLEX_DUPLICATE_PC_LINE)
+                && result.source_line == Some(duplicate_line)
         }),
-        "Expected source-line query to keep requested line {COMPLEX_DUPLICATE_PC_LINE} at duplicate PC 0x{duplicate_pc:x}. Results: {query_results:?}"
+        "Expected source-line query to keep requested line {duplicate_line} at duplicate PC 0x{duplicate_pc:x}. Results: {query_results:?}"
     );
 
     Ok(())

@@ -91,7 +91,7 @@ __attribute__((noinline)) static int trace_shadowed_state(int seed) {
     int total = state;
     {
         int state __attribute__((unused));
-        asm volatile("" : : : "memory");
+        asm volatile("nop" : : : "memory");
         total += seed;
     }
     asm volatile("" : "+r"(total) : : "memory");

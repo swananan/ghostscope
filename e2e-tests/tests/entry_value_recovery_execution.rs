@@ -1,4 +1,10 @@
 mod common;
+const CALLEE_SAVED_REGISTER: u16 = if cfg!(target_arch = "aarch64") { 19 } else { 3 };
+const RETURN_ADDRESS_REGISTER: u16 = if cfg!(target_arch = "aarch64") {
+    30
+} else {
+    16
+};
 
 use anyhow::Context;
 use common::{
@@ -268,7 +274,12 @@ fn write_synthetic_entry_value_breg_sections(
     );
     payload.set(constants::DW_AT_type, WriteAttributeValue::UnitRef(int_id));
     let mut inner = WriteExpression::new();
-    inner.op_breg(Register(7), 8);
+    let (sp, offset) = if cfg!(target_arch = "aarch64") {
+        (31, 0)
+    } else {
+        (7, 8)
+    };
+    inner.op_breg(Register(sp), offset);
     let mut location = WriteExpression::new();
     location.op_entry_value(inner);
     payload.set(
@@ -340,7 +351,8 @@ fn ensure_debug_dump_contains_breg_entry_value(debug_file: &Path) -> anyhow::Res
             && stdout.contains("payload")
             && (stdout.contains("contents 0x7708")
                 || stdout.contains("DW_OP_breg7")
-                || stdout.contains("DW_OP_breg7 8")),
+                || stdout.contains("DW_OP_breg7 8")
+                || stdout.contains("DW_OP_breg31")),
         "synthetic debug file did not contain the expected entry_value(breg7) expression:\n{stdout}"
     );
     Ok(())
@@ -953,16 +965,16 @@ async fn test_recover_caller_frame_exposes_pc_and_callee_saved_steps() -> anyhow
     );
 
     let recovery_by_address = analyzer
-        .recover_caller_frame(&addrs[0], &[3, 16])?
+        .recover_caller_frame(&addrs[0], &[CALLEE_SAVED_REGISTER, RETURN_ADDRESS_REGISTER])?
         .ok_or_else(|| anyhow::anyhow!("no caller-frame recovery returned"))?;
     let ctx = analyzer.resolve_pc(&addrs[0])?;
     let recovery = analyzer
-        .recover_caller_frame_for_context(&ctx, &[3, 16])?
+        .recover_caller_frame_for_context(&ctx, &[CALLEE_SAVED_REGISTER, RETURN_ADDRESS_REGISTER])?
         .ok_or_else(|| anyhow::anyhow!("no caller-frame recovery returned from PC context"))?;
 
     assert_eq!(recovery, recovery_by_address);
 
-    assert_eq!(recovery.return_address_register, 16);
+    assert_eq!(recovery.return_address_register, RETURN_ADDRESS_REGISTER);
     assert!(
         recovery.caller_pc_steps.iter().any(|step| matches!(
             step,
@@ -983,7 +995,7 @@ async fn test_recover_caller_frame_exposes_pc_and_callee_saved_steps() -> anyhow
     );
     let rbx_steps = recovery
         .register_recovery_steps
-        .get(&3)
+        .get(&CALLEE_SAVED_REGISTER)
         .ok_or_else(|| anyhow::anyhow!("missing rbx recovery steps"))?;
     assert!(
         rbx_steps.iter().any(|step| matches!(
@@ -1047,7 +1059,7 @@ async fn test_compact_unwind_table_exposes_pc_row() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no direct compact unwind row for PC context"))?;
     assert_eq!(&row_by_context, row);
     assert_eq!(row.module, ctx.module);
-    assert_eq!(row.return_address_register, 16);
+    assert_eq!(row.return_address_register, RETURN_ADDRESS_REGISTER);
     assert!(matches!(
         row.cfa,
         CfaRulePlan::RegPlusOffset { .. } | CfaRulePlan::Expression { .. }

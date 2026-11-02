@@ -7,6 +7,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         state: BtRegisterState<'ctx>,
         scratch: &BtScratch<'ctx>,
     ) -> Result<BtNextFrame<'ctx>> {
+        let ra_kind = self
+            .builder
+            .build_and(
+                row.ra_kind,
+                self.context.i8_type().const_int(
+                    u64::from(!ghostscope_protocol::BACKTRACE_RECOVERY_SIGNED_RA),
+                    false,
+                ),
+                "bt_ra_recovery_kind",
+            )
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let current_fn = self.current_function("recover next backtrace frame")?;
         let terminal_block = self
             .context
@@ -16,7 +27,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .context
             .append_basic_block(current_fn, "bt_ra_recovery_join");
         let ra_is_undefined = self.is_recovery_kind(
-            row.ra_kind,
+            ra_kind,
             crate::BACKTRACE_RECOVERY_UNDEFINED,
             "bt_ra_undefined_kind",
         )?;
@@ -49,7 +60,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         let ra_uses_memory = self.is_recovery_kind(
-            row.ra_kind,
+            ra_kind,
             crate::BACKTRACE_RECOVERY_AT_CFA_OFFSET,
             "bt_ra_at_kind",
         )?;
@@ -59,17 +70,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let ra_from_register = self.select_register_state(row.ra_register, state, "bt_ra_reg")?;
         let ra_is_val = self.is_recovery_kind(
-            row.ra_kind,
+            ra_kind,
             crate::BACKTRACE_RECOVERY_VAL_CFA_OFFSET,
             "bt_ra_val_kind",
         )?;
         let ra_is_register = self.is_recovery_kind(
-            row.ra_kind,
+            ra_kind,
             crate::BACKTRACE_RECOVERY_REGISTER,
             "bt_ra_reg_kind",
         )?;
         let ra_is_same = self.is_recovery_kind(
-            row.ra_kind,
+            ra_kind,
             crate::BACKTRACE_RECOVERY_SAME_VALUE,
             "bt_ra_same_kind",
         )?;
@@ -156,6 +167,45 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             (&ra_from_non_memory, ra_non_memory_block),
         ]);
         let next_ip = next_ip.as_basic_value().into_int_value();
+        let next_ip =
+            if let Some(mask) = ghostscope_platform::aarch64::native_instruction_address_mask() {
+                // Keep this branchless: signed rows clear PAC bits; unsigned rows
+                // preserve all bits, including malformed addresses for validation.
+                let signed = self
+                    .builder
+                    .build_right_shift(
+                        row.ra_kind,
+                        self.context.i8_type().const_int(7, false),
+                        false,
+                        "bt_ra_signed",
+                    )
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                let signed = self
+                    .builder
+                    .build_int_z_extend(signed, self.context.i64_type(), "bt_ra_signed_i64")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                let signed = self
+                    .builder
+                    .build_int_neg(signed, "bt_ra_signed_bits")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                let bits = self
+                    .builder
+                    .build_and(
+                        signed,
+                        self.context.i64_type().const_int(!mask, false),
+                        "bt_pac_bits",
+                    )
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                let keep = self
+                    .builder
+                    .build_not(bits, "bt_keep_address_bits")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+                self.builder
+                    .build_and(next_ip, keep, "bt_unsigned_return_address")
+                    .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
+            } else {
+                next_ip
+            };
         let next_rbp = self.recover_rbp_from_runtime_row(row, cfa, state, scratch)?;
         let error_code = self.load_i16(scratch.next_error_code_ptr, "bt_next_error_code_value")?;
         // This recovery is inlined for every captured frame. Keep availability
@@ -598,9 +648,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_int_compare(
                 inkwell::IntPredicate::EQ,
                 register,
-                self.context
-                    .i16_type()
-                    .const_int(X86_64_DWARF_RBP as u64, false),
+                self.context.i16_type().const_int(DWARF_FP as u64, false),
                 &format!("{name}_is_rbp"),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
@@ -609,9 +657,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .build_int_compare(
                 inkwell::IntPredicate::EQ,
                 register,
-                self.context
-                    .i16_type()
-                    .const_int(X86_64_DWARF_RIP as u64, false),
+                self.context.i16_type().const_int(DWARF_RA as u64, false),
                 &format!("{name}_is_rip"),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
@@ -628,7 +674,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_select::<BasicValueEnum<'ctx>, _>(
                 is_rip,
-                state.ip.into(),
+                state.link_register.unwrap_or(state.ip).into(),
                 rbp_or_rsp.into(),
                 name,
             )
@@ -642,22 +688,70 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         state: BtRegisterState<'ctx>,
         name: &str,
     ) -> Result<IntValue<'ctx>> {
+        if TargetArch::current() == TargetArch::Aarch64 {
+            // Encode availability as bits rather than nested selects. LLVM lowers
+            // the latter to BPF branches, multiplying verifier states when a
+            // program contains multiple deep backtraces.
+            let ty = self.context.i64_type();
+            let fp = self
+                .builder
+                .build_int_z_extend(state.rbp_available, ty, "bt_fp_available_bit")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let fp = self
+                .builder
+                .build_left_shift(
+                    fp,
+                    ty.const_int(DWARF_FP as u64, false),
+                    "bt_fp_available_mask",
+                )
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let fixed = (1u64 << DWARF_SP)
+                | if state.link_register.is_some() {
+                    1u64 << DWARF_RA
+                } else {
+                    0
+                };
+            let mask = self
+                .builder
+                .build_or(fp, ty.const_int(fixed, false), "bt_available_mask")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let register = self
+                .builder
+                .build_int_z_extend(register, ty, "bt_available_register")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            // All accepted AArch64 recovery registers are below 32. Bound the
+            // shift explicitly so LLVM and BPF agree for every map value.
+            let shift = self
+                .builder
+                .build_and(register, ty.const_int(63, false), "bt_available_shift")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            let bit = self
+                .builder
+                .build_right_shift(mask, shift, false, "bt_available_bit")
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+            return self
+                .builder
+                .build_int_truncate(bit, self.context.bool_type(), name)
+                .map_err(|e| CodeGenError::LLVMError(e.to_string()));
+        }
         let is_rbp = self
             .builder
             .build_int_compare(
                 inkwell::IntPredicate::EQ,
                 register,
-                self.context
-                    .i16_type()
-                    .const_int(X86_64_DWARF_RBP as u64, false),
+                self.context.i16_type().const_int(DWARF_FP as u64, false),
                 &format!("{name}_is_rbp"),
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        // The semantic fast-path plan already excludes unknown registers.
+        // Keep x86's original branchless availability expression: adding
+        // runtime conditions here multiplies verifier work for deep traces.
+        let other_available = self.context.bool_type().const_all_ones();
         self.builder
             .build_select::<BasicValueEnum<'ctx>, _>(
                 is_rbp,
                 state.rbp_available.into(),
-                self.context.bool_type().const_all_ones().into(),
+                other_available.into(),
                 name,
             )
             .map(|value| value.into_int_value())

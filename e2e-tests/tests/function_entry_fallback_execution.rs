@@ -133,7 +133,11 @@ fn add_dwarf(binary: &Path, language: gimli::DwLang) -> anyhow::Result<()> {
             gimli::DW_TAG_formal_parameter,
             "x",
             int,
-            Some(register_location(5)),
+            Some(register_location(if cfg!(target_arch = "aarch64") {
+                0
+            } else {
+                5
+            })),
         );
         let mut spill = Expression::new();
         spill.op_fbreg(-16);
@@ -171,7 +175,11 @@ fn add_dwarf(binary: &Path, language: gimli::DwLang) -> anyhow::Result<()> {
         gimli::DW_TAG_formal_parameter,
         "this",
         pointer,
-        Some(register_location(5)),
+        Some(register_location(if cfg!(target_arch = "aarch64") {
+            0
+        } else {
+            5
+        })),
     );
     if language == gimli::DW_LANG_C_plus_plus_14 {
         unit.get_mut(outer)
@@ -193,7 +201,14 @@ fn add_dwarf(binary: &Path, language: gimli::DwLang) -> anyhow::Result<()> {
         // Invalid bytecode must exercise the diagnostic path, independently
         // of a binding that was successfully parsed as optimized out.
         ("inline_diagnostic", Some(Expression::raw(vec![0xff]))),
-        ("inline_readable", Some(register_location(4))),
+        (
+            "inline_readable",
+            Some(register_location(if cfg!(target_arch = "aarch64") {
+                1
+            } else {
+                4
+            })),
+        ),
     ] {
         let origin = unit.add(root, gimli::DW_TAG_subprogram);
         unit.get_mut(origin)
@@ -346,6 +361,17 @@ finish outer_receiver
 .section .note.GNU-stack,"",@progbits
 "#,
     )?;
+    if cfg!(target_arch = "aarch64") {
+        let source = fs::read_to_string(&assembly)?
+            .replace("@function", "%function").replace("@progbits", "%progbits")
+            .replace("test %edi, %edi\njns 1f", "tbz w0, #31, 1f")
+            .replace("jmp 1f", "b 1f")
+            .replace("mov %edi, %eax", "nop")
+            .replace("sub $8, %rsp\n.cfi_adjust_cfa_offset 8\ncall guard_clobber\nadd $8, %rsp\n.cfi_adjust_cfa_offset -8",
+                "sub sp, sp, #16\n.cfi_def_cfa_offset 16\nstr x30, [sp]\n.cfi_offset 30, -16\nbl guard_clobber\nldr x30, [sp], #16\n.cfi_def_cfa_offset 0\n.cfi_restore 30")
+            .replace("mov $101, %edi", "mov w0, #101");
+        fs::write(&assembly, source)?;
+    }
     run(Command::new("cc")
         .args(["-g0", "-O2", "-no-pie", "-o"])
         .arg(&binary)
@@ -422,11 +448,18 @@ async fn test_function_entry_fallback_rejects_control_flow_but_allows_linear_set
             );
         }
     }
-    for flow in ["ConditionalBranch", "UnconditionalBranch", "Call", "Return"] {
+    if cfg!(target_arch = "aarch64") {
         assert!(
-            file_log.contains(&format!("control-flow instruction {flow}")),
+            file_log.contains("unsupported A64 instruction"),
             "{file_log}"
         );
+    } else {
+        for flow in ["ConditionalBranch", "UnconditionalBranch", "Call", "Return"] {
+            assert!(
+                file_log.contains(&format!("control-flow instruction {flow}")),
+                "{file_log}"
+            );
+        }
     }
     Ok(())
 }

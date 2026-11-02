@@ -8,7 +8,7 @@ GhostScope 把运行中程序的机器状态转换为源码感知的观测结果
 
 ## 支持范围
 
-- 官方发布产物和正确性测试面向 Linux x86_64。运行时构建会拒绝其他构建目标，trace setup 也会拒绝不是 64 位小端 x86_64 ELF 的目标文件。
+- 官方发布产物面向 Linux x86_64。允许实验性的 Linux AArch64 源码构建，支持 DWARF backtrace 和主可执行文件静态 TLS；trace setup 只接受与运行时架构一致的 64 位小端 ELF。
 - 源码级值依赖与目标模块对应的 DWARF。内嵌 DWARF 直接来自目标模块；独立调试文件默认严格检查可用的 `.gnu_debuglink` CRC 和 Build ID 证据。
 - C 语言的端到端覆盖最完整。C++ 仍主要按 DWARF 布局访问；Rust 则在
   验证目标 DWARF 后，为部分标准库类型提供语义适配。当前覆盖范围见
@@ -32,7 +32,7 @@ GhostScope 依赖 Linux 内核、eBPF verifier 和 helper、目标模块及编�
 
 **保证。** 官方构建和正确性声明的范围是 Linux x86_64。
 
-**保证机制。** platform crate 使用 Linux x86_64 编译期守卫，使运行时构建在其他目标上失败；安装器拒绝不支持的主机或请求架构；trace setup 在语义解释前验证 `-t` 目标、`-p` 进程可执行文件和实际加载的 DWARF 模块。发布产物按 x86_64 构建和命名，架构相关的寄存器、ABI、TLS 与 unwind 行为也在该环境中验证。
+**保证机制。** platform crate 允许 Linux x86_64 和实验性 AArch64 构建，两者按各自 ABI 生成 backtrace 和主可执行文件静态 TLS 访问代码；安装器拒绝不支持的主机或请求架构；trace setup 在语义解释前验证 `-t` 目标、`-p` 进程可执行文件和实际加载的 DWARF 模块。发布产物按 x86_64 构建和命名，架构相关的寄存器、ABI、TLS 与 unwind 行为也在该环境中验证。
 
 **失败边界。** 不支持的主机无法构建或安装；不支持的目标文件会在 DWARF 解释或 uprobe 附加之前让 setup 失败。在完成平台映射和端到端测试之前，其他架构不能被描述为已支持。
 

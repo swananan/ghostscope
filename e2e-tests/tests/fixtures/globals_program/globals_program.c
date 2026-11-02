@@ -28,7 +28,7 @@ __attribute__((noinline)) static void tick_once(int i) {
     const char* volatile lm = lib_message;
     char* volatile gb = g_bss_buffer;
     char* volatile lb = lib_bss;
-    // mutate executable globals
+    asm volatile("nop" ::: "memory"); // aliases initialized; once-per-tick trace point
     g_counter += 1;
     s_internal += 2; module_duplicate_counter += 11;
     s_bss_counter += 3;

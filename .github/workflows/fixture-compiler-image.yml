@@ -32,7 +32,7 @@ jobs:
         with:
           images: ghcr.io/swananan/ghostscope-fixture-compiler
           tags: |
-            type=raw,value=ubuntu24.04-clang18-rust1.88
+            type=raw,value=ubuntu24.04-clang18-rust1.98
             type=sha
 
       - name: Build and push
@@ -43,6 +43,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           cache-from: type=gha,scope=fixture-compiler
           cache-to: type=gha,mode=max,scope=fixture-compiler

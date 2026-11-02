@@ -16,7 +16,7 @@ uprobe 和 GDB 都会在目标进程中安装基于断点的探测机制，同�
 GhostScope 的脚本和编译器能力面只用于观测，不提供主动修改应用可见状态、变量值或控制流的操作。但这不代表目标完全不受影响：uprobe 会安装 trap 点，每次命中都会让目标线程同步承担 uprobe 和 eBPF 执行。
 
 ### 4. 平台与架构支持
-官方构建和正确性测试目前只支持 **Linux x86_64 (AMD64)**。GhostScope 依赖 Linux **eBPF** 和 **uprobe**，并且当前实现的是 x86_64 寄存器、ABI、TLS 和 unwind 行为。运行时构建会在其他构建目标上失败，安装器会拒绝非 Linux 系统和其他架构，trace setup 也会拒绝不是 64 位小端 x86_64 ELF 的目标文件。
+官方构建仍面向 **Linux x86_64 (AMD64)**。Linux AArch64 源码构建处于实验阶段，支持 DWARF `bt`/`backtrace` 和主可执行文件的静态 TLS。两种架构均运行完整标准 e2e；共享库/动态 TLS 仍不支持。安装器和发布产物仍仅支持 x86_64。trace setup 要求目标为与运行时架构一致的 64 位小端 ELF，拒绝跨架构 tracing。
 
 ## 软性限制
 
@@ -60,7 +60,7 @@ GhostScope 优先使用 RingBuf，并在需要时回退到 PerfEventArray。事�
 ### 5. DWARF 支持范围
 主要测试和验证了 DWARF 5 格式。理论上支持 DWARF 2-5，但其他版本可能存在兼容性问题。部分 DWARF 表达式指令暂不支持转换为 eBPF（纯实现还没有支持的原因），遇到时会给出明确的错误提示。
 
-GhostScope 能识别 `DW_OP_form_tls_address`，但运行时 TLS 地址解析目前只支持 x86_64 可执行文件里的 static TLS。GhostScope 会在探针触发时解析当前线程的 TLS 基址，因此在这个已支持的可执行文件场景下，同一个 trace 在不同 pthread 上会读取各自线程的 TLS 实例。同一个 DWARF 操作也会用于 dynamic/shared-library TLS；这类场景需要 DTV/module TLS lookup，目前尚未建模，所以 GhostScope 会拒绝共享对象里的 TLS，而不是猜测地址。
+GhostScope 能识别 `DW_OP_form_tls_address`，但运行时 TLS 地址解析目前支持 x86_64 和 AArch64 可执行文件里的 static TLS。GhostScope 会在探针触发时解析当前线程的 TLS 基址，因此在这个已支持的可执行文件场景下，同一个 trace 在不同 pthread 上会读取各自线程的 TLS 实例。同一个 DWARF 操作也会用于 dynamic/shared-library TLS；这类场景需要 DTV/module TLS lookup，目前尚未建模，所以 GhostScope 会拒绝共享对象里的 TLS，而不是猜测地址。
 
 GhostScope 默认严格检查独立调试文件所有可用的 `.gnu_debuglink` CRC 和可比较 Build ID。启用 `--allow-loose-debug-match` 后，可以在 warning 提示下使用不匹配的调试文件，但这会削弱源码语义所依赖的证据保证。显式指定的调试文件如果既没有可用 CRC，也没有可比较的 Build ID，同样会在 warning 后继续使用，但此时文件身份属于用户提供的信任假设，而不是经过验证的匹配。
 
@@ -115,3 +115,7 @@ setup 可能在运行时 map-change 监控有机会刷新之前失败。这主�
 ### 11. 观测一致性
 
 一个 trace 事件不是整个进程的原子快照。寄存器值和当前线程栈帧对应 uprobe 命中时刻，但 GhostScope 依次读取多个字段期间，其他线程仍可能修改共享内存。因此，同一个事件中的多个值可能来自一个很短的观测区间，而不是经过全局同步的同一瞬间。
+
+ARM64 CI 使用原生 ARM64 内核，覆盖基本参数/全局变量、PC/SP、O0/O2、
+PIE/非 PIE、PID/路径附加、perf-event-array，以及 host 到私有容器的跟踪。
+ARM64 job 运行完整 e2e，包括带 PAC 签名返回地址的 backtrace、多线程 TLS 和 Rust 编译器版本矩阵。具体命令和范围见 [开发文档](../development.md#arm64-ci-coverage)。

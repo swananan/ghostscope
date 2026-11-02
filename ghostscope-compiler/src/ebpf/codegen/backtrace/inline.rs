@@ -78,7 +78,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let module_cookie = self.cookie_for_module_or_fallback(&compile_ctx.module_path);
         let module_cookie_value = self.context.i64_type().const_int(module_cookie, false);
         let pt_regs = self.get_pt_regs_parameter()?;
-        let raw_ip = self.load_dwarf_register_i64(X86_64_DWARF_RIP, pt_regs)?;
+        let raw_ip = self
+            .load_probe_register(ProbeRegister::Pc, pt_regs)?
+            .into_int_value();
         let (module_bias, offsets_found) = self.generate_runtime_address_from_offsets(
             self.context.i64_type().const_zero(),
             0,
@@ -137,8 +139,13 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_store(ip_ptr, raw_ip)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let initial_rsp = self.load_dwarf_register_i64(X86_64_DWARF_RSP, pt_regs)?;
-        let initial_rbp = self.load_dwarf_register_i64(X86_64_DWARF_RBP, pt_regs)?;
+        let initial_rsp = self.load_dwarf_register_i64(DWARF_SP, pt_regs)?;
+        let initial_rbp = self.load_dwarf_register_i64(DWARF_FP, pt_regs)?;
+        let initial_lr = if TargetArch::current() == TargetArch::Aarch64 {
+            Some(self.load_dwarf_register_i64(DWARF_RA, pt_regs)?)
+        } else {
+            None
+        };
         self.builder
             .build_store(rsp_ptr, initial_rsp)
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
@@ -160,6 +167,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let runtime_row = self.runtime_row_from_static(row);
         let state = BtRegisterState {
+            link_register: initial_lr,
             ip: self.load_i64(ip_ptr, "bt_initial_current_ip")?,
             rsp: self.load_i64(rsp_ptr, "bt_initial_current_rsp")?,
             rbp: self.load_i64(rbp_ptr, "bt_initial_current_rbp")?,
@@ -318,6 +326,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
                 self.builder.position_at_end(found_block);
                 let state = BtRegisterState {
+                    link_register: None,
                     ip: self.load_i64(ip_ptr, "bt_current_ip")?,
                     rsp: self.load_i64(rsp_ptr, "bt_current_rsp")?,
                     rbp: self.load_i64(rbp_ptr, "bt_current_rbp")?,

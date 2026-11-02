@@ -8,9 +8,15 @@ use std::path::PathBuf;
 
 use plan::{BacktraceEmitMode, BacktraceInstructionPlan, BPF_INLINE_BACKTRACE_FRAME_LIMIT};
 
-const X86_64_DWARF_RIP: u16 = 16;
-const X86_64_DWARF_RBP: u16 = 6;
-const X86_64_DWARF_RSP: u16 = 7;
+use ghostscope_platform::{ProbeRegister, TargetArch};
+const NATIVE_REGISTERS: ghostscope_platform::architecture::DwarfRegisterRoles =
+    match TargetArch::current().dwarf_register_roles() {
+        Some(roles) => roles,
+        None => panic!("unsupported backtrace architecture"),
+    };
+const DWARF_FP: u16 = NATIVE_REGISTERS.frame_pointer;
+const DWARF_SP: u16 = NATIVE_REGISTERS.stack_pointer;
+const DWARF_RA: u16 = NATIVE_REGISTERS.return_address;
 const BPF_BACKTRACE_FRAMES_PER_TAIL_CALL: u8 = 4;
 const BPF_BACKTRACE_MAX_STEP_INVOCATIONS: u8 = 32;
 const BPF_BACKTRACE_STEP_PROG_INDEX: u32 = 0;
@@ -74,6 +80,9 @@ struct BtScratch<'ctx> {
 
 #[derive(Clone, Copy)]
 struct BtRegisterState<'ctx> {
+    // Only the interrupted frame has a live link register. After unwinding,
+    // a caller must recover its own return address from CFI, not reuse this LR.
+    link_register: Option<IntValue<'ctx>>,
     ip: IntValue<'ctx>,
     rsp: IntValue<'ctx>,
     rbp: IntValue<'ctx>,
@@ -177,19 +186,20 @@ mod tests {
         let row = RuntimeBtUnwindRow {
             found: context.bool_type().const_all_ones(),
             unsupported: context.bool_type().const_zero(),
-            cfa_register: i16_type.const_int(X86_64_DWARF_RBP as u64, false),
+            cfa_register: i16_type.const_int(DWARF_FP as u64, false),
             cfa_offset: i64_type.const_int(8, false),
             ra_kind: function
                 .get_nth_param(0)
                 .expect("RA kind parameter")
                 .into_int_value(),
-            ra_register: i16_type.const_int(X86_64_DWARF_RBP as u64, false),
+            ra_register: i16_type.const_int(DWARF_FP as u64, false),
             ra_offset: i64_type.const_int(u64::MAX, false),
             rbp_kind: i8_type.const_int(crate::BACKTRACE_RECOVERY_UNDEFINED as u64, false),
-            rbp_register: i16_type.const_int(X86_64_DWARF_RBP as u64, false),
+            rbp_register: i16_type.const_int(DWARF_FP as u64, false),
             rbp_offset: i64_type.const_zero(),
         };
         let state = BtRegisterState {
+            link_register: None,
             ip: i64_type.const_int(0x2000, false),
             rsp: i64_type.const_int(0x3000, false),
             rbp: function

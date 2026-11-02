@@ -19,7 +19,7 @@ Both uprobes and GDB install breakpoint-based instrumentation in the target proc
 GhostScope's script and compiler surface is observational: it does not provide operations that intentionally modify application-visible state, variable values, or control flow. This does not mean the target is untouched. Uprobes install trap points, and each hit synchronously adds uprobe and eBPF execution to the target thread.
 
 ### 4. Platform and Architecture Support
-Official builds and correctness testing currently support **Linux x86_64 (AMD64)** only because GhostScope depends on Linux **eBPF** and **uprobes** and currently implements x86_64 register, ABI, TLS, and unwind behavior. The runtime build fails on other build targets, the installer rejects non-Linux systems and other architectures, and trace setup rejects target objects that are not 64-bit little-endian x86_64 ELF files.
+Official builds currently target **Linux x86_64 (AMD64)**. Linux AArch64 source builds are experimental and support DWARF `bt`/`backtrace` and executable static TLS. Both architectures run the full standard e2e suite; shared-library/dynamic TLS remains unsupported. The installer and release artifacts remain x86_64-only. Trace setup requires a 64-bit little-endian ELF matching the runtime architecture; cross-architecture tracing is rejected.
 
 ## Soft Limitations
 
@@ -69,7 +69,7 @@ This provides loss visibility, not a lossless guarantee. The counters cover fail
 ### 5. DWARF Support Coverage
 Primarily tested and validated with DWARF 5 format. Theoretically supports DWARF 2-5, but other versions may have compatibility issues. Some DWARF expression instructions are not yet supported for conversion to eBPF (purely due to implementation not being completed yet) and will provide clear error messages when encountered.
 
-GhostScope recognizes `DW_OP_form_tls_address`, but the runtime TLS address resolver currently handles only x86_64 executable static TLS. GhostScope resolves the current thread's TLS base at probe time, so a trace running on different pthreads reads each thread's own TLS instance for that supported executable case. The same DWARF operation is also used for dynamic/shared-library TLS; those cases require DTV/module TLS lookup and are not modeled yet, so GhostScope rejects shared-object TLS instead of guessing an address.
+GhostScope recognizes `DW_OP_form_tls_address`, but the runtime TLS address resolver currently handles executable static TLS on x86_64 and AArch64. GhostScope resolves the current thread's TLS base at probe time, so a trace running on different pthreads reads each thread's own TLS instance for that supported executable case. The same DWARF operation is also used for dynamic/shared-library TLS; those cases require DTV/module TLS lookup and are not modeled yet, so GhostScope rejects shared-object TLS instead of guessing an address.
 
 GhostScope strictly checks any available `.gnu_debuglink` CRC and comparable Build ID for separate debug files by default. Enabling `--allow-loose-debug-match` permits a mismatch with a warning and weakens the source-semantic evidence guarantee. An explicitly supplied debug file with neither an available CRC nor a comparable Build ID is also accepted with a warning, but its identity is then a user-supplied trust assumption rather than a verified match.
 
@@ -127,3 +127,9 @@ In `-t` mode, globals depend on `proc_module_offsets`, which tracks runtime addr
 ### 11. Observation Consistency
 
 A trace event is not a process-wide atomic snapshot. Register values and the current thread's frame correspond to the uprobe hit, but other threads can modify shared memory while GhostScope reads multiple fields. Values collected in one event can therefore represent a short observation interval rather than one globally synchronized instant.
+
+Native ARM64 CI covers scalar arguments/globals, PC/SP, O0/O2,
+PIE/non-PIE, PID/path attachment, perf-event-array, and host-to-private-container
+tracing. It runs the full e2e suite, including backtrace with PAC-signed return addresses, multithreaded TLS, and
+the Rust compiler-version matrix; see
+[ARM64 CI coverage](development.md#arm64-ci-coverage).

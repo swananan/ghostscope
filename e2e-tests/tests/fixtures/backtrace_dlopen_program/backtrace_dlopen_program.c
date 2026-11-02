@@ -98,7 +98,7 @@ int main(void)
         return 0;
     }
 
-    char module_paths[MAX_DLOPEN_MODULES][PATH_MAX];
+    static char module_paths[MAX_DLOPEN_MODULES][PATH_MAX];
     void *handles[MAX_DLOPEN_MODULES] = {0};
     dlopen_lib_driver_fn drivers[MAX_DLOPEN_MODULES] = {0};
     size_t module_count = read_module_paths(module_paths);

@@ -565,7 +565,8 @@ trace scalar_float_bool_by_value {
 }
 
 #[tokio::test]
-async fn test_c_scalar_o3_float_by_value_parameters_report_xmm_unavailable() -> anyhow::Result<()> {
+async fn test_c_scalar_o3_float_by_value_parameters_report_simd_unavailable() -> anyhow::Result<()>
+{
     init();
 
     let binary_path =
@@ -585,9 +586,16 @@ trace scalar_float_bool_by_value {
         exit_code, 0,
         "Expected optimized XMM-backed float parameter to be reported unavailable. STDOUT: {stdout}"
     );
+    let (register, bank) = if cfg!(target_arch = "aarch64") {
+        ("64 (V0)", "SIMD/FP")
+    } else {
+        ("17 (XMM0)", "XMM")
+    };
     assert!(
-        stderr.contains("Unsupported DWARF register: 17 (XMM0)")
-            && stderr.contains("uprobe pt_regs does not expose XMM register values"),
+        stderr.contains(&format!("Unsupported DWARF register: {register}"))
+            && stderr.contains(&format!(
+                "uprobe pt_regs does not expose {bank} register values"
+            )),
         "Expected a clear XMM/pt_regs diagnostic. STDERR: {stderr}"
     );
     Ok(())

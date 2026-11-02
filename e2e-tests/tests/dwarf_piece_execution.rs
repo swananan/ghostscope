@@ -21,13 +21,22 @@ fn run_command(command: &mut Command) -> anyhow::Result<()> {
     Ok(())
 }
 
+const ARG0: u16 = if cfg!(target_arch = "aarch64") { 0 } else { 5 };
+const ARG1: u16 = if cfg!(target_arch = "aarch64") { 1 } else { 4 };
+const ARG2: u16 = if cfg!(target_arch = "aarch64") { 2 } else { 1 };
+const SIMD0: u16 = if cfg!(target_arch = "aarch64") {
+    64
+} else {
+    17
+};
+
 fn register_piece(expression: &mut Expression, register: u16, size: u64) {
     expression.op_reg(gimli::Register(register));
     expression.op_piece(size);
 }
 
 fn memory_piece(expression: &mut Expression, size: u64) {
-    expression.op_breg(gimli::Register(4), 0); // RSI points to exactly three readable bytes.
+    expression.op_breg(gimli::Register(ARG1), 0); // The second argument points to exactly three readable bytes.
     expression.op_piece(size);
 }
 
@@ -154,23 +163,23 @@ fn add_piece_dwarf(binary: &Path) -> anyhow::Result<u64> {
         .set(gimli::DW_AT_high_pc, AttributeValue::Udata(symbol.size()));
 
     let mut pair_location = Expression::new();
-    register_piece(&mut pair_location, 5, 8);
-    register_piece(&mut pair_location, 1, 8);
+    register_piece(&mut pair_location, ARG0, 8);
+    register_piece(&mut pair_location, ARG2, 8);
     let mut array_location = Expression::new();
-    register_piece(&mut array_location, 5, 8);
-    register_piece(&mut array_location, 1, 8);
+    register_piece(&mut array_location, ARG0, 8);
+    register_piece(&mut array_location, ARG2, 8);
     let mut mixed_location = Expression::new();
-    register_piece(&mut mixed_location, 5, 8);
+    register_piece(&mut mixed_location, ARG0, 8);
     memory_piece(&mut mixed_location, 3);
     mixed_location.op_implicit_value(vec![0x11, 0x22, 0x33, 0x44, 0x55].into_boxed_slice());
     mixed_location.op_piece(5);
-    register_piece(&mut mixed_location, 1, 8);
+    register_piece(&mut mixed_location, ARG2, 8);
     let mut scalar_location = Expression::new();
-    register_piece(&mut scalar_location, 5, 4);
-    register_piece(&mut scalar_location, 1, 4);
+    register_piece(&mut scalar_location, ARG0, 4);
+    register_piece(&mut scalar_location, ARG2, 4);
     let mut memory_scalar = Expression::new();
     memory_piece(&mut memory_scalar, 3);
-    register_piece(&mut memory_scalar, 5, 5);
+    register_piece(&mut memory_scalar, ARG0, 5);
     let mut signed_location = Expression::new();
     memory_piece(&mut signed_location, 3);
     signed_location.op_constu(255);
@@ -192,57 +201,57 @@ fn add_piece_dwarf(binary: &Path) -> anyhow::Result<u64> {
             .into_boxed_slice(),
     );
     let mut padded_location = Expression::new();
-    register_piece(&mut padded_location, 5, 4);
+    register_piece(&mut padded_location, ARG0, 4);
     padded_location.op_piece(4);
-    register_piece(&mut padded_location, 1, 4);
+    register_piece(&mut padded_location, ARG2, 4);
     padded_location.op_piece(4);
     let mut bad_read = Expression::new();
-    register_piece(&mut bad_read, 5, 8);
+    register_piece(&mut bad_read, ARG0, 8);
     bad_read.op_addr(Address::Constant(1));
     bad_read.op_piece(8);
-    register_piece(&mut bad_read, 1, 8);
+    register_piece(&mut bad_read, ARG2, 8);
     let mut broken_scalar = Expression::new();
-    register_piece(&mut broken_scalar, 5, 4);
+    register_piece(&mut broken_scalar, ARG0, 4);
     broken_scalar.op_addr(Address::Constant(1));
     broken_scalar.op_piece(4);
     let mut zero_computed_scalar = Expression::new();
-    register_piece(&mut zero_computed_scalar, 5, 4);
+    register_piece(&mut zero_computed_scalar, ARG0, 4);
     // Anonymous mmap bytes immediately before the initialized tail are zero.
-    zero_computed_scalar.op_breg(gimli::Register(4), -4);
+    zero_computed_scalar.op_breg(gimli::Register(ARG1), -4);
     zero_computed_scalar.op_deref_size(4);
     zero_computed_scalar.op(gimli::DW_OP_stack_value);
     zero_computed_scalar.op_piece(4);
     let mut computed_fault = Expression::new();
-    register_piece(&mut computed_fault, 5, 8);
-    computed_fault.op_breg(gimli::Register(4), 0);
+    register_piece(&mut computed_fault, ARG0, 8);
+    computed_fault.op_breg(gimli::Register(ARG1), 0);
     computed_fault.op_deref_size(4);
     computed_fault.op(gimli::DW_OP_stack_value);
     computed_fault.op_piece(8);
     let mut computed_address_fault = Expression::new();
-    register_piece(&mut computed_address_fault, 5, 8);
-    computed_address_fault.op_breg(gimli::Register(4), 0);
+    register_piece(&mut computed_address_fault, ARG0, 8);
+    computed_address_fault.op_breg(gimli::Register(ARG1), 0);
     computed_address_fault.op_deref_size(4);
     computed_address_fault.op_piece(8);
     let mut computed_ok = Expression::new();
-    register_piece(&mut computed_ok, 5, 8);
-    computed_ok.op_breg(gimli::Register(4), 0);
+    register_piece(&mut computed_ok, ARG0, 8);
+    computed_ok.op_breg(gimli::Register(ARG1), 0);
     computed_ok.op_deref_size(2);
     computed_ok.op(gimli::DW_OP_stack_value);
     computed_ok.op_piece(8);
     let mut null_computed = Expression::new();
-    register_piece(&mut null_computed, 5, 8);
+    register_piece(&mut null_computed, ARG0, 8);
     null_computed.op_constu(0);
     null_computed.op_deref_size(4);
     null_computed.op(gimli::DW_OP_stack_value);
     null_computed.op_piece(8);
     let mut null_computed_address = Expression::new();
-    register_piece(&mut null_computed_address, 5, 8);
+    register_piece(&mut null_computed_address, ARG0, 8);
     null_computed_address.op_constu(0);
     null_computed_address.op_deref_size(4);
     null_computed_address.op_piece(8);
     let mut repeated_fault = Expression::new();
-    register_piece(&mut repeated_fault, 5, 8);
-    repeated_fault.op_breg(gimli::Register(4), 0);
+    register_piece(&mut repeated_fault, ARG0, 8);
+    repeated_fault.op_breg(gimli::Register(ARG1), 0);
     repeated_fault.op_deref_size(4);
     repeated_fault.op_addr(Address::Constant(1));
     repeated_fault.op_deref_size(4);
@@ -250,17 +259,17 @@ fn add_piece_dwarf(binary: &Path) -> anyhow::Result<u64> {
     repeated_fault.op(gimli::DW_OP_stack_value);
     repeated_fault.op_piece(8);
     let mut read_address = Expression::new();
-    read_address.op_reg(gimli::Register(4));
+    read_address.op_reg(gimli::Register(ARG1));
     let mut missing = Expression::new();
-    register_piece(&mut missing, 5, 8);
+    register_piece(&mut missing, ARG0, 8);
     missing.op_piece(8);
     let mut short = Expression::new();
-    register_piece(&mut short, 5, 8);
+    register_piece(&mut short, ARG0, 8);
     let mut simd = Expression::new();
-    register_piece(&mut simd, 17, 8);
-    register_piece(&mut simd, 1, 8);
+    register_piece(&mut simd, SIMD0, 8);
+    register_piece(&mut simd, ARG2, 8);
     let mut bits = Expression::new();
-    bits.op_reg(gimli::Register(5));
+    bits.op_reg(gimli::Register(ARG0));
     bits.op_bit_piece(32, 0);
     for (name, ty, location) in [
         ("pair", pair, pair_location),
@@ -342,6 +351,14 @@ int main(void) {
 "#,
     )?;
     fs::write(&assembly, ".text\n.globl piece_probe\n.type piece_probe, @function\npiece_probe:\nnop\nret\n.size piece_probe, .-piece_probe\n.section .note.GNU-stack,\"\",@progbits\n")?;
+    if cfg!(target_arch = "aarch64") {
+        fs::write(
+            &assembly,
+            fs::read_to_string(&assembly)?
+                .replace("@function", "%function")
+                .replace("@progbits", "%progbits"),
+        )?;
+    }
     run_command(
         Command::new("cc")
             .args(["-g0", "-O2", "-no-pie", "-o"])

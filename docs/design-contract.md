@@ -16,9 +16,10 @@ does not permit known unsupported paths to return plausible but unproven data.
 
 ## Supported Operating Envelope
 
-- Official release artifacts and correctness testing target Linux x86_64. The
-  runtime build rejects other build targets, and trace setup rejects target
-  objects that are not 64-bit little-endian x86_64 ELF files.
+- Official release artifacts target Linux x86_64. The
+  runtime also permits experimental Linux AArch64 source builds with DWARF backtraces
+  and executable static TLS. Trace setup requires a 64-bit little-endian
+  ELF matching the runtime architecture.
 - Source-aware values require DWARF that corresponds to the module being
   traced. Embedded DWARF is read from that module. For separate debug files,
   available `.gnu_debuglink` CRC and Build ID evidence is checked strictly by
@@ -62,8 +63,8 @@ but it cannot guarantee unchanged timing.
 **Guarantee.** Official builds and correctness claims are scoped to Linux
 x86_64.
 
-**Enforcement.** The platform crate has a compile-time Linux x86_64 guard that
-makes the runtime build fail on other targets. The installer rejects unsupported
+**Enforcement.** The platform crate permits Linux x86_64 and experimental Linux
+AArch64 builds. Both use native register roles and executable TLS layouts. The installer rejects unsupported
 hosts or requested architectures, and trace setup validates `-t` objects, `-p`
 process executables, and loaded DWARF modules before semantic interpretation.
 Release artifacts are built and named for x86_64, and architecture-specific

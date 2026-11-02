@@ -7,38 +7,59 @@ use tracing::warn;
 /// pt_regs indices for x86_64 architecture
 ///
 /// These indices are used to access pt_regs structure fields as a u64 array.
-/// The indices are calculated by dividing the field offset by the size of u64,
-/// which gives us the array index for accessing pt_regs as a u64 array.
+/// They describe the x86_64 ABI on every build host and are checked against
+/// Aya's field offsets when building natively for x86_64.
 pub mod pt_regs_indices {
-    use aya_ebpf_bindings::bindings::pt_regs;
+    // Linux x86_64 pt_regs ABI, also usable for offline analysis on ARM64.
+    pub const R15: usize = 0;
+    pub const R14: usize = 1;
+    pub const R13: usize = 2;
+    pub const R12: usize = 3;
+    pub const RBP: usize = 4;
+    pub const RBX: usize = 5;
+    pub const R11: usize = 6;
+    pub const R10: usize = 7;
+    pub const R9: usize = 8;
+    pub const R8: usize = 9;
+    pub const RAX: usize = 10;
+    pub const RCX: usize = 11;
+    pub const RDX: usize = 12;
+    pub const RSI: usize = 13;
+    pub const RDI: usize = 14;
+    pub const ORIG_RAX: usize = 15;
+    pub const RIP: usize = 16;
+    pub const CS: usize = 17;
+    pub const EFLAGS: usize = 18;
+    pub const RSP: usize = 19;
+    pub const SS: usize = 20;
 
-    // Size of u64 in bytes for array index calculation
-    const U64_SIZE: usize = core::mem::size_of::<u64>();
-
-    // Core registers - calculated from pt_regs structure layout
-    pub const R15: usize = core::mem::offset_of!(pt_regs, r15) / U64_SIZE;
-    pub const R14: usize = core::mem::offset_of!(pt_regs, r14) / U64_SIZE;
-    pub const R13: usize = core::mem::offset_of!(pt_regs, r13) / U64_SIZE;
-    pub const R12: usize = core::mem::offset_of!(pt_regs, r12) / U64_SIZE;
-    pub const RBP: usize = core::mem::offset_of!(pt_regs, rbp) / U64_SIZE; // Frame pointer
-    pub const RBX: usize = core::mem::offset_of!(pt_regs, rbx) / U64_SIZE;
-    pub const R11: usize = core::mem::offset_of!(pt_regs, r11) / U64_SIZE;
-    pub const R10: usize = core::mem::offset_of!(pt_regs, r10) / U64_SIZE;
-    pub const R9: usize = core::mem::offset_of!(pt_regs, r9) / U64_SIZE;
-    pub const R8: usize = core::mem::offset_of!(pt_regs, r8) / U64_SIZE;
-    pub const RAX: usize = core::mem::offset_of!(pt_regs, rax) / U64_SIZE; // Return value
-    pub const RCX: usize = core::mem::offset_of!(pt_regs, rcx) / U64_SIZE; // 4th argument
-    pub const RDX: usize = core::mem::offset_of!(pt_regs, rdx) / U64_SIZE; // 3rd argument
-    pub const RSI: usize = core::mem::offset_of!(pt_regs, rsi) / U64_SIZE; // 2nd argument
-    pub const RDI: usize = core::mem::offset_of!(pt_regs, rdi) / U64_SIZE; // 1st argument
-
-    // Special registers
-    pub const ORIG_RAX: usize = core::mem::offset_of!(pt_regs, orig_rax) / U64_SIZE; // Original syscall number
-    pub const RIP: usize = core::mem::offset_of!(pt_regs, rip) / U64_SIZE; // Instruction pointer
-    pub const CS: usize = core::mem::offset_of!(pt_regs, cs) / U64_SIZE; // Code segment
-    pub const EFLAGS: usize = core::mem::offset_of!(pt_regs, eflags) / U64_SIZE; // Flags register
-    pub const RSP: usize = core::mem::offset_of!(pt_regs, rsp) / U64_SIZE; // Stack pointer
-    pub const SS: usize = core::mem::offset_of!(pt_regs, ss) / U64_SIZE; // Stack segment
+    // Check the ABI against Aya's native bindings without requiring x86 fields
+    // to exist in the AArch64 bindings.
+    #[cfg(target_arch = "x86_64")]
+    const _: () = {
+        use aya_ebpf_bindings::bindings::pt_regs;
+        assert!(R15 * 8 == core::mem::offset_of!(pt_regs, r15));
+        assert!(R14 * 8 == core::mem::offset_of!(pt_regs, r14));
+        assert!(R13 * 8 == core::mem::offset_of!(pt_regs, r13));
+        assert!(R12 * 8 == core::mem::offset_of!(pt_regs, r12));
+        assert!(RBP * 8 == core::mem::offset_of!(pt_regs, rbp));
+        assert!(RBX * 8 == core::mem::offset_of!(pt_regs, rbx));
+        assert!(R11 * 8 == core::mem::offset_of!(pt_regs, r11));
+        assert!(R10 * 8 == core::mem::offset_of!(pt_regs, r10));
+        assert!(R9 * 8 == core::mem::offset_of!(pt_regs, r9));
+        assert!(R8 * 8 == core::mem::offset_of!(pt_regs, r8));
+        assert!(RAX * 8 == core::mem::offset_of!(pt_regs, rax));
+        assert!(RCX * 8 == core::mem::offset_of!(pt_regs, rcx));
+        assert!(RDX * 8 == core::mem::offset_of!(pt_regs, rdx));
+        assert!(RSI * 8 == core::mem::offset_of!(pt_regs, rsi));
+        assert!(RDI * 8 == core::mem::offset_of!(pt_regs, rdi));
+        assert!(ORIG_RAX * 8 == core::mem::offset_of!(pt_regs, orig_rax));
+        assert!(RIP * 8 == core::mem::offset_of!(pt_regs, rip));
+        assert!(CS * 8 == core::mem::offset_of!(pt_regs, cs));
+        assert!(EFLAGS * 8 == core::mem::offset_of!(pt_regs, eflags));
+        assert!(RSP * 8 == core::mem::offset_of!(pt_regs, rsp));
+        assert!(SS * 8 == core::mem::offset_of!(pt_regs, ss));
+    };
 }
 
 /// Convert DWARF register number to pt_regs byte offset for x86_64
@@ -146,27 +167,53 @@ pub fn dwarf_reg_to_name_x86_64(dwarf_reg: u16) -> Option<&'static str> {
 
 /// Convert DWARF register number to register name
 ///
-/// Currently only supports x86_64. This function can be extended
-/// to support other architectures in the future.
+/// Uses the runtime host architecture; offline analysis should pass an explicit
+/// `TargetArch` instead.
 pub fn dwarf_reg_to_name(dwarf_reg: u16) -> Option<&'static str> {
-    // For now, we only support x86_64
-    // TODO: Add support for other architectures (ARM64, RISC-V, etc.)
-    dwarf_reg_to_name_x86_64(dwarf_reg)
+    crate::TargetArch::current().dwarf_register_name(dwarf_reg)
 }
 
 /// Convert DWARF register number to pt_regs byte offset
 ///
-/// Currently only supports x86_64. This function can be extended
-/// to support other architectures in the future.
+/// Uses the runtime host architecture; offline analysis should pass an explicit
+/// `TargetArch` instead.
 pub fn dwarf_reg_to_pt_regs_byte_offset(dwarf_reg: u16) -> Option<usize> {
-    // For now, we only support x86_64
-    // TODO: Add support for other architectures (ARM64, RISC-V, etc.)
-    dwarf_reg_to_pt_regs_byte_offset_x86_64(dwarf_reg)
+    crate::TargetArch::current().dwarf_register_byte_offset(dwarf_reg)
+}
+
+impl crate::TargetArch {
+    /// Name in the target DWARF register namespace.
+    pub fn dwarf_register_name(self, register: u16) -> Option<&'static str> {
+        match self {
+            Self::X86_64 => dwarf_reg_to_name_x86_64(register),
+            Self::Aarch64 => crate::aarch64::dwarf_register_name(register),
+            Self::Unknown => None,
+        }
+    }
+
+    /// Offset in the target's Linux uprobe context, not the host's layout.
+    pub fn dwarf_register_byte_offset(self, register: u16) -> Option<usize> {
+        match self {
+            Self::X86_64 => dwarf_reg_to_pt_regs_byte_offset_x86_64(register),
+            Self::Aarch64 => crate::aarch64::dwarf_register_byte_offset(register),
+            Self::Unknown => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_target_mapping_does_not_use_host_register_numbers() {
+        use crate::TargetArch;
+        assert_eq!(TargetArch::X86_64.dwarf_register_byte_offset(0), Some(80));
+        assert_eq!(TargetArch::Aarch64.dwarf_register_byte_offset(0), Some(0));
+        assert_eq!(TargetArch::Aarch64.dwarf_register_name(29), Some("X29"));
+        assert_eq!(TargetArch::Unknown.dwarf_register_byte_offset(0), None);
+        assert_eq!(TargetArch::Unknown.dwarf_register_name(0), None);
+    }
 
     #[test]
     fn test_x86_64_dwarf_to_pt_regs_mapping() {
@@ -208,6 +255,11 @@ mod tests {
     #[test]
     fn test_dwarf_reg_to_name_generic() {
         // Test the generic function (currently just calls x86_64)
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(dwarf_reg_to_name(0), Some("X0"));
+            assert_eq!(dwarf_reg_to_name(31), Some("SP"));
+            return;
+        }
         assert_eq!(dwarf_reg_to_name(0), Some("RAX"));
         assert_eq!(dwarf_reg_to_name(5), Some("RDI"));
         assert_eq!(dwarf_reg_to_name(13), Some("R13"));
@@ -217,6 +269,11 @@ mod tests {
     #[test]
     fn test_dwarf_reg_to_pt_regs_byte_offset_generic() {
         // Test the generic function (currently just calls x86_64)
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(dwarf_reg_to_pt_regs_byte_offset(0), Some(0));
+            assert_eq!(dwarf_reg_to_pt_regs_byte_offset(31), Some(248));
+            return;
+        }
         assert_eq!(dwarf_reg_to_pt_regs_byte_offset(0), Some(80)); // RAX
         assert_eq!(dwarf_reg_to_pt_regs_byte_offset(5), Some(112)); // RDI
         assert_eq!(dwarf_reg_to_pt_regs_byte_offset(99), None);

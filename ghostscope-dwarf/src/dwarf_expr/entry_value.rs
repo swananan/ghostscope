@@ -207,7 +207,7 @@ pub(crate) fn resolve_register_offset(
     function_context: Option<&FunctionBlocks>,
     cfi_index: Option<&CfiIndex>,
 ) -> Result<Vec<PlanExprOp>> {
-    if is_stack_pointer_register(register) {
+    if is_stack_pointer_register(register, cfi_index) {
         return recover_stack_pointer_steps(current_pc, offset, address_size, cfi_index);
     }
 
@@ -256,13 +256,16 @@ fn recover_stack_pointer_steps(
         anyhow::anyhow!("DW_OP_entry_value stack-pointer recovery needs CFI at 0x{current_pc:x}")
     })?;
     let mut steps = cfa_to_steps(cfi_index.get_cfa_result(current_pc)?);
-    // This assumes the common x86/x86_64 call-frame convention where the CFA
-    // observed after the call is `SP_entry + address_size` because the return
-    // address is stored on the stack. Targets such as AArch64 may define the
-    // CFA at call entry differently when LR is not pushed, so keep this
-    // adjustment centralized until entry-SP reconstruction becomes
-    // target-aware.
-    append_constant_offset(&mut steps, offset - i64::from(address_size));
+    let entry_sp_offset = cfi_index
+        .architecture()
+        .entry_sp_cfa_offset(address_size)
+        .ok_or_else(|| {
+            anyhow::anyhow!("unsupported target ABI for entry stack-pointer recovery")
+        })?;
+    let offset = offset
+        .checked_add(entry_sp_offset)
+        .ok_or_else(|| anyhow::anyhow!("entry stack-pointer offset overflow"))?;
+    append_constant_offset(&mut steps, offset);
     Ok(steps)
 }
 
@@ -284,11 +287,12 @@ pub(crate) fn append_constant_offset(steps: &mut Vec<PlanExprOp>, offset: i64) {
     }
 }
 
-fn is_stack_pointer_register(register: u16) -> bool {
-    matches!(
-        ghostscope_platform::register_mapping::dwarf_reg_to_name(register),
-        Some("RSP" | "ESP" | "SP")
-    )
+fn is_stack_pointer_register(register: u16, cfi_index: Option<&CfiIndex>) -> bool {
+    cfi_index
+        .map(CfiIndex::architecture)
+        .unwrap_or_else(ghostscope_platform::TargetArch::current)
+        .dwarf_register_roles()
+        .is_some_and(|roles| register == roles.stack_pointer)
 }
 
 pub(crate) fn build_lookup_steps(

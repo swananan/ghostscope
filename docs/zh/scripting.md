@@ -118,7 +118,7 @@ GhostScope 的脚本语法本身与源语言无关，但实际效果取决于被
 
 实践建议：
 - 需要较高成功率的复杂 DWARF 表达式时，优先选择 C 目标。
-- GhostScope 能识别 `DW_OP_form_tls_address`，这个操作既会用于 static TLS，也会用于 dynamic TLS。运行时地址解析目前只支持 x86_64 可执行文件 static TLS；dynamic/shared-library TLS 尚未建模。
+- GhostScope 能识别 `DW_OP_form_tls_address`，这个操作既会用于 static TLS，也会用于 dynamic TLS。运行时地址解析目前支持 x86_64 和 AArch64 可执行文件 static TLS；dynamic/shared-library TLS 尚未建模。
 - C++ 目前仍主要按 DWARF 布局访问。
 - Rust 支持根据每个目标类型的源语言、类型身份和经过验证的 DWARF 布局
   决定。从 `DW_AT_producer` 解析出的 rustc 版本只作为提示性元数据；

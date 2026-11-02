@@ -43,31 +43,6 @@ async fn compile_member_pointer_script_result(
     ))
 }
 
-async fn compile_member_pointer_failure_message(
-    script: &str,
-    opt_level: OptimizationLevel,
-) -> anyhow::Result<String> {
-    match compile_member_pointer_script_result(script, opt_level).await? {
-        Ok(result) => {
-            anyhow::ensure!(
-                result.uprobe_configs.is_empty(),
-                "invalid script should not produce uprobe configs: {result:?}"
-            );
-            anyhow::ensure!(
-                !result.failed_targets.is_empty(),
-                "invalid script should report failed targets: {result:?}"
-            );
-            Ok(result
-                .failed_targets
-                .iter()
-                .map(|target| target.error_message.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"))
-        }
-        Err(err) => Ok(err.user_message().into_owned()),
-    }
-}
-
 async fn member_pointer_pc(opt_level: OptimizationLevel) -> anyhow::Result<u64> {
     let binary_path = FIXTURES.get_test_binary_with_opt("member_pointer_program", opt_level)?;
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path)
@@ -525,7 +500,11 @@ async fn test_value_backed_aggregate_dw_op_piece_surfaces_composite_o2() -> anyh
             assert_eq!(
                 piece.location.as_ref(),
                 &ghostscope_dwarf::VariableLocation::ComputedValue(vec![
-                    ghostscope_dwarf::PlanExprOp::LoadRegister(5),
+                    ghostscope_dwarf::PlanExprOp::LoadRegister(if cfg!(target_arch = "aarch64") {
+                        0
+                    } else {
+                        5
+                    }),
                     ghostscope_dwarf::PlanExprOp::PushConstant(constant),
                     ghostscope_dwarf::PlanExprOp::Add,
                 ])
@@ -774,8 +753,16 @@ async fn test_complex_bitfield_chain_planner_resolves_member_offsets() -> anyhow
             .ok_or_else(|| anyhow::anyhow!("missing plan for c.flags at {module_address:?}"))?;
 
         let expected_steps = vec![
-            ghostscope_dwarf::PlanExprOp::LoadRegister(6),
-            ghostscope_dwarf::PlanExprOp::PushConstant(-8),
+            ghostscope_dwarf::PlanExprOp::LoadRegister(if cfg!(target_arch = "aarch64") {
+                31
+            } else {
+                6
+            }),
+            ghostscope_dwarf::PlanExprOp::PushConstant(if cfg!(target_arch = "aarch64") {
+                8
+            } else {
+                -8
+            }),
             ghostscope_dwarf::PlanExprOp::Add,
             ghostscope_dwarf::PlanExprOp::Dereference {
                 size: ghostscope_dwarf::MemoryAccessSize::U64,
