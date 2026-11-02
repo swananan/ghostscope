@@ -596,6 +596,28 @@ impl LoadedObjfile {
         segment: &VariableAccessSegment,
     ) -> Result<Option<TypeId>> {
         let current_loc = type_loc(current)?;
+        if matches!(segment, VariableAccessSegment::ArrayIndex(_)) {
+            if let Some(loc) = normalize_type_loc(self.dwarf(), self, current_loc)? {
+                let unit = loc.unit(self.dwarf())?;
+                let entry = unit.entry(loc.die_off)?;
+                if entry.tag() == gimli::DW_TAG_array_type {
+                    let mut tree = unit.entries_tree(Some(entry.offset()))?;
+                    let root = tree.root()?;
+                    let mut children = root.children();
+                    let mut dimensions = 0;
+                    while let Some(child) = children.next()? {
+                        dimensions +=
+                            usize::from(child.entry().tag() == gimli::DW_TAG_subrange_type);
+                    }
+                    if current.array_dimension + 1 < dimensions {
+                        return Ok(Some(TypeId {
+                            array_dimension: current.array_dimension + 1,
+                            ..current
+                        }));
+                    }
+                }
+            }
+        }
         projected_type_loc(self.dwarf(), self, current_loc, segment).map(|loc| {
             loc.map(|loc| {
                 type_id_from_loc(current.module, loc.in_context(current_loc.semantic_cu()))
@@ -628,7 +650,16 @@ impl LoadedObjfile {
 
     pub(crate) fn type_summary(&self, current: TypeId) -> Result<Option<crate::TypeInfo>> {
         let normalized = normalize_type_loc(self.dwarf(), self, type_loc(current)?)?;
-        Ok(normalized.and_then(|loc| self.detailed_shallow_type_loc(loc)))
+        let mut summary = normalized.and_then(|loc| self.detailed_shallow_type_loc(loc));
+        for _ in 0..current.array_dimension {
+            summary = match summary.as_ref().map(crate::strip_type_aliases) {
+                Some(crate::TypeInfo::ArrayType { element_type, .. }) => {
+                    Some(element_type.as_ref().clone())
+                }
+                _ => return Ok(None),
+            };
+        }
+        Ok(summary)
     }
 
     pub(crate) fn qualified_type_name(&self, current: TypeId) -> Result<Option<String>> {

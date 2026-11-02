@@ -24,10 +24,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         }
 
-        if let Ok(Some(var)) = self.query_dwarf_for_complex_expr(expr) {
-            if let Some(ref ty) = var.dwarf_type {
-                return ghostscope_dwarf::is_aggregate_type(ty);
-            }
+        if let Ok(Some(ty)) = self.query_dwarf_for_access_type(expr) {
+            return ghostscope_dwarf::is_aggregate_type(&ty);
         }
         false
     }

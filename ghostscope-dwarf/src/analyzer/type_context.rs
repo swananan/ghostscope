@@ -72,7 +72,7 @@ impl DwarfAnalyzer {
             .qualified_type_name(type_id)
     }
 
-    fn type_summary(&self, type_id: TypeId) -> Result<Option<TypeInfo>> {
+    pub(super) fn type_summary(&self, type_id: TypeId) -> Result<Option<TypeInfo>> {
         let module_path = self.module_path_for_id(type_id.module).ok_or_else(|| {
             anyhow::anyhow!("Semantic module id {:?} is not loaded", type_id.module)
         })?;
@@ -242,6 +242,9 @@ impl DwarfAnalyzer {
     ) -> Result<TypeProjection> {
         if let Some(mut projection) = current.project_structural(segment) {
             projection.resolved_type = self.hydrate_projected_type(projection.resolved_type)?;
+            if let TypeProjectionLayout::Element { stride } = &mut projection.layout {
+                *stride = projection.resolved_type.summary.size().max(1);
+            }
             return Ok(projection);
         }
 
@@ -318,10 +321,19 @@ impl DwarfAnalyzer {
             None => None,
         };
 
+        let resolved_type =
+            self.hydrate_projected_type(ResolvedType::new(summary, identity, origin))?;
+        // Pointer summaries may initially contain an unknown pointee. Its
+        // actual size is available only after resolving the exact target DIE.
+        let layout = match layout {
+            TypeProjectionLayout::Element { .. } => TypeProjectionLayout::Element {
+                stride: resolved_type.summary.size().max(1),
+            },
+            other => other,
+        };
         Ok(TypeProjection {
             layout,
-            resolved_type: self
-                .hydrate_projected_type(ResolvedType::new(summary, identity, origin))?,
+            resolved_type,
         })
     }
 

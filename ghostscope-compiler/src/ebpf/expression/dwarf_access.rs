@@ -238,6 +238,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     return Ok(Some(lvalue));
                 }
             }
+            if let Some(lvalue) = self.dynamic_lvalue_address_and_type(&expanded_inner)? {
+                if matches!(
+                    ghostscope_dwarf::strip_type_aliases(&lvalue.type_info.resolved_type.summary),
+                    DwarfType::PointerType { .. }
+                ) {
+                    return self.dynamic_member_base_address_and_type(lvalue);
+                }
+            }
         }
 
         if let Expr::ArrayAccess(array_expr, index_expr) = expr {
@@ -498,7 +506,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.expands_to_nonliteral_pointer_arithmetic(&expanded_array_expr)?;
         let cast_base = self.cast_index_base(&expanded_array_expr)?;
 
-        if literal_index.is_some() && !has_dynamic_base && cast_base.is_none() {
+        if literal_index.is_some()
+            && !has_dynamic_base
+            && cast_base.is_none()
+            && Self::access_path_from_expr(&expanded_array_expr)?.is_some()
+        {
             return Ok(None);
         }
 

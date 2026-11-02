@@ -385,6 +385,7 @@ mod tests {
 
     fn type_id() -> TypeId {
         TypeId {
+            array_dimension: 0,
             importing_cu: None,
             module: ModuleId(1),
             cu: CuId::primary(2),

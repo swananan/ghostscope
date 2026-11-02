@@ -1126,95 +1126,82 @@ impl DetailedParser {
                     };
                 }
                 DW_TAG_ARRAY_TYPE => {
-                    // element_type shallow + total_size if available + subrange element_count (one step deeper)
-                    let mut elem_type: Option<TypeInfo> = None;
-                    if let Some(ti) = Self::referenced_type(dwarf, unit, &entry, inheritance_depth)
-                    {
-                        elem_type = Some(ti);
-                    }
-                    let element_type = Box::new(elem_type.unwrap_or(TypeInfo::UnknownType {
-                        name: "<elem>".to_string(),
-                    }));
-                    let mut total_size: Option<u64> = None;
-                    if let Some(a) = entry.attr(DW_AT_BYTE_SIZE) {
-                        if let gimli::AttributeValue::Udata(sz) = a.value() {
-                            total_size = Some(sz);
-                        }
-                    }
-                    // Optional: subrange child yields count/upper_bound
-                    let mut element_count: Option<u64> = None;
+                    // C/C++ producers can encode every dimension as a subrange
+                    // of one array DIE. Preserve each dimension as an array layer.
+                    let mut element = Self::referenced_type(dwarf, unit, &entry, inheritance_depth)
+                        .unwrap_or(TypeInfo::UnknownType {
+                            name: "<elem>".into(),
+                        });
+                    let explicit_size = entry
+                        .attr(DW_AT_BYTE_SIZE)
+                        .and_then(|a| crate::core::attr_u64(a.value()));
+                    let mut dimensions = Vec::new();
                     if let Ok(mut tree) = unit.entries_tree(Some(entry.offset())) {
                         if let Ok(root) = tree.root() {
                             let mut children = root.children();
                             while let Ok(Some(child)) = children.next() {
-                                let ce = child.entry();
-                                if ce.tag() == gimli::DW_TAG_subrange_type {
-                                    // Prefer DW_AT_count; fallback to upper_bound (+1)
-                                    if let Some(cv) = ce.attr(gimli::DW_AT_count) {
-                                        match cv.value() {
-                                            gimli::AttributeValue::Udata(u) => {
-                                                element_count = Some(u);
-                                            }
-                                            gimli::AttributeValue::Sdata(s) => {
-                                                if s >= 0 {
-                                                    element_count = Some(s as u64);
-                                                }
-                                            }
-                                            gimli::AttributeValue::Data1(b) => {
-                                                element_count = Some(b as u64);
-                                            }
-                                            gimli::AttributeValue::Data2(u) => {
-                                                element_count = Some(u as u64);
-                                            }
-                                            gimli::AttributeValue::Data4(u) => {
-                                                element_count = Some(u as u64);
-                                            }
-                                            gimli::AttributeValue::Data8(u) => {
-                                                element_count = Some(u);
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    if element_count.is_none() {
-                                        if let Some(ub) = ce.attr(gimli::DW_AT_upper_bound) {
-                                            let ub_v: Option<i64> = match ub.value() {
-                                                gimli::AttributeValue::Udata(u) => Some(u as i64),
-                                                gimli::AttributeValue::Sdata(s) => Some(s),
-                                                gimli::AttributeValue::Data1(b) => Some(b as i64),
-                                                gimli::AttributeValue::Data2(u) => Some(u as i64),
-                                                gimli::AttributeValue::Data4(u) => Some(u as i64),
-                                                gimli::AttributeValue::Data8(u) => Some(u as i64),
-                                                _ => None,
-                                            };
-                                            if let Some(ub_i) = ub_v {
-                                                if ub_i >= 0 {
-                                                    element_count = Some((ub_i as u64) + 1);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Stop at first subrange
-                                    if element_count.is_some() {
-                                        break;
-                                    }
+                                let range = child.entry();
+                                if range.tag() != gimli::DW_TAG_subrange_type {
+                                    continue;
                                 }
+                                // Non-zero lower bounds and explicit strides need a
+                                // different layout model; never assume C layout.
+                                if range
+                                    .attr(gimli::DW_AT_lower_bound)
+                                    .is_some_and(|a| crate::core::attr_u64(a.value()) != Some(0))
+                                    || range.attr(gimli::DW_AT_byte_stride).is_some()
+                                    || range.attr(gimli::DW_AT_bit_stride).is_some()
+                                {
+                                    return Some(TypeInfo::UnknownType {
+                                        name: "<unsupported array layout>".into(),
+                                    });
+                                }
+                                let count = range
+                                    .attr(gimli::DW_AT_count)
+                                    .and_then(|a| crate::core::attr_u64(a.value()))
+                                    .or_else(|| {
+                                        range
+                                            .attr(gimli::DW_AT_upper_bound)
+                                            .and_then(|a| crate::core::attr_u64(a.value()))
+                                            .and_then(|n| n.checked_add(1))
+                                    });
+                                dimensions.push(count);
                             }
                         }
                     }
-                    // If total_size absent but count + elem size known, compute it
-                    if total_size.is_none() {
-                        let es = element_type.size();
-                        if let Some(cnt) = element_count {
-                            if es > 0 {
-                                total_size = Some(es * cnt);
-                            }
-                        }
+                    if entry.attr(gimli::DW_AT_ordering).is_some_and(|a| {
+                        a.value() != gimli::AttributeValue::Ordering(gimli::DW_ORD_row_major)
+                    }) || entry.attr(gimli::DW_AT_byte_stride).is_some()
+                        || entry.attr(gimli::DW_AT_bit_stride).is_some()
+                    {
+                        return Some(TypeInfo::UnknownType {
+                            name: "<unsupported array layout>".into(),
+                        });
                     }
-                    return Some(TypeInfo::ArrayType {
-                        element_type,
-                        element_count,
-                        total_size,
-                    });
+                    if dimensions.is_empty() {
+                        dimensions.push(None);
+                    }
+                    for (dimension, count) in dimensions.into_iter().enumerate().rev() {
+                        let size = count.and_then(|n| element.size().checked_mul(n));
+                        // An unknown inner extent cannot supply a reliable row stride.
+                        if (dimension > 0 && (count.is_none() || element.size() == 0))
+                            || (count.is_some() && size.is_none())
+                        {
+                            return Some(TypeInfo::UnknownType {
+                                name: "<unknown array stride>".into(),
+                            });
+                        }
+                        element = TypeInfo::ArrayType {
+                            element_type: Box::new(element),
+                            element_count: count,
+                            total_size: if dimension == 0 {
+                                explicit_size.or(size)
+                            } else {
+                                size
+                            },
+                        };
+                    }
+                    return Some(element);
                 }
                 DW_TAG_SUBROUTINE_TYPE => {
                     return Some(TypeInfo::FunctionType {
@@ -1427,6 +1414,140 @@ impl Default for DetailedParser {
 mod tests {
     use super::*;
     use crate::core::{Availability, VariableLocation};
+
+    fn array_fixture(dimensions: &[Option<u64>], upper_bounds: bool) -> TypeInfo {
+        array_fixture_with_layout(dimensions, upper_bounds, "contiguous")
+    }
+
+    fn array_fixture_with_layout(
+        dimensions: &[Option<u64>],
+        upper_bounds: bool,
+        layout: &str,
+    ) -> TypeInfo {
+        use gimli::write::{AttributeValue as A, Dwarf, EndianVec, LineProgram, Sections, Unit};
+        let mut written = Dwarf::new();
+        let id = written.units.add(Unit::new(
+            gimli::Encoding {
+                format: gimli::Format::Dwarf32,
+                version: 5,
+                address_size: 8,
+            },
+            LineProgram::none(),
+        ));
+        let unit = written.units.get_mut(id);
+        let root = unit.root();
+        let base = unit.add(root, gimli::DW_TAG_base_type);
+        unit.get_mut(base)
+            .set(gimli::DW_AT_name, A::String(b"int".to_vec()));
+        unit.get_mut(base).set(gimli::DW_AT_byte_size, A::Udata(4));
+        unit.get_mut(base)
+            .set(gimli::DW_AT_encoding, A::Encoding(gimli::DW_ATE_signed));
+        let array = unit.add(root, gimli::DW_TAG_array_type);
+        unit.get_mut(array).set(gimli::DW_AT_type, A::UnitRef(base));
+        if layout == "column-major" {
+            unit.get_mut(array)
+                .set(gimli::DW_AT_ordering, A::Ordering(gimli::DW_ORD_col_major));
+        }
+        if layout == "array-stride" {
+            unit.get_mut(array)
+                .set(gimli::DW_AT_byte_stride, A::Udata(16));
+        }
+        for count in dimensions {
+            let range = unit.add(array, gimli::DW_TAG_subrange_type);
+            if layout == "lower-bound" {
+                unit.get_mut(range)
+                    .set(gimli::DW_AT_lower_bound, A::Udata(1));
+            }
+            if layout == "range-stride" {
+                unit.get_mut(range)
+                    .set(gimli::DW_AT_bit_stride, A::Udata(64));
+            }
+            if let Some(count) = count {
+                unit.get_mut(range).set(
+                    if upper_bounds {
+                        gimli::DW_AT_upper_bound
+                    } else {
+                        gimli::DW_AT_count
+                    },
+                    A::Udata(if upper_bounds { count - 1 } else { *count }),
+                );
+            }
+        }
+        let mut sections = Sections::new(EndianVec::new(gimli::LittleEndian));
+        written.write(&mut sections).unwrap();
+        let dwarf = gimli::Dwarf::load(|id| {
+            Ok::<_, gimli::Error>(crate::binary::dwarf_reader_from_arc(std::sync::Arc::from(
+                sections.get(id).map_or(&[][..], |section| section.slice()),
+            )))
+        })
+        .unwrap();
+        let unit = dwarf.unit(dwarf.units().next().unwrap().unwrap()).unwrap();
+        let mut entries = unit.entries();
+        while let Some(entry) = entries.next_dfs().unwrap() {
+            if entry.tag() == gimli::DW_TAG_array_type {
+                return DetailedParser::resolve_type_shallow_at_offset_impl(
+                    &dwarf,
+                    &unit,
+                    entry.offset(),
+                )
+                .unwrap();
+            }
+        }
+        panic!("missing array DIE")
+    }
+
+    #[test]
+    fn multidimensional_array_subranges_preserve_counts_and_strides() {
+        for upper_bounds in [false, true] {
+            let mut ty = array_fixture(&[Some(2), Some(3), Some(4)], upper_bounds);
+            for (count, size) in [(2, 96), (3, 48), (4, 16)] {
+                let TypeInfo::ArrayType {
+                    element_type,
+                    element_count,
+                    total_size,
+                } = ty
+                else {
+                    panic!("missing array dimension");
+                };
+                assert_eq!(element_count, Some(count));
+                assert_eq!(total_size, Some(size));
+                ty = *element_type;
+            }
+            assert_eq!(ty.size(), 4);
+        }
+    }
+
+    #[test]
+    fn multidimensional_array_non_c_layout_is_rejected() {
+        for layout in [
+            "column-major",
+            "array-stride",
+            "lower-bound",
+            "range-stride",
+        ] {
+            assert!(
+                matches!(
+                    array_fixture_with_layout(&[Some(2), Some(3)], false, layout),
+                    TypeInfo::UnknownType { .. }
+                ),
+                "{layout}"
+            );
+        }
+    }
+
+    #[test]
+    fn multidimensional_array_unknown_inner_stride_is_not_guessed() {
+        assert!(matches!(
+            array_fixture(&[Some(2), None], false),
+            TypeInfo::UnknownType { .. }
+        ));
+        assert!(matches!(
+            array_fixture(&[Some(2), Some(u64::MAX)], false),
+            TypeInfo::UnknownType { .. }
+        ));
+        let ty = array_fixture(&[None, Some(3)], false);
+        assert_eq!(crate::indexable_element_layout(&ty).unwrap().stride, 12);
+    }
 
     #[test]
     fn local_type_names_reuse_the_supplied_unit_with_a_large_line_table() {

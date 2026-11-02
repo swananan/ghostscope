@@ -215,6 +215,7 @@ fn materialization_plan_preserves_module_path_origin() {
 #[test]
 fn materialization_plan_preserves_type_identity() {
     let type_id = TypeId {
+        array_dimension: 0,
         importing_cu: None,
         module: ModuleId(3),
         cu: CuId::primary(5),
