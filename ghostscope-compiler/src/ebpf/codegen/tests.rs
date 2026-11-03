@@ -759,3 +759,85 @@ fn pointer_int_arithmetic_is_rejected_with_friendly_error() {
         "unexpected error message: {msg}"
     );
 }
+
+#[test]
+fn format_lengths_reject_strings_addresses_and_pointer_casts() {
+    use crate::script::Expr;
+    for length in [
+        Expr::String("four".into()),
+        Expr::AddressOf(Box::new(Expr::Variable("target".into()))),
+        Expr::Cast {
+            expr: Box::new(Expr::Int(4)),
+            target_type: "char *".into(),
+        },
+    ] {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "format_types", Some(0), &opts).unwrap();
+        let statement = Statement::Print(PrintStatement::Formatted {
+            format: "{} {:s.*}".into(),
+            args: vec![Expr::Int(0), length, Expr::String("data".into())],
+        });
+        let error = ctx
+            .compile_program(&Program::new(), "probe", &[statement], None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Format '{:s.*}' length argument 2 must be an integer"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn format_capture_length_rejects_script_string() {
+    use crate::script::Expr;
+    let context = inkwell::context::Context::create();
+    let opts = CompileOptions::default();
+    let mut ctx = EbpfContext::new(&context, "format_types", Some(0), &opts).unwrap();
+    let statements = [
+        Statement::VarDeclaration {
+            name: "n".into(),
+            value: Expr::String("four".into()),
+        },
+        Statement::Print(PrintStatement::Formatted {
+            format: "{:x.n$}".into(),
+            args: vec![Expr::String("data".into())],
+        }),
+    ];
+    let error = ctx
+        .compile_program(&Program::new(), "probe", &statements, None, None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("capture length variable 'n' must be an integer"),
+        "{error}"
+    );
+}
+
+#[test]
+fn format_integer_lengths_and_byte_conversions_compile() {
+    use crate::script::Expr;
+    for format in ["{:s.*} {:x} {:s}", "{:s.n$} {:x} {:s}"] {
+        let context = inkwell::context::Context::create();
+        let opts = CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "format_types", Some(0), &opts).unwrap();
+        let mut args = vec![Expr::String("data".into()), Expr::Int(42), Expr::Int(65)];
+        if format.contains(".*") {
+            args.insert(0, Expr::Variable("n".into()));
+        }
+        let statements = [
+            Statement::VarDeclaration {
+                name: "n".into(),
+                value: Expr::Int(4),
+            },
+            Statement::Print(PrintStatement::Formatted {
+                format: format.into(),
+                args,
+            }),
+        ];
+        ctx.compile_program(&Program::new(), "probe", &statements, None, None, None)
+            .expect("integer length and raw byte conversions remain valid");
+        ctx.module.verify().expect("valid LLVM IR");
+    }
+}

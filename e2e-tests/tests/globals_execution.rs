@@ -2692,3 +2692,28 @@ trace globals_program.c:31 {
     // no numeric pointer literal checks anymore
     Ok(())
 }
+
+#[tokio::test]
+async fn test_format_lengths_reject_non_integer_source_types() -> anyhow::Result<()> {
+    init();
+    let binary_path = FIXTURES.get_test_binary("globals_program")?;
+    let target = spawn_globals_program(&binary_path).await?;
+    let mut results = Vec::new();
+    for body in [
+        r#"print "{:s.*}", gm, g_message;"#,
+        r#"print "{:x.*}", g_message, g_message;"#,
+        r#"print "{:s.*}", gm + 1, g_message;"#,
+        r#"let p = gm; print "{:s.*}", p, g_message;"#,
+        r#"let n = "four"; print "{:s.n$}", g_message;"#,
+    ] {
+        let script = format!("trace globals_program.c:31 {{ {body} }}");
+        results.push(run_ghostscope_with_script_for_target(&script, 1, &target).await);
+    }
+    target.terminate().await?;
+    for result in results {
+        let (exit, stdout, stderr) = result?;
+        assert_ne!(exit, 0, "non-integer length accepted: {stdout} {stderr}");
+        assert!(stderr.contains("must be an integer"), "{stdout} {stderr}");
+    }
+    Ok(())
+}
