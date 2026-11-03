@@ -541,6 +541,7 @@ print "tail={:s.n$}", p;
 
 Notes:
 - `{}` default; `{:x}`/`{:X}` render the captured value payload as hex bytes; `{:p}` renders an address; `{:s}` renders ASCII bytes.
+- Dynamic lengths (`.*` and `.name$`) must be integers. String, pointer, and aggregate lengths are rejected during compilation; diagnostics identify the placeholder and length argument or variable.
 - Length suffixes change `{:x}`/`{:s}` into memory-dump forms. `{:x}` formats the value already captured for the argument; `{:x.4}` treats the argument as an addressable memory source and reads 4 bytes from that address/source.
 - Length suffixes:
   - `.{N}`: static length (decimal/`0x..`/`0o..`/`0b..`).

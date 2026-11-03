@@ -1321,7 +1321,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(phi.as_basic_value().into_int_value())
     }
 
-    fn expand_dwarf_aliases(&self, expr: &crate::script::Expr) -> Result<crate::script::Expr> {
+    pub(in crate::ebpf) fn expand_dwarf_aliases(
+        &self,
+        expr: &crate::script::Expr,
+    ) -> Result<crate::script::Expr> {
         fn expand_aliases(
             ctx: &crate::ebpf::context::EbpfContext<'_, '_>,
             e: &crate::script::Expr,

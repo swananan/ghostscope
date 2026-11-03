@@ -5,6 +5,7 @@ mod hash_table;
 mod indirect;
 mod nested;
 mod pieces;
+mod validation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ComplexFormatArgLayout {
@@ -315,6 +316,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         let format_string_index = self.trace_context.add_string(format.to_string())?;
         let template = FormatTemplate::parse(format)
             .map_err(|error| CodeGenError::TypeError(error.to_string()))?;
+        self.validate_format_argument_types(&template, args)?;
         let mut complex_args: Vec<ComplexArg<'ctx>> =
             Vec::with_capacity(template.wire_argument_count());
         let mut ai = 0usize; // arg cursor
@@ -502,19 +504,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                             let len_val = self.load_variable(name)?;
                             let (len_iv, byte_len) = match len_val {
                                 BasicValueEnum::IntValue(iv) => (iv, 8usize),
-                                BasicValueEnum::PointerValue(pv) => (
-                                    self.builder
-                                        .build_ptr_to_int(
-                                            pv,
-                                            self.context.i64_type(),
-                                            "len_ptr_to_i64",
-                                        )
-                                        .map_err(|e| CodeGenError::Builder(e.to_string()))?,
-                                    8usize,
-                                ),
                                 _ => {
                                     return Err(CodeGenError::TypeError(
-                                        "length must be integer/pointer".into(),
+                                        "length must be integer".into(),
                                     ))
                                 }
                             };

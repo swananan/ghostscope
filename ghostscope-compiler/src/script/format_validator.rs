@@ -21,8 +21,9 @@ impl FormatValidator {
             )));
         }
 
-        // TODO (phase 2): validate expression types against format specifiers
-        // e.g., {:x} requires integer or pointer; {:s} requires char*/bytes
+        // Type-dependent checks run during code generation, where script bindings
+        // and DWARF types are available. Hex/ASCII conversions accept value bytes,
+        // including aggregate payloads; they are not limited to scalar types.
 
         Ok(())
     }
