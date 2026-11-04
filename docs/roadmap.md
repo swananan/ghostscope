@@ -48,3 +48,7 @@ GhostScope is still evolving quickly. The milestones below are ordered from “s
 - Typical scenario: sources and debug info live in the cloud, while binaries run on test rigs or local hosts.
 - Goal: keep GhostScope’s TUI on the control side and run the eBPF agent on the target machine, similar to `gdb`/`gdbserver`.
 - This will come after the core functionality stabilizes to avoid diluting near-term focus.
+
+## Prepared trace bundles
+- The CLI `prepare` / `run-bundle` first milestone moves DWARF parsing and LLVM codegen out of repeated attach operations for host processes. See [Prepared trace bundles](prepared-traces.md) for compatibility requirements and current exclusions.
+- Follow-up work includes runtime PID-namespace binding and module-level CFI/symbol providers for backtraces.

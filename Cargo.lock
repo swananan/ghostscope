@@ -1033,6 +1033,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.12",
  "tokio",

@@ -76,6 +76,13 @@ pub fn compile_script_for_cli(
         }
     }
 
+    report_value_diagnostics(&compilation_result);
+    Ok(compilation_result)
+}
+
+pub(crate) fn report_value_diagnostics(
+    compilation_result: &ghostscope_compiler::CompilationResult,
+) {
     for config in &compilation_result.uprobe_configs {
         for message in config.trace_context.value_diagnostic_messages() {
             eprintln!(
@@ -85,7 +92,6 @@ pub fn compile_script_for_cli(
             );
         }
     }
-    Ok(compilation_result)
 }
 
 /// Compile and load script for command line mode using session.command_loaders.
@@ -98,6 +104,16 @@ pub async fn compile_and_load_script_for_cli(
     prepare_runtime_modules_before_compile(script, session, &mut compile_options).await?;
 
     let compilation_result = compile_script_for_cli(script, session, &compile_options)?;
+    load_compiled_script_for_cli(script, compilation_result, session, &compile_options, None).await
+}
+
+pub(crate) async fn load_compiled_script_for_cli(
+    script: &str,
+    compilation_result: ghostscope_compiler::CompilationResult,
+    session: &mut GhostSession,
+    compile_options: &ghostscope_compiler::CompileOptions,
+    attach_target: Option<&str>,
+) -> Result<()> {
     ensure_prefill_for_session_pid(session)?;
 
     let ghostscope_compiler::CompilationResult {
@@ -114,8 +130,14 @@ pub async fn compile_and_load_script_for_cli(
 
     let mut attached_count = 0;
     for config in &uprobe_configs {
-        match create_and_attach_loader(config, session.attach_pid(), session, &compile_options)
-            .await
+        match create_and_attach_loader(
+            config,
+            session.attach_pid(),
+            session,
+            compile_options,
+            attach_target,
+        )
+        .await
         {
             Ok(loader) => {
                 info!(

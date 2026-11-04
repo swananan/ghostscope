@@ -967,3 +967,10 @@ Invalid configuration will produce clear error messages with suggestions for fix
    - Monitor kernel memory usage when using large ringbuf sizes
    - Use smaller `proc_module_offsets_max_entries` for single-process debugging
    - Increase buffer size for high-frequency tracing scenarios
+
+## Prepared trace commands
+
+`ghostscope prepare -t TARGET --script-file SCRIPT -o BUNDLE` compiles without
+BPF privileges. `ghostscope run-bundle BUNDLE -p PID` uses the saved compilation
+configuration and skips DWARF parsing and LLVM codegen. See
+[Prepared trace bundles](prepared-traces.md) for runtime requirements and limits.

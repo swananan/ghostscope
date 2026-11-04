@@ -61,8 +61,14 @@ pub async fn compile_and_load_script_for_tui(
 
         let mut attached_count = 0;
         for config in &uprobe_configs {
-            match create_and_attach_loader(config, session.attach_pid(), session, &compile_options)
-                .await
+            match create_and_attach_loader(
+                config,
+                session.attach_pid(),
+                session,
+                &compile_options,
+                None,
+            )
+            .await
             {
                 Ok(loader) => {
                     info!(

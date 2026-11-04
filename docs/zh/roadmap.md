@@ -48,3 +48,7 @@ GhostScope 仍处在快速演进阶段，以下里程碑按照“优先修补基
 - 典型场景：代码与调试信息在云端，目标二进制运行在测试机或本地。
 - 规划让 GhostScope TUI 仅运行在控制端，eBPF Agent 独立驻留在目标主机，参考 `gdb/gdbserver` 模式。
 - 待核心能力稳定后再启动该特性，以免分散目前的开发精力。
+
+## 预编译 trace bundle
+- CLI `prepare` / `run-bundle` 首版将宿主机进程重复附加时的 DWARF 解析与 LLVM 编译前移。兼容要求和当前限制见[预编译 trace bundle](prepared-traces.md)。
+- 后续支持运行时 PID namespace 绑定，以及用于 backtrace 的模块级 CFI/符号提供器。

@@ -1,3 +1,4 @@
+mod bundle;
 mod cli;
 mod config;
 mod core;
@@ -16,9 +17,11 @@ async fn main() -> Result<()> {
     // Setup panic hook before doing anything else
     crate::util::setup_panic_hook();
 
-    // Parse command line arguments and route explicit maintenance commands
+    // Route explicit commands before privileged tracing setup (prepare is offline).
     let parsed_args = match config::Args::parse_args() {
         config::ParsedCommand::Trace(parsed_args) => *parsed_args,
+        config::ParsedCommand::Prepare(args) => return bundle::prepare(args).await,
+        config::ParsedCommand::RunBundle(args) => return bundle::run(args).await,
         config::ParsedCommand::Bpffs(config::BpffsCommand::Prune(prune_args)) => {
             return cli::run_bpffs_prune(&prune_args);
         }

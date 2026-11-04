@@ -9,4 +9,5 @@ mod tui;
 
 // Re-export main functions for convenience
 pub use cli::{compile_and_load_script_for_cli, compile_script_for_cli};
+pub(crate) use cli::{load_compiled_script_for_cli, report_value_diagnostics};
 pub use tui::compile_and_load_script_for_tui;
