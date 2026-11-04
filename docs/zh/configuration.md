@@ -922,3 +922,9 @@ GhostScope 在启动时验证配置：
    - 使用大缓冲区时监控内核内存使用情况
    - 单进程调试时使用较小的 `proc_module_offsets_max_entries`
    - 高频跟踪场景下增加缓冲区大小
+
+## 预编译 trace 命令
+
+`ghostscope prepare -t TARGET --script-file SCRIPT -o BUNDLE` 无需 BPF 权限即可编译。
+`ghostscope run-bundle BUNDLE -p PID` 使用保存的编译配置，跳过 DWARF 解析和 LLVM 编译。
+运行要求和当前限制见[预编译 trace bundle](prepared-traces.md)。

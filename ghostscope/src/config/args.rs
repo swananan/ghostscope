@@ -38,9 +38,50 @@ pub enum ScriptTimestampFormat {
 #[derive(Debug, Clone)]
 pub enum ParsedCommand {
     Trace(Box<ParsedArgs>),
+    Prepare(PrepareArgs),
+    RunBundle(RunBundleArgs),
     Bpffs(BpffsCommand),
     ScriptHelp,
     ValueDiagnosticsHelp,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct PrepareArgs {
+    /// Target module to compile against, without attaching to a process
+    #[arg(short = 't', long = "target", value_name = "PATH")]
+    pub target: String,
+    #[arg(
+        long,
+        required_unless_present = "script_file",
+        conflicts_with = "script_file"
+    )]
+    pub script: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub script_file: Option<PathBuf>,
+    /// New bundle file; an existing file is never overwritten
+    #[arg(short = 'o', long = "output")]
+    pub output: PathBuf,
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[arg(long)]
+    pub debug_file: Option<PathBuf>,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct RunBundleArgs {
+    pub bundle: PathBuf,
+    /// Host process to attach to
+    #[arg(short = 'p', long = "pid", value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64))]
+    pub pid: u32,
+    /// Location of an identical target module (defaults to the prepared path)
+    #[arg(short = 't', long = "target")]
+    pub target: Option<String>,
+    #[arg(long, value_enum, default_value = "pretty")]
+    pub script_output: ScriptOutputMode,
+    #[arg(long)]
+    pub no_status: bool,
+    #[arg(long, value_name = "TEXT", hide = true)]
+    pub emit_ready_marker: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +143,11 @@ impl BpffsPruneArgs {
 }
 
 #[derive(Subcommand, Debug)]
-enum BpffsTopLevelCommand {
+enum TopLevelCommand {
+    /// Compile a reusable trace bundle without BPF privileges
+    Prepare(PrepareArgs),
+    /// Attach a prepared trace bundle without DWARF parsing or LLVM codegen
+    RunBundle(RunBundleArgs),
     /// Manage GhostScope bpffs pin directories
     Bpffs(BpffsArgs),
 }
@@ -412,6 +457,12 @@ impl Args {
     }
 
     fn parse_args_from(args: Vec<String>) -> ParsedCommand {
+        if matches!(
+            args.get(1).map(String::as_str),
+            Some("prepare" | "run-bundle")
+        ) {
+            return Self::try_parse_dispatch(&args).unwrap_or_else(|e| e.exit());
+        }
         let bpffs_prune_invocation = Self::is_bpffs_prune_invocation(&args);
         let args_pos = args.iter().position(|arg| arg == "--args");
         if Self::is_reference_help_invocation(&args, args_pos) {
@@ -494,12 +545,13 @@ impl Args {
             .unwrap_or_else(|e| e.exit())
     }
 
-    fn command_with_bpffs() -> clap::Command {
-        BpffsTopLevelCommand::augment_subcommands(Args::command())
+    fn command_with_subcommands() -> clap::Command {
+        TopLevelCommand::augment_subcommands(Args::command())
     }
 
     fn try_parse_dispatch(args: &[String]) -> std::result::Result<ParsedCommand, clap::Error> {
-        let matches = Self::command_with_bpffs().try_get_matches_from(args.iter().cloned())?;
+        let matches =
+            Self::command_with_subcommands().try_get_matches_from(args.iter().cloned())?;
 
         if matches.get_flag("script_help") {
             return Ok(ParsedCommand::ScriptHelp);
@@ -508,6 +560,16 @@ impl Args {
             return Ok(ParsedCommand::ValueDiagnosticsHelp);
         }
 
+        if let Some(("prepare", sub_matches)) = matches.subcommand() {
+            return Ok(ParsedCommand::Prepare(PrepareArgs::from_arg_matches(
+                sub_matches,
+            )?));
+        }
+        if let Some(("run-bundle", sub_matches)) = matches.subcommand() {
+            return Ok(ParsedCommand::RunBundle(RunBundleArgs::from_arg_matches(
+                sub_matches,
+            )?));
+        }
         if let Some(("bpffs", sub_matches)) = matches.subcommand() {
             let bpffs = BpffsArgs::from_arg_matches(sub_matches)?;
             return Ok(ParsedCommand::Bpffs(match bpffs.command {
@@ -521,6 +583,12 @@ impl Args {
         Ok(ParsedCommand::Trace(Box::new(
             Self::parsed_trace_args_from_clap(parsed, binary_path, binary_args)?,
         )))
+    }
+
+    pub(crate) fn into_parsed(self) -> std::result::Result<ParsedArgs, clap::Error> {
+        let binary = self.binary.clone();
+        let remaining = self.remaining.clone();
+        Self::parsed_trace_args_from_clap(self, binary, remaining)
     }
 
     fn parsed_trace_args_from_clap(
@@ -798,7 +866,9 @@ mod tests {
 
     #[test]
     fn root_help_lists_bpffs_subcommand() {
-        let help = Args::command_with_bpffs().render_long_help().to_string();
+        let help = Args::command_with_subcommands()
+            .render_long_help()
+            .to_string();
         assert!(help.contains("bpffs"));
         assert!(help.contains("--script-help"));
         assert!(help.contains("--value-diagnostics-help"));

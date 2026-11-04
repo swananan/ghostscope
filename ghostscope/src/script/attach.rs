@@ -51,6 +51,7 @@ pub(super) async fn create_and_attach_loader(
     attach_pid: Option<u32>,
     session: &mut GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
+    attach_target: Option<&str>,
 ) -> Result<GhostScopeLoader> {
     info!(
         "Creating new eBPF loader with {} bytes of bytecode for trace_id {}",
@@ -252,7 +253,7 @@ pub(super) async fn create_and_attach_loader(
             function_name, uprobe_offset, config.binary_path, config.ebpf_function_name
         );
         loader.attach_uprobe_with_program_name(
-            &config.binary_path,
+            attach_target.unwrap_or(&config.binary_path),
             function_name,
             Some(uprobe_offset),
             attach_pid.map(|p| p as i32),
@@ -264,7 +265,7 @@ pub(super) async fn create_and_attach_loader(
             uprobe_offset, config.binary_path, config.ebpf_function_name
         );
         loader.attach_uprobe_with_program_name(
-            &config.binary_path,
+            attach_target.unwrap_or(&config.binary_path),
             &format!("0x{uprobe_offset:x}"),
             Some(uprobe_offset),
             attach_pid.map(|p| p as i32),

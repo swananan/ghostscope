@@ -364,6 +364,17 @@ async fn run_cli_with_session(
         return Err(e);
     }
 
+    monitor_cli_session(session, config).await
+}
+
+/// Share output, loss reporting, cancellation and teardown across compiled and prepared traces.
+pub(crate) async fn monitor_cli_session(
+    mut session: GhostSession,
+    config: &ResolvedConfig,
+) -> Result<()> {
+    let show_cli_status = should_print_cli_status(config);
+    let stderr_colors = crate::cli::color::CliColors::for_stderr(config.script_color_mode);
+
     // Step 8: Start event monitoring loop using trace_manager
     info!(
         "Starting event monitoring for {} active traces",
