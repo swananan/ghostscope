@@ -73,3 +73,6 @@ lazy_static = "1.4"
 serial_test = "3.0"
 criterion = "0.5"
 scopeguard = "1.2"
+
+[profile.release]
+lto = "fat"
