@@ -285,11 +285,8 @@ impl ProcessSysmon {
         }
     }
 
-    /// Start background monitoring thread and return immediately.
-    ///
-    /// In the next iteration we will attach eBPF tracepoints (sched_process_exec/exit/fork)
-    /// and stream events into this channel. For now, we ensure the pinned offsets map exists
-    /// and keep a placeholder loop that can be extended to consume a real source.
+    /// Start monitoring and wait for tracepoint attachment, event transport setup,
+    /// and initial offset prefill. Startup failures are logged before returning.
     pub fn start(&mut self) {
         let _ =
             pinned_bpf_maps::ensure_pinned_proc_offsets_exists(self.cfg.proc_offsets_max_entries);
@@ -305,6 +302,8 @@ impl ProcessSysmon {
         let pending = Arc::clone(&self.pending_offsets);
         let pending_map_refreshes = Arc::clone(&self.pending_map_refreshes);
         let cfg = self.cfg.clone();
+        #[cfg(feature = "sysmon-ebpf")]
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
 
         let handle = thread::Builder::new()
             .name("gs-sysmon".to_string())
@@ -312,7 +311,9 @@ impl ProcessSysmon {
                 info!("ProcessSysmon thread started");
                 #[cfg(feature = "sysmon-ebpf")]
                 {
-                    if let Err(e) = run_sysmon_loop(mgr, cfg, pending, pending_map_refreshes, tx) {
+                    if let Err(e) =
+                        run_sysmon_loop(mgr, cfg, pending, pending_map_refreshes, tx, ready_tx)
+                    {
                         error!("Sysmon loop error: {}", e);
                     }
                 }
@@ -334,6 +335,10 @@ impl ProcessSysmon {
                 error!("Failed to spawn ProcessSysmon thread: {}", e);
                 self.handle = None;
             }
+        }
+        #[cfg(feature = "sysmon-ebpf")]
+        if self.handle.is_some() && ready_rx.recv().is_err() {
+            error!("Sysmon initialization failed before monitoring became ready");
         }
     }
 
