@@ -35,6 +35,7 @@ impl SysmonWorker {
         pending: Arc<Mutex<PendingOffsets>>,
         pending_map_refreshes: Arc<Mutex<PendingMapRefreshes>>,
         tx: mpsc::SyncSender<SysEvent>,
+        ready: mpsc::SyncSender<()>,
     ) -> anyhow::Result<Self> {
         let queue = Arc::new(Mutex::new(SysmonWorkQueue::new(
             SYSMON_WORK_LIFECYCLE_QUEUE_CAPACITY,
@@ -47,6 +48,12 @@ impl SysmonWorker {
             .name("gs-sysmon-work".to_string())
             .spawn(move || {
                 info!("Sysmon work thread started");
+                // The collector can drain events while initial discovery runs.
+                // Callers must not advertise readiness until both are ready.
+                let resolver = sysmon_proc_pid_resolver(cfg.watched_pid, cfg.watched_proc_pid);
+                initialize_target_offsets(&mgr, cfg.target_module.as_deref(), &resolver);
+                info!("Sysmon: setup complete");
+                let _ = ready.send(());
                 if let Err(error) = run_sysmon_worker(
                     mgr,
                     cfg,
@@ -343,9 +350,6 @@ fn run_sysmon_worker(
     let proc_pid_for_map_change =
         cached_sysmon_proc_pid_resolver(cfg.watched_pid, cfg.watched_proc_pid);
 
-    initialize_target_offsets(&mgr, target.as_deref(), &proc_pid_for_event);
-    tracing::info!("Sysmon: setup complete");
-
     // Initial prefill already ran above. Do not make the first periodic module
     // refresh immediately due: for `-t executable`, the exec event is the fast
     // path that inserts proc_module_offsets and allowed_pids. A fallback /proc
@@ -385,6 +389,7 @@ pub(super) fn run_sysmon_loop(
     pending: Arc<Mutex<PendingOffsets>>,
     pending_map_refreshes: Arc<Mutex<PendingMapRefreshes>>,
     tx: mpsc::SyncSender<SysEvent>,
+    ready: mpsc::SyncSender<()>,
 ) -> anyhow::Result<()> {
     use aya::include_bytes_aligned;
     use aya::maps::{
@@ -414,7 +419,7 @@ pub(super) fn run_sysmon_loop(
     // Event loop: prefer ringbuf; fallback to perf
     if let Some(map) = bpf.take_map("sysmon_events") {
         let mut rb: RingBuf<MapData> = map.try_into()?;
-        let mut worker = SysmonWorker::spawn(mgr, cfg, pending, pending_map_refreshes, tx)?;
+        let mut worker = SysmonWorker::spawn(mgr, cfg, pending, pending_map_refreshes, tx, ready)?;
         loop {
             worker.ensure_running()?;
             let mut had_event = false;
@@ -464,7 +469,7 @@ pub(super) fn run_sysmon_loop(
         if bufs.is_empty() {
             return Err(anyhow::anyhow!("No perf buffers opened"));
         }
-        let mut worker = SysmonWorker::spawn(mgr, cfg, pending, pending_map_refreshes, tx)?;
+        let mut worker = SysmonWorker::spawn(mgr, cfg, pending, pending_map_refreshes, tx, ready)?;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(10));
             worker.ensure_running()?;

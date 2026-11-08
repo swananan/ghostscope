@@ -78,14 +78,10 @@ int main(void) {
     };
     let mut sysmon = ProcessSysmon::new(Arc::new(Mutex::new(ProcessManager::new())), config);
     sysmon.start();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !pinned_bpf_maps::allowed_pid_exists(parent).unwrap_or(false) {
-        ensure!(
-            Instant::now() < deadline,
-            "sysmon did not initialize parent offsets"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    ensure!(
+        pinned_bpf_maps::allowed_pid_exists(parent)?,
+        "sysmon start returned before initial parent prefill"
+    );
     let send = |target: &mut std::process::Child, command: &[u8]| -> Result<()> {
         target
             .stdin
@@ -104,9 +100,8 @@ int main(void) {
         "worker exit removed the parent allowlist entry"
     );
     send(&mut target, b"f")?;
-    let fork = sysmon
-        .recv_timeout(Duration::from_secs(5))
-        .context("missing child fork event")?;
+    let fork =
+        recv_lifecycle(&sysmon, Duration::from_secs(5)).context("missing child fork event")?;
     ensure!(
         fork.event_kind() == Some(SysEventKind::Fork) && fork.tgid != parent,
         "fork reported the parent: {fork:?}"
@@ -116,9 +111,8 @@ int main(void) {
         "child was not prefilled"
     );
     send(&mut target, b"c")?;
-    let exit = sysmon
-        .recv_timeout(Duration::from_secs(5))
-        .context("missing child exit event")?;
+    let exit =
+        recv_lifecycle(&sysmon, Duration::from_secs(5)).context("missing child exit event")?;
     ensure!(
         exit.event_kind() == Some(SysEventKind::Exit) && exit.tgid == fork.tgid,
         "wrong child exit: {exit:?}"
@@ -137,8 +131,7 @@ int main(void) {
         "leader exit removed process state"
     );
     send(&mut target, b"x")?;
-    let exit = sysmon
-        .recv_timeout(Duration::from_secs(5))
+    let exit = recv_lifecycle(&sysmon, Duration::from_secs(5))
         .context("missing last-thread exit event")?;
     ensure!(
         exit.event_kind() == Some(SysEventKind::Exit) && exit.tgid == parent,
