@@ -182,7 +182,7 @@ fn emit_fork<C: EbpfContext>(ctx: &C, child: u64) -> u32 {
 
 #[inline(always)]
 fn emit_exit<C: EbpfContext>(ctx: &C) -> u32 {
-    if !event_enabled(SYS_EVENT_MASK_EXIT) || !thread_group_dead() {
+    if !event_enabled(SYS_EVENT_MASK_EXIT) {
         return 0;
     }
     let host_pid = current_host_tgid();
@@ -192,6 +192,9 @@ fn emit_exit<C: EbpfContext>(ctx: &C) -> u32 {
     }
     let event_pid = current_event_tgid(host_pid, pid);
     if ALLOWED_PIDS.get_ptr(&pid).is_none() && ALLOWED_PIDS.get_ptr(&event_pid).is_none() {
+        return 0;
+    }
+    if !thread_group_dead() {
         return 0;
     }
     let ev = SysEvent {
