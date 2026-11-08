@@ -1628,7 +1628,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         expr_index: u16,
         name_prefix: &str,
     ) -> Result<()> {
-        let cond_err_ptr = self.get_or_create_cond_error_global();
+        let cond_err_ptr = self.get_or_create_cond_error_slot()?;
         let err_code = self
             .builder
             .build_load(
@@ -1638,7 +1638,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .into_int_value();
-        let cond_err_addr_ptr = self.get_or_create_cond_error_addr_global();
+        let cond_err_addr_ptr = self.get_or_create_cond_error_addr_slot()?;
         let err_addr = self
             .builder
             .build_load(
@@ -1648,7 +1648,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
             .into_int_value();
-        let cond_err_flags_ptr = self.get_or_create_cond_error_flags_global();
+        let cond_err_flags_ptr = self.get_or_create_cond_error_flags_slot()?;
         let err_flags = self
             .builder
             .build_load(

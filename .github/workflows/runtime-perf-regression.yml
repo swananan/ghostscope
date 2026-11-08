@@ -143,7 +143,14 @@ jobs:
         run: |
           set -euo pipefail
           cargo_path=$(command -v cargo)
-          sudo -E env \
+          sudo env \
+            PATH="$PATH" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" \
+            LLVM_SYS_221_PREFIX="$LLVM_SYS_221_PREFIX" \
+            RUST_BACKTRACE="$RUST_BACKTRACE" \
+            GHOSTSCOPE_RUNTIME_BENCH_FAIL_ON_REGRESSION="$GHOSTSCOPE_RUNTIME_BENCH_FAIL_ON_REGRESSION" \
             CARGO_TARGET_DIR="$CARGO_TARGET_DIR/head" \
             GHOSTSCOPE_RUNTIME_BENCH_BIN="$CARGO_TARGET_DIR/head/release/ghostscope" \
             GHOSTSCOPE_RUNTIME_BENCH_BASE_BIN="$CARGO_TARGET_DIR/base/release/ghostscope" \

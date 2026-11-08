@@ -516,7 +516,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let compile_context = self.get_compile_time_context()?.clone();
         let status_ptr = if self.condition_context_active {
-            Some(self.get_or_create_cond_error_global())
+            Some(self.get_or_create_cond_error_slot()?)
         } else {
             None
         };

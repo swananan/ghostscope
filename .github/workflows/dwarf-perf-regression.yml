@@ -18,7 +18,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
 
 jobs:
   regression:
@@ -79,12 +78,10 @@ jobs:
           fetch-depth: 1
           submodules: recursive
 
-      - name: Install LLVM 18 and jq
+      - name: Install jq
         run: |
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 18
-          sudo apt-get install -y llvm-18-dev libpolly-18-dev jq
+          sudo apt-get update
+          sudo apt-get install -y jq
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.98.0

@@ -71,27 +71,41 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
-    pub(super) fn allocate_backtrace_scratch(&self) -> Result<BtScratch<'ctx>> {
+    // Backtrace statements finish using these temporary slots before the next
+    // statement starts. Reuse them within each function so invocation-local
+    // flags and read buffers still fit alongside multiple backtraces.
+    pub(super) fn allocate_backtrace_scratch(&mut self) -> Result<BtScratch<'ctx>> {
         let i16_type = self.context.i16_type();
         let i32_type = self.context.i32_type();
         let i64_type = self.context.i64_type();
 
         Ok(BtScratch {
             row: RuntimeBtRowScratch {
-                found_ptr: self.build_entry_alloca(i32_type, "bt_row_found")?,
-                cfa_register_ptr: self.build_entry_alloca(i16_type, "bt_row_cfa_register")?,
-                cfa_offset_ptr: self.build_entry_alloca(i64_type, "bt_row_cfa_offset")?,
-                ra_kind_ptr: self.build_entry_alloca(self.context.i8_type(), "bt_row_ra_kind")?,
-                ra_register_ptr: self.build_entry_alloca(i16_type, "bt_row_ra_register")?,
-                ra_offset_ptr: self.build_entry_alloca(i64_type, "bt_row_ra_offset")?,
-                rbp_kind_ptr: self.build_entry_alloca(self.context.i8_type(), "bt_row_rbp_kind")?,
-                rbp_register_ptr: self.build_entry_alloca(i16_type, "bt_row_rbp_register")?,
-                rbp_offset_ptr: self.build_entry_alloca(i64_type, "bt_row_rbp_offset")?,
+                found_ptr: self.get_or_create_invocation_scratch("bt_row_found", i32_type)?,
+                cfa_register_ptr: self
+                    .get_or_create_invocation_scratch("bt_row_cfa_register", i16_type)?,
+                cfa_offset_ptr: self
+                    .get_or_create_invocation_scratch("bt_row_cfa_offset", i64_type)?,
+                ra_kind_ptr: self
+                    .get_or_create_invocation_scratch("bt_row_ra_kind", self.context.i8_type())?,
+                ra_register_ptr: self
+                    .get_or_create_invocation_scratch("bt_row_ra_register", i16_type)?,
+                ra_offset_ptr: self
+                    .get_or_create_invocation_scratch("bt_row_ra_offset", i64_type)?,
+                rbp_kind_ptr: self
+                    .get_or_create_invocation_scratch("bt_row_rbp_kind", self.context.i8_type())?,
+                rbp_register_ptr: self
+                    .get_or_create_invocation_scratch("bt_row_rbp_register", i16_type)?,
+                rbp_offset_ptr: self
+                    .get_or_create_invocation_scratch("bt_row_rbp_offset", i64_type)?,
             },
-            next_rbp_ptr: self.build_entry_alloca(i64_type, "bt_next_rbp")?,
-            next_rbp_available_ptr: self
-                .build_entry_alloca(self.context.bool_type(), "bt_next_rbp_available")?,
-            next_error_code_ptr: self.build_entry_alloca(i16_type, "bt_next_error_code")?,
+            next_rbp_ptr: self.get_or_create_invocation_scratch("bt_next_rbp", i64_type)?,
+            next_rbp_available_ptr: self.get_or_create_invocation_scratch(
+                "bt_next_rbp_available",
+                self.context.bool_type(),
+            )?,
+            next_error_code_ptr: self
+                .get_or_create_invocation_scratch("bt_next_error_code", i16_type)?,
         })
     }
 
