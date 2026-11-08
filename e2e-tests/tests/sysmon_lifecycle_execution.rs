@@ -31,12 +31,15 @@ fn test_sysmon_process_lifecycle() -> Result<()> {
 void *worker(void *p) { return p; }
 void *last_thread(void *p) { getchar(); return p; }
 int main(void) {
+    /* Older unshare --fork passes SIGTERM ignored through exec. Exercise that
+     * disposition on every host, and use SIGKILL for the child exit below. */
+    signal(SIGTERM, SIG_IGN);
     int command; pid_t child = 0;
     while ((command = getchar()) != EOF) {
         pthread_t thread;
         if (command == 'w') { pthread_create(&thread, 0, worker, 0); pthread_join(thread, 0); }
-        if (command == 'f') { child = fork(); if (!child) { for (;;) pause(); } }
-        if (command == 'c') { kill(child, SIGTERM); waitpid(child, 0, 0); }
+        if (command == 'f') { child = fork(); if (child < 0) return 2; if (!child) { for (;;) pause(); } }
+        if (command == 'c') { if (child <= 0 || kill(child, SIGKILL)) return 2; waitpid(child, 0, 0); }
         if (command == 'l') { pthread_create(&thread, 0, last_thread, 0); pthread_exit(0); }
     }
     return 0;
