@@ -88,7 +88,16 @@ int main(int argc, char **argv) {
         let (binary_command, args) = SandboxHandle::host().ghostscope_command()?;
         ensure!(args.is_empty(), "expected a direct host executable");
         let ghostscope = directory.path().join("ghostscope");
-        fs::copy(PathBuf::from(binary_command), &ghostscope)?;
+        // Keep writable executable descriptors out of this multithreaded test
+        // process: another test can fork while fs::copy holds the destination
+        // open, retaining that writer until exec and causing ETXTBSY here.
+        successful(
+            Command::new("cp")
+                .arg("--")
+                .arg(binary_command)
+                .arg(&ghostscope)
+                .output()?,
+        )?;
         fs::set_permissions(&ghostscope, fs::Permissions::from_mode(0o755))?;
         Ok(Self {
             directory,
