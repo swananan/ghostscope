@@ -19,7 +19,7 @@ use aya_ebpf::{
 pub struct SysEvent {
     /// Runtime TGID in the configured sysmon event namespace when available.
     pub tgid: u32,
-    /// Host/initial-namespace TGID from bpf_get_current_pid_tgid().
+    /// Host/initial-namespace TGID of the event subject (the child for fork).
     pub host_tgid: u32,
     pub kind: u32, // 1=Exec,2=Fork,3=Exit,4=MapChange
 }
@@ -69,6 +69,62 @@ static SYSMON_EVENT_PID_NS_INO: Array<u64> = Array::with_max_entries(1, 0);
 #[map(name = "sysmon_map_change_unfiltered")]
 static SYSMON_MAP_CHANGE_UNFILTERED: Array<u32> = Array::with_max_entries(1, 0);
 
+// Kernel BTF member offsets, configured by userspace before any attachment.
+// pid, tgid, signal, live, thread_pid, level, numbers, nr, ns, ns_common, inum, sizeof(upid).
+#[map(name = "sysmon_task_layout")]
+static TASK_LAYOUT: Array<[u32; 12]> = Array::with_max_entries(1, 0);
+
+#[inline(always)]
+fn kernel_read<T: Copy>(base: u64, offset: u32) -> Option<T> {
+    // SAFETY: probe_read_kernel validates the kernel address and returns an error
+    // rather than dereferencing an invalid pointer. Offsets come from kernel BTF.
+    unsafe { aya_ebpf::helpers::bpf_probe_read_kernel((base + offset as u64) as *const T).ok() }
+}
+
+#[inline(always)]
+fn child_identity(child: u64) -> Option<(u32, u32)> {
+    let layout = TASK_LAYOUT.get(0)?;
+    let host_tgid = kernel_read::<u32>(child, layout[1])?;
+    if host_tgid == 0 || kernel_read::<u32>(child, layout[0])? != host_tgid {
+        return None; // CLONE_THREAD does not create a process.
+    }
+    let ns_ino = *SYSMON_EVENT_PID_NS_INO.get(0)?;
+    if ns_ino == 0 {
+        return Some((host_tgid, host_tgid));
+    }
+    let pid = kernel_read::<u64>(child, layout[4])?;
+    let level = kernel_read::<u32>(pid, layout[5])?;
+    // Linux bounds PID namespace nesting to 32. Match the configured namespace,
+    // not the child's innermost namespace (which may differ after clone).
+    for index in 0..=32u32 {
+        if index > level {
+            break;
+        }
+        let upid = pid + layout[6] as u64 + index as u64 * layout[11] as u64;
+        let ns = kernel_read::<u64>(upid, layout[8])?;
+        let ino = kernel_read::<u32>(ns + layout[9] as u64, layout[10])?;
+        if ino as u64 == ns_ino {
+            return Some((kernel_read::<u32>(upid, layout[7])?, host_tgid));
+        }
+    }
+    None
+}
+
+#[inline(always)]
+fn thread_group_dead() -> bool {
+    let Some(layout) = TASK_LAYOUT.get(0) else {
+        return false;
+    };
+    // signal->live is decremented before sched_process_exit, including on
+    // kernels predating its group_dead argument. A leader may exit first.
+    // SAFETY: this helper takes no arguments and returns the current task address.
+    let task = unsafe { aya_ebpf::helpers::bpf_get_current_task() };
+    let Some(signal) = kernel_read::<u64>(task, layout[2]) else {
+        return false;
+    };
+    kernel_read::<u32>(signal, layout[3]) == Some(0)
+}
+
 fn write_event<C: EbpfContext>(ctx: &C, ev: SysEvent) {
     if SYS_EVENTS.output::<SysEvent>(&ev, 0).is_err() {
         SYS_EVENTS_PERF.output(ctx, &ev, 0);
@@ -99,7 +155,7 @@ fn emit_exec<C: EbpfContext>(ctx: &C) -> u32 {
 }
 
 #[inline(always)]
-fn emit_fork<C: EbpfContext>(ctx: &C) -> u32 {
+fn emit_fork<C: EbpfContext>(ctx: &C, child: u64) -> u32 {
     if !event_enabled(SYS_EVENT_MASK_FORK) {
         return 0;
     }
@@ -112,9 +168,12 @@ fn emit_fork<C: EbpfContext>(ctx: &C) -> u32 {
     if ALLOWED_PIDS.get_ptr(&pid).is_none() && ALLOWED_PIDS.get_ptr(&event_pid).is_none() {
         return 0;
     }
+    let Some((child_pid, child_host_pid)) = child_identity(child) else {
+        return 0;
+    };
     let ev = SysEvent {
-        tgid: event_pid,
-        host_tgid: host_pid,
+        tgid: child_pid,
+        host_tgid: child_host_pid,
         kind: SYS_EVENT_FORK,
     };
     write_event(ctx, ev);
@@ -123,7 +182,7 @@ fn emit_fork<C: EbpfContext>(ctx: &C) -> u32 {
 
 #[inline(always)]
 fn emit_exit<C: EbpfContext>(ctx: &C) -> u32 {
-    if !event_enabled(SYS_EVENT_MASK_EXIT) {
+    if !event_enabled(SYS_EVENT_MASK_EXIT) || !thread_group_dead() {
         return 0;
     }
     let host_pid = current_host_tgid();
@@ -324,11 +383,6 @@ pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
     emit_exec(&ctx)
 }
 
-#[tracepoint(name = "sched_process_fork", category = "sched")]
-pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
-    emit_fork(&ctx)
-}
-
 #[tracepoint(name = "sched_process_exit", category = "sched")]
 pub fn sched_process_exit(ctx: TracePointContext) -> u32 {
     emit_exit(&ctx)
@@ -361,7 +415,7 @@ pub fn raw_sched_process_exec(ctx: RawTracePointContext) -> u32 {
 
 #[raw_tracepoint(tracepoint = "sched_process_fork")]
 pub fn raw_sched_process_fork(ctx: RawTracePointContext) -> u32 {
-    emit_fork(&ctx)
+    emit_fork(&ctx, ctx.arg::<u64>(1))
 }
 
 #[raw_tracepoint(tracepoint = "sched_process_exit")]
@@ -376,7 +430,7 @@ pub fn btf_sched_process_exec(ctx: BtfTracePointContext) -> u32 {
 
 #[btf_tracepoint(function = "sched_process_fork")]
 pub fn btf_sched_process_fork(ctx: BtfTracePointContext) -> u32 {
-    emit_fork(&ctx)
+    emit_fork(&ctx, ctx.arg::<u64>(1))
 }
 
 #[btf_tracepoint(function = "sched_process_exit")]
