@@ -332,6 +332,17 @@ pub(super) fn attach_classic_sysmon_tracepoints(bpf: &mut aya::Ebpf) -> anyhow::
     use aya::programs::TracePoint;
 
     for spec in SYSMON_TRACEPOINTS {
+        // A classic fork record contains a child TID, not its task pointer or
+        // namespace identity. Use the raw hook for fork even in this fallback.
+        if spec.event == "sched_process_fork" {
+            let prog = bpf
+                .program_mut(spec.raw_program)
+                .ok_or_else(|| anyhow::anyhow!("missing raw fork program"))?;
+            let tp: &mut aya::programs::RawTracePoint = prog.try_into()?;
+            tp.load()?;
+            tp.attach(spec.event)?;
+            continue;
+        }
         let prog = bpf.program_mut(spec.classic_program).ok_or_else(|| {
             anyhow::anyhow!("missing program '{}' in sysmon-bpf", spec.classic_program)
         })?;
@@ -402,6 +413,14 @@ pub(super) fn load_and_attach_sysmon_bpf(
         tracing::info!("Sysmon: trying {} backend", backend.label());
         let result = (|| {
             let mut bpf = load_sysmon_bpf(obj, use_verbose)?;
+            if cfg.event_mask.fork || cfg.event_mask.exit {
+                let layout = super::kernel_layout::lifecycle_layout()?;
+                let map = bpf
+                    .map_mut("sysmon_task_layout")
+                    .ok_or_else(|| anyhow::anyhow!("missing sysmon task layout map"))?;
+                let mut array: aya::maps::Array<_, [u32; 12]> = map.try_into()?;
+                array.set(0, &layout, 0)?;
+            }
             configure_sysmon_exec_comm_filter(&mut bpf, cfg.target_module.as_deref())?;
             configure_sysmon_event_filter(
                 &mut bpf,

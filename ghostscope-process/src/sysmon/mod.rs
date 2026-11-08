@@ -133,7 +133,7 @@ impl Default for SysmonEventMask {
 pub struct SysEvent {
     /// Runtime TGID in the configured sysmon event namespace when available.
     pub tgid: u32,
-    /// Host/initial-namespace TGID from bpf_get_current_pid_tgid().
+    /// Host/initial-namespace TGID of the event subject (the child for fork).
     pub host_tgid: u32,
     pub kind: u32, // 1=exec,2=fork,3=exit,4=map-change
 }
@@ -178,6 +178,8 @@ const SYSMON_EVENT_MASK_MAP_CHANGE: u32 = 1 << 3;
 #[cfg(feature = "sysmon-ebpf")]
 mod attach;
 mod events;
+#[cfg(feature = "sysmon-ebpf")]
+mod kernel_layout;
 mod offset_refresh;
 mod pending;
 mod pid_alias;
@@ -428,20 +430,18 @@ impl ProcessSysmon {
                         let _ = crate::pinned_bpf_maps::insert_allowed_pid(host_pid);
                     }
                 }
-                if kind == SysEventKind::Exec {
-                    if let Some(tpath) = target {
-                        if inserted {
-                            if let Ok(mut guard) = pending.lock() {
-                                guard.remove(ev.tgid);
-                            }
-                        } else if let Ok(mut guard) = pending.lock() {
-                            tracing::debug!(
-                                "Sysmon: event pid {} (proc pid {}) prefill inserted no matching offsets; scheduling retry",
-                                ev.tgid,
-                                proc_pid
-                            );
-                            guard.register(ev.tgid, tpath.as_path());
+                if let Some(tpath) = target {
+                    if inserted {
+                        if let Ok(mut guard) = pending.lock() {
+                            guard.remove(ev.tgid);
                         }
+                    } else if let Ok(mut guard) = pending.lock() {
+                        tracing::debug!(
+                            "Sysmon: event pid {} (proc pid {}) prefill inserted no matching offsets; scheduling retry",
+                            ev.tgid,
+                            proc_pid
+                        );
+                        guard.register(ev.tgid, tpath.as_path());
                     }
                 }
             }

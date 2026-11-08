@@ -15,3 +15,16 @@ The script expects:
 - `clang`, `llc`, and `bpftool` available on `PATH`
 
 Additional details are documented in the workspace README: <https://github.com/swananan/ghostscope#readme>.
+
+## Sysmon lifecycle tracking
+
+Fork and exit tracking requires kernel BTF at `/sys/kernel/btf/vmlinux`
+(`CONFIG_DEBUG_INFO_BTF`). Sysmon resolves task and PID-namespace field offsets
+before attaching its prebuilt probes; it does not assume a particular kernel
+layout or the newer `sched_process_exit` `group_dead` argument. If BTF is
+unavailable, lifecycle startup reports an error. PID-mode map-change monitoring
+does not require these offsets.
+
+Fork probes use raw or BTF tracepoints to access the child task. The classic
+tracepoint fallback also uses a raw fork hook, because a classic fork record
+only supplies the child TID, not its TGID and namespace identity.
