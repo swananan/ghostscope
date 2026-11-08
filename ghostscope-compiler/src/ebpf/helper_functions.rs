@@ -122,19 +122,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         }
 
-        let buffer_name = format!("_temp_read_buffer_{result_size}");
-        let global_buffer = match self.module.get_global(&buffer_name) {
-            Some(existing) => existing.as_pointer_value(),
-            None => {
-                let array_type = self.context.i8_type().array_type(result_size as u32);
-                let global =
-                    self.module
-                        .add_global(array_type, Some(AddressSpace::default()), &buffer_name);
-                global.set_initializer(&array_type.const_zero());
-                global.as_pointer_value()
-            }
-        };
-        Ok(global_buffer)
+        // An i64 slot provides the alignment required by U64/pointer loads.
+        // Reuse it within this invocation, never through shared .bss storage.
+        self.get_or_create_invocation_scratch("probe_read_scratch", self.context.i64_type())
     }
 
     pub fn lookup_proc_pid_alias(
@@ -1035,6 +1025,17 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         let result_size = size.bytes();
         let scratch_buffer = self.get_probe_read_scratch_buffer(result_size, name_suffix)?;
+        let scratch_type = match size {
+            MemoryAccessSize::U8 => self.context.i8_type(),
+            MemoryAccessSize::U16 => self.context.i16_type(),
+            MemoryAccessSize::U32 => self.context.i32_type(),
+            MemoryAccessSize::U64 => self.context.i64_type(),
+        };
+        // A missing module issues a zero-sized read; initialize on every use so
+        // that path cannot consume a previous read's value or uninitialized stack.
+        self.builder
+            .build_store(scratch_buffer, scratch_type.const_zero())
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         let dst_ptr = self
             .builder
             .build_bit_cast(scratch_buffer, ptr_type, "dst_ptr")
@@ -1140,7 +1141,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .builder
             .build_int_z_extend(combined_fail, i8_type, &format!("fail_i8_{name_suffix}"))
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
-        let fail_ptr = self.get_or_create_flag_global("_gs_any_fail");
+        let fail_ptr = self.get_or_create_flag_slot("_gs_any_fail")?;
         let cur_fail = self
             .builder
             .build_load(i8_type, fail_ptr, &format!("cur_fail_{name_suffix}"))
@@ -2060,6 +2061,102 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 mod architecture_tests {
     use super::*;
     use ghostscope_platform::ProbeRegister;
+    use inkwell::values::BasicValue;
+
+    #[test]
+    fn event_scratch_is_local_to_each_generated_function() {
+        let context = inkwell::context::Context::create();
+        let options = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "event_scratch", Some(0), &options).unwrap();
+        let mut previous_slots = None;
+        for name in ["main_probe", "tail_program"] {
+            ctx.create_basic_ebpf_function(name).unwrap();
+            let function = ctx.current_function("test").unwrap();
+            let entry = function.get_first_basic_block().unwrap();
+            let body = context.append_basic_block(function, "body");
+            ctx.builder.build_unconditional_branch(body).unwrap();
+            ctx.builder.position_at_end(body);
+
+            // Discover scratch after entry is terminated: allocations and initial
+            // stores must still dominate their uses, including in another program.
+            ctx.mark_any_fail().unwrap();
+            ctx.mark_any_success().unwrap();
+            ctx.reset_condition_error().unwrap();
+            ctx.condition_context_active = true;
+            ctx.set_condition_error_if_unset(1).unwrap();
+            ctx.set_condition_error_addr_if_unset(context.i64_type().const_int(123, false))
+                .unwrap();
+            ctx.or_condition_error_flags(context.i8_type().const_int(1, false))
+                .unwrap();
+            ctx.build_condition_error_predicate().unwrap();
+            let slots = [
+                ctx.get_or_create_flag_slot("_gs_any_fail").unwrap(),
+                ctx.get_or_create_flag_slot("_gs_any_success").unwrap(),
+                ctx.get_or_create_cond_error_slot().unwrap(),
+                ctx.get_or_create_cond_error_addr_slot().unwrap(),
+                ctx.get_or_create_cond_error_flags_slot().unwrap(),
+                ctx.get_probe_read_scratch_buffer(8, "first").unwrap(),
+            ];
+            assert_eq!(
+                slots[5],
+                ctx.get_probe_read_scratch_buffer(8, "second").unwrap()
+            );
+            for slot in slots {
+                assert_eq!(
+                    slot.as_instruction_value().unwrap().get_parent(),
+                    Some(entry)
+                );
+            }
+            if let Some(previous) = previous_slots {
+                for (current, previous) in slots.iter().zip(previous) {
+                    assert_ne!(*current, previous);
+                }
+            }
+            previous_slots = Some(slots);
+            assert_eq!(ctx.builder.get_insert_block(), Some(body));
+            ctx.builder
+                .build_return(Some(&context.i32_type().const_zero()))
+                .unwrap();
+        }
+        ctx.module.verify().unwrap();
+        assert_eq!(ctx.module.get_globals().count(), 0);
+    }
+
+    #[test]
+    fn scalar_reads_never_use_shared_globals() {
+        for with_map_key in [false, true] {
+            let context = inkwell::context::Context::create();
+            let options = crate::CompileOptions::default();
+            let mut ctx = EbpfContext::new(&context, "scalar_scratch", Some(0), &options).unwrap();
+            ctx.create_basic_ebpf_function("probe").unwrap();
+            if with_map_key {
+                ctx.__test_alloc_pm_key().unwrap();
+            }
+            for size in [
+                MemoryAccessSize::U8,
+                MemoryAccessSize::U16,
+                MemoryAccessSize::U32,
+                MemoryAccessSize::U64,
+            ] {
+                for found in [true, false] {
+                    let address = RuntimeAddress::with_offsets_found(
+                        context.i64_type().const_int(0x1000, false),
+                        context.bool_type().const_int(u64::from(found), false),
+                    );
+                    ctx.generate_memory_read(address, size, None).unwrap();
+                }
+            }
+            ctx.builder
+                .build_return(Some(&context.i32_type().const_zero()))
+                .unwrap();
+            ctx.module.verify().unwrap();
+            assert_eq!(ctx.module.get_globals().count(), 0);
+            let ir = ctx.module.print_to_string().to_string();
+            // There is one aligned fallback slot even with repeated mixed-width reads.
+            assert_eq!(ir.matches("alloca i64").count(), 1, "{ir}");
+            assert!(ir.contains("alloca i64, align 8"), "{ir}");
+        }
+    }
 
     #[test]
     fn probe_pc_and_sp_use_context_slots_not_assumed_dwarf_numbers() {

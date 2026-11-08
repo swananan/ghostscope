@@ -75,7 +75,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     expr.ops().len()
                 );
                 let runtime_status_ptr = if self.condition_context_active {
-                    Some(self.get_or_create_cond_error_global())
+                    Some(self.get_or_create_cond_error_slot()?)
                 } else {
                     status_ptr
                 };
@@ -100,7 +100,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             ghostscope_dwarf::PlannedValue::AddressValue { address, .. } => {
                 debug!("Generating address direct value for variable: {var_name}");
                 let runtime_status_ptr = if self.condition_context_active {
-                    Some(self.get_or_create_cond_error_global())
+                    Some(self.get_or_create_cond_error_slot()?)
                 } else {
                     status_ptr
                 };
@@ -485,7 +485,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         module_hint: Option<&str>,
     ) -> Result<BasicValueEnum<'ctx>> {
         let runtime_status_ptr = if self.condition_context_active {
-            Some(self.get_or_create_cond_error_global())
+            Some(self.get_or_create_cond_error_slot()?)
         } else {
             status_ptr
         };

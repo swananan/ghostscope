@@ -214,7 +214,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         if let Some(plan) = self.query_dwarf_for_complex_expr(expr)? {
             let status_ptr = if self.condition_context_active {
-                Some(self.get_or_create_cond_error_global())
+                Some(self.get_or_create_cond_error_slot()?)
             } else {
                 None
             };

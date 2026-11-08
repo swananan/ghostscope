@@ -656,8 +656,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 .map_err(|e| CodeGenError::LLVMError(format!("Failed to get status GEP: {e}")))?
         };
         // Compute execution_status from runtime flags _gs_any_fail and _gs_any_success
-        let any_fail_ptr = self.get_or_create_flag_global("_gs_any_fail");
-        let any_succ_ptr = self.get_or_create_flag_global("_gs_any_success");
+        let any_fail_ptr = self.get_or_create_flag_slot("_gs_any_fail")?;
+        let any_succ_ptr = self.get_or_create_flag_slot("_gs_any_success")?;
 
         let any_fail_val = self
             .builder

@@ -165,6 +165,8 @@ pub struct EbpfContext<'ctx, 'dw> {
     // Function-local storage prevents main and tail-call programs from sharing a pointer.
     pub(crate) event_accumulation_buffers:
         HashMap<FunctionValue<'ctx>, inkwell::values::PointerValue<'ctx>>,
+    // Invocation-local scratch, cached separately for each generated BPF function.
+    invocation_scratch: HashMap<(FunctionValue<'ctx>, String), PointerValue<'ctx>>,
     // Sequence numbers keep verifier-oriented llvm.bpf.passthrough calls
     // distinct while LLVM optimizes the generated module.
     pub(super) next_bpf_passthrough_sequence: u32,
@@ -318,6 +320,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             tls_scratch_alloca: None,
             event_offset_alloca: None,
             event_accumulation_buffers: HashMap::new(),
+            invocation_scratch: HashMap::new(),
             next_bpf_passthrough_sequence: 0,
             compile_time_event_bytes_upper_bound: 0,
             compile_options: compile_options.clone(),
@@ -1119,22 +1122,45 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
-    /// Get or create a global i8 flag by name, initialized to 0
-    pub fn get_or_create_flag_global(&mut self, name: &str) -> PointerValue<'ctx> {
-        if let Some(g) = self.module.get_global(name) {
-            return g.as_pointer_value();
+    /// Allocate zero-initialized invocation-local storage in the current function's
+    /// entry block. A separate builder preserves the caller's insertion point.
+    pub(crate) fn get_or_create_invocation_scratch(
+        &mut self,
+        name: &str,
+        ty: IntType<'ctx>,
+    ) -> Result<PointerValue<'ctx>> {
+        let function = self.current_function("allocate invocation scratch")?;
+        let key = (function, name.to_owned());
+        if let Some(ptr) = self.invocation_scratch.get(&key) {
+            return Ok(*ptr);
         }
-        let i8_type = self.context.i8_type();
-        let global = self
-            .module
-            .add_global(i8_type, Some(AddressSpace::default()), name);
-        global.set_initializer(&i8_type.const_zero());
-        global.as_pointer_value()
+        let entry = function.get_first_basic_block().ok_or_else(|| {
+            CodeGenError::LLVMError("no entry block for invocation scratch".to_string())
+        })?;
+        let builder = self.context.create_builder();
+        if let Some(first) = entry.get_first_instruction() {
+            builder.position_before(&first);
+        } else {
+            builder.position_at_end(entry);
+        }
+        let ptr = builder
+            .build_alloca(ty, name)
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        builder
+            .build_store(ptr, ty.const_zero())
+            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        self.invocation_scratch.insert(key, ptr);
+        Ok(ptr)
     }
 
-    /// Set a flag global to a constant u8 value at runtime
+    /// Get an invocation-local execution flag, initialized to zero at entry.
+    pub fn get_or_create_flag_slot(&mut self, name: &str) -> Result<PointerValue<'ctx>> {
+        self.get_or_create_invocation_scratch(name, self.context.i8_type())
+    }
+
+    /// Set an invocation-local flag to a constant u8 value at runtime
     pub fn store_flag_value(&mut self, name: &str, value: u8) -> Result<()> {
-        let ptr = self.get_or_create_flag_global(name);
+        let ptr = self.get_or_create_flag_slot(name)?;
         self.builder
             .build_store(ptr, self.context.i8_type().const_int(value as u64, false))
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to store flag {name}: {e}")))?;
@@ -1151,34 +1177,26 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.store_flag_value("_gs_any_fail", 1)
     }
 
-    /// Get or create global for condition error code (i8). Name: _gs_cond_error
-    pub fn get_or_create_cond_error_global(&mut self) -> PointerValue<'ctx> {
-        if let Some(g) = self.module.get_global("_gs_cond_error") {
-            return g.as_pointer_value();
-        }
-        let i8_type = self.context.i8_type();
-        let global =
-            self.module
-                .add_global(i8_type, Some(AddressSpace::default()), "_gs_cond_error");
-        global.set_initializer(&i8_type.const_zero());
-        global.as_pointer_value()
+    /// Get the invocation-local condition error code slot.
+    pub fn get_or_create_cond_error_slot(&mut self) -> Result<PointerValue<'ctx>> {
+        self.get_or_create_invocation_scratch("_gs_cond_error", self.context.i8_type())
     }
 
     /// Reset condition error to 0 (only meaningful when condition_context_active=true)
     pub fn reset_condition_error(&mut self) -> Result<()> {
-        let ptr = self.get_or_create_cond_error_global();
+        let ptr = self.get_or_create_cond_error_slot()?;
         self.builder
             .build_store(ptr, self.context.i8_type().const_zero())
             .map_err(|e| CodeGenError::LLVMError(format!("Failed to reset _gs_cond_error: {e}")))?;
         // Also reset error address
-        let aptr = self.get_or_create_cond_error_addr_global();
+        let aptr = self.get_or_create_cond_error_addr_slot()?;
         self.builder
             .build_store(aptr, self.context.i64_type().const_zero())
             .map_err(|e| {
                 CodeGenError::LLVMError(format!("Failed to reset _gs_cond_error_addr: {e}"))
             })?;
         // Also reset flags
-        let fptr = self.get_or_create_cond_error_flags_global();
+        let fptr = self.get_or_create_cond_error_flags_slot()?;
         self.builder
             .build_store(fptr, self.context.i8_type().const_zero())
             .map_err(|e| {
@@ -1187,19 +1205,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
-    /// Get or create global for condition error address (i64). Name: _gs_cond_error_addr
-    pub fn get_or_create_cond_error_addr_global(&mut self) -> PointerValue<'ctx> {
-        if let Some(g) = self.module.get_global("_gs_cond_error_addr") {
-            return g.as_pointer_value();
-        }
-        let i64_type = self.context.i64_type();
-        let global = self.module.add_global(
-            i64_type,
-            Some(AddressSpace::default()),
-            "_gs_cond_error_addr",
-        );
-        global.set_initializer(&i64_type.const_zero());
-        global.as_pointer_value()
+    /// Get the invocation-local condition error address slot.
+    pub fn get_or_create_cond_error_addr_slot(&mut self) -> Result<PointerValue<'ctx>> {
+        self.get_or_create_invocation_scratch("_gs_cond_error_addr", self.context.i64_type())
     }
 
     /// If in condition context, set error code when it's currently 0 (first error wins)
@@ -1207,7 +1215,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         if !self.condition_context_active {
             return Ok(());
         }
-        let ptr = self.get_or_create_cond_error_global();
+        let ptr = self.get_or_create_cond_error_slot()?;
         let cur = self
             .builder
             .build_load(self.context.i8_type(), ptr, "cond_err_cur")
@@ -1241,7 +1249,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     /// Read the current condition error as i1 predicate: (error != 0)
     pub fn build_condition_error_predicate(&mut self) -> Result<inkwell::values::IntValue<'ctx>> {
-        let ptr = self.get_or_create_cond_error_global();
+        let ptr = self.get_or_create_cond_error_slot()?;
         let cur = self
             .builder
             .build_load(self.context.i8_type(), ptr, "cond_err_cur")
@@ -1257,19 +1265,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))
     }
 
-    /// Get or create global for condition error flags (i8). Name: _gs_cond_error_flags
-    pub fn get_or_create_cond_error_flags_global(&mut self) -> PointerValue<'ctx> {
-        if let Some(g) = self.module.get_global("_gs_cond_error_flags") {
-            return g.as_pointer_value();
-        }
-        let i8_type = self.context.i8_type();
-        let global = self.module.add_global(
-            i8_type,
-            Some(AddressSpace::default()),
-            "_gs_cond_error_flags",
-        );
-        global.set_initializer(&i8_type.const_zero());
-        global.as_pointer_value()
+    /// Get the invocation-local condition error flags slot.
+    pub fn get_or_create_cond_error_flags_slot(&mut self) -> Result<PointerValue<'ctx>> {
+        self.get_or_create_invocation_scratch("_gs_cond_error_flags", self.context.i8_type())
     }
 
     /// OR into condition error flags (BV must be i8)
@@ -1277,7 +1275,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         if !self.condition_context_active {
             return Ok(());
         }
-        let ptr = self.get_or_create_cond_error_flags_global();
+        let ptr = self.get_or_create_cond_error_flags_slot()?;
         let cur = self
             .builder
             .build_load(self.context.i8_type(), ptr, "cond_err_flags_cur")
@@ -1298,7 +1296,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         if !self.condition_context_active {
             return Ok(());
         }
-        let ptr = self.get_or_create_cond_error_addr_global();
+        let ptr = self.get_or_create_cond_error_addr_slot()?;
         let cur = self
             .builder
             .build_load(self.context.i64_type(), ptr, "cond_err_addr_cur")

@@ -931,29 +931,41 @@ mod tests {
 
     #[test]
     fn test_gdb_global_debug_directory_layout() {
-        let binary_path = Path::new("/usr/bin/ls");
+        // Host binaries such as /usr/bin/ls may resolve to a different directory.
+        // Own both the binary and its symlink so this tests the mirrored layout
+        // independently of the runner's installed utilities.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let binary_path = root.join("usr/bin/ls");
+        let symlink_path = root.join("bin/ls");
+        std::fs::create_dir_all(binary_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(symlink_path.parent().unwrap()).unwrap();
+        std::fs::write(&binary_path, []).unwrap();
+        std::os::unix::fs::symlink(&binary_path, &symlink_path).unwrap();
+        let global_debug_dir = root.join("debug-root");
         let debug_filename = Path::new("ls.debug");
-        let user_paths = vec!["/usr/lib/debug".to_string()];
+        let user_paths = vec![global_debug_dir.to_string_lossy().into_owned()];
         let build_id = [0xab, 0xcd, 0xef, 0x12, 0x34];
+        let mirrored_debug_path = global_debug_dir
+            .join(binary_path.parent().unwrap().strip_prefix("/").unwrap())
+            .join(debug_filename);
 
-        let candidates = build_search_candidates(
-            binary_path,
-            Some(debug_filename),
-            Some(&build_id),
-            &user_paths,
-        );
+        for path in [&binary_path, &symlink_path] {
+            let candidates =
+                build_search_candidates(path, Some(debug_filename), Some(&build_id), &user_paths);
 
-        assert_eq!(
-            candidates[0],
-            DebugFileCandidate {
-                path: PathBuf::from("/usr/lib/debug/.build-id/ab/cdef1234.debug"),
-                validation: DebugFileValidation::BuildId,
-            }
-        );
-        assert!(candidates.iter().any(|candidate| {
-            candidate.path == Path::new("/usr/lib/debug/usr/bin/ls.debug")
-                && candidate.validation == DebugFileValidation::DebugLink
-        }));
+            assert_eq!(
+                candidates[0],
+                DebugFileCandidate {
+                    path: global_debug_dir.join(".build-id/ab/cdef1234.debug"),
+                    validation: DebugFileValidation::BuildId,
+                }
+            );
+            assert!(candidates.iter().any(|candidate| {
+                candidate.path == mirrored_debug_path
+                    && candidate.validation == DebugFileValidation::DebugLink
+            }));
+        }
     }
 
     #[test]

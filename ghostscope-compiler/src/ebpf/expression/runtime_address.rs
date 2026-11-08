@@ -289,7 +289,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     if let Some(target) = self.get_alias_variable(name) {
                         if let Some(var) = self.query_dwarf_for_complex_expr(&target)? {
                             let status_ptr = if self.condition_context_active {
-                                Some(self.get_or_create_cond_error_global())
+                                Some(self.get_or_create_cond_error_slot()?)
                             } else {
                                 None
                             };
@@ -328,7 +328,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
             if let Some(var) = self.query_dwarf_for_complex_expr(resolved_inner)? {
                 let status_ptr = if self.condition_context_active {
-                    Some(self.get_or_create_cond_error_global())
+                    Some(self.get_or_create_cond_error_slot()?)
                 } else {
                     None
                 };
@@ -369,7 +369,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 if var.dwarf_type.is_some() {
                     let pointed_plan = self.plan_dwarf_pointer_element_index(&var, index)?;
                     let status_ptr = if self.condition_context_active {
-                        Some(self.get_or_create_cond_error_global())
+                        Some(self.get_or_create_cond_error_slot()?)
                     } else {
                         None
                     };
@@ -455,7 +455,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     DwarfType::ArrayType { .. } => {
                         // Use the base address of the array as pointer
                         let status_ptr = if self.condition_context_active {
-                            Some(self.get_or_create_cond_error_global())
+                            Some(self.get_or_create_cond_error_slot()?)
                         } else {
                             None
                         };
@@ -468,7 +468,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 }
             } else {
                 let status_ptr = if self.condition_context_active {
-                    Some(self.get_or_create_cond_error_global())
+                    Some(self.get_or_create_cond_error_slot()?)
                 } else {
                     None
                 };

@@ -32,7 +32,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )));
         }
         let status_ptr = if self.condition_context_active {
-            Some(self.get_or_create_cond_error_global())
+            Some(self.get_or_create_cond_error_slot()?)
         } else if status_ptr.is_none()
             && pieces.iter().any(|piece| {
                 matches!(
@@ -142,7 +142,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         module_hint: Option<&str>,
     ) -> Result<IntValue<'ctx>> {
         let status_ptr = if self.condition_context_active {
-            Some(self.get_or_create_cond_error_global())
+            Some(self.get_or_create_cond_error_slot()?)
         } else {
             status_ptr
         };

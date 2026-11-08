@@ -246,7 +246,17 @@ jobs:
           GHOSTSCOPE_REQUIRE_RUST_E2E_TOOLCHAINS: 1
           GHOSTSCOPE_PRESERVE_PRECOMPILED_FIXTURES: 1
           RUST_BACKTRACE: 1
-        run: sudo -E "$(which cargo)" test -p ghostscope-e2e-tests --tests --all-features -- --nocapture
+        run: |
+          sudo env \
+            PATH="$PATH" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            LLVM_SYS_221_PREFIX="$LLVM_SYS_221_PREFIX" \
+            RUST_BACKTRACE="$RUST_BACKTRACE" \
+            GHOSTSCOPE_REQUIRE_RUST_135_E2E="$GHOSTSCOPE_REQUIRE_RUST_135_E2E" \
+            GHOSTSCOPE_REQUIRE_RUST_E2E_TOOLCHAINS="$GHOSTSCOPE_REQUIRE_RUST_E2E_TOOLCHAINS" \
+            GHOSTSCOPE_PRESERVE_PRECOMPILED_FIXTURES="$GHOSTSCOPE_PRESERVE_PRECOMPILED_FIXTURES" \
+            "$(command -v cargo)" test -p ghostscope-e2e-tests --tests --all-features -- --nocapture
 
   build:
     name: Build

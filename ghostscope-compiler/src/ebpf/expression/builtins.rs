@@ -427,10 +427,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.builder.position_at_end(cont_b);
         }
 
-        // Aggregate XOR/OR across 0..CAP, masked by (i < sel_len)
+        // Short-circuit byte comparisons keep register pressure bounded. A long
+        // masked XOR/OR expression can spill enough values to exhaust the BPF
+        // stack once per-event diagnostics also live on the stack.
         let i32_ty = self.context.i32_type();
         let idx0 = i32_ty.const_zero();
-        let mut acc = self.context.i8_type().const_zero();
+        let equal_block = self.context.append_basic_block(func, "memcmp_equal");
+        let unequal_block = self.context.append_basic_block(func, "memcmp_unequal");
+        let result_block = self.context.append_basic_block(func, "memcmp_result");
         for i in 0..cap as usize {
             let idx_i = i32_ty.const_int(i as u64, false);
             // active = (i < sel_len)
@@ -443,6 +447,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     &format!("memcmp_i{i}_active"),
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            let read_block = self.context.append_basic_block(func, "memcmp_byte");
+            let next_block = self.context.append_basic_block(func, "memcmp_next");
+            self.builder
+                .build_conditional_branch(active, read_block, equal_block)
+                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            self.builder.position_at_end(read_block);
             // a[i]
             // SAFETY: i is bounded by cmp_bound, which is clamped to the buffer cap.
             let pa = unsafe {
@@ -473,30 +483,36 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 BasicValueEnum::IntValue(iv) => iv,
                 _ => return Err(CodeGenError::LLVMError("memcmp load b != i8".into())),
             };
-            let diff = self
+            let equal = self
                 .builder
-                .build_xor(va, vb, &format!("memcmp_diff_{i}"))
+                .build_int_compare(inkwell::IntPredicate::EQ, va, vb, "memcmp_byte_equal")
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-            let zero8 = self.context.i8_type().const_zero();
-            let masked = self
-                .builder
-                .build_select(active, diff, zero8, &format!("memcmp_masked_{i}"))
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?
-                .into_int_value();
-            acc = self
-                .builder
-                .build_or(acc, masked, &format!("memcmp_acc_{i}"))
+            self.builder
+                .build_conditional_branch(equal, next_block, unequal_block)
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+            self.builder.position_at_end(next_block);
         }
+        self.builder
+            .build_unconditional_branch(equal_block)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        self.builder.position_at_end(equal_block);
+        self.builder
+            .build_unconditional_branch(result_block)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        self.builder.position_at_end(unequal_block);
+        self.builder
+            .build_unconditional_branch(result_block)
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        self.builder.position_at_end(result_block);
         let eq_bytes = self
             .builder
-            .build_int_compare(
-                inkwell::IntPredicate::EQ,
-                acc,
-                self.context.i8_type().const_zero(),
-                "memcmp_acc_zero",
-            )
+            .build_phi(self.context.bool_type(), "memcmp_bytes_equal")
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        eq_bytes.add_incoming(&[
+            (&bool_true, equal_block),
+            (&self.context.bool_type().const_zero(), unequal_block),
+        ]);
+        let eq_bytes = eq_bytes.as_basic_value().into_int_value();
         let nz_result = self
             .builder
             .build_and(status_ok, eq_bytes, "memcmp_and")
@@ -710,7 +726,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                         }
                         DwarfType::ArrayType { .. } => {
                             let status_ptr = if self.condition_context_active {
-                                Some(self.get_or_create_cond_error_global())
+                                Some(self.get_or_create_cond_error_slot()?)
                             } else {
                                 None
                             };
@@ -1123,7 +1139,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     return Ok((if is_equal { zero } else { one }).into());
                 }
                 let status_ptr = if self.condition_context_active {
-                    Some(self.get_or_create_cond_error_global())
+                    Some(self.get_or_create_cond_error_slot()?)
                 } else {
                     None
                 };
@@ -1218,7 +1234,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
             None => {
                 let status_ptr = if self.condition_context_active {
-                    Some(self.get_or_create_cond_error_global())
+                    Some(self.get_or_create_cond_error_slot()?)
                 } else {
                     None
                 };

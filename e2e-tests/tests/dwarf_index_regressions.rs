@@ -9,7 +9,7 @@ use gimli::write::{
 use gimli::Reader;
 use gimli::{Format, LineEncoding, SectionId};
 use object::{Object, ObjectSection, ObjectSymbol};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,6 @@ use tempfile::TempPath;
 
 // Keep these on the executable inline-body lines in inline_callsite_program.c.
 const INLINE_TRACE_LINE: u32 = 43;
-const COMPLEX_DUPLICATE_PC_LINE: u32 = 20;
 const OVERLAPPING_CU_OUTER_START: u64 = 0x501000;
 const OVERLAPPING_CU_OUTER_ROW_ADDRESS: u64 = 0x501020;
 const OVERLAPPING_CU_INNER_START: u64 = 0x501040;
@@ -1374,77 +1373,97 @@ fn dwarf_has_type_unit(path: &Path) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-fn duplicate_line_row_address_for_source_line(
-    binary_path: &Path,
-    source_basename: &str,
-    target_line: u64,
-) -> anyhow::Result<(u64, u64)> {
-    let dwarf = load_dwarf_from_binary(binary_path)?;
-    let mut rows_by_address: HashMap<u64, Vec<u64>> = HashMap::new();
-    let mut units = dwarf.units();
+fn build_same_pc_line_binary(out_dir: &Path) -> anyhow::Result<PathBuf> {
+    let cc = preferred_c_compiler().context("same-PC fixture requires a C compiler")?;
+    anyhow::ensure!(
+        command_available("objcopy"),
+        "same-PC fixture requires objcopy"
+    );
+    let source = out_dir.join("same_pc.c");
+    let binary = out_dir.join("same_pc");
+    fs::write(&source, "int main(void) { return 0; }\n")?;
+    run_command(
+        StdCommand::new(cc)
+            .arg("-g0")
+            .arg("-o")
+            .arg(&binary)
+            .arg(&source),
+        "compile same-PC stub",
+    )?;
 
-    while let Some(header) = units.next()? {
-        let unit = dwarf.unit(header)?;
-        let Some(ref line_program) = unit.line_program else {
+    let encoding = gimli::Encoding {
+        format: Format::Dwarf32,
+        version: 5,
+        address_size: 8,
+    };
+    let mut dwarf = WriteDwarf::new();
+    add_overlapping_cu(
+        &mut dwarf,
+        encoding,
+        b"same_pc.c",
+        b"same_pc",
+        0x501000..0x501100,
+        0x501020,
+        0x501100,
+        20,
+    );
+    let (_, unit) = dwarf
+        .units
+        .iter_mut()
+        .next()
+        .context("missing fixture CU")?;
+    let mut program = LineProgram::new(
+        encoding,
+        LineEncoding::default(),
+        LineString::String(b"/synthetic".to_vec()),
+        None,
+        LineString::String(b"same_pc.c".to_vec()),
+        None,
+    );
+    let file = program.add_file(
+        LineString::String(b"same_pc.c".to_vec()),
+        program.default_directory(),
+        None,
+    );
+    program.begin_sequence(Some(Address::Constant(0x501000)));
+    // Both lines have exactly one candidate PC, so consecutive-address
+    // coalescing cannot hide the duplicate-row behavior under test.
+    for line in [20, 21] {
+        let row = program.row();
+        row.address_offset = 0x20;
+        row.file = file;
+        row.line = line;
+        row.is_statement = true;
+        program.generate_row();
+    }
+    program.end_sequence(0x100);
+    unit.line_program = program;
+
+    let mut sections = Sections::new(EndianVec::new(gimli::LittleEndian));
+    dwarf.write(&mut sections)?;
+    let mut objcopy = StdCommand::new("objcopy");
+    for id in [
+        SectionId::DebugAbbrev,
+        SectionId::DebugInfo,
+        SectionId::DebugLine,
+        SectionId::DebugLineStr,
+        SectionId::DebugStr,
+    ] {
+        let Some(section) = sections.get(id) else {
             continue;
         };
-        let line_header = line_program.header();
-        let (line_program, sequences) = line_program.clone().sequences()?;
-
-        for sequence in sequences {
-            let mut rows = line_program.resume_from(&sequence);
-            while let Some((_, row)) = rows.next_row()? {
-                if row.end_sequence() {
-                    continue;
-                }
-                let Some(line) = row.line().map(|line| line.get()) else {
-                    continue;
-                };
-                let Some(file) = row.file(line_header) else {
-                    continue;
-                };
-                let Ok(path) = dwarf.attr_string(&unit, file.path_name()) else {
-                    continue;
-                };
-                let Ok(path) = path.to_string_lossy() else {
-                    continue;
-                };
-                let basename_matches = Path::new(path.as_ref())
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    == Some(source_basename);
-                if basename_matches || path.as_ref().ends_with(source_basename) {
-                    rows_by_address.entry(row.address()).or_default().push(line);
-                }
-            }
+        if section.slice().is_empty() {
+            continue;
         }
+        let path = out_dir.join(format!("{}.bin", id.name()));
+        fs::write(&path, section.slice())?;
+        objcopy
+            .arg("--add-section")
+            .arg(format!("{}={}", id.name(), path.display()));
     }
-
-    // Optimization changes which source lines share a PC across targets.
-    // Keep the collision requirement, preferring the historical line when it
-    // exists and otherwise choosing another genuine same-PC line pair.
-    rows_by_address
-        .into_iter()
-        .filter_map(|(address, lines)| {
-            let distinct: BTreeSet<_> = lines.into_iter().collect();
-            if distinct.len() < 2 {
-                return None;
-            }
-            let line = if distinct.contains(&target_line) {
-                target_line
-            } else {
-                *distinct.first()?
-            };
-            Some((address, line))
-        })
-        .min_by_key(|(address, line)| (*line != target_line, *address, *line))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} has no same-PC line rows for {}",
-                binary_path.display(),
-                source_basename
-            )
-        })
+    objcopy.arg(&binary);
+    run_command(&mut objcopy, "add same-PC DWARF")?;
+    Ok(binary)
 }
 
 fn line_sequence_end_and_gap_without_line_rows(binary_path: &Path) -> anyhow::Result<(u64, u64)> {
@@ -2026,34 +2045,29 @@ async fn test_source_lookup_ignores_line_sequence_end_and_gap() -> anyhow::Resul
 async fn test_source_line_query_preserves_same_pc_line_candidate() -> anyhow::Result<()> {
     init();
 
-    let binary_path =
-        FIXTURES.get_test_binary_with_opt("complex_types_program", OptimizationLevel::O3)?;
-    let (duplicate_pc, duplicate_line) = duplicate_line_row_address_for_source_line(
-        &binary_path,
-        "complex_types_program.c",
-        u64::from(COMPLEX_DUPLICATE_PC_LINE),
-    )?;
-
-    let duplicate_line = u32::try_from(duplicate_line)?;
+    let dir = tempfile::tempdir()?;
+    let binary_path = build_same_pc_line_binary(dir.path())?;
+    let duplicate_pc = 0x501020;
     let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
-    let addrs = analyzer.lookup_addresses_by_source_line("complex_types_program.c", duplicate_line);
-    assert!(
-        addrs
-            .iter()
-            .any(|addr| addr.module_path == binary_path && addr.address == duplicate_pc),
-        "Expected source-line lookup to include duplicate-PC row 0x{duplicate_pc:x}. Results: {addrs:?}"
-    );
+    for duplicate_line in [20, 21] {
+        let addrs = analyzer.lookup_addresses_by_source_line("same_pc.c", duplicate_line);
+        assert!(
+            addrs
+                .iter()
+                .any(|addr| addr.module_path == binary_path && addr.address == duplicate_pc),
+            "Expected source-line lookup to include duplicate-PC row 0x{duplicate_pc:x}. Results: {addrs:?}"
+        );
 
-    let query_results =
-        analyzer.query_source_line_best_effort("complex_types_program.c", duplicate_line)?;
-    assert!(
-        query_results.iter().any(|result| {
-            result.module_path == binary_path
-                && result.address == duplicate_pc
-                && result.source_line == Some(duplicate_line)
-        }),
-        "Expected source-line query to keep requested line {duplicate_line} at duplicate PC 0x{duplicate_pc:x}. Results: {query_results:?}"
-    );
+        let query_results = analyzer.query_source_line_best_effort("same_pc.c", duplicate_line)?;
+        assert!(
+            query_results.iter().any(|result| {
+                result.module_path == binary_path
+                    && result.address == duplicate_pc
+                    && result.source_line == Some(duplicate_line)
+            }),
+            "Expected source-line query to keep requested line {duplicate_line} at duplicate PC 0x{duplicate_pc:x}. Results: {query_results:?}"
+        );
+    }
 
     Ok(())
 }
