@@ -298,7 +298,7 @@ fn validate_sleepable_uprobe_config(
 
     if ebpf_config.sleepable_uprobe && !kernel_caps.supports_sleepable_uprobe {
         return Err(anyhow::anyhow!(
-            "[ebpf].sleepable_uprobe=true requires Linux 5.18+ with sleepable uprobe and bpf_copy_from_user_task support. Disable the setting or use a compatible kernel."
+            "[ebpf].sleepable_uprobe=true requires Linux 6.0+ with sleepable uprobe and bpf_copy_from_user_task support. Disable the setting or use a compatible kernel."
         ));
     }
 

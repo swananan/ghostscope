@@ -274,7 +274,7 @@ backtrace_depth = 128
 force_perf_event_array = false
 
 # 使用可睡眠的 `uprobe.s` 程序替代普通 `uprobe` 程序。
-# 这是显式开启的实验性选项：需要 Linux 5.18+；开启后，固定长度的用户态
+# 这是显式开启的实验性选项：需要 Linux 6.0+；开启后，固定长度的用户态
 # 内存读取可使用 bpf_copy_from_user_task()，从而允许处理用户页缺失。
 # 需要 NUL 终止语义的字符串读取仍使用 bpf_probe_read_user_str()。
 # sleepable uprobe 必须使用 RingBuf，不能与 force_perf_event_array 同时开启。

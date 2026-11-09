@@ -8,8 +8,8 @@ use aya::{
     util::KernelVersion,
 };
 use aya_obj::generated::{
-    bpf_attr, bpf_cmd, bpf_insn, bpf_map_type, bpf_prog_type, BPF_ALU64, BPF_CALL, BPF_DW,
-    BPF_EXIT, BPF_F_SLEEPABLE, BPF_IMM, BPF_JMP, BPF_K, BPF_LD, BPF_MOV, BPF_PSEUDO_MAP_FD,
+    bpf_attr, bpf_cmd, bpf_insn, bpf_map_type, bpf_prog_type, BPF_ADD, BPF_ALU64, BPF_CALL, BPF_DW,
+    BPF_EXIT, BPF_F_SLEEPABLE, BPF_IMM, BPF_JMP, BPF_K, BPF_LD, BPF_MOV, BPF_PSEUDO_MAP_FD, BPF_X,
 };
 use std::{fmt, io, mem, sync::OnceLock};
 use tracing::{error, info, warn};
@@ -95,9 +95,8 @@ pub struct KernelCapabilities {
     pub supports_perf_event_array: bool,
     /// Whether bpf_get_ns_current_pid_tgid helper is supported for kprobe/uprobe class programs.
     pub supports_ns_current_pid_tgid_helper: bool,
-    /// Whether the kernel supports the helpers required by GhostScope's sleepable
-    /// uprobe mode (`bpf_get_current_task_btf` and `bpf_copy_from_user_task`,
-    /// introduced in Linux 5.18).
+    /// Whether the kernel supports GhostScope's sleepable uprobe mode (Linux 6.0+),
+    /// including `bpf_get_current_task_btf` and `bpf_copy_from_user_task`.
     pub supports_sleepable_uprobe: bool,
     /// Whether sleepable KProbe-class programs can use a ProgramArray and
     /// `bpf_tail_call`. This is required for long DWARF backtraces.
@@ -467,9 +466,7 @@ where
             "✓ Kernel supports GhostScope sleepable uprobe mode (bpf_get_current_task_btf and bpf_copy_from_user_task)"
         );
     } else {
-        warn!(
-            "⚠️  Kernel does not support GhostScope sleepable uprobe mode (requires Linux 5.18+)"
-        );
+        warn!("⚠️  Kernel does not support GhostScope sleepable uprobe mode (requires Linux 6.0+)");
     }
 
     let supports_sleepable_tail_calls = if supports_sleepable_uprobe.supported {
@@ -493,8 +490,7 @@ fn detect_sleepable_uprobe_support() -> CapabilityProbe {
         ProgramType::KProbe,
         BpfHelper::BPF_FUNC_get_current_task_btf,
     );
-    let copy_from_user_task =
-        probe_sleepable_kprobe_helper_support(BpfHelper::BPF_FUNC_copy_from_user_task);
+    let copy_from_user_task = probe_sleepable_uprobe_program_support();
 
     match (task_btf, copy_from_user_task) {
         (Ok(true), Ok(true)) => CapabilityProbe::cacheable(true),
@@ -535,7 +531,7 @@ fn detect_sleepable_tail_call_support() -> CapabilityProbe {
     }
 }
 
-/// Probe one KProbe-class helper under the same sleepable program flag that
+/// Probe the required helpers under the same sleepable program flag that
 /// Aya uses for an `uprobe.s` section.
 ///
 /// `bpf_copy_from_user_task` is reported as an invalid helper by a regular
@@ -543,10 +539,32 @@ fn detect_sleepable_tail_call_support() -> CapabilityProbe {
 /// programs. The public Aya helper probe cannot set BPF program load flags.
 // TODO(aya): Replace these raw probes after Aya exposes semantic sleepable
 // uprobe capability probes, including support for sleepable tail calls.
-fn probe_sleepable_kprobe_helper_support(helper: BpfHelper) -> Result<bool, io::Error> {
-    let call = sleepable_helper_probe_instruction((BPF_JMP | BPF_CALL) as u8, helper as i32);
-    let exit = sleepable_helper_probe_instruction((BPF_JMP | BPF_EXIT) as u8, 0);
-    let instructions = [call, exit];
+fn probe_sleepable_uprobe_program_support() -> Result<bool, io::Error> {
+    // Supply valid arguments so that only a successful load proves support.
+    // This program is never attached or executed: the null user address is
+    // sufficient for verification of the helper's scalar address argument.
+    let instructions = [
+        bpf_instruction(
+            (BPF_JMP | BPF_CALL) as u8,
+            0,
+            0,
+            BpfHelper::BPF_FUNC_get_current_task_btf as i32,
+        ),
+        bpf_instruction((BPF_ALU64 | BPF_MOV | BPF_X) as u8, 4, 0, 0),
+        bpf_instruction((BPF_ALU64 | BPF_MOV | BPF_X) as u8, 1, 10, 0),
+        bpf_instruction((BPF_ALU64 | BPF_ADD | BPF_K) as u8, 1, 0, -8),
+        bpf_instruction((BPF_ALU64 | BPF_MOV | BPF_K) as u8, 2, 0, 8),
+        bpf_instruction((BPF_ALU64 | BPF_MOV | BPF_K) as u8, 3, 0, 0),
+        bpf_instruction((BPF_ALU64 | BPF_MOV | BPF_K) as u8, 5, 0, 0),
+        bpf_instruction(
+            (BPF_JMP | BPF_CALL) as u8,
+            0,
+            0,
+            BpfHelper::BPF_FUNC_copy_from_user_task as i32,
+        ),
+        bpf_instruction((BPF_ALU64 | BPF_MOV | BPF_K) as u8, 0, 0, 0),
+        bpf_instruction((BPF_JMP | BPF_EXIT) as u8, 0, 0, 0),
+    ];
     match load_sleepable_kprobe_program(&instructions) {
         Ok(fd) => {
             close_bpf_fd(fd);
@@ -774,6 +792,7 @@ fn classify_sleepable_helper_probe_failure(
         b"invalid func ",
         b"unknown func ",
         b"program of this type cannot use helper ",
+        b"Only fentry/fexit/fmod_ret and lsm programs can be sleepable",
     ];
 
     let verifier_log = verifier_log
@@ -782,7 +801,7 @@ fn classify_sleepable_helper_probe_failure(
         .unwrap_or(verifier_log);
     if verifier_log.is_empty() {
         return match error_code {
-            Some(libc::EINVAL | libc::E2BIG) => Some(false),
+            Some(libc::EINVAL | libc::E2BIG | libc::EOPNOTSUPP) => Some(false),
             _ => None,
         };
     }
@@ -794,9 +813,9 @@ fn classify_sleepable_helper_probe_failure(
     }) {
         Some(false)
     } else {
-        // The helper was recognized. Invalid arguments are expected because
-        // this deliberately minimal probe supplies no helper arguments.
-        Some(true)
+        // Unknown verifier failures are inconclusive, never evidence of support.
+        // Keep them uncacheable so a later attempt can retry.
+        None
     }
 }
 
@@ -946,7 +965,7 @@ mod tests {
                 Some(libc::EPERM),
                 b"R4 type=scalar expected=ptr_\0"
             ),
-            Some(true)
+            None
         );
         assert_eq!(
             classify_sleepable_helper_probe_failure(Some(libc::EINVAL), b"\0"),
@@ -956,6 +975,27 @@ mod tests {
             classify_sleepable_helper_probe_failure(Some(libc::EPERM), b"\0"),
             None
         );
+    }
+
+    #[test]
+    fn sleepable_uprobe_probe_rejects_pre_6_0_kernels_and_unknown_failures() {
+        assert_eq!(
+            classify_sleepable_helper_probe_failure(
+                Some(libc::EINVAL),
+                b"Only fentry/fexit/fmod_ret and lsm programs can be sleepable\n\0"
+            ),
+            Some(false)
+        );
+        for log in [
+            b"unexpected verifier rejection\0".as_slice(),
+            b"R1 !read_ok\0",
+            b"processed 0 insns\0",
+        ] {
+            assert_eq!(
+                classify_sleepable_helper_probe_failure(Some(libc::EACCES), log),
+                None
+            );
+        }
     }
 
     #[test]

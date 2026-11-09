@@ -269,7 +269,7 @@ ghostscope --enable-sysmon-for-target
 ### Sleepable Uprobes
 
 Sleepable uprobes are an opt-in `[ebpf]` configuration because they require a
-Linux 5.18+ kernel and can change probe latency by allowing a user-memory page
+Linux 6.0+ kernel and can change probe latency by allowing a user-memory page
 fault to be serviced during a probe hit. The default remains the regular,
 non-sleepable `uprobe` path.
 
@@ -674,7 +674,7 @@ backtrace_unwind_rows_max_entries = 65536
 # overhead compared to RingBuf and should only be used for compatibility testing.
 force_perf_event_array = false  # Default (auto-detect based on kernel version)
 
-# Opt-in sleepable uprobes. Requires Linux 5.18+.
+# Opt-in sleepable uprobes. Requires Linux 6.0+.
 # Fixed-size user-memory reads use bpf_copy_from_user_task().
 # NUL-terminated string reads retain bpf_probe_read_user_str() semantics.
 # Long DWARF bt uses tail calls when the kernel allows them; otherwise it is

@@ -295,7 +295,7 @@ backtrace_depth = 128
 force_perf_event_array = false
 
 # Use sleepable `uprobe.s` programs instead of regular `uprobe` programs.
-# This is opt-in because it requires Linux 5.18+ and can let fixed-size user
+# This is opt-in because it requires Linux 6.0+ and can let fixed-size user
 # memory reads use bpf_copy_from_user_task(), which may fault in user pages.
 # NUL-terminated string reads keep bpf_probe_read_user_str() semantics.
 # Sleepable uprobes require RingBuf; do not combine with force_perf_event_array.
