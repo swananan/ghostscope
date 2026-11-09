@@ -42,7 +42,7 @@ Hash 表条目中的嵌套 adapter 会在配置的递归深度、集合宽度和
 ### 2. 通过 `bpf_probe_read_user` 读取用户内存
 在传统的非 sleepable probe 路径里，`bpf_probe_read_user` 这类 helper 仍然不能处理用户态缺页，因此当目标虚拟地址对应的页面尚未驻留，或访问时会触发 fault，读取就可能失败。
 
-但这已经不是 eBPF 的绝对硬限制。将 `[ebpf].sleepable_uprobe` 设为 `true` 后，GhostScope 会生成可睡眠的 `uprobe.s` 程序；固定长度的用户态内存读取会使用 `bpf_copy_from_user_task()`，从而支持可处理缺页的读取。该选项默认关闭，并要求 Linux 5.18+，因为处理缺页可能增加被跟踪线程的延迟。需要 NUL 终止语义的字符串读取仍使用 `bpf_probe_read_user_str()`，所以 sleepable 模式并不保证每一种用户态内存访问都能 fault-in 页面。
+但这已经不是 eBPF 的绝对硬限制。将 `[ebpf].sleepable_uprobe` 设为 `true` 后，GhostScope 会生成可睡眠的 `uprobe.s` 程序；固定长度的用户态内存读取会使用 `bpf_copy_from_user_task()`，从而支持可处理缺页的读取。该选项默认关闭，并要求 Linux 6.0+，因为处理缺页可能增加被跟踪线程的延迟。需要 NUL 终止语义的字符串读取仍使用 `bpf_probe_read_user_str()`，所以 sleepable 模式并不保证每一种用户态内存访问都能 fault-in 页面。
 
 **参考**：
 - https://lists.iovisor.org/g/iovisor-dev/topic/accessing_user_memory_and/21386221

@@ -369,7 +369,7 @@ pub struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub force_perf_event_array: bool,
 
-    /// Enable sleepable uprobes for this run. Requires Linux 5.18+ and may
+    /// Enable sleepable uprobes for this run. Requires Linux 6.0+ and may
     /// increase probe-hit latency when user-memory pages must be faulted in.
     /// Cannot be combined with --force-perf-event-array.
     #[arg(long, action = clap::ArgAction::SetTrue)]

@@ -87,7 +87,7 @@ sleepable_uprobe = true
 ```
 
 Sleepable uprobes allow supported reads to fault in pages. They require Linux
-5.18+ and RingBuf output. Fixed-length reads use a fault-capable helper;
+6.0+ and RingBuf output. Fixed-length reads use a fault-capable helper;
 NUL-terminated reads that use `bpf_probe_read_user_str()` still cannot fault in
 pages. This option cannot fix an invalid address, missing DWARF, or an
 unsupported type layout.

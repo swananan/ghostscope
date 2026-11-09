@@ -51,7 +51,7 @@ development time. JIT language support is an even more distant goal.
 ### 2. User-Memory Reads via `bpf_probe_read_user`
 In traditional non-sleepable probe paths, helpers such as `bpf_probe_read_user` cannot resolve user-space page faults, so reads from a target virtual address may still fail if the page is not resident or otherwise faults on access.
 
-This is no longer an absolute eBPF limitation. GhostScope can emit sleepable `uprobe.s` programs when `[ebpf].sleepable_uprobe = true`; fixed-size user-memory reads then use `bpf_copy_from_user_task()` for fault-capable reads. The option is disabled by default and requires Linux 5.18+ because servicing a fault can increase the traced thread's latency. NUL-terminated string reads retain `bpf_probe_read_user_str()` semantics, so sleepable mode does not guarantee that every user-memory access can fault in a page.
+This is no longer an absolute eBPF limitation. GhostScope can emit sleepable `uprobe.s` programs when `[ebpf].sleepable_uprobe = true`; fixed-size user-memory reads then use `bpf_copy_from_user_task()` for fault-capable reads. The option is disabled by default and requires Linux 6.0+ because servicing a fault can increase the traced thread's latency. NUL-terminated string reads retain `bpf_probe_read_user_str()` semantics, so sleepable mode does not guarantee that every user-memory access can fault in a page.
 
 **References**:
 - https://lists.iovisor.org/g/iovisor-dev/topic/accessing_user_memory_and/21386221

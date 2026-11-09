@@ -265,7 +265,7 @@ ghostscope --enable-sysmon-for-target
 
 ### Sleepable Uprobe
 
-sleepable uprobe 是 `[ebpf]` 下显式开启的配置项：它要求 Linux 5.18+，并且
+sleepable uprobe 是 `[ebpf]` 下显式开启的配置项：它要求 Linux 6.0+，并且
 探针命中时允许为用户态内存处理缺页，因此可能增加目标线程的探针延迟。默认仍是
 普通、不可睡眠的 `uprobe` 路径。
 
@@ -656,7 +656,7 @@ backtrace_unwind_rows_max_entries = 65536
 # 有性能开销，仅应用于兼容性测试。
 force_perf_event_array = false  # 默认（根据内核版本自动检测）
 
-# 显式开启 sleepable uprobe；要求 Linux 5.18+。
+# 显式开启 sleepable uprobe；要求 Linux 6.0+。
 # 固定长度用户态内存读取使用 bpf_copy_from_user_task()。
 # 需要 NUL 终止语义的字符串读取仍使用 bpf_probe_read_user_str()。
 # 较深的 DWARF bt 在内核允许时使用 tail call；否则限制为五帧 inline 回溯并打印警告。

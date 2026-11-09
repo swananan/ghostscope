@@ -265,7 +265,7 @@ pub struct EbpfConfig {
     #[serde(default = "default_force_perf_event_array")]
     pub force_perf_event_array: bool,
     /// Emit sleepable (`uprobe.s`) programs and use fault-capable user-memory reads
-    /// where the generated program uses fixed-size reads. Requires Linux 5.18+
+    /// where the generated program uses fixed-size reads. Requires Linux 6.0+
     /// and RingBuf event output, so it cannot be combined with
     /// force_perf_event_array.
     #[serde(default = "default_sleepable_uprobe")]

@@ -73,7 +73,7 @@ GhostScope 计算地址有误。这是运行时读取失败，静态的深度限
 sleepable_uprobe = true
 ```
 
-sleepable uprobe 允许支持的内存读取处理缺页，要求 Linux 5.18+ 和 RingBuf
+sleepable uprobe 允许支持的内存读取处理缺页，要求 Linux 6.0+ 和 RingBuf
 输出。固定长度读取会使用可处理缺页的 helper；需要 NUL 终止语义、仍使用
 `bpf_probe_read_user_str()` 的读取不能因此处理缺页。它不能修复无效地址、
 缺失的 DWARF 或不支持的类型布局。
