@@ -72,7 +72,7 @@ impl<'ctx, T> RuntimeReturnAwareValue<'ctx, T> {
 }
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
-    /// Reserve `size` bytes in the per-CPU accumulation buffer and return a pointer to the
+    /// Reserve `size` bytes in the current invocation's accumulation buffer and return a pointer to the
     /// beginning of the reserved region. On overflow, resets the event offset and returns
     /// from the eBPF program early (mirrors existing control-flow style used elsewhere).
     fn reserve_event_space_or_return_zero(
@@ -185,6 +185,18 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         // ok: compute dest, bump offset, return dest
         self.builder.position_at_end(bb_ok);
+        // LLVM may turn the fit check into a boolean merge and reload an
+        // unconstrained copy of the offset. Re-establish the exact range on the
+        // value used for pointer arithmetic; the preceding check still rejects
+        // overflow rather than silently clamping an invalid reservation.
+        let offset_val = self.clamp_probe_read_length(
+            offset_val,
+            u64::from(self.compile_options.max_trace_event_size)
+                .checked_sub(size)
+                .ok_or_else(|| CodeGenError::LLVMError("event reservation exceeds buffer".into()))?
+                as usize,
+            "event_reservation_offset",
+        )?;
         let off64 = self
             .builder
             .build_int_z_extend(offset_val, i64_ty, "off64")
@@ -225,7 +237,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.reserve_event_space_or_return_zero(size)
     }
 
-    /// Look up event_accum_buffer[0] once for the current eBPF program.
+    /// Get the accumulation buffer once for the current eBPF program.
+    /// Sleepable programs install their owned hash entry before reaching here.
     ///
     /// The resulting map-value pointer is an SSA value owned by the current function. It must not
     /// be reused by another eBPF program, including a tail-call step program.
@@ -287,7 +300,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(accum_buffer)
     }
 
-    fn current_event_accumulation_buffer(&self) -> Result<PointerValue<'ctx>> {
+    pub(crate) fn current_event_accumulation_buffer(&self) -> Result<PointerValue<'ctx>> {
         let current_fn = self
             .current_codegen_continuation("get accumulation buffer")?
             .function;
@@ -793,6 +806,52 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 mod tests {
     use super::{checked_event_reservation, split_pid_tgid};
     use crate::ebpf::context::CodeGenError;
+
+    #[test]
+    fn event_reservation_bounds_the_pointer_offset_after_overflow_checks() {
+        let llvm = inkwell::context::Context::create();
+        let mut ctx = crate::ebpf::context::EbpfContext::new(
+            &llvm,
+            "reservation",
+            Some(0),
+            &crate::CompileOptions::default(),
+        )
+        .unwrap();
+        let i32_ty = llvm.i32_type();
+        let ptr_ty = llvm.ptr_type(inkwell::AddressSpace::default());
+        let function = ctx.module.add_function(
+            "reserve",
+            i32_ty.fn_type(&[ptr_ty.into(), i32_ty.into()], false),
+            None,
+        );
+        let entry = llvm.append_basic_block(function, "entry");
+        ctx.builder.position_at_end(entry);
+        let offset = ctx.builder.build_alloca(i32_ty, "event_offset").unwrap();
+        ctx.builder
+            .build_store(offset, function.get_nth_param(1).unwrap())
+            .unwrap();
+        ctx.event_offset_alloca = Some(offset);
+        ctx.event_accumulation_buffers.insert(
+            function,
+            function.get_first_param().unwrap().into_pointer_value(),
+        );
+        let reservation = ctx.reserve_event_space_or_return_zero(10).unwrap();
+        assert_eq!(reservation.early_returns.len(), 1);
+        let ptr = reservation.into_value_after_runtime_returns();
+        ctx.builder
+            .build_store(ptr, llvm.i8_type().const_int(1, false))
+            .unwrap();
+        ctx.builder
+            .build_return(Some(&i32_ty.const_zero()))
+            .unwrap();
+        ctx.module.verify().unwrap();
+        let ir = ctx.module.print_to_string().to_string();
+        assert!(ir.contains("event_reservation_offset_opaque_bound"));
+        assert!(ir.contains("event_reservation_offset_verifier_masked"));
+        assert!(ir.contains("32758")); // Entire ten-byte reservation must fit.
+        assert!(ir.contains("zext i32 %event_reservation_offset_bounded to i64"));
+        assert!(ir.contains("reserve_overflow"));
+    }
 
     #[test]
     fn split_pid_tgid_uses_tgid_for_pid_and_pid_for_tid() {

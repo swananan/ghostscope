@@ -1758,7 +1758,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(())
     }
 
-    fn clamp_probe_read_length(
+    pub(crate) fn clamp_probe_read_length(
         &mut self,
         length: IntValue<'ctx>,
         max_len: usize,

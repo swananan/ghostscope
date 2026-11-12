@@ -289,6 +289,16 @@ sleepable uprobe 必须使用 RingBuf 输出。不要将 `sleepable_uprobe = tru
 sleepable uprobe 模式所需的 helper，启动会给出明确错误，而不会静默回退到普通
 uprobe。
 
+sleepable 探针按线程隔离每次尚未结束的事件及其 backtrace 状态，tail-call 期间
+也保持隔离。每个生成的探针预留 128 次并发调用的容量；默认事件大小下约占
+4 MiB，另加 backtrace 状态和 map 管理开销。调用结束或中止时释放条目；容量
+耗尽时丢弃新事件并增加丢事件计数，不会覆盖尚未完成的事件。
+
+普通和 sleepable 探针的比较临时缓冲区都使用调用独占的 map 条目，避免较大的
+`compare_cap` 或长字符串字面量耗尽 BPF 栈。使用比较的探针预留 128 个条目，
+每个条目的大小为全部比较缓冲区对齐后的总和；返回或尾调用前释放条目。
+分配失败时丢弃当前事件并增加丢失计数。
+
 较深的 DWARF `bt` 通常使用 tail-call step program。GhostScope 会在启动时探测
 sleepable tail-call 路径；如果内核不允许 sleepable 程序使用
 `BPF_MAP_TYPE_PROG_ARRAY`，则会将该回溯编译为最多五帧的 inline 路径并打印警告。

@@ -727,6 +727,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         plan: &crate::ebpf::context::PendingBacktraceTailCall,
     ) -> Result<()> {
         self.create_tail_call_function(&plan.step_program_name)?;
+        if self.compile_options.runtime_capabilities.sleepable_uprobe {
+            self.initialize_sleepable_invocation(false)?;
+        }
         let accum_buffer = self.initialize_event_accumulation_buffer_or_return_zero()?;
         let current_fn = self.current_function("generate bt tail-call step")?;
         let return_block = self
@@ -1344,6 +1347,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             self.context.i64_type().into(),
             "bt_bpf_tail_call",
         )?;
+        self.comparison_tail_calls.push(
+            self.current_insert_block("record tail call")?
+                .get_last_instruction()
+                .ok_or_else(|| CodeGenError::LLVMError("missing tail call instruction".into()))?,
+        );
         Ok(())
     }
 
