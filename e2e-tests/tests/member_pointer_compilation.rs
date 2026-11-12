@@ -815,3 +815,56 @@ async fn test_complex_bitfield_chain_planner_resolves_member_offsets() -> anyhow
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_comparison_scratch_object_codegen_exceeds_old_stack_budget() -> anyhow::Result<()> {
+    init();
+    let binary_path =
+        FIXTURES.get_test_binary_with_opt("member_pointer_program", OptimizationLevel::Debug)?;
+    let analyzer = ghostscope_dwarf::DwarfAnalyzer::from_exec_path(&binary_path).await?;
+    let cases = [
+        (
+            512,
+            "if memcmp(h.key.data, h.value.data, 512) { print \"MATCH\"; }".to_owned(),
+        ),
+        // Automatic string comparisons are sized by the literal, not compare_cap.
+        (
+            64,
+            format!(
+                "if h.key.data == \"{}\" {{ print \"MATCH\"; }}",
+                "x".repeat(600)
+            ),
+        ),
+        // Distinct small buffers must not accumulate beyond the stack budget.
+        (
+            64,
+            (16..=64)
+                .step_by(8)
+                .map(|n| {
+                    format!(
+                        "if h.key.data == \"{}\" {{ print \"MATCH_{n}\"; }}",
+                        "x".repeat(n)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    ];
+    for sleepable in [false, true] {
+        for (cap, body) in &cases {
+            let mut options = ghostscope_compiler::CompileOptions {
+                binary_path_hint: Some(binary_path.to_string_lossy().into_owned()),
+                compare_cap: *cap,
+                ..Default::default()
+            };
+            options.runtime_capabilities.sleepable_uprobe = sleepable;
+            options.runtime_capabilities.copy_from_user_task = sleepable;
+            let script = format!("trace member_pointer_program.c:{TRACE_LINE} {{ {body} }}");
+            // compile_script includes LLVM BPF object emission; IR verification
+            // alone cannot detect the backend's 512-byte stack-limit error.
+            ghostscope_compiler::compile_script(&script, &analyzer, None, Some(1), &options)
+                .map_err(|e| anyhow::anyhow!("sleepable={sleepable}, cap={cap}: {e}"))?;
+        }
+    }
+    Ok(())
+}

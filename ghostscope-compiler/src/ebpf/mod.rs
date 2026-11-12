@@ -4,6 +4,7 @@
 //! for GhostScope tracing programs.
 
 pub mod codegen; // New instruction analysis and variable resolution
+mod comparison_scratch;
 pub mod context;
 pub mod dwarf_bridge;
 mod dwarf_pieces;
@@ -11,6 +12,7 @@ pub mod expression;
 mod expression_plan;
 pub mod helper_functions;
 pub mod instruction; // New staged transmission and ringbuf messaging
+mod invocation;
 pub mod maps;
 pub mod variables;
 

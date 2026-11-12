@@ -295,6 +295,19 @@ reported-length semantics differ. Startup fails clearly if the kernel does not
 support the helper required by sleepable uprobe mode rather than silently
 falling back.
 
+Sleepable probes keep each in-flight event and its backtrace state isolated by
+thread, including across tail calls. Each generated probe reserves capacity for
+128 concurrent invocations; at the default event size this costs approximately
+4 MiB plus backtrace state and map overhead. Entries are released when an
+invocation finishes or aborts. Capacity exhaustion drops the new event and
+increments the event-loss counter instead of overwriting an active event.
+
+Comparison scratch also uses invocation-owned map entries in both probe modes,
+so large `compare_cap` values and long string literals do not consume the BPF
+stack. A probe using comparisons reserves 128 entries sized to its combined,
+aligned scratch buffers; these entries are released on return or before a tail
+call. Allocation failure drops and counts the event.
+
 Long DWARF `bt` traces normally use a tail-call step program. GhostScope probes
 that sleepable tail-call path at startup; on kernels that do not allow a
 sleepable program to use `BPF_MAP_TYPE_PROG_ARRAY`, it compiles the trace with

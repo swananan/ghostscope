@@ -398,32 +398,35 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.lookup_proc_pid_alias(runtime_pid, name_prefix)
     }
 
-    /// Get or create a static i8 buffer global of a given size, returning its ArrayType and pointer
+    /// Reuse an invocation-local byte buffer for sequential comparisons.
+    /// Callers must consume its contents before requesting the same buffer again.
     pub fn get_or_create_i8_buffer(
         &mut self,
         size: u32,
         name_prefix: &str,
-    ) -> (
+    ) -> Result<(
         inkwell::types::ArrayType<'ctx>,
         inkwell::values::PointerValue<'ctx>,
-    ) {
+    )> {
         let array_ty = self.context.i8_type().array_type(size);
         let name = format!("{name_prefix}_{size}");
-        let global_ptr = match self.module.get_global(&name) {
-            Some(g) => g.as_pointer_value(),
-            None => {
-                let g = self
-                    .module
-                    .add_global(array_ty, Some(AddressSpace::default()), &name);
-                g.set_initializer(&array_ty.const_zero());
-                g.as_pointer_value()
-            }
-        };
-        (array_ty, global_ptr)
+        let ptr = self.get_or_create_invocation_scratch(&name, array_ty)?;
+        // These allocas are placeholders until the total scratch footprint is
+        // known. Finalization replaces all of them with owned map slices.
+        if !self.comparison_buffers.iter().any(|(_, p, _)| *p == ptr) {
+            self.comparison_buffers
+                .push((self.current_function("comparison buffer")?, ptr, size));
+        }
+        // Dynamic and failed reads may leave bytes untouched. Initialize on every
+        // use so comparisons never observe uninitialized or previous-read bytes.
+        self.builder
+            .build_store(ptr, array_ty.const_zero())
+            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+        Ok((array_ty, ptr))
     }
 
-    /// Read a user C-string into a static buffer using bpf_probe_read_user_str.
-    /// Returns (buffer_ptr, len_including_nul).
+    /// Read a user C-string into invocation-local scratch using bpf_probe_read_user_str.
+    /// Returns (buffer_ptr, len_including_nul, array_type).
     pub(crate) fn read_user_cstr_into_buffer(
         &mut self,
         src_addr: RuntimeAddress<'ctx>,
@@ -434,7 +437,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         inkwell::values::IntValue<'ctx>,
         inkwell::types::ArrayType<'ctx>,
     )> {
-        let (arr_ty, buf_global) = self.get_or_create_i8_buffer(size, name_prefix);
+        let (arr_ty, buf_global) = self.get_or_create_i8_buffer(size, name_prefix)?;
 
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         // Cast addresses to void pointers
@@ -501,7 +504,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok((buf_global, len, arr_ty))
     }
 
-    /// Read raw user bytes into a static buffer using bpf_probe_read_user.
+    /// Read raw user bytes into invocation-local scratch using bpf_probe_read_user.
     /// Returns (buffer_ptr, status==0?).
     pub(crate) fn read_user_bytes_into_buffer(
         &mut self,
@@ -513,7 +516,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         inkwell::values::IntValue<'ctx>,
         inkwell::types::ArrayType<'ctx>,
     )> {
-        let (arr_ty, buf_global) = self.get_or_create_i8_buffer(size, name_prefix);
+        let (arr_ty, buf_global) = self.get_or_create_i8_buffer(size, name_prefix)?;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i32_ty = self.context.i32_type();
         let i64_ty = self.context.i64_type();
@@ -1712,7 +1715,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         }
     }
 
-    fn increment_event_loss_counter(&mut self) -> Result<()> {
+    pub(crate) fn increment_event_loss_counter(&mut self) -> Result<()> {
         let i64_type = self.context.i64_type();
 
         let counter_ptr = self.lookup_percpu_value_ptr("event_loss_counters", 0)?;
@@ -1740,21 +1743,14 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
 
         self.builder.position_at_end(counter_hit_block);
-        let current = self
-            .builder
-            .build_load(i64_type, counter_ptr, "event_loss_counter")
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?
-            .into_int_value();
-        let next = self
-            .builder
-            .build_int_add(
-                current,
-                i64_type.const_int(1, false),
-                "event_loss_counter_next",
-            )
-            .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
+        // A sleepable invocation can be preempted by another task on this CPU.
         self.builder
-            .build_store(counter_ptr, next)
+            .build_atomicrmw(
+                inkwell::AtomicRMWBinOp::Add,
+                counter_ptr,
+                i64_type.const_int(1, false),
+                inkwell::AtomicOrdering::Monotonic,
+            )
             .map_err(|e| CodeGenError::LLVMError(e.to_string()))?;
         self.builder
             .build_unconditional_branch(counter_done_block)
@@ -2061,7 +2057,96 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 mod architecture_tests {
     use super::*;
     use ghostscope_platform::ProbeRegister;
-    use inkwell::values::BasicValue;
+    use inkwell::values::{AnyValue, BasicValue};
+
+    #[test]
+    fn comparison_buffers_are_initialized_reused_and_function_local() {
+        let context = inkwell::context::Context::create();
+        let options = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "buffers", Some(0), &options).unwrap();
+        let mut previous = None;
+        for name in ["probe_a", "probe_b"] {
+            ctx.create_basic_ebpf_function(name).unwrap();
+            let function = ctx.current_function("test").unwrap();
+            let entry = function.get_first_basic_block().unwrap();
+            let body = context.append_basic_block(function, "body");
+            ctx.builder.build_unconditional_branch(body).unwrap();
+            ctx.builder.position_at_end(body);
+            let (_, a) = ctx.get_or_create_i8_buffer(64, "_gs_bi_memcmp_a").unwrap();
+            let (_, b) = ctx.get_or_create_i8_buffer(64, "_gs_bi_memcmp_b").unwrap();
+            assert_ne!(a, b);
+            assert_eq!(a.as_instruction_value().unwrap().get_parent(), Some(entry));
+            assert_eq!(
+                a,
+                ctx.get_or_create_i8_buffer(64, "_gs_bi_memcmp_a")
+                    .unwrap()
+                    .1
+            );
+            assert_ne!(
+                a,
+                ctx.get_or_create_i8_buffer(8, "_gs_bi_memcmp_a").unwrap().1
+            );
+            if let Some(old) = previous {
+                assert_ne!(a, old);
+            }
+            previous = Some(a);
+            // Missing offsets produce zero-sized reads. The destination must
+            // still be fully initialized before consumers inspect its bytes.
+            let missing = RuntimeAddress {
+                value: context.i64_type().const_zero(),
+                offsets_found: context.bool_type().const_zero(),
+            };
+            ctx.read_user_cstr_into_buffer(missing, 16, "_gs_strbuf")
+                .unwrap();
+            ctx.read_user_bytes_into_buffer(missing, 16, "_gs_arrbuf")
+                .unwrap();
+            ctx.builder
+                .build_return(Some(&context.i32_type().const_zero()))
+                .unwrap();
+            let body_ir = std::iter::successors(body.get_first_instruction(), |inst| {
+                inst.get_next_instruction()
+            })
+            .map(|inst| inst.print_to_string().to_string())
+            .collect::<String>();
+            assert_eq!(
+                body_ir.matches("store [64 x i8] zeroinitializer").count(),
+                3
+            );
+            assert_eq!(
+                body_ir.matches("store [16 x i8] zeroinitializer").count(),
+                2
+            );
+        }
+        ctx.map_manager
+            .create_event_loss_counter_map(
+                &ctx.module,
+                &ctx.di_builder,
+                &ctx.compile_unit,
+                "event_loss_counters",
+                1,
+            )
+            .unwrap();
+        ctx.finalize_comparison_buffers().unwrap();
+        ctx.module.verify().unwrap();
+        for name in ["probe_a", "probe_b"] {
+            let ir = ctx
+                .module
+                .get_function(name)
+                .unwrap()
+                .print_to_string()
+                .to_string();
+            assert!(!ir.contains("alloca [64 x i8]") && !ir.contains("alloca [16 x i8]"));
+            assert!(ir.contains("comparison_acquire") && ir.contains("comparison_release"));
+        }
+        for global in ctx.module.get_globals() {
+            let name = global.get_name().to_str().unwrap();
+            assert!(
+                !name.starts_with("_gs_bi_")
+                    && !name.starts_with("_gs_strbuf")
+                    && !name.starts_with("_gs_arrbuf")
+            );
+        }
+    }
 
     #[test]
     fn event_scratch_is_local_to_each_generated_function() {
