@@ -12,8 +12,8 @@ use inkwell::context::Context;
 use inkwell::debug_info::DebugInfoBuilder;
 use inkwell::module::Module;
 use inkwell::targets::{Target, TargetTriple};
-use inkwell::types::IntType;
-use inkwell::values::{FunctionValue, IntValue, PointerValue};
+use inkwell::types::{BasicType, IntType};
+use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::AddressSpace;
 use inkwell::OptimizationLevel;
 use std::collections::HashMap;
@@ -141,13 +141,13 @@ pub struct EbpfContext<'ctx, 'dw> {
     pub compile_unit: inkwell::debug_info::DICompileUnit<'ctx>,
 
     // === Complete Variable Management System ===
-    pub variables: HashMap<String, PointerValue<'ctx>>, // Variable name -> LLVM pointer
-    pub var_types: HashMap<String, VarType>,            // Variable name -> type
-    pub optimized_out_vars: HashMap<String, bool>,      // Optimized out variables
-    pub var_pc_addresses: HashMap<String, u64>,         // Variable -> PC address
-    pub variable_context: Option<VariableContext>,      // Scope validation context
+    pub variables: HashMap<String, BasicValueEnum<'ctx>>, // Immutable binding -> SSA value
+    pub var_types: HashMap<String, VarType>,              // Variable name -> type
+    pub optimized_out_vars: HashMap<String, bool>,        // Optimized out variables
+    pub var_pc_addresses: HashMap<String, u64>,           // Variable -> PC address
+    pub variable_context: Option<VariableContext>,        // Scope validation context
     pub(super) process_analyzer: Option<&'dw DwarfAnalyzer>, // Multi-module DWARF analyzer
-    pub current_trace_id: Option<u32>,                  // Current trace_id being compiled
+    pub current_trace_id: Option<u32>,                    // Current trace_id being compiled
     pub current_compile_time_context: Option<CompileTimeContext>, // PC address and module for DWARF queries
 
     // === New instruction-based compilation system ===
@@ -165,7 +165,11 @@ pub struct EbpfContext<'ctx, 'dw> {
     // Function-local storage prevents main and tail-call programs from sharing a pointer.
     pub(crate) event_accumulation_buffers:
         HashMap<FunctionValue<'ctx>, inkwell::values::PointerValue<'ctx>>,
+    // Keys owned by each sleepable main/tail program. Zero means no ownership.
+    pub(super) invocation_cleanup_keys: HashMap<FunctionValue<'ctx>, PointerValue<'ctx>>,
     // Invocation-local scratch, cached separately for each generated BPF function.
+    pub(super) comparison_buffers: Vec<(FunctionValue<'ctx>, PointerValue<'ctx>, u32)>,
+    pub(crate) comparison_tail_calls: Vec<inkwell::values::InstructionValue<'ctx>>,
     invocation_scratch: HashMap<(FunctionValue<'ctx>, String), PointerValue<'ctx>>,
     // Sequence numbers keep verifier-oriented llvm.bpf.passthrough calls
     // distinct while LLVM optimizes the generated module.
@@ -321,6 +325,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             event_offset_alloca: None,
             event_accumulation_buffers: HashMap::new(),
             invocation_scratch: HashMap::new(),
+            comparison_buffers: Vec::new(),
+            comparison_tail_calls: Vec::new(),
+            invocation_cleanup_keys: HashMap::new(),
             next_bpf_passthrough_sequence: 0,
             compile_time_event_bytes_upper_bound: 0,
             compile_options: compile_options.clone(),
@@ -669,21 +676,22 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 CodeGenError::LLVMError(format!("Failed to create event_generation map: {e}"))
             })?;
 
-        // Create per-CPU accumulation maps for single-record event emission
-        //  - event_accum_buffer: value size = max_trace_event_size bytes, entries = 1
-        //  - event_accum_offset: value size = 4 bytes (u32), entries = 1
-        self.map_manager
-            .create_percpu_array_map(
-                &self.module,
-                &self.di_builder,
-                &self.compile_unit,
-                "event_accum_buffer",
-                1,
-                self.compile_options.max_trace_event_size as u64,
-            )
-            .map_err(|e| {
-                CodeGenError::LLVMError(format!("Failed to create event_accum_buffer: {e}"))
-            })?;
+        if self.compile_options.runtime_capabilities.sleepable_uprobe {
+            self.create_sleepable_invocation_map(create_backtrace_tail_call_maps)?;
+        } else {
+            self.map_manager
+                .create_percpu_array_map(
+                    &self.module,
+                    &self.di_builder,
+                    &self.compile_unit,
+                    "event_accum_buffer",
+                    1,
+                    self.compile_options.max_trace_event_size as u64,
+                )
+                .map_err(|e| {
+                    CodeGenError::LLVMError(format!("Failed to create event_accum_buffer: {e}"))
+                })?;
+        }
 
         // Create ASLR offsets map for (pid,module) → section offsets
         self.map_manager
@@ -777,18 +785,20 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                     })?;
             }
             if create_backtrace_tail_call_maps {
-                self.map_manager
-                    .create_percpu_array_map(
-                        &self.module,
-                        &self.di_builder,
-                        &self.compile_unit,
-                        "bt_state",
-                        self.backtrace_tail_call_slots.max(1) as u64,
-                        crate::BACKTRACE_TAIL_STATE_SIZE as u64,
-                    )
-                    .map_err(|e| {
-                        CodeGenError::LLVMError(format!("Failed to create bt_state map: {e}"))
-                    })?;
+                if !self.compile_options.runtime_capabilities.sleepable_uprobe {
+                    self.map_manager
+                        .create_percpu_array_map(
+                            &self.module,
+                            &self.di_builder,
+                            &self.compile_unit,
+                            "bt_state",
+                            self.backtrace_tail_call_slots.max(1) as u64,
+                            crate::BACKTRACE_TAIL_STATE_SIZE as u64,
+                        )
+                        .map_err(|e| {
+                            CodeGenError::LLVMError(format!("Failed to create bt_state map: {e}"))
+                        })?;
+                }
                 self.map_manager
                     .create_program_array_map(
                         &self.module,
@@ -819,6 +829,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         if let Some(spec) = pid_filter_spec {
             self.add_pid_filter(spec)?;
         }
+        if self.compile_options.runtime_capabilities.sleepable_uprobe {
+            self.initialize_sleepable_invocation(true)?;
+        }
         self.initialize_event_accumulation_buffer_or_return_zero()?;
 
         // Use new staged transmission system for all statements
@@ -843,6 +856,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.builder
             .build_return(Some(&return_value))
             .map_err(|e| CodeGenError::Builder(e.to_string()))?;
+
+        self.finalize_invocation_cleanup()?;
+        self.finalize_comparison_buffers()?;
 
         info!(
             "Successfully compiled program with function: {} and TraceContext",
@@ -1124,11 +1140,12 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     /// Allocate zero-initialized invocation-local storage in the current function's
     /// entry block. A separate builder preserves the caller's insertion point.
-    pub(crate) fn get_or_create_invocation_scratch(
+    pub(crate) fn get_or_create_invocation_scratch<T: BasicType<'ctx>>(
         &mut self,
         name: &str,
-        ty: IntType<'ctx>,
+        ty: T,
     ) -> Result<PointerValue<'ctx>> {
+        let ty = ty.as_basic_type_enum();
         let function = self.current_function("allocate invocation scratch")?;
         let key = (function, name.to_owned());
         if let Some(ptr) = self.invocation_scratch.get(&key) {

@@ -4,9 +4,7 @@
 
 use super::context::{CodeGenError, EbpfContext, Result};
 use crate::script::VarType;
-use inkwell::types::BasicTypeEnum;
 use inkwell::values::BasicValueEnum;
-use inkwell::AddressSpace;
 use tracing::{debug, info};
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
@@ -44,55 +42,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             }
         };
 
-        // In eBPF, we don't use dynamic stack allocation. Instead, we store variables
-        // directly as values and use them when needed. For simple cases, we can just
-        // track the value directly.
-
-        // For eBPF compatibility, we store variables as direct values rather than
-        // allocating stack space. This works for our current use case where we
-        // mainly read variables and send them via ringbuf.
-
-        // Create a global variable if we need persistent storage
-        let global_name = format!("_var_{name}");
-        let global_var = match value {
-            BasicValueEnum::IntValue(_) => {
-                let i64_type = self.context.i64_type();
-                let global =
-                    self.module
-                        .add_global(i64_type, Some(AddressSpace::default()), &global_name);
-                global.set_initializer(&i64_type.const_zero());
-                global.as_pointer_value()
-            }
-            BasicValueEnum::FloatValue(_) => {
-                let f64_type = self.context.f64_type();
-                let global =
-                    self.module
-                        .add_global(f64_type, Some(AddressSpace::default()), &global_name);
-                global.set_initializer(&f64_type.const_zero());
-                global.as_pointer_value()
-            }
-            BasicValueEnum::PointerValue(_) => {
-                let ptr_type = self.context.ptr_type(AddressSpace::default());
-                let global =
-                    self.module
-                        .add_global(ptr_type, Some(AddressSpace::default()), &global_name);
-                global.set_initializer(&ptr_type.const_null());
-                global.as_pointer_value()
-            }
-            _ => {
-                return Err(CodeGenError::TypeError(
-                    "Unsupported variable type".to_string(),
-                ))
-            }
-        };
-
-        // Store the value in the global variable
-        self.builder
-            .build_store(global_var, value)
-            .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-        // Track the variable
-        self.variables.insert(name.to_string(), global_var);
+        // Script bindings are immutable and lexically scoped. Keep the SSA value
+        // produced by this invocation instead of round-tripping through .bss.
+        self.variables.insert(name.to_string(), value);
         self.var_types.insert(name.to_string(), var_type.clone());
 
         info!(
@@ -114,49 +66,10 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
     /// Retrieve a variable value
     pub fn load_variable(&mut self, name: &str) -> Result<BasicValueEnum<'ctx>> {
-        if let Some(alloca) = self.variables.get(name) {
-            let var_type = self
-                .var_types
-                .get(name)
-                .ok_or_else(|| CodeGenError::VariableNotFound(name.to_string()))?;
-
-            debug!(
-                "load_variable: Loading variable '{}' with stored type {:?}",
-                name, var_type
-            );
-
-            // Get the pointed-to type, not the pointer type itself
-            let pointed_type: BasicTypeEnum = match var_type {
-                VarType::Int => self.context.i64_type().into(),
-                VarType::Float => self.context.f64_type().into(),
-                VarType::String => self.context.ptr_type(AddressSpace::default()).into(),
-                VarType::Bool => self.context.bool_type().into(),
-            };
-
-            let loaded_value = self
-                .builder
-                .build_load(pointed_type, *alloca, name)
-                .map_err(|e| CodeGenError::Builder(e.to_string()))?;
-
-            debug!(
-                "load_variable: Loaded variable '{}' with actual type: {:?}",
-                name,
-                loaded_value.get_type()
-            );
-            match &loaded_value {
-                BasicValueEnum::IntValue(iv) => debug!(
-                    "load_variable: Loaded IntValue with bit width {}",
-                    iv.get_type().get_bit_width()
-                ),
-                BasicValueEnum::FloatValue(_) => debug!("load_variable: Loaded FloatValue"),
-                BasicValueEnum::PointerValue(_) => debug!("load_variable: Loaded PointerValue"),
-                _ => debug!("load_variable: Loaded other type"),
-            }
-
-            Ok(loaded_value)
-        } else {
-            Err(CodeGenError::VariableNotFound(name.to_string()))
-        }
+        self.variables
+            .get(name)
+            .copied()
+            .ok_or_else(|| CodeGenError::VariableNotFound(name.to_string()))
     }
 
     /// Check if a variable exists in the current scope
@@ -190,5 +103,50 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     /// Get string variable bytes if present
     pub fn get_string_variable_bytes(&self, name: &str) -> Option<&Vec<u8>> {
         self.string_vars.get(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn immutable_bindings_preserve_values_and_widths_across_branches() {
+        let context = inkwell::context::Context::create();
+        let options = crate::CompileOptions::default();
+        let mut ctx = EbpfContext::new(&context, "bindings", Some(0), &options).unwrap();
+        ctx.create_basic_ebpf_function("probe").unwrap();
+        let function = ctx.current_function("test").unwrap();
+        let values = [
+            context.bool_type().const_int(1, false).into(),
+            context.i8_type().const_int(42, false).into(),
+            context.i64_type().const_int(123, false).into(),
+            context.f64_type().const_float(1.5).into(),
+            function.get_first_param().unwrap(),
+        ];
+        ctx.enter_scope();
+        for (i, value) in values.iter().enumerate() {
+            let name = format!("v{i}");
+            ctx.declare_name_in_current_scope(&name).unwrap();
+            ctx.store_variable(&name, *value).unwrap();
+        }
+        let body = context.append_basic_block(function, "body");
+        ctx.builder.build_unconditional_branch(body).unwrap();
+        ctx.builder.position_at_end(body);
+        ctx.enter_scope();
+        ctx.declare_name_in_current_scope("inner").unwrap();
+        ctx.store_variable("inner", values[0]).unwrap();
+        ctx.exit_scope();
+        assert!(ctx.load_variable("inner").is_err());
+        for (i, value) in values.iter().enumerate() {
+            assert_eq!(ctx.load_variable(&format!("v{i}")).unwrap(), *value);
+        }
+        ctx.exit_scope();
+        assert!(ctx.load_variable("v0").is_err());
+        ctx.builder
+            .build_return(Some(&context.i32_type().const_zero()))
+            .unwrap();
+        ctx.module.verify().unwrap();
+        assert!(!ctx.module.print_to_string().to_string().contains("@_var_"));
     }
 }
