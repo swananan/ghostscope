@@ -108,3 +108,5 @@ __pycache__/
 # DWARF perf generated artifacts
 scripts/dwarf-perf/corpus/out/
 perf-results/
+
+e2e-tests/tests/fixtures/sleepable_overlap_program/sleepable_overlap_program

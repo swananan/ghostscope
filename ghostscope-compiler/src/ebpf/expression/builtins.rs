@@ -101,9 +101,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         // Non-zero branch: perform reads and compare
         self.builder.position_at_end(nz_b);
 
-        // Prepare static buffers of size CAP for both sides
-        let (arr_a_ty, buf_a) = self.get_or_create_i8_buffer(cap, "_gs_bi_memcmp_a");
-        let (arr_b_ty, buf_b) = self.get_or_create_i8_buffer(cap, "_gs_bi_memcmp_b");
+        // Prepare invocation-local buffers of size CAP for both sides
+        let (arr_a_ty, buf_a) = self.get_or_create_i8_buffer(cap, "_gs_bi_memcmp_a")?;
+        let (arr_b_ty, buf_b) = self.get_or_create_i8_buffer(cap, "_gs_bi_memcmp_b")?;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
 
         // Helper: parse hex builtin into bytes
@@ -186,6 +186,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
                 .into_int_value();
+            let effective_len_a =
+                self.clamp_probe_read_length(effective_len_a, cap as usize, "memcmp_read_a")?;
             let ret_a = self
                 .create_bpf_helper_call(
                     BPF_FUNC_probe_read_user as u64,
@@ -265,6 +267,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
                 )
                 .map_err(|e| CodeGenError::Builder(e.to_string()))?
                 .into_int_value();
+            let effective_len_b =
+                self.clamp_probe_read_length(effective_len_b, cap as usize, "memcmp_read_b")?;
             let ret_b = self
                 .create_bpf_helper_call(
                     BPF_FUNC_probe_read_user as u64,
@@ -783,7 +787,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
 
         self.builder.position_at_end(nz_b);
 
-        let (arr_ty, buf_global) = self.get_or_create_i8_buffer(cmp_bound, "_gs_bi_strncmp");
+        let (arr_ty, buf_global) = self.get_or_create_i8_buffer(cmp_bound, "_gs_bi_strncmp")?;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let dst_ptr = self
             .builder
@@ -813,6 +817,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
             )
             .map_err(|e| CodeGenError::Builder(e.to_string()))?
             .into_int_value();
+        // Keep the bound visible after LLVM optimizes SSA length expressions.
+        let effective_len =
+            self.clamp_probe_read_length(effective_len, cmp_bound as usize, "strncmp_read")?;
         let ret = self
             .create_bpf_helper_call(
                 BPF_FUNC_probe_read_user as u64,

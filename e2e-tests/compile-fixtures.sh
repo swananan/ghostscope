@@ -70,6 +70,9 @@ run_make_fixture short_lived_long_comm_program all
 run_make_fixture c_multithread_program clean
 run_make_fixture c_multithread_program all
 
+run_make_fixture sleepable_overlap_program clean
+run_make_fixture sleepable_overlap_program all
+
 run_make_fixture backtrace_hot_program clean
 run_make_fixture backtrace_hot_program all
 run_make_fixture backtrace_hot_program backtrace_hot_program_nopie

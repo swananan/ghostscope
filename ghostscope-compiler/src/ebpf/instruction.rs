@@ -72,7 +72,7 @@ impl<'ctx, T> RuntimeReturnAwareValue<'ctx, T> {
 }
 
 impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
-    /// Reserve `size` bytes in the per-CPU accumulation buffer and return a pointer to the
+    /// Reserve `size` bytes in the current invocation's accumulation buffer and return a pointer to the
     /// beginning of the reserved region. On overflow, resets the event offset and returns
     /// from the eBPF program early (mirrors existing control-flow style used elsewhere).
     fn reserve_event_space_or_return_zero(
@@ -225,7 +225,8 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         self.reserve_event_space_or_return_zero(size)
     }
 
-    /// Look up event_accum_buffer[0] once for the current eBPF program.
+    /// Get the accumulation buffer once for the current eBPF program.
+    /// Sleepable programs install their owned hash entry before reaching here.
     ///
     /// The resulting map-value pointer is an SSA value owned by the current function. It must not
     /// be reused by another eBPF program, including a tail-call step program.
@@ -287,7 +288,7 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         Ok(accum_buffer)
     }
 
-    fn current_event_accumulation_buffer(&self) -> Result<PointerValue<'ctx>> {
+    pub(crate) fn current_event_accumulation_buffer(&self) -> Result<PointerValue<'ctx>> {
         let current_fn = self
             .current_codegen_continuation("get accumulation buffer")?
             .function;

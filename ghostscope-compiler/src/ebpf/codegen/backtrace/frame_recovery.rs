@@ -831,6 +831,11 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
     }
 
     pub(super) fn lookup_bt_state_ptr(&mut self, key_const: u32) -> Result<PointerValue<'ctx>> {
+        if self.compile_options.runtime_capabilities.sleepable_uprobe {
+            return self.lookup_sleepable_bt_state(
+                self.context.i32_type().const_int(key_const as u64, false),
+            );
+        }
         self.lookup_percpu_value_ptr("bt_state", key_const)
     }
 
@@ -838,6 +843,9 @@ impl<'ctx, 'dw> EbpfContext<'ctx, 'dw> {
         &mut self,
         state_index: IntValue<'ctx>,
     ) -> Result<PointerValue<'ctx>> {
+        if self.compile_options.runtime_capabilities.sleepable_uprobe {
+            return self.lookup_sleepable_bt_state(state_index);
+        }
         let ptr_type = self.context.ptr_type(AddressSpace::default());
         let i32_type = self.context.i32_type();
         let map_global = self
