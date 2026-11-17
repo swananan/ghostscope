@@ -58,6 +58,7 @@ pub struct UserConfig {
     pub dwarf_backtrace_runtime_module_timeout_ms: u64,
     pub dwarf_debuginfod: ResolvedDebuginfodConfig,
     pub dwarf_analysis_cache_dir: Option<PathBuf>,
+    pub dwarf_analysis_cache_max_size_mb: u64,
 
     // Source-language value adapter configuration
     pub value_adapter_config: crate::config::settings::ValueAdapterConfig,
@@ -220,6 +221,7 @@ impl UserConfig {
             dwarf_debuginfod,
             value_adapter_config: config.value_adapters,
             dwarf_analysis_cache_dir,
+            dwarf_analysis_cache_max_size_mb: config.dwarf.analysis_cache.max_size_mb,
             ebpf_config: {
                 let mut ebpf_config = config.ebpf;
                 if args.force_perf_event_array {

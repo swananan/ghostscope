@@ -944,6 +944,7 @@ mod tests {
                 dwarf_debuginfod: Default::default(),
                 value_adapter_config: Default::default(),
                 dwarf_analysis_cache_dir: None,
+                dwarf_analysis_cache_max_size_mb: 1024,
                 ebpf_config: EbpfConfig::default(),
                 source: Default::default(),
                 config_file_path: None,

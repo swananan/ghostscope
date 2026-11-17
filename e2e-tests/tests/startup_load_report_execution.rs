@@ -81,6 +81,7 @@ async fn test_prepare_analysis_cache_runs_without_root_and_reuses_entry() -> Res
         &public_binary,
         &cache_dir,
         unprivileged_identity,
+        None,
     )?;
     assert!(
         first.status.success(),
@@ -100,6 +101,7 @@ async fn test_prepare_analysis_cache_runs_without_root_and_reuses_entry() -> Res
         &public_binary,
         &cache_dir,
         unprivileged_identity,
+        None,
     )?;
     assert!(
         second.status.success(),
@@ -108,6 +110,46 @@ async fn test_prepare_analysis_cache_runs_without_root_and_reuses_entry() -> Res
         second.output
     );
     assert_output_contains(&second.output, "Reused analysis cache for");
+
+    // Lowering the configured budget must prune on a prepare hit too.
+    let version = cache_dir.join("v4");
+    let cold = version.join("0000000000000001.bin");
+    let warm = version.join("0000000000000002.bin");
+    for (path, seconds) in [(&cold, 1), (&warm, 2)] {
+        let file = fs::File::create(path)?;
+        file.set_len(700 * 1024)?;
+        file.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+        )?;
+    }
+    let orphan = version.join(".0000000000000003.bin.999.0.tmp");
+    fs::write(&orphan, b"abandoned write")?;
+    let config = temp_dir.path().join("cache-limit.toml");
+    fs::write(&config, "[dwarf.analysis_cache]\nmax_size_mb = 1\n")?;
+    let pruned = run_prepare_analysis_cache_command(
+        &public_ghostscope,
+        &public_binary,
+        &cache_dir,
+        unprivileged_identity,
+        Some(&config),
+    )?;
+    assert!(pruned.status.success(), "{}", pruned.output);
+    assert_output_contains(&pruned.output, "Reused analysis cache for");
+    assert!(
+        !cold.exists() && warm.exists(),
+        "prepare must evict the older entry first"
+    );
+    assert!(
+        !orphan.exists(),
+        "prepare must clean abandoned temporary output"
+    );
+    let used = fs::read_dir(&version)?
+        .map(|entry| Ok(entry?.metadata()?.len()))
+        .collect::<Result<Vec<u64>>>()?
+        .into_iter()
+        .sum::<u64>();
+    assert!(used <= 1024 * 1024, "configured budget exceeded: {used}");
+    fs::remove_file(warm)?;
 
     let runtime = run_startup_report_command_for_binary(
         &fixture,
@@ -866,6 +908,7 @@ fn run_prepare_analysis_cache_command(
     binary: &Path,
     cache_dir: &Path,
     unprivileged_identity: Option<(u32, u32)>,
+    config: Option<&Path>,
 ) -> Result<StartupReportRun> {
     let mut command = Command::new(ghostscope);
     command.args([
@@ -876,6 +919,9 @@ fn run_prepare_analysis_cache_command(
         cache_dir.as_os_str(),
         OsStr::new("--no-log"),
     ]);
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
     command.current_dir("/tmp");
     if let Some(home) = cache_dir.parent() {
         command.env("HOME", home);

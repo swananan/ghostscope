@@ -36,25 +36,40 @@ const MAX_CACHE_FILE_BYTES: u64 =
     CACHE_FILE_PREFIX_LEN as u64 + MAX_CACHE_HEADER_BYTES + MAX_CACHE_PAYLOAD_BYTES;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+mod maintenance;
+
 #[derive(Debug, Clone)]
 pub struct AnalysisCache {
     directory: PathBuf,
     writable: bool,
+    max_size_bytes: u64,
 }
 
 impl AnalysisCache {
+    pub const DEFAULT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+
     pub fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
             writable: true,
+            max_size_bytes: Self::DEFAULT_MAX_SIZE_BYTES,
         }
     }
 
+    /// Never create or replace payloads. Successful reads may update recency
+    /// metadata; failure to do so does not prevent using a shared cache.
     pub fn read_only(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
             writable: false,
+            max_size_bytes: Self::DEFAULT_MAX_SIZE_BYTES,
         }
+    }
+
+    /// Total logical bytes managed by prepare, including reserved output space.
+    pub fn with_max_size_bytes(mut self, max_size_bytes: u64) -> Self {
+        self.max_size_bytes = max_size_bytes;
+        self
     }
 
     pub fn default_directory() -> PathBuf {
@@ -87,6 +102,16 @@ impl AnalysisCache {
     ) -> Result<Option<PreparedAnalysis>> {
         let identity = CacheIdentity::new(binary, debug_file, supplementary)?;
         let path = self.entry_path(&identity)?;
+        // A prepare hit must also enforce a newly lowered budget. Hold the same
+        // writer lock across validation and pruning so its entry stays present.
+        let maintenance = if self.writable {
+            if !self.directory.try_exists()? {
+                return Ok(None);
+            }
+            Some(maintenance::Maintenance::acquire(&self.directory)?)
+        } else {
+            None
+        };
         let mut file = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -201,9 +226,12 @@ impl AnalysisCache {
             "payload",
             &path,
         )?;
-        payload
-            .into_parse_result(debug_file.as_bytes().len())
-            .map(Some)
+        let result = payload.into_parse_result(debug_file.as_bytes().len())?;
+        maintenance::record_hit(&file, &metadata);
+        if let Some(maintenance) = maintenance {
+            maintenance.prune(self.max_size_bytes, 0, Some(&path))?;
+        }
+        Ok(Some(result))
     }
 
     pub(crate) fn store(
@@ -240,6 +268,12 @@ impl AnalysisCache {
             "Analysis cache payload is {payload_len} bytes, exceeding the \
              {MAX_CACHE_PAYLOAD_BYTES} byte limit"
         );
+        let file_len = CACHE_FILE_PREFIX_LEN as u64 + header_len + payload_len;
+        anyhow::ensure!(file_len <= self.max_size_bytes,
+            "Prepared analysis cache entry is {file_len} bytes, exceeding the configured {} byte cache size limit",
+            self.max_size_bytes);
+        let maintenance = maintenance::Maintenance::acquire(&self.directory)?;
+        maintenance.prune(self.max_size_bytes, file_len, None)?;
         let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temp_path = directory.join(format!(
             ".{}.{}.{}.tmp",
@@ -1022,6 +1056,105 @@ mod tests {
                 .lookup_units("lookup_alias", GdbSymbolKind::Function, false)
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn real_hits_drive_eviction_and_loaded_snapshots_survive_it() {
+        let (dir, first, cache) = fixture();
+        let first_path = cache.store(&first, &first, None, &sample(), UNITS).unwrap();
+        let entry_size = fs::metadata(&first_path).unwrap().len();
+        let cache = cache.with_max_size_bytes(2 * entry_size);
+        let module = |name: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, b"another module").unwrap();
+            MappedFile::open(path).unwrap()
+        };
+        let second = module("second");
+        let second_path = cache
+            .store(&second, &second, None, &sample(), UNITS)
+            .unwrap();
+        let third = module("third");
+        assert!(cache
+            .clone()
+            .with_max_size_bytes(entry_size - 1)
+            .store(&third, &third, None, &sample(), UNITS)
+            .is_err());
+        assert!(first_path.exists() && second_path.exists());
+        std::fs::File::open(&first_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        std::fs::File::open(&second_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        let restored = AnalysisCache::read_only(cache.directory())
+            .load(&first, &first, None)
+            .unwrap()
+            .unwrap();
+        let third_path = cache.store(&third, &third, None, &sample(), UNITS).unwrap();
+        assert!(first_path.exists() && third_path.exists());
+        assert!(!second_path.exists());
+        let cache = cache.with_max_size_bytes(entry_size);
+        assert!(cache.load(&third, &third, None).unwrap().is_some());
+        assert!(!first_path.exists());
+        assert!(third_path.exists());
+        assert_eq!(
+            restored
+                .names
+                .lookup_units("lookup_alias", GdbSymbolKind::Function, false),
+            vec![UNITS[0]]
+        );
+    }
+
+    #[test]
+    fn concurrent_preparations_obey_one_shared_budget() {
+        let (dir, mapped, cache) = fixture();
+        let path = cache
+            .store(&mapped, &mapped, None, &sample(), UNITS)
+            .unwrap();
+        let entry_size = fs::metadata(path).unwrap().len();
+        let cache = cache.with_max_size_bytes(2 * entry_size);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for i in 0..8 {
+            let path = dir.path().join(format!("module-{i}"));
+            fs::write(&path, b"another module").unwrap();
+            let cache = cache.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let mapped = MappedFile::open(path).unwrap();
+                barrier.wait();
+                cache
+                    .store(&mapped, &mapped, None, &sample(), UNITS)
+                    .unwrap();
+                mapped
+            }));
+        }
+        let modules = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        let files = fs::read_dir(cache.directory().join(format!("v{CACHE_SCHEMA_VERSION}")))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 2);
+        assert!(
+            files
+                .iter()
+                .map(|entry| entry.metadata().unwrap().len())
+                .sum::<u64>()
+                <= 2 * entry_size
+        );
+        let reader = AnalysisCache::read_only(cache.directory());
+        assert_eq!(
+            modules
+                .iter()
+                .filter(|mapped| reader.load(mapped, mapped, None).unwrap().is_some())
+                .count(),
+            2
         );
     }
 }
