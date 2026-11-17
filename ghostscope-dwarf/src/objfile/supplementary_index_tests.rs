@@ -150,15 +150,29 @@ async fn supplementary_rejected_accelerator_falls_back_to_working_dwarf() -> any
 async fn cross_cu_declarations_load_definitions_only_when_projected() -> anyhow::Result<()> {
     use crate::{semantics::resolve_type_ref_with_origins, ModuleId, VariableAccessSegment};
     for index in [
-        Index::GnuPubNames,
-        Index::Gdb,
-        Index::DebugNames,
-        Index::GdbDebugNames,
+        Some(Index::GnuPubNames),
+        Some(Index::Gdb),
+        Some(Index::DebugNames),
+        Some(Index::GdbDebugNames),
+        None,
     ] {
         for standard in [false, true] {
             let dir = tempfile::tempdir()?;
             let fixture = build_cross_cu_fixture(dir.path(), standard)?;
-            indexes::add_index(&fixture.binary, index)?;
+            let cache_dir = dir.path().join("cache");
+            if let Some(index) = index {
+                indexes::add_index(&fixture.binary, index)?;
+            } else {
+                LoadedObjfile::load_parallel(
+                    ModuleMapping::from_path(fixture.binary.clone()),
+                    &[],
+                    false,
+                    None,
+                    None,
+                    Some(crate::AnalysisCache::new(&cache_dir)),
+                )
+                .await?;
+            }
             for segment in [
                 VariableAccessSegment::Dereference,
                 VariableAccessSegment::Field("second".into()),
@@ -169,7 +183,9 @@ async fn cross_cu_declarations_load_definitions_only_when_projected() -> anyhow:
                     false,
                     None,
                     None,
-                    None,
+                    index
+                        .is_none()
+                        .then(|| crate::AnalysisCache::read_only(&cache_dir)),
                 )
                 .await?;
                 assert!(
@@ -269,6 +285,7 @@ async fn prepared_scan_preserves_supplementary_lookups_and_lazy_lines() -> anyho
         let fixture = fixture::build_rust(dir.path(), standard, false)?;
         let cache_dir = dir.path().join("cache");
         let mut addresses = None;
+        let mut expected_names = None;
         for (cache, expected) in [
             (
                 Some(AnalysisCache::new(&cache_dir)),
@@ -291,8 +308,25 @@ async fn prepared_scan_preserves_supplementary_lookups_and_lazy_lines() -> anyho
             .await?;
             assert_eq!(module.analysis_cache_status(), &expected);
             assert!(module.indexed_line_cus.lock().unwrap().is_empty());
+            let mut functions = module.get_function_names();
+            let mut variables = module.get_variable_names();
+            functions.sort();
+            variables.sort();
+            let names = (functions, variables);
+            if let Some(previous) = &expected_names {
+                assert_eq!(previous, &names);
+            }
+            expected_names = Some(names);
+            if expected == AnalysisCacheStatus::Hit {
+                assert!(module.lazy_debug_info);
+                assert!(module.indexed_debug_info_cus.lock().unwrap().is_empty());
+                assert_eq!(module.lightweight_index.read().unwrap().entry_count(), 0);
+            }
             let actual = module.lookup_function_addresses("tick");
             assert!(!actual.is_empty());
+            if expected == AnalysisCacheStatus::Hit {
+                assert_eq!(module.indexed_debug_info_cus.lock().unwrap().len(), 1);
+            }
             if let Some(previous) = &addresses {
                 assert_eq!(previous, &actual);
             }

@@ -229,6 +229,7 @@ struct LoadTimingBreakdown {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 struct IndexUsage {
+    prepared: usize,
     full_scan: usize,
     gnu_pubnames: usize,
     gdb_index: usize,
@@ -524,6 +525,7 @@ fn summarize_load_breakdown(stats: &[ModuleLoadingStats]) -> LoadTimingBreakdown
         out.index_time_ms += stat.index_time_ms;
         out.internal_total_time_ms += stat.module_total_time_ms;
         match stat.dwarf_index_status {
+            DwarfIndexStatus::Prepared => out.index_usage.prepared += 1,
             DwarfIndexStatus::FullScan => out.index_usage.full_scan += 1,
             DwarfIndexStatus::GnuPubNames => out.index_usage.gnu_pubnames += 1,
             DwarfIndexStatus::GdbIndex { .. } => out.index_usage.gdb_index += 1,

@@ -44,7 +44,6 @@ fn select_fallback_index(
     has_gdb_index: bool,
     mapped_file: &Arc<MappedFile>,
     mut rejection: Option<String>,
-    cache: &ScanCacheContext,
 ) -> Result<(DebugParseResult, InitialIndexSelection)> {
     if has_gdb_index {
         return Ok((
@@ -95,52 +94,9 @@ fn select_fallback_index(
         }
     }
 
-    cache
-        .parse(parser, module_path)
+    parser
+        .parse_debug_info(module_path)
         .map(|index| (index, InitialIndexSelection::FullScan { rejection }))
-}
-
-/// Consult the prepared full-scan cache only after native accelerators decline.
-struct ScanCacheContext {
-    cache: Option<AnalysisCache>,
-    binary: Arc<MappedFile>,
-    debug: Arc<MappedFile>,
-    supplementary: Option<Arc<MappedFile>>,
-    status: Mutex<AnalysisCacheStatus>,
-}
-
-impl ScanCacheContext {
-    fn parse(&self, parser: &DwarfParser<'_>, module_path: &str) -> Result<DebugParseResult> {
-        if let Some(cache) = &self.cache {
-            match cache.load(&self.binary, &self.debug, self.supplementary.as_deref()) {
-                Ok(Some(result)) => {
-                    *self.status.lock().unwrap() = AnalysisCacheStatus::Hit;
-                    tracing::info!("DWARF analysis cache hit for {}", module_path);
-                    return Ok(result);
-                }
-                Ok(None) => *self.status.lock().unwrap() = AnalysisCacheStatus::Miss,
-                Err(error) => {
-                    tracing::warn!(
-                        "Ignoring unusable DWARF analysis cache for {}: {error:#}",
-                        module_path
-                    );
-                    *self.status.lock().unwrap() = AnalysisCacheStatus::Rejected {
-                        reason: format!("{error:#}"),
-                    };
-                }
-            }
-        }
-        let result = parser.parse_debug_info(module_path)?;
-        if let Some(cache) = self.cache.as_ref().filter(|cache| cache.is_writable()) {
-            cache.store(
-                &self.binary,
-                &self.debug,
-                self.supplementary.as_deref(),
-                &result,
-            )?;
-        }
-        Ok(result)
-    }
 }
 
 impl LoadedObjfile {
@@ -316,48 +272,96 @@ impl LoadedObjfile {
         }
         let dwarf = Arc::new(dwarf);
         let mapped_file = mapped_file_for_dwarf;
-        let (gdb_index, gdb_index_rejection) = match Self::load_gdb_index(&mapped_file, &dwarf) {
-            Ok(Some(index)) => {
-                tracing::info!(
-                    "Found .gdb_index v{} with {} compilation units in {}",
-                    index.version(),
-                    index.compilation_unit_count(),
-                    mapped_file.path.display()
-                );
-                (Some(index), None)
+        // Only a full-scan fallback can publish an entry. An identity-matched
+        // entry therefore cannot displace a usable native accelerator: changing
+        // any ELF/debug/supplementary object invalidates it before this point.
+        let (prepared, analysis_cache_status) = if let Some(cache) = analysis_cache.clone() {
+            let binary = Arc::clone(&binary_mapped);
+            let debug = Arc::clone(&mapped_file);
+            let supplementary = supplementary_mapped.clone();
+            match tokio::task::spawn_blocking(move || {
+                cache.load(&binary, &debug, supplementary.as_deref())
+            })
+            .await
+            {
+                Ok(Ok(Some(prepared))) => (Some(prepared), AnalysisCacheStatus::Hit),
+                Ok(Ok(None)) => (None, AnalysisCacheStatus::Miss),
+                result => {
+                    let reason = match result {
+                        Ok(Err(error)) => format!("{error:#}"),
+                        Err(error) => format!("Cache loading task failed: {error}"),
+                        _ => unreachable!(),
+                    };
+                    tracing::warn!(
+                        "Ignoring unusable DWARF analysis cache for {}: {}",
+                        module_path,
+                        reason
+                    );
+                    (None, AnalysisCacheStatus::Rejected { reason })
+                }
             }
-            Ok(None) => (None, None),
-            Err(error) => {
-                tracing::warn!(
-                    "Ignoring unusable .gdb_index in {}: {}",
-                    mapped_file.path.display(),
-                    error
-                );
-                (None, Some(error.to_string()))
-            }
+        } else {
+            (None, AnalysisCacheStatus::Disabled)
         };
-        let has_gdb_index = gdb_index.is_some();
-        let initial_rejection =
-            gdb_index_rejection.map(|reason| format!(".gdb_index could not be used: {reason}"));
+        let (
+            parse_result,
+            unwind_info,
+            gdb_index,
+            cu_name_index,
+            dwarf_index_status,
+            lazy_debug_info,
+        ) = if let Some(prepared) = prepared {
+            tracing::info!("DWARF analysis cache hit for {}", module_path);
+            let binary = Arc::clone(&binary_mapped);
+            let path = module_mapping.path.clone();
+            let unwind = tokio::task::spawn_blocking(move || {
+                ModuleUnwindInfo::from_mapped_file(binary, &path)
+            })
+            .await?;
+            (
+                prepared.parse_result,
+                unwind,
+                None,
+                Some(prepared.names),
+                DwarfIndexStatus::Prepared,
+                true,
+            )
+        } else {
+            let (gdb_index, gdb_index_rejection) = match Self::load_gdb_index(&mapped_file, &dwarf)
+            {
+                Ok(Some(index)) => {
+                    tracing::info!(
+                        "Found .gdb_index v{} with {} compilation units in {}",
+                        index.version(),
+                        index.compilation_unit_count(),
+                        mapped_file.path.display()
+                    );
+                    (Some(index), None)
+                }
+                Ok(None) => (None, None),
+                Err(error) => {
+                    tracing::warn!(
+                        "Ignoring unusable .gdb_index in {}: {}",
+                        mapped_file.path.display(),
+                        error
+                    );
+                    (None, Some(error.to_string()))
+                }
+            };
+            let has_gdb_index = gdb_index.is_some();
+            let initial_rejection =
+                gdb_index_rejection.map(|reason| format!(".gdb_index could not be used: {reason}"));
 
-        tracing::debug!(
-            "Starting parallel DWARF parsing with true debug_line || debug_info parallelism..."
-        );
+            tracing::debug!(
+                "Starting parallel DWARF parsing with true debug_line || debug_info parallelism..."
+            );
 
-        let scan_cache = Arc::new(ScanCacheContext {
-            cache: analysis_cache,
-            binary: Arc::clone(&binary_mapped),
-            debug: Arc::clone(&mapped_file),
-            supplementary: supplementary_mapped,
-            status: Mutex::new(AnalysisCacheStatus::Disabled),
-        });
-        let (pair_result, unwind_info) = tokio::try_join!(
-            tokio::task::spawn_blocking({
-                let dwarf = Arc::clone(&dwarf);
-                let mapped_file_for_index = Arc::clone(&mapped_file);
-                let scan_cache = Arc::clone(&scan_cache);
-                let module_path = module_path.clone();
-                move || -> Result<(
+            let (pair_result, unwind_info) = tokio::try_join!(
+                tokio::task::spawn_blocking({
+                    let dwarf = Arc::clone(&dwarf);
+                    let mapped_file_for_index = Arc::clone(&mapped_file);
+                    let module_path = module_path.clone();
+                    move || -> Result<(
                     crate::parser::LineParseResult,
                     crate::parser::DebugParseResult,
                     InitialIndexSelection,
@@ -379,7 +383,6 @@ impl LoadedObjfile {
                                     has_gdb_index,
                                     &mapped_file_for_index,
                                     initial_rejection,
-                                    &scan_cache,
                                 ),
                                 Err(error) => {
                                     tracing::warn!(
@@ -397,8 +400,7 @@ impl LoadedObjfile {
                                         has_gdb_index,
                                         &mapped_file_for_index,
                                         rejection,
-                                        &scan_cache,
-                                    )
+                                        )
                                 }
                             }
                         },
@@ -411,43 +413,79 @@ impl LoadedObjfile {
                         (_, Err(e)) => Err(e),
                     }
                 }
-            }),
-            tokio::task::spawn_blocking({
-                let binary_for_cfi = Arc::clone(&binary_mapped);
-                let module_path = module_mapping.path.clone();
-                move || ModuleUnwindInfo::from_mapped_file(binary_for_cfi, &module_path)
-            })
-        )?;
+                }),
+                tokio::task::spawn_blocking({
+                    let binary_for_cfi = Arc::clone(&binary_mapped);
+                    let module_path = module_mapping.path.clone();
+                    move || ModuleUnwindInfo::from_mapped_file(binary_for_cfi, &module_path)
+                })
+            )?;
 
-        let (line_result, info_result, index_selection) = pair_result?;
-        let lazy_debug_info = !matches!(index_selection, InitialIndexSelection::FullScan { .. });
-        let (gdb_index, cu_name_index, dwarf_index_status) = match index_selection {
-            InitialIndexSelection::FullScan { rejection } => {
-                let status = rejection.map_or(DwarfIndexStatus::FullScan, |reason| {
-                    DwarfIndexStatus::Rejected { reason }
-                });
-                (None, None, status)
+            let (line_result, info_result, index_selection) = pair_result?;
+            let lazy_debug_info =
+                !matches!(index_selection, InitialIndexSelection::FullScan { .. });
+            let (gdb_index, cu_name_index, dwarf_index_status) = match index_selection {
+                InitialIndexSelection::FullScan { rejection } => {
+                    let status = rejection.map_or(DwarfIndexStatus::FullScan, |reason| {
+                        DwarfIndexStatus::Rejected { reason }
+                    });
+                    (None, None, status)
+                }
+                InitialIndexSelection::DebugNames(cu_names) => {
+                    (None, cu_names, DwarfIndexStatus::DebugNames)
+                }
+                InitialIndexSelection::GdbIndex => {
+                    let index = gdb_index.expect("selected GDB index must be loaded");
+                    let status = DwarfIndexStatus::GdbIndex {
+                        version: index.version(),
+                    };
+                    (Some(index), None, status)
+                }
+                InitialIndexSelection::GnuPubNames(index) => {
+                    (None, Some(index), DwarfIndexStatus::GnuPubNames)
+                }
+            };
+
+            let parse_result = crate::parser::DwarfParser::combine_parallel_results(
+                line_result,
+                info_result,
+                module_path.clone(),
+            );
+            if !lazy_debug_info {
+                if let Some(cache) = analysis_cache.as_ref().filter(|cache| cache.is_writable()) {
+                    let mut units = Vec::new();
+                    let mut headers = dwarf.units();
+                    while let Some(header) = headers.next()? {
+                        if let Some(offset) = header.debug_info_offset() {
+                            units.push(offset);
+                        }
+                    }
+                    cache.store(
+                        &binary_mapped,
+                        &mapped_file,
+                        supplementary_mapped.as_deref(),
+                        &parse_result,
+                        &units,
+                    )?;
+                }
             }
-            InitialIndexSelection::DebugNames(cu_names) => {
-                (None, cu_names, DwarfIndexStatus::DebugNames)
-            }
-            InitialIndexSelection::GdbIndex => {
-                let index = gdb_index.expect("selected GDB index must be loaded");
-                let status = DwarfIndexStatus::GdbIndex {
-                    version: index.version(),
-                };
-                (Some(index), None, status)
-            }
-            InitialIndexSelection::GnuPubNames(index) => {
-                (None, Some(index), DwarfIndexStatus::GnuPubNames)
-            }
+            (
+                parse_result,
+                unwind_info,
+                gdb_index,
+                cu_name_index,
+                dwarf_index_status,
+                lazy_debug_info,
+            )
         };
-
-        let parse_result = crate::parser::DwarfParser::combine_parallel_results(
-            line_result,
-            info_result,
-            module_path,
-        );
+        // Native indexes need no prepared entry; do not report their absent
+        // entry as a miss or imply that --prepare wrote one.
+        let analysis_cache_status =
+            if lazy_debug_info && !matches!(dwarf_index_status, DwarfIndexStatus::Prepared) {
+                AnalysisCacheStatus::Disabled
+            } else {
+                analysis_cache_status
+            };
         let parse_elapsed_ms = load_started_at.elapsed().as_millis();
 
         if let Some(cfi) = unwind_info.cfi_index() {
@@ -535,7 +573,7 @@ impl LoadedObjfile {
             load_parse_ms: parse_elapsed_ms as u64,
             load_index_ms: index_elapsed_ms as u64,
             load_total_ms,
-            analysis_cache_status: scan_cache.status.lock().unwrap().clone(),
+            analysis_cache_status,
         };
 
         let (function_count, variable_count, _) = module.get_index_stats();

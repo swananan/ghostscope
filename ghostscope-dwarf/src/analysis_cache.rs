@@ -1,12 +1,15 @@
 use crate::{
     binary::MappedFile,
-    core::{FunctionDieKind, IndexEntry, IndexFlags},
-    index::{lightweight_index::NameIndexShard, LightweightIndex},
-    parser::DebugParseResult,
+    index::{
+        lightweight_file_index::LightweightFileEntry, CuNameIndex, GdbSymbolKind,
+        LightweightFileIndex, LightweightIndex, LineMappingTable, ScopedFileIndexManager,
+    },
+    parser::{CompilationUnit, DwarfParseResult, SourceFile},
 };
 use anyhow::{Context, Result};
 use bincode::Options;
 use object::Object;
+use rayon::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -23,7 +26,9 @@ use std::{
 };
 
 const CACHE_MAGIC: [u8; 8] = *b"GSANLYS\0";
-const CACHE_SCHEMA_VERSION: u32 = 3;
+// Bump for changes to the persisted layout or index-construction semantics,
+// even when the package version stays unchanged.
+const CACHE_SCHEMA_VERSION: u32 = 4;
 const CACHE_FILE_PREFIX_LEN: usize = 24;
 const MAX_CACHE_HEADER_BYTES: u64 = 64 * 1024;
 const MAX_CACHE_PAYLOAD_BYTES: u64 = 512 * 1024 * 1024;
@@ -79,7 +84,7 @@ impl AnalysisCache {
         binary: &MappedFile,
         debug_file: &MappedFile,
         supplementary: Option<&MappedFile>,
-    ) -> Result<Option<DebugParseResult>> {
+    ) -> Result<Option<PreparedAnalysis>> {
         let identity = CacheIdentity::new(binary, debug_file, supplementary)?;
         let path = self.entry_path(&identity)?;
         let mut file = match OpenOptions::new()
@@ -117,7 +122,8 @@ impl AnalysisCache {
 
         let snapshot_len = usize::try_from(metadata.len())?;
         let mut data = Vec::new();
-        data.try_reserve_exact(snapshot_len).context("Failed to allocate cache snapshot")?;
+        data.try_reserve_exact(snapshot_len)
+            .context("Failed to allocate cache snapshot")?;
         data.resize(snapshot_len, 0);
         file.read_exact(&mut data)
             .with_context(|| format!("Failed to snapshot analysis cache {}", path.display()))?;
@@ -189,13 +195,15 @@ impl AnalysisCache {
             crc32fast::hash(&data[header_end..]) == header.payload_crc32,
             "Analysis cache payload checksum mismatch"
         );
-        let payload: CachedDebugIndex = deserialize_cache_slice(
+        let payload: CachedAnalysis = deserialize_cache_slice(
             data.get(header_end..)
                 .context("Analysis cache payload is out of bounds")?,
             "payload",
             &path,
         )?;
-        payload.into_parse_result().map(Some)
+        payload
+            .into_parse_result(debug_file.as_bytes().len())
+            .map(Some)
     }
 
     pub(crate) fn store(
@@ -203,7 +211,8 @@ impl AnalysisCache {
         binary: &MappedFile,
         debug_file: &MappedFile,
         supplementary: Option<&MappedFile>,
-        parse_result: &DebugParseResult,
+        parse_result: &DwarfParseResult,
+        all_units: &[gimli::DebugInfoOffset],
     ) -> Result<PathBuf> {
         let identity = CacheIdentity::new(binary, debug_file, supplementary)?;
         let path = self.entry_path(&identity)?;
@@ -212,7 +221,7 @@ impl AnalysisCache {
             .context("Analysis cache entry has no parent directory")?;
         create_private_directory(directory)?;
 
-        let payload = CachedDebugIndex::from_parse_result(parse_result)?;
+        let payload = CachedAnalysis::from_parse_result(parse_result, all_units)?;
         let payload = cache_codec().serialize(&payload)?;
         let payload_len = payload.len() as u64;
         let header = CacheHeader {
@@ -241,18 +250,18 @@ impl AnalysisCache {
             sequence
         ));
 
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp_path)
+            .with_context(|| {
+                format!(
+                    "Failed to create temporary analysis cache {}",
+                    temp_path.display()
+                )
+            })?;
         let write_result = (|| -> Result<()> {
-            let file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&temp_path)
-                .with_context(|| {
-                    format!(
-                        "Failed to create temporary analysis cache {}",
-                        temp_path.display()
-                    )
-                })?;
             let mut writer = BufWriter::new(file);
             writer.write_all(&CACHE_MAGIC)?;
             writer.write_all(&CACHE_SCHEMA_VERSION.to_le_bytes())?;
@@ -414,72 +423,303 @@ struct CacheHeader {
     payload_crc32: u32,
 }
 
-/// Only full debug_info scans are persisted. Line headers/rows and native
-/// accelerator indexes retain the normal loader's ownership and lazy behavior.
-#[derive(Serialize, Deserialize)]
-struct CachedDebugIndex {
-    strings: Vec<String>,
-    entries: Vec<CachedIndexEntry>,
-    names: Vec<NameIndexShard>,
-    cu_ranges: Vec<CachedCuRange>,
-    functions_count: usize,
-    variables_count: usize,
+/// A prepared index selects CUs, but never substitutes for their concrete DIEs.
+pub(crate) struct PreparedAnalysis {
+    pub parse_result: crate::parser::DwarfParseResult,
+    pub names: CuNameIndex,
 }
 
-impl CachedDebugIndex {
-    fn from_parse_result(result: &DebugParseResult) -> Result<Self> {
+#[derive(Serialize, Deserialize)]
+struct CachedAnalysis {
+    strings: Vec<String>,
+    units: Vec<u64>,
+    names: Vec<(u8, u32, Vec<u32>)>,
+    ranges: Vec<(u64, u64, u32)>,
+    line_units: Vec<CachedLineUnit>,
+    source_units: Vec<(u32, Vec<u32>)>,
+    index_stats: (usize, usize, usize),
+    parse_stats: (usize, usize, usize, usize),
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedLineUnit {
+    unit: u32,
+    comp_dir: Option<u32>,
+    directories: Vec<u32>,
+    version: u16,
+    files: Vec<(u64, u64, u32)>,
+    base_directory: u32,
+    include_directories: Vec<u32>,
+    sources: Vec<(u32, u32, u32)>,
+}
+
+impl CachedAnalysis {
+    fn from_parse_result(
+        result: &DwarfParseResult,
+        all_units: &[gimli::DebugInfoOffset],
+    ) -> Result<Self> {
         let mut strings = StringInterner::default();
-        for entry in result.lightweight_index.cache_entries() {
-            strings.intern(&entry.name)?;
-        }
-        let entries = result
-            .lightweight_index
-            .cache_entries()
+        let mut units = all_units.to_vec();
+        units.sort_unstable_by_key(|unit| unit.0);
+        units.dedup();
+        let unit_ids: HashMap<_, _> = units
             .iter()
-            .map(|entry| CachedIndexEntry::from_index_entry(entry, &strings))
-            .collect::<Result<Vec<_>>>()?;
+            .enumerate()
+            .map(|(i, &unit)| Ok((unit, u32::try_from(i)?)))
+            .collect::<Result<_>>()?;
+        let unit_id = |unit: gimli::DebugInfoOffset| -> Result<u32> {
+            unit_ids
+                .get(&unit)
+                .copied()
+                .context("Cache references an unknown compilation unit")
+        };
+        let names = result
+            .lightweight_index
+            .cache_names()
+            .into_iter()
+            .map(|(kind, name, offsets)| {
+                Ok((
+                    kind,
+                    strings.intern(&name)?,
+                    offsets.into_iter().map(unit_id).collect::<Result<_>>()?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let ranges = result
+            .lightweight_index
+            .cache_cu_ranges()
+            .into_iter()
+            .map(|(start, end, unit)| Ok((start, end, unit_id(unit)?)))
+            .collect::<Result<_>>()?;
+        let mut line_units = Vec::new();
+        for &unit in &units {
+            let Some(info) = result.compilation_units.get(&unit) else {
+                continue;
+            };
+            let index = result
+                .scoped_file_manager
+                .get_cu_file_index(unit)
+                .context("Missing prepared CU file index")?;
+            let (comp_dir, directories, version) = index.cache_parts();
+            line_units.push(CachedLineUnit {
+                unit: unit_id(unit)?,
+                comp_dir: comp_dir.map(|s| strings.intern(s)).transpose()?,
+                directories: directories
+                    .iter()
+                    .map(|s| strings.intern(s))
+                    .collect::<Result<_>>()?,
+                version,
+                files: index
+                    .file_entries()
+                    .iter()
+                    .map(|file| {
+                        Ok((
+                            file.file_index,
+                            file.directory_index,
+                            strings.intern(&file.filename)?,
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
+                base_directory: strings.intern(&info.base_directory)?,
+                include_directories: info
+                    .include_directories
+                    .iter()
+                    .map(|s| strings.intern(s))
+                    .collect::<Result<_>>()?,
+                sources: info
+                    .files
+                    .iter()
+                    .map(|file| {
+                        Ok((
+                            strings.intern(&file.directory_path)?,
+                            strings.intern(&file.filename)?,
+                            strings.intern(&file.full_path)?,
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
+            });
+        }
+        let source_units = result
+            .line_source_unit_offsets
+            .iter()
+            .map(|(path, offsets)| {
+                Ok((
+                    strings.intern(path)?,
+                    offsets
+                        .iter()
+                        .copied()
+                        .map(unit_id)
+                        .collect::<Result<_>>()?,
+                ))
+            })
+            .collect::<Result<_>>()?;
         Ok(Self {
             strings: strings.strings,
-            entries,
-            names: result.lightweight_index.cache_names(),
-            cu_ranges: result
-                .lightweight_index
-                .cache_cu_ranges()
-                .into_iter()
-                .map(|(start, end, cu)| CachedCuRange {
-                    start,
-                    end,
-                    cu_offset: cu.0 as u64,
-                })
-                .collect(),
-            functions_count: result.functions_count,
-            variables_count: result.variables_count,
+            units: units.into_iter().map(|u| u.0 as u64).collect(),
+            names,
+            ranges,
+            line_units,
+            source_units,
+            index_stats: result.lightweight_index.get_stats(),
+            parse_stats: (
+                result.stats.total_functions,
+                result.stats.total_variables,
+                result.stats.total_line_entries,
+                result.stats.total_files,
+            ),
         })
     }
 
-    fn into_parse_result(self) -> Result<DebugParseResult> {
-        let strings: Vec<Arc<str>> = self.strings.into_iter().map(Arc::from).collect();
-        let entries = self
-            .entries
+    fn into_parse_result(self, debug_file_len: usize) -> Result<PreparedAnalysis> {
+        let strings = self.strings;
+        let shared_strings: Vec<Arc<str>> = strings.iter().map(|s| Arc::from(s.as_str())).collect();
+        let shared_string = |id: u32| -> Result<Arc<str>> {
+            shared_strings
+                .get(id as usize)
+                .cloned()
+                .context("Cached string ID is out of bounds")
+        };
+        let string = |id: u32| -> Result<String> {
+            strings
+                .get(id as usize)
+                .cloned()
+                .context("Cached string ID is out of bounds")
+        };
+        let units = self
+            .units
             .into_iter()
-            .map(|entry| entry.into_index_entry(&strings))
-            .collect::<Result<Vec<_>>>()?;
-        let ranges = self
-            .cu_ranges
-            .into_iter()
-            .map(|range| {
-                anyhow::ensure!(range.start < range.end, "Invalid cached CU range");
-                Ok((
-                    range.start,
-                    range.end,
-                    gimli::DebugInfoOffset(usize::try_from(range.cu_offset)?),
-                ))
+            .map(|offset| {
+                let offset = usize::try_from(offset)?;
+                anyhow::ensure!(offset < debug_file_len, "Cached CU offset is out of bounds");
+                Ok(gimli::DebugInfoOffset(offset))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(DebugParseResult {
-            lightweight_index: LightweightIndex::from_cached_entries(entries, self.names, ranges)?,
-            functions_count: self.functions_count,
-            variables_count: self.variables_count,
+        anyhow::ensure!(
+            units.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "Cached CU offsets are not strictly ordered"
+        );
+        let unit = |id: u32| -> Result<gimli::DebugInfoOffset> {
+            units
+                .get(id as usize)
+                .copied()
+                .context("Cached CU ID is out of bounds")
+        };
+        let mut names = CuNameIndex::new(units.clone()).with_prepared_stats(self.index_stats);
+        for (kind, name, offsets) in self.names {
+            let kind = match kind {
+                0 => GdbSymbolKind::Function,
+                1 => GdbSymbolKind::Variable,
+                2 => GdbSymbolKind::Type,
+                _ => anyhow::bail!("Invalid cached name kind"),
+            };
+            let name = string(name)?;
+            names.insert_prepared(
+                name,
+                offsets.into_iter().map(unit).collect::<Result<_>>()?,
+                kind,
+            );
+        }
+        let ranges = self
+            .ranges
+            .into_iter()
+            .map(|(start, end, offset)| {
+                anyhow::ensure!(start < end, "Invalid cached CU range");
+                Ok((start, end, unit(offset)?))
+            })
+            .collect::<Result<_>>()?;
+        let line_units = self
+            .line_units
+            .into_par_iter()
+            .map(|cached| -> Result<_> {
+                let unit = unit(cached.unit)?;
+                let count = cached.files.len() as u64;
+                let files = cached
+                    .files
+                    .into_iter()
+                    .map(|(file, directory, name)| -> Result<_> {
+                        // Path caches are indexed by the original DWARF file number.
+                        anyhow::ensure!(file <= count, "Cached file index is out of bounds");
+                        Ok(LightweightFileEntry {
+                            file_index: file,
+                            directory_index: directory,
+                            filename: shared_string(name)?,
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+                let index = LightweightFileIndex::from_prepared_parts(
+                    cached.comp_dir.map(shared_string).transpose()?,
+                    cached
+                        .directories
+                        .into_iter()
+                        .map(shared_string)
+                        .collect::<Result<_>>()?,
+                    cached.version,
+                    files,
+                );
+                let info = CompilationUnit {
+                    base_directory: string(cached.base_directory)?,
+                    include_directories: cached
+                        .include_directories
+                        .into_iter()
+                        .map(string)
+                        .collect::<Result<_>>()?,
+                    files: cached
+                        .sources
+                        .into_iter()
+                        .map(|(dir, name, path)| {
+                            Ok(SourceFile {
+                                directory_path: string(dir)?,
+                                filename: string(name)?,
+                                full_path: string(path)?,
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                };
+                Ok((unit, index, info))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut scoped_file_manager = ScopedFileIndexManager::new();
+        let mut compilation_units = HashMap::new();
+        for (unit, index, info) in line_units {
+            anyhow::ensure!(
+                compilation_units.insert(unit, info).is_none(),
+                "Duplicate cached line CU"
+            );
+            scoped_file_manager.add_compilation_unit(unit, index);
+        }
+        let line_source_unit_offsets = self
+            .source_units
+            .into_iter()
+            .map(|(path, offsets)| {
+                Ok((
+                    string(path)?,
+                    offsets.into_iter().map(unit).collect::<Result<Vec<_>>>()?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let (total_functions, total_variables, total_line_entries, total_files) = self.parse_stats;
+        anyhow::ensure!(
+            total_line_entries == 0,
+            "Prepared analysis must leave line rows lazy"
+        );
+        Ok(PreparedAnalysis {
+            parse_result: DwarfParseResult {
+                lightweight_index: LightweightIndex::from_cached_cu_ranges(ranges),
+                line_mapping: LineMappingTable::from_entries_with_scoped_manager(
+                    Vec::new(),
+                    &scoped_file_manager,
+                ),
+                scoped_file_manager,
+                compilation_units,
+                line_source_unit_offsets,
+                stats: crate::parser::fast_parser::DwarfParseStats {
+                    total_functions,
+                    total_variables,
+                    total_line_entries,
+                    total_files,
+                },
+            },
+            names,
         })
     }
 }
@@ -496,140 +736,22 @@ impl StringInterner {
             return Ok(id);
         }
         let id = u32::try_from(self.strings.len()).context("Too many cached strings")?;
-        let value = value.to_string();
-        self.strings.push(value.clone());
-        self.ids.insert(value, id);
+        self.strings.push(value.to_owned());
+        self.ids.insert(value.to_owned(), id);
         Ok(id)
     }
-
-    fn id(&self, value: &str) -> Result<u32> {
-        cached_string_id(&self.ids, value)
-    }
-}
-
-fn cached_string_id(ids: &HashMap<String, u32>, value: &str) -> Result<u32> {
-    ids.get(value)
-        .copied()
-        .with_context(|| format!("Cached string was not interned: {value:?}"))
-}
-
-fn cached_string<'a>(strings: &'a [Arc<str>], id: u32, field: &str) -> Result<&'a Arc<str>> {
-    strings
-        .get(id as usize)
-        .with_context(|| format!("Cached {field} string ID {id} is out of bounds"))
-}
-
-#[derive(Serialize, Deserialize)]
-struct CachedIndexEntry {
-    name_id: u32,
-    die_offset: u64,
-    unit_offset: u64,
-    lexical_scope: Option<u64>,
-    tag: u16,
-    flags: CachedIndexFlags,
-    language: Option<u16>,
-    representative_addr: Option<u64>,
-    entry_pc: Option<u64>,
-    function_kind: u8,
-}
-
-impl CachedIndexEntry {
-    fn from_index_entry(entry: &IndexEntry, strings: &StringInterner) -> Result<Self> {
-        Ok(Self {
-            name_id: strings.id(&entry.name)?,
-            die_offset: entry.die_offset.0 as u64,
-            unit_offset: entry.unit_offset.0 as u64,
-            lexical_scope: entry.lexical_scope.map(|offset| offset.0 as u64),
-            tag: entry.tag.0,
-            flags: CachedIndexFlags::from(entry.flags),
-            language: entry.language.map(|language| language.0),
-            representative_addr: entry.representative_addr,
-            entry_pc: entry.entry_pc,
-            function_kind: match entry.function_kind {
-                FunctionDieKind::NotFunction => 0,
-                FunctionDieKind::AbstractSubprogram => 1,
-                FunctionDieKind::ConcreteSubprogram => 2,
-                FunctionDieKind::InlineInstance => 3,
-            },
-        })
-    }
-
-    fn into_index_entry(self, strings: &[Arc<str>]) -> Result<IndexEntry> {
-        let function_kind = match self.function_kind {
-            0 => FunctionDieKind::NotFunction,
-            1 => FunctionDieKind::AbstractSubprogram,
-            2 => FunctionDieKind::ConcreteSubprogram,
-            3 => FunctionDieKind::InlineInstance,
-            value => anyhow::bail!("Invalid cached function kind {value}"),
-        };
-
-        Ok(IndexEntry {
-            name: Arc::clone(cached_string(strings, self.name_id, "index name")?),
-            die_offset: gimli::UnitOffset(usize::try_from(self.die_offset)?),
-            unit_offset: gimli::DebugInfoOffset(usize::try_from(self.unit_offset)?),
-            lexical_scope: self
-                .lexical_scope
-                .map(|offset| usize::try_from(offset).map(gimli::UnitOffset))
-                .transpose()?,
-            tag: gimli::DwTag(self.tag),
-            flags: self.flags.into_index_flags(),
-            language: self.language.map(gimli::DwLang),
-            representative_addr: self.representative_addr,
-            entry_pc: self.entry_pc,
-            function_kind,
-        })
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct CachedIndexFlags {
-    is_static: bool,
-    is_main: bool,
-    has_inline_attribute: bool,
-    is_linkage: bool,
-    is_type_declaration: bool,
-    is_synthesized: bool,
-}
-
-impl From<IndexFlags> for CachedIndexFlags {
-    fn from(flags: IndexFlags) -> Self {
-        Self {
-            is_static: flags.is_static,
-            is_main: flags.is_main,
-            has_inline_attribute: flags.has_inline_attribute,
-            is_linkage: flags.is_linkage,
-            is_type_declaration: flags.is_type_declaration,
-            is_synthesized: flags.is_synthesized,
-        }
-    }
-}
-
-impl CachedIndexFlags {
-    fn into_index_flags(self) -> IndexFlags {
-        IndexFlags {
-            is_static: self.is_static,
-            is_main: self.is_main,
-            has_inline_attribute: self.has_inline_attribute,
-            is_linkage: self.is_linkage,
-            is_type_declaration: self.is_type_declaration,
-            is_synthesized: self.is_synthesized,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct CachedCuRange {
-    start: u64,
-    end: u64,
-    cu_offset: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{FunctionDieKind, IndexEntry, IndexFlags};
     use crate::index::LightweightIndexShard;
+    use std::sync::Arc;
+    const UNITS: &[gimli::DebugInfoOffset] =
+        &[gimli::DebugInfoOffset(4), gimli::DebugInfoOffset(8)];
 
-    fn sample() -> DebugParseResult {
+    fn sample() -> DwarfParseResult {
         let mut shard = LightweightIndexShard::default();
         shard.push_function_entry(
             "lookup_alias".into(),
@@ -646,10 +768,43 @@ mod tests {
                 function_kind: FunctionDieKind::ConcreteSubprogram,
             },
         );
-        DebugParseResult {
+        let mut scoped_file_manager = ScopedFileIndexManager::new();
+        let mut compilation_units = HashMap::new();
+        let mut line_source_unit_offsets = HashMap::new();
+        for (&unit, dir) in UNITS.iter().zip(["/first", "/second"]) {
+            let mut index = LightweightFileIndex::new(Some(dir.into()), 4);
+            index.add_file_entry(1, 0, "same.c".into());
+            scoped_file_manager.add_compilation_unit(unit, index);
+            compilation_units.insert(
+                unit,
+                CompilationUnit {
+                    base_directory: dir.into(),
+                    include_directories: Vec::new(),
+                    files: vec![SourceFile {
+                        directory_path: dir.into(),
+                        filename: "same.c".into(),
+                        full_path: format!("{dir}/same.c"),
+                    }],
+                },
+            );
+            line_source_unit_offsets.insert(format!("{dir}/same.c"), vec![unit]);
+        }
+        line_source_unit_offsets.insert("same.c".into(), UNITS.to_vec());
+        DwarfParseResult {
             lightweight_index: LightweightIndex::from_shards(vec![shard]),
-            functions_count: 1,
-            variables_count: 0,
+            line_mapping: LineMappingTable::from_entries_with_scoped_manager(
+                Vec::new(),
+                &scoped_file_manager,
+            ),
+            scoped_file_manager,
+            compilation_units,
+            line_source_unit_offsets,
+            stats: crate::parser::fast_parser::DwarfParseStats {
+                total_functions: 1,
+                total_variables: 0,
+                total_line_entries: 0,
+                total_files: 2,
+            },
         }
     }
 
@@ -663,17 +818,46 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_preserves_aliases_and_lexical_scope() {
+    fn round_trip_preserves_aliases_and_cu_scoped_file_headers() {
+        for version in [4, 5] {
+            check_scoped_header_round_trip(version);
+        }
+    }
+
+    fn check_scoped_header_round_trip(version: u16) {
         let (_dir, mapped, cache) = fixture();
-        cache.store(&mapped, &mapped, None, &sample()).unwrap();
+        let first_file = u64::from(version < 5);
+        let mut result = sample();
+        for (&unit, dir) in UNITS.iter().zip(["/first", "/second"]) {
+            let mut index = LightweightFileIndex::new(Some(dir.into()), version);
+            if version >= 5 {
+                index.add_directory(dir.into());
+            }
+            index.add_file_entry(first_file, 0, "same.c".into());
+            result.scoped_file_manager.add_compilation_unit(unit, index);
+        }
+        cache.store(&mapped, &mapped, None, &result, UNITS).unwrap();
         let restored = cache.load(&mapped, &mapped, None).unwrap().unwrap();
-        let entries = restored
-            .lightweight_index
-            .find_dies_by_function_name("lookup_alias");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(&*entries[0].name, "display_name");
-        assert_eq!(entries[0].lexical_scope, Some(gimli::UnitOffset(8)));
-        assert_eq!(restored.functions_count, 1);
+        assert_eq!(
+            restored
+                .names
+                .lookup_units("lookup_alias", GdbSymbolKind::Function, false),
+            vec![UNITS[0]]
+        );
+        assert_eq!(restored.parse_result.lightweight_index.entry_count(), 0);
+        assert_eq!(
+            restored.parse_result.line_source_unit_offsets["same.c"],
+            UNITS
+        );
+        for (&unit, dir) in UNITS.iter().zip(["/first", "/second"]) {
+            assert_eq!(
+                restored
+                    .parse_result
+                    .scoped_file_manager
+                    .lookup_by_scoped_index(unit, first_file),
+                Some(format!("{dir}/same.c"))
+            );
+        }
     }
 
     #[test]
@@ -683,7 +867,7 @@ mod tests {
         fs::write(&path, b"first supplement").unwrap();
         let supplement = MappedFile::open(&path).unwrap();
         cache
-            .store(&mapped, &mapped, Some(&supplement), &sample())
+            .store(&mapped, &mapped, Some(&supplement), &sample(), UNITS)
             .unwrap();
         assert!(cache
             .load(&mapped, &mapped, Some(&supplement))
@@ -727,7 +911,9 @@ mod tests {
     #[test]
     fn corrupt_payload_is_rejected_before_decode() {
         let (_dir, mapped, cache) = fixture();
-        let path = cache.store(&mapped, &mapped, None, &sample()).unwrap();
+        let path = cache
+            .store(&mapped, &mapped, None, &sample(), UNITS)
+            .unwrap();
         rewrite_payload(&path, |payload| payload[20] ^= 1, false);
         let result = cache.load(&mapped, &mapped, None);
         assert!(result
@@ -740,7 +926,9 @@ mod tests {
     #[test]
     fn forged_string_length_is_bounded_even_with_valid_checksum() {
         let (_dir, mapped, cache) = fixture();
-        let path = cache.store(&mapped, &mapped, None, &sample()).unwrap();
+        let path = cache
+            .store(&mapped, &mapped, None, &sample(), UNITS)
+            .unwrap();
         rewrite_payload(
             &path,
             |payload| payload[8..16].copy_from_slice(&u64::MAX.to_le_bytes()),
@@ -752,12 +940,14 @@ mod tests {
     #[test]
     fn invalid_name_reference_is_rejected() {
         let (_dir, mapped, cache) = fixture();
-        let path = cache.store(&mapped, &mapped, None, &sample()).unwrap();
+        let path = cache
+            .store(&mapped, &mapped, None, &sample(), UNITS)
+            .unwrap();
         rewrite_payload(
             &path,
             |payload| {
-                let mut index: CachedDebugIndex = cache_codec().deserialize(payload).unwrap();
-                index.entries.clear();
+                let mut index: CachedAnalysis = cache_codec().deserialize(payload).unwrap();
+                index.units.clear();
                 *payload = cache_codec().serialize(&index).unwrap();
             },
             true,
@@ -766,9 +956,34 @@ mod tests {
     }
 
     #[test]
+    fn oversized_file_number_is_rejected_before_building_path_caches() {
+        let (_dir, mapped, cache) = fixture();
+        let path = cache
+            .store(&mapped, &mapped, None, &sample(), UNITS)
+            .unwrap();
+        rewrite_payload(
+            &path,
+            |payload| {
+                let mut index: CachedAnalysis = cache_codec().deserialize(payload).unwrap();
+                index.line_units[0].files[0].0 = u64::MAX;
+                *payload = cache_codec().serialize(&index).unwrap();
+            },
+            true,
+        );
+        assert!(cache
+            .load(&mapped, &mapped, None)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("file index is out of bounds"));
+    }
+
+    #[test]
     fn incompatible_truncated_oversized_and_symlink_entries_are_rejected() {
         let (dir, mapped, cache) = fixture();
-        let path = cache.store(&mapped, &mapped, None, &sample()).unwrap();
+        let path = cache
+            .store(&mapped, &mapped, None, &sample(), UNITS)
+            .unwrap();
         let encoded = fs::read(&path).unwrap();
         let mut old = encoded.clone();
         old[8..12].copy_from_slice(&2_u32.to_le_bytes());
@@ -796,13 +1011,15 @@ mod tests {
         let reader = AnalysisCache::read_only(cache.directory());
         assert!(reader.load(&mapped, &mapped, None).unwrap().is_none());
         assert!(!reader.directory().exists());
-        let path = cache.store(&mapped, &mapped, None, &sample()).unwrap();
+        let path = cache
+            .store(&mapped, &mapped, None, &sample(), UNITS)
+            .unwrap();
         let restored = reader.load(&mapped, &mapped, None).unwrap().unwrap();
         fs::write(path, []).unwrap();
         assert_eq!(
             restored
-                .lightweight_index
-                .find_dies_by_function_name("lookup_alias")
+                .names
+                .lookup_units("lookup_alias", GdbSymbolKind::Function, false)
                 .len(),
             1
         );

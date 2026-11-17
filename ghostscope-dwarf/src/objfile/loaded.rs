@@ -163,6 +163,13 @@ impl LoadedObjfile {
     }
 
     pub(crate) fn get_function_names(&self) -> Vec<String> {
+        if let Some(names) = self
+            .cu_name_index
+            .as_ref()
+            .and_then(|index| index.prepared_symbol_names(GdbSymbolKind::Function))
+        {
+            return names;
+        }
         if let Some(index) = &self.gdb_index {
             match index.symbol_names(GdbSymbolKind::Function) {
                 Ok(names) => return names.to_vec(),
@@ -190,6 +197,13 @@ impl LoadedObjfile {
     }
 
     pub(crate) fn get_variable_names(&self) -> Vec<String> {
+        if let Some(names) = self
+            .cu_name_index
+            .as_ref()
+            .and_then(|index| index.prepared_symbol_names(GdbSymbolKind::Variable))
+        {
+            return names;
+        }
         if let Some(index) = &self.gdb_index {
             match index.symbol_names(GdbSymbolKind::Variable) {
                 Ok(names) => return names.to_vec(),
