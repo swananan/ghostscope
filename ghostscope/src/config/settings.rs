@@ -174,6 +174,9 @@ pub struct DwarfAnalysisCacheConfig {
     /// Cache directory. Empty/absent uses the platform user cache directory.
     #[serde(default)]
     pub directory: Option<PathBuf>,
+    /// Total managed disk budget in MiB, enforced by prepare.
+    #[serde(default = "default_analysis_cache_max_size_mb")]
+    pub max_size_mb: u64,
 }
 
 /// Source-language semantic value adapter limits.
@@ -402,6 +405,10 @@ fn default_analysis_cache_enabled() -> bool {
     true
 }
 
+fn default_analysis_cache_max_size_mb() -> u64 {
+    ghostscope_dwarf::AnalysisCache::DEFAULT_MAX_SIZE_BYTES / (1024 * 1024)
+}
+
 fn default_ringbuf_size() -> u64 {
     262144 // 256KB
 }
@@ -549,12 +556,19 @@ impl Default for DwarfAnalysisCacheConfig {
         Self {
             enabled: default_analysis_cache_enabled(),
             directory: None,
+            max_size_mb: default_analysis_cache_max_size_mb(),
         }
     }
 }
 
 impl DwarfConfig {
     pub fn validate(&self, file_path: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.analysis_cache.max_size_mb > 0
+                && self.analysis_cache.max_size_mb.checked_mul(1024 * 1024).is_some(),
+            "Invalid DWARF configuration in '{}': analysis_cache.max_size_mb must be positive and fit in a byte count",
+            file_path
+        );
         if !(1..=1_024).contains(&self.backtrace_runtime_modules_max) {
             return Err(anyhow::anyhow!(
                 "Invalid DWARF configuration in '{}': backtrace_runtime_modules_max must be in range 1 to 1024, got {}",
@@ -1053,6 +1067,23 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn analysis_cache_budget_defaults_and_validation() {
+        assert_eq!(Config::default().dwarf.analysis_cache.max_size_mb, 1024);
+        let config: Config = toml::from_str("[dwarf.analysis_cache]\nmax_size_mb = 64\n").unwrap();
+        assert_eq!(config.dwarf.analysis_cache.max_size_mb, 64);
+        config.dwarf.validate("test.toml").unwrap();
+        for limit in [0, u64::MAX] {
+            let mut config = Config::default().dwarf;
+            config.analysis_cache.max_size_mb = limit;
+            assert!(config
+                .validate("test.toml")
+                .unwrap_err()
+                .to_string()
+                .contains("analysis_cache.max_size_mb"));
+        }
+    }
 
     #[test]
     fn value_adapter_defaults_are_bounded() {

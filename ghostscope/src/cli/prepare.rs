@@ -30,7 +30,14 @@ pub async fn prepare_analysis_cache(config: &UserConfig) -> Result<()> {
             .clone()
             .map(|debug_file| ExplicitDebugFile::new(target.clone(), debug_file)),
         debuginfod_client: build_debuginfod_client(&config.dwarf_debuginfod)?,
-        analysis_cache: Some(AnalysisCache::new(&cache_dir)),
+        analysis_cache: Some(
+            AnalysisCache::new(&cache_dir).with_max_size_bytes(
+                config
+                    .dwarf_analysis_cache_max_size_mb
+                    .checked_mul(1024 * 1024)
+                    .context("Analysis cache size limit overflows a byte count")?,
+            ),
+        ),
     };
 
     let native_index = Arc::new(AtomicBool::new(false));

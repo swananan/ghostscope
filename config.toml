@@ -118,6 +118,11 @@ enabled = true
 # ~/.cache/ghostscope/analysis.
 # directory = "/home/user/.cache/ghostscope/analysis"
 
+# Total managed cache budget in MiB (positive; 1024 = 1 GiB).
+# Prepare evicts old entries using approximate LRU, including when reusing a hit.
+# Runtime only updates hit timestamps (60-second coalescing), without scanning.
+max_size_mb = 1024
+
 [dwarf.debuginfod]
 # debuginfod fallback for separate debug information.
 # This follows GDB-style modes:

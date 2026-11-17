@@ -111,6 +111,11 @@ enabled = true
 # ~/.cache/ghostscope/analysis。
 # directory = "/home/user/.cache/ghostscope/analysis"
 
+# 缓存总预算，单位 MiB，必须大于 0；1024 即 1 GiB。
+# Prepare 按近似 LRU 淘汰旧条目，复用已有缓存时也会执行。
+# 普通运行只更新命中时间戳（按 60 秒间隔节流），不扫描缓存目录。
+max_size_mb = 1024
+
 [dwarf.debuginfod]
 # debuginfod 调试信息回退。
 # 模式参考 GDB：
