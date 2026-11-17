@@ -152,6 +152,32 @@ impl LightweightFileIndex {
         )
     }
 
+    pub(crate) fn cache_parts(&self) -> (Option<&str>, &[Arc<str>], u16) {
+        (
+            self.comp_dir.as_deref(),
+            &self.directories,
+            self.dwarf_version,
+        )
+    }
+
+    /// Restore pooled header strings without allocating a path cache until a
+    /// file in this CU is actually queried.
+    pub(crate) fn from_prepared_parts(
+        comp_dir: Option<Arc<str>>,
+        directories: Vec<Arc<str>>,
+        dwarf_version: u16,
+        file_entries: Vec<LightweightFileEntry>,
+    ) -> Self {
+        Self {
+            comp_dir,
+            directories,
+            dwarf_version,
+            total_files: file_entries.len(),
+            file_entries,
+            resolved_paths_cache: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Get all file entries (for iteration)
     pub fn file_entries(&self) -> &[LightweightFileEntry] {
         &self.file_entries

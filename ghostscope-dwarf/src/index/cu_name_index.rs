@@ -17,6 +17,7 @@ pub(crate) struct CuNameIndex {
     variables: SymbolsByName,
     types: SymbolsByName,
     all_unit_offsets: Vec<gimli::DebugInfoOffset>,
+    prepared_stats: Option<(usize, usize, usize)>,
 }
 
 impl CuNameIndex {
@@ -77,7 +78,39 @@ impl CuNameIndex {
         &self.all_unit_offsets
     }
 
+    pub(crate) fn with_prepared_stats(mut self, stats: (usize, usize, usize)) -> Self {
+        self.prepared_stats = Some(stats);
+        self
+    }
+
+    /// Prepared directories contain the exact full-scan names. Native name
+    /// accelerators may omit symbols, so enumeration still materializes them.
+    pub(crate) fn prepared_symbol_names(&self, kind: GdbSymbolKind) -> Option<Vec<String>> {
+        self.prepared_stats?;
+        Some(self.symbols(kind)?.keys().cloned().collect())
+    }
+
+    pub(crate) fn insert_prepared(
+        &mut self,
+        name: String,
+        mut offsets: Vec<gimli::DebugInfoOffset>,
+        kind: GdbSymbolKind,
+    ) {
+        let symbols = match kind {
+            GdbSymbolKind::Function => &mut self.functions,
+            GdbSymbolKind::Variable => &mut self.variables,
+            GdbSymbolKind::Type => &mut self.types,
+            GdbSymbolKind::Other => return,
+        };
+        offsets.sort_unstable_by_key(|offset| offset.0);
+        offsets.dedup();
+        symbols.insert(name, offsets);
+    }
+
     pub(crate) fn get_stats(&self) -> (usize, usize, usize) {
+        if let Some(stats) = self.prepared_stats {
+            return stats;
+        }
         let functions = self.functions.len();
         let variables = self.variables.len();
         let types = self.types.len();

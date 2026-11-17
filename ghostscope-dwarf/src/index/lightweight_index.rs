@@ -92,8 +92,8 @@ impl LightweightIndexShard {
     }
 }
 
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct NameIndexShard {
+#[derive(Debug, Default)]
+struct NameIndexShard {
     entry_base: usize,
     function_map: HashMap<String, Vec<usize>>,
     function_fragment_map: HashMap<String, Vec<usize>>,
@@ -423,8 +423,28 @@ impl LightweightIndex {
         self.entries.len()
     }
 
-    pub(crate) fn cache_entries(&self) -> &[IndexEntry] {
-        &self.entries
+    /// Build a complete name-to-CU directory; concrete DIEs stay in DWARF.
+    pub(crate) fn cache_names(&self) -> Vec<(u8, String, Vec<DebugInfoOffset>)> {
+        let mut names =
+            BTreeMap::<(u8, String), std::collections::BTreeSet<DebugInfoOffset>>::new();
+        for shard in &self.name_shards {
+            for (kind, map) in [
+                (0, &shard.function_map),
+                (1, &shard.variable_map),
+                (2, &shard.type_map),
+            ] {
+                for (name, indices) in map {
+                    let units = names.entry((kind, name.clone())).or_default();
+                    for &index in indices {
+                        units.insert(self.entries[shard.entry_base + index].unit_offset);
+                    }
+                }
+            }
+        }
+        names
+            .into_iter()
+            .map(|((kind, name), units)| (kind, name, units.into_iter().collect()))
+            .collect()
     }
 
     pub(crate) fn cache_cu_ranges(&self) -> Vec<(u64, u64, DebugInfoOffset)> {
@@ -434,44 +454,9 @@ impl LightweightIndex {
             .collect()
     }
 
-    pub(crate) fn cache_names(&self) -> Vec<NameIndexShard> {
-        self.name_shards.clone()
-    }
-
-    pub(crate) fn from_cached_entries(
-        entries: Vec<IndexEntry>,
-        names: Vec<NameIndexShard>,
-        cu_ranges: Vec<(u64, u64, DebugInfoOffset)>,
-    ) -> anyhow::Result<Self> {
-        for shard in &names {
-            anyhow::ensure!(
-                shard.entry_base <= entries.len(),
-                "Invalid cached name shard base"
-            );
-            for map in [
-                &shard.function_map,
-                &shard.function_fragment_map,
-                &shard.variable_map,
-                &shard.variable_fragment_map,
-                &shard.type_map,
-            ] {
-                for indices in map.values() {
-                    anyhow::ensure!(
-                        indices
-                            .iter()
-                            .all(|&index| index < entries.len() - shard.entry_base),
-                        "Invalid cached name entry index"
-                    );
-                }
-            }
-        }
-        let shard = LightweightIndexShard {
-            entries,
-            ..Default::default()
-        };
-        let mut index = Self::from_shards(vec![shard]);
-        index.name_shards = names;
-        index.cu_ranges = cu_ranges
+    pub(crate) fn from_cached_cu_ranges(ranges: Vec<(u64, u64, DebugInfoOffset)>) -> Self {
+        let mut index = Self::new();
+        index.cu_ranges = ranges
             .into_iter()
             .map(|(start, end, cu)| CuRange {
                 start,
@@ -481,21 +466,9 @@ impl LightweightIndex {
             })
             .collect();
         Self::finalize_cu_ranges(&mut index.cu_ranges);
-
-        let mut per_cu = HashMap::<DebugInfoOffset, BTreeMap<u64, usize>>::new();
-        for (idx, entry) in index.entries.iter().enumerate() {
-            if Self::is_function_tag(entry.tag) {
-                if let Some(address) = entry.representative_addr.or(entry.entry_pc) {
-                    per_cu
-                        .entry(entry.unit_offset)
-                        .or_default()
-                        .insert(address, idx);
-                }
-            }
-        }
-        index.func_addr_by_cu = per_cu;
+        // Subsequent lazy CU appends must populate function address maps.
         index.cu_maps_built = true;
-        Ok(index)
+        index
     }
 
     /// Get total statistics
@@ -818,6 +791,22 @@ mod tests {
         }
         LightweightIndex::finalize_cu_ranges(&mut index.cu_ranges);
         index
+    }
+
+    #[test]
+    fn cached_ranges_preserve_overlaps_and_half_open_ends() {
+        let original = index_with_ranges(&[
+            (0x1000, 0x1100, 1),
+            (0x1000, 0x1080, 2),
+            (0x1040, 0x1060, 3),
+        ]);
+        let restored = LightweightIndex::from_cached_cu_ranges(original.cache_cu_ranges());
+        for pc in [0xfff, 0x1000, 0x1050, 0x1060, 0x1080, 0x1100] {
+            assert_eq!(
+                original.find_cus_by_address(pc).collect::<Vec<_>>(),
+                restored.find_cus_by_address(pc).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

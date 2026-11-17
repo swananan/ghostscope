@@ -90,7 +90,7 @@ async fn test_prepare_analysis_cache_runs_without_root_and_reuses_entry() -> Res
     );
     assert_output_contains(&first.output, "Prepared analysis cache for");
     assert!(
-        cache_dir.join("v3").is_dir(),
+        cache_dir.join("v4").is_dir(),
         "prepare did not create a versioned cache under {}",
         cache_dir.display()
     );
@@ -917,7 +917,7 @@ fn workspace_owner_identity(workspace_root: &Path) -> Result<Option<(u32, u32)>>
 }
 
 fn corrupt_analysis_cache_payload_length(cache_dir: &Path) -> Result<()> {
-    let entries = fs::read_dir(cache_dir.join("v3"))?
+    let entries = fs::read_dir(cache_dir.join("v4"))?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.is_file())
         .collect::<Vec<_>>();

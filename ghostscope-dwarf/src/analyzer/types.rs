@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DwarfIndexStatus {
+    Prepared,
     FullScan,
     DebugNames,
     GdbIndex { version: u32 },
@@ -13,6 +14,7 @@ pub enum DwarfIndexStatus {
 impl DwarfIndexStatus {
     pub fn display_label(&self) -> String {
         match self {
+            Self::Prepared => "prepared".to_string(),
             Self::FullScan => "full-scan".to_string(),
             Self::DebugNames => ".debug_names".to_string(),
             Self::GdbIndex { version } => format!(".gdb_index-v{version}"),
