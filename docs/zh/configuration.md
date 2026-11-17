@@ -201,19 +201,33 @@ ghostscope --prepare --target /path/to/binary
 # prepare 和实际运行使用相同的显式 debug file 与缓存目录。
 ghostscope --prepare -t /path/to/binary -d /path/to/binary.debug \
   --analysis-cache-dir /var/cache/ghostscope
-ghostscope -p 1234 -t /path/to/binary --script-file trace.gs \
-  --analysis-cache-dir /var/cache/ghostscope
+ghostscope -p 1234 -t /path/to/binary -d /path/to/binary.debug \
+  --script-file trace.gs --analysis-cache-dir /var/cache/ghostscope
 ```
 
-Prepare 保存 `.debug_info` 全扫描的符号和编译单元索引。可用的 `.debug_names`、
-`.gdb_index` 和 GNU pubnames 优先；此时 prepare 会报告无需生成缓存。
-源码文件头仍正常读取，源码行继续按需解析。实际 tracing 时仍会解析 PID
+Prepare 从 `.debug_info` 全扫描结果提取紧凑的名称到编译单元目录、地址范围和
+源码文件头元数据。命中缓存时直接恢复这些目录，具体符号、类型和源码行仍按需解析。
+启动统计和名称枚举直接使用缓存目录，不触发全量扫描。已有可用 `.debug_names`、
+`.gdb_index` 或 GNU pubnames 的目标无需生成缓存。实际 tracing 时仍会解析 PID
 namespace、模块加载地址、`dlopen` 变化、CFI 和 eBPF attach。
 
 缓存绑定主 ELF、选中的 debug file 和 supplementary 文件的身份（含打开描述符的
 元数据），以及缓存 schema 和 GhostScope 版本。复制或替换文件后可能需要重新 prepare。
-Tracing 只读缓存，只有 `--prepare` 写入；checksum 用于检测内容损坏。
+只有 `--prepare` 创建或替换缓存内容。运行时命中后，会尝试更新文件时间戳用于近似 LRU，
+按 60 秒间隔节流；只读文件系统或共享目录不允许更新时间戳时，仍可正常读取缓存。
+Checksum 用于检测内容损坏。
 若 prepare 与 tracing 使用不同用户，请显式指定相同的 `--analysis-cache-dir`。
+
+`[dwarf.analysis_cache].max_size_mb` 默认 **1024 MiB（1 GiB）**，必须大于 0。
+Prepare 在已识别的当前及旧版缓存之间执行预算限制，优先淘汰旧格式，再按最近使用
+时间淘汰。降低配置值后，下次 prepare 即使复用已有条目，也会执行清理。普通 tracing
+不扫描或清理目录。单条缓存超过预算时，prepare 报错且不会为它淘汰其他条目；
+原有的单条 payload 512 MiB 安全上限仍然生效。
+
+并发 prepare 通过目录锁协调，并在写入临时文件前预留容量；读取不获取目录锁。
+清理会删除当前格式的遗留临时文件，以及超过 24 小时的旧格式临时文件；不会删除
+未知文件、符号链接或未来格式的目录。预算统计受管理文件的逻辑大小，不包含无关文件
+和文件系统元数据。共享同一个目录的 prepare 应使用相同预算。
 
 `--prepare` 参数生成分析索引，与生成脚本专用 trace bundle 的 `ghostscope prepare ...`
 子命令相互独立。设计细节见[分析缓存设计](../analysis-cache-design.md)。
@@ -551,6 +565,11 @@ enabled = true
 # 未设置时使用 $XDG_CACHE_HOME/ghostscope/analysis 或
 # ~/.cache/ghostscope/analysis。
 # directory = "/home/user/.cache/ghostscope/analysis"
+
+# 缓存总预算，单位 MiB，必须大于 0；1024 即 1 GiB。
+# Prepare 按近似 LRU 淘汰旧条目，复用已有缓存时也会执行。
+# 普通运行只更新命中时间戳（按 60 秒间隔节流），不扫描缓存目录。
+max_size_mb = 1024
 
 [dwarf.debuginfod]
 # 可选的 debuginfod 调试信息回退。
