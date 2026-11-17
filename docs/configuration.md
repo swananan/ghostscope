@@ -204,22 +204,41 @@ ghostscope --prepare --target /path/to/binary
 # Use the same explicit debug file and cache directory during prepare and run.
 ghostscope --prepare -t /path/to/binary -d /path/to/binary.debug \
   --analysis-cache-dir /var/cache/ghostscope
-ghostscope -p 1234 -t /path/to/binary --script-file trace.gs \
-  --analysis-cache-dir /var/cache/ghostscope
+ghostscope -p 1234 -t /path/to/binary -d /path/to/binary.debug \
+  --script-file trace.gs --analysis-cache-dir /var/cache/ghostscope
 ```
 
-Prepare stores the full-scan `.debug_info` symbol and compilation-unit indexes.
-Usable `.debug_names`, `.gdb_index`, and GNU pubnames take priority; prepare reports
-that no cache is needed for these targets. Source-file headers are read normally,
-and source-line rows remain lazy. A tracing run still resolves PID namespaces,
-module load addresses, `dlopen` changes, CFI, and eBPF attachment at runtime.
+Prepare stores a compact name-to-compilation-unit directory, address ranges and
+source-file header metadata from a full `.debug_info` scan. Cache hits restore
+these directories; concrete symbols, types and source-line rows are parsed only
+when queried. Startup statistics and name enumeration use the prepared directory
+without forcing a full scan. Usable `.debug_names`, `.gdb_index`, and GNU pubnames
+need no prepared cache. A tracing run still resolves PID namespaces, module load
+addresses, `dlopen` changes, CFI, and eBPF attachment at runtime.
 
 Entries are bound to the target, selected debug file, and supplementary debug
 file identities (including descriptor metadata), plus the cache schema and
 GhostScope version. Copying or replacing a file may require preparing again.
-Tracing opens entries read-only; only `--prepare` writes them. A checksum detects
-payload corruption. Use an explicit `--analysis-cache-dir` when prepare and
+Only `--prepare` creates or replaces cache payloads. Successful runtime reads
+best-effort update a file timestamp with 60-second coalescing for approximate LRU.
+Read-only/shared caches still work if that timestamp cannot be updated. A checksum
+detects payload corruption. Use an explicit `--analysis-cache-dir` when prepare and
 tracing run as different users, since their default cache directories differ.
+
+`[dwarf.analysis_cache].max_size_mb` defaults to **1024 MiB (1 GiB)** and must be
+positive. Prepare enforces the budget across recognized current/older cache
+formats, preferring obsolete formats and then least recently used entries.
+Lowering it takes effect on the next cache prepare, even if the entry is reused.
+Normal tracing does not scan or prune the directory. If one entry exceeds the
+budget, prepare fails without evicting other entries. The separate 512 MiB
+payload safety limit still applies.
+
+Concurrent preparations coordinate through a directory lock and reserve space
+before writing; readers remain lock-free. Cleanup removes abandoned current-format
+temporary files and legacy temporary files older than 24 hours. Unknown files,
+symlinks, and future format directories are left alone. The budget counts logical
+bytes of managed files, not unrelated files or filesystem metadata. Preparations
+sharing a directory should use the same configured budget.
 
 This `--prepare` flag prepares an analysis index, independently of the
 `ghostscope prepare ...` subcommand that creates a script-specific trace bundle.
@@ -572,6 +591,11 @@ enabled = true
 # Leave unset to use $XDG_CACHE_HOME/ghostscope/analysis or
 # ~/.cache/ghostscope/analysis.
 # directory = "/home/user/.cache/ghostscope/analysis"
+
+# Total managed cache budget in MiB (positive; 1024 = 1 GiB).
+# Prepare evicts old entries using approximate LRU, including when reusing a hit.
+# Runtime only updates hit timestamps (60-second coalescing), without scanning.
+max_size_mb = 1024
 
 [dwarf.debuginfod]
 # Optional debuginfod fallback for separate debug information.
