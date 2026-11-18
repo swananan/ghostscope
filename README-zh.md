@@ -37,7 +37,7 @@ C 的端到端覆盖最完整。对于 Rust 目标，GhostScope 为常用值提�
 - 如果你需要带断点、单步、改内存或调 coredump 的交互式调试体验，用 GDB。
 - 如果你想在 perf 生态里快速对某个函数、源码行或局部变量打一针式 probe，用 `perf probe`。
 - 如果你要在同一套脚本里混合大量内核 + 用户态事件做聚合，优先考虑 bpftrace 或 SystemTap。
-- 如果目标模块没有 DWARF 调试信息，就不要期待源码级变量追踪能很好地工作。
+- 准备源码级变量追踪需要匹配的 DWARF 调试信息；已有的[预编译 bundle](docs/zh/prepared-traces.md) 可以在没有调试文件的情况下运行。
 
 ### GhostScope 和 perf、GDB、bpftrace、SystemTap 的区别
 
@@ -150,6 +150,19 @@ GhostScope 把编译后的二进制重新变成“可观测系统”。在 TUI �
 想象一下，你面对的是一片广袤的二进制数据荒野 —— 内存地址、寄存器值、栈帧数据 —— 没有上下文，它们只是毫无意义的数字。**DWARF 调试信息就是我们的地图**：它告诉我们栈地址 `RSP-0x18` 存储着局部变量 `count`，堆地址 `0x5621a8c0` 处的结构体是 `user` 对象，其偏移 `+0x20` 处是字符串指针 `user.name`；它追踪每个变量在程序执行过程中的位置变化 —— 参数 `x` 现在在寄存器 `RDI` 中，之后会被移到栈上 `RSP-0x10` 的位置。
 
 有了这张地图，GhostScope 利用 **eBPF 和 uprobe** 技术从运行中程序的指令点安全地提取二进制数据。DWARF 揭示进程虚拟地址空间中数据的含义，eBPF 获取请求的数据，从而在不由调试器控制暂停、也不主动修改应用状态的前提下，输出源码感知的变量值和调用栈。每次 uprobe 命中仍会同步执行 trap 和 eBPF 路径，因此追踪并非对时序完全透明。
+
+### 预编译追踪，运行时复用
+
+**预编译 trace bundle 将源码分析、编译与运行时追踪分开。** `prepare` 使用 DWARF 和 LLVM，把探针程序与事件解码上下文保存为可复用的 bundle。`run-bundle` 随后校验目标并附加这些程序，**运行时无需解析 DWARF，也无需调用 LLVM**，不再需要独立调试文件或源码文件。
+
+```bash
+ghostscope prepare -t /path/to/app --script-file trace.gs -o trace.gsb
+sudo ghostscope run-bundle trace.gsb -p <PID>
+```
+
+你可以在构建阶段准备好诊断脚本，再把 bundle 用于运行同一个、内容未变的目标二进制的不同 PID。`prepare` 不需要 BPF 权限；`run-bundle` 仍需要通常的追踪权限和兼容的内核。
+
+当前 bundle 支持宿主机进程中的单个可执行文件或共享库模块，暂不支持调用栈回溯和容器 PID namespace。目标身份与兼容要求见[预编译 trace bundle](docs/zh/prepared-traces.md)。
 
 ## ✨ 核心特性
 
