@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 
-INDEX_KINDS = ("full_scan", "gnu_pubnames", "gdb_index", "debug_names", "rejected")
+INDEX_KINDS = ("prepared", "full_scan", "gnu_pubnames", "gdb_index", "debug_names", "rejected")
 
 
 def validate(expected: dict | None, actual: dict | None) -> None:
@@ -18,6 +18,8 @@ def validate(expected: dict | None, actual: dict | None) -> None:
         raise ValueError("dwarf-tool did not report its selected indexes")
     required = {kind: int(kind == expected["kind"]) for kind in INDEX_KINDS}
     required["supplementary"] = int(expected["supplementary"])
+    # Base revisions predating prepared caches do not report this counter.
+    actual = {"prepared": 0, **actual}
     if actual != required:
         raise ValueError(f"index selection mismatch: expected {required}, got {actual}")
 
