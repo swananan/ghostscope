@@ -1695,7 +1695,16 @@ async fn test_prepared_main_cache_keeps_uncached_backtrace_modules_loadable() ->
         return Ok(());
     }
 
-    let binary_path = FIXTURES.get_test_binary("backtrace_cross_module_program")?;
+    let shared_binary = FIXTURES.get_test_binary("backtrace_cross_module_program")?;
+    let fixture = tempfile::tempdir()?;
+    let binary_path = fixture.path().join("backtrace_cross_module_program");
+    // This test checks inode/timestamp-bound caching. Keep its executable and
+    // $ORIGIN library private so other fixture users cannot invalidate the cache.
+    fs::copy(&shared_binary, &binary_path)?;
+    fs::copy(
+        shared_binary.with_file_name("libbacktrace_cross_module.so"),
+        fixture.path().join("libbacktrace_cross_module.so"),
+    )?;
     let cache = tempfile::tempdir()?;
     let prepare_stdout = prepare_analysis_cache(&binary_path, cache.path())?;
     assert!(
@@ -1747,7 +1756,7 @@ trace cross_module_lib_leaf {
     });
     assert!(
         main_cache_hit,
-        "runtime should consume the prepared main executable cache\nSTDERR:\n{stderr}"
+        "runtime should consume the prepared main executable cache\nPREPARE:\n{prepare_stdout}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
     assert!(
         !stderr.lines().any(|line| {
