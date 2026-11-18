@@ -174,7 +174,7 @@ impl Bundle {
         Ok(())
     }
 
-    pub fn into_compilation(self, target: &str, pid: u32) -> CompilationResult {
+    pub fn into_compilation(self, target: &str, pid: Option<u32>) -> CompilationResult {
         let configs: Vec<_> = self
             .probes
             .into_iter()
@@ -184,7 +184,7 @@ impl Bundle {
                 function_name: probe.function_name,
                 function_address: Some(probe.function_address),
                 uprobe_offset: Some(probe.uprobe_offset),
-                target_pid: Some(pid),
+                target_pid: pid,
                 ebpf_bytecode: probe.ebpf_bytecode,
                 ebpf_function_name: probe.ebpf_function_name,
                 assigned_trace_id: probe.assigned_trace_id,

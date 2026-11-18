@@ -1055,5 +1055,7 @@ Invalid configuration will produce clear error messages with suggestions for fix
 
 `ghostscope prepare -t TARGET --script-file SCRIPT -o BUNDLE` compiles without
 BPF privileges. `ghostscope run-bundle BUNDLE -p PID` uses the saved compilation
-configuration and skips DWARF parsing and LLVM codegen. See
+configuration and skips DWARF parsing and LLVM codegen. Use
+`ghostscope run-bundle BUNDLE -t TARGET` to attach before a process starts and
+keep tracing across process restarts. Both modes use the same bundle. See
 [Prepared trace bundles](prepared-traces.md) for runtime requirements and limits.

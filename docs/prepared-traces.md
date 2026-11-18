@@ -15,15 +15,30 @@ An existing output file is never overwritten. Compilation must succeed for every
 resolved target; partial compilations are not published as bundles.
 
 `run-bundle` verifies the bundle format, GhostScope version, native architecture,
-target file SHA-256, module cookie, and the target's executable mapping in the
-specified process. It then checks kernel capabilities, initializes runtime module
-offsets, and attaches the saved probes. Event decoding, output-loss reporting,
-and signal handling use the normal CLI runtime. There is no fallback to DWARF
+target file SHA-256, and module cookie. With `-p`, it also verifies the target's
+executable mapping in the specified process. It then checks kernel capabilities,
+initializes runtime module offsets, and attaches the saved probes. Event decoding,
+output-loss reporting, and signal handling use the normal CLI runtime. There is no fallback to DWARF
 loading or recompilation.
+
+## Target scope
+
+- `run-bundle trace.gsb -p PID` traces one existing host process, using the
+  prepared target path unless `-t PATH` supplies an identical target elsewhere.
+- `run-bundle trace.gsb -t /path/to/app` attaches to the target module without
+  a PID filter. It traces existing and future processes using that file,
+  including worker threads, and stays attached across process restarts.
+  No target process needs to exist when the tracer starts.
+
+Specify at least one of `-p` or `-t`. Target mode reuses normal `-t` lifecycle
+tracking and runtime module-offset maintenance; the bundle's saved
+`enable_sysmon_for_target` setting controls that monitor. It still performs no
+DWARF parsing or LLVM compilation. Attachment follows the validated file inode;
+replacing the file at that path requires preparing and attaching again.
 
 ## First milestone scope
 
-- CLI scripts targeting one executable or shared-library module in a host process.
+- CLI scripts targeting one executable or shared-library module in host processes.
 - Process-scoped multi-uprobe support is required on the runtime kernel, including
   correct coverage of worker threads. Preparation does not require this support
   on its own kernel.

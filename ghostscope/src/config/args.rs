@@ -70,10 +70,10 @@ pub struct PrepareArgs {
 #[derive(ClapArgs, Debug, Clone)]
 pub struct RunBundleArgs {
     pub bundle: PathBuf,
-    /// Host process to attach to
-    #[arg(short = 'p', long = "pid", value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64))]
-    pub pid: u32,
-    /// Location of an identical target module (defaults to the prepared path)
+    /// Limit tracing to one existing host process; otherwise -t is required
+    #[arg(short = 'p', long = "pid", required_unless_present = "target", value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64))]
+    pub pid: Option<u32>,
+    /// Target module; without -p, trace existing and future processes using it
     #[arg(short = 't', long = "target")]
     pub target: Option<String>,
     #[arg(long, value_enum, default_value = "pretty")]
@@ -842,6 +842,35 @@ mod tests {
         Args, BpffsCommand, BpffsPruneArgs, ParsedCommand, ScriptOutputMode, ScriptTimestampFormat,
     };
     use crate::config::settings::DebuginfodMode;
+
+    #[test]
+    fn run_bundle_requires_an_explicit_process_or_target_scope() {
+        for (scope, expected_pid, expected_target) in [
+            (vec!["-p", "123"], Some(123), None),
+            (vec!["-t", "/tmp/app"], None, Some("/tmp/app")),
+            (
+                vec!["-t", "/tmp/app", "-p", "123"],
+                Some(123),
+                Some("/tmp/app"),
+            ),
+        ] {
+            let args: Vec<String> = ["ghostscope", "run-bundle", "trace.gsb"]
+                .into_iter()
+                .chain(scope)
+                .map(str::to_owned)
+                .collect();
+            let ParsedCommand::RunBundle(args) = Args::try_parse_dispatch(&args).unwrap() else {
+                panic!("expected run-bundle command");
+            };
+            assert_eq!(args.pid, expected_pid);
+            assert_eq!(args.target.as_deref(), expected_target);
+        }
+        let args = ["ghostscope", "run-bundle", "trace.gsb"].map(str::to_owned);
+        assert_eq!(
+            Args::try_parse_dispatch(&args).unwrap_err().kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
 
     #[test]
     fn parses_bpffs_prune_subcommand() {

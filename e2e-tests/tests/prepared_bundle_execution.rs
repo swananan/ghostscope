@@ -273,6 +273,135 @@ fn host_topology() -> Result<bool> {
         && SandboxHandle::default_target()?.is_host_backend())
 }
 
+fn wait_for_bundle_output(
+    tracer: &mut ChildGuard,
+    stdout: &Path,
+    stderr: &Path,
+    expected: impl Fn(&str) -> bool,
+) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let output = fs::read_to_string(stdout)?;
+        if let Some(status) = tracer.0.try_wait()? {
+            anyhow::bail!(
+                "bundle tracer exited {status}: {output}\n{}",
+                fs::read_to_string(stderr)?
+            );
+        }
+        if expected(&output) {
+            return Ok(output);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for bundle output: {output}\n{}",
+            fs::read_to_string(stderr)?
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn test_prepared_bundle_target_mode_traces_late_start_and_restart() -> Result<()> {
+    common::init();
+    if !host_topology()? {
+        return Ok(());
+    }
+    if !ghostscope_loader::KernelCapabilities::detect_for_startup(false)?.supports_uprobe_multi {
+        eprintln!("bundle target-mode test requires multi-uprobe support");
+        return Ok(());
+    }
+    for perf in [false, true] {
+        let fixture = Fixture::new(perf)?;
+        let bundle = fixture.directory.path().join("trace.gsb");
+        successful(fixture.prepare(SCRIPT, &bundle)?)?;
+        fs::remove_file(&fixture.debug)?;
+        fs::remove_file(fixture.directory.path().join("target.c"))?;
+
+        // Identical bytes at another inode must not become part of this attachment.
+        let other_binary = fixture.directory.path().join("other-target");
+        successful(
+            Command::new("cp")
+                .arg("--")
+                .arg(&fixture.binary)
+                .arg(&other_binary)
+                .output()?,
+        )?;
+        let _unrelated = ChildGuard(Command::new(&other_binary).arg("99").spawn()?);
+        let stdout = fixture.directory.path().join("target-mode.stdout");
+        let stderr = fixture.directory.path().join("target-mode.stderr");
+        let mut tracer = ChildGuard(
+            fixture
+                .command()
+                .arg("run-bundle")
+                .arg(&bundle)
+                // Exercise relative path resolution as well as PID-free attachment.
+                .args([
+                    "-t",
+                    "./target",
+                    "--no-status",
+                    "--script-output",
+                    "plain",
+                    "--emit-ready-marker",
+                    "BUNDLE_READY",
+                ])
+                .stdout(Stdio::from(File::create(&stdout)?))
+                .stderr(Stdio::from(File::create(&stderr)?))
+                .spawn()?,
+        );
+        // No process maps the target inode yet: readiness must not require a PID.
+        wait_for_bundle_output(&mut tracer, &stdout, &stderr, |s| {
+            s.contains("BUNDLE_READY")
+        })?;
+        let mut pids = Vec::new();
+        for value in [42, 84] {
+            let target = ChildGuard(
+                Command::new(&fixture.binary)
+                    .arg(value.to_string())
+                    .spawn()?,
+            );
+            let pid = target.0.id();
+            pids.push(pid);
+            wait_for_bundle_output(&mut tracer, &stdout, &stderr, |output| {
+                [value, value + 1]
+                    .into_iter()
+                    .all(|v| output.contains(&format!("BUNDLE value={v} global=73 pid={pid} ")))
+            })?;
+            // Keep the tracer alive while the first process exits and a new one starts.
+            drop(target);
+        }
+        common::termination::send_sigterm(tracer.0.id(), "target-mode bundle tracer")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = tracer.0.try_wait()? {
+                ensure!(
+                    status.success(),
+                    "bundle tracer failed shutdown: {}",
+                    fs::read_to_string(&stderr)?
+                );
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "bundle tracer failed to shut down"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = fs::read_to_string(&stdout)?;
+        for line in output.lines().filter(|line| line.contains("BUNDLE value=")) {
+            ensure!(
+                pids.iter()
+                    .any(|pid| line.contains(&format!(" pid={pid} "))),
+                "unrelated process was traced: {line}"
+            );
+            ensure!(
+                !line.contains("value=99") && !line.contains("value=100"),
+                "unrelated inode was traced: {line}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn test_prepared_bundle_unprivileged_roundtrip_without_debug_info() -> Result<()> {
     common::init();
@@ -379,19 +508,25 @@ fn test_prepared_bundle_rejects_backtrace_mismatch_and_overwrite() -> Result<()>
         contents[field] = value;
         let path = fixture.directory.path().join("bad.gsb");
         fs::write(&path, serde_json::to_vec(&contents)?)?;
-        let output = fixture
-            .command()
-            .arg("run-bundle")
-            .arg(path)
-            .arg("-p")
-            .arg(target.0.id().to_string())
-            .output()?;
-        ensure!(!output.status.success(), "invalid {field} accepted");
-        ensure!(
-            String::from_utf8_lossy(&output.stderr).contains(expected),
-            "unexpected {field} error: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        for pid_mode in [false, true] {
+            let mut command = fixture.command();
+            command.arg("run-bundle").arg(&path);
+            if pid_mode {
+                command.arg("-p").arg(target.0.id().to_string());
+            } else {
+                command.arg("-t").arg(&fixture.binary);
+            }
+            let output = command.output()?;
+            ensure!(
+                !output.status.success(),
+                "invalid {field} accepted (pid_mode={pid_mode})"
+            );
+            ensure!(
+                String::from_utf8_lossy(&output.stderr).contains(expected),
+                "unexpected {field} error: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
     let output = fixture
         .command()
