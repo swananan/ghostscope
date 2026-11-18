@@ -162,7 +162,7 @@ sudo ghostscope run-bundle trace.gsb -p <PID>
 
 你可以在构建阶段准备好诊断脚本，再把 bundle 用于运行同一个、内容未变的目标二进制的不同 PID。`prepare` 不需要 BPF 权限；`run-bundle` 仍需要通常的追踪权限和兼容的内核。
 
-当前 bundle 支持宿主机进程中的单个可执行文件或共享库模块，暂不支持调用栈回溯和容器 PID namespace。目标身份与兼容要求见[预编译 trace bundle](docs/zh/prepared-traces.md)。
+bundle 可包含多个可执行文件和共享库模块，通过 `prepare --module PATH` 逐个添加。运行时用 `run-bundle -p PID` 追踪一个宿主机进程，或用 `run-bundle -t PATH` 在进程启动前附加探针。暂不支持调用栈回溯和容器 PID namespace。目标身份与兼容要求见[预编译 trace bundle](docs/zh/prepared-traces.md)。
 
 ## ✨ 核心特性
 

@@ -528,6 +528,14 @@ pub struct GhostSession {
 impl GhostSession {
     /// Create a new ghost session with merged configuration
     pub fn new_with_config(config: &ResolvedConfig) -> Self {
+        Self::new_with_config_and_modules(config, &[])
+    }
+
+    /// Additional target modules share the same process coordinator and sysmon.
+    pub(crate) fn new_with_config_and_modules(
+        config: &ResolvedConfig,
+        additional_modules: &[PathBuf],
+    ) -> Self {
         info!("Creating ghost session with merged configuration");
         let (coordinator, coordinator_snapshot) = new_process_manager_state();
 
@@ -604,6 +612,7 @@ impl GhostSession {
             let (watched_pid, watched_pid_ns) = sysmon_watch_from_config(config, s.host_pid());
             let cfg = SysmonConfig {
                 target_module: None,
+                additional_target_modules: Vec::new(),
                 proc_offsets_max_entries: config.ebpf_config.proc_module_offsets_max_entries as u32,
                 perf_page_count: Some(config.ebpf_config.perf_page_count as usize),
                 event_mask: SysmonEventMask::pid_module_changes(),
@@ -630,11 +639,15 @@ impl GhostSession {
             if config.ebpf_config.enable_sysmon_for_target {
                 let cfg = SysmonConfig {
                     target_module: Some(tpath.clone()),
+                    additional_target_modules: additional_modules.to_vec(),
                     proc_offsets_max_entries: config.ebpf_config.proc_module_offsets_max_entries
                         as u32,
                     perf_page_count: Some(config.ebpf_config.perf_page_count as usize),
                     event_mask: target_mode_sysmon_event_mask(&tpath),
-                    map_change_unfiltered: target_mode_map_change_unfiltered(&tpath),
+                    map_change_unfiltered: target_mode_map_change_unfiltered(&tpath)
+                        || additional_modules
+                            .iter()
+                            .any(|path| target_mode_map_change_unfiltered(path)),
                     watched_pid: None,
                     watched_pid_ns: None,
                     event_pid_ns: config.runtime.proc_offsets_pid_ns,
@@ -700,6 +713,7 @@ impl GhostSession {
         if s.proc_pid().is_some() {
             let cfg = SysmonConfig {
                 target_module: None,
+                additional_target_modules: Vec::new(),
                 proc_offsets_max_entries: 4096,
                 perf_page_count: None,
                 event_mask: SysmonEventMask::pid_module_changes(),
@@ -725,6 +739,7 @@ impl GhostSession {
                 .is_some_and(target_mode_map_change_unfiltered);
             let cfg = SysmonConfig {
                 target_module,
+                additional_target_modules: Vec::new(),
                 proc_offsets_max_entries: 4096,
                 perf_page_count: None,
                 event_mask,
@@ -1365,6 +1380,28 @@ impl GhostSession {
             analyzer.resolve_target_module_path(target)?;
         }
         self.process_analyzer = process_analyzer;
+        Ok(())
+    }
+
+    /// Extend an offline analyzer with explicitly supplied bundle modules.
+    pub(crate) async fn load_additional_binary_modules(&mut self, paths: &[PathBuf]) -> Result<()> {
+        let search_paths = self.get_debug_search_paths();
+        let allow_loose = self.get_allow_loose_debug_match();
+        let debuginfod = self.build_debuginfod_client()?;
+        let analyzer = self
+            .process_analyzer
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("primary module must be loaded first"))?;
+        for path in paths {
+            analyzer
+                .add_exec_module_with_config(
+                    path.clone(),
+                    &search_paths,
+                    allow_loose,
+                    debuginfod.clone(),
+                )
+                .await?;
+        }
         Ok(())
     }
 

@@ -98,6 +98,42 @@ async fn load(paths: &[&Path]) -> DwarfAnalyzer {
 }
 
 #[tokio::test]
+async fn offline_modules_preserve_primary_and_existing_module_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    // Register in reverse lexical order to catch accidental ID renumbering.
+    let primary = dir.path().join("z-main");
+    let extra = dir.path().join("a-library.so");
+    write_module(&primary);
+    write_module(&extra);
+    let mut analyzer = DwarfAnalyzer::from_exec_path(&primary).await.unwrap();
+    let primary_id = analyzer.module_id_for_path(&primary).unwrap();
+    analyzer
+        .add_exec_module_with_config(extra.clone(), &[], false, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        analyzer.get_main_executable().unwrap().path,
+        primary.to_str().unwrap()
+    );
+    assert_eq!(analyzer.module_id_for_path(&primary), Some(primary_id));
+    assert_ne!(analyzer.module_id_for_path(&extra), Some(primary_id));
+    let query = analyzer.query_function("working_function").unwrap();
+    assert_eq!(query.addresses.len(), 2);
+    assert!(query
+        .addresses
+        .iter()
+        .any(|address| address.module_path == primary));
+    assert!(query
+        .addresses
+        .iter()
+        .any(|address| address.module_path == extra));
+    assert!(analyzer
+        .add_exec_module_with_config(extra, &[], false, None)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn non_utf8_module_path_does_not_alias_a_utf8_module() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;

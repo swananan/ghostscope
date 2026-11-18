@@ -124,6 +124,15 @@ int main(int argc, char **argv) {
     }
 
     fn prepare(&self, script: &str, bundle: &Path) -> Result<Output> {
+        self.prepare_with_modules(script, bundle, &[])
+    }
+
+    fn prepare_with_modules(
+        &self,
+        script: &str,
+        bundle: &Path,
+        modules: &[PathBuf],
+    ) -> Result<Output> {
         let mut command = self.command();
         command
             .arg("prepare")
@@ -135,6 +144,9 @@ int main(int argc, char **argv) {
             .arg(&self.config)
             .arg("-o")
             .arg(bundle);
+        for module in modules {
+            command.arg("--module").arg(module);
+        }
         // SAFETY: geteuid has no arguments or memory effects.
         if unsafe { libc::geteuid() } == 0 {
             command.gid(65534).uid(65534);
@@ -298,6 +310,493 @@ fn wait_for_bundle_output(
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+const MULTI_MODULE_SCRIPT: &str = r#"
+trace bundle_probe { print "MAIN value={} global={} pid={}", value, bundle_global, $pid; }
+trace shared_probe { print "LIB value={} global={} pid={}", value, shared_global, $pid; }
+"#;
+
+struct MultiModuleFixture {
+    base: Fixture,
+    libraries: Vec<PathBuf>,
+    loader: PathBuf,
+    gate: PathBuf,
+}
+
+impl MultiModuleFixture {
+    fn new(perf: bool) -> Result<Self> {
+        let base = Fixture::new(perf)?;
+        let dir = base.directory.path();
+        let mut libraries = Vec::new();
+        for (name, global) in [("a", 101), ("b", 202)] {
+            let source = dir.join(format!("libbundle_{name}.c"));
+            let library = dir.join(format!("libbundle_{name}.so"));
+            // Same function/global names, distinct DWARF scopes and runtime bases.
+            fs::write(
+                &source,
+                format!(
+                    r#"
+static volatile int shared_global = {global};
+__attribute__((noinline)) void shared_probe(int value) {{
+    asm volatile("" : : "r"(value), "r"(shared_global) : "memory");
+}}
+"#
+                ),
+            )?;
+            successful(
+                Command::new("cc")
+                    .args(["-g", "-O0", "-fPIC", "-shared", "-Wl,--build-id"])
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(&library)
+                    .output()?,
+            )?;
+            split_debug(&library)?;
+            libraries.push(library);
+        }
+        let source = dir.join("target.c");
+        fs::write(
+            &source,
+            r#"
+#include <dlfcn.h>
+#include <stdlib.h>
+#include <unistd.h>
+#ifndef ONLY_LIBRARY
+volatile int bundle_global = 73;
+__attribute__((noinline)) void bundle_probe(int value) {
+    asm volatile("" : : "r"(value), "r"(bundle_global) : "memory");
+}
+#endif
+int main(int argc, char **argv) {
+    if (argc != 5 && argc != 6) return 2;
+    int value = atoi(argv[1]);
+    while (access(argv[4], F_OK) != 0) usleep(10000);
+    void *a = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+    void *b = argc == 5 ? dlopen(argv[3], RTLD_NOW | RTLD_LOCAL) : 0;
+    if (!a || (argc == 5 && !b)) return 3;
+    void (*probe_a)(int) = dlsym(a, "shared_probe");
+    void (*probe_b)(int) = b ? dlsym(b, "shared_probe") : 0;
+    if (!probe_a || (b && !probe_b)) return 4;
+    int phase = 0;
+    for (;;) {
+        /* Optional gate exercises an absent, loaded, then unloaded secondary. */
+        if (argc == 6) {
+            int wanted = access(argv[5], F_OK) == 0;
+            if (wanted && !b) {
+                b = dlopen(argv[3], RTLD_NOW | RTLD_LOCAL);
+                if (!b) return 3;
+                probe_b = dlsym(b, "shared_probe");
+                if (!probe_b) return 4;
+                phase = 1;
+            } else if (!wanted && b) {
+                dlclose(b);
+                b = 0;
+                probe_b = 0;
+                phase = 2;
+            }
+        }
+        int current = value + phase * 100;
+#ifndef ONLY_LIBRARY
+        bundle_probe(current);
+#endif
+        probe_a(current + 1);
+        if (probe_b) probe_b(current + 2);
+        usleep(10000);
+    }
+}
+"#,
+        )?;
+        let loader = dir.join("independent-loader");
+        for (binary, only_library) in [(&base.binary, false), (&loader, true)] {
+            let mut cc = Command::new("cc");
+            cc.args(["-g", "-O0", "-Wl,--build-id"]);
+            if only_library {
+                cc.arg("-DONLY_LIBRARY");
+            }
+            successful(cc.arg(&source).args(["-ldl", "-o"]).arg(binary).output()?)?;
+            split_debug(binary)?;
+        }
+        let gate = dir.join("load-libraries");
+        Ok(Self {
+            base,
+            libraries,
+            loader,
+            gate,
+        })
+    }
+
+    fn start(&self, value: i32, only_library: bool) -> Result<ChildGuard> {
+        Ok(ChildGuard(
+            Command::new(if only_library {
+                &self.loader
+            } else {
+                &self.base.binary
+            })
+            .arg(value.to_string())
+            .args(&self.libraries)
+            .arg(&self.gate)
+            .spawn()?,
+        ))
+    }
+
+    fn remove_debug_inputs(&self) -> Result<()> {
+        for entry in fs::read_dir(self.base.directory.path())? {
+            let path = entry?.path();
+            if matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("c" | "debug")
+            ) {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn split_debug(binary: &Path) -> Result<()> {
+    let debug = binary.with_file_name(format!(
+        "{}.debug",
+        binary
+            .file_name()
+            .context("binary filename")?
+            .to_string_lossy()
+    ));
+    successful(
+        Command::new("objcopy")
+            .arg("--only-keep-debug")
+            .arg(binary)
+            .arg(&debug)
+            .output()?,
+    )?;
+    successful(
+        Command::new("strip")
+            .arg("--strip-debug")
+            .arg(binary)
+            .output()?,
+    )?;
+    successful(
+        Command::new("objcopy")
+            .arg(format!("--add-gnu-debuglink={}", debug.display()))
+            .arg(binary)
+            .output()?,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn test_prepared_bundle_multiple_modules_and_late_dlopen() -> Result<()> {
+    common::init();
+    if !host_topology()?
+        || !ghostscope_loader::KernelCapabilities::detect_for_startup(false)?.supports_uprobe_multi
+    {
+        return Ok(());
+    }
+    for perf in [false, true] {
+        let mut fixture = MultiModuleFixture::new(perf)?;
+        let bundle = fixture.base.directory.path().join("multi.gsb");
+        successful(fixture.base.prepare_with_modules(
+            MULTI_MODULE_SCRIPT,
+            &bundle,
+            &fixture.libraries,
+        )?)?;
+        let contents: serde_json::Value = serde_json::from_slice(&fs::read(&bundle)?)?;
+        ensure!(
+            contents["modules"]
+                .as_array()
+                .context("module table")?
+                .len()
+                == 3,
+            "missing prepared module"
+        );
+        for module in 0..3 {
+            ensure!(
+                contents["probes"]
+                    .as_array()
+                    .context("probe table")?
+                    .iter()
+                    .any(|probe| probe["module"] == module),
+                "missing probe for module {module}"
+            );
+        }
+        fixture.remove_debug_inputs()?;
+        // Relocate a library and remove its original path: runtime must use the
+        // matching override for both attachment and offset discovery.
+        let relocated = fixture.base.directory.path().join("relocated-b.so");
+        successful(
+            Command::new("cp")
+                .arg("--")
+                .arg(&fixture.libraries[1])
+                .arg(&relocated)
+                .output()?,
+        )?;
+        fs::remove_file(&fixture.libraries[1])?;
+        fixture.libraries[1] = relocated.clone();
+        for pid_mode in [true, false] {
+            let _ = fs::remove_file(&fixture.gate);
+            let existing = if pid_mode {
+                Some(fixture.start(42, false)?)
+            } else {
+                None
+            };
+            let unrelated = if pid_mode {
+                Some(fixture.start(99, false)?)
+            } else {
+                None
+            };
+            let stdout = fixture.base.directory.path().join("multi.stdout");
+            let stderr = fixture.base.directory.path().join("multi.stderr");
+            let mut command = fixture.base.command();
+            command
+                .arg("run-bundle")
+                .arg(&bundle)
+                .arg("--module-path")
+                .arg(format!("libbundle_b.so={}", relocated.display()))
+                .args([
+                    "--no-status",
+                    "--script-output",
+                    "plain",
+                    "--emit-ready-marker",
+                    "BUNDLE_READY",
+                ]);
+            if let Some(target) = &existing {
+                command.arg("-p").arg(target.0.id().to_string());
+            } else {
+                command.arg("-t").arg(&fixture.base.binary);
+            }
+            let mut tracer = ChildGuard(
+                command
+                    .stdout(Stdio::from(File::create(&stdout)?))
+                    .stderr(Stdio::from(File::create(&stderr)?))
+                    .spawn()?,
+            );
+            wait_for_bundle_output(&mut tracer, &stdout, &stderr, |s| {
+                s.contains("BUNDLE_READY")
+            })?;
+            // Both DSOs are first mapped after the tracer is ready, even in -p mode.
+            fs::write(&fixture.gate, b"go")?;
+            let target = if let Some(existing) = existing {
+                existing
+            } else {
+                fixture.start(42, false)?
+            };
+            let pid = target.0.id();
+            let output = wait_for_bundle_output(&mut tracer, &stdout, &stderr, |s| {
+                s.contains(&format!("MAIN value=42 global=73 pid={pid}"))
+                    && s.contains(&format!("LIB value=43 global=101 pid={pid}"))
+                    && s.contains(&format!("LIB value=44 global=202 pid={pid}"))
+            })?;
+            if let Some(unrelated) = &unrelated {
+                ensure!(
+                    !output.contains(&format!("pid={}", unrelated.0.id())),
+                    "PID scope leaked: {output}"
+                );
+            }
+            drop(target);
+            if !pid_mode {
+                // This executable is absent from the bundle and does not map its
+                // primary target. Secondary module discovery must be independent.
+                for value in [84, 126] {
+                    let loader = fixture.start(value, true)?;
+                    let pid = loader.0.id();
+                    wait_for_bundle_output(&mut tracer, &stdout, &stderr, |s| {
+                        s.contains(&format!("LIB value={} global=101 pid={pid}", value + 1))
+                            && s.contains(&format!("LIB value={} global=202 pid={pid}", value + 2))
+                    })?;
+                }
+            }
+            common::termination::send_sigterm(tracer.0.id(), "multi-module bundle tracer")?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = tracer.0.try_wait()? {
+                    ensure!(
+                        status.success(),
+                        "tracer shutdown failed: {}",
+                        fs::read_to_string(&stderr)?
+                    );
+                    break;
+                }
+                ensure!(Instant::now() < deadline, "tracer failed to shut down");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_prepared_bundle_keeps_other_modules_across_dlopen_and_dlclose() -> Result<()> {
+    common::init();
+    if !host_topology()?
+        || !ghostscope_loader::KernelCapabilities::detect_for_startup(false)?.supports_uprobe_multi
+    {
+        return Ok(());
+    }
+    let fixture = MultiModuleFixture::new(false)?;
+    let bundle = fixture.base.directory.path().join("partial.gsb");
+    successful(fixture.base.prepare_with_modules(
+        MULTI_MODULE_SCRIPT,
+        &bundle,
+        &fixture.libraries,
+    )?)?;
+    fixture.remove_debug_inputs()?;
+    let stdout = fixture.base.directory.path().join("partial.stdout");
+    let stderr = fixture.base.directory.path().join("partial.stderr");
+    let mut tracer = ChildGuard(
+        fixture
+            .base
+            .command()
+            .arg("run-bundle")
+            .arg(&bundle)
+            .arg("-t")
+            .arg(&fixture.base.binary)
+            .args([
+                "--no-status",
+                "--script-output",
+                "plain",
+                "--emit-ready-marker",
+                "BUNDLE_READY",
+            ])
+            .stdout(Stdio::from(File::create(&stdout)?))
+            .stderr(Stdio::from(File::create(&stderr)?))
+            .spawn()?,
+    );
+    wait_for_bundle_output(&mut tracer, &stdout, &stderr, |s| {
+        s.contains("BUNDLE_READY")
+    })?;
+    let secondary_gate = fixture.base.directory.path().join("load-second");
+    fs::write(&fixture.gate, b"go")?;
+    let target = ChildGuard(
+        Command::new(&fixture.base.binary)
+            .arg("42")
+            .args(&fixture.libraries)
+            .arg(&fixture.gate)
+            .arg(&secondary_gate)
+            .spawn()?,
+    );
+    let pid = target.0.id();
+    for phase in 0..3 {
+        match phase {
+            1 => fs::write(&secondary_gate, b"load")?,
+            2 => fs::remove_file(&secondary_gate)?,
+            _ => {}
+        }
+        let value = 42 + phase * 100;
+        wait_for_bundle_output(&mut tracer, &stdout, &stderr, |s| {
+            s.contains(&format!("MAIN value={value} global=73 pid={pid}"))
+                && s.contains(&format!("LIB value={} global=101 pid={pid}", value + 1))
+                && (phase != 1
+                    || s.contains(&format!("LIB value={} global=202 pid={pid}", value + 2)))
+        })?;
+    }
+    common::termination::send_sigterm(tracer.0.id(), "partial-module bundle tracer")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = tracer.0.try_wait()? {
+            ensure!(
+                status.success(),
+                "bundle tracer shutdown failed: {}",
+                fs::read_to_string(&stderr)?
+            );
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "bundle tracer failed to shut down"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+#[test]
+fn test_prepared_bundle_checks_every_module_before_attachment() -> Result<()> {
+    common::init();
+    if !host_topology()? {
+        return Ok(());
+    }
+    let fixture = MultiModuleFixture::new(false)?;
+    let bundle = fixture.base.directory.path().join("multi.gsb");
+    let duplicate = fixture.base.prepare_with_modules(
+        MULTI_MODULE_SCRIPT,
+        &bundle,
+        &[fixture.libraries[0].clone(), fixture.libraries[0].clone()],
+    )?;
+    ensure!(
+        !duplicate.status.success() && !bundle.exists(),
+        "duplicate module was accepted"
+    );
+    ensure!(
+        String::from_utf8_lossy(&duplicate.stderr).contains("duplicate module"),
+        "unexpected duplicate error"
+    );
+    successful(fixture.base.prepare_with_modules(
+        MULTI_MODULE_SCRIPT,
+        &bundle,
+        &fixture.libraries,
+    )?)?;
+    let original = fs::read(&bundle)?;
+    for (pointer, value, expected) in [
+        (
+            "/modules/2/sha256",
+            serde_json::json!(vec![0; 32]),
+            "identity mismatch",
+        ),
+        (
+            "/modules/2/cookie",
+            serde_json::from_slice::<serde_json::Value>(&original)?["modules"][1]["cookie"].clone(),
+            "duplicate module cookie",
+        ),
+        (
+            "/probes/0/module",
+            serde_json::json!(3),
+            "invalid probe module index",
+        ),
+    ] {
+        let mut contents: serde_json::Value = serde_json::from_slice(&original)?;
+        *contents
+            .pointer_mut(pointer)
+            .context("missing bundle field")? = value;
+        let bad = fixture.base.directory.path().join("bad.gsb");
+        fs::write(&bad, serde_json::to_vec(&contents)?)?;
+        let output = fixture
+            .base
+            .command()
+            .arg("run-bundle")
+            .arg(&bad)
+            .arg("-t")
+            .arg(&fixture.base.binary)
+            .args(["--emit-ready-marker", "BUNDLE_READY"])
+            .output()?;
+        ensure!(
+            !output.status.success(),
+            "invalid secondary module accepted"
+        );
+        ensure!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "unexpected error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        ensure!(
+            !String::from_utf8_lossy(&output.stdout).contains("BUNDLE_READY"),
+            "attached invalid bundle"
+        );
+    }
+    fs::remove_file(&fixture.libraries[1])?;
+    let output = fixture
+        .base
+        .command()
+        .arg("run-bundle")
+        .arg(&bundle)
+        .arg("-t")
+        .arg(&fixture.base.binary)
+        .output()?;
+    ensure!(
+        !output.status.success()
+            && String::from_utf8_lossy(&output.stderr).contains("cannot resolve bundle module"),
+        "missing secondary module accepted"
+    );
+    Ok(())
 }
 
 #[test]
@@ -487,25 +986,33 @@ fn test_prepared_bundle_rejects_backtrace_mismatch_and_overwrite() -> Result<()>
 
     let target = ChildGuard(Command::new(&fixture.binary).arg("42").spawn()?);
     for (field, value, expected) in [
-        ("format_version", serde_json::json!(999), "format version"),
+        ("/format_version", serde_json::json!(999), "format version"),
+        ("/format_version", serde_json::json!(1), "format version"),
         (
-            "architecture",
+            "/architecture",
             serde_json::json!("unsupported"),
             "architecture mismatch",
         ),
         (
-            "ghostscope_version",
+            "/ghostscope_version",
             serde_json::json!("0.0.0"),
             "version mismatch",
         ),
         (
-            "target_sha256",
+            "/modules/0/sha256",
             serde_json::json!(vec![0; 32]),
             "identity mismatch",
         ),
+        (
+            "/probes/0/module",
+            serde_json::json!(1),
+            "invalid probe module index",
+        ),
     ] {
         let mut contents: serde_json::Value = serde_json::from_slice(&original)?;
-        contents[field] = value;
+        *contents
+            .pointer_mut(field)
+            .context("missing bundle field")? = value;
         let path = fixture.directory.path().join("bad.gsb");
         fs::write(&path, serde_json::to_vec(&contents)?)?;
         for pid_mode in [false, true] {

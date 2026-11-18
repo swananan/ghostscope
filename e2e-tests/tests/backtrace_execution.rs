@@ -1735,11 +1735,10 @@ trace cross_module_lib_leaf {
             OsString::from("--analysis-cache-dir"),
             cache.path().as_os_str().to_os_string(),
             OsString::from("--log"),
-            OsString::from("--log-console"),
             OsString::from("--log-level"),
             OsString::from("info"),
             OsString::from("--log-file"),
-            log_path.into_os_string(),
+            log_path.as_os_str().to_os_string(),
         ],
         None,
         Some("libbacktrace_cross_module.so"),
@@ -1749,21 +1748,24 @@ trace cross_module_lib_leaf {
         return Ok(());
     }
 
-    let main_cache_hit = stderr.lines().any(|line| {
+    // Console logging is best effort and may drop the cache-hit event under
+    // load. The file log records every event needed for these assertions.
+    let runtime_log = fs::read_to_string(&log_path)?;
+    let main_cache_hit = runtime_log.lines().any(|line| {
         line.contains("DWARF analysis cache hit for")
             && line.contains("backtrace_cross_module_program")
             && !line.contains("libbacktrace_cross_module.so")
     });
     assert!(
         main_cache_hit,
-        "runtime should consume the prepared main executable cache\nPREPARE:\n{prepare_stdout}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        "runtime should consume the prepared main executable cache\nPREPARE:\n{prepare_stdout}\nLOG:\n{runtime_log}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
     assert!(
-        !stderr.lines().any(|line| {
+        !runtime_log.lines().any(|line| {
             line.contains("DWARF analysis cache hit for")
                 && line.contains("libbacktrace_cross_module.so")
         }),
-        "the shared library should remain uncached\nSTDERR:\n{stderr}"
+        "the shared library should remain uncached\nLOG:\n{runtime_log}"
     );
     assert_eq!(
         analysis_cache_entry_count(cache.path())?,

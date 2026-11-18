@@ -4,15 +4,52 @@ use super::offset_refresh::*;
 use super::pid_alias::*;
 use super::*;
 
+#[cfg(test)]
+#[path = "runtime_loop_tests.rs"]
+mod tests;
+
 #[cfg(feature = "sysmon-ebpf")]
 struct SysmonLoopContext<'a, F, M> {
     mgr: &'a Arc<Mutex<ProcessManager>>,
-    target: &'a Option<PathBuf>,
-    pending: &'a Arc<Mutex<PendingOffsets>>,
-    pending_map_refreshes: &'a Arc<Mutex<PendingMapRefreshes>>,
+    targets: Vec<SysmonTargetState>,
     proc_pid_for_event: &'a F,
     proc_pid_for_map_change: &'a M,
     tx: &'a mpsc::SyncSender<SysEvent>,
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+struct SysmonTargetState {
+    target: Option<PathBuf>,
+    pending: Arc<Mutex<PendingOffsets>>,
+    pending_map_refreshes: Arc<Mutex<PendingMapRefreshes>>,
+    last_module_refresh: Instant,
+    map_signatures: HashMap<u32, PidMapsSignature>,
+}
+
+#[cfg(feature = "sysmon-ebpf")]
+impl<F, M> SysmonLoopContext<'_, F, M> {
+    fn dispatch(&self, event: &SysEvent, resolver: &impl Fn(u32) -> u32) -> bool {
+        let mut matched = false;
+        let targets: Vec<&Path> = self
+            .targets
+            .iter()
+            .filter_map(|state| state.target.as_deref())
+            .collect();
+        for state in &self.targets {
+            // Do not short-circuit: each module has its own pending discovery
+            // and reconciliation state, including libraries not mapped yet.
+            matched |= dispatch_sysmon_event(
+                self.mgr,
+                &state.target,
+                &targets,
+                &state.pending,
+                &state.pending_map_refreshes,
+                resolver,
+                event,
+            );
+        }
+        matched
+    }
 }
 
 #[cfg(feature = "sysmon-ebpf")]
@@ -52,6 +89,9 @@ impl SysmonWorker {
                 // Callers must not advertise readiness until both are ready.
                 let resolver = sysmon_proc_pid_resolver(cfg.watched_pid, cfg.watched_proc_pid);
                 initialize_target_offsets(&mgr, cfg.target_module.as_deref(), &resolver);
+                for target in &cfg.additional_target_modules {
+                    initialize_target_offsets(&mgr, Some(target), &resolver);
+                }
                 info!("Sysmon: setup complete");
                 let _ = ready.send(());
                 if let Err(error) = run_sysmon_worker(
@@ -170,14 +210,7 @@ fn process_lifecycle_events<F: Fn(u32) -> u32, M: Fn(u32) -> u32>(
         let Some(event) = pop_lifecycle_work(queue)? else {
             break;
         };
-        let matched = dispatch_sysmon_event(
-            context.mgr,
-            context.target,
-            context.pending,
-            context.pending_map_refreshes,
-            context.proc_pid_for_event,
-            &event,
-        );
+        let matched = context.dispatch(&event, context.proc_pid_for_event);
         if matched {
             try_publish_sys_event(context.tx, event);
         }
@@ -200,14 +233,7 @@ fn process_coalesced_map_changes<F: Fn(u32) -> u32, M: Fn(u32) -> u32>(
         let Some(ev) = pop_ready_map_change_work(queue, Instant::now())? else {
             break;
         };
-        let matched = dispatch_sysmon_event(
-            context.mgr,
-            context.target,
-            context.pending,
-            context.pending_map_refreshes,
-            context.proc_pid_for_map_change,
-            &ev,
-        );
+        let matched = context.dispatch(&ev, context.proc_pid_for_map_change);
         if matched {
             try_publish_sys_event(context.tx, ev);
         }
@@ -221,10 +247,8 @@ fn process_coalesced_map_changes<F: Fn(u32) -> u32, M: Fn(u32) -> u32>(
 
 #[cfg(feature = "sysmon-ebpf")]
 fn service_sysmon_maintenance<F: Fn(u32) -> u32, M: Fn(u32) -> u32>(
-    context: &SysmonLoopContext<'_, F, M>,
+    context: &mut SysmonLoopContext<'_, F, M>,
     queue: &SharedSysmonWorkQueue,
-    last_module_refresh: &mut Instant,
-    target_pid_map_signatures: &mut HashMap<u32, PidMapsSignature>,
 ) -> anyhow::Result<usize> {
     // Lifecycle work is the latency-sensitive path. It is always selected before
     // scans, retries, and map-change refreshes, regardless of mmap event volume.
@@ -232,22 +256,32 @@ fn service_sysmon_maintenance<F: Fn(u32) -> u32, M: Fn(u32) -> u32>(
     // Reconciliation is the correctness fallback when lifecycle or map-change events are delayed
     // or dropped. Service it before lower-priority per-PID map work so event pressure cannot defer
     // the refresh past its deadline.
-    refresh_target_module_offsets(
-        context.mgr,
-        context.target.as_deref(),
-        last_module_refresh,
-        target_pid_map_signatures,
-        context.tx,
-    );
-    poll_pending_offsets(context.mgr, context.pending, context.proc_pid_for_event);
+    for state in &mut context.targets {
+        refresh_target_module_offsets(
+            context.mgr,
+            state.target.as_deref(),
+            &mut state.last_module_refresh,
+            &mut state.map_signatures,
+            context.tx,
+        );
+        poll_pending_offsets(context.mgr, &state.pending, context.proc_pid_for_event);
+    }
     let processed_map_changes = process_coalesced_map_changes(context, queue)?;
-    poll_pending_map_refreshes(
-        context.mgr,
-        context.target.as_deref(),
-        context.pending_map_refreshes,
-        context.pending,
-        context.tx,
-    );
+    let targets: Vec<&Path> = context
+        .targets
+        .iter()
+        .filter_map(|state| state.target.as_deref())
+        .collect();
+    for state in &context.targets {
+        poll_pending_map_refreshes(
+            context.mgr,
+            state.target.as_deref(),
+            &targets,
+            &state.pending_map_refreshes,
+            &state.pending,
+            context.tx,
+        );
+    }
     Ok(processed_lifecycle + processed_map_changes)
 }
 
@@ -342,7 +376,25 @@ fn run_sysmon_worker(
     queue: SharedSysmonWorkQueue,
     wake_rx: mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let target = cfg.target_module;
+    let targets = std::iter::once(cfg.target_module)
+        .chain(cfg.additional_target_modules.into_iter().map(Some))
+        .enumerate()
+        .map(|(index, target)| SysmonTargetState {
+            target,
+            pending: if index == 0 {
+                Arc::clone(&pending)
+            } else {
+                Arc::new(Mutex::new(PendingOffsets::new()))
+            },
+            pending_map_refreshes: if index == 0 {
+                Arc::clone(&pending_map_refreshes)
+            } else {
+                Arc::new(Mutex::new(PendingMapRefreshes::new()))
+            },
+            last_module_refresh: Instant::now(),
+            map_signatures: HashMap::new(),
+        })
+        .collect();
     let proc_pid_for_event = sysmon_proc_pid_resolver(cfg.watched_pid, cfg.watched_proc_pid);
     // Only noisy map-change handling uses a short-lived `/proc` index snapshot. Lifecycle events
     // keep fresh resolution semantics so a newly visible short-lived process cannot hit a cached
@@ -354,25 +406,16 @@ fn run_sysmon_worker(
     // refresh immediately due: for `-t executable`, the exec event is the fast
     // path that inserts proc_module_offsets and allowed_pids. A fallback /proc
     // scan here can delay a short-lived target past its only probe.
-    let mut last_module_refresh = Instant::now();
-    let mut target_pid_map_signatures = HashMap::<u32, PidMapsSignature>::new();
-    let context = SysmonLoopContext {
+    let mut context = SysmonLoopContext {
         mgr: &mgr,
-        target: &target,
-        pending: &pending,
-        pending_map_refreshes: &pending_map_refreshes,
+        targets,
         proc_pid_for_event: &proc_pid_for_event,
         proc_pid_for_map_change: &proc_pid_for_map_change,
         tx: &tx,
     };
 
     loop {
-        let processed = service_sysmon_maintenance(
-            &context,
-            &queue,
-            &mut last_module_refresh,
-            &mut target_pid_map_signatures,
-        )?;
+        let processed = service_sysmon_maintenance(&mut context, &queue)?;
         if processed == 0 {
             match wake_rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}

@@ -1,5 +1,5 @@
 use crate::core::GhostSession;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ghostscope_compiler::script::FailedTarget;
 use tracing::{error, info, warn};
 
@@ -112,7 +112,7 @@ pub(crate) async fn load_compiled_script_for_cli(
     compilation_result: ghostscope_compiler::CompilationResult,
     session: &mut GhostSession,
     compile_options: &ghostscope_compiler::CompileOptions,
-    attach_target: Option<&str>,
+    attach_targets: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<()> {
     ensure_prefill_for_session_pid(session)?;
 
@@ -130,6 +130,19 @@ pub(crate) async fn load_compiled_script_for_cli(
 
     let mut attached_count = 0;
     for config in &uprobe_configs {
+        let attach_target = attach_targets
+            .map(|targets| {
+                targets
+                    .get(&config.binary_path)
+                    .map(String::as_str)
+                    .with_context(|| {
+                        format!(
+                            "no verified attachment file for module {}",
+                            config.binary_path
+                        )
+                    })
+            })
+            .transpose()?;
         match create_and_attach_loader(
             config,
             session.attach_pid(),

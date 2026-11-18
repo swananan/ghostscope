@@ -860,6 +860,7 @@ pub(super) fn forget_pid_offsets_after_target_unmap(
 pub(super) fn poll_pending_map_refreshes(
     mgr: &Arc<Mutex<ProcessManager>>,
     target: Option<&Path>,
+    targets: &[&Path],
     pending_map_refreshes: &Arc<Mutex<PendingMapRefreshes>>,
     pending: &Arc<Mutex<PendingOffsets>>,
     tx: &mpsc::SyncSender<SysEvent>,
@@ -877,11 +878,7 @@ pub(super) fn poll_pending_map_refreshes(
     for event in due {
         let event_pid = event.event_pid;
         let host_pid = event.host_pid;
-        let proc_pid = target
-            .map(|target_path| {
-                canonicalize_cached_target_proc_pid(mgr, target_path, event.proc_pid)
-            })
-            .unwrap_or(event.proc_pid);
+        let proc_pid = canonicalize_cached_target_proc_pid(mgr, targets, event.proc_pid);
         if !pid_alive(proc_pid) {
             tracing::trace!(
                 "Sysmon: event pid {} (proc pid {}) exited before map refresh",
@@ -892,7 +889,14 @@ pub(super) fn poll_pending_map_refreshes(
         }
 
         if let Some(target_path) = target {
-            if !pid_maps_target_module(proc_pid, target_path) {
+            // Each module has its own pending queue, but offsets and the
+            // allowlist belong to the process. A missing module must not erase
+            // another selected module; refresh the full snapshot to remove
+            // only mappings that actually disappeared.
+            if !targets
+                .iter()
+                .any(|path| pid_maps_target_module(proc_pid, path))
+            {
                 if cached_offsets_exist_for_target_pid(mgr, target_path, proc_pid) {
                     forget_pid_offsets_after_target_unmap(mgr, event_pid, host_pid, proc_pid);
                     let ev = SysEvent {
@@ -903,7 +907,7 @@ pub(super) fn poll_pending_map_refreshes(
                     try_publish_sys_event(tx, ev);
                 }
                 tracing::trace!(
-                    "Sysmon: event pid {} (proc pid {}) map-change does not include target {}; skip",
+                    "Sysmon: event pid {} (proc pid {}) no longer maps any target (queued for {}); skip",
                     event_pid,
                     proc_pid,
                     target_path.display()

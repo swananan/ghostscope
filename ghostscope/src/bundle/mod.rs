@@ -5,16 +5,17 @@ use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use ghostscope_compiler::script::Statement;
 use ghostscope_loader::KernelCapabilities;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::config::args::{PrepareArgs, RunBundleArgs};
 use crate::config::{Args, Config, ResolvedConfig, UserConfig};
 use crate::core::GhostSession;
-use artifact::{fingerprint, open_regular_file, Bundle};
+use artifact::{Bundle, Module, MAX_MODULES};
 
 // This is a compilation profile, not a probe of the preparing machine's kernel.
 // Runtime must explicitly verify it before loading any saved bytecode.
@@ -53,6 +54,10 @@ fn reject_backtrace(statements: &[Statement]) -> Result<()> {
 pub(crate) async fn prepare(args: PrepareArgs) -> Result<()> {
     let started = Instant::now();
     ensure!(
+        args.modules.len() < MAX_MODULES,
+        "prepare supports at most {MAX_MODULES} modules"
+    );
+    ensure!(
         !args.output.try_exists()?,
         "output already exists: {}",
         args.output.display()
@@ -82,9 +87,23 @@ pub(crate) async fn prepare(args: PrepareArgs) -> Result<()> {
     let target = std::fs::canonicalize(user.target_path.as_ref().context("prepare requires -t")?)?;
     let target = ghostscope_process::module_probe::module_path_str(&target)?.to_owned();
     user.target_path = Some(target.clone());
-    let mut target_file = open_regular_file(Path::new(&target))?;
-    let target_sha256 = fingerprint(&mut target_file)?;
-    let module_cookie = ghostscope_compiler::module_cookie_for_path(&target);
+    let additional_paths: Vec<PathBuf> = args
+        .modules
+        .into_iter()
+        .map(std::fs::canonicalize)
+        .collect::<std::io::Result<_>>()?;
+    let mut modules = vec![Module::capture(target.clone())?];
+    let mut cookies = HashSet::from([modules[0].cookie]);
+    for path in &additional_paths {
+        let module =
+            Module::capture(ghostscope_process::module_probe::module_path_str(path)?.to_owned())?;
+        ensure!(
+            cookies.insert(module.cookie),
+            "duplicate module cookie or module alias: {}",
+            module.path
+        );
+        modules.push(module);
+    }
     let profile = compilation_profile(&user);
     let config = ResolvedConfig {
         user,
@@ -93,16 +112,21 @@ pub(crate) async fn prepare(args: PrepareArgs) -> Result<()> {
     };
     let mut session = GhostSession::new_with_config(&config);
     session.load_binary_parallel().await?;
-    let options = config.get_compile_options(false, false, false, Some(target.clone()));
+    session
+        .load_additional_binary_modules(&additional_paths)
+        .await?;
+    let mut options = config.get_compile_options(false, false, false, Some(target.clone()));
+    if !additional_paths.is_empty() {
+        options.target_binary_path = None;
+    }
     let compiled = crate::script::compile_script_for_cli(&script, &mut session, &options)?;
-    ensure!(
-        target_sha256 == fingerprint(&mut open_regular_file(Path::new(&target))?)?,
-        "target changed during preparation"
-    );
+    for module in &modules {
+        module
+            .open_verified(&module.path)
+            .context("module changed during preparation")?;
+    }
     let bundle = Bundle::from_compilation(
-        target,
-        target_sha256,
-        module_cookie,
+        modules,
         script,
         config.ebpf_config.clone(),
         config.value_adapter_config,
@@ -121,11 +145,16 @@ pub(crate) async fn prepare(args: PrepareArgs) -> Result<()> {
 pub(crate) async fn run(args: RunBundleArgs) -> Result<()> {
     let started = Instant::now();
     let bundle = Bundle::read(&args.bundle)?;
+    let paths = bundle.resolve_module_paths(args.target.as_deref(), &args.module_paths)?;
+    // Validate every module before starting sysmon or attaching any probe.
+    let files: Vec<File> = bundle
+        .modules
+        .iter()
+        .zip(&paths)
+        .map(|(module, path)| module.open_verified(path))
+        .collect::<Result<_>>()?;
     let mut trace_args = Args::try_parse_from(["ghostscope"])?;
-    let target = std::fs::canonicalize(args.target.unwrap_or_else(|| bundle.target.clone()))
-        .context("cannot resolve bundle target")?;
-    trace_args.target =
-        Some(ghostscope_process::module_probe::module_path_str(&target)?.to_owned());
+    trace_args.target = Some(paths[0].clone());
     trace_args.pid = args.pid;
     trace_args.script = Some(bundle.script.clone());
     trace_args.script_output = Some(args.script_output);
@@ -139,21 +168,11 @@ pub(crate) async fn run(args: RunBundleArgs) -> Result<()> {
     user.should_save_ebpf = false;
     user.should_save_ast = false;
     let target = user.target_path.clone().context("bundle has no target")?;
-    let mut target_file =
-        open_regular_file(Path::new(&target)).context("cannot open bundle target")?;
-    ensure!(
-        fingerprint(&mut target_file)? == bundle.target_sha256,
-        "bundle target identity mismatch (SHA-256); prepare it again for this binary"
-    );
-    ensure!(
-        ghostscope_compiler::module_cookie_for_path(&target) == bundle.module_cookie,
-        "bundle module cookie mismatch; targets without a build ID must retain their file identity"
-    );
     let process_identity = args
         .pid
         .map(|pid| -> Result<_> {
             let start_time = process_start_time(pid)?;
-            ensure_target_is_mapped(pid, &target_file)?;
+            ensure_target_is_mapped(pid, &files[0])?;
             Ok((pid, start_time))
         })
         .transpose()?;
@@ -187,24 +206,29 @@ pub(crate) async fn run(args: RunBundleArgs) -> Result<()> {
         "run-bundle currently supports host processes only; container PID namespaces require runtime binding support");
     let _cleanup = crate::util::PinnedMapsCleanupGuard::new();
     // No load_binary* call: the process manager only reads ELF mappings/offsets.
-    let mut session = GhostSession::new_with_config(&config);
+    let additional_paths: Vec<PathBuf> = paths[1..].iter().map(PathBuf::from).collect();
+    let mut session = GhostSession::new_with_config_and_modules(&config, &additional_paths);
     let mut options = config.get_compile_options(false, false, false, Some(target.clone()));
     options.pid_filter_spec = None;
     options.special_pid_ns = None;
     options.proc_offsets_pid_ns = None;
     options.input_pid = None;
     let script = bundle.script.clone();
-    let compilation = bundle.into_compilation(&target, args.pid);
+    let compilation = bundle.into_compilation(&paths, args.pid);
     crate::script::report_value_diagnostics(&compilation);
     // Attach through the retained descriptor, so a pathname replacement cannot
     // substitute another inode after the fingerprint/mapping checks.
-    let attach_target = format!("/proc/self/fd/{}", target_file.as_raw_fd());
+    let attach_targets: HashMap<String, String> = paths
+        .iter()
+        .zip(&files)
+        .map(|(path, file)| (path.clone(), format!("/proc/self/fd/{}", file.as_raw_fd())))
+        .collect();
     crate::script::load_compiled_script_for_cli(
         &script,
         compilation,
         &mut session,
         &options,
-        Some(&attach_target),
+        Some(&attach_targets),
     )
     .await?;
     if let Some((pid, start_time)) = process_identity {
@@ -212,7 +236,7 @@ pub(crate) async fn run(args: RunBundleArgs) -> Result<()> {
             process_start_time(pid)? == start_time,
             "target process changed during bundle attachment"
         );
-        ensure_target_is_mapped(pid, &target_file)?;
+        ensure_target_is_mapped(pid, &files[0])?;
     }
     if config.script_status {
         eprintln!(

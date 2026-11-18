@@ -208,6 +208,8 @@ use pending::PendingOffsetsKind;
 pub struct SysmonConfig {
     /// If set, only attempt offsets prefill for events whose binary/module path matches this target.
     pub target_module: Option<PathBuf>,
+    /// Other target modules sharing the same event collector and process offsets.
+    pub additional_target_modules: Vec<PathBuf>,
     /// Maximum number of entries for the pinned proc offsets map (used when ensuring existence).
     pub proc_offsets_max_entries: u32,
     /// PerfEventArray per-CPU buffer pages (used when ringbuf is unavailable).
@@ -230,6 +232,7 @@ impl SysmonConfig {
     pub fn new() -> Self {
         Self {
             target_module: None,
+            additional_target_modules: Vec::new(),
             proc_offsets_max_entries: 4096,
             perf_page_count: None,
             event_mask: SysmonEventMask::target_mode(),
