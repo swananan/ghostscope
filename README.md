@@ -41,7 +41,7 @@ C has the strongest end-to-end coverage. For Rust targets, GhostScope provides t
 - Use GDB when you want an interactive debugging experience with breakpoints, single-stepping, memory writes, or coredump debugging.
 - Use `perf probe` when you want a quick one-off probe at a function, source line, or local variable inside the perf ecosystem.
 - Use bpftrace or SystemTap when you want broad kernel + userspace event aggregation in one script.
-- Do not expect source-level variable tracing to work well without DWARF debug info for the modules you care about.
+- Preparing source-level variable traces requires matching DWARF debug info. An existing [prepared bundle](docs/prepared-traces.md) can run without the debug files.
 
 ### GhostScope vs perf, GDB, bpftrace, and SystemTap
 
@@ -155,6 +155,19 @@ The demo below follows exactly that path on a DWARF-enabled nginx worker: locate
 Imagine navigating a vast, uncharted forest of binary data — memory addresses, register values, stack frames — all meaningless numbers without context. **DWARF debug information is our map**: it tells us that stack address `RSP-0x18` stores local variable `count`, heap address `0x5621a8c0` is a `user` object with string pointer `user.name` at offset `+0x20`; it tracks where each variable lives throughout program execution — parameter `x` is in register `RDI` now but will move to stack offset `RSP-0x10` later.
 
 With this map in hand, GhostScope leverages **eBPF and uprobe** technology to safely extract binary data from instruction points in your running program. The combination is powerful: DWARF reveals the meaning of bytes in the process's virtual address space, while eBPF retrieves the requested data. The result is source-aware variable values and call stacks without debugger-controlled suspension or intentional application-state changes. Each uprobe hit still adds synchronous trap and eBPF work, so tracing is not timing-transparent.
+
+### Prepare Once, Reuse Trace Bundles
+
+**Prepared trace bundles separate source analysis and compilation from runtime tracing.** `prepare` uses DWARF and LLVM to save the probe programs and event-decoding context in a reusable bundle. `run-bundle` then validates the target and attaches those programs **without parsing DWARF or invoking LLVM**. Separate debug files and source files are no longer needed at runtime.
+
+```bash
+ghostscope prepare -t /path/to/app --script-file trace.gs -o trace.gsb
+sudo ghostscope run-bundle trace.gsb -p <PID>
+```
+
+You can prepare a diagnostic script alongside a build and reuse its bundle across PIDs running the same unchanged target binary. `prepare` needs no BPF privileges; `run-bundle` needs the usual tracing privileges and a compatible kernel.
+
+Current bundles support one executable or shared-library module in a host process; backtraces and container PID namespaces are not yet supported. See [Prepared Trace Bundles](docs/prepared-traces.md) for target identity and compatibility requirements.
 
 ## ✨ Highlights
 
