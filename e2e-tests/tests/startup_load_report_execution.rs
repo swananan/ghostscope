@@ -943,6 +943,7 @@ fn run_prepare_analysis_cache_command(
 }
 
 fn workspace_owner_identity(workspace_root: &Path) -> Result<Option<(u32, u32)>> {
+    // SAFETY: geteuid has no preconditions and does not access caller memory.
     if unsafe { libc::geteuid() } != 0 {
         return Ok(None);
     }
