@@ -4,7 +4,9 @@ mod common;
 use anyhow::{ensure, Result};
 use common::{runner::GhostscopeRunner, targets::TargetLauncher};
 use serde_json::Value;
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{collections::HashSet, path::PathBuf, sync::OnceLock, time::Duration};
+
+static FIXTURE_BUILD: OnceLock<Result<(), String>> = OnceLock::new();
 
 #[tokio::test]
 async fn test_sleepable_invocations_isolate_events_and_tail_state() -> Result<()> {
@@ -20,17 +22,18 @@ async fn run_comparison_scratch_test(sleepable: bool) -> Result<()> {
     common::init();
     let directory =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sleepable_overlap_program");
-    if std::env::var_os("GHOSTSCOPE_PRESERVE_PRECOMPILED_FIXTURES").is_none() {
-        let output = std::process::Command::new("make")
-            .arg("all")
-            .current_dir(&directory)
-            .output()?;
-        ensure!(
-            output.status.success(),
-            "fixture build: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    // Both tests share this binary: finish its only build before either launch.
+    FIXTURE_BUILD
+        .get_or_init(|| {
+            common::compile_c_make_fixture(
+                "sleepable_overlap_program",
+                common::FixtureCompiler::Default,
+                "",
+            )
+            .map_err(|error| format!("{error:#}"))
+        })
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     let target = TargetLauncher::binary(directory.join("sleepable_overlap_program"))
         .spawn()
         .await?;
