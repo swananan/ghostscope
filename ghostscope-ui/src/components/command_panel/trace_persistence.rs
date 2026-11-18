@@ -4,7 +4,7 @@
 //! and load them back, preserving their state (enabled/disabled) and full
 //! script content.
 
-use chrono::Local;
+use jiff::ZonedDateTime;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -241,7 +241,7 @@ impl TracePersistence {
 
     /// Generate default filename with timestamp
     fn generate_default_filename(&self) -> PathBuf {
-        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+        let timestamp = ZonedDateTime::now().strftime("%Y%m%d_%H%M%S");
         let binary_name = self
             .binary_path
             .as_ref()
@@ -279,7 +279,7 @@ impl TracePersistence {
         header.push_str("// GhostScope Trace Save File v1.0\n");
 
         // Timestamp
-        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+        let timestamp = ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S");
         header.push_str(&format!("// Generated: {timestamp}\n"));
 
         // Binary information

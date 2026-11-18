@@ -54,7 +54,7 @@ impl App {
         &mut self,
         filename: Option<String>,
     ) -> anyhow::Result<std::path::PathBuf> {
-        use chrono::Local;
+        use jiff::ZonedDateTime;
 
         // Check if already logging
         if self.state.realtime_output_logger.enabled {
@@ -71,7 +71,7 @@ impl App {
 
         // Generate filename if not provided
         let filename = filename.unwrap_or_else(|| {
-            let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+            let timestamp = ZonedDateTime::now().strftime("%Y%m%d_%H%M%S");
             format!("ebpf_output_{timestamp}.log")
         });
 
@@ -86,7 +86,7 @@ impl App {
 
         // Write header if this is a new file
         if is_new_file {
-            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+            let timestamp = ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S");
             self.state
                 .realtime_output_logger
                 .write_line("# GhostScope eBPF Output Log (Realtime)")?;
@@ -99,7 +99,7 @@ impl App {
             self.state.realtime_output_logger.write_line("")?;
         } else {
             // Add separator for continuation
-            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+            let timestamp = ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S");
             self.state.realtime_output_logger.write_line("")?;
             self.state
                 .realtime_output_logger
@@ -174,7 +174,7 @@ impl App {
         &mut self,
         filename: Option<String>,
     ) -> anyhow::Result<std::path::PathBuf> {
-        use chrono::Local;
+        use jiff::ZonedDateTime;
 
         // Check if already logging
         if self.state.realtime_session_logger.enabled {
@@ -191,7 +191,7 @@ impl App {
 
         // Generate filename if not provided
         let filename = filename.unwrap_or_else(|| {
-            let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+            let timestamp = ZonedDateTime::now().strftime("%Y%m%d_%H%M%S");
             format!("command_session_{timestamp}.log")
         });
 
@@ -208,7 +208,7 @@ impl App {
 
         // Write header if this is a new file
         if is_new_file {
-            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+            let timestamp = ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S");
             self.state
                 .realtime_session_logger
                 .write_line("# GhostScope Command Session Log (Realtime)")?;
@@ -229,7 +229,7 @@ impl App {
             self.state.realtime_session_logger.write_line("")?;
         } else {
             // Add separator for continuation
-            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+            let timestamp = ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S");
             self.state.realtime_session_logger.write_line("")?;
             self.state
                 .realtime_session_logger

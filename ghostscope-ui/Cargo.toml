@@ -21,6 +21,6 @@ futures-util = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 unicode-width = "0.2"
 regex = "1.10"

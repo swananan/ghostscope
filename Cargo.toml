@@ -50,7 +50,7 @@ tracing = "0.1.41"
 tracing-log = "0.2.0"
 thiserror = "2.0.12"
 tokio = { version = "1.53.3", features = ["full"] }
-chrono = { version = "0.4", features = ["serde", "clock"] }
+jiff = "1.0.1"
 futures = "0.3"
 futures-util = "0.3"
 crossterm = { version = "0.29", features = ["event-stream"] }
