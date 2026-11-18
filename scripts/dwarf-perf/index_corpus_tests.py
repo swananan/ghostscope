@@ -33,6 +33,17 @@ class IndexSelectionTests(unittest.TestCase):
         validate(None, None)
         validate(None, {"full_scan": 1})
 
+    def test_base_reports_without_prepared_counter_remain_usable(self):
+        expected = {"kind": "full_scan", "supplementary": False}
+        actual = {kind: int(kind == "full_scan") for kind in INDEX_KINDS if kind != "prepared"}
+        actual["supplementary"] = 0
+        validate(expected, actual)
+        validate(expected, {**actual, "prepared": 0})
+        with self.assertRaises(ValueError):
+            validate(expected, {**actual, "prepared": 1})
+        with self.assertRaises(ValueError):
+            validate(expected, {**actual, "unknown_index": 0})
+
 
 class RealCorpusTests(unittest.TestCase):
     def test_real_dwz_and_gdb_outputs_preserve_original(self):
