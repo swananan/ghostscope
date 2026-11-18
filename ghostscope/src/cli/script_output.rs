@@ -547,10 +547,10 @@ impl LocalTimestampFormatter {
 
     fn local_prefix_for_second(&mut self, unix_seconds: u64) -> Option<&str> {
         if self.cached_second != Some(unix_seconds) {
-            let utc_datetime = chrono::DateTime::from_timestamp(unix_seconds as i64, 0)?;
-            let local_datetime: chrono::DateTime<chrono::Local> = utc_datetime.into();
+            let timestamp = jiff::Timestamp::from_second(i64::try_from(unix_seconds).ok()?).ok()?;
+            let local_datetime = timestamp.to_zoned_datetime(jiff::tz::TimeZone::system());
             self.cached_second = Some(unix_seconds);
-            self.cached_prefix = local_datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+            self.cached_prefix = local_datetime.strftime("%Y-%m-%d %H:%M:%S").to_string();
         }
 
         Some(self.cached_prefix.as_str())

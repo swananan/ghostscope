@@ -35,7 +35,7 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 sha2 = "0.10"
 
 tempfile = { workspace = true }

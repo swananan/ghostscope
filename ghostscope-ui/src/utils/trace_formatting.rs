@@ -17,14 +17,14 @@ pub fn format_timestamp_ns(ns_timestamp: u64) -> String {
         let actual_time_secs = actual_time_ns / 1_000_000_000;
         let actual_time_nanos = actual_time_ns % 1_000_000_000;
 
-        // Convert to chrono DateTime with local timezone
-        if let Some(utc_datetime) =
-            chrono::DateTime::from_timestamp(actual_time_secs as i64, actual_time_nanos as u32)
+        // Convert to the local timezone
+        if let Ok(timestamp) =
+            jiff::Timestamp::new(actual_time_secs as i64, actual_time_nanos as i32)
         {
-            let local_datetime: chrono::DateTime<chrono::Local> = utc_datetime.into();
+            let local_datetime = timestamp.to_zoned_datetime(jiff::tz::TimeZone::system());
             return format!(
                 "{}.{:03}",
-                local_datetime.format("%Y-%m-%d %H:%M:%S"),
+                local_datetime.strftime("%Y-%m-%d %H:%M:%S"),
                 actual_time_nanos / 1_000_000
             );
         }

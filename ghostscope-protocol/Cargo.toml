@@ -17,7 +17,6 @@ description = "Shared protocol definitions and serialization glue for GhostScope
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-chrono = { workspace = true }
 aya-ebpf-bindings = { workspace = true }
 aya = { workspace = true, optional = true }
 gimli = { workspace = true }
