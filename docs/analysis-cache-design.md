@@ -49,14 +49,15 @@ The analysis `--prepare` flag is separate from the script-specific
 
 ## Format and failure behavior
 
-Schema v4 uses a fixed 24-byte prefix (magic, schema, header length, payload
-length), a bounded header, and a bincode payload. The header binds the GhostScope
+Schema v5 uses a fixed 24-byte prefix (magic, schema, header length, payload
+length), a bounded header, and a postcard payload. The header binds the GhostScope
 package version, payload CRC32, and identities of the ELF, debug object, and
 optional supplementary object. File identity includes build ID, length, device,
 inode, ctime and mtime; metadata comes from the descriptor used for mapping.
 Replacing a pathname cannot pair an old mapping with new inode metadata.
 Copying an object can produce a conservative cache miss even with the same build
-ID. Schema changes must accompany incompatible index semantics within a release.
+ID. Schema v5 replaces the unmaintained bincode codec; v4 entries must be
+prepared again. Schema changes must accompany incompatible index semantics within a release.
 
 Readers reject non-regular files, final-component symlinks, oversized/truncated
 entries, incompatible versions, identity mismatch and checksum mismatch. They
@@ -78,7 +79,7 @@ distribution is outside this change.
 `[dwarf.analysis_cache].max_size_mb` sets a positive total managed-file budget,
 defaulting to 1024 MiB. The library exposes `AnalysisCache::with_max_size_bytes`.
 The format's 512 MiB payload bound remains independent of this disk budget.
-Changing policy does not invalidate existing v4 entries.
+Changing policy does not invalidate existing v5 entries.
 
 Recency uses the cache file's modification timestamp, updated through its opened
 file descriptor only after successful decoding and validation. A 60-second

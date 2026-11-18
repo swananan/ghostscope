@@ -91,7 +91,7 @@ async fn test_prepare_analysis_cache_runs_without_root_and_reuses_entry() -> Res
     );
     assert_output_contains(&first.output, "Prepared analysis cache for");
     assert!(
-        cache_dir.join("v4").is_dir(),
+        cache_dir.join("v5").is_dir(),
         "prepare did not create a versioned cache under {}",
         cache_dir.display()
     );
@@ -112,7 +112,7 @@ async fn test_prepare_analysis_cache_runs_without_root_and_reuses_entry() -> Res
     assert_output_contains(&second.output, "Reused analysis cache for");
 
     // Lowering the configured budget must prune on a prepare hit too.
-    let version = cache_dir.join("v4");
+    let version = cache_dir.join("v5");
     let cold = version.join("0000000000000001.bin");
     let warm = version.join("0000000000000002.bin");
     for (path, seconds) in [(&cold, 1), (&warm, 2)] {
@@ -167,7 +167,7 @@ async fn test_prepare_analysis_cache_runs_without_root_and_reuses_entry() -> Res
     );
     assert_plain_output_contains(&runtime.output, "analysis cache: 1 hit");
 
-    corrupt_analysis_cache_payload_length(&cache_dir)?;
+    corrupt_analysis_cache_payload(&cache_dir)?;
     let fallback = run_startup_report_command_for_binary(
         &fixture,
         &public_binary,
@@ -962,8 +962,8 @@ fn workspace_owner_identity(workspace_root: &Path) -> Result<Option<(u32, u32)>>
     Ok(Some((metadata.uid(), metadata.gid())))
 }
 
-fn corrupt_analysis_cache_payload_length(cache_dir: &Path) -> Result<()> {
-    let entries = fs::read_dir(cache_dir.join("v4"))?
+fn corrupt_analysis_cache_payload(cache_dir: &Path) -> Result<()> {
+    let entries = fs::read_dir(cache_dir.join("v5"))?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.is_file())
         .collect::<Vec<_>>();
@@ -981,20 +981,16 @@ fn corrupt_analysis_cache_payload_length(cache_dir: &Path) -> Result<()> {
         bail!("analysis cache entry {} is too short", entry.display());
     }
     let header_len = u32::from_le_bytes(encoded[12..16].try_into()?) as usize;
-    let string_length_offset = 24_usize
+    let payload_offset = 24_usize
         .checked_add(header_len)
-        .and_then(|offset| offset.checked_add(8))
         .context("analysis cache payload offset overflow")?;
-    let string_length_end = string_length_offset
-        .checked_add(8)
-        .context("analysis cache string length offset overflow")?;
-    if string_length_end > encoded.len() {
+    if payload_offset >= encoded.len() {
         bail!(
             "analysis cache entry {} has an invalid payload offset",
             entry.display()
         );
     }
-    encoded[string_length_offset..string_length_end].copy_from_slice(&u64::MAX.to_le_bytes());
+    encoded[payload_offset] ^= 1;
     fs::write(entry, encoded)?;
     Ok(())
 }
