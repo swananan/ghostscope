@@ -135,7 +135,7 @@ all samples, their medians and artifact size. It does not flush the OS page cach
 or measure whole-CLI startup or attachment throughput. Native-index targets deliberately avoid this
 cache and must not be presented as cache speedups.
 
-### Measured result (2026-11-17)
+### Schema v4 measurement (2026-11-17)
 
 The earlier cooked-index design (v3) measured 94.102 ms raw and 78.600 ms cached
 on the OpenResty nginx sample. Profiling found three remaining costs: source
@@ -144,7 +144,7 @@ and type-index construction (13 ms). Header and symbol parsing overlapped, so
 these times are not additive. Persisting the lightweight directories and deferring
 concrete symbols removes those costs from the hit path.
 
-The current benchmark includes module/CFI loading, startup symbol statistics,
+The v4 benchmark includes module/CFI loading, startup symbol statistics,
 and the same `main` function/source query. It asserts hits and query equivalence.
 The previous benchmark counted statistics after stopping the timer; the new
 measurement deliberately includes them.
@@ -177,7 +177,7 @@ cold-storage measurements or tracing throughput. Queries that visit many CUs
 will amortize less of the preparation cost. Native-index targets use their
 existing accelerators and are not part of this speedup claim.
 
-### Verification record
+### Initial v4 verification record (2026-11-17)
 
 - `cargo fmt --all`, its final `--check`, and `git diff --check`.
 - `cargo clippy --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks`.
@@ -198,3 +198,32 @@ existing accelerators and are not part of this speedup claim.
   All smoke-test temporary directories were removed after completion.
 - Container-topology E2E is intentionally excluded because this change does not
   alter container behavior, PID namespaces or runner topology.
+
+### CI follow-up (2026-11-18)
+
+Schema v5 uses postcard instead of the unmaintained bincode dependency. The
+same nginx sample produces a 3,382,242-byte entry (3.23 MiB), down from
+7,042,340 bytes in v4. The v4 timings above are historical measurements; the
+codec change needs its own timing comparison. Input length, checksums,
+trailing-byte rejection and reference validation remain enforced. Eviction
+tests account for variable-length encoded identity metadata.
+
+The performance validator accepts the new `prepared` counter and treats its
+absence in base-revision reports as zero. It still rejects unexpected cache
+hits and unknown counters. All 11 archived CI base reports pass with both
+counter layouts; the three index-selection tests pass. The real DWZ/GDB
+corpus-generation test was skipped locally because the required tools were
+not all available.
+
+The overlap execution tests share one fixture initialization before launching
+targets. The inode-sensitive prepared-backtrace test uses private executable
+and shared-library copies and includes prepare/runtime output on failure.
+The original CI cache miss did not reproduce in local focused or parallel
+backtrace runs.
+
+Dependency checks also required replacing chrono with jiff for local timestamp
+formatting and updating rustix, quinn-proto and quinn-udp to fixed versions.
+`cargo audit --deny warnings`, `cargo deny check advisories bans licenses sources`,
+formatting and the CI Clippy command pass. Unit tests pass: 390 DWARF, 129 CLI,
+50 UI, 9 debuginfod and 82 process tests. Full standard E2E results are recorded
+in the PR; container-topology runs remain outside the local scope of this fix.
