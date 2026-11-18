@@ -998,4 +998,6 @@ GhostScope 在启动时验证配置：
 
 `ghostscope prepare -t TARGET --script-file SCRIPT -o BUNDLE` 无需 BPF 权限即可编译。
 `ghostscope run-bundle BUNDLE -p PID` 使用保存的编译配置，跳过 DWARF 解析和 LLVM 编译。
+`ghostscope run-bundle BUNDLE -t TARGET` 可以先附加探针，等待目标启动，并在进程重启后
+继续追踪；两种模式复用同一份 bundle。
 运行要求和当前限制见[预编译 trace bundle](prepared-traces.md)。

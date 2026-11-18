@@ -122,8 +122,11 @@ pub(crate) async fn run(args: RunBundleArgs) -> Result<()> {
     let started = Instant::now();
     let bundle = Bundle::read(&args.bundle)?;
     let mut trace_args = Args::try_parse_from(["ghostscope"])?;
-    trace_args.target = Some(args.target.unwrap_or_else(|| bundle.target.clone()));
-    trace_args.pid = Some(args.pid);
+    let target = std::fs::canonicalize(args.target.unwrap_or_else(|| bundle.target.clone()))
+        .context("cannot resolve bundle target")?;
+    trace_args.target =
+        Some(ghostscope_process::module_probe::module_path_str(&target)?.to_owned());
+    trace_args.pid = args.pid;
     trace_args.script = Some(bundle.script.clone());
     trace_args.script_output = Some(args.script_output);
     trace_args.no_status = args.no_status;
@@ -146,8 +149,14 @@ pub(crate) async fn run(args: RunBundleArgs) -> Result<()> {
         ghostscope_compiler::module_cookie_for_path(&target) == bundle.module_cookie,
         "bundle module cookie mismatch; targets without a build ID must retain their file identity"
     );
-    let start_time = process_start_time(args.pid)?;
-    ensure_target_is_mapped(args.pid, &target_file)?;
+    let process_identity = args
+        .pid
+        .map(|pid| -> Result<_> {
+            let start_time = process_start_time(pid)?;
+            ensure_target_is_mapped(pid, &target_file)?;
+            Ok((pid, start_time))
+        })
+        .transpose()?;
 
     crate::util::ensure_privileges();
     let caps = if user.ebpf_config.sleepable_uprobe {
@@ -167,8 +176,14 @@ pub(crate) async fn run(args: RunBundleArgs) -> Result<()> {
         "kernel does not support the bundle event transport; prepare a compatible bundle"
     );
     let config = ResolvedConfig::resolve(user, &caps)?;
+    let in_initial_pid_namespace = match config.runtime.pid_views.as_ref() {
+        Some(views) => views.is_initial_pid_namespace(),
+        None => {
+            ghostscope_process::resolve_input_pid(std::process::id())?.is_initial_pid_namespace()
+        }
+    };
     ensure!(!config.runtime.runtime_env.is_container_likely()
-        && config.runtime.pid_views.as_ref().is_some_and(|views| views.is_initial_pid_namespace()),
+        && in_initial_pid_namespace,
         "run-bundle currently supports host processes only; container PID namespaces require runtime binding support");
     let _cleanup = crate::util::PinnedMapsCleanupGuard::new();
     // No load_binary* call: the process manager only reads ELF mappings/offsets.
@@ -192,11 +207,13 @@ pub(crate) async fn run(args: RunBundleArgs) -> Result<()> {
         Some(&attach_target),
     )
     .await?;
-    ensure!(
-        process_start_time(args.pid)? == start_time,
-        "target process changed during bundle attachment"
-    );
-    ensure_target_is_mapped(args.pid, &target_file)?;
+    if let Some((pid, start_time)) = process_identity {
+        ensure!(
+            process_start_time(pid)? == start_time,
+            "target process changed during bundle attachment"
+        );
+        ensure_target_is_mapped(pid, &target_file)?;
+    }
     if config.script_status {
         eprintln!(
             "Bundle attached in {:.1} ms (DWARF parsing and LLVM codegen skipped)",
