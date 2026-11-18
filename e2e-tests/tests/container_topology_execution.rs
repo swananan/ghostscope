@@ -446,7 +446,9 @@ async fn test_host_pid_resolution_ignores_nested_namespace_pid_collisions() -> a
             .with_target(&binary)
             .with_pid(host_pid)
             .with_script("trace calculate_something { print \"COLLISION:a={}\", a; }")
-            .timeout_secs(2)
+            // The fixture calls this function every two seconds. Observe
+            // multiple iterations so shutdown cannot race the first sample.
+            .timeout_secs(6)
             .run()
             .await?;
         assert_eq!(

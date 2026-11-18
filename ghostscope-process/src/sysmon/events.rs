@@ -202,6 +202,7 @@ pub(super) fn try_publish_sys_event(tx: &mpsc::SyncSender<SysEvent>, ev: SysEven
 pub(super) fn dispatch_sysmon_event(
     mgr: &Arc<Mutex<ProcessManager>>,
     target: &Option<PathBuf>,
+    targets: &[&Path],
     pending: &Arc<Mutex<PendingOffsets>>,
     pending_map_refreshes: &Arc<Mutex<PendingMapRefreshes>>,
     proc_pid_for_event: &impl Fn(u32) -> u32,
@@ -212,12 +213,7 @@ pub(super) fn dispatch_sysmon_event(
             if let Some(proc_pid) =
                 proc_pid_for_map_change_event(mgr, target, proc_pid_for_event, ev)
             {
-                let proc_pid = target
-                    .as_deref()
-                    .map(|target_path| {
-                        canonicalize_cached_target_proc_pid(mgr, target_path, proc_pid)
-                    })
-                    .unwrap_or(proc_pid);
+                let proc_pid = canonicalize_cached_target_proc_pid(mgr, targets, proc_pid);
                 record_runtime_pid_aliases_for_sys_event(mgr, ev, proc_pid);
                 if let Ok(mut guard) = pending_map_refreshes.lock() {
                     guard.register(ev.tgid, sys_event_host_pid(ev), proc_pid);
@@ -437,9 +433,14 @@ pub(super) fn cached_single_target_proc_pid(
 
 pub(super) fn canonicalize_cached_target_proc_pid(
     mgr: &Arc<Mutex<ProcessManager>>,
-    target_path: &Path,
+    targets: &[&Path],
     fallback_proc_pid: u32,
 ) -> u32 {
+    // A multi-module scope can include independent processes. A PID that does
+    // not map one module must not be redirected to another module's sole PID.
+    let [target_path] = targets else {
+        return fallback_proc_pid;
+    };
     if pid_alive(fallback_proc_pid) && pid_maps_target_module(fallback_proc_pid, target_path) {
         return fallback_proc_pid;
     }

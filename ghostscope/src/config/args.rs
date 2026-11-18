@@ -47,9 +47,12 @@ pub enum ParsedCommand {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct PrepareArgs {
-    /// Target module to compile against, without attaching to a process
+    /// Primary module to compile against, without attaching to a process
     #[arg(short = 't', long = "target", value_name = "PATH")]
     pub target: String,
+    /// Additional ELF module to include in offline script resolution (repeatable)
+    #[arg(long = "module", value_name = "PATH")]
+    pub modules: Vec<PathBuf>,
     #[arg(
         long,
         required_unless_present = "script_file",
@@ -73,9 +76,12 @@ pub struct RunBundleArgs {
     /// Limit tracing to one existing host process; otherwise -t is required
     #[arg(short = 'p', long = "pid", required_unless_present = "target", value_parser = clap::value_parser!(u32).range(1..=i32::MAX as i64))]
     pub pid: Option<u32>,
-    /// Target module; without -p, trace existing and future processes using it
+    /// Primary module path; without -p, trace all prepared modules across processes
     #[arg(short = 't', long = "target")]
     pub target: Option<String>,
+    /// Relocate a saved module by its full path or unique path suffix (repeatable)
+    #[arg(long = "module-path", value_name = "MODULE=PATH")]
+    pub module_paths: Vec<String>,
     #[arg(long, value_enum, default_value = "pretty")]
     pub script_output: ScriptOutputMode,
     #[arg(long)]

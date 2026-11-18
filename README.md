@@ -167,7 +167,7 @@ sudo ghostscope run-bundle trace.gsb -p <PID>
 
 You can prepare a diagnostic script alongside a build and reuse its bundle across PIDs running the same unchanged target binary. `prepare` needs no BPF privileges; `run-bundle` needs the usual tracing privileges and a compatible kernel.
 
-Current bundles support one executable or shared-library module in a host process; backtraces and container PID namespaces are not yet supported. See [Prepared Trace Bundles](docs/prepared-traces.md) for target identity and compatibility requirements.
+Bundles can include multiple executable and shared-library modules: add each extra module with `prepare --module PATH`. Use `run-bundle -p PID` for one host process, or `run-bundle -t PATH` to attach before processes start. Backtraces and container PID namespaces are not yet supported. See [Prepared Trace Bundles](docs/prepared-traces.md) for target identity and compatibility requirements.
 
 ## ✨ Highlights
 

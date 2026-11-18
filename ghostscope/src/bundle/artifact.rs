@@ -10,8 +10,9 @@ use std::path::Path;
 use crate::config::settings::{EbpfConfig, ValueAdapterConfig};
 
 // Bump when the stored probe/context schema or compiled runtime ABI changes.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_MODULES: usize = 64;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,9 +20,8 @@ pub(super) struct Bundle {
     format_version: u32,
     ghostscope_version: String,
     architecture: String,
-    pub target: String,
-    pub target_sha256: [u8; 32],
-    pub module_cookie: u64,
+    /// Module zero is the primary target and default module for bare addresses.
+    pub modules: Vec<Module>,
     pub script: String,
     pub ebpf: EbpfConfig,
     pub value_adapter: ValueAdapterConfig,
@@ -30,7 +30,40 @@ pub(super) struct Bundle {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct Module {
+    pub path: String,
+    pub sha256: [u8; 32],
+    pub cookie: u64,
+}
+
+impl Module {
+    pub fn capture(path: String) -> Result<Self> {
+        let sha256 = fingerprint(&mut open_regular_file(Path::new(&path))?)?;
+        let cookie = ghostscope_compiler::module_cookie_for_path(&path);
+        Ok(Self {
+            path,
+            sha256,
+            cookie,
+        })
+    }
+
+    pub fn open_verified(&self, path: &str) -> Result<File> {
+        let mut file = open_regular_file(Path::new(path))
+            .with_context(|| format!("cannot open bundle module {path}"))?;
+        ensure!(
+            fingerprint(&mut file)? == self.sha256,
+            "bundle module identity mismatch (SHA-256): {path}; prepare it again"
+        );
+        ensure!(ghostscope_compiler::module_cookie_for_path(path) == self.cookie,
+            "bundle module cookie mismatch: {path}; targets without a build ID must retain their file identity");
+        Ok(file)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Probe {
+    module: usize,
     function_name: Option<String>,
     function_address: u64,
     uprobe_offset: u64,
@@ -43,9 +76,7 @@ pub(super) struct Probe {
 
 impl Bundle {
     pub fn from_compilation(
-        target: String,
-        target_sha256: [u8; 32],
-        module_cookie: u64,
+        modules: Vec<Module>,
         script: String,
         ebpf: EbpfConfig,
         value_adapter: ValueAdapterConfig,
@@ -64,11 +95,14 @@ impl Bundle {
                     !config.uses_backtrace,
                     "prepare does not support bt/backtrace yet"
                 );
-                ensure!(
-                    config.binary_path == target,
-                    "prepare supports one target module only"
-                );
+                let module = modules
+                    .iter()
+                    .position(|module| module.path == config.binary_path)
+                    .with_context(|| {
+                        format!("probe module was not prepared: {}", config.binary_path)
+                    })?;
                 Ok(Probe {
+                    module,
                     function_name: config.function_name,
                     function_address: config.function_address.context("probe has no address")?,
                     uprobe_offset: config
@@ -82,18 +116,18 @@ impl Bundle {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
+        let bundle = Self {
             format_version: FORMAT_VERSION,
             ghostscope_version: env!("CARGO_PKG_VERSION").into(),
             architecture: std::env::consts::ARCH.into(),
-            target,
-            target_sha256,
-            module_cookie,
+            modules,
             script,
             ebpf,
             value_adapter,
             probes,
-        })
+        };
+        bundle.validate()?;
+        Ok(bundle)
     }
 
     pub fn read(path: &Path) -> Result<Self> {
@@ -108,6 +142,15 @@ impl Bundle {
         ensure!(
             bytes.len() as u64 <= MAX_BUNDLE_BYTES,
             "bundle exceeds 64 MiB limit"
+        );
+        #[derive(Deserialize)]
+        struct Version {
+            format_version: u32,
+        }
+        let version: Version = serde_json::from_slice(&bytes).context("invalid trace bundle")?;
+        ensure!(
+            version.format_version == FORMAT_VERSION,
+            "unsupported bundle format version; prepare it again"
         );
         let bundle: Self = serde_json::from_slice(&bytes).context("invalid trace bundle")?;
         bundle.validate()?;
@@ -130,8 +173,29 @@ impl Bundle {
             "bundle architecture mismatch"
         );
         ensure!(!self.probes.is_empty(), "bundle contains no probes");
+        ensure!(
+            !self.modules.is_empty() && self.modules.len() <= MAX_MODULES,
+            "bundle must contain 1..={MAX_MODULES} modules"
+        );
+        let mut paths = std::collections::HashSet::new();
+        let mut cookies = std::collections::HashSet::new();
+        for module in &self.modules {
+            ensure!(
+                !module.path.is_empty() && paths.insert(&module.path),
+                "empty or duplicate module path in bundle"
+            );
+            ensure!(
+                cookies.insert(module.cookie),
+                "duplicate module cookie in bundle: {}",
+                module.path
+            );
+        }
         let mut ids = std::collections::HashSet::new();
         for probe in &self.probes {
+            ensure!(
+                probe.module < self.modules.len(),
+                "invalid probe module index in bundle"
+            );
             ensure!(
                 ids.insert(probe.assigned_trace_id),
                 "duplicate trace ID in bundle"
@@ -174,13 +238,62 @@ impl Bundle {
         Ok(())
     }
 
-    pub fn into_compilation(self, target: &str, pid: Option<u32>) -> CompilationResult {
+    pub fn resolve_module_paths(
+        &self,
+        primary: Option<&str>,
+        overrides: &[String],
+    ) -> Result<Vec<String>> {
+        let mut paths: Vec<String> = self
+            .modules
+            .iter()
+            .map(|module| module.path.clone())
+            .collect();
+        let mut changed = std::collections::HashSet::new();
+        if let Some(primary) = primary {
+            paths[0] = primary.to_owned();
+            changed.insert(0);
+        }
+        for item in overrides {
+            let (selector, path) = item
+                .split_once('=')
+                .context("--module-path expects MODULE=PATH")?;
+            ensure!(
+                !selector.is_empty() && !path.is_empty(),
+                "--module-path expects nonempty MODULE=PATH"
+            );
+            let matches: Vec<usize> = self
+                .modules
+                .iter()
+                .enumerate()
+                .filter(|(_, module)| Path::new(&module.path).ends_with(selector))
+                .map(|(index, _)| index)
+                .collect();
+            let [index] = matches.as_slice() else {
+                anyhow::bail!("module selector '{selector}' must match exactly one bundle module (matched {})", matches.len());
+            };
+            ensure!(
+                changed.insert(*index),
+                "module path specified more than once: {selector}"
+            );
+            paths[*index] = path.to_owned();
+        }
+        paths
+            .into_iter()
+            .map(|path| {
+                let path = std::fs::canonicalize(&path)
+                    .with_context(|| format!("cannot resolve bundle module {path}"))?;
+                Ok(ghostscope_process::module_probe::module_path_str(&path)?.to_owned())
+            })
+            .collect()
+    }
+
+    pub fn into_compilation(self, paths: &[String], pid: Option<u32>) -> CompilationResult {
         let configs: Vec<_> = self
             .probes
             .into_iter()
             .map(|probe| UProbeConfig {
                 trace_pattern: TracePattern::Address(probe.function_address),
-                binary_path: target.into(),
+                binary_path: paths[probe.module].clone(),
                 function_name: probe.function_name,
                 function_address: Some(probe.function_address),
                 uprobe_offset: Some(probe.uprobe_offset),
@@ -198,7 +311,7 @@ impl Bundle {
             .collect();
         CompilationResult {
             trace_count: configs.len(),
-            target_info: target.into(),
+            target_info: paths.join(", "),
             failed_targets: Vec::new(),
             next_available_trace_id: configs
                 .iter()
@@ -243,6 +356,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn module_overrides_are_unique_and_probes_keep_their_module() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let replacement = directory.path().join("replacement.so");
+        std::fs::write(&replacement, b"test")?;
+        let mut bundle = Bundle {
+            format_version: FORMAT_VERSION,
+            ghostscope_version: env!("CARGO_PKG_VERSION").into(),
+            architecture: std::env::consts::ARCH.into(),
+            modules: ["/old/one/lib.so", "/old/two/lib.so"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, path)| Module {
+                    path: path.into(),
+                    sha256: [0; 32],
+                    cookie: index as u64,
+                })
+                .collect(),
+            script: String::new(),
+            ebpf: EbpfConfig::default(),
+            value_adapter: ValueAdapterConfig::default(),
+            probes: (0..2)
+                .map(|index| Probe {
+                    module: index,
+                    function_name: None,
+                    function_address: 1,
+                    uprobe_offset: 1,
+                    ebpf_bytecode: b"\x7fELF".to_vec(),
+                    ebpf_function_name: "probe".into(),
+                    assigned_trace_id: index as u32,
+                    trace_context: Default::default(),
+                    resolved_address_index: None,
+                })
+                .collect(),
+        };
+        bundle.validate()?;
+        for (selector, expected) in [
+            ("lib.so", "matched 2"),
+            ("missing.so", "matched 0"),
+            ("=", "nonempty"),
+            ("no-assignment", "expects MODULE=PATH"),
+        ] {
+            let item = if selector.contains('=') || selector == "no-assignment" {
+                selector.to_owned()
+            } else {
+                format!("{selector}={}", replacement.display())
+            };
+            assert!(bundle
+                .resolve_module_paths(None, &[item])
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+        }
+        let path = replacement.to_str().unwrap();
+        let extra = format!("two/lib.so={path}");
+        assert!(bundle
+            .resolve_module_paths(Some(path), &[extra.clone(), extra.clone()])
+            .unwrap_err()
+            .to_string()
+            .contains("more than once"));
+        assert!(bundle
+            .resolve_module_paths(Some(path), &[format!("one/lib.so={path}")])
+            .unwrap_err()
+            .to_string()
+            .contains("more than once"));
+        assert_eq!(
+            bundle.resolve_module_paths(Some(path), &[extra])?,
+            vec![path, path]
+        );
+        bundle.probes[1].module = 2;
+        assert!(bundle
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("module index"));
+        bundle.probes[1].module = 1;
+        let result =
+            bundle.into_compilation(&["/new/main".into(), "/new/library".into()], Some(123));
+        assert_eq!(result.uprobe_configs[0].binary_path, "/new/main");
+        assert_eq!(result.uprobe_configs[1].binary_path, "/new/library");
+        assert!(result
+            .uprobe_configs
+            .iter()
+            .all(|config| config.target_pid == Some(123)));
+        Ok(())
+    }
+
+    #[test]
     fn oversized_bundle_is_rejected_before_json_decoding() -> Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         file.as_file().set_len(MAX_BUNDLE_BYTES + 1)?;
@@ -282,13 +482,16 @@ mod tests {
             format_version: FORMAT_VERSION,
             ghostscope_version: env!("CARGO_PKG_VERSION").into(),
             architecture: std::env::consts::ARCH.into(),
-            target: "unused".into(),
-            target_sha256: [0; 32],
-            module_cookie: 1,
+            modules: vec![Module {
+                path: "unused".into(),
+                sha256: [0; 32],
+                cookie: 1,
+            }],
             script: String::new(),
             ebpf: EbpfConfig::default(),
             value_adapter: ValueAdapterConfig::default(),
             probes: vec![Probe {
+                module: 0,
                 function_name: None,
                 function_address: 1,
                 uprobe_offset: 1,

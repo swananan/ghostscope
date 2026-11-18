@@ -913,6 +913,35 @@ impl DwarfAnalyzer {
         Ok(analyzer)
     }
 
+    /// Add an explicitly selected offline module while preserving the primary
+    /// module and previously registered semantic module IDs.
+    pub async fn add_exec_module_with_config(
+        &mut self,
+        path: PathBuf,
+        debug_search_paths: &[String],
+        allow_loose_debug_match: bool,
+        debuginfod_client: Option<Arc<DebuginfodClient>>,
+    ) -> Result<()> {
+        anyhow::ensure!(self.pid == 0, "offline modules require an offline analyzer");
+        anyhow::ensure!(
+            self.loaded_module_path_for(&path).is_none(),
+            "module is already loaded: {}",
+            path.display()
+        );
+        let module = LoadedObjfile::load_parallel(
+            ModuleMapping::from_path(path),
+            debug_search_paths,
+            allow_loose_debug_match,
+            None,
+            debuginfod_client,
+            self.analysis_cache.clone(),
+        )
+        .await?;
+        self.insert_module(module);
+        self.clear_pc_context_cache();
+        Ok(())
+    }
+
     /// Create analyzer from pre-loaded modules (for Builder pattern)
     pub(crate) fn from_modules(pid: u32, mut modules: Vec<LoadedObjfile>) -> Self {
         let mut analyzer = Self {

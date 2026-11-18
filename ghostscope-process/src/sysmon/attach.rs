@@ -421,7 +421,13 @@ pub(super) fn load_and_attach_sysmon_bpf(
                 let mut array: aya::maps::Array<_, [u32; 12]> = map.try_into()?;
                 array.set(0, &layout, 0)?;
             }
-            configure_sysmon_exec_comm_filter(&mut bpf, cfg.target_module.as_deref())?;
+            // A single executable basename cannot represent a multi-module scope.
+            let comm_target = if cfg.additional_target_modules.is_empty() {
+                cfg.target_module.as_deref()
+            } else {
+                None
+            };
+            configure_sysmon_exec_comm_filter(&mut bpf, comm_target)?;
             configure_sysmon_event_filter(
                 &mut bpf,
                 cfg.event_mask,

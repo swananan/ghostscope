@@ -1057,5 +1057,8 @@ Invalid configuration will produce clear error messages with suggestions for fix
 BPF privileges. `ghostscope run-bundle BUNDLE -p PID` uses the saved compilation
 configuration and skips DWARF parsing and LLVM codegen. Use
 `ghostscope run-bundle BUNDLE -t TARGET` to attach before a process starts and
-keep tracing across process restarts. Both modes use the same bundle. See
+keep tracing across process restarts. Both modes use the same bundle. Repeat
+`prepare --module PATH` to include additional modules and
+`run-bundle --module-path MODULE=PATH` to relocate them. Target mode traces all
+prepared modules; `-p` restricts every probe to that process. See
 [Prepared trace bundles](prepared-traces.md) for runtime requirements and limits.
