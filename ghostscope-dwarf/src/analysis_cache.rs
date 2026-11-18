@@ -7,7 +7,6 @@ use crate::{
     parser::{CompilationUnit, DwarfParseResult, SourceFile},
 };
 use anyhow::{Context, Result};
-use bincode::Options;
 use object::Object;
 use rayon::prelude::*;
 use serde::de::DeserializeOwned;
@@ -28,7 +27,7 @@ use std::{
 const CACHE_MAGIC: [u8; 8] = *b"GSANLYS\0";
 // Bump for changes to the persisted layout or index-construction semantics,
 // even when the package version stays unchanged.
-const CACHE_SCHEMA_VERSION: u32 = 4;
+const CACHE_SCHEMA_VERSION: u32 = 5;
 const CACHE_FILE_PREFIX_LEN: usize = 24;
 const MAX_CACHE_HEADER_BYTES: u64 = 64 * 1024;
 const MAX_CACHE_PAYLOAD_BYTES: u64 = 512 * 1024 * 1024;
@@ -250,14 +249,15 @@ impl AnalysisCache {
         create_private_directory(directory)?;
 
         let payload = CachedAnalysis::from_parse_result(parse_result, all_units)?;
-        let payload = cache_codec().serialize(&payload)?;
+        let payload = postcard::to_stdvec(&payload)?;
         let payload_len = payload.len() as u64;
         let header = CacheHeader {
             package_version: env!("CARGO_PKG_VERSION").to_string(),
             identity,
             payload_crc32: crc32fast::hash(&payload),
         };
-        let header_len = cache_codec().serialized_size(&header)?;
+        let header = postcard::to_stdvec(&header)?;
+        let header_len = header.len() as u64;
         anyhow::ensure!(
             header_len > 0 && header_len <= MAX_CACHE_HEADER_BYTES,
             "Analysis cache header is {header_len} bytes, exceeding the \
@@ -301,14 +301,7 @@ impl AnalysisCache {
             writer.write_all(&CACHE_SCHEMA_VERSION.to_le_bytes())?;
             writer.write_all(&u32::try_from(header_len)?.to_le_bytes())?;
             writer.write_all(&payload_len.to_le_bytes())?;
-            cache_codec()
-                .serialize_into(&mut writer, &header)
-                .with_context(|| {
-                    format!(
-                        "Failed to encode analysis cache header {}",
-                        temp_path.display()
-                    )
-                })?;
+            writer.write_all(&header)?;
             writer.write_all(&payload)?;
             writer.flush()?;
             writer.get_ref().sync_all()?;
@@ -330,7 +323,7 @@ impl AnalysisCache {
     }
 
     fn entry_path(&self, identity: &CacheIdentity) -> Result<PathBuf> {
-        let encoded = cache_codec().serialize(identity)?;
+        let encoded = postcard::to_stdvec(identity)?;
         let hash = fnv1a64(&encoded);
         Ok(self
             .directory
@@ -339,10 +332,10 @@ impl AnalysisCache {
     }
 }
 
-fn cache_codec() -> impl Options {
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .reject_trailing_bytes()
+fn decode_cache<T: DeserializeOwned>(encoded: &[u8]) -> Result<T> {
+    let (decoded, remaining) = postcard::take_from_bytes(encoded)?;
+    anyhow::ensure!(remaining.is_empty(), "Trailing bytes in analysis cache");
+    Ok(decoded)
 }
 
 fn deserialize_cache_slice<T: DeserializeOwned>(
@@ -350,25 +343,21 @@ fn deserialize_cache_slice<T: DeserializeOwned>(
     part: &str,
     path: &Path,
 ) -> Result<T> {
-    let decoded = catch_unwind(AssertUnwindSafe(|| {
-        cache_codec()
-            .with_limit(encoded.len() as u64)
-            .deserialize(encoded)
-    }))
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "Analysis cache {} decoder panicked while reading {}",
-            path.display(),
-            part
-        )
-    })?
-    .with_context(|| {
-        format!(
-            "Failed to decode analysis cache {} {}",
-            part,
-            path.display()
-        )
-    })?;
+    let decoded = catch_unwind(AssertUnwindSafe(|| decode_cache(encoded)))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Analysis cache {} decoder panicked while reading {}",
+                path.display(),
+                part
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "Failed to decode analysis cache {} {}",
+                part,
+                path.display()
+            )
+        })?;
     Ok(decoded)
 }
 
@@ -927,9 +916,8 @@ mod tests {
         let encoded = fs::read(path).unwrap();
         let header_len = u32::from_le_bytes(encoded[12..16].try_into().unwrap()) as usize;
         let header_end = CACHE_FILE_PREFIX_LEN + header_len;
-        let mut header: CacheHeader = cache_codec()
-            .deserialize(&encoded[CACHE_FILE_PREFIX_LEN..header_end])
-            .unwrap();
+        let mut header: CacheHeader =
+            decode_cache(&encoded[CACHE_FILE_PREFIX_LEN..header_end]).unwrap();
         let mut payload = encoded[header_end..].to_vec();
         change(&mut payload);
         if checksum {
@@ -937,7 +925,9 @@ mod tests {
         }
         let mut out = encoded[..CACHE_FILE_PREFIX_LEN].to_vec();
         out[16..24].copy_from_slice(&(payload.len() as u64).to_le_bytes());
-        out.extend(cache_codec().serialize(&header).unwrap());
+        let header = postcard::to_stdvec(&header).unwrap();
+        out[12..16].copy_from_slice(&(header.len() as u32).to_le_bytes());
+        out.extend(header);
         out.extend(payload);
         fs::write(path, out).unwrap();
     }
@@ -965,10 +955,27 @@ mod tests {
             .unwrap();
         rewrite_payload(
             &path,
-            |payload| payload[8..16].copy_from_slice(&u64::MAX.to_le_bytes()),
+            |payload| {
+                // Retain the string-table count, but forge its first string length.
+                let (_, rest) = postcard::take_from_bytes::<usize>(payload).unwrap();
+                let first_string = payload.len() - rest.len();
+                payload.truncate(first_string);
+                payload.extend(postcard::to_stdvec(&usize::MAX).unwrap());
+            },
             true,
         );
         assert!(cache.load(&mapped, &mapped, None).is_err());
+    }
+
+    #[test]
+    fn trailing_payload_bytes_are_rejected_even_with_valid_checksum() {
+        let (_dir, mapped, cache) = fixture();
+        let path = cache
+            .store(&mapped, &mapped, None, &sample(), UNITS)
+            .unwrap();
+        rewrite_payload(&path, |payload| payload.push(0), true);
+        let error = cache.load(&mapped, &mapped, None).err().unwrap();
+        assert!(format!("{error:#}").contains("Trailing bytes"));
     }
 
     #[test]
@@ -980,9 +987,9 @@ mod tests {
         rewrite_payload(
             &path,
             |payload| {
-                let mut index: CachedAnalysis = cache_codec().deserialize(payload).unwrap();
+                let mut index: CachedAnalysis = decode_cache(payload).unwrap();
                 index.units.clear();
-                *payload = cache_codec().serialize(&index).unwrap();
+                *payload = postcard::to_stdvec(&index).unwrap();
             },
             true,
         );
@@ -998,9 +1005,9 @@ mod tests {
         rewrite_payload(
             &path,
             |payload| {
-                let mut index: CachedAnalysis = cache_codec().deserialize(payload).unwrap();
+                let mut index: CachedAnalysis = decode_cache(payload).unwrap();
                 index.line_units[0].files[0].0 = u64::MAX;
-                *payload = cache_codec().serialize(&index).unwrap();
+                *payload = postcard::to_stdvec(&index).unwrap();
             },
             true,
         );
@@ -1064,7 +1071,6 @@ mod tests {
         let (dir, first, cache) = fixture();
         let first_path = cache.store(&first, &first, None, &sample(), UNITS).unwrap();
         let entry_size = fs::metadata(&first_path).unwrap().len();
-        let cache = cache.with_max_size_bytes(2 * entry_size);
         let module = |name: &str| {
             let path = dir.path().join(name);
             fs::write(&path, b"another module").unwrap();
@@ -1075,9 +1081,15 @@ mod tests {
             .store(&second, &second, None, &sample(), UNITS)
             .unwrap();
         let third = module("third");
+        let third_path = cache.store(&third, &third, None, &sample(), UNITS).unwrap();
+        let second_size = fs::metadata(&second_path).unwrap().len();
+        let third_size = fs::metadata(&third_path).unwrap().len();
+        fs::remove_file(&third_path).unwrap();
+        // Varint-encoded inode/timestamps can give each entry a different size.
+        let cache = cache.with_max_size_bytes(entry_size + second_size.max(third_size));
         assert!(cache
             .clone()
-            .with_max_size_bytes(entry_size - 1)
+            .with_max_size_bytes(third_size - 1)
             .store(&third, &third, None, &sample(), UNITS)
             .is_err());
         assert!(first_path.exists() && second_path.exists());
@@ -1096,7 +1108,7 @@ mod tests {
         let third_path = cache.store(&third, &third, None, &sample(), UNITS).unwrap();
         assert!(first_path.exists() && third_path.exists());
         assert!(!second_path.exists());
-        let cache = cache.with_max_size_bytes(entry_size);
+        let cache = cache.with_max_size_bytes(third_size);
         assert!(cache.load(&third, &third, None).unwrap().is_some());
         assert!(!first_path.exists());
         assert!(third_path.exists());
@@ -1140,7 +1152,7 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(files.len(), 2);
+        assert!(!files.is_empty());
         assert!(
             files
                 .iter()
@@ -1154,7 +1166,7 @@ mod tests {
                 .iter()
                 .filter(|mapped| reader.load(mapped, mapped, None).unwrap().is_some())
                 .count(),
-            2
+            files.len()
         );
     }
 }

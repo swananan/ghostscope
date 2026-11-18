@@ -74,7 +74,7 @@ fn prepare_analysis_cache(binary_path: &Path, cache_dir: &Path) -> anyhow::Resul
 }
 
 fn analysis_cache_entry_count(cache_dir: &Path) -> anyhow::Result<usize> {
-    Ok(fs::read_dir(cache_dir.join("v4"))?
+    Ok(fs::read_dir(cache_dir.join("v5"))?
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_file())
         .count())
