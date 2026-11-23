@@ -6,6 +6,11 @@ use tracing::{error, info, warn};
 use super::runtime_maps::{apply_cached_offsets_for_session_pid, apply_pid_alias_for_session};
 
 pub(super) fn target_display(config: &ghostscope_compiler::UProbeConfig) -> String {
+    if let ghostscope_compiler::script::TracePattern::FunctionInModule { module, name } =
+        &config.trace_pattern
+    {
+        return format!("{module}:\"{name}\"");
+    }
     let addr_disp = config.function_address.unwrap_or(0);
     config
         .function_name

@@ -53,6 +53,14 @@ t process_data               # 使用缩写形式
 **说明：**
 执行 trace 命令后会进入脚本编辑模式，编写追踪脚本。按 `Ctrl+S` 保存并执行，`Ctrl+C` 或 `Esc` 取消。
 
+
+指定模块中的函数可写成 `trace libfoo.so:handle_request`，或
+`trace libfoo.so:"ns::Handler::run(int, double)"`。模块支持完整路径或唯一后缀，
+并遵守已有的 `-t` 作用域。`info function` 接受相同选择器，例如
+`info function libfoo.so:handle_request v`。地址编号限于所选模块，
+`trace libfoo.so:handle_request 2` 会选中该查询显示的第 2 个地址。
+保存追踪时会保留模块选择器和所选编号。
+
 **脚本模式工作流：**
 1. 执行 `trace <target>` → 进入带语法高亮的脚本模式
 2. 编写追踪脚本（脚本语法见[脚本语言参考](scripting.md)）

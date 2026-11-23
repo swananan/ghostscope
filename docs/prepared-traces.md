@@ -52,7 +52,10 @@ sudo ghostscope run-bundle trace.gsb -p <PID>
 
 Function and source patterns resolve across the selected modules. Same-named
 functions in different modules produce separate probes with their own variable
-contexts. Bare addresses refer to the primary `-t` module; use `libfoo.so:0x1234`
+contexts. Use `trace libfoo.so:handle_request { ... }` to select just one module,
+or `trace libfoo.so:"ns::Handler::run(int)" { ... }` for a quoted function name.
+The module must match a full path or unique suffix among the prepared modules;
+unknown or ambiguous selectors fail. Bare addresses refer to the primary `-t` module; use `libfoo.so:0x1234`
 for a module-qualified address. A bundle supports up to 64 modules. Duplicate
 module identities are rejected, including copies with the same build ID.
 

@@ -94,6 +94,32 @@ trace "ns1::Foo::bar(int)" {
 Qualified names use `::` between identifiers. Quoted function names are passed
 to symbol lookup without the surrounding quotes, preserving all other characters.
 
+#### Function in a Specific Module
+
+Use `module:function` to select a function in one executable or shared library:
+
+```ghostscope
+trace libfoo.so:handle_request {
+    print "foo request={}", request_id;
+}
+trace /opt/app/libbar.so:"ns::Handler::run(int, double)" {
+    print "bar request={}", request_id;
+}
+```
+
+The module is a full path or a unique path suffix, using the same rules as
+module-qualified addresses. Unknown or ambiguous modules fail before function
+lookup; a missing function never falls back to another module. Put quotes around
+only the function name when it contains spaces, parameters, or templates. Rust
+and C++ `::` names keep their existing meaning. Module-qualified wildcard targets
+are not supported.
+
+In ordinary `-t` sessions, the module must match the selected target, including
+when `-p` is also present. Use `-p` without `-t` to select functions from different
+loaded modules in one script. With `prepare -t ... --module ...`, selectors can
+refer to any explicitly prepared module. Local variables and globals resolve in
+the module selected for each probe.
+
 #### Source Line
 ```ghostscope
 // Trace a specific file and line

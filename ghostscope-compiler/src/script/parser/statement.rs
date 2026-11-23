@@ -242,13 +242,23 @@ fn parse_else_clause(pair: Pair<Rule>) -> Result<Statement> {
         }
     }
 }
-fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
+pub(super) fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
     let inner = pair
         .into_inner()
         .next()
         .ok_or(ParseError::InvalidExpression)?;
 
     match inner.as_rule() {
+        Rule::module_function => {
+            let mut parts = inner.into_inner();
+            let module = parts
+                .next()
+                .ok_or(ParseError::InvalidExpression)?
+                .as_str()
+                .to_string();
+            let name = parse_function_name(parts.next().ok_or(ParseError::InvalidExpression)?)?;
+            Ok(TracePattern::FunctionInModule { module, name })
+        }
         Rule::module_hex_address => {
             let mut parts = inner.into_inner();
             let module = parts
@@ -288,23 +298,7 @@ fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
             let pattern = inner.as_str().to_string();
             Ok(TracePattern::Wildcard(pattern))
         }
-        Rule::function_name => {
-            let name = inner
-                .into_inner()
-                .next()
-                .ok_or(ParseError::InvalidExpression)?;
-            let func_name = if name.as_rule() == Rule::string {
-                &name.as_str()[1..name.as_str().len() - 1]
-            } else {
-                name.as_str()
-            };
-            if func_name.is_empty() {
-                return Err(ParseError::SyntaxError(
-                    "Function trace target cannot be empty".to_string(),
-                ));
-            }
-            Ok(TracePattern::FunctionName(func_name.to_string()))
-        }
+        Rule::function_name => Ok(TracePattern::FunctionName(parse_function_name(inner)?)),
         Rule::source_line => {
             let mut parts = inner.into_inner();
             let file_path = parts
@@ -324,6 +318,24 @@ fn parse_trace_pattern(pair: Pair<Rule>) -> Result<TracePattern> {
         }
         _ => Err(ParseError::UnexpectedToken(inner.as_rule())),
     }
+}
+
+fn parse_function_name(pair: Pair<Rule>) -> Result<String> {
+    let name = pair
+        .into_inner()
+        .next()
+        .ok_or(ParseError::InvalidExpression)?;
+    let name = if name.as_rule() == Rule::string {
+        &name.as_str()[1..name.as_str().len() - 1]
+    } else {
+        name.as_str()
+    };
+    if name.is_empty() {
+        return Err(ParseError::SyntaxError(
+            "Function trace target cannot be empty".to_string(),
+        ));
+    }
+    Ok(name.to_string())
 }
 fn parse_print_content(pair: Pair<Rule>) -> Result<PrintStatement> {
     info!(

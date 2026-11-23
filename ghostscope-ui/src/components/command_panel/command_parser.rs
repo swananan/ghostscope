@@ -952,9 +952,10 @@ impl CommandParser {
                 command.strip_prefix("i f ").unwrap()
             };
 
-            let parts: Vec<&str> = args.split_whitespace().collect();
-            if parts.is_empty() {
-                let plain = "Usage: info function <function_name> [verbose|v]".to_string();
+            let (target, arguments) = crate::utils::trace_target::split_target_argument(args);
+            if target.is_empty() {
+                let plain =
+                    "Usage: info function <function_name|module:function> [verbose|v]".to_string();
                 let styled = Self::styled_usage(&plain);
                 return Some(vec![Action::AddResponseWithStyle {
                     content: plain,
@@ -963,8 +964,8 @@ impl CommandParser {
                 }]);
             }
 
-            let target = parts[0].to_string();
-            let verbose = parts.len() > 1 && (parts[1] == "verbose" || parts[1] == "v");
+            let target = target.to_string();
+            let verbose = matches!(arguments.split_whitespace().next(), Some("verbose" | "v"));
 
             state.input_state = InputState::WaitingResponse {
                 command: command.to_string(),
@@ -1618,6 +1619,19 @@ mod tests {
     use super::*;
 
     static SOURCE_SHORTCUT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn info_module_function_preserves_quoted_signature() {
+        for prefix in ["info function", "i f"] {
+            let target = r#"libfoo.so:"ns::Foo::bar(int, double) const""#;
+            let mut state = CommandPanelState::default();
+            let actions = CommandParser::parse_command(&mut state, &format!("{prefix} {target} v"));
+            assert!(matches!(
+                &actions[0],
+                Action::SendRuntimeCommand(RuntimeCommand::InfoFunction { target: actual, verbose: true }) if actual == target
+            ));
+        }
+    }
 
     fn write_temp_trace_file(name: &str) -> PathBuf {
         let id = SOURCE_SHORTCUT_TEST_ID.fetch_add(1, Ordering::Relaxed);

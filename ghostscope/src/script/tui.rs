@@ -194,10 +194,7 @@ fn build_tui_results(
 
         results.push(ScriptExecutionResult {
             pc_address: config.function_address.unwrap_or(0),
-            target_name: config
-                .function_name
-                .clone()
-                .unwrap_or_else(|| format!("{:#x}", config.function_address.unwrap_or(0))),
+            target_name: super::attach::target_display(config),
             binary_path: config.binary_path.clone(),
             status: ExecutionStatus::Success,
             source_file,

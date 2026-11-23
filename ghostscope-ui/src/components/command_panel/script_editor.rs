@@ -14,6 +14,33 @@ pub struct TraceDetails {
     pub function_name: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::action::RuntimeCommand;
+
+    #[test]
+    fn module_function_editor_preserves_quotes_and_index() {
+        let mut state = CommandPanelState::default();
+        let target = r#"libfoo.so:"ns::Foo::bar(int, double) const""#;
+        ScriptEditor::enter_script_mode(&mut state, &format!("trace {target} 2"));
+        let cache = state.script_cache.as_mut().unwrap();
+        assert_eq!(cache.target, target);
+        assert_eq!(cache.selected_index, Some(2));
+        cache.lines = vec!["print 42;".to_string()];
+        let actions = ScriptEditor::submit_script(&mut state);
+        assert!(matches!(
+            &actions[0],
+            Action::SendRuntimeCommand(RuntimeCommand::ExecuteScript { command, selected_index: Some(2) })
+                if command == &format!("trace {target} {{print 42;}}")
+        ));
+        ScriptEditor::enter_script_mode(&mut state, &format!("trace {target}"));
+        let cache = state.script_cache.as_ref().unwrap();
+        assert_eq!(cache.lines, ["print 42;"]);
+        assert_eq!(cache.selected_index, None);
+    }
+}
+
 /// Detailed error information for failed trace operations
 #[derive(Debug, Clone)]
 pub struct TraceErrorDetails {
@@ -30,13 +57,15 @@ impl ScriptEditor {
     pub fn enter_script_mode(state: &mut CommandPanelState, command: &str) -> Vec<Action> {
         let rest = command.trim_start_matches("trace").trim();
         // Support optional index: trace <target> [index]
-        let mut parts = rest.split_whitespace();
-        let base_target = parts.next().unwrap_or("");
-        let index_opt = parts.next().and_then(|s| s.parse::<usize>().ok());
+        let (base_target, arguments) = crate::utils::trace_target::split_target_argument(rest);
+        let index_opt = arguments
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<usize>().ok());
 
         if base_target.is_empty() {
             let plain =
-                "Usage: trace <function_name|file:line|0xADDR|module_suffix:0xADDR>".to_string();
+                "Usage: trace <function_name|module:function|file:line|0xADDR|module:0xADDR> [index]".to_string();
             let styled = vec![
                 crate::components::command_panel::style_builder::StyledLineBuilder::new()
                     .styled(

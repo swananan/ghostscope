@@ -135,6 +135,7 @@ fn trace_pattern_label(config: &UProbeConfig) -> String {
 
     match &config.trace_pattern {
         TracePattern::FunctionName(name) => format!("function {name}"),
+        TracePattern::FunctionInModule { module, name } => format!("function {module}:{name}"),
         TracePattern::Wildcard(pattern) => format!("wildcard {pattern}"),
         TracePattern::Address(address) => format!("address 0x{address:x}"),
         TracePattern::AddressInModule { module, address } => {
