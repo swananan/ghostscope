@@ -1,4 +1,5 @@
 pub mod trace_formatting;
+pub(crate) mod trace_target;
 pub mod utf8;
 
 pub use trace_formatting::format_timestamp_ns;

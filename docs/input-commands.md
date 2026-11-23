@@ -55,6 +55,15 @@ t process_data               # Use short form
 **Description:**
 After executing trace command, you enter Script Mode to write trace scripts. Press `Ctrl+S` to save and execute, `Ctrl+C` or `Esc` to cancel.
 
+
+For a function in one module, use `trace libfoo.so:handle_request` or
+`trace libfoo.so:"ns::Handler::run(int, double)"`. The module is a full path or
+unique suffix and must respect any `-t` scope. `info function` accepts the same
+selector, for example `info function libfoo.so:handle_request v`. Its address
+indices apply within the selected module, so `trace libfoo.so:handle_request 2`
+selects the second address shown by that query. Saved traces retain the module
+selector and selected index.
+
 **Script Mode Workflow:**
 1. Execute `trace <target>` → Enter Script Mode with syntax highlighting
 2. Write trace script (see [Script Language Reference](scripting.md) for syntax)

@@ -19,6 +19,7 @@ trace_pattern = {
     hex_address |
     wildcard_pattern |
     source_line |
+    module_function |
     function_name
 }
 
@@ -27,6 +28,7 @@ module_hex_address = { file_path ~ ":" ~ hex_address }
 wildcard_pattern = @{ identifier ~ "*" }
 source_line = { file_path ~ ":" ~ line_number }
 function_name = { qualified_identifier | string }
+module_function = ${ file_path ~ ":" ~ !":" ~ function_name }
 qualified_identifier = @{ identifier ~ ("::" ~ identifier)* }
 
 file_path = @{ (ASCII_ALPHANUMERIC | "_" | "/" | "." | "-")+ }

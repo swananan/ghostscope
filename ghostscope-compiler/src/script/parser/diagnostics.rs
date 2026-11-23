@@ -139,7 +139,7 @@ pub(super) fn detect_unknown_keyword(input: &str) -> Option<String> {
         };
         if !matches!(
             path_pattern.as_rule(),
-            Rule::source_line | Rule::module_hex_address
+            Rule::source_line | Rule::module_hex_address | Rule::module_function
         ) {
             return false;
         }

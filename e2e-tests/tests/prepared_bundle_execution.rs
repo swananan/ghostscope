@@ -485,6 +485,153 @@ fn split_debug(binary: &Path) -> Result<()> {
 }
 
 #[test]
+fn test_module_qualified_functions_scope_scripts_and_bundles() -> Result<()> {
+    common::init();
+    if !host_topology()? {
+        return Ok(());
+    }
+    let fixture = MultiModuleFixture::new(false)?;
+    let dir = fixture.base.directory.path();
+    let script = format!(
+        r#"
+trace libbundle_a.so:shared_probe {{ print "QUAL_A value={{}} global={{}}", value, shared_global; }}
+trace {}:"shared_probe" {{ print "QUAL_B value={{}} global={{}}", value, shared_global; }}
+"#,
+        fixture.libraries[1].display()
+    );
+    let bundle = dir.join("qualified.gsb");
+    successful(
+        fixture
+            .base
+            .prepare_with_modules(&script, &bundle, &fixture.libraries)?,
+    )?;
+    let contents: serde_json::Value = serde_json::from_slice(&fs::read(&bundle)?)?;
+    let probes = contents["probes"].as_array().context("probe table")?;
+    ensure!(
+        probes.len() == 2,
+        "qualified functions expanded to other modules: {probes:?}"
+    );
+    ensure!(
+        probes[0]["module"] == 1 && probes[1]["module"] == 2,
+        "incorrect module selection"
+    );
+
+    for (target, expected) in [
+        ("missing.so:shared_probe", "not found among loaded modules"),
+        (".so:shared_probe", "Ambiguous module suffix"),
+        ("target:shared_probe", "in module"),
+        ("libbundle_a.so:no_such_function", "in module"),
+    ] {
+        let rejected = fixture.base.prepare_with_modules(
+            &format!("trace {target} {{ print 1; }}"),
+            &dir.join("rejected.gsb"),
+            &fixture.libraries,
+        )?;
+        ensure!(!rejected.status.success(), "accepted {target}");
+        ensure!(
+            String::from_utf8_lossy(&rejected.stderr).contains(expected),
+            "unexpected error for {target}: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        ensure!(
+            !dir.join("rejected.gsb").exists(),
+            "published failed preparation"
+        );
+    }
+
+    let rejected = fixture
+        .base
+        .command()
+        .arg("-t")
+        .arg(&fixture.libraries[0])
+        .args([
+            "--dry-run",
+            "--script",
+            "trace libbundle_b.so:shared_probe { print 1; }",
+        ])
+        .arg("--config")
+        .arg(&fixture.base.config)
+        .output()?;
+    ensure!(
+        !rejected.status.success()
+            && String::from_utf8_lossy(&rejected.stderr).contains("outside -t target"),
+        "module selector escaped -t scope: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    fs::write(&fixture.gate, b"go")?;
+    let target = fixture.start(42, false)?;
+    let maps_path = format!("/proc/{}/maps", target.0.id());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let maps = fs::read_to_string(&maps_path)?;
+        if fixture
+            .libraries
+            .iter()
+            .all(|path| maps.contains(path.to_str().unwrap()))
+        {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "target libraries did not load");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let supports_bundle =
+        ghostscope_loader::KernelCapabilities::detect_for_startup(false)?.supports_uprobe_multi;
+    for mode in ["script", "bundle-pid", "bundle-target"] {
+        if mode != "script" && !supports_bundle {
+            continue;
+        }
+        let mut command = fixture.base.command();
+        if mode == "script" {
+            command
+                .arg("--script")
+                .arg(&script)
+                .arg("--config")
+                .arg(&fixture.base.config);
+        } else {
+            if mode == "bundle-pid" {
+                fixture.remove_debug_inputs()?;
+            }
+            command.arg("run-bundle").arg(&bundle);
+        }
+        if mode == "bundle-target" {
+            command.arg("-t").arg(&fixture.base.binary);
+        } else {
+            command.arg("-p").arg(target.0.id().to_string());
+        }
+        let stdout = dir.join(format!("{mode}.stdout"));
+        let stderr = dir.join(format!("{mode}.stderr"));
+        let mut tracer = ChildGuard(
+            command
+                .args(["--no-status", "--script-output", "plain"])
+                .stdout(Stdio::from(File::create(&stdout)?))
+                .stderr(Stdio::from(File::create(&stderr)?))
+                .spawn()?,
+        );
+        let output = wait_for_bundle_output(&mut tracer, &stdout, &stderr, |output| {
+            output.contains("QUAL_A value=43 global=101")
+                && output.contains("QUAL_B value=44 global=202")
+        })?;
+        for line in output.lines() {
+            if line.contains("QUAL_A") {
+                ensure!(
+                    line.contains("QUAL_A value=43 global=101"),
+                    "wrong module for A: {line}"
+                );
+            }
+            if line.contains("QUAL_B") {
+                ensure!(
+                    line.contains("QUAL_B value=44 global=202"),
+                    "wrong module for B: {line}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_prepared_bundle_multiple_modules_and_late_dlopen() -> Result<()> {
     common::init();
     if !host_topology()?

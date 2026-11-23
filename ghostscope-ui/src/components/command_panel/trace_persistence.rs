@@ -658,6 +658,18 @@ mod tests {
     }
 
     #[test]
+    fn module_function_trace_roundtrip_preserves_target_and_index() {
+        let target = r#"libfoo.so:"ns::Foo::bar(int, double) const""#;
+        let block = TracePersistence::wrap_script_body(target, "print 42;");
+        let block = TracePersistence::format_trace_block(&block, target);
+        let traces = TracePersistence::parse_trace_file(&format!("// Index: 2\n{block}")).unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].target, target);
+        assert_eq!(traces[0].selected_index, Some(2));
+        assert_eq!(traces[0].script, "print 42;");
+    }
+
+    #[test]
     fn test_parse_trace_file() {
         let content = r#"// Header
 //@disabled

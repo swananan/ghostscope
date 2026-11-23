@@ -48,6 +48,20 @@ impl From<pest::error::Error<Rule>> for ParseError {
 
 pub type Result<T> = std::result::Result<T, ParseError>;
 
+/// Parse one complete target using the same grammar as a script trace block.
+pub fn parse_trace_target(input: &str) -> Result<crate::script::ast::TracePattern> {
+    let input = input.trim();
+    let pair = GhostScopeParser::parse(Rule::trace_pattern, input)?
+        .next()
+        .ok_or(ParseError::InvalidExpression)?;
+    if pair.as_span().end() != input.len() {
+        return Err(ParseError::SyntaxError(
+            "Unexpected text after trace target".to_string(),
+        ));
+    }
+    statement::parse_trace_pattern(pair)
+}
+
 // Custom chunks function with RuleType constraint
 fn chunks_of_two<'a, T: RuleType>(pairs: Pairs<'a, T>) -> Vec<Vec<Pair<'a, T>>> {
     let pairs_vec: Vec<_> = pairs.collect();

@@ -654,8 +654,38 @@ fn handle_function_target(
     function_name: &str,
     target_path: Option<&str>,
 ) -> Result<TargetDebugInfo, String> {
-    let query_result = process_analyzer
-        .query_function_best_effort(function_name)
+    use ghostscope_compiler::script::{parser::parse_trace_target, TracePattern};
+
+    let parsed = parse_trace_target(function_name).ok();
+    let explicit_module = match &parsed {
+        Some(TracePattern::FunctionInModule { module, .. }) => Some(
+            process_analyzer
+                .resolve_module_spec(module, target_path)
+                .map_err(|e| e.to_string())?,
+        ),
+        _ => None,
+    };
+    let name = match &parsed {
+        Some(TracePattern::FunctionName(name) | TracePattern::FunctionInModule { name, .. }) => {
+            name
+        }
+        _ => function_name,
+    };
+    let mut query_result = process_analyzer
+        .query_function_best_effort(name)
         .map_err(|e| format!("Failed to analyze function '{function_name}': {e}"))?;
-    handle_function_query_result(process_analyzer, query_result, target_path)
+    if let Some(module) = explicit_module {
+        query_result
+            .addresses
+            .retain(|address| address.module_path == module);
+        if query_result.addresses.is_empty() {
+            return Err(format!(
+                "Function '{name}' not found in module '{}'",
+                module.display()
+            ));
+        }
+    }
+    let mut info = handle_function_query_result(process_analyzer, query_result, target_path)?;
+    info.target = function_name.to_string();
+    Ok(info)
 }

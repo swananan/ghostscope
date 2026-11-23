@@ -87,6 +87,29 @@ trace /home/user/project/src/utils.c:100 {
 }
 ```
 
+#### 指定模块中的函数
+
+使用 `模块:函数` 选中某个可执行文件或共享库内的函数：
+
+```ghostscope
+trace libfoo.so:handle_request {
+    print "foo request={}", request_id;
+}
+trace /opt/app/libbar.so:"ns::Handler::run(int, double)" {
+    print "bar request={}", request_id;
+}
+```
+
+模块支持完整路径或唯一的路径后缀，与模块限定地址使用相同规则。模块不存在或
+后缀有歧义时直接报错；函数不存在时不会回退到其他模块。函数名含空格、参数或
+模板时，只给函数名加双引号。Rust/C++ 的 `::` 名称保持原有含义。
+暂不支持模块限定的通配符目标。
+
+普通 `-t` 会话中，模块必须匹配指定目标，同时使用 `-p` 时也一样。要在一个脚本
+中分别追踪多个已加载模块，使用不带 `-t` 的 `-p` 模式。
+`prepare -t ... --module ...` 则允许选择任一显式准备的模块。
+局部变量和全局变量使用各探针所选模块的上下文。
+
 #### 地址
 ```ghostscope
 // 按模块相对虚拟地址（DWARF/符号表 PC）追踪

@@ -665,7 +665,6 @@ fn parse_qualified_trace_targets_rejects_malformed_paths_and_variable_names() {
         "trace ns:::probe {}",
         "trace ns:: {}",
         "trace ns::123 {}",
-        "trace ns:probe {}",
         "trace ns ::probe {}",
         "trace ns:: probe {}",
         "trace \"\" {}",
@@ -673,6 +672,54 @@ fn parse_qualified_trace_targets_rejects_malformed_paths_and_variable_names() {
         "trace main { print ns::value; }",
     ] {
         assert!(parse(script).is_err(), "unexpectedly accepted {script}");
+    }
+}
+
+#[test]
+fn parse_module_qualified_function_targets() {
+    for (module, target, name) in [
+        ("libfoo.so", "probe", "probe"),
+        ("/opt/app/libfoo.so", "ns::probe", "ns::probe"),
+        ("/opt//app/libfoo.so", "_probe", "_probe"),
+        ("app", "rust_mod::probe", "rust_mod::probe"),
+        (
+            "libfoo.so",
+            r#""ns::Foo::bar(int, double) const""#,
+            "ns::Foo::bar(int, double) const",
+        ),
+        (
+            "libfoo.so",
+            r#""<app::Type as app::Trait>::call""#,
+            "<app::Type as app::Trait>::call",
+        ),
+    ] {
+        let target = format!("{module}:{target}");
+        let program = parse(&format!("trace {target} {{ print \"hit\"; }}")).unwrap();
+        assert!(matches!(
+            &program.statements[0],
+            Statement::TracePoint { pattern: TracePattern::FunctionInModule { module: actual_module, name: actual_name }, .. }
+                if actual_module == module && actual_name == name
+        ));
+        assert!(matches!(
+            super::parse_trace_target(&target).unwrap(),
+            TracePattern::FunctionInModule { .. }
+        ));
+    }
+    for target in [
+        "libfoo.so:",
+        "libfoo.so::probe",
+        "libfoo.so:probe*",
+        "libfoo.so:\"\"",
+        "libfoo.so:probe extra",
+    ] {
+        assert!(
+            parse(&format!("trace {target} {{}}")).is_err(),
+            "accepted {target}"
+        );
+        assert!(
+            super::parse_trace_target(target).is_err(),
+            "accepted standalone {target}"
+        );
     }
 }
 

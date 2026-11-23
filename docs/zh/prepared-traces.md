@@ -42,7 +42,10 @@ sudo ghostscope run-bundle trace.gsb -p <PID>
 ```
 
 函数和源码模式在所选模块中解析。不同模块中的同名函数生成独立探针，各自保留变量
-上下文。裸地址默认指向 `-t` 主模块；其他模块可使用 `libfoo.so:0x1234`。
+上下文。使用 `trace libfoo.so:handle_request { ... }` 可只选择一个模块；
+函数名含参数等字符时可写成 `trace libfoo.so:"ns::Handler::run(int)" { ... }`。
+模块必须匹配已准备模块的完整路径或唯一后缀，不存在或有歧义时会报错。
+裸地址默认指向 `-t` 主模块；其他模块可使用 `libfoo.so:0x1234`。
 每个 bundle 最多包含 64 个模块，拒绝重复模块身份，包括具有相同 build ID 的副本。
 
 使用 `-p` 时主模块必须已经映射，附加库可以稍后通过 `dlopen` 加载。不使用 `-p`

@@ -187,6 +187,9 @@ impl<'a> AstCompiler<'a> {
                             let has_failed_for_this_pattern =
                                 self.failed_targets.iter().any(|ft| match pattern {
                                     TracePattern::FunctionName(name) => ft.target_name == *name,
+                                    TracePattern::FunctionInModule { module, name } => {
+                                        ft.target_name == format!("{module}:{name}")
+                                    }
                                     TracePattern::SourceLine {
                                         file_path,
                                         line_number,
@@ -205,6 +208,9 @@ impl<'a> AstCompiler<'a> {
                             if !has_failed_for_this_pattern {
                                 let target_name = match pattern {
                                     TracePattern::FunctionName(name) => name.clone(),
+                                    TracePattern::FunctionInModule { module, name } => {
+                                        format!("{module}:{name}")
+                                    }
                                     TracePattern::SourceLine {
                                         file_path,
                                         line_number,
@@ -570,38 +576,60 @@ impl<'a> AstCompiler<'a> {
                     }
                 }
             }
-            TracePattern::FunctionName(func_name) => {
-                // Resolve all addresses for the function name and generate per-PC programs
-                let module_addresses = if let Some(analyzer) = self.process_analyzer {
-                    analyzer.lookup_function_addresses(func_name)
-                } else {
-                    Vec::new()
+            TracePattern::FunctionName(func_name)
+            | TracePattern::FunctionInModule {
+                name: func_name, ..
+            } => {
+                let analyzer = self.process_analyzer.ok_or_else(|| {
+                    CompileError::Other(
+                        "No process analyzer available to resolve function".to_string(),
+                    )
+                })?;
+                // Resolve the module before looking up the function: a suffix must
+                // remain unambiguous even if only one candidate defines the name.
+                let explicit_module = match pattern {
+                    TracePattern::FunctionInModule { module, .. } => Some(
+                        analyzer
+                            .resolve_module_spec(module, self.configured_target_path())
+                            .map_err(|e| CompileError::Other(e.to_string()))?,
+                    ),
+                    _ => None,
                 };
-
-                if module_addresses.is_empty() {
-                    // Strict behavior: fail this trace point immediately instead of skipping silently
-                    return Err(CompileError::Other(format!(
-                        "No addresses resolved for function '{func_name}' - function not found in debug symbols"
-                    )));
-                }
-
-                let original_address_count = module_addresses.len();
-                let target_path = self.configured_target_path();
-                let module_addresses = self
-                    .process_analyzer
-                    .ok_or_else(|| {
-                        CompileError::Other(
-                            "No process analyzer available to resolve -t target".to_string(),
-                        )
-                    })?
-                    .filter_module_addresses_to_target(module_addresses, target_path)
-                    .map_err(|e| CompileError::Other(e.to_string()))?;
-                if original_address_count > 0 && module_addresses.is_empty() {
-                    let target = target_path.unwrap_or("<unknown>");
-                    return Err(CompileError::Other(format!(
-                        "No addresses resolved for function '{func_name}' in -t target '{target}'. When -t and -p are combined, -t takes precedence for trace target resolution."
-                    )));
-                }
+                let target_name = match pattern {
+                    TracePattern::FunctionInModule { module, name } => format!("{module}:{name}"),
+                    _ => func_name.clone(),
+                };
+                let module_addresses = analyzer.lookup_function_addresses(func_name);
+                let module_addresses = if let Some(module) = &explicit_module {
+                    let addresses: Vec<_> = module_addresses
+                        .into_iter()
+                        .filter(|address| address.module_path == *module)
+                        .collect();
+                    if addresses.is_empty() {
+                        return Err(CompileError::Other(format!(
+                            "No addresses resolved for function '{func_name}' in module '{}'",
+                            module.display()
+                        )));
+                    }
+                    addresses
+                } else {
+                    if module_addresses.is_empty() {
+                        return Err(CompileError::Other(format!(
+                            "No addresses resolved for function '{func_name}' - function not found in debug symbols"
+                        )));
+                    }
+                    let target_path = self.configured_target_path();
+                    let addresses = analyzer
+                        .filter_module_addresses_to_target(module_addresses, target_path)
+                        .map_err(|e| CompileError::Other(e.to_string()))?;
+                    if addresses.is_empty() {
+                        let target = target_path.unwrap_or("<unknown>");
+                        return Err(CompileError::Other(format!(
+                            "No addresses resolved for function '{func_name}' in -t target '{target}'. When -t and -p are combined, -t takes precedence for trace target resolution."
+                        )));
+                    }
+                    addresses
+                };
 
                 let total_addresses: usize = module_addresses.len();
                 debug!(
@@ -615,7 +643,7 @@ impl<'a> AstCompiler<'a> {
                 if let Some(idx) = self.compile_options.selected_index {
                     if idx == 0 || idx > module_addresses.len() {
                         return Err(CompileError::Other(format!(
-                            "Selected index {idx} is out of range for function '{func_name}' (valid 1..={}). Use 'info function {func_name}' to view indices.",
+                            "Selected index {idx} is out of range for function '{target_name}' (valid 1..={}). Use 'info function {target_name}' to view indices.",
                             module_addresses.len()
                         )));
                     }
@@ -676,7 +704,7 @@ impl<'a> AstCompiler<'a> {
 
                             // Record this failed target
                             self.failed_targets.push(FailedTarget {
-                                target_name: func_name.clone(),
+                                target_name: target_name.clone(),
                                 pc_address: module_address.address,
                                 error_message: e.user_message().into_owned(),
                             });

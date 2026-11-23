@@ -126,8 +126,12 @@ pub enum PrintStatement {
 #[derive(Debug, Clone)]
 pub enum TracePattern {
     FunctionName(String), // trace main { ... }
-    Wildcard(String),     // trace printf* { ... }
-    Address(u64),         // trace 0x400000 { ... }
+    FunctionInModule {
+        module: String,
+        name: String,
+    },
+    Wildcard(String), // trace printf* { ... }
+    Address(u64),     // trace 0x400000 { ... }
     AddressInModule {
         // trace module_suffix:0xADDR { ... }
         module: String,
