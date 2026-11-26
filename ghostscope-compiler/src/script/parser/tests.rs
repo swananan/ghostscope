@@ -679,6 +679,8 @@ fn parse_qualified_trace_targets_rejects_malformed_paths_and_variable_names() {
 fn parse_module_qualified_function_targets() {
     for (module, target, name) in [
         ("libfoo.so", "probe", "probe"),
+        ("0xff", "probe", "probe"),
+        ("0xapp", "ns::probe", "ns::probe"),
         ("/opt/app/libfoo.so", "ns::probe", "ns::probe"),
         ("/opt//app/libfoo.so", "_probe", "_probe"),
         ("app", "rust_mod::probe", "rust_mod::probe"),
@@ -692,6 +694,11 @@ fn parse_module_qualified_function_targets() {
             r#""<app::Type as app::Trait>::call""#,
             "<app::Type as app::Trait>::call",
         ),
+        (
+            "0xff.so",
+            r#""run()::{lambda(int)#1}::operator()(int) const""#,
+            "run()::{lambda(int)#1}::operator()(int) const",
+        ),
     ] {
         let target = format!("{module}:{target}");
         let program = parse(&format!("trace {target} {{ print \"hit\"; }}")).unwrap();
@@ -702,7 +709,8 @@ fn parse_module_qualified_function_targets() {
         ));
         assert!(matches!(
             super::parse_trace_target(&target).unwrap(),
-            TracePattern::FunctionInModule { .. }
+            TracePattern::FunctionInModule { module: actual_module, name: actual_name }
+                if actual_module == module && actual_name == name
         ));
     }
     for target in [
@@ -721,6 +729,28 @@ fn parse_module_qualified_function_targets() {
             "accepted standalone {target}"
         );
     }
+}
+
+#[test]
+fn parse_hex_prefixed_paths_preserves_address_and_source_targets() {
+    let program = parse("trace 0xff:0x1234 {} trace 0xff.c:42 {} trace 0x1234 {}").unwrap();
+    assert!(matches!(
+        &program.statements[0],
+        Statement::TracePoint { pattern: TracePattern::AddressInModule { module, address: 0x1234 }, .. }
+            if module == "0xff"
+    ));
+    assert!(matches!(
+        &program.statements[1],
+        Statement::TracePoint { pattern: TracePattern::SourceLine { file_path, line_number: 42 }, .. }
+            if file_path == "0xff.c"
+    ));
+    assert!(matches!(
+        &program.statements[2],
+        Statement::TracePoint {
+            pattern: TracePattern::Address(0x1234),
+            ..
+        }
+    ));
 }
 
 #[test]
