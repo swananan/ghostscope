@@ -16,10 +16,10 @@ statement = {
 trace_stmt = { "trace" ~ trace_pattern ~ "{" ~ statement* ~ "}" }
 trace_pattern = { 
     module_hex_address |
-    hex_address |
-    wildcard_pattern |
     source_line |
     module_function |
+    hex_address |
+    wildcard_pattern |
     function_name
 }
 
